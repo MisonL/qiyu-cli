@@ -1,0 +1,40 @@
+{
+  "name": "qiyu-cli",
+  "version": "0.1.0",
+  "description": "网易七鱼开放 API 的命令行封装，主要用户是 AI Agent：默认输出机器可读 JSON，用退出码表达意图，危险操作有硬门禁",
+  "type": "module",
+  "license": "MIT",
+  "author": "MisonL",
+  "homepage": "https://github.com/MisonL/qiyu-cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MisonL/qiyu-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MisonL/qiyu-cli/issues"
+  },
+  "keywords": [
+    "qiyu",
+    "七鱼",
+    "网易七鱼",
+    "cli",
+    "api",
+    "agent",
+    "ai-agent",
+    "customer-service"
+  ],
+  "engines": { "node": ">=20.10" },
+  "bin": { "qiyu": "dist/cli.js" },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "test": "vitest run --maxWorkers=1 --no-file-parallelism",
+    "typecheck": "tsc -p tsconfig.test.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

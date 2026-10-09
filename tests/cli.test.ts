@@ -1,0 +1,258 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { run } from '../src/cli.js'
+
+let out = ''
+let err = ''
+beforeEach(() => {
+  out = ''; err = ''
+  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
+  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+})
+afterEach(() => vi.restoreAllMocks())
+
+describe('命令行入口', () => {
+  it('无参数时返回用法错误码 2', async () => {
+    expect(await run([])).toBe(2)
+    // ⚠️ stderr 是给人读的 —— 无参数是用法错误，不是"用户请求帮助"
+    expect(err).toContain('用法：')
+    // ⚠️ **stdout 同时必须是合法 JSON**（2026-10-05 修，见 output.ts `usageFail`）。
+    // 此前此处 stdout 为空：`qiyu | jq` 拿到空输入、jq 报 parse error，Agent 看不到原因。
+    // 这条断言正是防止它退回"只写 stderr"的那个钉子。
+    expect(JSON.parse(out).error).toMatchObject({
+      code: 'usage', kind: 'usage', retryable: false,
+    })
+  })
+
+  it('未知子命令返回用法错误码 2', async () => {
+    expect(await run(['不存在的命令'])).toBe(2)
+    expect(err).toContain('未知子命令：不存在的命令')
+    // ⚠️ 这里**只**断言"走到了「可用子命令：」这条分支"，**不**断言列表里具体有哪些命令。
+    // 原因是本文件在**任务 1 就被创建**，而 `COMMANDS` 此时是**空表**（auth 到任务 10、
+    // api 到任务 11 才挂载）。空表时正确输出是「可用子命令：（暂无）」，挂载后才是
+    // 「可用子命令：auth、api」—— **正确输出本身随任务推进变化**，所以不存在一条
+    // 断言能同时在两种状态下成立。曾经这里写过 `toMatch(/可用子命令：[\s\S]*auth/)`，
+    // 那是**错的**：它在任务 1 必然失败（空表拿不到 auth），与步骤 5「预期 PASS」矛盾。
+    // → 列表**内容**的断言在任务 11（`api` 挂载后）单独引入，见该任务的测试。
+    //
+    // 关于 `Object.keys(COMMANDS).join('、') || '（暂无）'` 的 `||`→`&&` 变异：
+    // 它确实无法在本文件里用一条断言钉死（理由同上）。本计划**如实记录这个覆盖缺口**，
+    // 不假装已覆盖 —— 该变异的可观测后果是"空表时输出空串、非空表时输出（暂无）"，
+    // 属低危（错误信息少列几个命令，不改变退出码），且它保护的是"未来有人手滑改错"。
+    expect(err, '必须走到「可用子命令：」这条分支').toContain('可用子命令：')
+  })
+
+  it('--help 走 stdout 且退出码为 0 —— 它是"请求帮助"，不是错误', async () => {
+    // ⚠️ 全局约束承诺「CLI 的 --help 一律中文」。若不实现它，
+    // `qiyu --help` 会落到「未知子命令」分支（实测输出"未知子命令：--help"、退出码 2）——
+    // 对一个 Agent 而言那是坏交互：它请求帮助，却得到一个错误。
+    expect(await run(['--help'])).toBe(0)
+    expect(out).toContain('用法：')
+    expect(out).toContain('api call')
+    expect(err).toBe('')
+  })
+
+  it('-h 与 --help 等价', async () => {
+    expect(await run(['-h'])).toBe(0)
+    expect(out).toContain('用法：')
+  })
+
+  it('--help 不吞额外参数 —— 拼错的 flag / 多余的位置参数必须报出来（2026-10-08 修）', async () => {
+    // ⚠️ 此前 `--help` 是"首个 token 特判且排在最前"：实测 `qiyu --help --bod` /
+    // `qiyu --help extra` 都返回 0，把错误静默吞掉（而 `qiyu --bod` 单独跑是 2）——
+    // "多带一个 --help"把一条用法错误变成了静默成功，与 `api list --al --help`
+    // 是同一个坑（叶子命令 2026-10-05/08 修过两轮，分派层这一处漏了）。
+    // 修法与叶子命令同一条次序：未知/位置参数 → help。
+    expect(await run(['--help', '--bod'])).toBe(2)
+    expect(err, 'stderr 要给人读').toContain('未知参数：--bod')
+    expect(JSON.parse(out).error.message, 'stdout 要给 Agent 读')
+      .toContain('--help 不接受额外参数')
+    out = ''; err = ''
+    expect(await run(['--help', 'extra'])).toBe(2)
+    expect(err).toContain('未知参数：extra')
+    // `--help --help` 仍给帮助 —— `--help`/`-h` 是这条伪命令仅有的合法 token，
+    // 不算"额外参数"（与 `api list --help --help` 同答）。
+    out = ''; err = ''
+    expect(await run(['--help', '--help'])).toBe(0)
+    expect(out).toContain('用法：')
+    expect(err).toBe('')
+  })
+
+  it('纯空白的子命令也要点名，不能渲染成不可见的名字（2026-10-08 修）', async () => {
+    // `qiyu " "`（shell 变量展开成一个空格）此前报「未知子命令： ；可用子命令：…」——
+    // 冒号后是空格，Agent 看不出自己传了什么。规则同 output.ts 的 describeArgs。
+    expect(await run([' '])).toBe(2)
+    expect(err).toContain("未知子命令：' '")
+  })
+
+  it('帮助文本告知「按 kind 分支、code 只是标签」（2026-10-07 补）', async () => {
+    // ⚠️ 契约里唯一没写清的一件事：`error.code` 混合了**服务端数字码**与
+    // **本 CLI 合成的词**（usage / network / internal / auth_missing /
+    // confirm_required / local_rate_limit）。字段名 `code` 强烈暗示"服务端错误码"，
+    // 而设计稿 §4.3 的错误码表全是数字 —— Agent 按 code 去查表会查不到合成词，
+    // 而设计稿 §11.2 D 的分支依据其实是 **kind**。
+    // 此前这句话在 CLI 的任何输出里都不存在（只写在计划的「已知缺口」里，而
+    // Agent 手里没有那份文档）。help 是 Agent 唯一能读到的契约说明，放在这里。
+    // ⚠️ 断言必须命中"按 kind"与"合成"两个要点，而不是只断言出现了 kind 一词。
+    await run(['--help'])
+    expect(out, 'help 必须告诉 Agent 按 kind 分支').toMatch(/按 kind 分支/)
+    expect(out, 'help 必须点破 code 可能是合成词').toMatch(/合成/)
+    expect(out, '必须点破合成词查不到官方错误码表').toMatch(/查不到|不在官方/)
+  })
+
+  it('帮助文本里不出现未实现的子命令 —— 那会是一句指向不存在能力的指引', async () => {
+    // `auth login` 在「已知缺口」里明确未实现（会显式报错）。
+    // 把它写进 --help 等于向 Agent 承诺一个跑不通的命令。
+    await run(['--help'])
+    expect(out).not.toContain('auth login')
+  })
+
+  it('原型链上的键（toString/constructor/valueOf…）按未知子命令处理，不是处理器', async () => {
+    // ⚠️ 这条分支此前**没有测试**，且实现原本是错的。变异/实测确认：
+    // `const handler = COMMANDS[sub]` + `if (!handler)` 在 `COMMANDS` 是普通对象
+    // 字面量时会命中 `Object.prototype` 上的方法（**truthy**），于是
+    // `if (!handler)` 不成立，原型方法被当成子命令处理器调用。实测（Node 24）：
+    //   toString / constructor → 返回非数字，随后 `process.exitCode = <非数字>`
+    //     抛 ERR_INVALID_ARG_TYPE
+    //   valueOf / hasOwnProperty / __proto__ → 直接抛 TypeError
+    // 后果是 unhandled rejection（入口当时也没有 .catch）：Node 打一段堆栈、
+    // 退出码 1 —— 既不是「未知子命令」的退出码 2，也不符合输出契约。
+    //
+    // 仓库已在 `core/ratelimit.ts` 用 `Object.hasOwn` 修过同一类问题
+    // （并有测试钉 `limitFor('constructor')`）—— 分发表当时漏了。
+    // 这里逐个断言**退出码 2** 与**「未知子命令」文本**，而不只是"不抛"。
+    for (const key of ['toString', 'constructor', 'valueOf', 'hasOwnProperty',
+                       'isPrototypeOf', '__proto__', '__defineGetter__']) {
+      out = ''; err = ''
+      expect(await run([key]), `原型键 ${key} 必须按未知子命令返回 2`).toBe(2)
+      expect(err, `原型键 ${key} 必须报「未知子命令」`).toContain('未知子命令')
+    }
+  })
+
+  it('除 --help 外，stdout 一律是合法 JSON —— 这是 Agent 能 `| jq` 的前提', async () => {
+    // ⚠️ 全局约束是「stdout 只输出 JSON」，唯一例外是 --help。
+    //
+    // ⚠️ 这条测试此前**标题与断言互相矛盾**（2026-10-05 修）：标题说「stdout 一律是
+    // 合法 JSON」，断言却是 `expect(out).toBe('')` —— 断言的是"stdout 为空"。两者不是
+    // 一回事：空 stdout 恰恰是 **Agent 最坏**的情形（`| jq` 拿到空输入、报
+    // `Unexpected end of JSON input`，而全局约束明写「其余任何情况下 stdout
+    // 都必须是合法 JSON —— 包括所有错误输出」）。测试一直绿，是因为它只钉住了当时
+    // 的实现（只写 stderr），漏掉了约束本身。现在两条都钉：stdout 是合法 JSON，
+    // **且** stderr 有人类可读的说明。
+    const cases: Array<[string[], string]> = [
+      [[], '无参数'],
+      [['不存在的命令'], '未知子命令'],
+    ]
+    for (const [argv, label] of cases) {
+      out = ''; err = ''
+      await run(argv)
+      // 1) stdout 必须是合法 JSON（不是空、不是纯文本）—— 这才是"能 `| jq`"的含义
+      const parsed = JSON.parse(out)
+      expect(parsed.ok, `${label} 的 stdout 应是 ok:false 的错误信封`).toBe(false)
+      expect(parsed.error.code, `${label} 的 code 应是 usage`).toBe('usage')
+      // 2) stderr 同时有人类可读说明（两个通道各服务一类读者）
+      expect(err, `${label} 应走 stderr`).not.toBe('')
+    }
+    // --help 是唯一的例外，且必须是纯文本（不是 JSON）
+    out = ''
+    await run(['--help'])
+    expect(() => JSON.parse(out)).toThrow()
+  })
+})
+
+describe('分层约束（架构不变量）', () => {
+  it('core/ 不得 import commands/ —— 否则 core 无法脱离 CLI 复用为 MCP Server', async () => {
+    // ⚠️ 这条约束写在「全局约束」里，但没有任何东西守着它 ——
+    // 加一行 `import { fail } from '../output.js'` 就能悄悄违反，
+    // 而后果（core 层绑死 CLI）要等到复用时才暴露。
+    // 用一个静态扫描把它钉住，成本几乎为零。
+    const { readdirSync, readFileSync, statSync, existsSync } = await import('node:fs')
+    const { join, dirname } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const root = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'core')
+
+    // ⚠️ 必须守卫：`src/core/` 要到任务 2 才创建，而本用例在任务 1 就要跑通。
+    // 没有这行，任务 1 步骤 5 会抛 ENOENT（readdirSync 一个不存在的目录），
+    // 与「预期：PASS」直接矛盾 —— 照做的执行者会卡在"计划说该过、实际不过"。
+    if (!existsSync(root)) return
+
+    const walk = (dir: string): string[] =>
+      readdirSync(dir).flatMap((n) => {
+        const p = join(dir, n)
+        if (statSync(p).isDirectory()) return walk(p)
+        return p.endsWith('.ts') ? [p] : []
+      })
+
+    const offenders: string[] = []
+    for (const file of walk(root)) {
+      const src = readFileSync(file, 'utf8')
+      // 匹配任何指向 commands/ 或 output.js 的 import（相对路径写法）
+      for (const m of src.matchAll(/from\s+['"]([^'"]+)['"]/g)) {
+        const spec = m[1]
+        if (/commands\//.test(spec) || /(^|\/)output\.js$/.test(spec)) {
+          offenders.push(`${file} → ${spec}`)
+        }
+      }
+    }
+    expect(offenders, `core/ 里出现了指向 CLI 层的 import：\n${offenders.join('\n')}`).toEqual([])
+  })
+})
+
+describe('入口退出行为（架构不变量）', () => {
+  it('入口不得用 process.exit() —— 它会在 stdout 排空前强杀进程，静默截断大输出', async () => {
+    // ⚠️ 实测（Node 24）：`process.exit(0)` 紧跟一个大 stdout 写入、且输出走**管道**时，
+    // 只写出 131072 字节（正好是 128 KiB 管道缓冲区），其余被丢弃 —— 退出码仍是 0，
+    // 没有任何报错。而 `qiyu api call <大结果集> | jq` 正是 Agent 的标准用法，
+    // 也是**唯一**值得管道的场景（`ticket.search` 实测 2885 行、报表 17765 行）。
+    // Agent 拿到的 JSON 会在中间断掉，jq 报一个与真实原因（输出太大）无关的解析错误。
+    // 设 `process.exitCode` 让事件循环自然结束，Node 会先把 stdout 排空再退出。
+    //
+    // 为什么只能扫源码、不能行为断言：vitest 里 `process.stdout.write` 被 mock 成
+    // 往字符串累加（见各测试文件），**完全绕过了 OS 管道** —— 那种 mock 下
+    // `process.exit()` 不会截断任何东西，行为测试永远抓不到这个缺陷。
+    // 与 http.test.ts 里「不读 Content-Length」那条同理：不改变可观测行为的代码
+    // 只能静态钉住。
+    const { readFileSync } = await import('node:fs')
+    const { join, dirname } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.ts'), 'utf8')
+    // ⚠️ 扫**代码**不扫注释（2026-10-07 改）：cli.ts 的注释里本来就写着
+    // 「不要用 `process.exit`」之类的说明（本计划自己在 3 处代码块注释里写了
+    // `process.exit()` 这个字样）—— 裸扫时，谁把说明补全成带括号的
+    // `process.exit()`，这条就**假红**。与 http.test.ts 的 Content-Length 那条
+    // 同一种假红形态，同一种修法：匹配点之前有同行 `//` 即视为注释。
+    // 两个断言都走 inCode：负向的防假红，正向的防「注释里写了 `exitCode =`
+    // 就以为真的设置了退出码」——那是另一种空转。
+    // ⚠️ 局限（如实标注）：判据是"匹配点之前有没有同行 `//`"，只有 `https://`
+    // 这种前一字符是 `:` 的 `//` 被排除。若某行**真代码里含 `//` 字符串**
+    // （如 `const u = 'a//b'`）且匹配点在其后，会被误判成注释。当前两个被扫的词
+    // （`process.exit(` / `exitCode =`）在 cli.ts 里都不挨着这种字符串，不触发；
+    // 要更严可上真正的词法扫描，但为两条断言引依赖不值 —— 记在这里，别当它万无一失。
+    const inCode = (text: string, re: RegExp): boolean => {
+      for (const line of text.split('\n')) {
+        const m = line.match(re)
+        if (!m || m.index === undefined) continue
+        const c = line.indexOf('//')
+        if (c < 0 || c > m.index || line[c - 1] === ':') return true
+      }
+      return false
+    }
+    expect(inCode(src, /process\.exit\(/),
+      '入口的代码必须用 process.exitCode 而不是 process.exit()（注释提及不受限）')
+      .toBe(false)
+    expect(inCode(src, /process\.exitCode\s*=/),
+      '入口必须真的设置退出码（注释里写不算），否则失败也会返回 0').toBe(true)
+    // ⚠️ shebang 必须是**字面第一行**（2026-10-06 补）。本计划的代码块约定是
+    // "首行写 `// <路径>` 归属注释"，而 `cli.ts` 的第一行是 `#!/usr/bin/env node` ——
+    // 照抄含归属行的块会把 shebang 挤到第二行，Node/tsc 直接拒绝整个文件
+    // （实测 `TS18026: '#!' can only be used at the start of a file`，紧跟一条 `TS1005`）。
+    // 影响面是 3 个测试文件（本文件 + 两个在用例内 `await import()` 它的）——
+    // 不是"整个套件全挂"，但足以让入口永远不可用且**报错指向语法**、
+    // 不指向"你多抄了一行注释"。
+    // 这条断言把"落盘时删掉归属行"从一句嘱咐变成机器可查的事实 ——
+    // 它同时也是"包能不能被 npx 执行"的前提：shebang 不在首行，`dist/cli.js`
+    // 就不是可执行脚本。
+    expect(src.split('\n')[0], 'shebang 必须是第一行（归属注释不能挤在它前面）')
+      .toBe('#!/usr/bin/env node')
+  })
+})

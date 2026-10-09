@@ -1,0 +1,53 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+*.tsbuildinfo
+
+# 测试与覆盖率
+coverage/
+.nyc_output/
+
+# 本地数据文件（可能含真实客户 PII —— 绝不提交）
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+*.sqlite3
+
+# 凭据与本地配置 —— 绝不提交
+.env
+.env.*
+!.env.example
+config.local.*
+*.pem
+*.key
+
+# 导出产物（会话/工单导出可能含 PII）
+export/
+downloads/
+*.zip
+
+# 编辑器与操作系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 日志
+*.log
+logs/
+
+# 私有参考资料 —— 含真实企业数据，绝不提交
+private/
+
+# 注册表生成脚本的抓取产物（第三方文档快照，不提交）
+registry-src/
+
+# 开发期临时产物（工作交接、子代理执行账本、git worktree）
+HANDOFF.md
+.superpowers/
+.worktrees/

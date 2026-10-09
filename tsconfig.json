@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": false,
+    "skipLibCheck": true,
+    // 任务 6 要 `import specs.json with { type: 'json' }`，缺这项会编译失败
+    "resolveJsonModule": true
+  },
+  "include": ["src"]
+}

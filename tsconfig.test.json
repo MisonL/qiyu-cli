@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // 覆盖父配置的 rootDir：测试不在 src 下，否则报 TS6059
+    "rootDir": "."
+  },
+  "include": ["src", "tests"]
+}
