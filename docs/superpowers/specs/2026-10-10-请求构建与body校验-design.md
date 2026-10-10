@@ -359,19 +359,27 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
    （**只缺** `robotId`；其余必填齐）→ **2、零网络请求**（mock fetch 断言未被调用）、stderr 点名 `robotId`、
    stdout `error.kind==="usage"` 且**不含** `confirm_required`。
 4. 同上 body 再加 `"bogus":1` → 仍 **2**（硬拒短路，**不**输出 warnings——验收 §四 的短路规则）。
-5. 补全 `robotId` 后重跑 → 0，`meta.warnings` 含 `{kind:"unknown_field", field:"bogus"}`。
-6. `merchant.account.login` 只传 `userName+code`（缺 `shopCode`）→ **0**（one-of 满足、不误拒）；
-   三者全缺 → 2 且消息来自 override 的 `message`。
+   ⚠️ 3/4 之所以是 2 而不是 4：`ai.knowledge.addKnowledge` 是**危险接口**，但 D5 让校验先于门禁——
+   缺必填在本地拦下，根本走不到 `--yes` 门禁。这**正是** D5 的验收。
+5. **改用非危险接口** `ai.knowledge.search`（必填 body 字段仅 `robotId`，`dangerous:false`）：
+   `--body '{"robotId":1,"bogus":1}'` → **0**，`meta.warnings` 含 `{kind:"unknown_field", field:"bogus"}`。
+   （不用 addKnowledge：它是危险接口，合法 body 会撞 `--yes` 门禁返回 4，验不到「软警告 + 成功」。）
+6. `merchant.account.login`（**危险接口，须加 `--yes`**）只传 `userName+code`（缺 `shopCode`）→ **0**
+   （one-of 满足、不误拒）；三者全缺 → 2 且消息来自 override 的 `message`（缺必填在校验期拦下，早于门禁）。
 7. `ai.knowledge.editKnowledgeNoSimilars`（危险接口，加 `--yes`）传
    `--body '{"id":1,"robotId":2,"name":"q","answer":"a","validitySwitch":1,"categoryId":1,"ruleType":0,"channelAnswers":[]}'`
    （用源键 `name`，其余必填齐）→ **0**；`meta.warnings` 含 `{kind:"alias_normalized", field:"name"}`，
    且**实际发给 `call()` 的 body 用 `question`**（mock 断言）；`name` 不产生 `unknown_field`。
    同 body 再加 `"question":"q2"`（源键与目标键都在）→ **2**（歧义硬拒）。
 8. `qiyu api call tag.all --body '{"foo":"bar"}'` → 0，**不出** `unknown_field`（`bodyIgnored`）。
-9. `kefu.add`（xml）带 JSON 字符串字面量 body → `meta.warnings` 含 `{kind:"non_json_body"}`、请求照发（mock）。
-10. `export.session`（bodyKind none、0 body 参数）不带 `--body` → **0、无任何 warning**；
-    `ticket.search`（12 个 body 字段全可选）不带 `--body` → **0、无任何 warning**（无必填 → 不报，D10）；
-    `ai.knowledge.addKnowledge` 不带 `--body` → **2**（有必填 → 缺必填硬拒，消息显式点明「未传 `--body`」）。
+9. **非 json body**（用**非危险**的 `icoutcall.phone.getLineList`，`bodyKind:"none"`、`callable`、`dangerous:false`）：
+   带 `--body '"x"'` → **0**、`meta.warnings` 含 `{kind:"non_json_body"}`、请求照发（mock）。
+   （⚠️ 不用 `kefu.add`：它是危险接口，不带 `--yes` 会返回 4，验不到「警告 + 成功」。xml 的透传路径
+   与 none 走的是同一段 `bodyKind !== 'json'` 逻辑。）
+10. `icoutcall.phone.getLineList`（bodyKind none、0 body 参数、非危险）不带 `--body` → **0、无任何 warning**；
+    `ticket.search`（12 个 body 字段全可选、非危险）不带 `--body` → **0、无任何 warning**（无必填 → 不报，D10）；
+    `ai.knowledge.addKnowledge`（危险）不带 `--body` → **2**（有必填 → 缺必填硬拒**先于**门禁，
+    消息显式点明「未传 `--body`」；⚠️ 是 2 不是 4，D5）。
 11. 危险接口 `message.send` 缺必填（body 有必填 `uid/msgType/content`）+ 无 `--yes` → **2**（不是 4，D5）；
     补必填 + 无 `--yes` → **4**（`needs_confirmation`、含确认字段）。
 12. `validate.json`：加一个不存在的 id → B 启动即抛；`relaxRequired` 引用不存在的字段 / 引用非必填字段
@@ -381,16 +389,18 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
     （构造：对某接口临时移除/改坏 `params/<id>.json`，断言 call 与 schema 行为一致）。
 14. `qiyu api schema crm.modifyOrder`（`callable:false`）→ **0**，输出照常（不经 `assertCallable`）。
 15. `--no-validate --strict` 同传 → **2**。
-16. `--body '{"robotId":null,…}'`（必填字段值为 null）：普通模式 → 0 + `type_mismatch`；
-    `--strict` → 2。钉住「存在 ≠ 通过」。
+16. `--body '{"robotId":null}'`（用非危险的 `ai.knowledge.search`，必填 `robotId` 值为 null）：
+    普通模式 → **0** + `type_mismatch`；`--strict` → **2**。钉住「存在 ≠ 通过」。
 17. **红线**：危险接口带 `--no-validate`、body 任意/缺失、无 `--yes` → **4**（`--no-validate` 不削弱门禁）。
-18. `--body '[]'` / `'null'` / `'"x"'` 对「有 body 表」的接口 → **2**（非对象硬拒）；对 0 body 表的接口
-    （如 `export.session`）→ 不因形状报错。
-19. `--no-validate` 下 B 完全静默：3/4/10 的硬拒不再发生（改为真实发请求，用 mock 断言「请求已发出」）；
+18. `--body '[]'` / `'null'` / `'"x"'` 对「有 body 表」的**非危险**接口（`ai.knowledge.search`）→ **2**
+    （非对象硬拒，先于门禁）；对 0 body 表的**非危险**接口（`icoutcall.phone.getLineList`）→ 不因形状报错。
+    ⚠️ 不用 `export.session`（危险接口，形状不报错也会撞门禁返回 4）。
+19. `--no-validate` 下 B 完全静默（用**非危险**接口验，否则会撞门禁返回 4）：
+    对 `ai.knowledge.search` 传 `--body '{}'`（缺 `robotId`）→ 不再硬拒，**改为真实发请求**（mock 断言「已发出」）；
     9 的 `non_json_body`、7 的 `alias_normalized` 等 warnings 一律不再输出；
-    7 的别名改写也不再发生（`name` 原样发送）。
+    7 的别名改写也不再发生（`name` 原样发送，用非危险的等价场景验）。
     **危险接口仍需 `--yes`**（见 17）。
-20. `--strict` 下 5（补全后）→ 2；9 的 `non_json_body`、7 的 `alias_normalized`
+20. `--strict` 下 5（`ai.knowledge.search` 带 `bogus`）→ **2**；9 的 `non_json_body`、7 的 `alias_normalized`
     仍只提示（D7）。
 21. **生成确定性不受影响**：`validate.json` 不进生成输出；`generate.mjs` 重跑后 `specs.json` 与
     154 份 params 字节不变（复用/扩展 `tests/registry/generate.test.ts`）。
@@ -519,6 +529,7 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 | 22 | 新增 §十.0 **类型与函数定义**（`ParamSpec`/`BodyKind`/`ParamFile`/`ResponseShape`/`loadParams`/`validateBody`/`normalizeAliases`/`ValidationOverride` + 加载机制 `import.meta.url`） | 可实现性（A-严重） |
 | 23 | 补 `has_body_schema` 与 `bodyIgnored` 的组合语义（表存在 vs 本次是否比对，不再加字段） | 内部自洽 |
 | 24 | 补退出码 2 与 4 的**语义分工**说明（2=改参数、不需人类；4=停下问人类；硬拒消息不得暗示确认） | 安全与门禁 |
+| 25 | **修正验收判据的接口选择**（v2.2，controller 复查时发现）：验收 5/9/10/16/18 原用**危险接口**（addKnowledge/kefu.add/export.session）却断言退出码 **0** —— 但 D5 让校验先于门禁，合法 body 会撞 `--yes` 门禁返回 **4**，判据自相矛盾。改用**非危险**替身（`ai.knowledge.search` / `icoutcall.phone.getLineList`），并在 6/7 显式标注「危险接口须加 `--yes`」；19/20 的交叉引用同步修正 | controller 复查（非 agent 发现） |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `fileURLToPath(new URL('./params/<id>.json', import.meta.url))`
