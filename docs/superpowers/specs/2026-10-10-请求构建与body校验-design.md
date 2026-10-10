@@ -474,9 +474,18 @@ export interface ValidationOverride {
   aliases?: Record<string, string>
   bodyIgnored?: boolean
 }
-/** 加载并 fail-closed 校验 validate.json（§五 加载规则），失败即抛 kind:'internal' */
+/** 纯函数：fail-closed 校验（§五 加载规则），坏数据抛 kind:'internal'。可注入测试数据 */
+export function validateOverrides(
+  raw: unknown, specs: readonly EndpointSpec[], paramsFor: (id: string) => ParamFile | null,
+): Record<string, ValidationOverride>
+/** 生产入口：静态 import validate.json → validateOverrides（与 loadSpecs 同款两段式） */
 export function loadValidationOverrides(): Record<string, ValidationOverride>
 ```
+
+⚠️ **两段式**（对齐既有 `loadSpecs(raw)` 的写法：纯函数收 `raw`、模块级常量做生产入口）——
+`validateOverrides` 收原始值 + 依赖注入，验收 12 的每条 fail-closed 分支（坏 id、坏字段引用、
+`bodyIgnored`+dangerous、alias 源/目标非法）都能用**合成数据**直接测，不必去改真实文件；
+`loadValidationOverrides()` 只是 `validateOverrides(raw, allEndpoints(), paramsFor)` 的薄包装。
 
 ⚠️ **`validate.json` 用静态 JSON import**（与 `specs.json` 同款）：
 `import raw from './validate.json' with { type: 'json' }`——tsc 会把它拷进 `dist`，
@@ -503,8 +512,8 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 - `tests/core/validate.test.ts`（新）：纯函数 `normalizeAliases`（归一化、改写、源/目标键冲突）
   与 `validateBody` 的硬/软全规则；顶层形状契约（对象/数组/标量/null）；
   one-of；`relaxRequired`；`bodyIgnored`；`--strict` 升级集合逐 kind 钉住；warnings 顺序稳定。
-- `tests/core/registry/validation-overrides.test.ts`（新）：`validate.json` 加载期的全部 fail-closed 分支
-  （坏 id、坏字段引用、dangerous+bodyIgnored、alias 源/目标非法）。
+- `tests/core/registry/validation-overrides.test.ts`（新）：`validateOverrides` 的全部 fail-closed 分支
+  （坏 id、坏字段引用、dangerous+bodyIgnored、alias 源/目标非法）——用**合成数据**直接调纯函数。
 - `tests/commands/api.test.ts`（扩展）：`api schema` 成功/未知 id/`--help`/`--pretty`/位置参数/`callable:false`；
   `call` 硬违规退出码与双通道、`--no-validate`/`--strict` 冲突、`meta.warnings` 两态、
   危险接口次序回归、`--no-validate` 不削弱门禁。
@@ -547,6 +556,7 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 | 24 | 补退出码 2 与 4 的**语义分工**说明（2=改参数、不需人类；4=停下问人类；硬拒消息不得暗示确认） | 安全与门禁 |
 | 25 | **修正验收判据的接口选择**（v2.2，controller 复查时发现）：验收 5/9/10/16/18 原用**危险接口**（addKnowledge/kefu.add/export.session）却断言退出码 **0** —— 但 D5 让校验先于门禁，合法 body 会撞 `--yes` 门禁返回 **4**，判据自相矛盾。改用**非危险**替身（`ai.knowledge.search` / `icoutcall.phone.getLineList`），并在 6/7 显式标注「危险接口须加 `--yes`」；19/20 的交叉引用同步修正 | controller 复查（非 agent 发现） |
 | 26 | **`validate.json` 移出 `overrides/`**（v2.2，controller 复查时发现）：`overrides/` 是 A 的**构建期**目录、不打进 `dist`（实测 `dist/core/registry/` 无 `overrides/`；`copy-params.mjs` 只拷 `params/`）。B 的 `validate.json` 是**运行时**消费，放在那里打包后读不到。改放 `src/core/registry/validate.json`（`specs.json` 旁）、用**同款静态 JSON import** 进 dist；并加验收 24 钉住「打包产物含它」 | controller 复查（非 agent 发现） |
+| 27 | **override 加载改两段式**（v2.2）：`validateOverrides(raw, specs, paramsFor)` 纯函数 + `loadValidationOverrides()` 薄包装（对齐既有 `loadSpecs(raw)`），使验收 12 的 fail-closed 分支可用合成数据测试，无需改真实文件 | controller 复查（可测性） |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `fileURLToPath(new URL('./params/<id>.json', import.meta.url))`
