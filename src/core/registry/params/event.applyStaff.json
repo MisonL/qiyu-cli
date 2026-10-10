@@ -1,0 +1,116 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "uid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "开发者的应用里的用户 ID。"
+    },
+    {
+      "name": "fromPage",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "用户发起咨询客服操作的页面 url，比如商品链接，订单页面等。"
+    },
+    {
+      "name": "fromTitle",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "fromPage 页面的标题。"
+    },
+    {
+      "name": "fromIp",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": ""
+    },
+    {
+      "name": "deviceType",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "用户设备类型信息。"
+    },
+    {
+      "name": "productId",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "产品标识，可以是 Android 应用的包名，iOS 应用的 bundleid 等。"
+    },
+    {
+      "name": "staffType",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "请求分配的客服类型，如果传0，表示机器人，传1表示人工。默认为机器人。"
+    },
+    {
+      "name": "staffId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "只请求该 ID 的客服，客服 ID 可在管理后台查看。"
+    },
+    {
+      "name": "groupId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "只请求该客服分组 ID 内的客服，分组 ID 可在管理后台查看。"
+    },
+    {
+      "name": "robotShuntSwitch",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "申请人工客服之前是否先申请机器人开关，0代表关闭，1代表启用。"
+    },
+    {
+      "name": "level",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "该访客这次会话的vip等级，从0到11"
+    },
+    {
+      "name": "robotId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "有多个机器人时，指定接入某一个机器人。"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

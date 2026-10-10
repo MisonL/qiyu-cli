@@ -1,0 +1,50 @@
+{
+  "params": [
+    {
+      "name": "appid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "企业分配给网易七鱼系统的 appid。"
+    },
+    {
+      "name": "token",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "当前有效的 token。"
+    },
+    {
+      "name": "userid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "用户的唯一性标识。"
+    },
+    {
+      "name": "count",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "请求返回订单的最大数量。与from配合使用实现分页。"
+    },
+    {
+      "name": "from",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "请求返回订单列表的偏移量，与count配合使用实现分页。"
+    },
+    {
+      "name": "type",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "订单类型"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

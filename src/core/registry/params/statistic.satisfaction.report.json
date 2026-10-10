@@ -1,0 +1,68 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "content-type",
+      "in": "header",
+      "required": true,
+      "type": "string",
+      "description": "",
+      "example": "application/json;charset=utf-8"
+    },
+    {
+      "name": "startTime",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "开始时间"
+    },
+    {
+      "name": "endTime",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "结束时间，开始时间和结束时间均不传的情况下，会查询近一个月的数据"
+    },
+    {
+      "name": "model",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "模式1 默认全部， 模式2 客服组列表， 模式3 客服"
+    },
+    {
+      "name": "staffIdList",
+      "in": "body",
+      "required": false,
+      "type": "array",
+      "description": "客服组id"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

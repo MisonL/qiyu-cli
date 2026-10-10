@@ -66,12 +66,9 @@ describe('api list', () => {
 
   it('--all 时包含不可调用的接口，并标明原因', async () => {
     await apiCommand(['list', '--all'])
-    const push = rows().find((r) => r.path === '/')
+    const push = rows().find((r) => r.id === 'receive.message')
     expect(push).toBeDefined()
     expect(push!.callable).toBe(false)
-    // ⚠️ 「标明原因」此前零断言 —— 只钉 `callable === false`。
-    // 真正承载「原因」的是每行的 `note`，把映射里的 `note: e.note` 删掉，
-    // --all 的输出对所有不可调用接口都失去说明文字，而本条测试仍全绿。
     expect(push!.note, '不可调用接口必须带说明为什么').toMatch(/入站|推送/)
   })
 
@@ -112,8 +109,46 @@ describe('api list', () => {
     expect(rows().map((r) => r.id).sort()).toEqual([
       'ai.knowledge.addKnowledge', 'ai.knowledge.deleteKnowledges',
       'ai.knowledge.editChannelAnswer', 'ai.knowledge.editKnowledge',
-      'ai.knowledge.editKnowledgeNoSimilars', 'message.send',
-      'robot.transfer.config', 'settings.wxTemplates', 'ticket.search',
+      'ai.knowledge.editKnowledgeNoSimilars', 'ai.knowledge.getCategoryTree',
+      'ai.knowledge.getDetail', 'ai.knowledge.search', 'ai.statistic.transferHuman',
+      'category.list', 'chat.queue.group.query', 'crm.syncCrmInfo', 'data.overview.ipcc',
+      'data.overview.session', 'evaluation.setting.get', 'event.applyStaff',
+      'event.evaluate', 'event.queryQueueStatus', 'event.quitQueue', 'event.updateUInfo',
+      'export.session', 'export.session.check', 'export.session.one',
+      'export.session.one.message', 'icoutcall.callIntercept.list',
+      'icoutcall.dialogFlow.fuzzySearch', 'icoutcall.dialogFlow.getDialogFlowList',
+      'icoutcall.get.customer', 'icoutcall.get.jobdetail', 'icoutcall.get.jobproperties',
+      'icoutcall.history.seat', 'icoutcall.history.team', 'icoutcall.job.create',
+      'icoutcall.job.importcustomer', 'icoutcall.job.pause', 'icoutcall.job.readdcustomer',
+      'icoutcall.job.start', 'icoutcall.job.terminate', 'icoutcall.phone.getLineList',
+      'ipcc.calltask.add.auto', 'ipcc.calltask.add.byCustom', 'ipcc.calltask.add.byRelation',
+      'ipcc.calltask.add.toGroup', 'ipcc.calltask.add.toStaff', 'ipcc.calltask.get',
+      'ipcc.calltaskdetail.add', 'ipcc.calltaskdetail.delete', 'ipcc.calltaskdetail.get',
+      'ipcc.calltaskdetail.update', 'ipcc.customfield.template.get', 'ipcc.login',
+      'kefu.add', 'kefu.delete', 'kefu.update', 'kefu.v2.query', 'kefuGroup.add',
+      'kefuGroup.delete', 'kefuGroup.update', 'kefuGroup.updateKefus',
+      'merchant.account.login', 'merchant.changePassword', 'merchant.create',
+      'merchant.disable', 'merchant.enable', 'merchant.list', 'merchant.query',
+      'merchant.update', 'message.send', 'message.send.image', 'message.send.voice',
+      'message.sendFile', 'message.uploadFile', 'online.session.category.list',
+      'online.session.customfield.template', 'online.session.customfield.update',
+      'order.upload', 'push.msg.image', 'push.msg.richText', 'push.msg.text',
+      'robot.data.getQuestionsByCategoryName', 'robot.data.knowledge', 'robot.data.kpoint',
+      'robot.data.queryStandardByEffectiveQuestion', 'robot.data.queryStandardQuestionList',
+      'robot.evaluation.comment', 'robot.evaluation.setting', 'robot.session.assist',
+      'robot.session.chat', 'robot.session.close', 'robot.session.commonQuestions',
+      'robot.session.create', 'robot.session.evaluation', 'robot.session.msgAssociate',
+      'robot.session.msgEvaluation', 'robot.session.msgPredict', 'robot.session.transfer',
+      'robot.session.uploadFile', 'robot.statistic.summary', 'robot.transfer.config',
+      'session.user.profile', 'settings.wxTemplates', 'smstask.create', 'smstask.status',
+      'staff.group.list.new', 'staff.group.members.new', 'staff.list.new', 'staff.login',
+      'statistic.overview', 'statistic.performance', 'statistic.salaryDetail',
+      'statistic.satisfaction.report', 'statistic.staffAttendance', 'statistic.staffquality',
+      'statistic.staffworklod', 'tag.all', 'tag.batchUpdate', 'tag.update', 'ticket.apply',
+      'ticket.batch.modify', 'ticket.create', 'ticket.filter.count', 'ticket.filter.list',
+      'ticket.finish', 'ticket.followers.update', 'ticket.list', 'ticket.log', 'ticket.modify',
+      'ticket.new.detail', 'ticket.reminder', 'ticket.reopen', 'ticket.reply', 'ticket.search',
+      'ticket.template.fields', 'ticket.template.list', 'ticket.transfer', 'track.event.set',
     ])
     for (const r of rows()) {
       expect(r.title, `${r.id} 的 title 必须非空`).not.toBe('')
@@ -160,7 +195,7 @@ describe('api list', () => {
     // （此刻注册表其实仍缺那 4 条）。测试与实现必须引用同一阈值。
     await apiCommand(['list'])
     const meta = JSON.parse(out).meta
-    expect(meta.registry_complete).toBe(false)
+    expect(meta.registry_complete).toBe(true)
     // ⚠️ 断言用**推导式**写，而不是 `toBe(false)` 字面量 —— 这表达的是"该字段的
     // 契约是 `条数 >= 154`"，读者一眼看到阈值，数据补齐后这行会**自动**要求 true。
     //
@@ -180,17 +215,30 @@ describe('api list', () => {
   it('每条记录带 verified，且 meta 解释了它的含义', async () => {
     // ⚠️ `verified` 若只输出不解释，就是一个"声明了但没人读"的字段：
     // Agent 会看到 true/false 却不知道差别，于是把"注册了"当成"验证过了"。
-    // 本计划 11 条里只有 2 条是 callable && !dangerous && verified。
+    // 当前 154 条注册表中，callable && !dangerous && verified 的接口共有 44 条。
     await apiCommand(['list'])
     expect(rows().length).toBeGreaterThan(0)
-    // ⚠️ 不能只断言 `typeof r.verified === 'boolean'`（2026-10-07 改）—— 同样恒真：
-    // `loadSpecs` 保证该键是布尔。改成钉**默认视图里实测过的正好是这两条**：
-    // 若生成脚本把某条的 verified 从 true 翻成 false（或反之），这里会红，
-    // 而不是像恒真断言那样无声通过。
+    // 默认视图是 callable && outbound，共 136 条，其中 44 条已实测。
     expect(rows().filter((r) => r.verified).map((r) => r.id).sort())
-      .toEqual(['robot.transfer.config', 'ticket.search'])
-    expect(rows().filter((r) => !r.verified).length, '默认视图 9 条里只有 2 条实测过')
-      .toBe(7)
+      .toEqual([
+        'ai.knowledge.getCategoryTree', 'ai.knowledge.getDetail', 'ai.knowledge.search',
+        'ai.statistic.transferHuman', 'category.list', 'data.overview.ipcc',
+        'data.overview.session', 'evaluation.setting.get', 'export.session',
+        'export.session.check', 'export.session.one', 'export.session.one.message',
+        'icoutcall.history.seat', 'icoutcall.history.team', 'kefu.v2.query',
+        'online.session.category.list', 'online.session.customfield.template',
+        'robot.data.getQuestionsByCategoryName', 'robot.data.knowledge', 'robot.data.kpoint',
+        'robot.data.queryStandardByEffectiveQuestion', 'robot.data.queryStandardQuestionList',
+        'robot.evaluation.setting', 'robot.session.msgAssociate', 'robot.statistic.summary',
+        'robot.transfer.config', 'session.user.profile', 'smstask.status',
+        'staff.group.list.new', 'staff.group.members.new', 'staff.list.new',
+        'statistic.overview', 'statistic.performance', 'statistic.salaryDetail',
+        'statistic.satisfaction.report', 'statistic.staffAttendance', 'statistic.staffquality',
+        'statistic.staffworklod', 'tag.all', 'ticket.filter.count', 'ticket.filter.list',
+        'ticket.search', 'ticket.template.fields', 'ticket.template.list',
+      ])
+    expect(rows().filter((r) => !r.verified).length, '默认视图 136 条里有 44 条实测过')
+      .toBe(92)
     const notes = JSON.parse(out).meta.field_notes
     expect(notes.verified).toMatch(/实测/)
     // ⚠️ 全局说明是**索引**不是全文（2026-10-07 加）：true 的实测范围三条各不相同

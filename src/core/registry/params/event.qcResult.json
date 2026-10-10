@@ -1,0 +1,166 @@
+{
+  "params": [
+    {
+      "name": "QIYU_MSG_URL",
+      "in": "path",
+      "required": true,
+      "type": "string",
+      "description": "",
+      "example": "{{QIYU_MSG_URL}}"
+    },
+    {
+      "name": "eventType",
+      "in": "query",
+      "required": false,
+      "type": "string",
+      "description": "",
+      "example": "DATA_SESSION_QUALITY"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "category",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "分类"
+    },
+    {
+      "name": "evaluationType",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "评价模型"
+    },
+    {
+      "name": "evaluation",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "evaluationType:(evaluation)=>  2:(100满意1不满意);  3(100满意50一般1不满意); 5(100非常满意75满意50一般25不满意1非常不满意) 否则未评价"
+    },
+    {
+      "name": "evaluationRemark",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "评价内容"
+    },
+    {
+      "name": "forbiddenItems",
+      "in": "body",
+      "required": true,
+      "type": "array",
+      "description": "禁忌项"
+    },
+    {
+      "name": "foreignId",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "由企业提供"
+    },
+    {
+      "name": "fromGroup",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "会话来自分流组名称"
+    },
+    {
+      "name": "id",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "会话id"
+    },
+    {
+      "name": "inspectTime",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "质检时间"
+    },
+    {
+      "name": "inspector",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "质检人"
+    },
+    {
+      "name": "qualityComment",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "质检备注"
+    },
+    {
+      "name": "score",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "质检分数"
+    },
+    {
+      "name": "scoreItems",
+      "in": "body",
+      "required": true,
+      "type": "array",
+      "description": "指标项及评分"
+    },
+    {
+      "name": "staffId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "被质检的客服"
+    },
+    {
+      "name": "staffName",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": ""
+    },
+    {
+      "name": "startTime",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "会话开始时间"
+    },
+    {
+      "name": "type",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "1：在线；2：呼叫"
+    },
+    {
+      "name": "userId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "访客id"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

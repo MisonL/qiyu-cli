@@ -1,0 +1,81 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "uid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "访客在调用方系统里的标志，用于唯一确定用户身份"
+    },
+    {
+      "name": "productId",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "当前咨询应用唯一标识，可以是 Android 应用的包名，iOS 应用的 bundleid，微信公众号appid等。调用方系统如果有多个应用需要接入七鱼时，对不同应用需保证该字段值的唯一性。未指定时取默认值“qyopen”"
+    },
+    {
+      "name": "fromType",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "当前访客咨询来源渠道。未指定时取默认值“WEB”"
+    },
+    {
+      "name": "robotId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "机器人id，存在多个机器人时指定当前接入的机器人，未指定时取设置的默认机器人"
+    },
+    {
+      "name": "welcomeTemplateId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "指定七鱼机器人欢迎语模版id，如果指定了模版且模版生效，则取当前模版配置的欢迎语，否则按“fromType”取相应渠道默认模版"
+    },
+    {
+      "name": "questionTemplateId",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "指定七鱼机器人常见问题模版id，如果指定了模版且模版生效，则取当前模版配置的常见问题数据；否则按“fromType-productId-fromPage”来匹配相应模版；"
+    },
+    {
+      "name": "fromPage",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "当前访客咨询来源页面"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

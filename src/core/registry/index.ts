@@ -2,6 +2,8 @@ import raw from './specs.json' with { type: 'json' }
 
 export interface EndpointSpec {
   id: string
+  /** 来源 Apifox 页面编号（如 `api-10845443`）。4 个文档外接口没有它。 */
+  pageId?: string
   title: string
   method: 'POST' | 'GET'
   /** null 表示文档页没有可用的路径 —— 该接口不可调用 */
@@ -48,11 +50,19 @@ export interface EndpointSpec {
 export function loadSpecs(raw: unknown): EndpointSpec[] {
   if (!Array.isArray(raw)) throw new Error('specs.json 顶层必须是数组')
   const seen = new Set<string>()
+  const seenPage = new Set<string>()
   return raw.map((e, i) => {
     const o = e as Record<string, unknown>
     if (typeof o.id !== 'string' || !o.id) throw new Error(`specs.json[${i}] 缺少 id`)
     if (seen.has(o.id)) throw new Error(`specs.json 存在重复 id：${o.id}`)
     seen.add(o.id)
+    if (o.pageId !== undefined) {
+      if (typeof o.pageId !== 'string' || !/^api-\d+$/.test(o.pageId)) {
+        throw new Error(`specs.json[${o.id}] 的 pageId 非法：${o.pageId}`)
+      }
+      if (seenPage.has(o.pageId)) throw new Error(`specs.json 存在重复 pageId：${o.pageId}`)
+      seenPage.add(o.pageId)
+    }
     if (typeof o.dangerous !== 'boolean') {
       throw new Error(
         `specs.json[${o.id}] 缺少 dangerous 字段。` +

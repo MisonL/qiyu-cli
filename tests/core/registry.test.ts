@@ -138,7 +138,24 @@ describe('注册表', () => {
     // 反向：verified:true 的三条都得进注册表（否则"唯一"是因为别的都丢了，
     // 而那本身是更严重的缺陷）—— 钉住这个集合，"唯一"才有意义。
     expect(allEndpoints().filter((e) => e.verified).map((e) => e.id).sort())
-      .toEqual(['receive.message', 'robot.transfer.config', 'ticket.search'])
+      .toEqual([
+        'ai.knowledge.getCategoryTree', 'ai.knowledge.getDetail', 'ai.knowledge.search',
+        'ai.statistic.transferHuman', 'category.list', 'data.overview.ipcc',
+        'data.overview.session', 'evaluation.setting.get', 'export.session',
+        'export.session.check', 'export.session.one', 'export.session.one.message',
+        'icoutcall.history.seat', 'icoutcall.history.team', 'kefu.v2.query',
+        'online.session.category.list', 'online.session.customfield.template',
+        'receive.message', 'robot.data.getQuestionsByCategoryName', 'robot.data.knowledge',
+        'robot.data.kpoint', 'robot.data.queryStandardByEffectiveQuestion',
+        'robot.data.queryStandardQuestionList', 'robot.evaluation.setting',
+        'robot.session.msgAssociate', 'robot.statistic.summary', 'robot.transfer.config',
+        'session.user.profile', 'smstask.status', 'staff.group.list.new',
+        'staff.group.members.new', 'staff.list.new', 'statistic.overview',
+        'statistic.performance', 'statistic.salaryDetail', 'statistic.satisfaction.report',
+        'statistic.staffAttendance', 'statistic.staffquality', 'statistic.staffworklod',
+        'tag.all', 'ticket.filter.count', 'ticket.filter.list', 'ticket.search',
+        'ticket.template.fields', 'ticket.template.list',
+      ])
   })
 
   it('receive.message 的 note 不许把「已实测」扩大化 —— 真正测过的只有「不可主动调用」', () => {
@@ -171,8 +188,74 @@ describe('注册表', () => {
       'ai.knowledge.editChannelAnswer',
       'ai.knowledge.editKnowledge',
       'ai.knowledge.editKnowledgeNoSimilars',
+      'crm.syncCrmInfo',
+      'event.applyStaff',
+      'event.evaluate',
+      'event.quitQueue',
+      'event.updateUInfo',
+      'export.session',
+      'icoutcall.job.create',
+      'icoutcall.job.importcustomer',
+      'icoutcall.job.pause',
+      'icoutcall.job.readdcustomer',
+      'icoutcall.job.start',
+      'icoutcall.job.terminate',
+      'ipcc.calltask.add.auto',
+      'ipcc.calltask.add.byCustom',
+      'ipcc.calltask.add.byRelation',
+      'ipcc.calltask.add.toGroup',
+      'ipcc.calltask.add.toStaff',
+      'ipcc.calltaskdetail.add',
+      'ipcc.calltaskdetail.delete',
+      'ipcc.calltaskdetail.update',
+      'ipcc.login',
+      'kefu.add',
+      'kefu.delete',
+      'kefu.update',
+      'kefuGroup.add',
+      'kefuGroup.delete',
+      'kefuGroup.update',
+      'kefuGroup.updateKefus',
+      'merchant.account.login',
+      'merchant.changePassword',
+      'merchant.create',
+      'merchant.disable',
+      'merchant.enable',
+      'merchant.update',
       'message.send',
+      'message.send.image',
+      'message.send.voice',
+      'message.sendFile',
+      'message.uploadFile',
+      'online.session.customfield.update',
+      'order.upload',
+      'push.msg.image',
+      'push.msg.richText',
+      'push.msg.text',
+      'robot.evaluation.comment',
+      'robot.session.assist',
+      'robot.session.close',
+      'robot.session.create',
+      'robot.session.evaluation',
+      'robot.session.msgEvaluation',
+      'robot.session.transfer',
+      'robot.session.uploadFile',
       'settings.wxTemplates',
+      'smstask.create',
+      'staff.login',
+      'tag.batchUpdate',
+      'tag.update',
+      'ticket.apply',
+      'ticket.batch.modify',
+      'ticket.create',
+      'ticket.finish',
+      'ticket.followers.update',
+      'ticket.modify',
+      'ticket.reminder',
+      'ticket.reopen',
+      'ticket.reply',
+      'ticket.transfer',
+      'track.event.set',
     ])
   })
 
@@ -197,29 +280,21 @@ describe('注册表', () => {
     }
   })
 
-  it('限频表与注册表的交集被如实记录（当前 5/33，仍是已知缺口）', () => {
-    // ⚠️ 这条**如实记录**一个交付时的真实状态，而不是断言"应该没问题"。
-    //
-    // 本计划补进了 5 个知识库写接口，它们的限频行与注册表 id 对得上 ——
-    // 所以交集不再是空的（此前 0/27）。但注册表 11 条里仍有 6 条
-    // （message.send、ticket.search、settings.wxTemplates、receive.message、
-    // robot.transfer.config、wecom.robot.switch）在限频表里没有对应行，
-    // 而限频表里另有 28 个 id 在注册表里找不到（33 - 5）—— 那部分接口要等生成脚本。
-    //
-    // 为什么留着它：它是一条**回归哨兵**。等生成脚本补齐 specs.json 时，
-    // 若忘了同步限频表的 id，这条会从"5"变成别的数字 —— 有人必须显式
-    // 改这个断言，也就必须看见这件事。断言的是"缺口被记录过"，不是"缺口不存在"。
+  it('限频表键覆盖注册表（当前 33/33，已完整对齐）', () => {
+    const ids = new Set(allEndpoints().map((e) => e.id))
+    const orphans = Object.keys(RATE_LIMITS).filter((id) => !ids.has(id))
+    expect(orphans, 'RATE_LIMITS 中的每个键都必须在注册表中存在').toEqual([])
+    expect(Object.keys(RATE_LIMITS).length, '限频表键总数必须为 33').toBe(33)
+  })
+
+  it('限频表非空档位（当前 27/33；其余 6 个键显式不限频）', () => {
     const inRegistry = allEndpoints().filter((e) => limitFor(e.id) !== null).length
-    const total = allEndpoints().length
-    expect(inRegistry, `注册表 ${total} 条中命中的限频行数变了：${inRegistry}。` +
-      '若你正在补齐 specs.json，请同时核对限频表 id，并更新这条断言与「已知缺口」。')
-      .toBe(5)
-    // ⚠️ 分母也要钉。此前标题写「5/33」但只断言分子，向 RATE_LIMITS 增删任何一行，
-    // 标题立刻失真（变成 5/34）而测试不红 —— 与本计划自己立的「标题里的数字必须
-    // 与断言一致」规矩冲突。`Object.keys` 而非 `Object.entries` 过滤 null：
-    // 这里要的是**表的行数**，与每行是否有值无关。
-    expect(Object.keys(RATE_LIMITS).length, '标题里的分母 33 必须与限频表实际行数一致')
-      .toBe(33)
+    const nullTiers = ['export.session.check', 'chat.queue.group.query', 'evaluation.setting.get',
+      'event.queryQueueStatus', 'smstask.status', 'online.session.customfield.template']
+    expect(inRegistry, '非空限频档位数量必须为 27（其余 6 个键是显式 null）').toBe(27)
+    expect(nullTiers.filter((id) => RATE_LIMITS[id] !== null),
+      '这 6 个键必须是限频表中的显式 null').toEqual([])
+    expect(Object.keys(RATE_LIMITS).length, '限频表分母必须为 33').toBe(33)
   })
 
   it('知识库写接口既在注册表里、也有限频行 —— 两者缺一都会静默降级', () => {
@@ -291,6 +366,17 @@ describe('注册表', () => {
     expect(byId('ai.knowledge.editKnowledge').note ?? '',
       '必须指出读不到 → 只能从 getDetail 取或显式传').toMatch(/getDetail|显式传/)
   })
+
+  it('merchant.account.login 的 note 记录上游 required 自相矛盾 —— 参数表会误判', () => {
+    // 上游页面（api-10845577）的 description 写「code和shopCode必填其一」，
+    // 而同一页 schema 的 required 把 userName/code/shopCode 三者都标了必填。
+    // 参数表（params/merchant.account.login.json）忠实按 schema 生成 —— 上游快照
+    // 不得篡改，所以矛盾只能经 note 这一个渠道告诉调用方，否则"只传其一"会被
+    // 误判为不完整请求。
+    const note = byId('merchant.account.login').note ?? ''
+    expect(note, 'note 必须点名 code/shopCode 必填其一与 required 的冲突').toMatch(/必填其一/)
+    expect(note, 'note 必须指向会误判的那份参数表').toMatch(/merchant\.account\.login\.json/)
+  })
 })
 
 describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地方）', () => {
@@ -312,6 +398,23 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
     expect(() => loadSpecs([base, base])).toThrow(/重复 id/)
   })
 
+  it('非法 pageId 时抛错', () => {
+    expect(() => loadSpecs([{ ...base, pageId: 'bad-page' }])).toThrow(/pageId 非法/)
+  })
+
+  it('pageId 末尾带换行也被拒 —— JS 的 $ 不匹配末尾换行之前', () => {
+    // ⚠️ 钉住一个**外部审查误报过的**行为：有人以为 `/^api-\d+$/` 会放行 `"api-1\n"`
+    // （那是 Python/Perl 里 `$` 的语义）。JS 中无 `m` 标志时 `$` 只匹配输入末尾，
+    // 不匹配末尾换行之前，故这里本就抛错。写这条测试是为了让"误报"不能变成
+    // "有人照着改成正则" —— 改成 `m` 标志反而会真的放行。
+    expect(/^api-\d+$/.test('api-1\n'), '前提：JS 的 $ 不放行末尾换行').toBe(false)
+    expect(() => loadSpecs([{ ...base, pageId: 'api-1\n' }])).toThrow(/pageId 非法/)
+  })
+
+  it('重复 pageId 时抛错', () => {
+    expect(() => loadSpecs([{ ...base, id: 'a', pageId: 'api-1' }, { ...base, id: 'b', pageId: 'api-1' }]))
+      .toThrow(/重复 pageId/)
+  })
   it('缺少 dangerous 时抛错 —— 这一条就是门禁 fail-open 的唯一防线', () => {
     const { dangerous: _drop, ...noDangerous } = base
     expect(() => loadSpecs([noDangerous])).toThrow(/dangerous/)
@@ -396,10 +499,7 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
     // 点名的头号静默失败：形状 C 的接口在 `envelope: null` 下，限流/超限那种
     // `code:200` + 纯文本 message 会被报成"成功但无数据"。
     expect(byId('ticket.search').envelope, '形状 C 的 code:200 可能是错误，必须如实标注').toBe('C')
-    // 反向哨兵：msgAssociate 尚未进注册表（154 条生成脚本的活儿）。等它进来时，
-    // 这一条会失败，提醒实现者去核对它必须是 'D-nf' 并把断言的注释补上。
-    expect(allEndpoints().some((e) => e.id === 'robot.session.msgAssociate'),
-      'msgAssociate 已进注册表 —— 请为它加一条 `expect(...envelope).toBe(\'D-nf\')` 断言').toBe(false)
+    expect(byId('robot.session.msgAssociate').envelope).toBe('D-nf')
   })
 
   it('缺少 title 时抛错 —— 否则门禁消息里会输出 `（undefined）`', () => {

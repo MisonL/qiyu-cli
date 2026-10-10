@@ -1,0 +1,109 @@
+{
+  "params": [
+    {
+      "name": "QIYU_MSG_URL",
+      "in": "path",
+      "required": true,
+      "type": "string",
+      "description": ""
+    },
+    {
+      "name": "eventType",
+      "in": "query",
+      "required": false,
+      "type": "string",
+      "description": "",
+      "example": "SESSION_START"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "code",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "错误码。200表示分配到客服，14005：没有客服在线，14006：需要排队，14010：没有客服在线，且留言功能已关闭。"
+    },
+    {
+      "name": "staffId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "客服 ID。"
+    },
+    {
+      "name": "message",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "如果分配到客服，此字段是客服的欢迎语，如果没有分配到客服，则是错误提示信息。"
+    },
+    {
+      "name": "sessionId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "会话 ID，后续对会话评价时有用。仅返回分配到客服时该参数有效。"
+    },
+    {
+      "name": "staffName",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "客服名字。"
+    },
+    {
+      "name": "staffType",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "客服类型，0 表示机器人，1 表示人工会话。"
+    },
+    {
+      "name": "staffIcon",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "客服头像的 url。"
+    },
+    {
+      "name": "uid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": ""
+    },
+    {
+      "name": "evaluationModel",
+      "in": "body",
+      "required": true,
+      "type": "object",
+      "description": "满意度评价模型，在申请到人工客服时有值，后面根据该模型 value 值进行客服评价。"
+    },
+    {
+      "name": "transferFrom",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "如果会话是被转接过来的，会有该字段，值为发起转接的那次会话的ID。"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

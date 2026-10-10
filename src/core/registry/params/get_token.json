@@ -1,0 +1,22 @@
+{
+  "params": [
+    {
+      "name": "appid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "企业分配给网易七鱼系统的 appid"
+    },
+    {
+      "name": "appsecret",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "企业分配给网易七鱼系统的 appsecret"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}
