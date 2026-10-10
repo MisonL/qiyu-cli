@@ -90,6 +90,10 @@
   `body_kind === 'json' && body 参数数 > 0`（与 §四 `unknown_field` 的触发条件同源：没有表就不谈「未知」）。
   ⚠️ **命名刻意不叫 `body_validated`**（v1 的名字读起来像「本次 body 已通过校验」，实为「有表可比对」——
   审查判为易误判，见 §十一）。它**不代表**本次请求校验通过；本次结果看 `api call` 的 `meta.warnings`。
+  ⚠️ **与 `bodyIgnored` 的组合**：若某接口在 override 里标了 `bodyIgnored`（§五）但确有 body 参数，
+  `has_body_schema` 仍为 `true`（表存在），而 `api call` **不会**执行比对——`has_body_schema` 只答
+  「**有没有表**」，不答「**本次会不会比**」；后者由 `--no-validate` 与 override 共同决定。B **不**为此
+  再加一个「本次是否校验」的字段（那会是又一个「声明了没人读」的装饰键）。
 - `response_shape` —— **原样透传** params 文件里的 `{"kind": "..."}` 对象。
   ⚠️ 设计稿 §5.2 写的是 `responseShape: string`（旧设计）；A 的现行接口缝（`params/*.json`）是结构化对象，
   **以 A 的产物为准**，B 不改写成字符串（见 §八.2）。
@@ -290,6 +294,12 @@ return ok(r.payload, {
 **绝不**影响 `assertConfirmed`——危险接口带 `--no-validate`、body 任意或缺失、**无 `--yes`** 时
 **仍返回 4**。见 §九 验收 17。
 
+⚠️ **退出码 2 与 4 的语义分工必须让 Agent 分得清**（安全审查建议）：**2 = 参数写错了，改参数重来，
+不需要人类介入**；**4 = 不可逆操作，必须停下向人类确认**。D5（校验先于门禁）会让一个"危险接口 +
+缺必填 + 无 `--yes`"的调用先得到 2——这是**有意的**：Agent 该先修参数，修好后**必然**撞上 4 才去问人。
+B 的硬拒消息里**不得**出现任何"需要人类确认"的暗示（那会把 2 与 4 混淆）；`API_USAGE` 的退出码说明
+沿用既有的「2 用法错误 · 4 需要 --yes」，不新增歧义。
+
 ## 七、`category` 处置（路线图 §八.6 的 B 侧答案）
 
 **B 不动它**——既不删数据、也不补类型/输出。`EndpointSpec` 本就没声明 category、`api list`
@@ -314,6 +324,30 @@ return ok(r.payload, {
    「json 但无表」时声称 validated 的谎言。
 7. **同名字段跨 `in`**（理论边界）：实测 0 个，但加载期仍应加护栏——同一接口里同一 `name`
    不得同时出现在 `in: "body"` 与 `in: "query"`（否则 `(name,in)` 身份歧义）。属防御性检查。
+
+## 八之二、联动文案修正（契约诚实性审查：B 合入后不改这些文字就是「说了假话」）
+
+B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起改（**这是 B 的交付内容，不是可选项**）：
+
+1. **`README.md:149`** —— 现值：「请求参数校验：`api call` 的 `--body` 不做字段校验，也**无法**校验」。
+   B 之后应改为（逐字建议）：
+   > 请求参数校验：`api call` 的 `--body` 会与注册表参数表比对——**缺必填字段会拒绝**
+   > （退出码 2），未知字段/类型不符会以 `meta.warnings` 提示（`--strict` 可升级为拒绝，
+   > `--no-validate` 可关闭）。参数表见 `qiyu api schema <id>`。
+   > ⚠️ 校验只依据文档生成的参数表，**不构成对服务端行为的保证**；**响应体不做校验**。
+2. **`src/commands/api.ts` 的 `field_notes.request_schema`**（`api list` 的 meta）——
+   现值：「本 meta **不提供**接口的请求参数表（`params`）与响应形状（`responseShape`）……本 CLI
+   无法校验其字段是否正确」。
+   B 之后应改为（逐字建议）：
+   > 本 meta 不含参数表（体积考虑）；用 `qiyu api schema <id>` 查该接口的 `params`/`responseShape`。
+   > `api call --body` 会做**有限**校验（缺必填拒绝、未知字段/类型提示）——见 `api schema` 的
+   > `meta.field_notes`。⚠️ **响应体不做校验**，`responseShape` 仅供参照。
+
+   ⚠️ **不得只机械删旧句**：旧句里「无法校验」是当时的事实，删掉后必须补上**新的事实**（校验了什么、
+   没校验什么），否则会从「说了假话」变成「什么都没说」，而 Agent 无从判断边界。特别是
+   **响应体仍不校验**这一点必须保留——否则 Agent 会以为 `responseShape` 被用上了。
+3. 路线图 §八.7（「params 无运行时消费方」）在 B 合入后应标记为**已关闭**。
+
 
 ## 九、验收判据（spec 级，供实施计划展开为测试）
 
@@ -361,8 +395,82 @@ return ok(r.payload, {
 21. **生成确定性不受影响**：`validate.json` 不进生成输出；`generate.mjs` 重跑后 `specs.json` 与
     154 份 params 字节不变（复用/扩展 `tests/registry/generate.test.ts`）。
 22. `npm test` 全绿、`npm run typecheck` 0 错误；既有计数型断言（154 等）同步核对。
+23. **联动文案**（§八之二）：`README.md` 与 `api list` 的 `field_notes.request_schema` 已改为
+   与实现一致的新文案；断言二者**不再**含「不做字段校验/无法校验/不提供 params」等旧表述，
+    且**保留**「响应体不做校验」的说明。
 
 ## 十、测试计划（文件落点，v2 新增）
+
+### 10.0 新增类型与函数（可实现性审查 A-严重：v1 未定义，实施者无从下手）
+
+B 必须新建以下符号（现有 `src/core/registry/index.ts` 只有 `EndpointSpec`，无 params 相关类型）：
+
+```ts
+// src/core/registry/params.ts
+export type BodyKind = 'json' | 'none' | 'form' | 'xml' | 'multipart' | 'text'
+export interface ParamSpec {
+  name: string
+  in: 'query' | 'body' | 'path' | 'header'
+  required: boolean
+  type?: string          // Apifox 展示类型：string|integer|number|boolean|array|object（实测穷尽）
+  description?: string
+  example?: string
+}
+export interface ResponseShape { kind: string }
+export interface ParamFile {
+  params: ParamSpec[]
+  bodyKind: BodyKind
+  responseShape: ResponseShape
+}
+/** 惰性读 + 缓存；缺文件/畸形 JSON/结构非法 → 抛 kind:'internal'（§四 错误分类） */
+export function loadParams(id: string): ParamFile
+/** 运行时校验 params 文件结构（in/required/type/bodyKind 枚举；同名跨 in 护栏），失败即抛 */
+export function validateParamsFile(id: string, raw: unknown): ParamFile
+```
+
+```ts
+// src/core/validate.ts
+export interface Violation { kind: string; field?: string; message: string }
+export interface ValidateResult { hard: Violation[]; soft: Violation[] }
+/** 归一化别名（D8）：返回改写后的 body 与 alias_normalized 警告；源/目标键冲突 → 抛（硬） */
+export function normalizeAliases(
+  spec: EndpointSpec, file: ParamFile | null, body: unknown,
+  ov: ValidationOverride | undefined,
+): { body: unknown; warnings: Violation[] }
+/** 纯函数：顶层形状契约 + 硬/软规则；不碰 I/O */
+export function validateBody(
+  spec: EndpointSpec, file: ParamFile | null, body: unknown,
+  ov: ValidationOverride | undefined, mode: { strict: boolean },
+): ValidateResult
+```
+
+```ts
+// src/core/registry/validation-overrides.ts（或并入 params.ts）
+export interface ValidationOverride {
+  note?: string
+  relaxRequired?: string[]
+  oneOf?: { anyOf: string[]; message: string }[]
+  aliases?: Record<string, string>
+  bodyIgnored?: boolean
+}
+/** 加载并 fail-closed 校验 overrides/validate.json（§五 加载规则），失败即抛 kind:'internal' */
+export function loadValidationOverrides(): Record<string, ValidationOverride>
+```
+
+**加载机制**（可实现性审查 A-严重）：`params.ts` 以**自身模块位置**为根定位文件，源码与 `dist` 同构
+（`copy-params.mjs` 已把 `params/` 拷到 `dist/core/registry/params/`）：
+
+```ts
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+const url = new URL(`./params/${id}.json`, import.meta.url)
+const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
+```
+
+**不**用动态 `import()`（ESM 下需 import attributes、缓存语义复杂），**不**用相对 CWD 的路径
+（CLI 从任意目录启动会找不到文件）。`validate.json` 在模块初始化时加载并校验（fail-closed）。
+
+### 10.1 测试文件落点
 
 - `tests/core/registry/params.test.ts`（新）：`loadParams` 惰性加载 + 缓存；缺文件/畸形 JSON →
   `kind:'internal'`；结构校验（`in`/`required`/`type`/`bodyKind` 枚举）；同名跨 `in` 护栏。
@@ -407,10 +515,14 @@ return ok(r.payload, {
 | 18 | 明确 `--strict` 的安全边界（「严格」≠「正确严格」，可能误伤） | 契约诚实性 |
 | 19 | 新增 §五 `note` 腐化缓解（强制引用存在 + 证据来源要求） | 契约诚实性 |
 | 20 | 新增 §八.7 同名字段跨 `in` 的加载期护栏（实测 0 个，防御性） | 内部自洽 |
+| 21 | 新增 §八之二 **联动文案修正**（README:149 + `field_notes.request_schema` 的逐字改后文案），并列为验收 23；强调不得只机械删旧句、必须保留「响应体不校验」 | 契约诚实性 + 上游一致性 |
+| 22 | 新增 §十.0 **类型与函数定义**（`ParamSpec`/`BodyKind`/`ParamFile`/`ResponseShape`/`loadParams`/`validateBody`/`normalizeAliases`/`ValidationOverride` + 加载机制 `import.meta.url`） | 可实现性（A-严重） |
+| 23 | 补 `has_body_schema` 与 `bodyIgnored` 的组合语义（表存在 vs 本次是否比对，不再加字段） | 内部自洽 |
+| 24 | 补退出码 2 与 4 的**语义分工**说明（2=改参数、不需人类；4=停下问人类；硬拒消息不得暗示确认） | 安全与门禁 |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `fileURLToPath(new URL('./params/<id>.json', import.meta.url))`
-+ `readFileSync`（源码与 dist 同构，见 §十 params.test.ts）。
++ `readFileSync`（源码与 dist 同构，见 §十.0 与 `params.test.ts`）。
 
 ## 十二、开放问题（留给实施计划/后续）
 
