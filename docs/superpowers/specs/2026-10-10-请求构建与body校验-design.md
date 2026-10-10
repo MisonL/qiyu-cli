@@ -33,7 +33,7 @@
 |---|---|
 | D1 | **分级校验（缺必填硬拒，其余提示）**：缺必填 → 退出码 2 不发请求；未知字段/类型不符 → 只提示 |
 | D2 | **暴露形态 = 新子命令 `qiyu api schema <id>`**（不并入 `api list`） |
-| D3 | **B 带一份校验 override 表**（`src/core/registry/overrides/validate.json`），登记「文档必填不可靠」的接口：降级 required、定义二选一组（one-of）。B 读 params 时应用它 |
+| D3 | **B 带一份校验 override 表**（`src/core/registry/validate.json`，与 `specs.json` 同目录），登记「文档必填不可靠」的接口：降级 required、定义二选一组（one-of）。B 读 params 时应用它 |
 | D4 | **只对 `bodyKind: 'json'` 校验**；其余（none/xml/multipart/text/form）`--body` 原样透传不校验，`api schema` 标注 bodyKind、`api call` 提示「该接口 body 非 JSON」。⚠️ **非 json 的 callable 接口实测共 13 个**（none 9 + xml 1 + multipart 2 + text 1；2 个 form 均 `callable: false`）——见 §十一 修订 |
 | D5 | **校验排在危险接口门禁（`assertConfirmed`）之前**——与既有契约「参数错误不能被门禁掩盖」一致：硬校验违规 → 2；只有 body 校验通过才轮到 `--yes` 的 4 |
 | D6 | **软警告 = 结构化数组** `meta.warnings = [{kind, field?, message}]`，`kind ∈ unknown_field \| type_mismatch \| non_json_body \| alias_normalized` |
@@ -216,8 +216,14 @@ return ok(r.payload, {
 
 ## 五、校验 override 表（D3 / D8）
 
-**路径**：`src/core/registry/overrides/validate.json`（**归 B 所有**——A 的 `ids/paths/attrs.json`
-归 A，生成管线 `generate.mjs` 不读本文件；B 是唯一消费方，生成管线重跑不会碰它）。
+**路径**：`src/core/registry/validate.json`（与 `specs.json` 同目录、同款加载）。
+
+⚠️ **为什么不在 `overrides/` 下**（v2.2 修正，见 §十一 第 26 条）：`src/core/registry/overrides/`
+（A 的 `ids/paths/attrs.json`）是**构建期**目录——生成管线读它、**不打进 dist**（实测
+`dist/core/registry/` 只有 `index.js`/`params/`/`specs.json`，无 `overrides/`；`copy-params.mjs`
+只拷 `params/`）。B 的 `validate.json` 是**运行时**消费，若放进 `overrides/` 则打包后 CLI
+根本读不到它。放在 `specs.json` 旁边、用**同款静态 JSON import**，则由 tsc 自动拷进 `dist`
+（`specs.json` 正是这么进 dist 的），无需改 `copy-params.mjs`。
 
 **形状**（v2）：
 
@@ -408,6 +414,11 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
 23. **联动文案**（§八之二）：`README.md` 与 `api list` 的 `field_notes.request_schema` 已改为
    与实现一致的新文案；断言二者**不再**含「不做字段校验/无法校验/不提供 params」等旧表述，
     且**保留**「响应体不做校验」的说明。
+24. **打包后能读到 `validate.json`**（§五 路径说明的验收）：`npm run build` 后
+   `dist/core/registry/validate.json` **存在**；从**非仓库目录**运行打包产物（如
+   `node <repo>/dist/cli.js api call ai.knowledge.search --body '{"robotId":1}'`）时，
+   override 仍生效（`merchant.account.login` 的 one-of 在打包产物里同样不误拒）。
+   —— 钉住「运行时文件确实进了 dist、且路径不依赖 CWD」。
 
 ## 十、测试计划（文件落点，v2 新增）
 
@@ -463,9 +474,14 @@ export interface ValidationOverride {
   aliases?: Record<string, string>
   bodyIgnored?: boolean
 }
-/** 加载并 fail-closed 校验 overrides/validate.json（§五 加载规则），失败即抛 kind:'internal' */
+/** 加载并 fail-closed 校验 validate.json（§五 加载规则），失败即抛 kind:'internal' */
 export function loadValidationOverrides(): Record<string, ValidationOverride>
 ```
+
+⚠️ **`validate.json` 用静态 JSON import**（与 `specs.json` 同款）：
+`import raw from './validate.json' with { type: 'json' }`——tsc 会把它拷进 `dist`，
+无需改 `copy-params.mjs`（见 §五 路径说明）。**不**用 `readFileSync`（那需要额外的打包步骤，
+而静态 import 已由既有机制覆盖）。
 
 **加载机制**（可实现性审查 A-严重）：`params.ts` 以**自身模块位置**为根定位文件，源码与 `dist` 同构
 （`copy-params.mjs` 已把 `params/` 拷到 `dist/core/registry/params/`）：
@@ -530,6 +546,7 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 | 23 | 补 `has_body_schema` 与 `bodyIgnored` 的组合语义（表存在 vs 本次是否比对，不再加字段） | 内部自洽 |
 | 24 | 补退出码 2 与 4 的**语义分工**说明（2=改参数、不需人类；4=停下问人类；硬拒消息不得暗示确认） | 安全与门禁 |
 | 25 | **修正验收判据的接口选择**（v2.2，controller 复查时发现）：验收 5/9/10/16/18 原用**危险接口**（addKnowledge/kefu.add/export.session）却断言退出码 **0** —— 但 D5 让校验先于门禁，合法 body 会撞 `--yes` 门禁返回 **4**，判据自相矛盾。改用**非危险**替身（`ai.knowledge.search` / `icoutcall.phone.getLineList`），并在 6/7 显式标注「危险接口须加 `--yes`」；19/20 的交叉引用同步修正 | controller 复查（非 agent 发现） |
+| 26 | **`validate.json` 移出 `overrides/`**（v2.2，controller 复查时发现）：`overrides/` 是 A 的**构建期**目录、不打进 `dist`（实测 `dist/core/registry/` 无 `overrides/`；`copy-params.mjs` 只拷 `params/`）。B 的 `validate.json` 是**运行时**消费，放在那里打包后读不到。改放 `src/core/registry/validate.json`（`specs.json` 旁）、用**同款静态 JSON import** 进 dist；并加验收 24 钉住「打包产物含它」 | controller 复查（非 agent 发现） |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `fileURLToPath(new URL('./params/<id>.json', import.meta.url))`
