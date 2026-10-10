@@ -9,7 +9,12 @@ const INDEX_URL = 'https://qiyukf.apifox.cn/llms.txt'
 
 /** 从 llms.txt 提取全部 api-*.md 的 URL，去重后按出现顺序返回。 */
 export async function listPageUrls(fetchImpl = fetch) {
-  const text = await (await fetchImpl(INDEX_URL)).text()
+  const res = await fetchImpl(INDEX_URL)
+  // ⚠️ 索引页也要查 res.ok —— llms.txt 若 404/5xx，正文是 HTML 错误页，
+  // 下面的正则匹配不到任何 URL，`fetchAll` 会打出「抓取完成：0/0」这种"成功"，
+  // 而实际上一页都没抓到（旧页却留在目录里，看起来更像成功）。
+  if (!res.ok) throw new Error(`抓取索引 ${INDEX_URL} 失败：HTTP ${res.status}`)
+  const text = await res.text()
   const urls = []
   const seen = new Set()
   for (const m of text.matchAll(/https:\/\/qiyukf\.apifox\.cn\/api-\d+\.md/g)) {
@@ -17,6 +22,8 @@ export async function listPageUrls(fetchImpl = fetch) {
     seen.add(m[0])
     urls.push(m[0])
   }
+  // ⚠️ 同理：正则 0 命中说明索引格式变了或内容异常，不能当作"站点本来就没有接口页"。
+  if (urls.length === 0) throw new Error(`${INDEX_URL} 里没有匹配到任何 api-*.md —— 索引格式可能已变`)
   return urls
 }
 

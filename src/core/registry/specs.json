@@ -1060,7 +1060,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "平台电商（Platform OpenAPI）"
+    "category": "平台电商（Platform OpenAPI）",
+    "note": "⚠️ 上游文档自相矛盾：接口描述明写「code和shopCode必填其一，都存在的情况下，优先以code为准」，但 schema 的 required 把 userName/code/shopCode 三者都标了必填 —— 照 schema 生成的参数表（params/merchant.account.login.json）会把「只传其一」误判为不完整。二者取哪种以服务端为准，未实测（登录属写接口，不在只读测试范围内）。"
   },
   {
     "id": "merchant.changePassword",

@@ -366,6 +366,17 @@ describe('注册表', () => {
     expect(byId('ai.knowledge.editKnowledge').note ?? '',
       '必须指出读不到 → 只能从 getDetail 取或显式传').toMatch(/getDetail|显式传/)
   })
+
+  it('merchant.account.login 的 note 记录上游 required 自相矛盾 —— 参数表会误判', () => {
+    // 上游页面（api-10845577）的 description 写「code和shopCode必填其一」，
+    // 而同一页 schema 的 required 把 userName/code/shopCode 三者都标了必填。
+    // 参数表（params/merchant.account.login.json）忠实按 schema 生成 —— 上游快照
+    // 不得篡改，所以矛盾只能经 note 这一个渠道告诉调用方，否则"只传其一"会被
+    // 误判为不完整请求。
+    const note = byId('merchant.account.login').note ?? ''
+    expect(note, 'note 必须点名 code/shopCode 必填其一与 required 的冲突').toMatch(/必填其一/)
+    expect(note, 'note 必须指向会误判的那份参数表').toMatch(/merchant\.account\.login\.json/)
+  })
 })
 
 describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地方）', () => {
@@ -389,6 +400,15 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
 
   it('非法 pageId 时抛错', () => {
     expect(() => loadSpecs([{ ...base, pageId: 'bad-page' }])).toThrow(/pageId 非法/)
+  })
+
+  it('pageId 末尾带换行也被拒 —— JS 的 $ 不匹配末尾换行之前', () => {
+    // ⚠️ 钉住一个**外部审查误报过的**行为：有人以为 `/^api-\d+$/` 会放行 `"api-1\n"`
+    // （那是 Python/Perl 里 `$` 的语义）。JS 中无 `m` 标志时 `$` 只匹配输入末尾，
+    // 不匹配末尾换行之前，故这里本就抛错。写这条测试是为了让"误报"不能变成
+    // "有人照着改成正则" —— 改成 `m` 标志反而会真的放行。
+    expect(/^api-\d+$/.test('api-1\n'), '前提：JS 的 $ 不放行末尾换行').toBe(false)
+    expect(() => loadSpecs([{ ...base, pageId: 'api-1\n' }])).toThrow(/pageId 非法/)
   })
 
   it('重复 pageId 时抛错', () => {

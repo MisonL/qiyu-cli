@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { generate } from '../../scripts/registry/generate.mjs'
+import { generate, loadRateLimits } from '../../scripts/registry/generate.mjs'
 import { parsePage, fixPath, deriveId } from '../../scripts/registry/lib.mjs'
 
 const PAGES_DIR = fileURLToPath(new URL('../fixtures/registry/pages/', import.meta.url))
@@ -52,5 +52,52 @@ describe('generate', () => {
     await generate({ pagesDir: PAGES_DIR, outDir: a, overridesDir: ov, reportPath: join(a, 'r.md'), rateLimits: {} })
     await generate({ pagesDir: PAGES_DIR, outDir: b, overridesDir: ov, reportPath: join(b, 'r.md'), rateLimits: {} })
     expect(readFileSync(join(a, 'specs.json'), 'utf8')).toBe(readFileSync(join(b, 'specs.json'), 'utf8'))
+  })
+
+  describe('loadRateLimits', () => {
+    // ⚠️ 对账哨兵读的是 dist 里的 RATE_LIMITS。产物缺失/过期时必须**在写任何
+    // 产物之前**抛错 —— 否则 specs.json 已经写了一半，目录里新旧混杂。
+    it('产物缺失时抛错，且提示先 build', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'nodist-'))
+      await expect(
+        loadRateLimits({ distUrl: join(dir, 'missing.js'), srcUrl: join(dir, 'missing.ts') }),
+      ).rejects.toThrow(/npm run build/)
+    })
+
+    it('源文件比产物新时抛错 —— 过期表会藏掉孤儿 id', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'stale-'))
+      const dist = join(dir, 'ratelimit.js')
+      const src = join(dir, 'ratelimit.ts')
+      writeFileSync(dist, 'export const RATE_LIMITS = {}')
+      writeFileSync(src, 'export const RATE_LIMITS = {}')
+      const old = Date.now() / 1000 - 3600
+      const fresh = Date.now() / 1000
+      utimesSync(dist, old, old)   // 产物是 1 小时前的
+      utimesSync(src, fresh, fresh) // 源文件是刚改的
+      await expect(loadRateLimits({ distUrl: dist, srcUrl: src })).rejects.toThrow(/可能已过期/)
+    })
+
+    it('产物新鲜时读回 RATE_LIMITS', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'fresh-'))
+      const dist = join(dir, 'ratelimit.js')
+      writeFileSync(dist, 'export const RATE_LIMITS = { "a.b": { limit: 1, windowSeconds: 1, source: "doc" } }')
+      const old = Date.now() / 1000 - 3600
+      utimesSync(dist, old, old)
+      const rl = await loadRateLimits({ distUrl: dist, srcUrl: join(dir, 'no-src.ts') })
+      expect(rl).toEqual({ 'a.b': { limit: 1, windowSeconds: 1, source: 'doc' } })
+    })
+  })
+
+  it('dist 不可读时抛错，且**不写**任何产物 —— 不留半更新目录', async () => {
+    // ⚠️ 这是「先读限频表、再写文件」那条顺序的回归哨兵：若把 loadRateLimits 挪回
+    // 写文件之后，specs.json 会先落盘、再因 dist 缺失炸掉，目录里留下新旧混杂的产物。
+    const out = mkdtempSync(join(tmpdir(), 'nowrite-'))
+    const dir = mkdtempSync(join(tmpdir(), 'nodist-'))
+    await expect(generate({
+      pagesDir: PAGES_DIR, outDir: out, overridesDir: tmpOverrides(),
+      reportPath: join(out, 'report.md'),
+      distUrl: join(dir, 'missing.js'), srcUrl: join(dir, 'missing.ts'),
+    })).rejects.toThrow(/读不到构建产物/)
+    expect(readdirSync(out), '失败后不得留下 specs.json / params/').toEqual([])
   })
 })
