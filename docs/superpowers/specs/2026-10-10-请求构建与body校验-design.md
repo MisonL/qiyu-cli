@@ -443,7 +443,10 @@ export interface ParamFile {
   bodyKind: BodyKind
   responseShape: ResponseShape
 }
-/** 惰性读 + 缓存；缺文件/畸形 JSON/结构非法 → 抛 kind:'internal'（§四 错误分类） */
+/** 惰性读 + 缓存；缺文件/畸形 JSON/结构非法 → 抛 kind:'internal'（§四 错误分类）。
+ *  ⚠️ 生产环境**每个 id 都有** params 文件（实测 154/154），故返回值**非 null**；
+ *  「该接口没有 body 表可比对」（如 `tag.all`：json 但 0 body 参数）由**文件内容**表达，
+ *  不由 null 表达 —— 调用方拿到 `ParamFile` 后按 `bodyKind` 与 body 参数数自行判定。 */
 export function loadParams(id: string): ParamFile
 /** 运行时校验 params 文件结构（in/required/type/bodyKind 枚举；同名跨 in 护栏），失败即抛 */
 export function validateParamsFile(id: string, raw: unknown): ParamFile
@@ -455,12 +458,12 @@ export interface Violation { kind: string; field?: string; message: string }
 export interface ValidateResult { hard: Violation[]; soft: Violation[] }
 /** 归一化别名（D8）：返回改写后的 body 与 alias_normalized 警告；源/目标键冲突 → 抛（硬） */
 export function normalizeAliases(
-  spec: EndpointSpec, file: ParamFile | null, body: unknown,
-  ov: ValidationOverride | undefined,
+  file: ParamFile, body: unknown, ov: ValidationOverride | undefined,
 ): { body: unknown; warnings: Violation[] }
-/** 纯函数：顶层形状契约 + 硬/软规则；不碰 I/O */
+/** 纯函数：顶层形状契约 + 硬/软规则；不碰 I/O。
+ *  `file` 为 `loadParams` 的结果（生产非 null）；`ov` 为该接口的 override（可能 undefined）。 */
 export function validateBody(
-  spec: EndpointSpec, file: ParamFile | null, body: unknown,
+  spec: EndpointSpec, file: ParamFile, body: unknown,
   ov: ValidationOverride | undefined, mode: { strict: boolean },
 ): ValidateResult
 ```
@@ -476,7 +479,7 @@ export interface ValidationOverride {
 }
 /** 纯函数：fail-closed 校验（§五 加载规则），坏数据抛 kind:'internal'。可注入测试数据 */
 export function validateOverrides(
-  raw: unknown, specs: readonly EndpointSpec[], paramsFor: (id: string) => ParamFile | null,
+  raw: unknown, specs: readonly EndpointSpec[], paramsFor: (id: string) => ParamFile,
 ): Record<string, ValidationOverride>
 /** 生产入口：静态 import validate.json → validateOverrides（与 loadSpecs 同款两段式） */
 export function loadValidationOverrides(): Record<string, ValidationOverride>
