@@ -1,0 +1,109 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "robotCallJobId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "任务ID"
+    },
+    {
+      "name": "customerPersonIds",
+      "in": "body",
+      "required": true,
+      "type": "array",
+      "description": "需要添加的客户id （可通过获取已经完成外呼的客户信息列表接口获取）"
+    },
+    {
+      "name": "lastCallRecord",
+      "in": "body",
+      "required": false,
+      "type": "boolean",
+      "description": "是否过滤重复通话记录只显示最近的一条"
+    },
+    {
+      "name": "searchWords",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "通过手机号码或者用户名通话记录ID模糊搜索筛选"
+    },
+    {
+      "name": "customerGroupId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "分组ID"
+    },
+    {
+      "name": "resultStatuses",
+      "in": "body",
+      "required": false,
+      "type": "array",
+      "description": "呼叫状态 ANSWERED(0, \"已接听\", null), NO_ANSWER(1, \"无应答\", \"呼叫号码未接听\"), BUSY(2, \"忙线中\", \"呼叫号码占线\"),POWER_OFF(3, \"关机\", \"呼叫号码关机\"), OUT_OF_SERVICE(4, \"停机\", \"呼叫号码停机\"), REFUSED(5, \"拒接\", \"呼叫号码拒接\"),VACANT_NUMBER(6, \"空号\", \"呼叫的号码是空号\"), CAN_NOT_CONNECT(7, \"无法接通\", \"呼叫的号码无法接通\"),FROM_PHONE_ERROR(8, \"主叫停机\", \"主叫号码不可用\"), SYSTEM_ERROR(9, \"系统错误\", \"外呼失败，系统错误\"),CALL_LOSS(10,\"多并发呼损\",\"等待服务中用户挂断\"), TRANSFER_ARTIFICIAL(11,\"转人工呼损\",\"等待转人工服务中用户挂断\");"
+    },
+    {
+      "name": "intentLevels",
+      "in": "body",
+      "required": false,
+      "type": "array",
+      "description": "意向等级 A(0, \"A级(较强)\"), B(1, \"B级(一般)\"), C(2, \"C级(无法判断)\"), D(3, \"D级(很少)\"),E(4, \"E级别(需要再次跟进)\"), F(5, \"F级别(无需再次跟进)\");"
+    },
+    {
+      "name": "followStatus",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "跟进状态 CLUE(0, \"线索\"), AI_INITIAL_VISIT(1, \"AI初访\"), PEOPLE_INITIAL_VISIT(2, \"人工初访\"), AI_FOLLOW_UP(3, \"AI持续跟进\"), PEOPLE_FOLLOW_UP(4, \"人工持续跟进\"), QUOTE(5, \"报价\"), DEAL(6, \"成交\"), LOSS(7, \"流失\");"
+    },
+    {
+      "name": "dialogFlowId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "话术ID"
+    },
+    {
+      "name": "earliestCreationTime",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "最早创建时间，日期标准格式，请不要包含时间\"2018-07-25\""
+    },
+    {
+      "name": "latestCreationTime",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "最晚创建时间，日期标准格式，请不要包含时间\"2018-07-25\""
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

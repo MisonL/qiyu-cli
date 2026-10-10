@@ -147,8 +147,7 @@ qiyu api call <id> [--body <JSON>] [--yes]
 - `--pretty`（人类可读输出）——目前只输出紧凑 JSON；
 - 本地数据仓库（`store/`）、查询（`qiyu query`）、同步（`qiyu sync`）；
 - 请求参数校验：`api call` 的 `--body` 不做字段校验，也**无法**校验——
-  注册表当前只有 11 条骨架，完整的 154 条（150 个文档页 + 4 个文档外接口）由生成脚本产出；
-  注册表暂不包含每个接口的 `params`/`responseShape`。
+  注册表已收录全部 **154** 条（150 个文档页 + 4 个文档外接口），并含每接口的 `params`/`responseShape`（`dist/core/registry/params/`）。
 
 `api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 

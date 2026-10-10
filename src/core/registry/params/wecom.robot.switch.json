@@ -1,0 +1,43 @@
+{
+  "params": [
+    {
+      "name": "robotId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "目标机器人id"
+    },
+    {
+      "name": "wxWorkCorpId",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "企业微信的企业ID，在企业微信后台企业信息中查看"
+    },
+    {
+      "name": "wxWorkAgentId",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "企业我先应用agentId"
+    },
+    {
+      "name": "fromAccount",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "访客访客企业微信账号"
+    },
+    {
+      "name": "groupId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "转人工分流组id，默认0不指定转人工分流组"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

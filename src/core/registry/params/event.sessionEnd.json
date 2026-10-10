@@ -1,0 +1,117 @@
+{
+  "params": [
+    {
+      "name": "QIYU_MSG_URL",
+      "in": "path",
+      "required": true,
+      "type": "string",
+      "description": ""
+    },
+    {
+      "name": "eventType",
+      "in": "query",
+      "required": false,
+      "type": "string",
+      "description": "",
+      "example": "SESSION_END"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": false,
+      "type": "string",
+      "description": "",
+      "example": "1463217187"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": false,
+      "type": "string",
+      "description": "",
+      "example": "2f13932c4b7c6888b12360a85261a11b8b543f64 Content-Type:application/json;charset=utf-8"
+    },
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "code",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "错误码。200表示分配到客服，14005：没有客服在线，14006：需要排队，14010：没有客服在线，且留言功能已关闭。"
+    },
+    {
+      "name": "staffId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "客服 ID。"
+    },
+    {
+      "name": "message",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "如果分配到客服，此字段是客服的欢迎语，如果没有分配到客服，则是错误提示信息。"
+    },
+    {
+      "name": "sessionId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "会话 ID，后续对会话评价时有用。仅返回分配到客服时该参数有效。"
+    },
+    {
+      "name": "staffName",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "客服名字。"
+    },
+    {
+      "name": "staffType",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "客服类型，0 表示机器人，1 表示人工会话。"
+    },
+    {
+      "name": "staffIcon",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "客服头像的 url。"
+    },
+    {
+      "name": "uid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": ""
+    },
+    {
+      "name": "closeReason",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "会话关闭原因：0-客服关闭；1-访客离开页面失效关闭；2-访客离开超时关闭；3-访客申请其他客服关闭；4-网络差客服掉线关闭；5-客服转接关闭；6-管理员接管关闭；7-访客主动关闭；8-系统关闭，静默超时关闭；9-系统关闭，静默转接关闭；10-访客未说话；11-访客排队超时清队列；12-访客放弃排队；13-客服离线清队列；16-系统关闭会话；其他-机器人转人工。"
+    },
+    {
+      "name": "transferTo",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "如果会话是被转接出去了，会有该字段，值为转接到的会话ID。"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

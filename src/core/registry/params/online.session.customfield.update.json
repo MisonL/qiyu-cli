@@ -1,0 +1,74 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "sessionId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "会话id"
+    },
+    {
+      "name": "status",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "问题解决状态-客服（值为 (0:未解决, 1:已解决, 2:解决中)）"
+    },
+    {
+      "name": "category",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "咨询分类id"
+    },
+    {
+      "name": "description",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "会话备注（长度上限500字符）"
+    },
+    {
+      "name": "customfield",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "自定义字段（单行文本：长度上限100字符；多行文本：长度上限500字符；数字：长度上限100字符；单选：长度上限100字符；多选：长度上限100字符；时间：限制为毫秒时间戳）"
+    },
+    {
+      "name": "templateId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "模版id"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

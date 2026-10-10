@@ -1,0 +1,36 @@
+{
+  "params": [
+    {
+      "name": "robotId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "目标机器人id"
+    },
+    {
+      "name": "appId",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "微信公众号appid"
+    },
+    {
+      "name": "fromAccount",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "访客标识"
+    },
+    {
+      "name": "groupId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "转人工分流组id，默认0不指定转人工分流组"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

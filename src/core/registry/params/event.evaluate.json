@@ -1,0 +1,74 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "uid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "开发者的应用里的用户 ID。"
+    },
+    {
+      "name": "sessionId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "待评价的会话 ID。该会话 ID 可由分配客服的接口拿到。"
+    },
+    {
+      "name": "evaluation",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "评价值来自请求分配客服接口响应参数中 evaluationModel 中的 value 值。"
+    },
+    {
+      "name": "evaluation_resolved",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "用户上报问题解决状态，可以为空。0-未选择，1-已解决，2-未解决。"
+    },
+    {
+      "name": "remarks",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "评价备注信息，可以为空"
+    },
+    {
+      "name": "tagList",
+      "in": "body",
+      "required": true,
+      "type": "array",
+      "description": "评价时给客服打的标签信息"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

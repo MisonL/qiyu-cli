@@ -1,0 +1,431 @@
+{
+  "ticket.search": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true,
+    "maxWindowDays": 31,
+    "note": "⚠️ 该接口有三个必须同时满足的限制：① opStart 被服务端静默钳到 now-31d —— 请求 [now-89d, now] 按 createTime 升序取最旧 500 条，最旧的仍只距今 30.5 天；不报错，也不多返回。② 跨度硬限 90 天 —— 跨度 91 天即返回 14004 opTime range over limit，跨度 90 天（哪怕窗口整体落在 150 天前）正常返回。③ opEnd 缺省或为 0 时被静默忽略、返回全量 —— 实测 {opStart: now-1d, opEnd: now} → total 100，而 {opStart: now-1d, opEnd: 0} 与 {opStart: now-1d} → total 2885（全量）；opStart=opEnd=now 的零窗口同样返回 2885。**传一个你以为是空窗口的查询会拿到全量数据**，而响应是合法的 code:200、信封层判不出异常 —— 必须自己保证 opEnd 是有效时间戳。→ maxWindowDays 取 31（三者中最严的）：按 ≤31 天切片同时满足全部三个；按 90 天切片虽不触发 14004，但每片会静默少取约 58 天。"
+  },
+  "message.send": {
+    "dangerous": true,
+    "note": "写接口，未探测成功信封（只读测试约束）"
+  },
+  "settings.wxTemplates": {
+    "dangerous": true,
+    "note": "写接口（配置微信模板绑定）。⚠️ 成功路径**从未被验证**：实测时每个请求都返回 14004 appId not bind（当时未绑定任何公众号）。这是**当时那个账号**的状态，你的账号若已绑定公众号可能得到不同结果 —— 但信封与错误模式因此均未实测"
+  },
+  "receive.message": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType",
+    "envelope": null,
+    "verified": true,
+    "note": "入站推送：方向相反，响应信封由我方实现决定，无从实测。⚠️ path 的 \"/\" 是**占位符**，不是真实路径 —— 本接口由七鱼回调我方，不存在可调用的 URL。callable 为 false 即表示这一点。⚠️ 本记录是全表**唯一** `verified: true` 与 `envelope: null` 并存的一条 —— 这里的 `verified` 指的是'**不可主动调用**已实测'（`/` 的 POST 302 实测 —— 它重定向到网易云商产品页，不是可调用的 API 端点），**不是**'信封已实测'；信封（`envelope: null`）恰恰是**无从实测**的，因为响应体由我方实现决定。**也不是**'方向/鉴权已实测'：`direction: inbound` 是据文档对 9 个推送页的分类（302 只证明它不可调用，不能证明七鱼确实会回调我们），`auth: eventType` 是按注册表类型联合做的分类（入站推送不走 checksum）—— 入站推送的**鉴权方式从未实测**（实测它必须真实接收一次推送，而 CLI 不接收推送）。与 `robot.transfer.config` 的 note 同理，不要据 `verified: true` 以为它的信封被验证过"
+  },
+  "robot.transfer.config": {
+    "dangerous": false,
+    "envelope": "D",
+    "verified": true,
+    "note": "⚠️ 实测返回**空壳** `{code:200}`，完全没有字段。它是当前注册表里少数 `callable && !dangerous && verified` 的接口之一，但**调用它拿不到任何数据** —— 不要把它当成一个可用的只读接口。`verified: true` 指的是'信封与鉴权行为已实测'（形状 D：`{code:200}` 即正常成功，不是查无此物），**不是**'有可用数据'。另注：该接口在厂商文档里声明无鉴权，实测**会**校验 checksum（失败返回 14500，与内部错误无法区分）"
+  },
+  "wecom.robot.switch": {
+    "dangerous": false,
+    "callable": false,
+    "auth": "checksum",
+    "note": "⚠️ auth 取 `checksum` 是**保守假设、未核实**：厂商文档把本接口与 robot/transfer/config、robot/session/transfer 一同声明为「无鉴权」，但它的兄弟接口 robot/transfer/config 实测**会**校验 checksum（失败返回 14500）—— 故不采信文档的「无鉴权」值，保守按需签名处理。⚠️ 本接口路径已损坏（文档页 paths: 键是一段中文散文，解析不出路径），无法实测，auth 与信封均未核实"
+  },
+  "ai.knowledge.addKnowledge": {
+    "dangerous": true,
+    "note": "写接口：创建标准问，会立即改变生产机器人的回答。⚠️ robotId 必填（与读接口不同 —— robot.data.knowledge 会静默忽略它）。⚠️ 文档限（未实测）：answer ≤ 3500 字符；相似问 ≤ 200 条、每条 ≤ 50 字符。路径已用 GET 探针确认存在（未执行任何写操作）。响应信封未实测"
+  },
+  "ai.knowledge.editKnowledge": {
+    "dangerous": true,
+    "note": "写接口，且是读-改-写而非 patch。⚠️ robotId 必填（与读接口不同 —— robot.data.knowledge 会静默忽略它）。⚠️ validitySwitch 也是必填，但 **list 端点（robot.data.knowledge）里根本没有这个字段** —— 只能从 ai.knowledge.getDetail 取，否则必须显式传值。⚠️ similars 是三态：省略=不变、[]=清空、有值=替换 —— 传 [] 会静默抹掉相似问。⚠️ 文档限（未实测）：answer ≤ 3500 字符；相似问 ≤ 200 条、每条 ≤ 50 字符。响应信封未实测"
+  },
+  "ai.knowledge.deleteKnowledges": {
+    "dangerous": true,
+    "note": "⚠️ 整个 API 面中唯一的批量破坏性接口，且无法通过 API 恢复。⚠️ robotId 必填（与读接口不同 —— robot.data.knowledge 会静默忽略它）。返回值 data 是**失败**的 id 列表（空数组=全部成功，与通常约定相反）。响应信封未实测"
+  },
+  "ai.knowledge.editChannelAnswer": {
+    "dangerous": true,
+    "note": "写接口。⚠️ robotId 必填（与读接口不同 —— robot.data.knowledge 会静默忽略它）。⚠️ channelAnswers 传 [] 会清空全部规则答案，非空数组则整体替换，不存在部分更新。文档限每次最多 20 条规则答案。响应信封未实测"
+  },
+  "ai.knowledge.editKnowledgeNoSimilars": {
+    "dangerous": true,
+    "note": "写接口。⚠️ robotId 必填（与读接口不同 —— robot.data.knowledge 会静默忽略它）。⚠️ 问题字段名是 question 而非 name（已对照官方字段表核实）—— 复用 editKnowledge body 的调用方会传错。⚠️ 文档限（未实测）：answer ≤ 3500 字符（本接口不含 similars，无相似问上限）。响应信封未实测"
+  },
+  "ai.knowledge.getCategoryTree": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "ai.knowledge.getDetail": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "ai.knowledge.search": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "ai.statistic.transferHuman": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true,
+    "maxWindowDays": 365
+  },
+  "category.list": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "chat.queue.group.query": {
+    "dangerous": false
+  },
+  "crm.modifyOrder": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "none"
+  },
+  "crm.modifyUser": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "none"
+  },
+  "crm.tagChange": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false
+  },
+  "data.overview.ipcc": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "data.overview.session": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "evaluation.setting.get": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "event.inviteEvaluate": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType"
+  },
+  "event.qcResult": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType"
+  },
+  "event.queryQueueStatus": {
+    "dangerous": false
+  },
+  "event.queueEnter": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType"
+  },
+  "event.queueLeave": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType"
+  },
+  "event.sessionChange": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType"
+  },
+  "event.sessionData": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType"
+  },
+  "event.sessionEnd": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType"
+  },
+  "event.sessionStart": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "eventType"
+  },
+  "export.session": {
+    "envelope": "A",
+    "verified": true,
+    "maxWindowDays": 6
+  },
+  "export.session.check": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "export.session.one": {
+    "dangerous": false,
+    "envelope": "D-nf",
+    "verified": true
+  },
+  "export.session.one.message": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "get_call_order": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "none"
+  },
+  "get_call_user_info": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "none"
+  },
+  "get_order": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "none"
+  },
+  "get_token": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "none"
+  },
+  "get_user_info": {
+    "dangerous": false,
+    "direction": "inbound",
+    "callable": false,
+    "auth": "none"
+  },
+  "icoutcall.callIntercept.list": {
+    "dangerous": false
+  },
+  "icoutcall.dialogFlow.fuzzySearch": {
+    "dangerous": false
+  },
+  "icoutcall.dialogFlow.getDialogFlowList": {
+    "dangerous": false
+  },
+  "icoutcall.get.customer": {
+    "dangerous": false
+  },
+  "icoutcall.get.jobdetail": {
+    "dangerous": false
+  },
+  "icoutcall.get.jobproperties": {
+    "dangerous": false
+  },
+  "icoutcall.history.seat": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "icoutcall.history.team": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "icoutcall.phone.getLineList": {
+    "dangerous": false
+  },
+  "ipcc.calltask.get": {
+    "dangerous": false
+  },
+  "ipcc.calltaskdetail.get": {
+    "dangerous": false
+  },
+  "ipcc.customfield.template.get": {
+    "dangerous": false
+  },
+  "kefu.v2.query": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "merchant.list": {
+    "dangerous": false
+  },
+  "merchant.query": {
+    "dangerous": false
+  },
+  "online.session.category.list": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "online.session.customfield.template": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "robot.data.getQuestionsByCategoryName": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "robot.data.knowledge": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "robot.data.kpoint": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "robot.data.queryStandardByEffectiveQuestion": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "robot.data.queryStandardQuestionList": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "robot.evaluation.setting": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "robot.session.chat": {
+    "dangerous": false
+  },
+  "robot.session.commonQuestions": {
+    "dangerous": false
+  },
+  "robot.session.msgAssociate": {
+    "dangerous": false,
+    "envelope": "D-nf",
+    "verified": true
+  },
+  "robot.session.msgPredict": {
+    "dangerous": false
+  },
+  "robot.statistic.summary": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true,
+    "maxWindowDays": 31
+  },
+  "session.user.profile": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "smstask.status": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "staff.group.list.new": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "staff.group.members.new": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "staff.list.new": {
+    "dangerous": false,
+    "envelope": "A",
+    "verified": true
+  },
+  "statistic.overview": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true,
+    "maxWindowDays": 31
+  },
+  "statistic.performance": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true,
+    "maxWindowDays": 365
+  },
+  "statistic.salaryDetail": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "statistic.satisfaction.report": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true,
+    "maxWindowDays": 31
+  },
+  "statistic.staffAttendance": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true,
+    "maxWindowDays": 31
+  },
+  "statistic.staffquality": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true,
+    "maxWindowDays": 31
+  },
+  "statistic.staffworklod": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true,
+    "maxWindowDays": 31
+  },
+  "tag.all": {
+    "dangerous": false,
+    "envelope": "B",
+    "verified": true
+  },
+  "ticket.filter.count": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "ticket.filter.list": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "ticket.list": {
+    "dangerous": false
+  },
+  "ticket.log": {
+    "dangerous": false
+  },
+  "ticket.new.detail": {
+    "dangerous": false
+  },
+  "ticket.template.fields": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  },
+  "ticket.template.list": {
+    "dangerous": false,
+    "envelope": "C",
+    "verified": true
+  }
+}

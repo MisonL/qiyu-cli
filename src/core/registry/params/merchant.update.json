@@ -1,0 +1,74 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "contact",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "联系方式，50个字符以内"
+    },
+    {
+      "name": "name",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "商户名，50个字符以内"
+    },
+    {
+      "name": "id",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "商户id,与商户列表接口拉取到的数据中id对应"
+    },
+    {
+      "name": "seatNumber",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "坐席数，增加的数量不能超过剩余平台剩余总坐席数，可以为0"
+    },
+    {
+      "name": "account",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "商户超管超管账号，格式为邮箱，最好是可用邮箱"
+    },
+    {
+      "name": "portrait",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "头像图片文件内容base64运算后的字符串"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

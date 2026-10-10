@@ -1,0 +1,48 @@
+{
+  "params": [
+    {
+      "name": "modify_cb",
+      "in": "path",
+      "required": true,
+      "type": "string",
+      "description": "接口地址由获取订单信息接口get_order返回的modify_cb的内容指定。",
+      "example": ""
+    },
+    {
+      "name": "appid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "企业分配给网易七鱼系统的 appid。",
+      "example": "qiyukf"
+    },
+    {
+      "name": "token",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "当前有效的 token。",
+      "example": "qiyukf_security_token"
+    },
+    {
+      "name": "userid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "用户的唯一性标识。",
+      "example": "zhangsan"
+    },
+    {
+      "name": "data",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "用一个数组表示修改的用户信息数据。",
+      "example": "[{\"key\":\"name\",\"value\":\"张三\"},{\"key\":\"phone\",\"value\":\"1397777777X\"}]"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "form"
+}

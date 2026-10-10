@@ -1,0 +1,15 @@
+{
+  "params": [
+    {
+      "name": "robotId",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "机器人id"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

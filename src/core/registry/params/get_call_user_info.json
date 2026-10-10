@@ -1,0 +1,36 @@
+{
+  "params": [
+    {
+      "name": "appid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "企业分配给网易七鱼系统的 appid。"
+    },
+    {
+      "name": "token",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "当前有效的 token。"
+    },
+    {
+      "name": "userid",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "用户的唯一性标识。"
+    },
+    {
+      "name": "staffphone",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "企业和用户联系时使用的中继号码。"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

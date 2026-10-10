@@ -1,0 +1,53 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "userName",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "登录的平台所属企业中的账号"
+    },
+    {
+      "name": "code",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "登录平台所属企业code，商户二级域名前缀，商户登录域名为qiyu_merchant.qiyukf.com，code即为qiyu_merchant"
+    },
+    {
+      "name": "shopCode",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "登录平台所属企业shopCode，商户二级域名前缀‘_’后的内容，商户登录域名为qiyu_merchant.qiyukf.com，shopCode即为merchant"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}

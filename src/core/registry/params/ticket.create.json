@@ -1,0 +1,151 @@
+{
+  "params": [
+    {
+      "name": "appKey",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "企业的appKey",
+      "example": "{{appKey}}"
+    },
+    {
+      "name": "time",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "当前 UTC 时间戳，从 1970 年 1 月 1 日 0 点 0 分 0 秒开始到现在的秒数,1463217187",
+      "example": "{{time}}"
+    },
+    {
+      "name": "checksum",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "description": "SHA1(appSecret + md5 + time), 三个参数拼接的字符串，进行SHA1哈希计算，转化成16进制字符(String，小写).示例2f13932c4b7c6888b12360a85261a11b8b543f64 ",
+      "example": "{{checksum}} "
+    },
+    {
+      "name": "title",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "工单标题，不超过30个字符"
+    },
+    {
+      "name": "uid",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "开发者的应用里的用户ID，不超过64个字符(如果没有userMobile则必传)"
+    },
+    {
+      "name": "uniqueId",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": ""
+    },
+    {
+      "name": "typeId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "分类ID，0表示未分类"
+    },
+    {
+      "name": "content",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "工单内容，不超过3000个字符"
+    },
+    {
+      "name": "userName",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "用户姓名，不超过128个字符"
+    },
+    {
+      "name": "userMobile",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "用户联系方式，不超过128个字符(如果没有uid则必传)"
+    },
+    {
+      "name": "userEmail",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "用户联系邮箱，不超过255个字符"
+    },
+    {
+      "name": "targetStaffId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "指定客服ID"
+    },
+    {
+      "name": "targetGroupId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "指定客服分组ID"
+    },
+    {
+      "name": "staffId",
+      "in": "body",
+      "required": true,
+      "type": "integer",
+      "description": "托管客服ID"
+    },
+    {
+      "name": "priority",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "优先级,5=一般;8=紧急;10=非常紧急"
+    },
+    {
+      "name": "templateId",
+      "in": "body",
+      "required": false,
+      "type": "integer",
+      "description": "模板ID"
+    },
+    {
+      "name": "followerIds",
+      "in": "body",
+      "required": false,
+      "type": "array",
+      "description": "工单关注人"
+    },
+    {
+      "name": "attachments",
+      "in": "body",
+      "required": false,
+      "type": "array",
+      "description": "附件列表"
+    },
+    {
+      "name": "properties",
+      "in": "body",
+      "required": false,
+      "type": "array",
+      "description": "附加属性对，json格式，不超过1024个字符"
+    },
+    {
+      "name": "customFields",
+      "in": "body",
+      "required": false,
+      "type": "array",
+      "description": "自定义字段, 暂不支持级联类型自定义字段"
+    }
+  ],
+  "responseShape": {
+    "kind": "object"
+  },
+  "bodyKind": "json"
+}
