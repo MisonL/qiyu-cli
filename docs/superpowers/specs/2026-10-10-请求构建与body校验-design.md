@@ -92,10 +92,8 @@
   `body_kind === 'json' && body 参数数 > 0`（与 §四 `unknown_field` 的触发条件同源：没有表就不谈「未知」）。
   ⚠️ **命名刻意不叫 `body_validated`**（v1 的名字读起来像「本次 body 已通过校验」，实为「有表可比对」——
   审查判为易误判，见 §十一）。它**不代表**本次请求校验通过；本次结果看 `api call` 的 `meta.warnings`。
-  ⚠️ **与 `bodyIgnored` 的组合**：若某接口在 override 里标了 `bodyIgnored`（§五）但确有 body 参数，
-  `has_body_schema` 仍为 `true`（表存在），而 `api call` **不会**执行比对——`has_body_schema` 只答
-  「**有没有表**」，不答「**本次会不会比**」；后者由 `--no-validate` 与 override 共同决定。B **不**为此
-  再加一个「本次是否校验」的字段（那会是又一个「声明了没人读」的装饰键）。
+  唯一能让「有表却不比对」的情形是 `--no-validate`（用户显式关闭），B **不**为此再加一个
+  「本次是否校验」的字段（那会是又一个「声明了没人读」的装饰键）。
 - `response_shape` —— **原样透传** params 文件里的 `{"kind": "..."}` 对象。
   ⚠️ 设计稿 §5.2 写的是 `responseShape: string`（旧设计）；A 的现行接口缝（`params/*.json`）是结构化对象，
   **以 A 的产物为准**，B 不改写成字符串（见 §八.2）。
@@ -239,13 +237,15 @@ return ok(r.payload, {
   "ai.knowledge.editKnowledgeNoSimilars": {
     "note": "设计稿 §5.4：该接口取 question，复用 editKnowledge body 形态的调用方会传 name——改名必须在请求构建器处理，不能留给调用方。",
     "aliases": { "name": "question" }
-  },
-  "tag.all": {
-    "note": "实测该接口对任何 body 都返回 200（含格式错误的 {），文档「body 必须是字面量 all」不成立。",
-    "bodyIgnored": true
   }
 }
 ```
+
+> ⚠️ **`tag.all` 不进这张表**（v2.3，见 §十一 第 28 条）：它 `bodyKind: json` 但 **0 个 body 参数**，
+  §四 的比对本就全部跳过（`has_body_schema: false`）——给它写任何 override 都是**零效果的死配置**。
+  v1/v2 曾设想一个 `bodyIgnored` 标记，实测**没有任何接口需要它**（凡「body 语义与文档不符」的接口，
+  要么本就没有 body 参数表，要么该用 `relaxRequired`/`aliases` 精确表达），故**不设该字段**
+  （与删 `keepRequired` 同一条理由：零效果字段 = 「声明了但没人读」）。
 
 字段语义：
 
@@ -263,24 +263,20 @@ return ok(r.payload, {
   4. **如实报告**：出 `alias_normalized` 警告（永不升级）。
   5. 目标键必须是该接口 params 里的 body 字段名（加载期校验）；源键**不得**是 body 字段名
      （否则它本就是合法字段，不该被别名覆盖 → 加载期抛）。
-- `bodyIgnored: true` —— 该接口**不比对**任何字段（未知字段、类型、必填全不查）。
-  用于「body 语义已实测与文档完全不符」的接口（`tag.all`）。
-  ⚠️ **安全约束（fail-closed，v2 新增）**：`bodyIgnored` **禁止用于 `dangerous: true` 的接口**——
-  它会静默放宽对写/破坏性调用的 body 保护。加载期发现「dangerous 接口带 `bodyIgnored`」→ 抛错。
-  同一条精神也适用于 `relaxRequired`/`oneOf`/`aliases` 作用于危险接口：**允许**（`editKnowledgeNoSimilars`
-  本身是危险接口且确需 `aliases`），但**必须在 `note` 里写明实测/文档依据**，且新增这类条目时
-  测试要逐条钉住——见 §八.5。
 - `note` —— 进 override 的理由。⚠️ 它是**唯一**不进 CLI 输出、只供 review 的字段（v1 因此被
   判为「会腐化的注释」，见 §十一）。缓解：`note` 必须写明**证据来源**（设计稿节号 / 实测日期），
   且 §九 验收 12 要求「override 引用的字段必须存在于 params」在加载期强制——证据漂移的下限防线。
+- ⚠️ **危险接口的约束**：`relaxRequired`/`oneOf`/`aliases` **允许**作用于 `dangerous: true` 的接口
+  （`editKnowledgeNoSimilars` 本身是危险接口且确需 `aliases`），但**必须在 `note` 里写明实测/文档依据**，
+  且新增这类条目时测试要逐条钉住——见 §八.5。
 
 **加载规则（fail-closed，与 `loadSpecs` 同款）**：顶层必须是对象；每条 key 必须是注册表里
-存在的 id；`relaxRequired`/`oneOf.anyOf`/`aliases` 的值必须满足上面的引用约束；
-`bodyIgnored` 不得用于 dangerous 接口。加载失败 = B 不可用（宁可炸，不可静默变成「没有 override」——
+存在的 id；`relaxRequired`/`oneOf.anyOf`/`aliases` 的值必须满足上面的引用约束。
+加载失败 = B 不可用（宁可炸，不可静默变成「没有 override」——
 那会把 one-of 接口的合法调用硬拒掉，正是 D3 要防的事）。
 
 **初始收录范围（有实测/文档证据才写）**：`merchant.account.login`（one-of）、
-`ai.knowledge.editKnowledgeNoSimilars`（aliases，设计稿 §5.4）、`tag.all`（bodyIgnored，§5.3 陷阱 2）。
+`ai.knowledge.editKnowledgeNoSimilars`（aliases，设计稿 §5.4）。
 其余不录——**override 是证据驱动的，不是预防性的**。
 
 ## 六、退出码与 flags
@@ -326,7 +322,7 @@ B 的硬拒消息里**不得**出现任何"需要人类确认"的暗示（那会
 4. **`--strict` 的升级范围**（D7）：只有 `unknown_field`/`type_mismatch` 被升级；
    `non_json_body`/`alias_normalized` 永远软，`--strict` 不改变它们。
 5. **override 腐化 / 被滥用**：`note` 是唯一不进输出的字段，会随文档漂移。缓解：加载期强制
-   「引用必须存在」（§五）、`bodyIgnored` 禁用于危险接口、新增条目必须带证据并逐条测试。
+   「引用必须存在」（§五）、新增条目必须带证据并逐条测试。
 6. **`has_body_schema` 的判据分叉**（§三/§四）：`body_kind === 'json'` 与「body 表非空」不总一致
    （`tag.all` 是 json 但 0 body 参数）。实现与测试必须分别钉住这两个条件，合并成一个布尔会造出
    「json 但无表」时声称 validated 的谎言。
@@ -379,7 +375,8 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
    （用源键 `name`，其余必填齐）→ **0**；`meta.warnings` 含 `{kind:"alias_normalized", field:"name"}`，
    且**实际发给 `call()` 的 body 用 `question`**（mock 断言）；`name` 不产生 `unknown_field`。
    同 body 再加 `"question":"q2"`（源键与目标键都在）→ **2**（歧义硬拒）。
-8. `qiyu api call tag.all --body '{"foo":"bar"}'` → 0，**不出** `unknown_field`（`bodyIgnored`）。
+8. `qiyu api call tag.all --body '{"foo":"bar"}'` → **0**，**不出** `unknown_field`——因为 `tag.all`
+   有 0 个 body 参数（`has_body_schema:false`），§四 的比对本就跳过（无需任何 override）。
 9. **非 json body**（用**非危险**的 `icoutcall.phone.getLineList`，`bodyKind:"none"`、`callable`、`dangerous:false`）：
    带 `--body '"x"'` → **0**、`meta.warnings` 含 `{kind:"non_json_body"}`、请求照发（mock）。
    （⚠️ 不用 `kefu.add`：它是危险接口，不带 `--yes` 会返回 4，验不到「警告 + 成功」。xml 的透传路径
@@ -391,8 +388,7 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
 11. 危险接口 `message.send` 缺必填（body 有必填 `uid/msgType/content`）+ 无 `--yes` → **2**（不是 4，D5）；
     补必填 + 无 `--yes` → **4**（`needs_confirmation`、含确认字段）。
 12. `validate.json`：加一个不存在的 id → B 启动即抛；`relaxRequired` 引用不存在的字段 / 引用非必填字段
-    → 抛；`aliases` 的目标键不存在 / 源键恰是 body 字段 → 抛；`bodyIgnored` 用在 `dangerous:true` 的接口
-    → 抛。消息点名接口 id 与字段名。
+    → 抛；`aliases` 的目标键不存在 / 源键恰是 body 字段 → 抛。消息点名接口 id 与字段名。
 13. **params 文件缺失/畸形** → 退出码 **1**、`kind:"internal"`、**不是** usage 双通道
     （构造：对某接口临时移除/改坏 `params/<id>.json`，断言 call 与 schema 行为一致）。
 14. `qiyu api schema crm.modifyOrder`（`callable:false`）→ **0**，输出照常（不经 `assertCallable`）。
@@ -477,7 +473,6 @@ export interface ValidationOverride {
   relaxRequired?: string[]
   oneOf?: { anyOf: string[]; message: string }[]
   aliases?: Record<string, string>
-  bodyIgnored?: boolean
 }
 /** 纯函数：fail-closed 校验（§五 加载规则），坏数据抛 kind:'internal'。可注入测试数据 */
 export function validateOverrides(
@@ -489,7 +484,7 @@ export function loadValidationOverrides(): Record<string, ValidationOverride>
 
 ⚠️ **两段式**（对齐既有 `loadSpecs(raw)` 的写法：纯函数收 `raw`、模块级常量做生产入口）——
 `validateOverrides` 收原始值 + 依赖注入，验收 12 的每条 fail-closed 分支（坏 id、坏字段引用、
-`bodyIgnored`+dangerous、alias 源/目标非法）都能用**合成数据**直接测，不必去改真实文件；
+alias 源/目标非法）都能用**合成数据**直接测，不必去改真实文件；
 `loadValidationOverrides()` 只是 `validateOverrides(raw, allEndpoints(), paramsFor)` 的薄包装。
 
 ⚠️ **`validate.json` 用静态 JSON import**（与 `specs.json` 同款）：
@@ -516,9 +511,9 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
   `kind:'internal'`；结构校验（`in`/`required`/`type`/`bodyKind` 枚举）；同名跨 `in` 护栏。
 - `tests/core/validate.test.ts`（新）：纯函数 `normalizeAliases`（归一化、改写、源/目标键冲突）
   与 `validateBody` 的硬/软全规则；顶层形状契约（对象/数组/标量/null）；
-  one-of；`relaxRequired`；`bodyIgnored`；`--strict` 升级集合逐 kind 钉住；warnings 顺序稳定。
+  one-of；`relaxRequired`；`--strict` 升级集合逐 kind 钉住；warnings 顺序稳定。
 - `tests/core/registry/validation-overrides.test.ts`（新）：`validateOverrides` 的全部 fail-closed 分支
-  （坏 id、坏字段引用、dangerous+bodyIgnored、alias 源/目标非法）——用**合成数据**直接调纯函数。
+  （坏 id、坏字段引用、alias 源/目标非法）——用**合成数据**直接调纯函数。
 - `tests/commands/api.test.ts`（扩展）：`api schema` 成功/未知 id/`--help`/`--pretty`/位置参数/`callable:false`；
   `call` 硬违规退出码与双通道、`--no-validate`/`--strict` 冲突、`meta.warnings` 两态、
   危险接口次序回归、`--no-validate` 不削弱门禁。
@@ -545,7 +540,7 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 | 9 | `body_validated` → **`has_body_schema`**；`bodyIgnored` 组合语义闭合 | 契约诚实性 + 内部自洽 |
 | 10 | 删除 `keepRequired`（与 relax 无交集、零效果、语义不闭合） | 契约诚实性 |
 | 11 | 新增**错误分类**：硬违规 usage 2 vs params/override 缺陷 internal 1 | 可实现性 |
-| 12 | 新增 `bodyIgnored` **禁用于 dangerous 接口**（安全 fail-closed） | 安全与门禁 |
+| 12 | ~~新增 `bodyIgnored` 禁用于 dangerous 接口~~ → **被 28 取代**（`bodyIgnored` 整个删除，风险随字段消失） | 安全与门禁 |
 | 13 | 新增 `responseShape` 形态说明（A 产物覆盖设计稿旧 `string`） | 上游一致性 |
 | 14 | 新增 `rateLimit.scope` 声明为「B 不消费、归 G1」 | 上游一致性 |
 | 15 | 补 `api schema` 的 `callable:false` 验收、`null` 值「存在≠通过」验收、非对象 body 验收、
@@ -562,6 +557,7 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 | 25 | **修正验收判据的接口选择**（v2.2，controller 复查时发现）：验收 5/9/10/16/18 原用**危险接口**（addKnowledge/kefu.add/export.session）却断言退出码 **0** —— 但 D5 让校验先于门禁，合法 body 会撞 `--yes` 门禁返回 **4**，判据自相矛盾。改用**非危险**替身（`ai.knowledge.search` / `icoutcall.phone.getLineList`），并在 6/7 显式标注「危险接口须加 `--yes`」；19/20 的交叉引用同步修正 | controller 复查（非 agent 发现） |
 | 26 | **`validate.json` 移出 `overrides/`**（v2.2，controller 复查时发现）：`overrides/` 是 A 的**构建期**目录、不打进 `dist`（实测 `dist/core/registry/` 无 `overrides/`；`copy-params.mjs` 只拷 `params/`）。B 的 `validate.json` 是**运行时**消费，放在那里打包后读不到。改放 `src/core/registry/validate.json`（`specs.json` 旁）、用**同款静态 JSON import** 进 dist；并加验收 24 钉住「打包产物含它」 | controller 复查（非 agent 发现） |
 | 27 | **override 加载改两段式**（v2.2）：`validateOverrides(raw, specs, paramsFor)` 纯函数 + `loadValidationOverrides()` 薄包装（对齐既有 `loadSpecs(raw)`），使验收 12 的 fail-closed 分支可用合成数据测试，无需改真实文件 | controller 复查（可测性） |
+| 28 | **删除 `bodyIgnored` 字段与 `tag.all` 条目**（v2.3）：它的唯一引证 `tag.all` 是 json 但 **0 个 body 参数**，§四 的比对本就跳过——override 是**零效果的死配置**；实测 154 条里**没有任何接口**需要它（其余「body 语义与文档不符」的案例要么本就没有 body 表，要么该用 `relaxRequired`/`aliases` 精确表达）。零效果字段 = 「声明了但没人读」（与删 `keepRequired` 同一条理由），也违背 §五 自己的「override 是证据驱动的，不是预防性的」。安全审查第 12 条（bodyIgnored 禁用于 dangerous）随字段删除而**自动满足** | controller 复查（契约诚实性） |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `fileURLToPath(new URL('./params/<id>.json', import.meta.url))`
