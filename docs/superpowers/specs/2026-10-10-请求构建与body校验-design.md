@@ -4,8 +4,9 @@
 - **状态**：已批准（设计经用户逐节/逐题确认）。**v2.3** —— 经 6 路独立只读审查修订（v2）
   ＋ 用户两轮追问后 controller 逐行复读复查（v2.1 补 5 条遗漏、v2.2 修 4 处实测缺陷）
   ＋ 3 路对抗性证伪审查（v2.3 补 16 条契约/可实现性缺陷）＋ 第二轮 6 路全维度审查
-  （v2.3 再补 12 条：判据自相矛盾、模块初始化断言被实测证伪、联动文案不全等），
-  全部修订见 §十一（55 条）
+  （v2.3 再补 14 条：判据自相矛盾、模块初始化断言被实测证伪、联动文案不全等）
+  ＋ 收官自查（v2.3 再补 7 条：help 次序、warnings 合成次序、注入点等），
+  全部修订见 §十一（62 条）
 - **上游**：`docs/superpowers/specs/2026-10-09-后续交付路线图-design.md`（§二 B 节、§八.6/.7 遗留）、
   `docs/qiyu-cli-design.md`（§5.2 注册表与 ParamSpec、§5.3 元数据陷阱、§5.4 写接口与字段改名、§9.1 输出契约）、
   A 的交付物（`src/core/registry/params/*.json` 154 份 + `src/core/registry/specs.json` 154 条，合入 `main` `a3f1c17`）。
@@ -62,16 +63,22 @@
 ```
 1. 分离 flag 与位置参数（判据同 list/callOne：以 `-` 开头为 flag）
 2. 未知 flag（不在 {--pretty,--help,-h}）→ 2（点名）
-3. 位置参数 > 1 个 → 2（点名多出来的）
-4. help 请求（含 --help/-h）→ 输出 API_USAGE、退出码 0
-   —— ⚠️ help 优先于"缺 id"：`schema --help`（无 id）给帮助而非报错，
-      与 `callOne` 的 `api call --help` 同款（help 是"请求帮助"，不是"写错 id"）
+3. —— help 请求（含 --help/-h）在此**提前处理**，见下方 3a/3b（help 优先于"位置参数数量"与"缺 id"）
+   3a. help 请求**且**位置参数 > 0 个 → 2（`--help` 不吞额外参数，位置参数是多余的）
+   3b. help 请求**且**位置参数为 0 → 输出 API_USAGE、退出码 0
+       —— ⚠️ help 优先于"缺 id"：`schema --help`（无 id）给帮助而非报错，
+          与 `callOne` 的 `api call --help` 同款（help 是"请求帮助"，不是"写错 id"）
+4. 非 help 请求且位置参数 > 1 个 → 2（点名多出来的）
 5. --pretty → 2（尚未实现，同 list/callOne）
 6. 位置参数为 0 → 2（`用法：qiyu api schema <接口id>`）
 7. byId(id) → 未知 id → 2
 ```
 
-`--help` 不吞额外参数（与另两处一致）：`schema --help extra` → 2（extra 是多余位置参数）。
+⚠️ **次序的关键：help 判定必须在「位置参数 > 1」之前、且自身要检查位置参数**（v2.3 修正，见 §十一 第 56 条）。
+原写法把「位置参数 > 1 → 2」排在 help 前，导致 `schema --help extra`（只有 1 个位置参数）不触发该步、
+落到 help 给出**退出码 0** —— 与「`--help` 不吞额外参数」直接矛盾。三条输入的结果必须同时正确：
+`schema --help` → 0；`schema --help extra` → 2；`schema a --help` → 2（`a` 对 help 是多余位置参数）；
+`schema a b` → 2（非 help、位置参数 > 1）。
 
 **输出**（stdout，`ok(data, meta)` 形态，退出码 0）：
 
@@ -288,6 +295,9 @@ Agent 学不到稳定规则；`field` 字段独立承载字段名，`message` �
 「请求正常，无需重试」是这条警告唯一的安全价值——不得省略。
 
 `warnings` 的**顺序**：按 `params` 表顺序、再按 body 键的出现顺序（稳定，便于测试与 Agent 解析）。
+⚠️ **两来源的合成次序**（v2.3 定，见 §十一 第 58 条）：`meta.warnings = [...aliasWarnings, ...vr.soft]`
+——别名归一化在比对之前发生，其警告也排在前；两段各自内部按上述顺序规则。不定义则两种实现
+对 `{"bogus":1,"name":"q"}` 会输出互为逆序的数组，而单键验收杀不掉这个分歧。
 
 ### 错误分类（v2 新增，消解「usage 2 vs internal 1」冲突）
 
@@ -421,8 +431,10 @@ B 的硬拒消息里**不得**出现任何"需要人类确认"的暗示（那会
 
 1. **params 与真实服务端的偏差**（D2 的根源）：文档字段表与真实返回不一致是实测常态。因此
    B 的硬校验**只覆盖「缺必填 + 非对象 body」这一最不可能出错的子集**，其余降为提示。
-2. **`responseShape` 形态**（v2 新增说明）：设计稿 §5.2 是 `string`，A 产物是 `{kind}` 对象。
+2. **`response_shape` 形态**（v2 新增说明）：设计稿 §5.2（:260）是 `string`，A 产物是 `{kind}` 对象。
    **以 A 的产物为准**，B 原样透传、不改写。来源优先级：`params/*.json` 的 schema 由 A 定义。
+   ⚠️ 实测 154 份的 `responseShape` 恒为 `{"kind":"object"}`（150）/`{"kind":"none"}`（4），**从不是**字符串——
+   设计稿的 `string` 是 A 之前的历史形态（v2.3 补，见 §十一 第 59 条）。
 3. **`--strict` 的安全边界**（v2 新增）：`unknown_field` 的判定依赖 params 完整性，而文档常不全——
    故 `--strict` 的硬拒**可能误伤合法调用**（params 漏记了服务端实际接受的字段）。**「严格」≠「正确严格」**。
    文档/help 必须写明：`--strict` 只做「本地参数表闭集一致性检查」，不构成对服务端行为的保证。
@@ -496,7 +508,7 @@ B 上线后，**现有**多处文字会与代码矛盾，必须随实现一起�
 3. `qiyu api call ai.knowledge.addKnowledge --body '{"name":"x","answer":"y","similars":[],"validitySwitch":1,"categoryId":1}'`
    （**只缺** `robotId`；其余必填齐）→ **2、零网络请求**（mock fetch 断言未被调用）、stderr 点名 `robotId`、
    stdout `error.kind==="usage"` 且**不含** `confirm_required`。
-4. 同上 body 再加 `"bogus":1` → 仍 **2**（硬拒短路，**不**输出 warnings——验收 §四 的短路规则）。
+4. 同上 body 再加 `"bogus":1` → 仍 **2**（硬拒短路，**不**输出 warnings——§四 的短路规则）。
    ⚠️ 3/4 之所以是 2 而不是 4：`ai.knowledge.addKnowledge` 是**危险接口**，但 D5 让校验先于门禁——
    缺必填在本地拦下，根本走不到 `--yes` 门禁。这**正是** D5 的验收。
 5. **改用非危险接口** `ai.knowledge.search`（必填 body 字段仅 `robotId`，`dangerous:false`）：
@@ -597,6 +609,10 @@ B 上线后，**现有**多处文字会与代码矛盾，必须随实现一起�
     断言**不再**出现只列 `list|call` 的旧文本。
 33. **路线图 §八.7 标记关闭**（§八之二 第 3 条）：`docs/superpowers/specs/2026-10-09-后续交付路线图-design.md`
     里 §八.7 已标为「已关闭」。
+34. **`meta.warnings` 两来源的合成次序**（§四）：对同时触发 `alias_normalized` 与
+    `unknown_field`/`type_mismatch` 的 body（如 `{"bogus":1,"name":"q"}`），
+    `meta.warnings` 必须保持**稳定顺序**：`[...aliasWarnings, ...vr.soft]`，两段各自再按
+    「params 表顺序 → body 键出现顺序」。不定义会让两种实现输出互为逆序的数组。
 
 ## 十、测试计划（文件落点，v2 新增）
 
@@ -622,10 +638,15 @@ export interface ParamFile {
   responseShape: ResponseShape
 }
 /** 惰性读 + 缓存；缺文件/畸形 JSON/结构非法 → 抛 kind:'internal'（§四 错误分类）。
+ *  ⚠️ 第二个参数 `root` 是**注入的 params 根目录**（源码态 = `dist`/`src` 同构的
+ *  `.../core/registry/`，见下方加载机制），默认指向真实目录；**测试**把 root 指向
+ *  `mkdtempSync` 出的副本，以便构造「缺失/畸形」而不污染仓库真文件（见 §九 验收 13/26）。
+ *  同进程内 `root` 一经首次读取即并入缓存，测试须为不同 root 各起模块图
+ *  （`vi.resetModules()`），否则缓存会掩盖改动。
  *  ⚠️ 生产环境**每个 id 都有** params 文件（实测 154/154），故返回值**非 null**；
  *  「该接口没有 body 表可比对」（如 `tag.all`：json 但 0 body 参数）由**文件内容**表达，
  *  不由 null 表达 —— 调用方拿到 `ParamFile` 后按 `bodyKind` 与 body 参数数自行判定。 */
-export function loadParams(id: string): ParamFile
+export function loadParams(id: string, root?: string): ParamFile
 /** 运行时校验 params 文件结构（in/required/type/bodyKind 枚举；同名跨 in 护栏），失败即抛 */
 export function validateParamsFile(id: string, raw: unknown): ParamFile
 ```
@@ -657,7 +678,6 @@ export function validateBody(
 // src/commands/api.ts（`api schema` 的输出层加工，不是文件字段）
 /** `ParamSpec` 的浅复制 + `auto`：见 §三 `params` 说明。`auto` 只加给 query 里的鉴权参数 */
 export type SchemaParam = ParamSpec & { auto?: true }
-```
 ```
 
 ```ts
@@ -736,9 +756,17 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
   `call` 硬违规退出码与双通道、`--no-validate`/`--strict` 冲突、`meta.warnings` 两态、
   危险接口次序回归、`--no-validate` 不削弱门禁。
 - `tests/registry/generate.test.ts`（扩展）：`validate.json` 不进生成、确定性不变。
-- **测试基建**：统一 `beforeEach` 注入 `QIYU_APP_KEY`/`QIYU_APP_SECRET`（否则 `resolveCredentials`
-  先报 auth_missing，验不到请求路径）；`vi.stubGlobal('fetch', …)` 且硬违规用「被调用即失败」的 mock；
-  **不使用真实凭证/网络**。既有 350 用例若含计数哨兵需同步更新。
+- `tests/readme.test.ts`（新，v2.3 补，见 §十一 第 60 条）：读 `README.md` 断言 §八之二 第 1 条的
+  新文案在、旧表述（「不做字段校验」「无法校验」「不提供 params」）不在、「响应体不做校验」保留——
+  验收 23 的 README 部分落这里（原落点清单没有它，会变成无人执行的纸面条款）。
+- **测试基建**：
+  ⚠️ **凭证注入沿用既有 per-test 口径**（v2.3 修正，见 §十一 第 61 条）：现有 `api.test.ts` 是
+  **逐用例** `vi.stubEnv('QIYU_APP_KEY', …)` + `afterEach` 清空（19 处），且**存在反向用例**——
+  显式 stub 空串来测 `auth_missing`。若新测试文件用共享 `beforeEach` 统一注入凭证，必须
+  成对 `afterEach` 清空，且**不得**污染这类反向用例（否则「没发请求」的断言会假绿）。
+  需要凭证才能走到请求路径的用例沿用 per-test 注入（与现状一致）。
+  `vi.stubGlobal('fetch', …)` 且硬违规用「被调用即失败」的 mock；**不使用真实凭证/网络**。
+  既有 350 用例若含计数哨兵需同步更新。
 
 ## 十一、修订记录
 
@@ -805,6 +833,13 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 | 53 | **§八之二 第 3 条的「标记路线图 §八.7 已关闭」进验收**（v2.3）：原只写在联动段落、不在验收网内，按「交付清单式执行」会漏。列为验收 33 | 上游一致性 |
 | 54 | **硬拒消息合成规则**（v2.3）：`merchant.account.login` 三者全缺时同时触发「userName 缺必填」与「one-of 组全缺」两条硬违规，原文未定义聚合——实施者若「只报第一条」会导致 Agent 补完 userName 后再撞 one-of。补：`vr.hard` 每条各一行、按规则序拼接、不短路；验收 6 相应加强 | 契约诚实性 |
 | 55 | **验收 19 别名改写关闭的验证改用危险接口**（v2.3）：原文说「用非危险的等价场景验」，但 override 表里 `aliases` **只有** `editKnowledgeNoSimilars`（危险），不存在非危险替身——该验收落不了地。改为对 `editKnowledgeNoSimilars --yes --no-validate` 断言 mock fetch 收到 `name`、不含 `question` | 可实现性 |
+| 56 | **§三 `schema` 7 步次序修正 help 与位置参数的先后**（v2.3 复查）：原文把「位置参数 > 1 → 2」排在 help 之前，导致 `schema --help extra`（1 个位置参数）不触发该步、落入 help 给出**退出码 0**——与「`--help` 不吞额外参数」直接矛盾。改为 help 提前处理、且自身检查位置参数（3a/3b）；四条输入 `--help` / `--help extra` / `a --help` / `a b` 结果同时正确 | 内部自洽（controller 复查） |
+| 57 | **`loadParams` 增可注入的 `root` 参数**（v2.3 复查）：验收 13/26 要构造「params 缺失/畸形」而不污染仓库真文件，原签名无注入点、实施者只能改真文件（会被缓存与工作区污染反噬）。补 `loadParams(id, root?)`（默认真实目录、测试指向 `mkdtempSync` 副本），并注明缓存与 `vi.resetModules()` 的关系；§十.0 的加载机制代码同步 | 可实现性（controller 复查） |
+| 58 | **§四 定 `meta.warnings` 两来源的合成次序**（v2.3 复查）：`alias_normalized`（来自 `normalizeAliases`，比对前发生）必须排在 `vr.soft` 之前——`meta.warnings = [...aliasWarnings, ...vr.soft]`；两段各自再按「params 表顺序 → body 键出现顺序」。不定义则两种实现输出互为逆序。列为验收 34 | 契约诚实性 + 可实现性 |
+| 59 | **§八.2 补 `responseShape` 实测分布**（v2.3 复查）：实测 154 份的 `responseShape` 恒为 `{"kind":"object"}`（150）/`{"kind":"none"}`（4），从不是字符串——设计稿的 `string` 是 A 之前的历史形态 | 事实对拍 |
+| 60 | **§十.1 补 `tests/readme.test.ts` 落点**（v2.3 复查）：验收 23 的 README 部分原先无测试落点，按「交付清单式执行」会变成纸面条款 | 可实现性 |
+| 61 | **§十.1 修正凭证注入口径**（v2.3 复查）：原文说「统一 `beforeEach` 注入」，但现有 `api.test.ts` 是 per-test `vi.stubEnv`（19 处）且有反向用例（显式 stub 空串测 `auth_missing`）。改为：沿用 per-test 注入；新文件若用 `beforeEach` 必须成对清空、不得污染反向用例 | 可实现性 |
+| 62 | **修 §九 验收 4 的措辞**（v2.3 复查）：「验收 §四 的短路规则」会把读者指向不存在的「§四 验收」；应为「§四 的短路规则」 | 内部自洽 |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `fileURLToPath(new URL('./params/<id>.json', import.meta.url))`
