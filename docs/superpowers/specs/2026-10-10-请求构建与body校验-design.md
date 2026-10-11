@@ -3,7 +3,9 @@
 - **日期**：2026-10-10
 - **状态**：已批准（设计经用户逐节/逐题确认）。**v2.3** —— 经 6 路独立只读审查修订（v2）
   ＋ 用户两轮追问后 controller 逐行复读复查（v2.1 补 5 条遗漏、v2.2 修 4 处实测缺陷）
-  ＋ 3 路对抗性证伪审查（v2.3 补 16 条契约/可实现性缺陷），全部修订见 §十一（43 条）
+  ＋ 3 路对抗性证伪审查（v2.3 补 16 条契约/可实现性缺陷）＋ 第二轮 6 路全维度审查
+  （v2.3 再补 12 条：判据自相矛盾、模块初始化断言被实测证伪、联动文案不全等），
+  全部修订见 §十一（55 条）
 - **上游**：`docs/superpowers/specs/2026-10-09-后续交付路线图-design.md`（§二 B 节、§八.6/.7 遗留）、
   `docs/qiyu-cli-design.md`（§5.2 注册表与 ParamSpec、§5.3 元数据陷阱、§5.4 写接口与字段改名、§9.1 输出契约）、
   A 的交付物（`src/core/registry/params/*.json` 154 份 + `src/core/registry/specs.json` 154 条，合入 `main` `a3f1c17`）。
@@ -97,8 +99,7 @@
   },
   "meta": {
     "endpoint": "ai.knowledge.search",
-    "field_notes": { "…": "…" },
-    "note": "…（该接口 specs.json 里有 note 才输出）"
+    "field_notes": { "…": "…" }
   }
 }
 ```
@@ -135,10 +136,14 @@
 - `in: "path"`/`in: "header"` 参数照原样输出、标原值（Apifox 原貌，B 不消费）。
 - `meta.field_notes` —— 解释**本输出**中所有非自明键的含义（与 `api list` 同款约定：键 =
   本子命令输出的字段名，两条子命令的键集各自独立，Agent 不应跨子命令套用）。至少含：
-  `has_body_schema`（=「有可比对的表」，**不代表**本次已校验）、`body_kind`、`auto`
-  （CLI 自填的鉴权参数，调用方不要传）、`dangerous`（true → 调用需 `--yes`，否则退出码 4）、
-  `response_shape`（**仅供参照，不做校验**）、`one_of`（若输出）。只输出不解释 = 没输出
-  （v2.3 扩围，见 §十一 第 34 条）。
+  `has_body_schema`（=「有可比对的表」，**不代表**本次已校验；且**只有 `body_kind === 'json'`
+  且该接口有 body 参数时才为 true**——其余 bodyKind 一律 false）、`body_kind`（含「**只有 `json`
+  会被 `api call` 比对字段，其余原样透传不校验**」）、`auto`（CLI 自填的鉴权参数，调用方不要传）、
+  `dangerous`（true → 调用需 `--yes`，否则退出码 4；⚠️ 措辞**不得**出现「加 `--yes` 重来」式指引——
+  见 §六 安全审查，须复用 `needs_confirmation` hint 的「**必须由人类确认，不要自动追加 `--yes`**」口径）、
+  `callable`（false = 结构上不可主动调用）、`path`（null = 路径未收录；`"/"` = 入站占位符——
+  与 `api list` 的 `path` 说明同源）、`response_shape`（**仅供参照，不做校验**）、`one_of`（若输出）。
+  只输出不解释 = 没输出（v2.3 扩围，见 §十一 第 34 条、第 48 条）。
 - `callable: false` 的接口 `api schema` **照常输出、退出码 0**（查 schema 不是调用；纯本地读，
   不经 `assertCallable`）——见 §九 验收 14。
 - 未知 id → 与 `api call` 同一条 `byId` 抛错 → 用法错误、退出码 2、stdout JSON + stderr 文本。
@@ -157,10 +162,11 @@
 命令行门（未知/位置 → help → --pretty，body JSON.parse）
 → byId(id)                          // 未知 id → 2（既有）
 → assertCallable(spec)              // 不可调用 → 2（既有）
+→ assertNoValidateStrictConflict()  // 互斥 → 2（v2.3 排进次序，见 §十一 第 49 条）
 →【B】file = loadParams(spec.id)    // 缺文件/畸形 → kind:'internal' → 1
        ov   = overrides[spec.id]
-       ({ body, warnings } = normalizeAliases(file, body, ov))   // body 被改写（D8）
-       vr   = validateBody(spec, file, body, ov, { strict })     // 硬违规 → 2，零网络请求
+       ({ body, warnings } = normalizeAliases(file, body, ov))   // body 被改写（D8）；冲突 → 抛普通 Error → 2
+       vr   = validateBody(spec, file, body, ov, { strict })     // 返回 {hard, soft}；hard 非空 → 抛普通 Error → 2
 → assertConfirmed(spec, --yes)      // 危险未确认 → 4（既有，D5）
 → 凭证解析 → call(spec, body)       // ⚠️ 必须用**改写后**的 body（见下）
 ```
@@ -204,6 +210,11 @@
   `has_body_schema: false` 让 Agent **调用前**就知道「本接口没有可查的参数表」；
   `api call` 侧**不**为此加 warning（那会是「声明了没人读」的装饰，且对 `bodyKind: none`
   的合法调用稳定误报）。见 §十一 第 36 条。
+  ⚠️ **「先按 `bodyKind` 分流」与「0 body 表则形状不判」的优先级**（v2.3 澄清，见 §十一 第 45 条）：
+  分流**先于**形状表——`bodyKind !== 'json'` 的接口**根本不进**顶层形状表（形状表只对 json 接口生效）。
+  故 `bodyKind: none` 传对象 body → 只出 `non_json_body`（软）；`bodyKind: none` 传标量 → 同样只出
+  `non_json_body`（**不**硬拒）；`bodyKind: json` 但 0 body 表 → 形状也不判（静默）。
+  三条规则串起来才得到这些结论，实施者不得把「形状表」当成对所有 bodyKind 生效。
 
 ### 硬（退出码 2、发不出请求；经 `callOne` 既有 catch 的 usage 出口，stdout JSON + stderr 文本）
 
@@ -267,8 +278,8 @@ Agent 学不到稳定规则；`field` 字段独立承载字段名，`message` �
 | kind | `field` | `message` 必须说清 |
 |---|---|---|
 | `unknown_field` | 未知字段名 | 「该字段不在本接口的文档参数表中，**服务端可能忽略它**」 |
-| `type_mismatch` | 不符字段名 | 「声明类型 `<type>`，实际是 `<实际类型>`」（两者都要有） |
-| `non_json_body` | 无 | 「本接口 bodyKind 是 `<kind>`，你的 `--body` 已被**原样发送、未经字段校验**」 |
+| `type_mismatch` | 不符字段名 | 「声明类型 `<type>`，实际是 `<实际类型>`」（两者都要有；`<实际类型>` 用固定词汇 `null`/数组/`string`/`number`/`boolean`/`object` 之一渲染，**不**直接用 `typeof`——`typeof null`、`typeof []` 都是 `object`，会与实际不符） |
+| `non_json_body` | 无 | 「本接口 `body_kind` 是 `<kind>`，你的 `--body` 已被**原样发送、未经字段校验**」 |
 | `alias_normalized` | 源字段名 | 「`<源>` 已按本接口约定改写为 `<目标>` 发送；**请求正常，无需重试**」 |
 
 ⚠️ **`alias_normalized` 必须显式写"无需重试"**：它是**信息性**事件（退出码 0 的成功调用）。
@@ -283,6 +294,14 @@ Agent 学不到稳定规则；`field` 字段独立承载字段名，`message` �
 - **硬校验违规**（`validateBody` 抛出的普通 `Error`，**不挂 `kind`**）→ 落进 `callOne` catch 的
   usage 兜底分支 → 退出码 **2**、双通道（stdout JSON + stderr 文本）。实现**不得**给它挂
   `kind: 'internal'`/`'validation'` 之类，否则会走业务错误分支变成退出码 1。
+  ⚠️ **别名冲突的抛错同属此类**（v2.3 补，见 §十一 第 47 条）：`normalizeAliases` 的源/目标键冲突
+  也是**普通 `Error`、不挂 `kind`**，同样落 usage 出口 → 2。§六 的「alias 冲突 → 2」依赖这条。
+  ⚠️ **抛错主体在 `callOne`，不在 `validateBody`**（v2.3 澄清，见 §十一 第 50 条）：`validateBody`
+  是**纯函数、返回 `{hard, soft}`、不抛**；由 `callOne` 在 B 块内检查 `vr.hard.length > 0` 后
+  `throw new Error(拼接后的硬违规消息)`（普通 `Error`，不挂 `kind`）。这样 `ValidateResult.hard`
+  与错误分类不冲突，且单元测试可以直接断言 `vr.hard` 内容而不必包 `toThrow`。
+  `normalizeAliases` 的冲突则**必须抛**（它是纯函数、无返回值语义），`callOne` 让它落进同一个
+  catch 出口即可——两处的**分类规则一致**：都是「普通 Error、不挂 kind、→ 2」。
 - **params 文件缺失/畸形、override 加载失败**（打包缺陷，**不是**调用方写错）→ 抛带
   `kind: 'internal'` 的 `Error` → 落进 catch 的 `err.kind && err.kind !== 'usage'` 分支 →
   退出码 **1**（业务错误，只出 stdout JSON，不出 stderr）。**绝不**报成 usage 2（那会让 Agent
@@ -364,25 +383,33 @@ Agent 学不到稳定规则；`field` 字段独立承载字段名，`message` �
 | 情形 | 退出码 | 说明 |
 |---|---|---|
 | 硬校验违规（非对象 body / 缺必填含 one-of / strict 下 unknown·type / alias 冲突） | **2** | 用法错误，双通道，经 catch 的 usage 出口（普通 `Error`，不挂 kind） |
-| `--no-validate` 与 `--strict` 同传 | **2** | 互斥（v2） |
+| `--no-validate` 与 `--strict` 同传 | **2** | 互斥（v2）；**排在 B 块之前、`assertConfirmed` 之前**（见 §四 次序） |
 | 未知 id / 不可调用 / `--body` 非法 JSON / 未知 flag | 2 | 既有 |
-| **params 文件缺失或畸形 / override 加载失败** | **1** | internal（打包缺陷），挂 `kind:'internal'`，只出 stdout |
+| **params 文件缺失或畸形 / override 加载失败** | **1** | 分两形态：**命令执行期**挂 `kind:'internal'`、只出 stdout（§四 错误分类）；**模块初始化期**（`validate.json`/`specs.json` 损坏）= 未捕获异常、stdout 空、stderr 堆栈（§十.0，B 不改变既有行为） |
 | 危险未确认 | 4 | 既有；B 的硬校验在其**之前**（D5） |
 | 软警告请求成功 | 0 | `meta.warnings` 随成功 meta 输出 |
 
 `API_USAGE` 增补：`schema` 子命令行、`--no-validate`、`--strict`。
+⚠️ **`API_USAGE` 不是唯一会失真的字符串**（v2.3 补，见 §十一 第 51 条）：`api.ts` 里还有
+**子命令清单**（`qiyu api <list|call>`、`可用子命令：list、call` 两处）与 `callOne` 的**未知参数提示**
+（`可用：--body <JSON>、--yes`）——B 之后必须把 `schema`、`--no-validate`、`--strict` 一并列出，
+否则 Agent 读到的是**事实错误**的子命令/flag 清单（本仓对「说明文字不能与事实相反」有前科式敏感）。
+同样，`cli.ts` 的顶层 `USAGE` 子命令表与 `README` 命令一览也要同步（见 §八之二）。
 `KNOWN` 集合：**只给 `callOne` 加** `--no-validate`/`--strict`（`api list` 不校验 body）；
 `schema` 有独立 `KNOWN`（`--pretty`/`--help`/`-h`）。
 
-**红线（安全审查确认，须测试钉死）**：`--no-validate` **只**关闭 B 的校验与 warnings，
-**绝不**影响 `assertConfirmed`——危险接口带 `--no-validate`、body 任意或缺失、**无 `--yes`** 时
-**仍返回 4**。见 §九 验收 17。
+**红线（安全审查确认，须测试钉死）**：`--no-validate` **只**关闭 B 的校验、别名归一化与 warnings，
+**绝不**影响 `assertConfirmed`——危险接口带 `--no-validate`、body **为合法 JSON 的任意值或缺失**、
+**无 `--yes`** 时**仍返回 4**（非法 JSON 仍是 2，见 §九 验收 17）。见 §九 验收 17。
 
 ⚠️ **退出码 2 与 4 的语义分工必须让 Agent 分得清**（安全审查建议）：**2 = 参数写错了，改参数重来，
 不需要人类介入**；**4 = 不可逆操作，必须停下向人类确认**。D5（校验先于门禁）会让一个"危险接口 +
 缺必填 + 无 `--yes`"的调用先得到 2——这是**有意的**：Agent 该先修参数，修好后**必然**撞上 4 才去问人。
-B 的硬拒消息里**不得**出现任何"需要人类确认"的暗示（那会把 2 与 4 混淆）；`API_USAGE` 的退出码说明
-沿用既有的「2 用法错误 · 4 需要 --yes」，不新增歧义。
+B 的硬拒消息里**不得**出现任何"需要人类确认"的暗示（那会把 2 与 4 混淆）。
+⚠️ **「2 = 改参数重来」有既存例外**（v2.3 补，见 §十一 第 52 条）：`auth.ts` 已记录一类
+「换任何参数都过不了」的 2（如「接口不可主动调用」「`auth login` 未实现」）——B 的硬拒**都属于可修类**
+（消息指引 `api schema`），但 `API_USAGE` 的退出码说明应沿用既有文本，不新增歧义、也不宣称
+「所有 2 都能靠改参数解决」。
 
 ## 七、`category` 处置（路线图 §八.6 的 B 侧答案）
 
@@ -405,27 +432,31 @@ B 的硬拒消息里**不得**出现任何"需要人类确认"的暗示（那会
    「引用必须存在」（§五）、新增条目必须带证据并逐条测试。
 6. **`has_body_schema` 的判据分叉**（§三/§四）：`body_kind === 'json'` 与「body 表非空」不总一致。
    实现与测试必须分别钉住这两个条件，合并成一个布尔会造出「json 但无表」时声称 validated 的谎言。
-   ⚠️ **判据是「body 参数数 > 0」，与 bodyKind 无关**（v2.3 澄清）：实测 154 里有 **5 个**
-   `bodyKind: json` 却 0 body 参数（`tag.all`、`tag.batchUpdate`、`track.event.set`、
+   ⚠️ **判据是 `bodyKind === 'json' 且 body 参数数 > 0`（合取式），两个条件缺一不可**（v2.3 澄清，见 §十一 第 44 条）：
+   实测 154 里有 **5 个** `bodyKind: json` 却 0 body 参数（`tag.all`、`tag.batchUpdate`、`track.event.set`、
    `ipcc.calltaskdetail.update/delete`）——它们 `has_body_schema: false`、**不比对**（§四 静默通过边界）。
-   4 个是危险接口，故本 spec 的验收**只用 `tag.all`**（唯一非危险的那个）。反过来，
-   `kefu.add` 是 `bodyKind: xml` 却有 14 个 body 参数——仍 `has_body_schema: false`（D4 只校验 json）。
-   ⚠️ 因此**测试禁止用 `has_body_schema === (bodyKind === 'json')` 做断言**（该式在 9 个接口上为假）。
+   4 个是危险接口，故本 spec 的验收**只用 `tag.all`**（唯一非危险的那个）。另一侧同样有反例：
+   `kefu.add` 是 `bodyKind: xml` 却有 14 个 body 参数——仍 `has_body_schema: false`（**只按参数数判就会给 true**）。
+   ⚠️ 因此**测试禁止把 `has_body_schema` 写成单一条件的推断**（`=== (bodyKind === 'json')` 在 **5** 个接口上为假、
+   写成 `> 0` 又在 **5** 个非 json 接口上为假——两个方向的等价变异体都要钉住），且**不得**由上层把
+   `bodyKind` 预先"过滤"后再把判定简化成单条件。
 7. **同名字段跨 `in`**（理论边界）：实测 0 个，但加载期仍应加护栏——同一接口里同一 `name`
    不得同时出现在 `in: "body"` 与 `in: "query"`（否则 `(name,in)` 身份歧义）。属防御性检查。
 
 ## 八之二、联动文案修正（契约诚实性审查：B 合入后不改这些文字就是「说了假话」）
 
-B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起改（**这是 B 的交付内容，不是可选项**）：
+B 上线后，**现有**多处文字会与代码矛盾，必须随实现一起改（**这是 B 的交付内容，不是可选项**）：
 
 1. **`README.md:149`** —— 现值：「请求参数校验：`api call` 的 `--body` 不做字段校验，也**无法**校验」。
    B 之后应改为（逐字建议）：
    > 请求参数校验：`api call` 的 `--body` 会与注册表参数表比对——**缺必填字段会拒绝**
    > （退出码 2），未知字段/类型不符会以 `meta.warnings` 提示（`--strict` 可升级为拒绝，
-   > `--no-validate` 可关闭）。参数表见 `qiyu api schema <id>`。
+   > `--no-validate` 可关闭）。参数表见 `qiyu api schema <id>`（`data.params`、`data.response_shape`）。
    > ⚠️ 校验只依据文档生成的参数表，**不构成对服务端行为的保证**；**响应体不做校验**。
    > ⚠️ 校验发生在**危险接口确认门禁之前**：危险接口即使 body 合法，仍会返回 **4**（需要 `--yes`）——
    > 校验通过 ≠ 可以直接发出，写接口仍需显式确认。
+   > ⚠️ **校验只对 `body_kind` 为 `json` 且有 body 参数表的接口生效**；其余 bodyKind（xml/multipart/text/form/none）
+   > 一律原样透传、不做字段比对（只出 `non_json_body` 提示）。
 2. **`src/commands/api.ts` 的 `field_notes.request_schema`**（`api list` 的 meta）——
    现值：「本 meta **不提供**接口的请求参数表（`params`）与响应形状（`responseShape`）……本 CLI
    无法校验其字段是否正确」。
@@ -433,6 +464,7 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
    > 本 meta 不含参数表（体积考虑）；用 `qiyu api schema <id>` 查该接口的 `params`/`response_shape`。
    > `api call --body` 会做**有限**校验（缺必填拒绝、未知字段/类型提示）——见 `api schema` 的
    > `meta.field_notes`。⚠️ **响应体不做校验**，`response_shape` 仅供参照。
+   > ⚠️ 传错的字段可能被服务端以 **14004** 拒绝，也可能被**静默忽略**——**别把「返回成功」当作「字段写对了」**。
 
    ⚠️ **键名口径统一**：上面两处建议文案一律写 **`response_shape`**（下划线）——那是
    `api schema` 输出里的**实际键名**；旧文里的 `responseShape` 是设计稿 §5.2 的 TS 字段名，
@@ -440,7 +472,17 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
    ⚠️ **不得只机械删旧句**：旧句里「无法校验」是当时的事实，删掉后必须补上**新的事实**（校验了什么、
    没校验什么），否则会从「说了假话」变成「什么都没说」，而 Agent 无从判断边界。特别是
    **响应体仍不校验**这一点必须保留——否则 Agent 会以为 `response_shape` 被用上了。
-3. 路线图 §八.7（「params 无运行时消费方」）在 B 合入后应标记为**已关闭**。
+   ⚠️ **旧句里「静默忽略 / 成功 ≠ 字段写对」两句在 B 之后仍然为真**（B 的软警告只在调用时提示，
+   `api list` 这层的全局警示不能丢）——新文案已补回。
+3. **路线图 §八.7（「params 无运行时消费方」）在 B 合入后应标记为已关闭**（v2.3 补，见 §十一 第 53 条）。
+   ⚠️ 该动作**必须进验收判据**（验收 23 增补），否则「交付清单式执行」会漏掉它。
+4. **`src/commands/api.ts` 的子命令清单与 flag 清单**（v2.3 补，见 §十一 第 51 条）——
+   `qiyu api <list|call>` 用法行、`可用子命令：list、call`（两处）、`callOne` 的
+   `可用：--body <JSON>、--yes` 提示，B 之后都要补上 `schema`、`--no-validate`、`--strict`。
+5. **`src/cli.ts` 的顶层 `USAGE` 子命令表**（v2.3 补）——`api list` / `api call` 两行之后补 `api schema`。
+6. **`README` 命令一览与「已实现」清单**（v2.3 补）——`qiyu api schema <id>` 进命令一览；
+   「已实现」清单补「body 分级校验」「`api schema`」。
+7. **`CHANGELOG.md`**（v2.3 补）——按其自身规则（「所有重要变更都会记录在此文件」）补 B 的条目。
 
 
 ## 九、验收判据（spec 级，供实施计划展开为测试）
@@ -461,7 +503,11 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
    `--body '{"robotId":1,"bogus":1}'` → **0**，`meta.warnings` 含 `{kind:"unknown_field", field:"bogus"}`。
    （不用 addKnowledge：它是危险接口，合法 body 会撞 `--yes` 门禁返回 4，验不到「软警告 + 成功」。）
 6. `merchant.account.login`（**危险接口，须加 `--yes`**）只传 `userName+code`（缺 `shopCode`）→ **0**
-   （one-of 满足、不误拒）；三者全缺 → 2 且消息来自 override 的 `message`（缺必填在校验期拦下，早于门禁）。
+   （one-of 满足、不误拒）；三者全缺 → 2，且消息**同时**包含：① override 的 `message`（组全缺）
+   ② 缺失的**单个**必填字段名 `userName`（它不在 one-of 组内、relax 后仍必填）。
+   ⚠️ 硬拒消息的**合成规则**（v2.3 定，见 §十一 第 54 条）：`vr.hard` 里**每条硬违规各一行**、
+   按规则序拼接（组消息与单字段消息都出现），**不**做「只报第一条」短路——否则 Agent 补完
+   `userName` 后还会再撞 one-of，多烧一轮且第二条消息未点名 `userName`。
 7. `ai.knowledge.editKnowledgeNoSimilars`（危险接口，加 `--yes`）传
    `--body '{"id":1,"robotId":2,"name":"q","answer":"a","validitySwitch":1,"categoryId":1,"ruleType":0,"channelAnswers":[]}'`
    （用源键 `name`，其余必填齐）→ **0**；`meta.warnings` 含 `{kind:"alias_normalized", field:"name"}`，
@@ -469,6 +515,10 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
    同 body 再加 `"question":"q2"`（源键与目标键都在）→ **2**（歧义硬拒）。
 8. `qiyu api call tag.all --body '{"foo":"bar"}'` → **0**，**不出** `unknown_field`——因为 `tag.all`
    有 0 个 body 参数（`has_body_schema:false`），§四 的比对本就跳过（无需任何 override）。
+   ⚠️ **形状也不判**：再验 `tag.all --body '[]'` / `'null'` → **0、仍不硬拒**（见 27）——
+   `has_body_schema:false` 的接口连形状都不比对，这是本 spec 的有意边界。
+   另验 **`api schema tag.all`** → `has_body_schema:false`、`body_kind:"json"`（判据是合取式，
+   不是「json 就 true」——见 §八.6）。
 9. **非 json body**（用**非危险**的 `icoutcall.phone.getLineList`，`bodyKind:"none"`、`callable`、`dangerous:false`）：
    带 `--body '"x"'` → **0**、`meta.warnings` 含 `{kind:"non_json_body"}`、请求照发（mock）。
    （⚠️ 不用 `kefu.add`：它是危险接口，不带 `--yes` 会返回 4，验不到「警告 + 成功」。xml 的透传路径
@@ -483,24 +533,33 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
     → 抛；`aliases` 的目标键不存在 / 源键恰是 body 字段 → 抛。消息点名接口 id 与字段名。
     ⚠️ **测试方式**：这些分支用**合成数据**直接调纯函数 `validateOverrides(raw, specs, paramsFor)`
     （§十.0 两段式），**不**去改真实的 `validate.json`（模块级常量，改了要重启进程，且会污染其他用例）。
-    另有一条**集成级**验收：`loadValidationOverrides()` 的模块初始化失败 → 由 `cli.ts` 入口
-    `.catch()` 兜住 → 退出码 **1**、`kind:"internal"`、**不出现未捕获堆栈**（§十.0 加载时机第 1 条）。
+    另有一条**集成级**验收：`loadValidationOverrides()` 的模块初始化失败 → 退出码 **1**、
+    **stderr 含堆栈、stdout 为空**（模块求值期抛错，入口 `.catch()` 兜不住——§十.0 加载时机第 1 条）。
+    ⚠️ 这条与「命令执行期的 `internal` → 退出码 1 + stdout JSON」是**两种不同的失败形态**，
+    测试与 Agent 都不得混为一谈。
 13. **params 文件缺失/畸形** → 退出码 **1**、`kind:"internal"`、**不是** usage 双通道
-    （构造：对某接口临时移除/改坏 `params/<id>.json`，断言 call 与 schema 行为一致）。
+    （构造：**经注入的 params 根目录**临时移除/改坏 `params/<id>.json`，断言 call 与 schema 行为一致）。
+    ⚠️ 不得直接改仓库里的真文件（会污染工作区、且 `loadParams` 的缓存让同进程内改文件读不到）。
 14. `qiyu api schema crm.modifyOrder`（`callable:false`）→ **0**，输出照常（不经 `assertCallable`）。
 15. `--no-validate --strict` 同传 → **2**。
 16. `--body '{"robotId":null}'`（用非危险的 `ai.knowledge.search`，必填 `robotId` 值为 null）：
     普通模式 → **0** + `type_mismatch`；`--strict` → **2**。钉住「存在 ≠ 通过」。
-17. **红线**：危险接口带 `--no-validate`、body 任意/缺失、无 `--yes` → **4**（`--no-validate` 不削弱门禁）。
+17. **红线**：危险接口带 `--no-validate`、body 为**合法 JSON 的任意值或缺失**、无 `--yes` → **4**
+    （`--no-validate` 不削弱门禁）。⚠️ 「任意」**不含非法 JSON**——`--body` 的 `JSON.parse` 在 B 之前，
+    非法 JSON 恒 → 2（B 不改这条既有行为，`--no-validate` 也不豁免）。
+    本条须同时断言 `fetch` **未被调用**（与硬违规同款 mock 约定）。
 18. `--body '[]'` / `'null'` / `'"x"'` 对「有 body 表」的**非危险**接口（`ai.knowledge.search`）→ **2**
     （非对象硬拒，先于门禁）；对 0 body 表的**非危险**接口（`icoutcall.phone.getLineList`）→ 不因形状报错。
     ⚠️ 不用 `export.session`（危险接口，形状不报错也会撞门禁返回 4）。
 19. `--no-validate` 下 B 完全静默（用**非危险**接口验，否则会撞门禁返回 4）：
     对 `ai.knowledge.search` 传 `--body '{}'`（缺 `robotId`）→ 不再硬拒，**请求照常构造并交给
     `call()`**（断言 mock 的 `fetch` **已被调用**，即 `call()` 确实走到网络层；测试中**不产生真实网络流量**）；
-    9 的 `non_json_body`、7 的 `alias_normalized` 等 warnings 一律不再输出；
-    7 的别名改写也不再发生（`name` 原样发送，用非危险的等价场景验）。
-    **危险接口仍需 `--yes`**（见 17）。
+    9 的 `non_json_body`、7 的 `alias_normalized` 等 warnings 一律不再输出。
+    **别名改写也不再发生**——但**不用**「非危险的等价场景」验（v2.3 修正，见 §十一 第 55 条）：
+    当前 override 表里 `aliases` **只有** `editKnowledgeNoSimilars`（危险接口），不存在非危险替身。
+    改为：对 `editKnowledgeNoSimilars` 加 `--yes --no-validate`，断言 mock fetch 收到的 body
+    **含 `name` 键、不含 `question` 键**（改写确实被关闭）——危险接口在此无妨（门禁由 `--yes` 放行，
+    与验收 17 同款结构）。
 20. `--strict` 下 5（`ai.knowledge.search` 带 `bogus`）→ **2**；9 的 `non_json_body`、7 的 `alias_normalized`
     仍只提示（D7）。
 21. **生成确定性不受影响**：`validate.json` 不进生成输出；`generate.mjs` 重跑后 `specs.json` 与
@@ -521,6 +580,23 @@ B 上线后，**现有**两处文字会与代码矛盾，必须随实现一起�
 26. **`api schema` 的 internal 出口**（§三/§四 错误分类）：对某接口临时移除/改坏
    `params/<id>.json` 后 `qiyu api schema <id>` → **1**、`kind:"internal"`、`retryable:false`、
    **stderr 空**；与验收 13 的 `api call` 行为**逐字段一致**（同一出口，不是两份实现）。
+27. **0 body 表的 json 接口形状不判**（§四 边界）：`tag.all --body '[]'` / `'null'` / `'"x"'`
+   → **0、无 warning、不硬拒**（`has_body_schema:false` → 形状表不生效）。
+28. **`type_mismatch` 的 `<实际类型>` 渲染**（§四 message 表）：`ai.knowledge.search --body '{"robotId":null}'`
+    的 warning message 必须含「实际是 `null`」（**不是** `object`）；`--body '{"robotId":[]}'` → 「实际是 数组」；
+    `--body '{"robotId":"1"}'` → 「实际是 `string`」。钉住渲染词汇，防 `typeof` 泄漏。
+29. **`--strict` 硬拒的消息带字段名**（§四）：`ai.knowledge.search --strict --body '{"robotId":1,"bogus":1}'`
+    → **2**，stderr/消息**点名 `bogus`**（不能只有一个无字段名的 «usage 错误»——Agent 需知道改哪个键）。
+30. **别名冲突消息**（§四）：`editKnowledgeNoSimilars --yes --body`（同时含 `name` 与 `question`）
+    → **2**，消息要求「只传其一」（不预设谁优先）。
+31. **`no_json_body`/`alias_normalized` 在危险接口成功响应里也照出**（§四）：危险接口带 `--yes`
+    成功时，若触发这两类 warning，`meta.warnings` 照常输出（信息性，不代表失败）。
+32. **子命令/flag 清单文案**（§八之二 第 4–6 条）：`qiyu api --help` 的 `API_USAGE`、
+    `api.ts` 的 `可用子命令：list、call`、`callOne` 的 `可用：--body <JSON>、--yes`、
+    `cli.ts` 的 `USAGE`、`README` 命令一览——均含 `schema`/`--no-validate`/`--strict`；
+    断言**不再**出现只列 `list|call` 的旧文本。
+33. **路线图 §八.7 标记关闭**（§八之二 第 3 条）：`docs/superpowers/specs/2026-10-09-后续交付路线图-design.md`
+    里 §八.7 已标为「已关闭」。
 
 ## 十、测试计划（文件落点，v2 新增）
 
@@ -567,9 +643,10 @@ export function normalizeAliases(
 ): { body: unknown; warnings: Violation[] }
 /** 纯函数：顶层形状契约 + 硬/软规则；不碰 I/O。
  *  `file` 为 `loadParams` 的结果（生产非 null）；`ov` 为该接口的 override（可能 undefined）。
- *  ⚠️ `hasBodySchema` 的判据是「`file.params` 里 `in==='body'` 的个数 > 0」，**与 `bodyKind` 无关**
- *  （§八.6：5 个 `json` 接口 0 body 参数、`kefu.add` 是 `xml` 却有 14 个 body 参数）——
- *  实现必须由这个函数从 `file` 现算，**不要**另存一个可能与 `bodyKind` 混同的布尔。 */
+ *  ⚠️ `hasBodySchema` 的判据是**合取式**「`file.bodyKind === 'json'` 且 body 参数数 > 0」（§三 / §八.6：
+ *  5 个 `json` 接口 0 body 参数、`kefu.add` 是 `xml` 却有 14 个 body 参数——两个条件缺一不可）。
+ *  实现必须由这个函数从 `file` 现算，**不要**另存一个可能与单一条件混同的布尔（单向化会造出
+ *  「json 但无表」声称 validated、或把 xml 有表接口误判有表两种谎言）。 */
 export function validateBody(
   spec: EndpointSpec, file: ParamFile, body: unknown,
   ov: ValidationOverride | undefined, mode: { strict: boolean },
@@ -629,6 +706,14 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 
 1. **失败即模块初始化抛错** → 由 `cli.ts` 入口的 `.catch()` 兜住 → 退出码 **1**、`kind:'internal'`
    （不是未捕获堆栈）。验收 12 的「启动即抛」指的是这一层。
+   ⚠️ **这条断言是错的**（v2.3 修正，见 §十一 第 46 条）：ESM 下静态 `import` 的依赖在**模块求值期**
+   抛错时，入口模块体还没执行，`cli.ts` 的 `.catch()` 根本没注册——**兜不住**。实测（最小探针 +
+   真实 dist 副本改坏 `specs.json`）：stdout **0 字节**、stderr 是原生堆栈、退出码 1。
+   故本条改为：**失败 = 未捕获异常**（与 `specs.json` 的既有行为**逐字一致**——它同样裸崩），
+   §四 的 `internal` 契约（`code/kind/retryable/message/hint`）**只覆盖命令执行期**的失败
+   （`loadParams` 在 `callOne` 内被调用时抛的错），**不覆盖**模块初始化期。
+   验收 12 的集成断言相应改为「退出码 1、stderr 含堆栈、**stdout 为空**」——
+   这条路径**不承诺** stdout JSON（与全局约束的冲突是既有的、由 `specs.json` 继承来的，B 不扩大也不假装修复）。
 2. **失败范围是整个 CLI**，不只 B：`api.ts` 静态 import 了该模块，故 `qiyu auth whoami` /
    `api list` 也会一起失败。**Ruling**：接受。理由——(a) 与 `specs.json` 的既有行为一致
    （它同样在模块初始化抛错、同样拖垮所有命令），不引入第二种失败语义；(b) `validate.json`
@@ -707,7 +792,19 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 | 40 | **补 override 的加载时机与失败范围**（v2.3）：原文只说「模块初始化加载、fail-closed」，未说明失败会拖垮**整个 CLI**（`auth whoami`/`api list` 一起挂）。补三条后果并给出 **Ruling**（接受：与 `specs.json` 同款、dist 不完整时整份产物不可信、惰性加载会让失败点漂移）；同时明确只读被引用的 id（当前 2 份），启动开销可忽略 | 可实现性 + controller ruling |
 | 41 | **§十.0 补 `hasBodySchema` 判据与 `SchemaParam` 类型**（v2.3）：`validateBody` 的注释里显式写「由 `file.params` 现算、与 `bodyKind` 无关」，防实现混同；并把 `SchemaParam` 从 §三 的散落描述收进 §十.0 的类型清单 | 可实现性 |
 | 42 | **§三 输出样例改用 `ai.knowledge.search`**（v2.3）：原样例用 `ai.knowledge.addKnowledge`，却写 `"dangerous": false` —— 实测它是 **`dangerous: true`**，即样例里有一个**与事实相反**的字段值（正是契约诚实性审查自己反对的）。`search` 实测 `dangerous: false`，且 body 字段一必填（`robotId`）一可选（`keyWord`），同时展示 `required` 两种取值；title/path/description 均按实测逐字对齐 | 事实对拍（controller 复查） |
-| 43 | **§一「非目标」与 §八之二 的 `responseShape` → `response_shape`**（v2.3）：面向 Agent 的正文/文案统一用 CLI **实际输出键名**（下划线），仅在设计稿溯源处保留 TS 字段名 `responseShape` | 上游一致性（controller 复查） |
+| 43 | **§一「非目标」与 §八之二 的 `responseShape` → `response_shape`**（v2.3）：面向 Agent 的正文/文案统一用 CLI **实际输出键名**（下划线），仅在设计稿溯源处保留 TS 字段名 `responseShape` | 上游一致性 |
+| 44 | **§八.6 的 `has_body_schema` 判据改回合取式**（v2.3）：原文（本 spec v2.3 自造）写「判据是『body 参数数 > 0』，**与 bodyKind 无关**」，与 §三 的 `body_kind === 'json' && body 参数数 > 0` 及自身的 kefu.add 反例（xml 有 14 个 body 参数却 `false`）**三处互相矛盾**。统一为合取式；并更正「该式在 9 个接口上为假」——实测 `=== (bodyKind==='json')` 在 **5** 个接口上为假、化成 `> 0` 在另 **5** 个非 json 接口上为假，两个方向的等价变异体都要钉住。**Ruling**：§三/§十.0/§八.6 一律用合取式 | 契约诚实性 + 安全门禁（两路独立命中）+ controller 实测 |
+| 45 | **§四 澄清「先按 bodyKind 分流」与「0 body 表形状不判」的优先级**（v2.3）：原 §四 说「先按 bodyKind 分流」，但未明说 bodyKind≠json 的接口**根本不进**形状表——实施者可能让 `kefu.add` 的非对象 body 被「非对象硬拒」（2），与 D4（非 json 直发）冲突。补：形状表**只对 json 接口生效**；`none` 传对象/标量 → 只出 `non_json_body` | 安全门禁 + 内部自洽 |
+| 46 | **【重要】修正「模块初始化抛错 → 入口 `.catch()` 兜住」的错误断言**（v2.3）：实测证伪（最小探针 + 真实 dist 副本改坏 `specs.json`）——ESM 静态 import 的依赖在**模块求值期**抛错时入口模块体尚未执行、`.catch()` 未注册，故 stdout **0 字节**、stderr 原生堆栈、退出码 1。改：命令执行期的 `internal`（`loadParams` 在 `callOne` 内抛）→ stdout JSON + 退出码 1；**模块初始化期**的失败 = 未捕获异常（与 `specs.json` 既有行为逐字一致，B 不改变也不假装修复）；验收 12 相应改为「退出码 1、stderr 堆栈、stdout 空」 | 可实现性 + 契约诚实性 + 安全门禁（三路独立命中）+ controller 实测 |
+| 47 | **错误分类补别名冲突**（v2.3）：§四 只点名 `validateBody` 的硬违规，未覆盖 `normalizeAliases` 的别名冲突抛错——实施者可能给它挂 `kind` → 走成退出码 1，与 §六「alias 冲突 → 2」冲突。补：两处抛出点分类一致（普通 `Error`、不挂 `kind`、→ 2） | 安全门禁 |
+| 48 | **`api schema` 的 `field_notes` 必含键补全**（v2.3）：原文未含 `callable`/`path`，且 `dangerous` 的措辞未复用 `needs_confirmation` 的「必须由人类确认，不要自动追加 `--yes`」口径（安全审查指出的两跳绕过链路：硬拒 → `api schema` → 学到「加 --yes 就行」）。补 `callable`/`path` 说明，并把 `dangerous` 措辞钉到安全口径 | 契约诚实性 + 安全门禁 |
+| 49 | **互斥检查排进 `callOne` 次序图**（v2.3）：§六 有「`--no-validate` 与 `--strict` 同传 → 2」，但 §四 的次序图没画它——实施者不知道它相对 `loadParams`/门禁的位置（危险接口上 `NV+S` 的退出码可能是 2 也可能是 4）。补 `assertNoValidateStrictConflict()` 于 B 块之前、门禁之前 | 安全门禁 |
+| 50 | **澄清 `validateBody` 返回 `{hard,soft}` 不抛、由 `callOne` 抛**（v2.3）：§十.0 让 `validateBody` 返回 `ValidateResult{hard,soft}`，§四 却说「硬违规 → 抛」——实施者不清楚谁抛。补：`validateBody` **纯函数、不抛**；`callOne` 检查 `vr.hard.length > 0` 后抛普通 `Error`；`normalizeAliases` 的冲突**必须抛**（无返回值语义） | 可实现性 + 内部自洽 |
+| 51 | **§六/§八之二 补「`API_USAGE` 不是唯一失真字符串」**（v2.3）：`api.ts` 还有子命令清单（`<list|call>`、`可用子命令：list、call` 两处）与 `callOne` 的未知参数提示（`可用：--body <JSON>、--yes`）、`cli.ts` 顶层 `USAGE`、README 命令一览——B 之后都必须补 `schema`/`--no-validate`/`--strict`，否则 Agent 读到事实错误的清单。列为验收 32 | 上游一致性 |
+| 52 | **§六 补「2 = 改参数重来」的既存例外**（v2.3）：`auth.ts` 已记录一类换任何参数都过不了的 2（不可调用/未实现）——`API_USAGE` 说明不得宣称「所有 2 都能靠改参数解决」。B 的硬拒都属于可修类 | 安全门禁 |
+| 53 | **§八之二 第 3 条的「标记路线图 §八.7 已关闭」进验收**（v2.3）：原只写在联动段落、不在验收网内，按「交付清单式执行」会漏。列为验收 33 | 上游一致性 |
+| 54 | **硬拒消息合成规则**（v2.3）：`merchant.account.login` 三者全缺时同时触发「userName 缺必填」与「one-of 组全缺」两条硬违规，原文未定义聚合——实施者若「只报第一条」会导致 Agent 补完 userName 后再撞 one-of。补：`vr.hard` 每条各一行、按规则序拼接、不短路；验收 6 相应加强 | 契约诚实性 |
+| 55 | **验收 19 别名改写关闭的验证改用危险接口**（v2.3）：原文说「用非危险的等价场景验」，但 override 表里 `aliases` **只有** `editKnowledgeNoSimilars`（危险），不存在非危险替身——该验收落不了地。改为对 `editKnowledgeNoSimilars --yes --no-validate` 断言 mock fetch 收到 `name`、不含 `question` | 可实现性 |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `fileURLToPath(new URL('./params/<id>.json', import.meta.url))`
@@ -723,3 +820,7 @@ const raw = JSON.parse(readFileSync(fileURLToPath(url), 'utf8'))
 4. **`--strict` 的误伤面**（§八.3）——params 漏记的服务端字段会在 `--strict` 下被硬拒。
    是否要在 `--strict` 的拒绝消息里附「若确认该字段合法，请报告缺失的注册表项」之类的指引，
    留待实施计划决定（当前只要求文档写明「严格 ≠ 正确严格」）。
+5. **模块初始化失败的 `stdout` JSON 契约**（§十.0 第 1 条）——当前与 `specs.json` 一致地裸崩
+   （stdout 空）。全局约束「其余任何情况下 stdout 都必须是合法 JSON」在这条路径上落空，是既有缺口。
+   是否要为**整个 CLI** 加一层顶层兜底（如在 `bin` 脚本外包 try/catch）来兑现该约束，属全局治理，
+   **不在 B 的范围**（B 只保证不扩大它）。
