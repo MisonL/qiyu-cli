@@ -443,9 +443,8 @@ Agent 学不到稳定规则；`field` 字段独立承载字段名，`message` �
 - ⚠️ **危险接口的约束**：`relaxRequired`/`oneOf`/`aliases` **允许**作用于 `dangerous: true` 的接口
   （`editKnowledgeNoSimilars` 本身是危险接口且确需 `aliases`），但**必须在 `note` 里写明实测/文档依据**，
   且新增这类条目时测试要逐条钉住——对应 §八.3（`--strict` 的安全边界）与 §八.5（override 腐化/被滥用）。
-  ⚠️ 原引用只写「见 §八.5」时审查曾以为指向 §八.5（`--strict` 升级范围）而判为张冠李戴（v2.3 第三轮）；
-  **实测 §八.5 在本 spec 是「override 腐化/被滥用」（§八 第 5 条，`:455`）**，引用成立。但为避免
-  后续读者再误读（§八 条目众多），此处显式写明两条对应关系，不改引用本身。
+  （v2.3 第三轮曾有一路审查把原引用「见 §八.5」判为张冠李戴——实测本 spec §八.5 正是
+  「override 腐化/被滥用」，引用成立；此处显式写明两条对应关系以免后续读者再误读。）
 
 **加载规则（fail-closed，与 `loadSpecs` 同款）**：顶层必须是对象；每条 key 必须是注册表里
 存在的 id；`relaxRequired`/`oneOf.anyOf`/`aliases` 的值必须满足上面的引用约束。
@@ -756,6 +755,7 @@ B 上线后，**现有**多处文字会与代码矛盾，必须随实现一起�
     ⚠️ **钉住形式**（v2.3 补，见 §十一 第 67 条）：**保留条目原文 + 加 `~~删除线~~` + `✅ 已关闭`
     （与条目 3 的关闭形态同款）**，**不整条删除**——条目 7 是「B 为什么存在」的溯源，删掉它
     就丢了 B 的动机记录（原判据不钉形式，「整条删掉」也能过验收）。
+    ⚠️ **落点**：`tests/readme.test.ts`（读路线图断言条目 7/条目 4 含 `~~` + `✅`）。
 34. **`meta.warnings` 两来源的合成次序**（§四）：对同时触发 `alias_normalized` 与
     `unknown_field`/`type_mismatch` 的 body（如 `{"bogus":1,"name":"q"}`，对危险接口
     `editKnowledgeNoSimilars` 须加 `--yes` 且补全必填字段，否则先撞硬拒 2 到不了 warnings 合成——
@@ -929,11 +929,14 @@ const raw = JSON.parse(readFileSync(new URL(`./params/${id}.json`, pathToFileURL
   ⚠️ **扩围**（v2.3 补，见 §十一 第 67 条）：同一文件同时断言——①验收 23 扩围（横幅句、
   已实现清单、README 安全段）；②验收 35（CHANGELOG `[未发布]` 段含 `api schema`）；
   ③验收 1 的 `meta.note` 条件输出（`api schema ai.knowledge.addKnowledge` → note 存在）；
-  ④验收 7 的 `alias_normalized.message` 含「无需重试」；⑤验收 25 的 `field_notes.one_of` 含「任一」。
+  ④验收 7 的 `alias_normalized.message` 含「无需重试」；⑤验收 25 的 `field_notes.one_of` 含「任一」；
+  ⑥验收 33（路线图条目 7/条目 4 标关闭）。
   ⚠️ **root 注入测试流程**（v2.3 补，见 §十一 第 67 条）：验收 13/26 落 `api.test.ts`——
   `mkdtempSync` 复制 `src/core/registry/` → 改坏副本目标文件 → `setParamsRoot(副本目录)` →
   `vi.resetModules()` + 动态 `import()` 拿新模块图（**`api.test.ts` 顶层静态 import 的
   `apiCommand` 须改为动态 import**，否则静态图拿到的是未设 root 的旧实例——见 §十.0 缓存键）。
+  ⚠️ **验收 12 的集成级断言**（模块初始化失败）**不落 `npm test`**——发布前手动 checklist
+  （见 §十一 第 66 条），`tests/` 无子进程测试基建。
 - **测试基建**：
   ⚠️ **凭证注入沿用既有 per-test 口径**（v2.3 修正，见 §十一 第 61 条）：现有 `api.test.ts` 是
   **逐用例** `vi.stubEnv('QIYU_APP_KEY', …)` + `afterEach` 清空（18 处用例），且**存在反向用例**——
