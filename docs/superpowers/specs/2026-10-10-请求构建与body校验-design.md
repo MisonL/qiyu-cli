@@ -676,11 +676,11 @@ B 上线后，**现有**多处文字会与代码矛盾，必须随实现一起�
     （构造：**经注入的 params 根目录**临时移除/改坏 `params/<id>.json`，断言 call 与 schema 行为一致）。
     ⚠️ 不得直接改仓库里的真文件（会污染工作区、且 `loadParams` 的缓存让同进程内改文件读不到）。
     ⚠️ **注入机制**（v2.3 补，见 §十一 第 67 条）：`params.ts` 持一个模块级 `let injectedRoot: string | undefined`
-    并导出 `setParamsRoot(dir: string | undefined)`；`loadParams(id, root = injectedRoot)` 默认取它。
-    生产**不调用** `setParamsRoot`（`injectedRoot` 恒 `undefined` = 用 `import.meta.url` 定位真目录），
-    `callOne`/`schema` 仍写 `loadParams(spec.id)` **无需改签名**。测试流程：`mkdtempSync` 复制
-    `src/core/registry/` 内容 → 改坏副本里目标文件 → `setParamsRoot(副本目录)` → `vi.resetModules()`
-    + 动态 `import()` 拿新模块图 → 断言。**缓存键是 `(root, id)`**（见 §十.0），故不同 root 互不污染。
+    并导出 `setParamsRoot(dir: string | undefined)`；`loadParams(id, root = injectedRoot)` 默认取它
+    （**调用时**读 `injectedRoot`，不是 import 时）。生产**不调用** `setParamsRoot`
+    （`injectedRoot` 恒 `undefined` = 用 `import.meta.url` 定位真目录），`callOne`/`schema` 仍写
+    `loadParams(spec.id)` **无需改签名**。**缓存键是 `(root, id)`**（见 §十.0），故不同 root 互不污染。
+    测试流程（见 §十.1）：复制 → 改坏 → 设 root → 断言（无需 resetModules）。
 14. `qiyu api schema crm.modifyOrder`（`callable:false`）→ **0**，输出照常（不经 `assertCallable`）。
 15. `--no-validate --strict` 同传 → **2**。
     ⚠️ 该检查**排在 B 块之前、`assertConfirmed` 之前**（§四 次序图）——故危险接口上
@@ -795,14 +795,17 @@ export interface ParamFile {
  *  ⚠️ 第二个参数 `root` 是**注入的 params 根目录**（源码态 = `dist`/`src` 同构的
  *  `.../core/registry/`，见下方加载机制），默认指向真实目录；**测试**把 root 指向
  *  `mkdtempSync` 出的副本，以便构造「缺失/畸形」而不污染仓库真文件（见 §九 验收 13/26）。
- *  同进程内 `root` 一经首次读取即并入缓存，测试须为不同 root 各起模块图
- *  （`vi.resetModules()`），否则缓存会掩盖改动。
+ *  同进程内 `root` 一经首次读取即并入缓存（缓存键 `(root, id)`，见下），故同一路径内容被
+ *  改写后要靠 `vi.resetModules()` 起新模块图才能重读——但**改 root 本身不需要 reset**
+ *  （不同 root 是不同缓存键）。
  *  ⚠️ **缓存键是 `(root, id)`**（v2.3 补，见 §十一 第 67 条）：若缓存只按 `id` 键入，
- *  同进程内切 root 后仍会读到旧 root 的文件（与本注释「缓存会掩盖改动」的警告叠加，
- *  实施者必须靠 `vi.resetModules()` 重启模块图——但那样 root 注入就退化成只能测一次）。
- *  按 `(root, id)` 双键，不同 root 的缓存互不覆盖，测试流程：`setParamsRoot(副本目录)` →
- *  `vi.resetModules()` → 动态 `import()` 新模块图（`api.test.ts` 顶部静态 import 的
- *  `apiCommand` 须改为动态 import 或用 `vi.resetModules()` 拿新实例——见 §十.1 测试基建）。
+ *  同进程内切 root 后仍会读到旧 root 的文件（缓存会掩盖改动）。
+ *  ⚠️ **`setParamsRoot` 与「读 root」必须是同一个 `params.ts` 实例**（v2.3 修正，见 §十一 第 67 条）：
+ *  它设的是**被调用时那个实例**的模块级变量，而 `loadParams` 在**调用时**读 `injectedRoot`。
+ *  实测（最小 ESM 探针）：**set-then-reset** → `resetModules()` 后拿到新实例、root 丢失
+ *  （读回 `undefined`）；**reset-then-set** → 生效。故若测试用 `vi.resetModules()`，
+ *  必须**先 reset、后 set**；或干脆**不 reset**——静态 import 的 `apiCommand` 与测试里
+ *  `setParamsRoot` 本就是同一个 `params.ts` 实例，直接 `setParamsRoot(copyDir)` 即生效。
  *  ⚠️ 生产环境**每个 id 都有** params 文件（实测 154/154），故返回值**非 null**；
  *  「该接口没有 body 表可比对」（如 `tag.all`：json 但 0 body 参数）由**文件内容**表达，
  *  不由 null 表达 —— 调用方拿到 `ParamFile` 后按 `bodyKind` 与 body 参数数自行判定。 */
@@ -875,12 +878,19 @@ alias 源/目标非法）都能用**合成数据**直接测，不必去改真实
 ```ts
 import { readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-const root = injectedRoot ?? fileURLToPath(new URL('.', import.meta.url))
-const raw = JSON.parse(readFileSync(new URL(`./params/${id}.json`, pathToFileURL(root + '/')), 'utf8'))
+let injectedRoot: string | undefined                       // 模块级；生产恒 undefined
+export function setParamsRoot(dir: string | undefined) { injectedRoot = dir }
+export function loadParams(id: string, root: string | undefined = injectedRoot): ParamFile {
+  const base = root ?? fileURLToPath(new URL('.', import.meta.url))   // 默认：本模块所在目录
+  const raw = JSON.parse(readFileSync(fileURLToPath(new URL(`./params/${id}.json`, pathToFileURL(base + '/'))), 'utf8'))
+  return validateParamsFile(id, raw)
+}
 ```
 
-⚠️ `injectedRoot` 是模块级可注入变量（默认 `undefined`，见 §九 验收 13 的 `setParamsRoot`）——
-代码片段必须体现 root 的用法，否则与签名 `loadParams(id, root?)` 不一致（v2.3 补，见 §十一 第 67 条）。
+⚠️ `root` 参数默认取模块级 `injectedRoot`（生产不调用 `setParamsRoot` → `undefined` → 用
+`import.meta.url` 定位真目录）；代码片段必须体现 root 的用法，否则与签名 `loadParams(id, root?)`
+不一致（v2.3 补，见 §十一 第 67 条）。`loadParams` 在**调用时**读 `injectedRoot`（不是 import 时），
+故测试里 `setParamsRoot` 与调用方静态 import 的必须是**同一实例**（见上注释）。
 缓存键 `(root, id)`（见上）。`pathToFileURL` 从 `node:url` 一并 import。
 
 **不**用动态 `import()`（ESM 下需 import attributes、缓存语义复杂），**不**用相对 CWD 的路径
@@ -932,9 +942,12 @@ const raw = JSON.parse(readFileSync(new URL(`./params/${id}.json`, pathToFileURL
   ④验收 7 的 `alias_normalized.message` 含「无需重试」；⑤验收 25 的 `field_notes.one_of` 含「任一」；
   ⑥验收 33（路线图条目 7/条目 4 标关闭）。
   ⚠️ **root 注入测试流程**（v2.3 补，见 §十一 第 67 条）：验收 13/26 落 `api.test.ts`——
-  `mkdtempSync` 复制 `src/core/registry/` → 改坏副本目标文件 → `setParamsRoot(副本目录)` →
-  `vi.resetModules()` + 动态 `import()` 拿新模块图（**`api.test.ts` 顶层静态 import 的
-  `apiCommand` 须改为动态 import**，否则静态图拿到的是未设 root 的旧实例——见 §十.0 缓存键）。
+  ① `mkdtempSync` 复制 `src/core/registry/` 内容 → ② 改坏副本目标文件 → ③ `setParamsRoot(副本目录)`
+  → ④ 断言。**不需要 `vi.resetModules()`**：`setParamsRoot` 设的与 `apiCommand` 静态 import 的
+  是**同一个 `params.ts` 实例**，而 `loadParams` 在**调用时**读 `injectedRoot`（实测：直接
+  set 后调用即生效）。⚠️ **若确实用了 `vi.resetModules()`，顺序必须是「先 reset、后 set」**——
+  实测 set-then-reset 会让新实例的 root 丢失（读回 `undefined`），reset-then-set 才生效
+  （§十.0 缓存键）。
   ⚠️ **验收 12 的集成级断言**（模块初始化失败）**不落 `npm test`**——发布前手动 checklist
   （见 §十一 第 66 条），`tests/` 无子进程测试基建。
 - **测试基建**：
@@ -1012,7 +1025,7 @@ const raw = JSON.parse(readFileSync(new URL(`./params/${id}.json`, pathToFileURL
 | 54 | **硬拒消息合成规则**（v2.3）：`merchant.account.login` 三者全缺时同时触发「userName 缺必填」与「one-of 组全缺」两条硬违规，原文未定义聚合——实施者若「只报第一条」会导致 Agent 补完 userName 后再撞 one-of。补：`vr.hard` 每条各一行、按规则序拼接、不短路；验收 6 相应加强 | 契约诚实性 |
 | 55 | **验收 19 别名改写关闭的验证改用危险接口**（v2.3）：原文说「用非危险的等价场景验」，但 override 表里 `aliases` **只有** `editKnowledgeNoSimilars`（危险），不存在非危险替身——该验收落不了地。改为对 `editKnowledgeNoSimilars --yes --no-validate` 断言 mock fetch 收到 `name`、不含 `question` | 可实现性 |
 | 56 | **§三 `schema` 7 步次序修正 help 与位置参数的先后**（v2.3 复查）：原文把「位置参数 > 1 → 2」排在 help 之前，导致 `schema --help extra`（1 个位置参数）不触发该步、落入 help 给出**退出码 0**——与「`--help` 不吞额外参数」直接矛盾。改为 help 提前处理、且自身检查位置参数（3a/3b）；四条输入 `--help` / `--help extra` / `a --help` / `a b` 结果同时正确 | 内部自洽（controller 复查） |
-| 57 | **`loadParams` 增可注入的 `root` 参数**（v2.3 复查）：验收 13/26 要构造「params 缺失/畸形」而不污染仓库真文件，原签名无注入点、实施者只能改真文件（会被缓存与工作区污染反噬）。补 `loadParams(id, root?)`（默认真实目录、测试指向 `mkdtempSync` 副本），并注明缓存与 `vi.resetModules()` 的关系；§十.0 的加载机制代码同步 | 可实现性（controller 复查） |
+| 57 | **`loadParams` 增可注入的 `root` 参数**（v2.3 复查）：验收 13/26 要构造「params 缺失/畸形」而不污染仓库真文件，原签名无注入点、实施者只能改真文件（会被缓存与工作区污染反噬）。补 `loadParams(id, root?)`（默认真实目录、测试指向 `mkdtempSync` 副本），并注明缓存与 `vi.resetModules()` 的关系；§十.0 的加载机制代码同步。⚠️ 后续第 67 条进一步明确「`setParamsRoot` 与读 root 必须同一实例、无需 resetModules」 | 可实现性（controller 复查） |
 | 58 | **§四 定 `meta.warnings` 两来源的合成次序**（v2.3 复查）：`alias_normalized`（来自 `normalizeAliases`，比对前发生）必须排在 `vr.soft` 之前——`meta.warnings = [...aliasWarnings, ...vr.soft]`；两段各自再按「params 表顺序 → body 键出现顺序」。不定义则两种实现输出互为逆序。列为验收 34 | 契约诚实性 + 可实现性 |
 | 59 | **§八.2 补 `responseShape` 实测分布**（v2.3 复查）：实测 154 份的 `responseShape` 恒为 `{"kind":"object"}`（150）/`{"kind":"none"}`（4），从不是字符串——设计稿的 `string` 是 A 之前的历史形态 | 事实对拍 |
 | 60 | **§十.1 补 `tests/readme.test.ts` 落点**（v2.3 复查）：验收 23 的 README 部分原先无测试落点，按「交付清单式执行」会变成纸面条款 | 可实现性 |
@@ -1022,7 +1035,7 @@ const raw = JSON.parse(readFileSync(new URL(`./params/${id}.json`, pathToFileURL
 | 64 | **验收 24 降级为发布前手动 checklist**（v2.3 复查）：`vitest.config.ts` 钉死 `testTimeout: 5_000`，在测试里跑 `npm run build`（tsc + copy-params）没有超时余量且会动 `dist/`。改为发布前人工步骤，不写进 `npm test` | 可实现性 |
 | 65 | **§十.0 补 `validateBody` 的 `spec` 参数用途**（v2.3 复查）：原文只列了签名、没说 `spec` 用来做什么——实施者可能写成 `_spec` 占位（消息里出现 `qiyu api schema undefined`）或越权读 `dangerous`。补：唯一用途是消息回显 `spec.id`；不读 `dangerous`/`callable` | 可实现性 |
 | 66 | **【重要】三种 warning 的 message 补「请求已发出」口径 + 验收 12 降级为手动 checklist**（v2.3 第三轮 6 路审查，三路独立命中）：①`unknown_field`/`type_mismatch`/`non_json_body` 的 message 原本**不含**「已发送/不要重试」语义——`alias_normalized` 的「无需重试」是安全关键文本，但同一推理（「见 warning 就改输入重试」的 Agent 会重复写）对三类**同样成立**，spec 只堵了一类。补「请求已发出 + 重发风险」口径；②`alias_normalized` 的「无需重试」此前**无验收钉**（验收 7 只断 kind/field/body 改写）——列为验收 7 的断言；③验收 12 的模块初始化失败（进程级断言）在 vitest 落不了地（tests/ 无 spawn 先例、无 tsx、testTimeout 5_000 无余量、须改坏真实 validate.json）——降级为发布前手动 checklist（与验收 24 同款） | 契约诚实性 + 安全门禁 + 可实现性（三路独立命中） |
-| 67 | **第三轮 6 路审查裁决（21 条机械核验后的落盘）**（v2.3）：①§三 `params` 与验收 25 矛盾（「原样保留」vs「relaxRequired 后 required 已降为 false」）——§三 补「`required` 输出的是应用 override 之后的值」；②`one_of` 的 field_notes 无最小内容要求——补「组内任一存在即可」必含口径，验收 25 钉住含「任一」；③`meta.note` 条件输出只在验收 1 括号里提了一句、正文无正向说明、无验收钉——§三 补条件输出条款，验收 1 补「有 note 接口输出 note」；④`loadParams` 的 root 注入在 api.ts 层无接线方案——§十.0/§九 验收 13 补 `setParamsRoot` + `(root,id)` 缓存键 + `vi.resetModules()` 动态 import 流程；⑤模块初始化崩溃面比 spec 声称的更宽（被 override 引用的 2 个 id 的 params 损坏也裸崩）——§三/§四/§六 三处补「限非被引用 id」+「override 加载失败只有模块初始化一种形态」；⑥README 安全段「缺 --yes 必返 4」在 B 之后不再恒真（硬拒 2 先于门禁）——§八之二 增第 8 条，验收 23 扩围；⑦README:9「只实现了认证+API 通道」横幅、README:187 目录树失真——第 6 条扩围；⑧验收 33 未钉关闭形式（「整条删掉」也能过）——补「保留原文+删除线+✅」；⑨路线图条目 4「B vs A/E 归属仍开放」从未被 B 的 spec 回应——§一 补「B 独立交付」答案，验收 33 一并断言条目 4 标关闭；⑩spec 头部「§5.3 元数据陷阱」节号失准——改为「§5.2 元数据陷阱（§5.2 尾部）」；⑪CHANGELOG 与「已实现清单」联动无验收——第 7 条列为验收 35；⑫第 8 条 callOne 同族三处用法串只点名一处——补 `api.ts:268/:291/:377` 三处；⑬§四 接入点括号把 body JSON.parse 画在 --pretty 之后（与实际代码相反）——修正为「未知/位置 → body JSON.parse → help → --pretty」；⑭`assertNoValidateStrictConflict` 是「参数校验必须全部在 byId 之前」不变量的新例外——补 Ruling（接受，退出码恒 2、无请求）；⑮§三 3a 与 callOne 的 help 行为差异（schema a --help → 2 vs api call <id> --help → 0）未交代——补「刻意差异」声明；⑯§十.0 加载机制代码无 root 的位置——代码片段补 `injectedRoot` 用法；⑰§十一 第 36 条保留已被第 44 条推翻的「判据与 bodyKind 无关」表述——标注作废；⑱§八之二 第 3 条「验收 23 增补」笔误——改为「验收 33」；⑲（已核为**误判**：审查称第 20 条「§八.7」张冠李戴，实测本 spec §八.7 正是「同名字段跨 `in`」护栏，引用正确，不改）；⑳§十一 第 61 条「19 处」误植（call() 推导数字）——实测 18 处用例，更正；㉑验收 34 示例 body 对危险接口须 --yes 且补必填——补标注。⚠️ 另有两条审查发现经核为**误判**、不改：§八.5 引用（审查以为它指 --strict 升级范围，实为「override 腐化」，引用正确）、§五 第 20 条来源列（见 ⑲） | 第三轮 6 路审查（全部经机械核验） |
+| 67 | **第三轮 6 路审查裁决（21 条机械核验后的落盘）**（v2.3）：①§三 `params` 与验收 25 矛盾（「原样保留」vs「relaxRequired 后 required 已降为 false」）——§三 补「`required` 输出的是应用 override 之后的值」；②`one_of` 的 field_notes 无最小内容要求——补「组内任一存在即可」必含口径，验收 25 钉住含「任一」；③`meta.note` 条件输出只在验收 1 括号里提了一句、正文无正向说明、无验收钉——§三 补条件输出条款，验收 1 补「有 note 接口输出 note」；④`loadParams` 的 root 注入在 api.ts 层无接线方案——§十.0/§九 验收 13 补 `setParamsRoot` + `(root,id)` 缓存键（**并经最小 ESM 探针实测校正**：`setParamsRoot` 与「读 root」必须同一实例、set-then-reset 会丢 root，故测试无需 resetModules）；⑤模块初始化崩溃面比 spec 声称的更宽（被 override 引用的 2 个 id 的 params 损坏也裸崩）——§三/§四/§六 三处补「限非被引用 id」+「override 加载失败只有模块初始化一种形态」；⑥README 安全段「缺 --yes 必返 4」在 B 之后不再恒真（硬拒 2 先于门禁）——§八之二 增第 8 条，验收 23 扩围；⑦README:9「只实现了认证+API 通道」横幅、README:187 目录树失真——第 6 条扩围；⑧验收 33 未钉关闭形式（「整条删掉」也能过）——补「保留原文+删除线+✅」；⑨路线图条目 4「B vs A/E 归属仍开放」从未被 B 的 spec 回应——§一 补「B 独立交付」答案，验收 33 一并断言条目 4 标关闭；⑩spec 头部「§5.3 元数据陷阱」节号失准——改为「§5.2 元数据陷阱（§5.2 尾部）」；⑪CHANGELOG 与「已实现清单」联动无验收——第 7 条列为验收 35；⑫第 8 条 callOne 同族三处用法串只点名一处——补 `api.ts:268/:291/:377` 三处；⑬§四 接入点括号把 body JSON.parse 画在 --pretty 之后（与实际代码相反）——修正为「未知/位置 → body JSON.parse → help → --pretty」；⑭`assertNoValidateStrictConflict` 是「参数校验必须全部在 byId 之前」不变量的新例外——补 Ruling（接受，退出码恒 2、无请求）；⑮§三 3a 与 callOne 的 help 行为差异（schema a --help → 2 vs api call <id> --help → 0）未交代——补「刻意差异」声明；⑯§十.0 加载机制代码无 root 的位置——代码片段补 `injectedRoot` 用法；⑰§十一 第 36 条保留已被第 44 条推翻的「判据与 bodyKind 无关」表述——标注作废；⑱§八之二 第 3 条「验收 23 增补」笔误——改为「验收 33」；⑲（已核为**误判**：审查称第 20 条「§八.7」张冠李戴，实测本 spec §八.7 正是「同名字段跨 `in`」护栏，引用正确，不改）；⑳§十一 第 61 条「19 处」误植（call() 推导数字）——实测 18 处用例，更正；㉑验收 34 示例 body 对危险接口须 --yes 且补必填——补标注。⚠️ 另有两条审查发现经核为**误判**、不改：§八.5 引用（审查以为它指 --strict 升级范围，实为「override 腐化」，引用正确）、§五 第 20 条来源列（见 ⑲） | 第三轮 6 路审查（全部经机械核验） |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `readFileSync(pathToFileURL(...))` + `readFileSync`
