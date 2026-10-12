@@ -1059,16 +1059,17 @@ export function loadParams(id: string, root: string | undefined = injectedRoot):
 `const OVERRIDES = validateOverrides(raw, allEndpoints(), loadParams)` 是一个模块级常量，
 不是每次调用重读。三条后果都必须是有意的：
 
-1. **失败即模块初始化抛错** → 由 `cli.ts` 入口的 `.catch()` 兜住 → 退出码 **1**、`kind:'internal'`
-   （不是未捕获堆栈）。验收 12 的「启动即抛」指的是这一层。
-   ⚠️ **这条断言是错的**（v2.3 修正，见 §十一 第 46 条）：ESM 下静态 `import` 的依赖在**模块求值期**
-   抛错时，入口模块体还没执行，`cli.ts` 的 `.catch()` 根本没注册——**兜不住**。实测（最小探针 +
-   真实 dist 副本改坏 `specs.json`）：stdout **0 字节**、stderr 是原生堆栈、退出码 1。
-   故本条改为：**失败 = 未捕获异常**（与 `specs.json` 的既有行为**逐字一致**——它同样裸崩），
+1. **失败 = 模块初始化未捕获异常**：ESM 下静态 `import` 的依赖在**模块求值期**
+   抛错时，入口模块体还没执行，`cli.ts` 的 `.catch()` 根本没注册——**兜不住**。
+   实测（最小探针 + 真实 dist 副本改坏 `specs.json`）：stdout **0 字节**、stderr 是原生堆栈、退出码 1。
+   故：**失败 = 未捕获异常**（与 `specs.json` 的既有行为**逐字一致**——它同样裸崩），
    §四 的 `internal` 契约（`code/kind/retryable/message/hint`）**只覆盖命令执行期**的失败
    （`loadParams` 在 `callOne` 内被调用时抛的错），**不覆盖**模块初始化期。
    验收 12 的集成断言相应改为「退出码 1、stderr 含堆栈、**stdout 为空**」——
    这条路径**不承诺** stdout JSON（与全局约束的冲突是既有的、由 `specs.json` 继承来的，B 不扩大也不假装修复）。
+   ⚠️ **本条曾写错并被实测证伪**（v2.3 修正，见 §十一 第 46 条）：上文旧版断言「由 `cli.ts` 入口的
+   `.catch()` 兜住 → 退出码 1、`kind:'internal'`（不是未捕获堆栈）」——最小探针证明该断言不成立
+   （`.catch()` 未注册），上段已是修正后的结论，此处仅存证防回潮。
 2. **失败范围是整个 CLI**，不只 B：`api.ts` 静态 import 了该模块，故 `qiyu auth whoami` /
    `api list` 也会一起失败。**Ruling**：接受。理由——(a) 与 `specs.json` 的既有行为一致
    （它同样在模块初始化抛错、同样拖垮所有命令），不引入第二种失败语义；(b) `validate.json`
