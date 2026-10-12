@@ -1490,6 +1490,21 @@ describe('api schema', () => {
     expect(await apiCommand(['schema', 'a', 'b'])).toBe(2)
     expect(await apiCommand(['schema', '--help'])).toBe(0)
   })
+  it('帮助次序：未知参数优先于 help，help 优先于 --pretty（只看退出码区分不开，必须断 stderr 文本）', async () => {
+    // ① 未知参数优先于 help：`--bad` 是真拼错 → 必须报「未知参数：--bad」，而不是给帮助
+    out = ''; err = ''
+    expect(await apiCommand(['schema', '--bad', '--help'])).toBe(2)
+    expect(err, '未知参数必须先于 help 报出').toContain('未知参数：--bad')
+    expect(err).not.toContain('用法：qiyu api schema')
+    // ② help 优先于 --pretty：help 本该永远成功（spec：`schema --help` → 0）
+    out = ''; err = ''
+    expect(await apiCommand(['schema', '--pretty', '--help'])).toBe(0)
+    expect(out, 'help 先于 --pretty').toContain('用法：qiyu api schema')
+    // ③ 反向：只有 --pretty、无 help 时仍必须显式拒绝「尚未实现」（不能被次序调整吞掉）
+    out = ''; err = ''
+    expect(await apiCommand(['schema', 'ai.knowledge.search', '--pretty'])).toBe(2)
+    expect(err).toContain('--pretty 尚未实现')
+  })
   it('验收 8：schema tag.all → has_body_schema:false、body_kind json', async () => {
     await apiCommand(['schema', 'tag.all'])
     const o = JSON.parse(out)
