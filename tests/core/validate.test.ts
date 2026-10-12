@@ -64,4 +64,28 @@ describe('effectiveBodyParams', () => {
     //    并硬拒「缺 appKey/time/checksum」（验收 8）。
     expect(effectiveBodyParams(file, undefined)).toEqual([])
   })
+  it('relaxRequired 为空数组 → 与 undefined 等价（不改 required）', () => {
+    const file = { params: [
+      { name: 'a', in: 'body', required: true },
+    ], bodyKind: 'json', responseShape: { kind: 'object' } } as never
+    const out = effectiveBodyParams(file, { relaxRequired: [] })
+    expect(out.map((p: { name: string }) => p.name)).toEqual(['a'])
+    expect(out[0].required).toBe(true)
+  })
+  it('relaxRequired 含不存在的字段名 → 忽略，其余原样（不误伤别人）', () => {
+    const file = { params: [
+      { name: 'a', in: 'body', required: true },
+      { name: 'b', in: 'body', required: true },
+    ], bodyKind: 'json', responseShape: { kind: 'object' } } as never
+    const out = effectiveBodyParams(file, { relaxRequired: ['ghost'] })
+    expect(out.map((p: { name: string }) => p.name)).toEqual(['a', 'b'])
+    expect(out.every((p) => p.required)).toBe(true)
+  })
+  it('不改写传入的 file.params（纯函数，不污染 loadParams 的缓存对象）', () => {
+    const file = { params: [
+      { name: 'a', in: 'body', required: true },
+    ], bodyKind: 'json', responseShape: { kind: 'object' } } as never
+    effectiveBodyParams(file, { relaxRequired: ['a'] })
+    expect((file as { params: Array<{ required: boolean }> }).params[0].required).toBe(true)
+  })
 })
