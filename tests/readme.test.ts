@@ -16,7 +16,8 @@ describe('联动文案（B 上线后不得与事实相反）', () => {
   })
   it('验收 23：README 安全段不再无条件说「绝不发出任何请求，直接返回退出码 4」', () => {
     const md = read('README.md')
-    expect(md).toMatch(/body 合法则返回退出码 4|body 缺必填\/非对象则.*2/)
+    expect(md, 'body 合法 → 4').toMatch(/body 合法则返回退出码 4/)
+    expect(md, 'body 缺必填/非对象 → 先报 2').toMatch(/body 缺必填\/非对象则.*2/)
   })
   it('验收 23：退出码表 2 行不再无条件是「改参数重来」', () => {
     const md = read('README.md')
@@ -64,8 +65,13 @@ describe('联动文案（B 上线后不得与事实相反）', () => {
     expect(rm).toMatch(/^7\..*~~[^~]*params[^~]*~~[^\n]*✅/m)
     expect(rm).toMatch(/^4\..*~~[^~]*B vs A\/E[^~]*~~[^\n]*✅/m)
   })
-  it('验收 35：CHANGELOG [未发布] 段含 api schema', () => {
+  it('验收 35：CHANGELOG [未发布] 段含 api schema', async () => {
     const cl = read('CHANGELOG.md')
-    expect(cl).toMatch(/\[未发布\][\s\S]*api schema/)
+    // ⚠️ ` [\\s\\S]* ` 会吃到文件末尾 —— 把 api schema 挪到后续版本段断言仍绿。限定在
+    //    「[未发布]」到下一个 `## ` 版本标题之间。
+    expect(cl).toMatch(/\[未发布\][\s\S]*?(?=\n## )/)
+    const start = cl.indexOf('[未发布]')
+    const section = cl.slice(start, cl.indexOf('\n## ', start))
+    expect(section).toContain('api schema')
   })
 })
