@@ -167,7 +167,10 @@ describe('api list', () => {
     // "没有这个能力"显式说出来 —— 与 `verified`/`direction` 同一条标准。
     await apiCommand(['list'])
     const note = JSON.parse(out).meta.field_notes.request_schema
-    expect(note).toMatch(/不提供|没有/)
+    expect(note).toMatch(/不含|不提供|没有/)
+    expect(note).toMatch(/响应体不做校验/)
+    expect(note).toMatch(/不要删字段重试/)
+    expect(note).toMatch(/api schema/)
     // ⚠️ 这条字符串**逐字输出给 Agent**，所以它点名的错误码必须是"传错字段"真会得到的。
     // 此前写的是「多半回 14003/14004」（2026-10-06 修）—— 而 14003 是 `time` 错误
     // （鉴权层的时间戳/时钟偏移），与 body 字段毫无关系：设计稿 §4.3 错误码表如此定义

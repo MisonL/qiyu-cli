@@ -20,8 +20,9 @@ const USAGE = `用法：qiyu <子命令> [参数]
 子命令：
   auth whoami              检查凭证是否已配置
   api list [--all]         列出接口（默认只列可主动调用的出站接口）
-  api call <id> [--body <JSON>] [--yes]
+  api call <id> [--body <JSON>] [--yes] [--no-validate] [--strict]
                            调用接口；危险接口必须加 --yes
+  api schema <id>         查看接口的请求参数表与响应形状
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的

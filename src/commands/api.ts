@@ -33,7 +33,7 @@ const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 export async function apiCommand(argv: string[]): Promise<number> {
   const [sub] = argv
   // ⚠️ 子命令层的 --help 必须走 stdout + 退出码 0，与顶层一致。
-  // 否则 `qiyu api --help` 会得到「用法：qiyu api <list|call>」+ 退出码 2 ——
+  // 否则 `qiyu api --help` 会得到「用法：qiyu api <list|call|schema>」+ 退出码 2 ——
   // Agent 请求帮助却拿到一个错误，这是坏交互。
   // ⚠️ `--help` 不吞额外参数（2026-10-08 修）—— 与叶子命令同一条次序
   // （未知/位置参数 → help）：实测 `qiyu api --help --bod` / `qiyu api --help extra`
@@ -261,12 +261,12 @@ function list(argv: string[]): number {
       // 一句话点破"要参数得去查文档"，比让 Agent 在 14004 或静默忽略上撞墙便宜得多
       // （⚠️ 不是 14003 —— 那是 `time` 错误、鉴权层的码，与 body 字段无关）。
       request_schema:
-        '本 meta **不提供**接口的请求参数表（`params`）与响应形状（`responseShape`）。' +
-        '`id`/`title`/`path` 足以**定位**接口，但不足以**构造 body**：' +
-        '`qiyu api call <id> --body <JSON>` 的 body 必须查官方文档得到，' +
-        '本 CLI 无法校验其字段是否正确 —— 传错的字段可能被服务端以 **14004** 拒绝，' +
-        '也可能被**静默忽略**（实测：有接口对必填字段照单全收却不生效）。' +
-        '别把"返回成功"当作"字段写对了"。',
+        '本 meta 不含参数表（体积考虑）；用 `qiyu api schema <id>` 查该接口的 `params`/`response_shape`。' +
+        '`api call --body` 会做**有限**校验（缺必填拒绝、未知字段/类型提示）——见 `api schema` 的 ' +
+        '`meta.field_notes`。⚠️ **响应体不做校验**，`response_shape` 仅供参照。' +
+        '⚠️ `--strict` 把「未知字段/类型不符」升级为拒绝，但那是「本地参数表闭集一致性」检查，' +
+        '**不是对服务端行为的保证**——参数表漏记时它会误拒合法字段，此时**不要删字段重试**。' +
+        '⚠️ 传错的字段可能被服务端以 **14004** 拒绝，也可能被**静默忽略**——**别把「返回成功」当作「字段写对了」**。',
     },
   })
 }
