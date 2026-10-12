@@ -5,6 +5,9 @@ import { call } from '../core/http.js'
 import type { QiyuError } from '../core/errors.js'
 import type { ParamSpec } from '../core/registry/params.js'
 import type { ValidationOverride } from '../core/registry/validation-overrides.js'
+import { loadValidationOverrides } from '../core/registry/validation-overrides.js'
+import { loadParams } from '../core/registry/params.js'
+import { normalizeAliases, validateBody } from '../core/validate.js'
 import { ok, fail, usageFail, describeArgs, EXIT } from '../output.js'
 
 const API_USAGE = `用法：qiyu api <list|call> [参数]
@@ -372,7 +375,7 @@ async function callOne(argv: string[]): Promise<number> {
   //   `--al` 是**真的拼错**（该报未知参数），`--pretty` 是**真的存在**（该报未实现）——
   //   两者同时出现时，先报哪个都对，但**三个子命令必须选同一个**，否则又是一族
   //   "同族错误两种行为"。选"未知参数优先"与 `list()` 一致。
-  const KNOWN = new Set(['--body', '--yes', '--pretty', '--help', '-h'])
+  const KNOWN = new Set(['--body', '--yes', '--pretty', '--help', '-h', '--no-validate', '--strict'])
   const unknown = argv.filter((a, idx) =>
     a.startsWith('-') && !KNOWN.has(a) && !isBodyValue(idx))
   if (unknown.length > 0) {
@@ -454,6 +457,23 @@ async function callOne(argv: string[]): Promise<number> {
   try {
     const spec = byId(id)
     assertCallable(spec)
+    assertNoValidateStrictConflict(argv)
+    const noValidate = argv.includes('--no-validate')
+    const strict = argv.includes('--strict')
+    const overrides = loadValidationOverrides()
+    const file = loadParams(spec.id)
+    const ov: ValidationOverride | undefined = overrides[spec.id]
+    const warnings: Array<{ kind: string; field?: string; message: string }> = []
+    if (!noValidate) {
+      const norm = normalizeAliases(file, body, ov)
+      body = norm.body
+      warnings.push(...norm.warnings)
+      const vr = validateBody(spec, file, body, ov, { strict })
+      if (vr.hard.length > 0) {
+        throw new Error(vr.hard.map((h) => h.message).join('\n'))
+      }
+      warnings.push(...vr.soft)
+    }
     assertConfirmed(spec, argv.includes('--yes'))
 
     // ⚠️ 凭证解析必须**先于** call()，且失败时走 `auth` 而不是 `usage`。
@@ -494,6 +514,7 @@ async function callOne(argv: string[]): Promise<number> {
     // 只给有 note 的接口输出（`api list` 已是这个口径），保持两处一致。
     return ok(r.payload, {
       endpoint: spec.id,
+      ...(warnings.length ? { warnings } : {}),
       ...(r.notFound ? { not_found: true, warning: '接口返回成功但无数据' } : {}),
       ...(spec.note ? { note: spec.note } : {}),
     })
