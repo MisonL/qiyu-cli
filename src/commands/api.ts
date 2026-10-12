@@ -7,17 +7,20 @@ import type { ParamSpec } from '../core/registry/params.js'
 import type { ValidationOverride } from '../core/registry/validation-overrides.js'
 import { loadValidationOverrides } from '../core/registry/validation-overrides.js'
 import { loadParams } from '../core/registry/params.js'
-import { normalizeAliases, validateBody } from '../core/validate.js'
+import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/validate.js'
 import { ok, fail, usageFail, describeArgs, EXIT } from '../output.js'
 
-const API_USAGE = `用法：qiyu api <list|call> [参数]
+const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 
   qiyu api list [--all]                      列出接口
-  qiyu api call <接口id> [--body <JSON>] [--yes]   调用接口
+  qiyu api schema <接口id> [--pretty]          查看接口的请求参数表
+  qiyu api call <接口id> [--body <JSON>] [--yes] [--no-validate] [--strict]   调用接口
 
 --all     连同不可主动调用的接口一起列出
 --body    请求体（JSON 字面量）。省略与传 {} 是两条不同的服务端路径
 --yes     危险接口（写/破坏性操作）必须显式确认
+--no-validate  关闭 body 校验（危险门禁不受影响）
+--strict       把「未知字段/类型不符」的提示升级为拒绝
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
@@ -67,6 +70,7 @@ export async function apiCommand(argv: string[]): Promise<number> {
     return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
   }
   if (sub === 'list') return list(argv.slice(1))
+  if (sub === 'schema') return await schema(argv.slice(1))
   if (sub === 'call') return callOne(argv.slice(1))
   // ⚠️ 用法错误必须也出 stdout JSON（见 output.ts 的 `usageFail` 说明）：
   // 人类在 stderr 读用法，Agent 在 stdout 读 `{ok:false,error}`。
@@ -80,13 +84,13 @@ export async function apiCommand(argv: string[]): Promise<number> {
   // undefined"—— 那是一句**事实错误**的说明（undefined 不是用户写的东西）。
   // 顶层 `run()` 的 `if (!sub)` 已经把这两件事分开了，这里照做。
   if (!sub) {
-    return usageFail(`用法：qiyu api <list|call> [参数]（\`qiyu api --help\` 查看全部）`,
-      '可用子命令：list、call')
+    return usageFail(`用法：qiyu api <list|call|schema> [参数]（\`qiyu api --help\` 查看全部）`,
+      '可用子命令：list、call、schema')
   }
   // ⚠️ 用 describeArgs 渲染 sub（2026-10-08 修）：`qiyu api " "` 此前报
   // 「未知子命令： 」—— 名字是纯空白、不可见（与空串参数同一个病）。
   return usageFail(
-    `未知子命令：${describeArgs([sub])}\n可用子命令：list、call`,
+    `未知子命令：${describeArgs([sub])}\n可用子命令：list、call、schema`,
     '`qiyu api --help` 查看完整用法')
 }
 
@@ -267,10 +271,69 @@ function list(argv: string[]): number {
   })
 }
 
+const SCHEMA_KNOWN = new Set(['--pretty', '--help', '-h'])
+const SCHEMA_USAGE = `用法：qiyu api schema <接口id> [--pretty]\n\n  查看某接口的请求参数表（params）与响应形状（response_shape）。\n\n--pretty  尚未实现（无参数替代它）。当前只输出紧凑 JSON。\n`
+
+async function schema(argv: string[]): Promise<number> {
+  const unknown = argv.filter((a) => a.startsWith('-') && !SCHEMA_KNOWN.has(a))
+  if (unknown.length > 0) return usageFail(`未知参数：${describeArgs(unknown)}。可用：--pretty`)
+  const positional = argv.filter((a) => !a.startsWith('-'))
+  const help = argv.includes('--help') || argv.includes('-h')
+  // 3a/3b：help 优先于「缺 id」与「位置参数 > 1」，但自身检查位置参数
+  if (help) {
+    if (positional.length > 0) return usageFail(`未知参数：${describeArgs(positional)}。--help 不接受额外参数`)
+    process.stdout.write(SCHEMA_USAGE)
+    return EXIT.OK
+  }
+  if (positional.length > 1) return usageFail(`未知参数：${describeArgs(positional.slice(1))}。api schema 只接受一个接口 id`)
+  if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+  if (positional.length === 0) return usageFail('用法：qiyu api schema <接口id>')
+  const id = positional[0]
+  try {
+    const spec = byId(id)
+    const file = loadParams(spec.id)
+    const ov = loadValidationOverrides()[spec.id]
+    const bodyParams = effectiveBodyParams(file, ov)
+    const hasBodySchema = file.bodyKind === 'json' && bodyParams.length > 0
+    const AUTH = new Set(['appKey', 'time', 'checksum'])
+    // ⚠️ params 输出的 required 必须是应用 override 之后的值，且必须与 validateBody 共用 effectiveBodyParams。
+    const effBody = effectiveBodyParams(file, ov)
+    const effByName = new Map(effBody.map((p) => [p.name, p]))
+    const params: SchemaParam[] = file.params.map((p) => {
+      const base = p.in === 'body' ? (effByName.get(p.name) ?? p) : p
+      return p.in === 'query' && AUTH.has(p.name) ? { ...base, auto: true as const } : { ...base }
+    })
+    const data: Record<string, unknown> = {
+      id: spec.id, title: spec.title, method: spec.method, path: spec.path,
+      callable: spec.callable, dangerous: spec.dangerous,
+      body_kind: file.bodyKind, has_body_schema: hasBodySchema,
+      params, response_shape: file.responseShape,
+      ...(ov?.oneOf ? { one_of: ov.oneOf } : {}),
+    }
+    return ok(data, {
+      endpoint: spec.id,
+      ...(spec.note ? { note: spec.note } : {}),
+      field_notes: {
+        has_body_schema: 'true = 本接口有可比对的 body 参数表（body_kind 为 json 且 body 参数数 > 0）；不代表本次请求已校验，也不代表其余 bodyKind。本次校验结果见 api call 的 meta.warnings',
+        body_kind: '只有 json 会被 api call 比对字段，其余（none/xml/multipart/text/form）原样透传不校验',
+        auto: 'true = CLI 自填的鉴权 query 参数（appKey/time/checksum），调用方不要也不能通过 --body 传',
+        dangerous: 'true = 危险操作，调用时需 --yes，否则退出码 4。必须由人类确认，不要自动追加 --yes',
+        callable: 'false = 结构上不可主动调用（如 inbound 推送）；Agent 只能查、不能调',
+        path: 'null = 路径未收录（数据缺口）；"/" = 入站占位符。两者都不可据此拼 URL',
+        response_shape: '仅供参照，不做校验',
+        one_of: 'one_of 数组每项是一组「组内任一存在即可满足」的字段，全缺会被拒绝（退出码 2）；组内字段的 required 已因此降为 false —— false 是「二选一」的意思，不是「两个都可省」',
+      },
+    })
+  } catch (e) {
+    // 与 callOne 的 catch 共用唯一出口；schema 不经过门禁。
+    return mapThrownToExit(e)
+  }
+}
+
 async function callOne(argv: string[]): Promise<number> {
   const [id] = argv
   if (!id) {
-    return usageFail('用法：qiyu api call <接口id> [--body <JSON>] [--yes]')
+    return usageFail('用法：qiyu api call <接口id> [--body <JSON>] [--yes] [--no-validate] [--strict]')
   }
   // ⚠️ 接口 id 必须是第一个参数。若第一个 token 是 flag（`--yes`/`--body`/`--bod`…），
   // 用户把 flag 写在了 id 之前 —— 此前它会落到 `byId('--yes')` 报出
@@ -294,7 +357,7 @@ async function callOne(argv: string[]): Promise<number> {
   if (id.startsWith('-') && id !== '--help' && id !== '-h') {
     return usageFail(
       `用法：接口 id 必须是第一个参数，但你给的是 flag \`${id}\`。\n` +
-        '正确写法：qiyu api call <接口id> [--body <JSON>] [--yes]',
+        '正确写法：qiyu api call <接口id> [--body <JSON>] [--yes] [--no-validate] [--strict]',
     )
   }
 
@@ -379,7 +442,7 @@ async function callOne(argv: string[]): Promise<number> {
   const unknown = argv.filter((a, idx) =>
     a.startsWith('-') && !KNOWN.has(a) && !isBodyValue(idx))
   if (unknown.length > 0) {
-    return usageFail(`未知参数：${describeArgs(unknown)}。可用：--body <JSON>、--yes`)
+    return usageFail(`未知参数：${describeArgs(unknown)}。可用：--body <JSON>、--yes、--no-validate、--strict`)
   }
 
   // ⚠️ **位置参数同样必须报错** —— 上面那条只筛 `-` 开头的。`api call` 除接口 id
@@ -403,7 +466,7 @@ async function callOne(argv: string[]): Promise<number> {
     // 哨兵在 tests/commands/api.test.ts 的「用法错误的 stderr 也不得出现 Markdown」。
     return usageFail(
       `未知参数：${describeArgs(positional)}。` +
-        '接口 id 之后的参数必须写成 --body <JSON> / --yes —— ' +
+        '接口 id 之后的参数必须写成 --body <JSON> / --yes / --no-validate / --strict —— ' +
         'body 必须用 --body 传入，直接写 JSON 会被忽略（那会发出一个没有 body 的请求）',
     )
   }
@@ -538,43 +601,29 @@ async function callOne(argv: string[]): Promise<number> {
         confirmRequired: true, target: err.target ?? id,
       })
     }
-    // 已分类的业务/网络错误 —— 字段名与 QiyuError 完全一致，可直传。
-    // ⚠️ 这里**不补 stderr**，与全 CLI 的分工一致：只有**用法错误**是双通道
-    // （stderr 给人 + stdout 给 Agent）；业务/网络错误只出 stdout JSON ——
-    // `auth whoami` 的 auth_missing 路径同样只走 `fail()`。
-    // ⚠️ **但 `kind === 'usage'` 必须排除在这条之外**（2026-10-08 修）。此前的
-    // 说明只点了 `classify` / `networkError` 两个来源（它们确实永不产出 usage），
-    // 漏了第三个 —— `http.ts` 的 `isLocalRequestError`（fetch 抛**无 cause** 的
-    // TypeError，如给 GET 传 body）抛的就是 `kind:'usage'`。它若落进这条分支，
-    // 就只出 stdout、**stderr 空**，与 `qiyu api call`（缺 id）两边都有输出
-    // 形成同族两种表现 —— 恰是"用法错误双通道"契约的反例。
-    // 修法：usage 与下方兜底共用双通道出口。（该异常在 http.test.ts 有 `call()`
-    // 级的真实测试；本计划 11 条骨架全是 POST、生产路径暂不可达，但 154 条里
-    // 出现 GET 时必达 —— 见「已知缺口」。）
-    if (err.kind && err.kind !== 'usage') {
-      return fail({
-        code: err.code ?? 'unknown', kind: err.kind, retryable: err.retryable ?? false,
-        message: err.message ?? String(e), hint: err.hint, retryAfter: err.retryAfter,
-      })
-    }
-    // 其余（未知接口 id、不可调用、请求构造失败、危险未确认的兜底）属于**用法**错误 ——
-    // 退出码 2，不是业务错误 1。
-    //
-    // ⚠️ **这条路径的来源是"抛异常"，不是"写 stderr"** —— 所以这里不能调 `usageFail`
-    // （它会再往 stderr 写一遍原文）。但契约要求 stdout 出 JSON、且"用法错误也应
-    // 让人看得到"。做法：`fail()` 负责 stdout 的 JSON，同时**手工补一条 stderr**
-    // 与其余用法错误保持一致 —— 否则 `qiyu api call 不存在的接口` 只在 stdout 有
-    // 输出、stderr 空，而 `qiyu api call`（缺 id）在两边都有。同族错误两种表现。
-    const message = e instanceof Error ? e.message : String(e)
-    process.stderr.write(message.endsWith('\n') ? message : message + '\n')
+    // 已分类的业务/网络错误与其余用法错误共用 mapThrownToExit，避免同族错误两种表现。
+    return mapThrownToExit(e)
+  }
+}
+
+/** 把 catch 到的异常映射为退出码与输出 —— `callOne` 与 `api schema` **共用**的唯一出口（spec §三 :207）。
+ *  两类：① 已分类的业务/网络错误（kind!=='usage'）→ 只出 stdout JSON（失败也 classification 直传）；
+ *        ② 其余（未知 id、不可调用、校验硬拒、`--no-validate`/`--strict` 冲突等）→ usage 双通道 + 退出码 2。
+ *  ⚠️ 不含 needsConfirmation 分支 —— 那是 callOne 独有（schema 不过门禁），由 callOne 在调本函数前先判。 */
+function mapThrownToExit(e: unknown): number {
+  // ⚠️ 用 `Partial<QiyuError>`（src/core/errors.ts:53，`retryAfter` 是 `{seconds,source}` 对象）——
+  // 不要写成 `retryAfter: number`（fail() 的入参类型是对象，tsc 会 TS2322 红）。
+  const err = e as Partial<QiyuError>
+  if (err.kind && err.kind !== 'usage') {
     return fail({
-      code: 'usage', kind: 'usage', retryable: false,
-      message: message.replace(/\n+$/, ''),
-      // isLocalRequestError 会带 hint（"CLI 侧构造问题、重试无用"）；byId /
-      // assertCallable 的普通 Error 没有，undefined 时 fail() 会整个省略该键。
-      hint: err.hint,
+      code: err.code ?? 'unknown', kind: err.kind, retryable: err.retryable ?? false,
+      message: err.message ?? String(e), hint: err.hint, retryAfter: err.retryAfter,
     })
   }
+  // 用法错误双通道：fail() 出 stdout JSON，同时手工补 stderr 一条（与 usageFail 的可见性一致）
+  const message = e instanceof Error ? e.message : String(e)
+  process.stderr.write(message.endsWith('\n') ? message : message + '\n')
+  return fail({ code: 'usage', kind: 'usage', retryable: false, message: message.replace(/\n+$/, ''), hint: err.hint })
 }
 
 /** `ParamSpec` 的浅复制 + `auto`：见 §三 `params` 说明。`auto` 只加给 query 里的鉴权参数。 */

@@ -1452,3 +1452,78 @@ describe('assertNoValidateStrictConflict', () => {
     expect(() => assertNoValidateStrictConflict([])).not.toThrow()
   })
 })
+
+describe('api schema', () => {
+  it('验收 1：search → 0，含 body_kind/has_body_schema/auto/response_shape，meta 无 validation，无 one_of，无 note', async () => {
+    expect(await apiCommand(['schema', 'ai.knowledge.search'])).toBe(0)
+    const o = JSON.parse(out)
+    expect(o.data.body_kind).toBe('json')
+    expect(o.data.has_body_schema).toBe(true)
+    expect(o.data.params.find((p: { name: string }) => p.name === 'appKey').auto).toBe(true)
+    expect(o.data.params.find((p: { name: string }) => p.name === 'robotId').required).toBe(true)
+    expect(o.data.response_shape).toEqual({ kind: 'object' })
+    expect(o.meta.field_notes.has_body_schema).toBeTruthy()
+    expect(o.meta.field_notes.body_kind).toMatch(/json/)
+    expect(o.meta.validation).toBeUndefined()
+    expect(o.data.one_of).toBeUndefined()
+    expect(o.meta.note).toBeUndefined()
+  })
+  it('验收 1 补：addKnowledge（有 note）→ meta.note 存在', async () => {
+    await apiCommand(['schema', 'ai.knowledge.addKnowledge'])
+    expect(JSON.parse(out).meta.note).toBeTruthy()
+  })
+  it('验收 25：merchant.account.login → one_of 输出 + relaxRequired 生效 + field_notes.one_of 含「任一」', async () => {
+    await apiCommand(['schema', 'merchant.account.login'])
+    const o = JSON.parse(out)
+    expect(o.data.one_of[0].anyOf).toEqual(['code', 'shopCode'])
+    expect(o.data.params.find((p: { name: string }) => p.name === 'code').required).toBe(false)
+    expect(o.meta.field_notes.one_of).toMatch(/任一/)
+  })
+  it('验收 2：未知 id → 2', async () => { expect(await apiCommand(['schema', '不存在的id'])).toBe(2) })
+  it('验收 14：callable:false 照常输出 → 0', async () => {
+    expect(await apiCommand(['schema', 'crm.modifyOrder'])).toBe(0)
+    expect(JSON.parse(out).data.callable).toBe(false)
+  })
+  it('位置参数规则：schema --help extra → 2；schema a --help → 2；schema a b → 2；schema --help → 0', async () => {
+    expect(await apiCommand(['schema', '--help', 'extra'])).toBe(2)
+    expect(await apiCommand(['schema', 'ai.knowledge.search', '--help'])).toBe(2)
+    expect(await apiCommand(['schema', 'a', 'b'])).toBe(2)
+    expect(await apiCommand(['schema', '--help'])).toBe(0)
+  })
+  it('验收 8：schema tag.all → has_body_schema:false、body_kind json', async () => {
+    await apiCommand(['schema', 'tag.all'])
+    const o = JSON.parse(out)
+    expect(o.data.has_body_schema).toBe(false)
+    expect(o.data.body_kind).toBe('json')
+  })
+  it('验收 27：schema kefu.add（xml、14 body 参数）→ has_body_schema:false、body_kind xml', async () => {
+    await apiCommand(['schema', 'kefu.add'])
+    const o = JSON.parse(out)
+    expect(o.data.body_kind).toBe('xml')
+    expect(o.data.has_body_schema).toBe(false)
+  })
+  it('验收 27（api call 半边）：tag.all --body 非对象 → 0、无 warning、不硬拒', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    for (const b of ['[]', 'null', '"x"']) {
+      out = ''
+      expect(await apiCommand(['call', 'tag.all', '--body', b])).toBe(0)
+      expect(JSON.parse(out).meta?.warnings).toBeUndefined()
+    }
+    vi.unstubAllGlobals()
+  })
+  it('验收 26：schema 走 loadParams，params 缺失（root 注入）→ 1（internal），与 api call 同一条路径', async () => {
+    try {
+      const emptyRoot = mkdtempSync(join(tmpdir(), 'qiyu-schema-empty-'))
+      setParamsRoot(emptyRoot)
+      const code = await apiCommand(['schema', 'ai.knowledge.search'])
+      expect(code).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind).toBe('internal')
+      expect(e.retryable).toBe(false)
+      expect(err, 'internal 只出 stdout，不补 stderr（与 callOne 同一出口）').toBe('')
+    } finally {
+      setParamsRoot(undefined)
+    }
+  })
+})
