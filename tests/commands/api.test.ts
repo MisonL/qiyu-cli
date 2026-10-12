@@ -767,6 +767,20 @@ describe('api call —— B 块（body 校验）', () => {
     vi.unstubAllGlobals()
   })
 
+  it('验收 11：message.send 缺必填 + 无 --yes → 2（不是 4，D5：校验先于门禁）', async () => {
+    // spec §九 第 11 条前半句。⚠️ 必须用危险接口验：非危险接口返回 0，
+    //    无法区分「门禁被跳过」与「门禁本就不管」。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn(); vi.stubGlobal('fetch', fetchSpy)
+    const code = await apiCommand(['call', 'message.send', '--body', '{"uid":1}'])
+    expect(code, '缺必填必须报参数错误 2，而不是先撞门禁报 4').toBe(2)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('usage')
+    expect(e.confirm_required).toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
   it('验收 5：search 带 bogus → 0，warning 含「已发出」「不要重发」', async () => {
     vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
