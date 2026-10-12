@@ -62,6 +62,8 @@ describe('generate', () => {
       reportPath: join(a, 'r.md'), rateLimits: {},
     })
     expect(first.errors, first.errors.join('\n')).toEqual([])
+    // ⚠️ 无结构子串扫描（非结构化断言）：将来某条 note 含英文 validate/oneOf/aliases 会假红，
+    //    届时应改为结构化断言（逐键检查顶层不含这些键）。
     expect(JSON.stringify(first.specs)).not.toMatch(/validate|relaxRequired|oneOf|aliases/)
     const second = await generate({
       pagesDir: PAGES_DIR, outDir: b, overridesDir: ov,
