@@ -79,4 +79,12 @@ describe('validateParamsFile', () => {
   it('顶层非对象 → 抛', () => {
     expect(() => validateParamsFile('x.y', null)).toThrow()
   })
+  it('params 元素是 null → 抛（不得抛原生 TypeError）', () => {
+    expect(() => validateParamsFile('x.y', { params: [null], bodyKind: 'json', responseShape: { kind: 'object' } }))
+      .toThrow(/\[0\] 必须是对象/)
+  })
+  it('params 元素是数组 → 抛', () => {
+    expect(() => validateParamsFile('x.y', { params: [[]], bodyKind: 'json', responseShape: { kind: 'object' } }))
+      .toThrow(/\[0\] 必须是对象/)
+  })
 })

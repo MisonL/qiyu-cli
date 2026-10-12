@@ -37,6 +37,9 @@ export function validateParamsFile(id: string, raw: unknown): ParamFile {
   const seenBodyNames = new Set<string>()
   const seenQueryNames = new Set<string>()
   const params: ParamSpec[] = o.params.map((p, i) => {
+    if (p === null || typeof p !== 'object' || Array.isArray(p)) {
+      throw new Error(`params/${id}.json[${i}] 必须是对象`)
+    }
     const e = p as Record<string, unknown>
     if (typeof e.name !== 'string' || !e.name) throw new Error(`params/${id}.json[${i}] 缺少 name`)
     if (typeof e.in !== 'string' || !IN_KINDS.has(e.in)) {
