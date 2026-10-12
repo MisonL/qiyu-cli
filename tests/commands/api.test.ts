@@ -1495,7 +1495,9 @@ describe('api schema', () => {
     out = ''; err = ''
     expect(await apiCommand(['schema', '--bad', '--help'])).toBe(2)
     expect(err, '未知参数必须先于 help 报出').toContain('未知参数：--bad')
-    expect(err).not.toContain('用法：qiyu api schema')
+    // ⚠️ 次序颠倒（help 先执行）时 `--bad --help` 会返回 0 并把**用法文本**写进 stdout ——
+    //    故必须断 stdout **不含用法文本**；`toBe('')` 是错的（usageFail 必然 fail() 写失败 JSON）。
+    expect(out, '不得因 help 分支先执行而输出用法文本').not.toContain('用法：qiyu api schema')
     // ② help 优先于 --pretty：help 本该永远成功（spec：`schema --help` → 0）
     out = ''; err = ''
     expect(await apiCommand(['schema', '--pretty', '--help'])).toBe(0)
