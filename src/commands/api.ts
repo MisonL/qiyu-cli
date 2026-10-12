@@ -3,6 +3,8 @@ import { allEndpoints, byId, assertCallable, assertConfirmed } from '../core/reg
 import { resolveCredentials } from '../core/credentials.js'
 import { call } from '../core/http.js'
 import type { QiyuError } from '../core/errors.js'
+import type { ParamSpec } from '../core/registry/params.js'
+import type { ValidationOverride } from '../core/registry/validation-overrides.js'
 import { ok, fail, usageFail, describeArgs, EXIT } from '../output.js'
 
 const API_USAGE = `用法：qiyu api <list|call> [参数]
@@ -551,5 +553,15 @@ async function callOne(argv: string[]): Promise<number> {
       // assertCallable 的普通 Error 没有，undefined 时 fail() 会整个省略该键。
       hint: err.hint,
     })
+  }
+}
+
+/** `ParamSpec` 的浅复制 + `auto`：见 §三 `params` 说明。`auto` 只加给 query 里的鉴权参数。 */
+export type SchemaParam = ParamSpec & { auto?: true }
+
+/** 私有：`--no-validate` 与 `--strict` 同传 → 抛普通 Error（→ 退出码 2）。 */
+export function assertNoValidateStrictConflict(argv: string[]): void {
+  if (argv.includes('--no-validate') && argv.includes('--strict')) {
+    throw new Error('--no-validate 与 --strict 不能同时使用 —— 前者完全关闭校验，后者把提示升级为拒绝，两者直接矛盾')
   }
 }

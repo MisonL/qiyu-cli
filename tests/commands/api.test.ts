@@ -1227,3 +1227,23 @@ describe('api call —— 危险操作门禁', () => {
     vi.unstubAllEnvs()
   })
 })
+
+// 追加到 tests/commands/api.test.ts
+import { assertNoValidateStrictConflict } from '../../src/commands/api.js'
+
+describe('assertNoValidateStrictConflict', () => {
+  it('同传抛普通 Error（不挂 kind）', () => {
+    let caught: unknown
+    try { assertNoValidateStrictConflict(['--no-validate', '--strict']) } catch (e) { caught = e }
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as { kind?: string }).kind).toBeUndefined()
+    // spec §六：消息须可操作、点明两个 flag 冲突
+    expect((caught as Error).message).toMatch(/--no-validate/)
+    expect((caught as Error).message).toMatch(/--strict/)
+  })
+  it('单传 / 都不传不抛', () => {
+    expect(() => assertNoValidateStrictConflict(['--no-validate'])).not.toThrow()
+    expect(() => assertNoValidateStrictConflict(['--strict'])).not.toThrow()
+    expect(() => assertNoValidateStrictConflict([])).not.toThrow()
+  })
+})

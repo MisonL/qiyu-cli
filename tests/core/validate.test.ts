@@ -35,3 +35,33 @@ describe('normalizeAliases', () => {
     expect(() => normalizeAliases(file(), { name: 'q', question: 'q2' }, ov)).toThrow(/只传其一/)
   })
 })
+
+// 追加到 tests/core/validate.test.ts（effectiveBodyParams 的落点在 validate.ts）
+import { effectiveBodyParams } from '../../src/core/validate.js'
+
+describe('effectiveBodyParams', () => {
+  it('把 relaxRequired 字段的 required 降为 false，其余原样；**只返回 body 参数**', () => {
+    const file = { params: [
+      { name: 'appKey', in: 'query', required: true },      // 不得出现在结果里
+      { name: 'userName', in: 'body', required: true },
+      { name: 'code', in: 'body', required: true },
+      { name: 'shopCode', in: 'body', required: true },
+    ], bodyKind: 'json', responseShape: { kind: 'object' } } as never
+    const out = effectiveBodyParams(file, { relaxRequired: ['code', 'shopCode'] })
+    expect(out.map((p: { name: string }) => p.name)).toEqual(['userName', 'code', 'shopCode'])
+    expect(out.every((p: { in: string }) => p.in === 'body')).toBe(true)
+    expect(out.find((p) => p.name === 'userName')!.required).toBe(true)
+    expect(out.find((p) => p.name === 'code')!.required).toBe(false)
+    expect(out.find((p) => p.name === 'shopCode')!.required).toBe(false)
+  })
+  it('无 override 时返回**仅 body** 参数（过滤掉 query/path/header）—— tag.all 语义：全 query → 空', () => {
+    const file = { params: [
+      { name: 'appKey', in: 'query', required: true },
+      { name: 'time', in: 'query', required: true },
+      { name: 'checksum', in: 'query', required: true },
+    ], bodyKind: 'json', responseShape: { kind: 'object' } } as never
+    // ⚠️ tag.all（json、0 body、3 个 required query）必须返回 []，否则 validateBody 会误判 hasBodySchema=true
+    //    并硬拒「缺 appKey/time/checksum」（验收 8）。
+    expect(effectiveBodyParams(file, undefined)).toEqual([])
+  })
+})
