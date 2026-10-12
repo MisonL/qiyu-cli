@@ -54,6 +54,23 @@ describe('generate', () => {
     expect(readFileSync(join(a, 'specs.json'), 'utf8')).toBe(readFileSync(join(b, 'specs.json'), 'utf8'))
   })
 
+  it('validate.json 不参与生成：输出不含校验键且 fixture 重跑确定', async () => {
+    const a = mkdtempSync(join(tmpdir(), 'validate-a-')), b = mkdtempSync(join(tmpdir(), 'validate-b-'))
+    const ov = tmpOverrides()
+    const first = await generate({
+      pagesDir: PAGES_DIR, outDir: a, overridesDir: ov,
+      reportPath: join(a, 'r.md'), rateLimits: {},
+    })
+    expect(first.errors, first.errors.join('\n')).toEqual([])
+    expect(JSON.stringify(first.specs)).not.toMatch(/validate|relaxRequired|oneOf|aliases/)
+    const second = await generate({
+      pagesDir: PAGES_DIR, outDir: b, overridesDir: ov,
+      reportPath: join(b, 'r.md'), rateLimits: {},
+    })
+    expect(second.errors, second.errors.join('\n')).toEqual([])
+    expect(readFileSync(join(b, 'specs.json'), 'utf8')).toBe(readFileSync(join(a, 'specs.json'), 'utf8'))
+  })
+
   describe('loadRateLimits', () => {
     // ⚠️ 对账哨兵读的是 dist 里的 RATE_LIMITS。产物缺失/过期时必须**在写任何
     // 产物之前**抛错 —— 否则 specs.json 已经写了一半，目录里新旧混杂。
