@@ -1,4 +1,3 @@
-export { sanitizeControlChars } from './core/sanitize.js'
 
 export const EXIT = {
   OK: 0,            // 成功
@@ -78,6 +77,9 @@ function write(obj: unknown): void {
 export function describeArgs(args: readonly string[]): string {
   return args.map((a) => (a.trim() === '' ? `'${a}'` : a)).join('、')
 }
+
+/** 把不受信文本（调用方 body 的字段名等）中的终端控制字符抹成占位，防止 stderr 注入 ANSI/OSC 序列。 */
+export { sanitizeControlChars } from './core/sanitize.js'
 
 export function ok(data: unknown, meta?: unknown): number {
   // ⚠️ `data` 必须**始终存在**，即便值是 undefined 也写成 null。
