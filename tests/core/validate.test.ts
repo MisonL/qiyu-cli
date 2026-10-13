@@ -35,6 +35,15 @@ describe('normalizeAliases', () => {
   it('源键与目标键同时存在 → 抛（硬拒歧义）', () => {
     expect(() => normalizeAliases(file(), { name: 'q', question: 'q2' }, ov)).toThrow(/只传其一/)
   })
+  it('body 含 __proto__ 这个 own key 时不得被静默丢弃（fromEntries 而非逐键赋值）', () => {
+    // JSON.parse 会把 "__proto__" 解析成 own key；逐键 `rewritten[k]=v` 会被 setPrototypeOf 吞掉。
+    const body = JSON.parse('{"name":"q","__proto__":{"x":1},"answer":"a"}')
+    const r = normalizeAliases(file(), body, ov)
+    expect(Object.keys(r.body as object)).toEqual(['question', '__proto__', 'answer'])
+    expect(JSON.stringify(r.body)).toContain('__proto__')
+    // 且不得污染原型
+    expect(({} as { x?: number }).x).toBeUndefined()
+  })
 })
 
 // 追加到 tests/core/validate.test.ts（effectiveBodyParams 的落点在 validate.ts）

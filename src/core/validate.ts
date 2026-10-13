@@ -40,17 +40,19 @@ export function normalizeAliases(
   }
   // 按 body 键出现顺序输出 warning
   const warnings: Violation[] = []
-  const rewritten: Record<string, unknown> = {}
-  for (const [k, v] of Object.entries(body)) {
-    if (Object.hasOwn(aliases, k)) {
+  // 必须用 Object.fromEntries 而非 `rewritten[k] = v` 逐键赋值：body 里可能有
+  // `__proto__` 这个 own key（`JSON.parse('{"__proto__":…}')` 会产出），而对普通对象
+  // 做 `obj["__proto__"] = v` 会被 setPrototypeOf 语义吞掉，导致字段静默消失。
+  // 原型不会被污染，但字段会丢；fromEntries 会保留它为普通 own key。
+  const rewritten = Object.fromEntries(
+    Object.entries(body).map(([k, v]) => {
+      if (!Object.hasOwn(aliases, k)) return [k, v]
       const dst = aliases[k]
-      rewritten[dst] = v
       warnings.push({ kind: 'alias_normalized', field: k,
         message: `${k} 已按本接口约定改写为 ${dst} 发送；请求正常，无需重试` })
-    } else {
-      rewritten[k] = v
-    }
-  }
+      return [dst, v]
+    }),
+  )
   return { body: rewritten, warnings }
 }
 

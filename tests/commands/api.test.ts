@@ -767,6 +767,18 @@ describe('api call —— B 块（body 校验）', () => {
     vi.unstubAllGlobals()
   })
 
+  it('验收 4：硬拒短路 —— 同时缺必填与含未知字段时，仍 2 且不输出 warnings', async () => {
+    // spec §九 第 4 条：硬拒短路，不输出 warnings（soft 被清空）。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn(); vi.stubGlobal('fetch', fetchSpy)
+    const code = await apiCommand(['call', 'ai.knowledge.addKnowledge', '--body',
+      '{"name":"x","answer":"y","similars":[],"validitySwitch":1,"categoryId":1,"bogus":1}'])
+    expect(code).toBe(2)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(JSON.parse(out).meta?.warnings, '硬拒时 soft 必须被清空').toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
   it('验收 11：message.send 缺必填 + 无 --yes → 2（不是 4，D5：校验先于门禁）', async () => {
     // spec §九 第 11 条前半句。⚠️ 必须用危险接口验：非危险接口返回 0，
     //    无法区分「门禁被跳过」与「门禁本就不管」。
@@ -825,6 +837,18 @@ describe('api call —— B 块（body 校验）', () => {
     expect(await apiCommand(['call', 'message.send', '--yes', '--body', '{"uid":1,"msgType":"TEXT","content":"x","bogus":1}'])).toBe(0)
     const w = JSON.parse(out).meta.warnings
     expect(w.some((x: { kind: string; field?: string }) => x.kind === 'unknown_field' && x.field === 'bogus')).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 31：危险接口（--yes）成功响应里 non_json_body 照出', async () => {
+    // spec §九 第 31 条：危险接口成功响应里 non_json_body/alias_normalized 也照出。
+    // kefu.add 是 xml + dangerous:true，带 --yes 过门禁，body 出 non_json_body 软警告。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    const code = await apiCommand(['call', 'kefu.add', '--yes', '--body', '"x"'])
+    expect(code).toBe(0)
+    const w = JSON.parse(out).meta.warnings
+    expect(w.some((x: { kind: string }) => x.kind === 'non_json_body')).toBe(true)
     vi.unstubAllGlobals()
   })
 
