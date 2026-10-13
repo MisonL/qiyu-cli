@@ -98,6 +98,14 @@ describe('validateBody —— 硬规则', () => {
 })
 
 describe('validateBody —— 软规则与 strict', () => {
+  it('unknown_field 消息清除字段名中的终端控制字符并保留重发语义', () => {
+    const field = '\u001b]0;pwned\u0007'
+    const r = validateBody(spec(), jsonFile([{ name: 'robotId', in: 'body', required: true }]),
+      { robotId: 1, [field]: 1 }, undefined, { strict: false })
+    const message = r.soft.find((w) => w.kind === 'unknown_field')!.message
+    expect(message).not.toMatch(/\u001b/)
+    expect(message).toMatch(/已(随请求)?发出|已经发出/)
+  })
   it('unknown_field 只软；strict 下升硬', () => {
     const file = jsonFile([{ name: 'robotId', in: 'body', required: true }])
     const soft = validateBody(spec(), file, { robotId: 1, bogus: 1 }, undefined, { strict: false })

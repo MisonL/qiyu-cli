@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { ok, fail, usageFail, describeArgs } from '../src/output.js'
+import { ok, fail, usageFail, describeArgs, sanitizeControlChars } from '../src/output.js'
 
 let out: string
 // ⚠️ 用法错误现在**双通道**（stderr 给人、stdout 给 Agent），所以 err 也要捕获。
@@ -10,6 +10,12 @@ beforeEach(() => {
   vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
 })
 afterEach(() => vi.restoreAllMocks())
+
+describe('sanitizeControlChars —— 不受信文本不得注入终端控制序列', () => {
+  it('替换 C0/C1 控制字符但保留 Tab 与换行', () => {
+    expect(sanitizeControlChars('a\u001b]0;pwned\u0007\t\nb')).toBe('a·]0;pwned·\t\nb')
+  })
+})
 
 describe('成功输出', () => {
   it('形态为 {ok:true,data,meta}，且 stdout 是纯 JSON', () => {

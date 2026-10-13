@@ -23,6 +23,14 @@ describe('validateOverrides —— fail-closed', () => {
   it('不存在的 id → 抛，且消息点名接口 id（spec 验收 12）', () => {
     expect(() => validateOverrides({ 'no.such': {} }, specs, paramsFor)).toThrow(/no\.such/)
   })
+  it.each([null, 123, []])('条目为 %s 时必须拒绝非对象形状', (entry) => {
+    expect(() => validateOverrides({ 'a.b': entry }, specs, paramsFor))
+      .toThrow('validate.json[a.b] 必须是对象')
+  })
+  it('条目含未知键时必须点名该键', () => {
+    expect(() => validateOverrides({ 'a.b': { oneof: ['code', 'shopCode'] } }, specs, paramsFor))
+      .toThrow('validate.json[a.b] 含未知键 oneof')
+  })
   it('relaxRequired 引用不存在的字段 → 抛', () => {
     expect(() => validateOverrides({ 'a.b': { relaxRequired: ['nope'] } }, specs, paramsFor)).toThrow()
   })
@@ -38,6 +46,10 @@ describe('validateOverrides —— fail-closed', () => {
   })
   it('aliases 目标键不存在 → 抛', () => {
     expect(() => validateOverrides({ 'c.d': { aliases: { name: 'ghost' } } }, specs, paramsFor)).toThrow()
+  })
+  it('多个别名源键指向同一目标时必须拒绝', () => {
+    expect(() => validateOverrides({ 'c.d': { aliases: { a: 'question', b: 'question' } } }, specs, paramsFor))
+      .toThrow('validate.json[c.d] 的别名目标 question 被多个源键指向')
   })
   it('aliases 源键恰是 body 字段 → 抛', () => {
     expect(() => validateOverrides({ 'c.d': { aliases: { question: 'question' } } }, specs, paramsFor)).toThrow()

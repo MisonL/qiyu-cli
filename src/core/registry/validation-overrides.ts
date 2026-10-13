@@ -22,6 +22,9 @@ export function validateOverrides(
   const out: Record<string, ValidationOverride> = {}
   for (const [id, v] of Object.entries(rawIn as Record<string, unknown>)) {
     if (!ids.has(id)) throw new Error(`validate.json 的键 ${id} 不是注册表里的接口 id`)
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+      throw new Error(`validate.json[${id}] 必须是对象`)
+    }
     const o = v as Record<string, unknown>
     const file = paramsFor(id)
     const bodyNames = new Set(file.params.filter((p) => p.in === 'body').map((p) => p.name))
@@ -59,12 +62,19 @@ export function validateOverrides(
       if (o.aliases === null || typeof o.aliases !== 'object' || Array.isArray(o.aliases)) {
         throw new Error(`validate.json[${id}].aliases 必须是对象`)
       }
+      const targets = new Set<string>()
       for (const [src, dst] of Object.entries(o.aliases as Record<string, unknown>)) {
         if (typeof dst !== 'string') throw new Error(`validate.json[${id}].aliases 的目标键必须是字符串`)
         if (!bodyNames.has(dst)) throw new Error(`validate.json[${id}].aliases 的目标键 ${dst} 不是 body 字段`)
         if (bodyNames.has(src)) throw new Error(`validate.json[${id}].aliases 的源键 ${src} 本身就是 body 字段（不该被别名覆盖）`)
+        if (targets.has(dst)) throw new Error(`validate.json[${id}] 的别名目标 ${dst} 被多个源键指向`)
+        targets.add(dst)
       }
       ov.aliases = o.aliases as Record<string, string>
+    }
+    const known = new Set(['note', 'relaxRequired', 'oneOf', 'aliases'])
+    for (const k of Object.keys(o)) {
+      if (!known.has(k)) throw new Error(`validate.json[${id}] 含未知键 ${k}`)
     }
     out[id] = ov
   }

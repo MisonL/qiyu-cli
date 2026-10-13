@@ -1,3 +1,4 @@
+import { sanitizeControlChars } from './sanitize.js'
 import type { ParamFile, ParamSpec } from './registry/params.js'
 import type { ValidationOverride } from './registry/validation-overrides.js'
 import type { EndpointSpec } from './registry/index.js'
@@ -35,7 +36,7 @@ export function normalizeAliases(
   if (srcPresent.length === 0) return { body, warnings: [] }
   for (const s of srcPresent) {
     if (Object.hasOwn(body, aliases[s])) {
-      throw new Error(`body 同时含别名源键 ${s} 与目标键 ${aliases[s]} —— 只传其一（不预设谁优先）`)
+      throw new Error(`body 同时含别名源键 ${sanitizeControlChars(s)} 与目标键 ${sanitizeControlChars(aliases[s])} —— 只传其一（不预设谁优先）`)
     }
   }
   // 按 body 键出现顺序输出 warning
@@ -49,7 +50,7 @@ export function normalizeAliases(
       if (!Object.hasOwn(aliases, k)) return [k, v]
       const dst = aliases[k]
       warnings.push({ kind: 'alias_normalized', field: k,
-        message: `${k} 已按本接口约定改写为 ${dst} 发送；请求正常，无需重试` })
+        message: `${sanitizeControlChars(k)} 已按本接口约定改写为 ${sanitizeControlChars(dst)} 发送；请求正常，无需重试` })
       return [dst, v]
     }),
   )
@@ -84,7 +85,7 @@ export function validateBody(
   if (file.bodyKind !== 'json') {
     if (body === undefined) return { hard: [], soft: [] }
     return { hard: [], soft: [{ kind: 'non_json_body',
-      message: `本接口 body_kind 是 ${file.bodyKind}，你的 --body 已按原样字面量发送、未经字段校验；本 CLI 不构造非 JSON 的 body 编码。该字面量已随请求发出，不要重发（重发 = 再执行一次接口，写接口会重复写入）` }] }
+      message: `本接口 body_kind 是 ${sanitizeControlChars(file.bodyKind)}，你的 --body 已按原样字面量发送、未经字段校验；本 CLI 不构造非 JSON 的 body 编码。该字面量已随请求发出，不要重发（重发 = 再执行一次接口，写接口会重复写入）` }] }
   }
   if (!hasBodySchema) return { hard: [], soft: [] }
 
@@ -94,13 +95,13 @@ export function validateBody(
     const missing = bodyParams.filter((p) => p.required)
     if (missing.length > 0) {
       return { hard: [{ kind: 'missing_required', field: missing[0].name,
-        message: `未传 --body，但该接口需要 JSON 对象 body（缺必填字段：${missing.map((p) => p.name).join('、')}）。用 qiyu api schema ${spec.id} 查看完整参数表` }], soft: [] }
+        message: `未传 --body，但该接口需要 JSON 对象 body（缺必填字段：${missing.map((p) => sanitizeControlChars(p.name)).join('、')}）。用 qiyu api schema ${spec.id} 查看完整参数表` }], soft: [] }
     }
     return { hard: [], soft: [] }
   }
   if (!isPlainObject(body)) {
     return { hard: [{ kind: 'non_object_body',
-      message: `该接口需要 JSON 对象 body，实际是 ${body === null ? 'null' : Array.isArray(body) ? '数组' : '标量'}。用 qiyu api schema ${spec.id} 查看参数表` }], soft: [] }
+      message: `该接口需要 JSON 对象 body，实际是 ${sanitizeControlChars(body === null ? 'null' : Array.isArray(body) ? '数组' : '标量')}。用 qiyu api schema ${spec.id} 查看参数表` }], soft: [] }
   }
 
   const bodyNames = new Set(bodyParams.map((p) => p.name))
@@ -110,7 +111,7 @@ export function validateBody(
   for (const p of bodyParams) {
     if (p.required && (!Object.hasOwn(body, p.name) || body[p.name] === undefined)) {
       hard.push({ kind: 'missing_required', field: p.name,
-        message: `缺少必填字段 ${p.name}（body 里没有该键）。用 qiyu api schema ${spec.id} 查看完整参数表` })
+        message: `缺少必填字段 ${sanitizeControlChars(p.name)}（body 里没有该键）。用 qiyu api schema ${spec.id} 查看完整参数表` })
     }
   }
   // 硬：one-of 组（组内任一存在即满足；全缺 → 用 override message），排在 per-field 之后
@@ -125,7 +126,7 @@ export function validateBody(
   for (const k of Object.keys(body)) {
     if (!bodyNames.has(k) && !aliasSrc.has(k)) {
       soft.push({ kind: 'unknown_field', field: k,
-        message: `字段 ${k} 不在本接口的文档参数表中，服务端可能忽略它；但本次请求已经发出（退出码 0）——不要重发（重发 = 再执行一次接口，写接口会重复写入）` })
+        message: `字段 ${sanitizeControlChars(k)} 不在本接口的文档参数表中，服务端可能忽略它；但本次请求已经发出（退出码 0）——不要重发（重发 = 再执行一次接口，写接口会重复写入）` })
     }
   }
   for (const p of bodyParams) {
@@ -133,7 +134,7 @@ export function validateBody(
       const check = BODY_TYPE_MAP[p.type]
       if (check && !check(body[p.name])) {
         soft.push({ kind: 'type_mismatch', field: p.name,
-          message: `字段 ${p.name} 声明类型 ${p.type}，实际是 ${renderActual(body[p.name])}。本值已随请求发出（退出码 0），不要重发` })
+          message: `字段 ${sanitizeControlChars(p.name)} 声明类型 ${sanitizeControlChars(p.type)}，实际是 ${sanitizeControlChars(renderActual(body[p.name]))}。本值已随请求发出（退出码 0），不要重发` })
       }
     }
   }
@@ -143,8 +144,8 @@ export function validateBody(
     if (upgraded.length > 0) {
       const hardMsgs: Violation[] = upgraded.map((w) => ({ kind: w.kind, field: w.field,
         message: w.kind === 'unknown_field'
-          ? `本地参数表未收录字段 ${w.field}，未发出请求，请修正后重试（这是本地参数表闭集一致性检查，不是对服务端行为的保证 —— 若确认该字段合法，请改用默认模式或报告缺失的注册表项，不要删字段重试）`
-          : `字段 ${w.field} 类型不符（声明类型与传入值不符），未发出请求，请修正后重试 —— 不要删字段重试` }))
+          ? `本地参数表未收录字段 ${sanitizeControlChars(w.field ?? '')}，未发出请求，请修正后重试（这是本地参数表闭集一致性检查，不是对服务端行为的保证 —— 若确认该字段合法，请改用默认模式或报告缺失的注册表项，不要删字段重试）`
+          : `字段 ${sanitizeControlChars(w.field ?? '')} 类型不符（声明类型与传入值不符），未发出请求，请修正后重试 —— 不要删字段重试` }))
       return { hard: hardMsgs, soft: [] }
     }
   }

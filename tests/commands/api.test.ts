@@ -1513,6 +1513,21 @@ describe('api schema', () => {
     await apiCommand(['schema', 'ai.knowledge.addKnowledge'])
     expect(JSON.parse(out).meta.note).toBeTruthy()
   })
+  it('event.sessionData 的鉴权 query 参数不标 auto', async () => {
+    expect(await apiCommand(['schema', 'event.sessionData'])).toBe(0)
+    const params = JSON.parse(out).data.params
+    for (const name of ['time', 'checksum']) {
+      const param = params.find((p: { name: string }) => p.name === name)
+      expect(param, `${name} 必须保留在 schema params 中`).toBeDefined()
+      expect(param.auto).not.toBe(true)
+    }
+  })
+  it('ai.knowledge.search 的 time 仍标 auto', async () => {
+    expect(await apiCommand(['schema', 'ai.knowledge.search'])).toBe(0)
+    const time = JSON.parse(out).data.params.find((p: { name: string }) => p.name === 'time')
+    expect(time).toBeDefined()
+    expect(time.auto).toBe(true)
+  })
   it('验收 25：merchant.account.login → one_of 输出 + relaxRequired 生效 + field_notes.one_of 含「任一」', async () => {
     await apiCommand(['schema', 'merchant.account.login'])
     const o = JSON.parse(out)
@@ -1520,7 +1535,11 @@ describe('api schema', () => {
     expect(o.data.params.find((p: { name: string }) => p.name === 'code').required).toBe(false)
     expect(o.meta.field_notes.one_of).toMatch(/任一/)
   })
-  it('验收 2：未知 id → 2', async () => { expect(await apiCommand(['schema', '不存在的id'])).toBe(2) })
+  it('验收 2：未知 id → 2，stderr 点名 id 与未知接口', async () => {
+    expect(await apiCommand(['schema', '不存在的id'])).toBe(2)
+    expect(err).toContain('不存在的id')
+    expect(err).toContain('未知接口')
+  })
   it('验收 14：callable:false 照常输出 → 0', async () => {
     expect(await apiCommand(['schema', 'crm.modifyOrder'])).toBe(0)
     expect(JSON.parse(out).data.callable).toBe(false)

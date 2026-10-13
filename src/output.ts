@@ -1,4 +1,4 @@
-// src/output.ts
+export { sanitizeControlChars } from './core/sanitize.js'
 
 export const EXIT = {
   OK: 0,            // 成功
