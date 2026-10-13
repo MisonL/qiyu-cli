@@ -1,0 +1,11 @@
+{
+  "merchant.account.login": {
+    "note": "上游自相矛盾：接口描述要求 code/shopCode 必填其一，schema 却把三者全标必填。按接口描述建模为 one-of。",
+    "relaxRequired": ["code", "shopCode"],
+    "oneOf": [{ "anyOf": ["code", "shopCode"], "message": "code 与 shopCode 必填其一（都存在时以 code 为准）" }]
+  },
+  "ai.knowledge.editKnowledgeNoSimilars": {
+    "note": "设计稿 §5.4.1：该接口取 question，复用 editKnowledge body 形态的调用方会传 name——改名必须在请求构建器处理，不能留给调用方。",
+    "aliases": { "name": "question" }
+  }
+}

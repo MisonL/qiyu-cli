@@ -50,4 +50,5 @@ registry-src/
 # 开发期临时产物（工作交接、子代理执行账本、git worktree）
 HANDOFF.md
 .superpowers/
+.claude/
 .worktrees/

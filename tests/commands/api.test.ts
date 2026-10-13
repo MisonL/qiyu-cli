@@ -6,6 +6,10 @@ import { __resetBuckets } from '../../src/core/http.js'
 // `registry_complete` 那条测试要拿注册表**实际条数**与 `meta.registry_note` 比对，
 // 才能证明该字段是由数据推导的、不是一个独立写死的常量。
 import { allEndpoints } from '../../src/core/registry/index.js'
+import { setParamsRoot } from '../../src/core/registry/params.js'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 let out = ''
 let err = ''
@@ -163,7 +167,10 @@ describe('api list', () => {
     // "没有这个能力"显式说出来 —— 与 `verified`/`direction` 同一条标准。
     await apiCommand(['list'])
     const note = JSON.parse(out).meta.field_notes.request_schema
-    expect(note).toMatch(/不提供|没有/)
+    expect(note).toMatch(/不含|不提供|没有/)
+    expect(note).toMatch(/响应体不做校验/)
+    expect(note).toMatch(/不要删字段重试/)
+    expect(note).toMatch(/api schema/)
     // ⚠️ 这条字符串**逐字输出给 Agent**，所以它点名的错误码必须是"传错字段"真会得到的。
     // 此前写的是「多半回 14003/14004」（2026-10-06 修）—— 而 14003 是 `time` 错误
     // （鉴权层的时间戳/时钟偏移），与 body 字段毫无关系：设计稿 §4.3 错误码表如此定义
@@ -745,6 +752,245 @@ describe('api list', () => {
   })
 })
 
+describe('api call —— B 块（body 校验）', () => {
+  it('验收 3/4：addKnowledge 只缺 robotId → 2、零网络、消息点名 robotId、不含 confirm_required', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn(); vi.stubGlobal('fetch', fetchSpy)
+    const code = await apiCommand(['call', 'ai.knowledge.addKnowledge', '--body',
+      '{"name":"x","answer":"y","similars":[],"validitySwitch":1,"categoryId":1}'])
+    expect(code).toBe(2)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(err).toMatch(/robotId/)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('usage')
+    expect(e.confirm_required).toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 4：硬拒短路 —— 同时缺必填与含未知字段时，仍 2 且不输出 warnings', async () => {
+    // spec §九 第 4 条：硬拒短路，不输出 warnings（soft 被清空）。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn(); vi.stubGlobal('fetch', fetchSpy)
+    const code = await apiCommand(['call', 'ai.knowledge.addKnowledge', '--body',
+      '{"name":"x","answer":"y","similars":[],"validitySwitch":1,"categoryId":1,"bogus":1}'])
+    expect(code).toBe(2)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(JSON.parse(out).meta?.warnings, '硬拒时 soft 必须被清空').toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 11：message.send 缺必填 + 无 --yes → 2（不是 4，D5：校验先于门禁）', async () => {
+    // spec §九 第 11 条前半句。⚠️ 必须用危险接口验：非危险接口返回 0，
+    //    无法区分「门禁被跳过」与「门禁本就不管」。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn(); vi.stubGlobal('fetch', fetchSpy)
+    const code = await apiCommand(['call', 'message.send', '--body', '{"uid":1}'])
+    expect(code, '缺必填必须报参数错误 2，而不是先撞门禁报 4').toBe(2)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('usage')
+    expect(e.confirm_required).toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 5：search 带 bogus → 0，warning 含「已发出」「不要重发」', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    const code = await apiCommand(['call', 'ai.knowledge.search', '--body', '{"robotId":1,"bogus":1}'])
+    expect(code).toBe(0)
+    const w = JSON.parse(out).meta.warnings
+    expect(w[0]).toMatchObject({ kind: 'unknown_field', field: 'bogus' })
+    expect(w[0].message).toMatch(/已(随请求)?发出|已经发出/)
+    expect(w[0].message).toMatch(/不要重发/)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 9：非危险接口 non_json_body → 0，warning 含「已发出」「不要重发」且不含「未验证」', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    const code = await apiCommand(['call', 'icoutcall.phone.getLineList', '--body', '"x"'])
+    expect(code).toBe(0)
+    const w = JSON.parse(out).meta.warnings
+    const nj = w.find((x: { kind: string }) => x.kind === 'non_json_body')
+    expect(nj).toBeTruthy()
+    expect(nj.message).toMatch(/已(随请求)?发出|已经发出/)
+    expect(nj.message).toMatch(/不要重发/)
+    expect(nj.message).not.toMatch(/未验证/)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 28：type_mismatch message 含「已随请求发出」+ 渲染词（如 null）', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    const code = await apiCommand(['call', 'ai.knowledge.search', '--body', '{"robotId":"1"}'])
+    expect(code).toBe(0)
+    const tm = JSON.parse(out).meta.warnings.find((x: { kind: string }) => x.kind === 'type_mismatch')
+    expect(tm).toBeTruthy()
+    expect(tm.message).toMatch(/已(随请求)?发出|已经发出/)
+    expect(tm.message).toMatch(/不要重发/)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 31：危险接口（带 --yes）成功响应里 warning 照出', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    expect(await apiCommand(['call', 'message.send', '--yes', '--body', '{"uid":1,"msgType":"TEXT","content":"x","bogus":1}'])).toBe(0)
+    const w = JSON.parse(out).meta.warnings
+    expect(w.some((x: { kind: string; field?: string }) => x.kind === 'unknown_field' && x.field === 'bogus')).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 31：危险接口（--yes）成功响应里 non_json_body 照出', async () => {
+    // spec §九 第 31 条：危险接口成功响应里 non_json_body/alias_normalized 也照出。
+    // kefu.add 是 xml + dangerous:true，带 --yes 过门禁，body 出 non_json_body 软警告。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    const code = await apiCommand(['call', 'kefu.add', '--yes', '--body', '"x"'])
+    expect(code).toBe(0)
+    const w = JSON.parse(out).meta.warnings
+    expect(w.some((x: { kind: string }) => x.kind === 'non_json_body')).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 15：--no-validate --strict 同传 → 2', async () => {
+    expect(await apiCommand(['call', 'ai.knowledge.search', '--no-validate', '--strict', '--body', '{}'])).toBe(2)
+  })
+
+  it('验收 17（红线）：危险接口 + --no-validate + 合法/缺失 body + 无 --yes → 4，fetch 未被调用', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn(); vi.stubGlobal('fetch', fetchSpy)
+    expect(await apiCommand(['call', 'message.send', '--no-validate', '--body', '{"uid":1}'])).toBe(4)
+    expect(await apiCommand(['call', 'message.send', '--no-validate'])).toBe(4)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 7：editKnowledgeNoSimilars 用 name → 0，mock body 用 question；加 question → 2', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn((_url: string | URL | Request, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchSpy)
+    const body = '{"id":1,"robotId":2,"name":"q","answer":"a","validitySwitch":1,"categoryId":1,"ruleType":0,"channelAnswers":[]}'
+    expect(await apiCommand(['call', 'ai.knowledge.editKnowledgeNoSimilars', '--yes', '--body', body])).toBe(0)
+    const sent = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body)
+    expect(sent).toHaveProperty('question'); expect(sent).not.toHaveProperty('name')
+    expect(JSON.parse(out).meta.warnings.some((x: { kind: string; field?: string }) => x.kind === 'alias_normalized' && x.field === 'name')).toBe(true)
+    out = ''
+    expect(await apiCommand(['call', 'ai.knowledge.editKnowledgeNoSimilars', '--yes', '--body',
+      '{"id":1,"robotId":2,"name":"q","question":"q2","answer":"a","validitySwitch":1,"categoryId":1,"ruleType":0,"channelAnswers":[]}'])).toBe(2)
+    expect(err).toMatch(/只传其一/)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 34：meta.warnings 两来源合成次序 [alias_normalized(name), unknown_field(bogus)]', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    expect(await apiCommand(['call', 'ai.knowledge.editKnowledgeNoSimilars', '--yes', '--body',
+      '{"id":1,"robotId":2,"name":"q","answer":"a","validitySwitch":1,"categoryId":1,"ruleType":0,"channelAnswers":[],"bogus":1}'])).toBe(0)
+    const w = JSON.parse(out).meta.warnings
+    expect(w.map((x: { kind: string }) => x.kind)).toEqual(['alias_normalized', 'unknown_field'])
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 13/26：root 注入下 params 缺失 → api call 走 loadParams 抛 kind:internal → 1', async () => {
+    try {
+      vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+      const emptyRoot = mkdtempSync(join(tmpdir(), 'qiyu-empty-'))
+      setParamsRoot(emptyRoot)
+      expect(await apiCommand(['call', 'ai.knowledge.search', '--body', '{"robotId":1}'])).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind).toBe('internal')
+      expect(e.code).toBe('internal')
+      expect(await apiCommand(['call', 'ai.knowledge.search', '--no-validate', '--body', '{}'])).toBe(1)
+    } finally {
+      setParamsRoot(undefined)
+    }
+  })
+
+  it('验收 19：--no-validate 下 search 传 --body {} → 请求照发，warnings 全静默、别名改写关闭', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn((_url: string | URL | Request, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchSpy)
+    expect(await apiCommand(['call', 'ai.knowledge.search', '--no-validate', '--body', '{}'])).toBe(0)
+    expect(fetchSpy).toHaveBeenCalled()
+    expect(JSON.parse(out).meta.warnings).toBeUndefined()
+    out = ''
+    expect(await apiCommand(['call', 'ai.knowledge.editKnowledgeNoSimilars', '--yes', '--no-validate', '--body',
+      '{"id":1,"robotId":2,"name":"q","answer":"a","validitySwitch":1,"categoryId":1,"ruleType":0,"channelAnswers":[]}'])).toBe(0)
+    const sent = JSON.parse((fetchSpy.mock.calls[1][1] as { body: string }).body)
+    expect(sent).toHaveProperty('name'); expect(sent).not.toHaveProperty('question')
+    expect(JSON.parse(out).meta.warnings).toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 6：merchant.account.login（危险）one-of：userName+code+--yes → 0；{} 全缺 → 2 且同时含组消息与 userName', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    expect(await apiCommand(['call', 'merchant.account.login', '--yes', '--body', '{"userName":1,"code":2}'])).toBe(0)
+    out = ''
+    expect(await apiCommand(['call', 'merchant.account.login', '--yes', '--body', '{}'])).toBe(2)
+    expect(err).toMatch(/userName/)
+    expect(err).toMatch(/code 与 shopCode 必填其一/)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 10：无必填的接口不带 --body → 0、无 warning（json 有表无必填 + bodyKind none 两个方向）', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, message: '{}' }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    expect(await apiCommand(['call', 'ticket.search'])).toBe(0)
+    expect(JSON.parse(out).meta.warnings).toBeUndefined()
+    out = ''
+    expect(await apiCommand(['call', 'icoutcall.phone.getLineList'])).toBe(0)
+    expect(JSON.parse(out).meta.warnings).toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 16：robotId=null 普通模式 → 0 + type_mismatch；--strict → 2（存在 ≠ 通过）', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    expect(await apiCommand(['call', 'ai.knowledge.search', '--body', '{"robotId":null}'])).toBe(0)
+    expect(JSON.parse(out).meta.warnings.some((w: { kind: string }) => w.kind === 'type_mismatch')).toBe(true)
+    out = ''
+    expect(await apiCommand(['call', 'ai.knowledge.search', '--strict', '--body', '{"robotId":null}'])).toBe(2)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 18：非对象 body 对「有表」接口 → 2；对 0 body 表接口（getLineList）→ 不因形状报错', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    for (const b of ['[]', 'null', '"x"']) {
+      out = ''; err = ''
+      expect(await apiCommand(['call', 'ai.knowledge.search', '--body', b]), b).toBe(2)
+      expect(err, b).toMatch(/需要 JSON 对象/)
+    }
+    out = ''
+    expect(await apiCommand(['call', 'icoutcall.phone.getLineList', '--body', '[]'])).toBe(0)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 20：--strict 下 non_json_body 与 alias_normalized 仍只提示', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    expect(await apiCommand(['call', 'icoutcall.phone.getLineList', '--strict', '--body', '"x"'])).toBe(0)
+    expect(JSON.parse(out).meta.warnings.some((w: { kind: string }) => w.kind === 'non_json_body')).toBe(true)
+    out = ''
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    expect(await apiCommand(['call', 'ai.knowledge.editKnowledgeNoSimilars', '--yes', '--strict', '--body',
+      '{"id":1,"robotId":2,"name":"q","answer":"a","validitySwitch":1,"categoryId":1,"ruleType":0,"channelAnswers":[]}'])).toBe(0)
+    const w = JSON.parse(out).meta.warnings
+    expect(w.some((x: { kind: string }) => x.kind === 'alias_normalized')).toBe(true)
+    expect(w.some((x: { kind: string }) => x.kind === 'unknown_field')).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
+  it('验收 29：--strict 硬拒消息点名 bogus 且不含「已发出」', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    const code = await apiCommand(['call', 'ai.knowledge.search', '--strict', '--body', '{"robotId":1,"bogus":1}'])
+    expect(code).toBe(2)
+    expect(err).toMatch(/bogus/)
+    expect(err).not.toMatch(/已(随请求)?发出|已经发出/)
+  })
+})
+
 describe('api call —— 危险操作门禁', () => {
   it('未加 --yes 调危险接口：退出码 4，且不发任何网络请求', async () => {
     // 逃生舱是唯一的写入口。门禁若在这里失效，等于所有写保护都不存在。
@@ -753,7 +999,7 @@ describe('api call —— 危险操作门禁', () => {
     vi.stubEnv('QIYU_APP_SECRET', 's')
     const fetchSpy = vi.fn()
     vi.stubGlobal('fetch', fetchSpy)
-    const code = await apiCommand(['call', 'message.send'])
+    const code = await apiCommand(['call', 'message.send', '--body', '{"uid":1,"msgType":"TEXT","content":"x"}'])
     expect(code).toBe(4)
     expect(fetchSpy).not.toHaveBeenCalled()
     const e = JSON.parse(out).error
@@ -791,7 +1037,7 @@ describe('api call —— 危险操作门禁', () => {
       new Response(JSON.stringify({ code: 200, data: { ok: 1 } }),
         { status: 200, headers: { 'content-type': 'application/json' } })))
     vi.stubGlobal('fetch', fetchSpy)
-    const code = await apiCommand(['call', 'message.send', '--yes', '--body', '{"uid":1}'])
+    const code = await apiCommand(['call', 'message.send', '--yes', '--body', '{"uid":1,"msgType":"TEXT","content":"x"}'])
     expect(fetchSpy, '--yes 必须让请求真的发出去，而不是被门禁继续拦着').toHaveBeenCalledTimes(1)
     expect(code, '放行后走正常成功路径').toBe(0)
     expect(JSON.parse(out).ok).toBe(true)
@@ -1225,5 +1471,136 @@ describe('api call —— 危险操作门禁', () => {
     expect(fetchSpy, '请求照常发出').toHaveBeenCalledTimes(1)
     vi.unstubAllGlobals()
     vi.unstubAllEnvs()
+  })
+})
+
+// 追加到 tests/commands/api.test.ts
+import { assertNoValidateStrictConflict } from '../../src/commands/api.js'
+
+describe('assertNoValidateStrictConflict', () => {
+  it('同传抛普通 Error（不挂 kind）', () => {
+    let caught: unknown
+    try { assertNoValidateStrictConflict(['--no-validate', '--strict']) } catch (e) { caught = e }
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as { kind?: string }).kind).toBeUndefined()
+    // spec §六：消息须可操作、点明两个 flag 冲突
+    expect((caught as Error).message).toMatch(/--no-validate/)
+    expect((caught as Error).message).toMatch(/--strict/)
+  })
+  it('单传 / 都不传不抛', () => {
+    expect(() => assertNoValidateStrictConflict(['--no-validate'])).not.toThrow()
+    expect(() => assertNoValidateStrictConflict(['--strict'])).not.toThrow()
+    expect(() => assertNoValidateStrictConflict([])).not.toThrow()
+  })
+})
+
+describe('api schema', () => {
+  it('验收 1：search → 0，含 body_kind/has_body_schema/auto/response_shape，meta 无 validation，无 one_of，无 note', async () => {
+    expect(await apiCommand(['schema', 'ai.knowledge.search'])).toBe(0)
+    const o = JSON.parse(out)
+    expect(o.data.body_kind).toBe('json')
+    expect(o.data.has_body_schema).toBe(true)
+    expect(o.data.params.find((p: { name: string }) => p.name === 'appKey').auto).toBe(true)
+    expect(o.data.params.find((p: { name: string }) => p.name === 'robotId').required).toBe(true)
+    expect(o.data.response_shape).toEqual({ kind: 'object' })
+    expect(o.meta.field_notes.has_body_schema).toBeTruthy()
+    expect(o.meta.field_notes.body_kind).toMatch(/json/)
+    expect(o.meta.validation).toBeUndefined()
+    expect(o.data.one_of).toBeUndefined()
+    expect(o.meta.note).toBeUndefined()
+  })
+  it('验收 1 补：addKnowledge（有 note）→ meta.note 存在', async () => {
+    await apiCommand(['schema', 'ai.knowledge.addKnowledge'])
+    expect(JSON.parse(out).meta.note).toBeTruthy()
+  })
+  it('event.sessionData 的鉴权 query 参数不标 auto', async () => {
+    expect(await apiCommand(['schema', 'event.sessionData'])).toBe(0)
+    const params = JSON.parse(out).data.params
+    for (const name of ['time', 'checksum']) {
+      const param = params.find((p: { name: string }) => p.name === name)
+      expect(param, `${name} 必须保留在 schema params 中`).toBeDefined()
+      expect(param.auto).not.toBe(true)
+    }
+  })
+  it('ai.knowledge.search 的 time 仍标 auto', async () => {
+    expect(await apiCommand(['schema', 'ai.knowledge.search'])).toBe(0)
+    const time = JSON.parse(out).data.params.find((p: { name: string }) => p.name === 'time')
+    expect(time).toBeDefined()
+    expect(time.auto).toBe(true)
+  })
+  it('验收 25：merchant.account.login → one_of 输出 + relaxRequired 生效 + field_notes.one_of 含「任一」', async () => {
+    await apiCommand(['schema', 'merchant.account.login'])
+    const o = JSON.parse(out)
+    expect(o.data.one_of[0].anyOf).toEqual(['code', 'shopCode'])
+    expect(o.data.params.find((p: { name: string }) => p.name === 'code').required).toBe(false)
+    expect(o.meta.field_notes.one_of).toMatch(/任一/)
+  })
+  it('验收 2：未知 id → 2，stderr 点名 id 与未知接口', async () => {
+    expect(await apiCommand(['schema', '不存在的id'])).toBe(2)
+    expect(err).toContain('不存在的id')
+    expect(err).toContain('未知接口')
+  })
+  it('验收 14：callable:false 照常输出 → 0', async () => {
+    expect(await apiCommand(['schema', 'crm.modifyOrder'])).toBe(0)
+    expect(JSON.parse(out).data.callable).toBe(false)
+  })
+  it('位置参数规则：schema --help extra → 2；schema a --help → 2；schema a b → 2；schema --help → 0', async () => {
+    expect(await apiCommand(['schema', '--help', 'extra'])).toBe(2)
+    expect(await apiCommand(['schema', 'ai.knowledge.search', '--help'])).toBe(2)
+    expect(await apiCommand(['schema', 'a', 'b'])).toBe(2)
+    expect(await apiCommand(['schema', '--help'])).toBe(0)
+  })
+  it('帮助次序：未知参数优先于 help，help 优先于 --pretty（只看退出码区分不开，必须断 stderr 文本）', async () => {
+    // ① 未知参数优先于 help：`--bad` 是真拼错 → 必须报「未知参数：--bad」，而不是给帮助
+    out = ''; err = ''
+    expect(await apiCommand(['schema', '--bad', '--help'])).toBe(2)
+    expect(err, '未知参数必须先于 help 报出').toContain('未知参数：--bad')
+    // ⚠️ 次序颠倒（help 先执行）时 `--bad --help` 会返回 0 并把**用法文本**写进 stdout ——
+    //    故必须断 stdout **不含用法文本**；`toBe('')` 是错的（usageFail 必然 fail() 写失败 JSON）。
+    expect(out, '不得因 help 分支先执行而输出用法文本').not.toContain('用法：qiyu api schema')
+    // ② help 优先于 --pretty：help 本该永远成功（spec：`schema --help` → 0）
+    out = ''; err = ''
+    expect(await apiCommand(['schema', '--pretty', '--help'])).toBe(0)
+    expect(out, 'help 先于 --pretty').toContain('用法：qiyu api schema')
+    // ③ 反向：只有 --pretty、无 help 时仍必须显式拒绝「尚未实现」（不能被次序调整吞掉）
+    out = ''; err = ''
+    expect(await apiCommand(['schema', 'ai.knowledge.search', '--pretty'])).toBe(2)
+    expect(err).toContain('--pretty 尚未实现')
+  })
+  it('验收 8：schema tag.all → has_body_schema:false、body_kind json', async () => {
+    await apiCommand(['schema', 'tag.all'])
+    const o = JSON.parse(out)
+    expect(o.data.has_body_schema).toBe(false)
+    expect(o.data.body_kind).toBe('json')
+  })
+  it('验收 27：schema kefu.add（xml、14 body 参数）→ has_body_schema:false、body_kind xml', async () => {
+    await apiCommand(['schema', 'kefu.add'])
+    const o = JSON.parse(out)
+    expect(o.data.body_kind).toBe('xml')
+    expect(o.data.has_body_schema).toBe(false)
+  })
+  it('验收 27（api call 半边）：tag.all --body 非对象 → 0、无 warning、不硬拒', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    for (const b of ['[]', 'null', '"x"']) {
+      out = ''
+      expect(await apiCommand(['call', 'tag.all', '--body', b])).toBe(0)
+      expect(JSON.parse(out).meta?.warnings).toBeUndefined()
+    }
+    vi.unstubAllGlobals()
+  })
+  it('验收 26：schema 走 loadParams，params 缺失（root 注入）→ 1（internal），与 api call 同一条路径', async () => {
+    try {
+      const emptyRoot = mkdtempSync(join(tmpdir(), 'qiyu-schema-empty-'))
+      setParamsRoot(emptyRoot)
+      const code = await apiCommand(['schema', 'ai.knowledge.search'])
+      expect(code).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind).toBe('internal')
+      expect(e.retryable).toBe(false)
+      expect(err, 'internal 只出 stdout，不补 stderr（与 callOne 同一出口）').toBe('')
+    } finally {
+      setParamsRoot(undefined)
+    }
   })
 })
