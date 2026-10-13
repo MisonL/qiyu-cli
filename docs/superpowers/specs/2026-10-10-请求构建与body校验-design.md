@@ -1227,6 +1227,7 @@ export function loadParams(id: string, root: string | undefined = injectedRoot):
 | 69 | **B 实施计划审查（6 路 agent 全维度审查，逐条机械核验后的落盘）**（v2.4）：审查对象是 `docs/superpowers/plans/2026-10-12-请求构建与body校验.md`（c6e5139 初版），6 个独立 agent（spec 覆盖 / 可实现性对拍 / 安全全场景 / 冷启动实施者 / 测试有效性变异杀灭 / 文档联动）共报 40+ 条发现，controller 逐条对拍代码/数据/文件后采纳落计划。**改动落在计划，本 spec 仅三处联动**：①§四 `non_json_body` 的 message 措辞修正——原「不要因『未验证』而重发」与验收 9 的「不含『未验证』」**自相矛盾**（message 里含被禁字面量、测试必红），改为「**不要重发**（重发 = 再执行一次接口，写接口会重复写入）」——同款口径已在 `unknown_field` 的 message 里使用，两处统一；②§四 `type_mismatch` **硬形态** message 补「不要删字段重试」——§八.3 的误拒指引此前只挂在 `unknown_field` 硬形态上，`type_mismatch` 在 `--strict` 下同样可能误拒（类型映射与实际业务不符），同一指引不得缺席；③§八.6 对 4 个危险接口（`tag.batchUpdate`/`ipcc.calltaskdetail.update`/`ipcc.calltaskdetail.delete`/`track.event.set`）的静默通过补 **Ruling**（接受：params 表为空无字段可点名、门禁不受影响）——这是对 §八.6 既有实测事实的**处置补记**，非行为变更。计划侧其余重大修正（均在计划内，不回写本 spec）：`effectiveBodyParams` 从 api.ts 改落 `validate.ts`（消除循环依赖 + 满足 §四 :998-999 共用硬要求）、`loadValidationOverrides` 从「每次调用重算」改为模块级常量 `OVERRIDES` 的只读访问器（§十.0 原文如此，计划初版写错了）、`schema()` 的 catch 与 `callOne` **共用** `mapThrownToExit`（§三 :207）、schema 的 `params` 输出应用 override 后的 required（第 67 条①）、Task 6 补三处会被 D5 打破的既有用例（`:749`/`:794` 补全 message.send body）+ stub 泄漏收尾 + 验收 6/9/28/30/31/34/13/26/27/20 的落点断言、Task 8 补 README:120「写接口仍需显式确认」联动（§八之二 第 1 条②此前无落点）、Task 9 生成器路径改 `scripts/registry/generate.mjs` 且测试补真实调用形态（`await generate({...})` → `{specs,errors}`） | B 计划 6 路审查（全部经机械核验）＋ controller 对拍落盘 |
 
 | 70 | `api schema` 的 `auto` 仅适用于可调用且 `auth: 'checksum'` 的接口；入站/`eventType` 的同名 query 参数由回调方提供，CLI 不填（9 处误标实测）。 | 外部审查（sourcery-ai PR#3 评论 9）+ 实测 9 处误标 |
+| 71 | **外部审查（sourcery-ai PR#3，10 条）处置落盘**：采纳 8 条已修（C1 构建失败路径、C5/C6/C7 override 加载 fail-closed 三项、C8 消息消毒防终端注入、C9 auto 条件收紧、C10 验收 2 断言补强，commit `62725d3`+`a3852f9`）；驳回 1 条（integer 拒小数——§四:322 明文「不拒小数」）；降级 1 条（C3 非有限数 → 记 §十二 第 7 条开放问题）。全仓 444/444。 | PR#3 外部审查（sourcery-ai）+ controller 逐条机械核验 |
 
 **未采纳**：审查提出的「params 用静态 import 编译期映射」建议——与既有 `copy-params.mjs`
 把 params 拷进 `dist` 的机制不符；改为 `readFileSync(pathToFileURL(...))` + `readFileSync`
@@ -1261,3 +1262,8 @@ export function loadParams(id: string, root: string | undefined = injectedRoot):
    根因是 `tests/` 无 `spawn`/`child_process` 先例、无 tsx、`testTimeout: 5_000` 无余量。
    是否要引入子进程测试能力（可覆盖模块初始化崩溃、真实 CLI 端到端）留待后续——**不在 B 的范围**
    （B 不为此改测试基建）。
+7. **非有限数的发送语义**（v2.4 补，见 §十一 第 71 条）——`JSON.parse('1e400')` 得 `Infinity`
+   （`typeof === 'number'`），按 §四 类型映射通过校验，但 `JSON.stringify(Infinity)` 序列化为
+   `null` 发出：字段值与调用方所传不同。是否给 `number`/`integer` 判据加 `Number.isFinite`
+   属类型判据语义层变更（§四 明文「只按 JS 类型直接判」），**不在 B 的范围**；
+   154 个真实 params 文件的参数值域未出现该形态，实际风险与「14004/静默忽略」同族（已有文档警示）。
