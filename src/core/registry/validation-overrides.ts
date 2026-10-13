@@ -47,6 +47,9 @@ export function validateOverrides(
     if (o.oneOf !== undefined) {
       if (!Array.isArray(o.oneOf)) throw new Error(`validate.json[${id}].oneOf 必须是数组`)
       ov.oneOf = (o.oneOf as unknown[]).map((g, gi) => {
+        if (g === null || typeof g !== 'object' || Array.isArray(g)) {
+          throw new Error(`validate.json[${id}].oneOf[${gi}] 必须是对象`)
+        }
         const gg = g as { anyOf?: unknown; message?: unknown }
         if (!Array.isArray(gg.anyOf) || gg.anyOf.length < 2 || !gg.anyOf.every((x) => typeof x === 'string')) {
           throw new Error(`validate.json[${id}].oneOf[${gi}].anyOf 必须是 ≥2 的字符串数组`)

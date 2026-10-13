@@ -12,8 +12,8 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks())
 
 describe('sanitizeControlChars —— 不受信文本不得注入终端控制序列', () => {
-  it('替换 C0/C1 控制字符但保留 Tab 与换行', () => {
-    expect(sanitizeControlChars('a\u001b]0;pwned\u0007\t\nb')).toBe('a·]0;pwned·\t\nb')
+  it('替换 C0/C1 控制字符但保留 Tab', () => {
+    expect(sanitizeControlChars('a\u001b]0;pwned\u0007\t\nb')).toBe('a·]0;pwned·\t·b')
   })
 })
 

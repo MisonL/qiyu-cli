@@ -38,6 +38,10 @@ describe('validateOverrides —— fail-closed', () => {
     const pf = (id: string) => file([{ name: 'opt', in: 'body', required: false }])
     expect(() => validateOverrides({ 'a.b': { relaxRequired: ['opt'] } }, specs, pf)).toThrow()
   })
+  it('oneOf 元素不是对象时必须点名索引并拒绝', () => {
+    expect(() => validateOverrides({ 'a.b': { oneOf: [null] } }, specs, paramsFor))
+      .toThrow('validate.json[a.b].oneOf[0] 必须是对象')
+  })
   it('oneOf.anyOf 少于 2 个 → 抛', () => {
     expect(() => validateOverrides({ 'a.b': { oneOf: [{ anyOf: ['code'], message: 'm' }] } }, specs, paramsFor)).toThrow()
   })
