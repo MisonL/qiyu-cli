@@ -45,7 +45,12 @@ export interface FetchCtx {
   credentials: { appKey: string; appSecret: string }
 }
 
-/** enrich 返回 null 表示该行被正当淘汰（不计入 written 也不算 count_mismatch）。 */
+/**
+ * enrich：确定性派生/过滤（红线 1 推论：同输入行永远同输出）。
+ * 返回 null 表示该行被本地决策淘汰——计入 fetched，但不写库；
+ * 若淘汰导致 written < fetch 声明的 apiCount，引擎按红线 2 记 count_mismatch
+ *（淘汰是本地决策，mismatch 是核查信号——口径见 engine.ts 与 task-5-report）。
+ */
 export type EnrichFn = (row: Record<string, unknown>) => Record<string, unknown> | null
 
 /** 同步任务声明（spec §4.1）。 */

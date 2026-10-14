@@ -11,6 +11,7 @@ import {
   clearGap,
   listGaps,
 } from '../../src/sync/state.js'
+import type { WatermarkState } from '../../src/sync/state.js'
 import type { Store, StoreConfig } from '../../src/store/types.js'
 
 // L1 对冲：真库冷启动偶发 >5s，统一放宽到 15s。
@@ -46,11 +47,39 @@ describe('sync/state —— 水位与缺口', () => {
 
   it('markPending 后未推进时读到 pending 与空水位', async () => {
     const store = await fresh()
-    await store.transaction(async (tx) => { await markPending(tx, 'd') })
+    const existing = await readWatermark(store, 'd')
+    await store.transaction(async (tx) => { await markPending(tx, 'd', existing) })
     const s = await readWatermark(store, 'd')
     expect(s.watermark).toBeNull()
     expect(s.rangeStatus).toBe('pending')
     expect(s.lastSyncedAt).toBeNull()
+    await store.close()
+  })
+
+  it('markPending 保留已有水位（中断重跑不退回全量——中-1 钉死）', async () => {
+    const store = await fresh()
+    // 预置水位：complete @ 2026-10-01
+    await store.transaction(async (tx) => {
+      await advanceWatermark(tx, 'reports.overview', '2026-10-01', { start: 0, end: 1 }, '2026-10-01T00:00:00Z')
+    })
+    // 新一轮窗口开始：置 pending —— 水位必须保留，绝不能清成 null（否则重跑从 0 全量拉）
+    const existing = await readWatermark(store, 'reports.overview')
+    await store.transaction(async (tx) => { await markPending(tx, 'reports.overview', existing) })
+    const s = await readWatermark(store, 'reports.overview')
+    expect(s.watermark).toBe('2026-10-01')
+    expect(s.rangeStatus).toBe('pending')
+    expect(s.lastSyncedAt).toBe('2026-10-01T00:00:00Z')
+    await store.close()
+  })
+
+  it('recordGap 的 recorded_at 取注入时钟（低-4 确定性钉死）', async () => {
+    const store = await fresh()
+    const fixed = new Date('2026-10-14T08:00:00Z').toISOString()
+    await store.transaction(async (tx) => {
+      await recordGap(tx, 't', 'a', 'b', 'count_mismatch', 'd', { now: () => Date.parse(fixed) })
+    })
+    const gaps = await listGaps(store, 't')
+    expect(gaps[0].recordedAt).toBe(fixed)
     await store.close()
   })
 

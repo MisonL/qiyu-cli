@@ -68,7 +68,7 @@ async function storeGap(ctx: RunCtx, task: SyncTask, w: Range,
   reason: WindowGapReason, detail: string, gaps: GapInfo[]): Promise<void> {
   const info: GapInfo = { rangeStart: String(w.start), rangeEnd: String(w.end), reason, detail }
   await ctx.store.transaction(async (tx) => {
-    await recordGap(tx, task.id, info.rangeStart, info.rangeEnd, reason, detail)
+    await recordGap(tx, task.id, info.rangeStart, info.rangeEnd, reason, detail, { now: ctx.clock })
   })
   gaps.push(info)
 }
@@ -141,7 +141,8 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   const raw = sliceByMaxWindow(resolvedRange, task.maxWindowDays, task.overlapDays ?? 0)
   const windows = skipContained(raw, overlapMs)
 
-  await store.transaction(async (tx) => { await markPending(tx, task.id) })
+  // markPending 只翻状态、保留水位（修复轮中-1）：existing 在事务外读出传入。
+  await store.transaction(async (tx) => { await markPending(tx, task.id, state) })
 
   let succeeded = 0
   let failed = 0

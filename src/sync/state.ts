@@ -43,9 +43,22 @@ function stateRow(dataset: string, watermark: string | null, rangeStatus: RangeS
   return { dataset, watermark, range_status: rangeStatus, last_error: lastError, locked_by: lockedBy, locked_at: lockedAt, last_synced_at: lastSyncedAt, next_allowed_at: null, last_rate_limited_at: null }
 }
 
-/** 标记该 dataset 待同步（新一轮窗口开始）。 */
-export async function markPending(tx: WriteTx, dataset: string): Promise<void> {
-  await tx.upsert('sync_state', [stateRow(dataset, null, 'pending', null, null, null, null)])
+/**
+ * 标记该 dataset 待同步（新一轮窗口开始）。
+ * ⚠️ 只翻状态、不动水位：`existing` 由调用方先经 readWatermark 读出传入
+ *（WriteTx 无 query——防线分层，读改写的「读」在事务外完成），markPending
+ * 保留其 watermark —— 清成 null 会让中断后重跑从 0 全量拉（API 成本巨大）。
+ * existing 缺省/null 或全空（无既有行）时水位为 null（首跑）。
+ */
+export async function markPending(tx: WriteTx, dataset: string,
+  existing?: WatermarkState | null): Promise<void> {
+  const hasRow = existing !== null && existing !== undefined
+    && !(existing.watermark === null && existing.rangeStatus === null && existing.lastSyncedAt === null)
+  if (!hasRow) {
+    await tx.upsert('sync_state', [stateRow(dataset, null, 'pending', null, null, null, null)])
+    return
+  }
+  await tx.upsert('sync_state', [stateRow(dataset, existing.watermark, 'pending', null, null, null, existing.lastSyncedAt)])
 }
 
 /**
@@ -60,8 +73,10 @@ export async function advanceWatermark(tx: WriteTx, dataset: string, watermark: 
 
 /** 记录/覆盖一条缺口（同 dataset+range_start 靠主键幂等覆盖）。 */
 export async function recordGap(tx: WriteTx, dataset: string, rangeStart: string,
-  rangeEnd: string, reason: string, detail: string): Promise<void> {
-  const recordedAt = new Date().toISOString()
+  rangeEnd: string, reason: string, detail: string,
+  opts: { now?: () => number } = {}): Promise<void> {
+  // 时钟注入（T5 修复轮 低-4）：引擎传 ctx.clock，测试可确定性断言；缺省真实时间。
+  const recordedAt = new Date(opts.now?.() ?? Date.now()).toISOString()
   await tx.upsert('sync_gaps', [{ dataset, range_start: rangeStart, range_end: rangeEnd, reason, recorded_at: recordedAt, detail }])
 }
 
