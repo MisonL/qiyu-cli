@@ -95,13 +95,78 @@ export const TABLES: TableDef[] = [
       col('prefill', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['template_id', 'fieldId'],
   },
+  // —— D：报表表批次（迁移 v5 建；spec §5.2 十一列的 9 张历史报表——
+  // realtime_session/realtime_ipcc 是实时快照，不建同步任务、不建表）——
+  // 业务字段收敛进 payload JSON 字符串列（响应字段集漂移频繁：overview 69 字段、
+  // performance 的 Radio 拼写等——按 payload 建 schema 的列名对拍无稳定基准，
+  // 固定键列 + payload 收敛是红线 1 兼容的最小稳定面）；stat_date 恒由调用方
+  // 按窗口填写（「日期一律由调用方填写」统一结论）。
+  {
+    name: 'daily_overview',
+    columns: [col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
+      col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['stat_date'],
+  },
+  {
+    name: 'staff_workload',
+    columns: [col('stat_date', 'VARCHAR', false), col('staff_id', 'VARCHAR', false),
+      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['stat_date', 'staff_id'],
+  },
+  {
+    name: 'staff_quality',
+    columns: [col('stat_date', 'VARCHAR', false), col('staff_id', 'VARCHAR', false),
+      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['stat_date', 'staff_id'],
+  },
+  {
+    name: 'staff_satisfaction',
+    columns: [col('stat_date', 'VARCHAR', false), col('staff_id', 'VARCHAR', false),
+      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['stat_date', 'staff_id'],
+  },
+  {
+    // 粒度是客服 × 小时（必须传 startTime，否则静默降级为天粒度少抓 ~10 倍）；
+    // hour_ts 是响应内唯一可信的日期字段（该小时按小时对齐的时间戳）。
+    name: 'staff_attendance',
+    columns: [col('staff_id', 'VARCHAR', false), col('hour_ts', 'VARCHAR', false),
+      col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
+      col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['staff_id', 'hour_ts'],
+  },
+  {
+    name: 'order_performance',
+    columns: [col('order_id', 'VARCHAR', false), col('stat_date', 'VARCHAR', false),
+      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['order_id'],
+  },
+  {
+    // 1 次调用 = 1 个客服，且只覆盖窗口起始的那一天 → work_date = 窗口起始日。
+    name: 'staff_salary_detail',
+    columns: [col('staff_id', 'VARCHAR', false), col('work_date', 'VARCHAR', false),
+      col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
+      col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['staff_id', 'work_date'],
+  },
+  {
+    name: 'robot_summary',
+    columns: [col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
+      col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['stat_date'],
+  },
+  {
+    name: 'transfer_human',
+    columns: [col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
+      col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['stat_date'],
+  },
 ]
 
 export function tableByName(name: string): TableDef | undefined {
   return TABLES.find((t) => t.name === name)
 }
 
-/** v1 基线批次（C1 交付的四张）；v3 起的数据表批次不进 v1 建表循环。 */
+/** v1 基线批次（C1 交付的四张）；v3/v5 起的数据表批次不进 v1 建表循环。 */
 export const V1_TABLES = ['schema_version', 'sync_state', 'sync_gaps', 'tags']
 
 /** ⚠️ 只产 v1 基线建表语句 —— 对已存在的库加不了列。任何 TABLES 变更必须新增迁移条目（spec §6.2）。 */
@@ -146,6 +211,17 @@ export const MIGRATIONS: Migration[] = [
     up: async (exec) => {
       for (const name of ['staff', 'staff_groups', 'staff_group_members',
         'ticket_categories', 'ticket_templates', 'ticket_template_fields']) {
+        await exec(ddlFor(tableByName(name)!))
+      }
+    },
+  },
+  // D-T7 迁移：9 张报表表（键列 + stat_date 范围列 + payload 收敛列）。
+  {
+    version: 5,
+    up: async (exec) => {
+      for (const name of ['daily_overview', 'staff_workload', 'staff_quality',
+        'staff_satisfaction', 'staff_attendance', 'order_performance',
+        'staff_salary_detail', 'robot_summary', 'transfer_human']) {
         await exec(ddlFor(tableByName(name)!))
       }
     },

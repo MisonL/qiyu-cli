@@ -26,7 +26,7 @@ import type {
 
 const DAY = 86_400_000
 
-/** 窗口级 gap 的 reason（sync_gaps.reason 的引擎侧取值）。 */
+/** 窗口级 gap 的 reason（sync_gaps.reason 的引擎侧取值 + 任务 gapHint 的业务 reason）。 */
 type WindowGapReason = 'count_mismatch' | 'fetch_failed' | 'write_failed' | 'rate_limit_local'
 
 /** 写策略落地（事务内调用）：deleteRangeInsert 按范围列删旧 + upsert；upsertRows 直接 upsert。 */
@@ -199,8 +199,11 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     }
 
     // —— gapHint（如 order_performance 的 orders:null 筛选失败，spec §5.2）：成功窗也落提示 ——
+    // T5 裁定（T7 接线）：透传 hint 的原始 reason（filter_matched_no_staff 等），
+    // 不压成统一 fetch_failed——缺口原因在 sync_gaps 里必须可分派。
     if (fetchRes.gapHint) {
-      await storeGap(ctx, task, w, 'fetch_failed', `${fetchRes.gapHint.reason}: ${fetchRes.gapHint.detail}`, gaps)
+      await storeGap(ctx, task, w, fetchRes.gapHint.reason as WindowGapReason,
+        fetchRes.gapHint.detail, gaps)
     }
 
     succeeded++
@@ -305,4 +308,113 @@ function skipContained(windows: Range[], overlapMs: number): Range[] {
     out.push(cur)
   }
   return out
+}
+
+/**
+ * 报表按天轮转（spec §5.2 实测策略）：限频按路径独立 30 秒——同一天（第 i 窗）
+ * 内跨任务背靠背调用，不同任务之间不共享冷却；逐任务串行推进则会在同一路径上
+ * 连发吃满 31 天 × 30 秒 ≈ 2.6 小时，轮转降到 ≈ 16 分钟。
+ *
+ * 调度形态：round r = 所有任务的第 r 个窗口背靠背跑完，再进 round r+1。
+ * 每任务内部仍复用单任务引擎的全部语义（gate → 假空重试 → 同事务落库/推水位/
+ * 清缺口 → 配对核对 → gapHint/gap 记录），仅执行顺序按「天分组、组内背靠背」交错。
+ * 单任务请用 runTask；本函数面向 REPORT_TASKS 这类 reportDayRotation 批量入口。
+ */
+export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRunResult[]> {
+  const { store, gate, clock } = ctx
+  const progress = ctx.onProgress ?? (() => {})
+  const DAY_MS = 86_400_000
+
+  // —— 各任务的范围合成与切窗（与 runWindowed 同口径）——
+  const plans: Array<{
+    task: SyncTask; windows: Range[]; state: Awaited<ReturnType<typeof readWatermark>>
+    gaps: GapInfo[]; succeeded: number; failed: number; fetched: number; written: number
+  }> = []
+  for (const task of tasks) {
+    if (task.kind !== 'windowed') throw new RangeError(`轮转调度只接受 windowed 任务：${task.id}`)
+    if (task.maxWindowDays === undefined || task.maxWindowDays <= 0) {
+      throw new RangeError(`任务 ${task.id} 的 maxWindowDays 非法：${task.maxWindowDays}（必须为正数）`)
+    }
+    const state = await readWatermark(store, task.id)
+    const requested = ctx.rangeOverride ?? { start: 0, end: clock() }
+    let rangeStart = requested.start
+    if (state.watermark !== null) {
+      const wm = Date.parse(state.watermark)
+      if (!Number.isNaN(wm)) rangeStart = Math.max(requested.start, wm + 1)
+    }
+    const resolvedRange: Range = { start: rangeStart, end: Math.max(requested.end, rangeStart) }
+    const overlapMs = (task.overlapDays ?? 0) * DAY_MS
+    const windows = resolvedRange.end <= resolvedRange.start
+      ? []
+      : skipContained(sliceByMaxWindow(resolvedRange, task.maxWindowDays, task.overlapDays ?? 0), overlapMs)
+    await store.transaction(async (tx) => { await markPending(tx, task.id, state) })
+    plans.push({ task, windows, state, gaps: [], succeeded: 0, failed: 0, fetched: 0, written: 0 })
+  }
+
+  const maxRounds = plans.reduce((m, p) => Math.max(m, p.windows.length), 0)
+
+  // —— round r：各任务第 r 窗背靠背 ——
+  for (let round = 0; round < maxRounds; round++) {
+    for (const plan of plans) {
+      const { task } = plan
+      const windows = plan.windows
+      if (round >= windows.length) continue
+      const w = windows[round]
+      const ref: WindowRef = { ...w, index: round, total: windows.length }
+      progress(`[${task.id}] 轮转 round ${round + 1}/${maxRounds}: ${new Date(w.start).toISOString()} ~ ${new Date(w.end).toISOString()}`)
+
+      // 限频闸门（同 runWindowed）
+      try {
+        await gate.acquire(task.id)
+      } catch (e) {
+        if ((e as { kind?: string }).kind === 'rate_limit_local') {
+          plan.failed++
+          await storeGap(ctx, task, w, 'rate_limit_local', (e as Error).message, plan.gaps)
+          continue
+        }
+        throw e
+      }
+
+      // fetch（假空重试一次；失败记 gap 继续）
+      let fetchRes: FetchResult
+      try {
+        fetchRes = await fetchWithFakeEmptyRetry(task, ref, ctx)
+      } catch (e) {
+        plan.failed++
+        await storeGap(ctx, task, w, 'fetch_failed', (e as Error).message, plan.gaps)
+        continue
+      }
+
+      const { kept } = applyEnrich(task, fetchRes.rows)
+      plan.fetched += fetchRes.rows.length
+      const expected = fetchRes.apiCount !== undefined ? fetchRes.apiCount : kept.length
+      try {
+        const written = await commitWindow(ctx, task, w, kept, expected)
+        plan.written += written
+        plan.succeeded++
+      } catch (e) {
+        plan.failed++
+        const isMismatch = (e as { code?: string }).code === 'count_mismatch'
+        plan.written += kept.length
+        await storeGap(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
+          (e as Error).message, plan.gaps)
+        continue
+      }
+      if (fetchRes.gapHint) {
+        await storeGap(ctx, task, w, fetchRes.gapHint.reason as WindowGapReason,
+          fetchRes.gapHint.detail, plan.gaps)
+      }
+      progress(`[${task.id}] 轮转 round ${round + 1}/${maxRounds} 完成：拉取 ${fetchRes.rows.length} 行，写入 ${kept.length} 行`)
+    }
+  }
+
+  // —— 汇总（空窗任务 total=0、complete，与 runWindowed 空跑语义一致）——
+  return plans.map((p) => ({
+    taskId: p.task.id,
+    windows: { total: p.windows.length, succeeded: p.succeeded, failed: p.failed },
+    rows: { fetched: p.fetched, written: p.written },
+    resolvedRange: { start: 0, end: clock() },
+    gaps: p.gaps,
+    status: p.failed === 0 ? 'complete' as const : 'partial' as const,
+  }))
 }
