@@ -48,8 +48,3 @@ export interface Store {
   query(sql: string, params?: unknown[]): Promise<QueryResult>
   close(): Promise<void>
 }
-
-/** 工厂：按 cfg.backend 查后端注册表；未知后端 → usage 错误。 */
-export function openStore(cfg: StoreConfig, mode: StoreMode): Promise<Store> {
-  throw new Error('openStore 尚未实现（Task 6 落地）')
-}
