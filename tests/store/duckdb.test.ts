@@ -478,4 +478,29 @@ describe('duckdb —— init 与关闭', () => {
       .rejects.toThrow(/Conversion|类型|bind/i)
     await s.close()
   })
+
+  it('delete 按条件删行并返回行数（D: 报表按范围删除的基础）', async () => {
+    const store = await fresh()
+    await store.init()
+    await store.upsert('tags', [
+      { id: '1', name: '标签A', color: '#FF0000' },
+      { id: '2', name: '标签B', color: '#00FF00' },
+    ])
+    const n = await store.delete('tags', 'id >= ?', ['2'])
+    expect(n).toBe(1)
+    expect(await store.count('tags')).toBe(1)
+    await store.close()
+  })
+
+  it('delete 未知表 → usage；在事务内则加入事务（回滚可撤）', async () => {
+    const store = await fresh()
+    await store.init()
+    await expect(store.delete('nope', '1=1')).rejects.toMatchObject({ kind: 'usage' })
+    await store.transaction(async (tx) => {
+      await tx.upsert('tags', [{ id: '3', name: '标签C', color: '#0000FF' }])
+      await tx.delete('tags', 'id = ?', ['3'])
+    })
+    expect(await store.count('tags')).toBe(0)
+    await store.close()
+  })
 })

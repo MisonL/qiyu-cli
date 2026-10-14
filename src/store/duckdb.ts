@@ -6,7 +6,8 @@
 // ⚠️ 重试归属（O 组 O-2/G-6）：写者路径**无内置重试**——D 的重试调度须在 D 层做。
 // ⚠️ SQL 红线基线（O 组 O-3）：C1 交付时本文件 + commands/store.ts 的 SQL 字面
 // 调用点共 8 处，全部为代码内常量（红线：外部派生字符串不得进 query()）；
-// D/E 扩展时须保持并**更新此计数**。
+// D/E 扩展时须保持并**更新此计数**。D-T1 追加 delete 原语后为 9 处
+//（duckdb.ts 7：INSERT×2 / DELETE×1 / SELECT×4；commands/store.ts 2：SELECT×2）。
 import { MIGRATIONS, tableByName, type TableDef } from './schema.js'
 import { retryWithBackoff, isLockError } from './retry.js'
 import type { QueryResult, Store, StoreConfig, StoreMode, WriteTx } from './types.js'
@@ -186,6 +187,14 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     return written
   }
 
+  const del = async (tname: string, where: string, params: unknown[] = []): Promise<number> => {
+    const t = assertTable(tname)
+    const before = await store.count(tname)
+    await store.execSql(`DELETE FROM "${t.name}" WHERE ${where}`, params)
+    const after = await store.count(tname)
+    return Math.max(0, before - after)
+  }
+
   // ⚠️ 回滚保护（G 组 G-3）：若回滚本身失败（如连接已被并发 close），次生错误
   // 不得掩盖原始失败原因 —— 吞掉回滚错误，保留 catch 里的原错误继续抛。
   // （ROLLBACK 与 BEGIN/COMMIT 同为事务控制语句，闭包直调——见 upsert 处注释。）
@@ -255,6 +264,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         throw e
       }
     },
+    delete: del,
     async transaction<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T> {
       if (inTx) throw usage('不得嵌套事务')
       await execSql('BEGIN')
@@ -266,6 +276,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           tables: () => store.tables(),
           count: (t: string) => store.count(t),
           upsert: (t: string, rows: Record<string, unknown>[]) => store.upsert(t, rows),
+          delete: (t: string, w: string, p?: unknown[]) => store.delete(t, w, p),
           transaction: <U>(f: (tx2: WriteTx) => Promise<U>) => store.transaction(f),
         }
         const r = await fn(tx)
