@@ -48,8 +48,7 @@ export async function markPending(tx: WriteTx, dataset: string): Promise<void> {
 
 /**
  * 推进水位：写 watermark、range_status=complete 与同步时间。
- * range（引擎侧窗口，string 键）由引擎在调用前自行 stringify 落水位值本身；
- * 状态层只负责水位与 syncedAt 的持久化形态。
+ * @param range 预留参数，当前不落库；水位值由调用方 stringify 后经 watermark 传入。
  */
 export async function advanceWatermark(tx: WriteTx, dataset: string, watermark: string,
   range: { start: string | number; end: string | number }, syncedAt: string): Promise<void> {

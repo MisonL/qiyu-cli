@@ -253,7 +253,7 @@ describe('duckdb —— init 与关闭', () => {
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
     expect(await s1.count('schema_version')).toBe(2)   // v1/v2 已记、v3 未记（失败不推进）
     await s1.close()
-    // 恢复真实迁移，重新 init → 重放路径只补 v2（真实清单无 v2，MAX 保持 1）
+    // 恢复真实迁移，重新 init → 重放路径只补 v3（真实清单无 v3，MAX 保持 2）
     failingSpy.mockRestore()
     // ⚠️ J-M1 实测裁决（controller 以 vitest 2.1.9 真跑探测）：对本地 ESM 模块命名空间
     // 的具名导出做 `vi.spyOn(mod, 'MIGRATIONS', 'get')` **可用**——vitest 的模块转换

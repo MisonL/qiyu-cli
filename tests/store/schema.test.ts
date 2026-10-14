@@ -15,10 +15,10 @@ describe('TABLES —— 表定义', () => {
     expect(t.primaryKey).toEqual(['id'])
   })
 
-  it('sync_state 六列（含 locked_by/locked_at）', () => {
+  it('sync_state 七列（含 locked_by/locked_at，D-T3 加 last_synced_at）', () => {
     const t = tableByName('sync_state')!
     expect(t.columns.map((c) => c.name)).toEqual(
-      ['dataset', 'watermark', 'range_status', 'last_error', 'locked_by', 'locked_at'])
+      ['dataset', 'watermark', 'range_status', 'last_error', 'locked_by', 'locked_at', 'last_synced_at'])
     expect(t.primaryKey).toEqual(['dataset'])
   })
 
