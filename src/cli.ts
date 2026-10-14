@@ -5,11 +5,13 @@ import { authCommand } from './commands/auth.js'
 import { fail, usageFail, describeArgs } from './output.js'
 import { apiCommand } from './commands/api.js'
 import { storeCommand } from './commands/store.js'
+import { syncCommand } from './commands/sync.js'
 
 const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   auth: authCommand,
   api: apiCommand,
   store: storeCommand,
+  sync: syncCommand,
 }
 
 /**
@@ -29,6 +31,7 @@ const USAGE = `用法：qiyu <子命令> [参数]
                            初始化本地数据库（DuckDB）
   store status [--db <path>] [--profile <name>] [--backend <name>]
                            查看数据库状态与各表行数
+  sync tasks               列出全部同步任务与不支持的实时快照数据集
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
