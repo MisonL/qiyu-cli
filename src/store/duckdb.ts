@@ -8,6 +8,7 @@
 // 调用点共 8 处，全部为代码内常量（红线：外部派生字符串不得进 query()）；
 // D/E 扩展时须保持并**更新此计数**。D-T1 追加 delete 原语后为 9 处
 //（duckdb.ts 7：INSERT×2 / DELETE×1 / SELECT×4；commands/store.ts 2：SELECT×2）。
+// D-T3 追加：src/sync/state.ts 常量 SELECT 3 处（水位/缺口读取），不在上述 9 处内。
 import { MIGRATIONS, tableByName, type TableDef } from './schema.js'
 import { retryWithBackoff, isLockError } from './retry.js'
 import type { QueryResult, Store, StoreConfig, StoreMode, WriteTx } from './types.js'

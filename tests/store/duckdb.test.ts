@@ -149,7 +149,7 @@ describe('duckdb —— upsert 契约', () => {
   it('null 到 nullable 列 → 正常写入并读回 null（显式 null ≠ 缺列）', async () => {
     const s = await fresh()
     await s.upsert('sync_state', [{ dataset: 'tags', watermark: null, range_status: null,
-      last_error: null, locked_by: null, locked_at: null }])
+      last_error: null, locked_by: null, locked_at: null, last_synced_at: null }])
     const r = await s.query('SELECT watermark, range_status FROM sync_state WHERE dataset = ?', ['tags'])
     expect(r.rows[0].watermark).toBeNull()
     expect(await s.count('sync_state')).toBe(1)
@@ -247,10 +247,11 @@ describe('duckdb —— init 与关闭', () => {
     const schema = await import('../../src/store/schema.js')
     const real = schema.MIGRATIONS
     const failingSpy = vi.spyOn(schema, 'MIGRATIONS', 'get')
-      .mockReturnValue([...real, { version: 2, up: async () => { throw new Error('注入的迁移失败') } }] as never)
+      // ⚠️ D-T3 起真实清单已有 v2，注入失败条目改用 version 3。
+      .mockReturnValue([...real, { version: 3, up: async () => { throw new Error('注入的迁移失败') } }] as never)
     const s1 = await createDuckDbStore(cfg, 'rw')
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
-    expect(await s1.count('schema_version')).toBe(1)   // v1 已记、v2 未记（失败不推进）
+    expect(await s1.count('schema_version')).toBe(2)   // v1/v2 已记、v3 未记（失败不推进）
     await s1.close()
     // 恢复真实迁移，重新 init → 重放路径只补 v2（真实清单无 v2，MAX 保持 1）
     failingSpy.mockRestore()
@@ -263,7 +264,7 @@ describe('duckdb —— init 与关闭', () => {
     const s2 = await createDuckDbStore(cfg, 'rw')
     await s2.init()
     const v = await s2.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    expect(Number(v.rows[0].v)).toBe(1)
+    expect(Number(v.rows[0].v)).toBe(2)
     await s2.close()
   })
 

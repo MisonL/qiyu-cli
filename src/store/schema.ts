@@ -16,13 +16,17 @@ export const TABLES: TableDef[] = [
   {
     name: 'sync_state',
     columns: [col('dataset', 'VARCHAR', false), col('watermark', 'VARCHAR'), col('range_status', 'VARCHAR'),
-      col('last_error', 'VARCHAR'), col('locked_by', 'VARCHAR'), col('locked_at', 'VARCHAR')],
+      col('last_error', 'VARCHAR'), col('locked_by', 'VARCHAR'), col('locked_at', 'VARCHAR'),
+      // D-T3：水位状态的同步时间（readWatermark 的 lastSyncedAt 往返落点）。
+      col('last_synced_at', 'VARCHAR')],
     primaryKey: ['dataset'],
   },
   {
     name: 'sync_gaps',
     columns: [col('dataset', 'VARCHAR', false), col('range_start', 'VARCHAR', false), col('range_end', 'VARCHAR'),
-      col('reason', 'VARCHAR'), col('recorded_at', 'VARCHAR')],
+      col('reason', 'VARCHAR'), col('recorded_at', 'VARCHAR'),
+      // D-T3：缺口诊断详情（recordGap 的 detail 落点）。
+      col('detail', 'VARCHAR')],
     primaryKey: ['dataset', 'range_start'],
   },
   {
@@ -51,6 +55,15 @@ export const MIGRATIONS: Migration[] = [
     version: 1,
     up: async (exec) => {
       for (const t of TABLES) await exec(ddlFor(t))
+    },
+  },
+  // D-T3 迁移：为已有 C1 库补 sync_state.last_synced_at 与 sync_gaps.detail 两列。
+  // ⚠️ 新库 v1 建表时 TABLES 已含这两列，故用 IF NOT EXISTS 保证幂等（v1+ v2 连放不炸）。
+  {
+    version: 2,
+    up: async (exec) => {
+      await exec('ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "last_synced_at" VARCHAR')
+      await exec('ALTER TABLE "sync_gaps" ADD COLUMN IF NOT EXISTS "detail" VARCHAR')
     },
   },
 ]
