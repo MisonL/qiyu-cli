@@ -25,10 +25,10 @@ const USAGE = `用法：qiyu <子命令> [参数]
   api call <id> [--body <JSON>] [--yes] [--no-validate] [--strict]
                            调用接口；危险接口必须加 --yes
   api schema <id>         查看接口的请求参数表与响应形状
-  qiyu store init [--db <path>] [--profile <name>] [--backend <name>]
-                                  初始化本地数据库（DuckDB）
-  qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
-                                  查看数据库状态与各表行数
+  store init [--db <path>] [--profile <name>] [--backend <name>]
+                           初始化本地数据库（DuckDB）
+  store status [--db <path>] [--profile <name>] [--backend <name>]
+                           查看数据库状态与各表行数
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的

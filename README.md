@@ -6,8 +6,8 @@
 JSON、用退出码表达该做什么、错误按语义分类、危险操作有硬门禁。有了它，Agent 不必先学会
 七鱼 API 的 26 种响应信封、3 种分页和一堆静默失败，就能正确调用。
 
-> **本仓库仍在早期**：已实现「认证 + 通用 API 通道」＋ API 参数校验（`api schema`/body 分级校验）（见[当前状态](#当前状态)）。
-> 本地数据仓库、查询、同步等能力尚未实现。
+> **本仓库仍在早期**：已实现「认证 + 通用 API 通道」＋ API 参数校验（`api schema`/body 分级校验）＋ 存储基础（见[当前状态](#当前状态)）。
+> 本地数据仓库的同步与查询尚未实现（存储基础已交付，见[当前状态](#当前状态)）。
 
 ## 为什么需要它
 
@@ -39,7 +39,7 @@ git clone https://github.com/MisonL/qiyu-cli.git
 cd qiyu-cli && npm install && npm run build
 ```
 
-> `qiyu-cli` 零运行时依赖。`npm install` 是为构建（TypeScript）与测试准备的。
+> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。
 
 ## 配置凭证
 
@@ -56,6 +56,8 @@ export QIYU_APP_SECRET=你的AppSecret
 qiyu auth whoami
 # {"ok":true,"data":{"configured":true}}
 ```
+
+存储配置需**手工编辑** `~/.config/qiyu/config.json`——CLI 目前不会自动创建该文件（`auth login` 尚未实现）。也可用 `--db`/`QIYU_DB_PATH` 直接指定库路径。**凭证字段暂不支持写入该文件（会报未知键），请继续用 `QIYU_APP_KEY`/`QIYU_APP_SECRET` 环境变量。**若配置文件权限过宽（group/other 可读），CLI 会在 stderr 给出警告但不阻断执行；数据库正常关闭后 `.wal` 临时文件会自动消失，请勿手工删除。
 
 > ⚠️ `whoami` **只检查凭证是否存在**，不校验它是否有效——一个拼错的 AppKey 同样返回
 > `configured: true`。第一次真实调用才是唯一的验证。
@@ -84,6 +86,10 @@ qiyu api list [--all]                列出接口
 qiyu api call <id> [--body <JSON>] [--yes] [--no-validate] [--strict]
                                      调用接口
 qiyu api schema <id>                 查看接口参数表与响应形状
+qiyu store init [--db <path>] [--profile <name>] [--backend <name>]
+                                     初始化本地数据库（DuckDB）
+qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
+                                     查看数据库状态与各表行数
 ```
 
 ## 输出契约
@@ -107,7 +113,8 @@ qiyu api schema <id>                 查看接口参数表与响应形状
 
 **请按 `kind` 分支，不要按 `code`。** `code` 只是个标签：它可能是服务端的数字码
 （如 `14009`），也可能是本 CLI 合成的词（`usage` / `network` / `internal` /
-`auth_missing` / `confirm_required` / `local_rate_limit` / `unknown`）。合成词在官方
+`auth_missing` / `confirm_required` / `store_locked` / `store_not_initialized` /
+`local_rate_limit` / `unknown`）。合成词在官方
 错误码表里查不到。
 
 ### 退出码
@@ -125,6 +132,13 @@ qiyu api schema <id>                 查看接口参数表与响应形状
 用法错误的**同一句话**会同时写到 `stderr`（给人看）和 `stdout` 的 `{ok:false,error}`
 （给 Agent 看）。所以无论人还是 Agent，都不会读到空输出。
 
+### store 命令的输出
+
+`store init` 与 `store status` 成功时输出六字段：`path` / `backend` / `config_path` /
+`config_exists` / `schema_version` / `tables`。其中 `tables` 是 `[{name, rows}]` 数组——
+每张表的名字与行数。`store status` 的每次调用都要对各表做全表 `COUNT`（行数无缓存），
+轮询代价与数据量成正比，Agent 不应把它当作高频健康检查来用。
+
 ## 安全
 
 - **危险操作硬门禁**：标记为 `dangerous` 的接口在缺少 `--yes` 时，**绝不发出任何请求**：body 合法则返回退出码 4，body 缺必填/非对象则**先**报参数错误（退出码 2），并给出 `confirm_required` / `confirm_arg` / `risk` / `target` 四个字段。
@@ -139,7 +153,8 @@ qiyu api schema <id>                 查看接口参数表与响应形状
 本仓库实现了设计稿中的**前两个子项目**：认证与通用 API 通道、API 参数校验（`api schema`/body 分级校验）。
 
 **已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
-限频感知（`retry_after`）。
+限频感知（`retry_after`）、本地数据仓库基础——`store init` / `store status`（存储层已交付，
+含 `Store` 抽象、DuckDB 后端、schema 迁移与 `store_locked`/`store_not_initialized` 错误分类）。
 
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
@@ -152,7 +167,7 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 
 - `auth login`（配置文件写入）——目前只支持环境变量；
 - `--pretty`（人类可读输出）——目前只输出紧凑 JSON；
-- 本地数据仓库（`store/`）、查询（`qiyu query`）、同步（`qiyu sync`）；
+- 本地数据仓库的**同步**（`qiyu sync`）与**查询**（`qiyu query`）——存储基础（初始化/状态查看两条命令）已可用，见「当前状态」；
 
 `api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
@@ -181,7 +196,8 @@ npm test                  # 运行测试
 src/
   cli.ts                入口与顶层分派
   output.ts             输出契约（ok / fail / usageFail，退出码）
-  commands/             子命令（auth / api）
+  commands/             子命令（auth / api / store）
+  store/                存储抽象（src/store/：Store 接口、DuckDB 后端、schema 与迁移）
   core/
     sign.ts             七鱼签名（checksum = SHA1(appSecret + md5(body) + time)）
     http.ts             请求构建、重试、限频
