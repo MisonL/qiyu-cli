@@ -99,6 +99,9 @@ describe('RateGate —— acquire / penalize', () => {
     await gate.penalize('tag.all', 10)
     const r = await store.query('SELECT watermark FROM sync_state WHERE dataset = ?', ['__ratelimit__:tag.all'])
     expect(r.rows[0].watermark).toBe(new Date(15_000).toISOString())
+    // last_rate_limited_at 也取注入时钟（fix 轻-2）：可确定性断言。
+    const r2 = await store.query('SELECT last_rate_limited_at FROM sync_state WHERE dataset = ?', ['__ratelimit__:tag.all'])
+    expect(r2.rows[0].last_rate_limited_at).toBe(new Date(5_000).toISOString())
     await store.close()
   })
 })

@@ -22,8 +22,11 @@ export async function readCooldown(store: Store, endpointId: string): Promise<nu
 }
 
 /** 写/覆盖某 endpoint 的冷却截止（毫秒时间戳）。 */
-export async function writeCooldown(tx: WriteTx, endpointId: string, untilMs: number): Promise<void> {
+export async function writeCooldown(tx: WriteTx, endpointId: string, untilMs: number,
+  opts: { now?: () => number } = {}): Promise<void> {
   const untilIso = new Date(untilMs).toISOString()
+  // last_rate_limited_at 同样取注入时钟（默认 Date.now）—— 纯 clock 注入下可确定性断言。
+  const limitedAtIso = new Date(opts.now?.() ?? Date.now()).toISOString()
   // upsert 契约：每行必须完整列集（sync_state 共 9 列）。
   await tx.upsert('sync_state', [{
     dataset: RATELIMIT_PREFIX + endpointId,
@@ -34,7 +37,7 @@ export async function writeCooldown(tx: WriteTx, endpointId: string, untilMs: nu
     locked_at: null,
     last_synced_at: null,
     next_allowed_at: untilIso,
-    last_rate_limited_at: new Date().toISOString(),
+    last_rate_limited_at: limitedAtIso,
   }])
 }
 
@@ -76,6 +79,7 @@ export class RateGate {
     // 必须用 hasOwn —— 与 limitFor 同理，防原型链键。显式 null 才免罚；
     // 未登记（hasOwn false）视为未知接口，远端说限频就限频。
     if (Object.hasOwn(RATE_LIMITS, endpointId) && RATE_LIMITS[endpointId] === null) return
-    await this.store.transaction((tx) => writeCooldown(tx, endpointId, this.clock() + seconds * 1000))
+    const now = this.clock()
+    await this.store.transaction((tx) => writeCooldown(tx, endpointId, now + seconds * 1000, { now: this.clock }))
   }
 }

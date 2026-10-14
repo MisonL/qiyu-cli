@@ -15,10 +15,11 @@ describe('TABLES —— 表定义', () => {
     expect(t.primaryKey).toEqual(['id'])
   })
 
-  it('sync_state 七列（含 locked_by/locked_at，D-T3 加 last_synced_at）', () => {
+  it('sync_state 九列（D-T3 加 last_synced_at，D-T4 加 next_allowed_at/last_rate_limited_at）', () => {
     const t = tableByName('sync_state')!
     expect(t.columns.map((c) => c.name)).toEqual(
-      ['dataset', 'watermark', 'range_status', 'last_error', 'locked_by', 'locked_at', 'last_synced_at'])
+      ['dataset', 'watermark', 'range_status', 'last_error', 'locked_by', 'locked_at', 'last_synced_at',
+        'next_allowed_at', 'last_rate_limited_at'])
     expect(t.primaryKey).toEqual(['dataset'])
   })
 
@@ -64,10 +65,11 @@ describe('ddlFor —— 生成建表语句', () => {
 })
 
 describe('MIGRATIONS —— 迁移', () => {
-  it('版本号从 1 起连续、LATEST_VERSION 为最大值', () => {
+  it('版本号从 1 起严格递增、LATEST_VERSION 为最大值', () => {
     const vs = MIGRATIONS.map((m) => m.version).sort((a, b) => a - b)
     expect(vs[0]).toBe(1)
-    for (let i = 1; i < vs.length; i++) expect(vs[i]).toBe(vs[i - 1] + 1)
+    // v3 空档预留给数据表 DDL（T6），跳号是有意的 —— 故只断言严格递增而非连续。
+    for (let i = 1; i < vs.length; i++) expect(vs[i]).toBeGreaterThan(vs[i - 1])
     expect(LATEST_VERSION).toBe(vs[vs.length - 1])
   })
 
