@@ -19,6 +19,10 @@ export type ErrorKind =
   // `--yes` 门禁拒绝时的 kind —— `api.ts` 的 `fail()` 产出它，
   // 对应 `code: 'confirm_required'`（危险接口未加 --yes），退出码 4
   | 'needs_confirmation'
+  // 存储层（C1）：数据库被写进程持锁（读者退避超限 / 写者立即）—— 退出码 1，可重试
+  | 'store_locked'
+  // 存储层（C1）：库不存在 / 缺表 / 依赖缺失 / 非 DuckDB 文件 / 他人库 —— 退出码 1
+  | 'store_not_initialized'
 
 export interface QiyuError {
   code: string
