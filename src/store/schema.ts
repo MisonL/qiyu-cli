@@ -18,7 +18,11 @@ export const TABLES: TableDef[] = [
     columns: [col('dataset', 'VARCHAR', false), col('watermark', 'VARCHAR'), col('range_status', 'VARCHAR'),
       col('last_error', 'VARCHAR'), col('locked_by', 'VARCHAR'), col('locked_at', 'VARCHAR'),
       // D-T3：水位状态的同步时间（readWatermark 的 lastSyncedAt 往返落点）。
-      col('last_synced_at', 'VARCHAR')],
+      col('last_synced_at', 'VARCHAR'),
+      // D-T4：持久化限频闸门 —— 冷却行（dataset=__ratelimit__:<endpointId>）的
+      // 下次可调用时间（watermark 列存同一 ISO 截止时间，两列冗余以备演进）与
+      // 最近一次被限频时间。
+      col('next_allowed_at', 'VARCHAR'), col('last_rate_limited_at', 'VARCHAR')],
     primaryKey: ['dataset'],
   },
   {
@@ -64,6 +68,14 @@ export const MIGRATIONS: Migration[] = [
     up: async (exec) => {
       await exec('ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "last_synced_at" VARCHAR')
       await exec('ALTER TABLE "sync_gaps" ADD COLUMN IF NOT EXISTS "detail" VARCHAR')
+    },
+  },
+  // D-T4 迁移：限频闸门的冷却列。v3 预留给 T6 的数据表 DDL（跳号，留空档不撞号）。
+  {
+    version: 4,
+    up: async (exec) => {
+      await exec('ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "next_allowed_at" VARCHAR')
+      await exec('ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "last_rate_limited_at" VARCHAR')
     },
   },
 ]

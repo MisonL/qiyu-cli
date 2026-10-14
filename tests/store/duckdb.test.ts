@@ -148,8 +148,10 @@ describe('duckdb —— upsert 契约', () => {
 
   it('null 到 nullable 列 → 正常写入并读回 null（显式 null ≠ 缺列）', async () => {
     const s = await fresh()
+    // D-T4 起 sync_state 共 9 列：完整列集须含 next_allowed_at / last_rate_limited_at。
     await s.upsert('sync_state', [{ dataset: 'tags', watermark: null, range_status: null,
-      last_error: null, locked_by: null, locked_at: null, last_synced_at: null }])
+      last_error: null, locked_by: null, locked_at: null, last_synced_at: null,
+      next_allowed_at: null, last_rate_limited_at: null }])
     const r = await s.query('SELECT watermark, range_status FROM sync_state WHERE dataset = ?', ['tags'])
     expect(r.rows[0].watermark).toBeNull()
     expect(await s.count('sync_state')).toBe(1)
@@ -247,7 +249,7 @@ describe('duckdb —— init 与关闭', () => {
     const schema = await import('../../src/store/schema.js')
     const real = schema.MIGRATIONS
     const failingSpy = vi.spyOn(schema, 'MIGRATIONS', 'get')
-      // ⚠️ D-T3 起真实清单已有 v2，注入失败条目改用 version 3。
+      // ⚠️ D-T3 起真实清单已有 v2，注入失败条目改用 version 3（真实清单跳到 v4，3 不撞号）。
       .mockReturnValue([...real, { version: 3, up: async () => { throw new Error('注入的迁移失败') } }] as never)
     const s1 = await createDuckDbStore(cfg, 'rw')
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
@@ -264,7 +266,7 @@ describe('duckdb —— init 与关闭', () => {
     const s2 = await createDuckDbStore(cfg, 'rw')
     await s2.init()
     const v = await s2.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    expect(Number(v.rows[0].v)).toBe(2)
+    expect(Number(v.rows[0].v)).toBe(4)   // D-T4 起 v1+v2+v4，MAX=4（v3 空档预留给 T6）
     await s2.close()
   })
 

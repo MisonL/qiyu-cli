@@ -38,7 +38,9 @@ export async function readWatermark(store: Store, dataset: string): Promise<Wate
 /** sync_state 行的完整列集（Store.upsert 契约：每行必须完整列集）。 */
 function stateRow(dataset: string, watermark: string | null, rangeStatus: RangeStatus,
   lastError: string | null, lockedBy: string | null, lockedAt: string | null, lastSyncedAt: string | null) {
-  return { dataset, watermark, range_status: rangeStatus, last_error: lastError, locked_by: lockedBy, locked_at: lockedAt, last_synced_at: lastSyncedAt }
+  // D-T4 起 sync_state 共 9 列：next_allowed_at / last_rate_limited_at 属限频闸门
+  //（src/sync/rate-gate.ts）专用，水位行恒为 null。
+  return { dataset, watermark, range_status: rangeStatus, last_error: lastError, locked_by: lockedBy, locked_at: lockedAt, last_synced_at: lastSyncedAt, next_allowed_at: null, last_rate_limited_at: null }
 }
 
 /** 标记该 dataset 待同步（新一轮窗口开始）。 */
