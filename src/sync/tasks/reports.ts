@@ -12,6 +12,28 @@ import type { SyncTask, FetchResult, FetchCtx, WindowRef } from '../types.js'
 /** 窗口起止的 ISO（与引擎 deleteRangeInsert 的范围值同形——T5 验收项）。 */
 const isoOf = (ms: number): string => new Date(ms).toISOString()
 
+let sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+/** 仅测试用：替换等待实现（分页/逐客服的限频等待默认真实 30s，不可测）。 */
+export function __setSleep(fn: (ms: number) => Promise<void>): void { sleep = fn }
+
+/**
+ * 带冷却重试的调用：同窗口内的第 2+ 次调用（翻页/逐客服）会撞进程内令牌桶
+ *（同路径 30 秒）——真实同步里按 retryAfter 等待后重试（宁可慢，不超发）；
+ * 测试经 __setSleep 注入零等待。有界重试，防冷却行坏数据导致死循环。
+ */
+async function callPaced(taskId: string, body: unknown, ctx: FetchCtx, attempt = 0): Promise<{ payload: unknown }> {
+  try {
+    return await call(byId(endpointOf(taskId)), body, { credentials: ctx.credentials })
+  } catch (e) {
+    const rl = e as { code?: string; retryAfter?: { seconds?: number } }
+    if (rl.code === 'local_rate_limit' && attempt < 3) {
+      await sleep(((rl.retryAfter?.seconds ?? 30) + 1) * 1000)
+      return callPaced(taskId, body, ctx, attempt + 1)
+    }
+    throw e
+  }
+}
+
 /** 通用窗口请求体：startTime/endTime 恒为毫秒（传秒会静默降级）。 */
 function timeBody(w: WindowRef): Record<string, unknown> {
   return { startTime: w.start, endTime: w.end }
@@ -33,7 +55,7 @@ export function reportBody(taskId: string, w: WindowRef): Record<string, unknown
     case 'reports.overview':
       return { ...timeBody(w), pageSize: 1000 }
     case 'reports.order_performance':
-      // 空结果集 page>1 会 14500（§5.2）——单窗 ≤365 天内单页 1000 足够，不翻页
+      // 空结果集 page>1 会 14500（§5.2）——分页循环只在首页拉满且 total 更大时才进下一页
       return { ...timeBody(w), pageSize: 1000 }
     case 'reports.staff_salary_detail':
       // 单 staffId 由 fetch 按 staff 表逐客服注入（见 salaryDetail 任务）；此处仅时间
@@ -74,39 +96,53 @@ function rowsOfPayload(taskId: string, res: { payload: unknown }): Record<string
   return payloadRows(taskId, res.payload).rows
 }
 
+/** per-staff 行投影：staff_id 键缺失 → null（丢弃——脏单行不致断流的取舍，见 task-7-report）。 */
+function staffRow(w: WindowRef, r: Record<string, unknown>, nowIso: string): Record<string, unknown> | null {
+  const sid = r.staffId ?? r.staffid ?? r.staff_id
+  if (sid === null || sid === undefined) return null
+  return { ...baseRow(w, r, nowIso), staff_id: String(sid) }
+}
+
+/** 分页 + per-staff 投影（staffworklod / staff_satisfaction）。 */
+async function fetchPagedStaff(taskId: string, w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
+  const nowIso = new Date().toISOString()
+  const { rows } = await pagedRaw(taskId, w, ctx)
+  const mapped = rows
+    .map((r) => staffRow(w, r, nowIso))
+    .filter((r): r is Record<string, unknown> => r !== null)
+  return { rows: mapped, apiCount: mapped.length }
+}
+
 /** stat_date + payload 的通用行投影（键列由各任务补齐）。 */
 function baseRow(w: WindowRef, src: Record<string, unknown>, nowIso: string): Record<string, unknown> {
   return { stat_date: isoOf(w.start), payload: JSON.stringify(src), synchronized_at: nowIso }
 }
 
 /**
- * 运行一个分页窗口拉取（result 包装族：staffworklod/quality/satisfaction/
- * staffAttendance/salaryDetail）。page 从 1 起、pageSize=1000，total 收敛翻页。
+ * 分页拉取原始行（result/orders 包装族：staffworklod/satisfaction/staffAttendance/
+ * performance）。page 从 1 起、pageSize=1000，total 收敛翻页（total 缺省视为单页）。
  */
-async function fetchPaged(taskId: string, w: WindowRef, ctx: FetchCtx,
-  extraBody: Record<string, unknown> = {}, pageKey = 'page'): Promise<FetchResult> {
-  const nowIso = new Date().toISOString()
-  const spec = byId(endpointOf(taskId))
+async function pagedRaw(taskId: string, w: WindowRef, ctx: FetchCtx): Promise<{
+  rows: Record<string, unknown>[]; sum: Record<string, unknown> | null
+}> {
   const out: Record<string, unknown>[] = []
+  let sum: Record<string, unknown> | null = null
   let page = 1
   for (;;) {
-    const body = { ...reportBody(taskId, w), [pageKey]: page }
-    const res = await call(spec, body, { credentials: ctx.credentials })
-    const rows = rowsOfPayload(taskId, res)
+    const body = { ...reportBody(taskId, w), page }
+    const res = await callPaced(taskId, body, ctx)
+    const { rows, sum: s } = payloadRows(taskId, res.payload)
+    if (s) sum = s
     out.push(...rows)
     // total 与已取行数收敛即停（total 缺省视为单页）
     const total = (res.payload as { total?: unknown } | null)?.total
     if (typeof total !== 'number' || out.length >= total || rows.length === 0) break
     page++
   }
-  const mapped: Record<string, unknown>[] = []
-  for (const r of out) {
-    const sid = r.staffId ?? r.staffid ?? r.staff_id
-    if (sid === null || sid === undefined) continue   // 键缺失行：计入 fetched 不写库
-    mapped.push({ ...baseRow(w, r, nowIso), staff_id: String(sid) })
-  }
-  return { rows: mapped, apiCount: mapped.length }
+  return { rows: out, sum }
 }
+
+/** stat_date + payload 的通用行投影（键列由各任务补齐）。 */
 
 /** 任务 id → 注册表 endpoint id。 */
 function endpointOf(taskId: string): string {
@@ -174,7 +210,7 @@ export const REPORT_TASKS: SyncTask[] = [
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     write: { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'] },
     // 响应 date 恒 0 → stat_date 只能用窗口起点（调用方填写）
-    fetch: (w, ctx) => fetchPaged('reports.staff_workload', w, ctx),
+    fetch: (w, ctx) => fetchPagedStaff('reports.staff_workload', w, ctx),
   },
   {
     id: 'reports.staff_quality', table: 'staff_quality', kind: 'windowed',
@@ -190,7 +226,7 @@ export const REPORT_TASKS: SyncTask[] = [
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     write: { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'] },
-    fetch: (w, ctx) => fetchPaged('reports.staff_satisfaction', w, ctx),
+    fetch: (w, ctx) => fetchPagedStaff('reports.staff_satisfaction', w, ctx),
   },
   {
     id: 'reports.staff_attendance', table: 'staff_attendance', kind: 'windowed',
@@ -199,12 +235,11 @@ export const REPORT_TASKS: SyncTask[] = [
     // hour_ts 是响应内唯一可信日期字段（小时对齐时间戳）
     primaryKey: ['staff_id', 'hour_ts'], reportDayRotation: true,
     write: { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'] },
-    // ⚠️ 请求体恒含 startTime（reportBody 已保证）——省略会静默降级为天粒度、少抓 ~10 倍
+    // ⚠️ 请求体恒含 startTime（reportBody 已保证）——省略会静默降级为天粒度、少抓 ~10 倍。
+    // 分页 total 收敛拉满（单页 pageSize=1000，31d 实测 17765 行 → 两页），再抽 hour_ts。
     fetch: async (w, ctx) => {
       const nowIso = new Date().toISOString()
-      const res = await call(byId(endpointOf('reports.staff_attendance')),
-        reportBody('reports.staff_attendance', w), { credentials: ctx.credentials })
-      const { rows } = payloadRows('reports.staff_attendance', res.payload)
+      const { rows } = await pagedRaw('reports.staff_attendance', w, ctx)
       const mapped: Record<string, unknown>[] = []
       for (const r of rows) {
         const sid = r.staffId ?? r.staffid
@@ -223,9 +258,21 @@ export const REPORT_TASKS: SyncTask[] = [
     write: { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'] },
     // orders:null = 筛选失败、不是空窗口（staffIdList 含租户不存在的 id 时 code:200
     // 全 null）→ 显式 gapHint，引擎落 sync_gaps（T5 裁定：透传原始 reason）。
+    // 行映射补主键列 order_id（响应键 orderId）；缺 order_id 的订单行丢弃——
+    // 计入 fetched 不写库（脏单行不致断流，与 per-staff 表同一取舍）；
+    // sum 全局行按 controller 裁定落同表哨兵 order_id='sum'（与 staff_quality 一致）。
     fetch: async (w, ctx) => {
       try {
-        return await fetchPaged('reports.order_performance', w, ctx)
+        const nowIso = new Date().toISOString()
+        const { rows, sum } = await pagedRaw('reports.order_performance', w, ctx)
+        const mapped: Record<string, unknown>[] = []
+        for (const r of rows) {
+          const oid = r.orderId ?? r.order_id
+          if (oid === null || oid === undefined) continue
+          mapped.push({ ...baseRow(w, r, nowIso), order_id: String(oid) })
+        }
+        if (sum) mapped.push({ ...baseRow(w, sum, nowIso), order_id: 'sum' })
+        return { rows: mapped, apiCount: mapped.length }
       } catch (e) {
         if ((e as { kind?: string }).kind === 'filter_matched_no_staff') {
           return { rows: [], apiCount: 0,
@@ -254,8 +301,7 @@ export const REPORT_TASKS: SyncTask[] = [
       const out: Record<string, unknown>[] = []
       for (const sid of ids) {
         const body = { ...reportBody('reports.staff_salary_detail', w), staffId: Number(sid) }
-        const res = await call(byId(endpointOf('reports.staff_salary_detail')), body,
-          { credentials: ctx.credentials })
+        const res = await callPaced('reports.staff_salary_detail', body, ctx)
         const { rows, sum } = payloadRows('reports.staff_salary_detail', res.payload)
         for (const r of rows) {
           out.push({ ...baseRow(w, r, nowIso), staff_id: sid, work_date: isoOf(w.start) })

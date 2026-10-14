@@ -323,7 +323,6 @@ function skipContained(windows: Range[], overlapMs: number): Range[] {
 export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRunResult[]> {
   const { store, gate, clock } = ctx
   const progress = ctx.onProgress ?? (() => {})
-  const DAY_MS = 86_400_000
 
   // —— 各任务的范围合成与切窗（与 runWindowed 同口径）——
   const plans: Array<{
@@ -343,7 +342,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
       if (!Number.isNaN(wm)) rangeStart = Math.max(requested.start, wm + 1)
     }
     const resolvedRange: Range = { start: rangeStart, end: Math.max(requested.end, rangeStart) }
-    const overlapMs = (task.overlapDays ?? 0) * DAY_MS
+    const overlapMs = (task.overlapDays ?? 0) * DAY
     const windows = resolvedRange.end <= resolvedRange.start
       ? []
       : skipContained(sliceByMaxWindow(resolvedRange, task.maxWindowDays, task.overlapDays ?? 0), overlapMs)

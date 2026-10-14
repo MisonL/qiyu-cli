@@ -54,7 +54,7 @@ const STAFF_COLS = ['id', 'realname', 'nickname', 'username', 'role', 'roleId', 
 const STAFF_GROUP_COLS = ['id', 'name']
 const CATEGORY_COLS = ['id', 'name', 'parentId', 'rank']
 const TEMPLATE_COLS = ['id', 'name', 'createTime', 'autoFlow', 'autoStatus', 'fileStatus', 'autoGuide']
-const FIELD_COLS = ['id', 'name', 'type', 'required', 'customer', 'description', 'prefill']
+const FIELD_COLS = ['fieldId', 'id', 'name', 'type', 'required', 'customer', 'description', 'prefill']
 
 export const DIM_TASKS: SyncTask[] = [
   {
@@ -121,9 +121,9 @@ export const DIM_TASKS: SyncTask[] = [
   {
     id: 'dim.ticket_template_fields', table: 'ticket_template_fields', kind: 'snapshot',
     watermark: { field: 'synchronized_at', initial: null },
-    primaryKey: ['template_id', 'field_id'],
+    primaryKey: ['template_id', 'fieldId'],
     write: { kind: 'upsertRows' },
-    // 每模板一次调用（接口按 templateId 取字段）；行补 template_id 列、fieldId → field_id。
+    // 每模板一次调用（接口按 templateId 取字段）；行补 template_id 列（主键 template_id+fieldId，fieldId 是响应键）。
     fetch: async (w, ctx) => {
       void w
       const nowIso = new Date().toISOString()
@@ -134,8 +134,7 @@ export const DIM_TASKS: SyncTask[] = [
       for (const t of templates) {
         const fres = await call(byId('ticket.template.fields'), { templateId: t.id },
           { credentials: ctx.credentials })
-        const rows = project(rowsOf(fres, 'ticket.template.fields'), FIELD_COLS, nowIso,
-          (r) => ({ ...r, field_id: r.fieldId }))
+        const rows = project(rowsOf(fres, 'ticket.template.fields'), FIELD_COLS, nowIso)
         for (const row of rows) out.push({ ...row, template_id: String(t.id) })
       }
       return { rows: out, apiCount: out.length }

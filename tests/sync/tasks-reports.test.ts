@@ -9,7 +9,7 @@ import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { runTask, runRotated } from '../../src/sync/engine.js'
 import { RateGate } from '../../src/sync/rate-gate.js'
 import { REPORT_TASKS, taskById as reportById } from '../../src/sync/tasks/reports.js'
-import { reportBody } from '../../src/sync/tasks/reports.js'
+import { reportBody, __setSleep } from '../../src/sync/tasks/reports.js'
 import { listGaps, readWatermark } from '../../src/sync/state.js'
 import { __resetBuckets } from '../../src/core/http.js'
 import type { RunCtx, SyncTask, WindowRef } from '../../src/sync/types.js'
@@ -24,8 +24,12 @@ let cfg: StoreConfig
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-reports-'))
   cfg = { backend: 'duckdb', path: join(dir, 'q.db'), readOnlyRetryMs: 30000, batchSize: 1000 }
-  // 令牌桶是模块级状态（报表接口 30 秒桶）——不清空会跨用例污染
+  // 令牌桶是模块级状态（报表接口 30 秒桶）——不清空会跨用例污染；
+  // 任务内多次调用（翻页/逐客服）的冷却等待注入零耗时，测试可确定性断言
   __resetBuckets()
+  // 注入的 sleep 代表「等满了 retryAfter」——令牌桶按真实时钟计窗，
+  // 测试用清桶模拟时间推进（与真实 31s 等待后放行等价）
+  __setSleep(async () => { __resetBuckets() })
 })
 afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 
@@ -181,23 +185,50 @@ describe('报表任务 fetch（http mock）', () => {
     }
   })
 
-  it('staff_attendance：分页拉满（pageSize=1000）+ hour_ts 取响应 date', async () => {
-    // 首页 2 行 + 第二页空 → 假空重试补一次（引擎语义）；这里直接两页真实数据
+  it('staff_attendance：分页 total 收敛拉满（两页）+ hour_ts 取响应 date，apiCount 与 total 一致', async () => {
+    // 首页 2 行（total=3）→ 第二页 1 行（total=3 收敛停）——单页实现会静默截掉第 3 行
     const row = (id: number, ts: number) => ({ staffId: id, date: ts, loginDuration: 3600001 })
     const fetchMock = respondQueue([
-      () => okC({ result: [row(1000002, 3_600_000), row(1000002, 7_200_000)], total: 2 }),
+      () => okC({ result: [row(1000002, 3_600_000), row(1000002, 7_200_000)], total: 3 }),
+      () => okC({ result: [row(1000002, 10_800_000)], total: 3 }),
     ])
     vi.stubGlobal('fetch', fetchMock)
     try {
+      expect(fetchMock.mock.calls.length).toBe(0)
       const store = await fresh()
       const r = await runTask(reportById('reports.staff_attendance')!, ctx(store))
+      expect(fetchMock.mock.calls.length).toBe(2)   // page1 + page2（page2 撞本地桶，等满冷却后重试成功）
       expect(r.status).toBe('complete')
-      expect(r.rows.written).toBe(2)
+      expect(r.rows).toEqual({ fetched: 3, written: 3 })   // apiCount 与 total 一致
       const rows = await store.query('SELECT staff_id, hour_ts FROM staff_attendance ORDER BY hour_ts')
       expect(rows.rows).toEqual([
         { staff_id: '1000002', hour_ts: new Date(3_600_000).toISOString() },
         { staff_id: '1000002', hour_ts: new Date(7_200_000).toISOString() },
+        { staff_id: '1000002', hour_ts: new Date(10_800_000).toISOString() },
       ])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('order_performance 真实落库：2 订单 + sum → 3 行（order_id 主键非空、sum 走哨兵行）', async () => {
+    const fetchMock = respondQueue([
+      () => okC({ orders: [{ orderId: 900001, sellMoney: 10 }, { orderId: 900002, sellMoney: 20 }],
+        sum: { sellMoney: 30 }, total: 2 }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.order_performance')!, ctx(store))
+      expect(r.status).toBe('complete')
+      expect(r.rows.written).toBe(3)
+      const rows = await store.query('SELECT order_id, stat_date FROM order_performance ORDER BY order_id')
+      // sum 哨兵行按 controller 裁定进同表（order_id='sum'，sum 字段在 payload 里）
+      expect(rows.rows.map((x) => x.order_id)).toEqual(['900001', '900002', 'sum'])
+      expect(rows.rows.every((x) => typeof x.order_id === 'string' && x.order_id.length > 0)).toBe(true)
+      const sumRow = await store.query("SELECT payload FROM order_performance WHERE order_id = 'sum'")
+      expect(JSON.parse(sumRow.rows[0].payload as string)).toEqual({ sellMoney: 30 })
       await store.close()
     } finally {
       vi.unstubAllGlobals()

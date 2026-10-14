@@ -110,7 +110,7 @@ describe('DIM_TASKS 任务声明', () => {
     }
     expect(dimById('dim.staff')!.table).toBe('staff')
     expect(dimById('dim.staff_group_members')!.primaryKey).toEqual(['group_id', 'staff_id'])
-    expect(dimById('dim.ticket_template_fields')!.primaryKey).toEqual(['template_id', 'field_id'])
+    expect(dimById('dim.ticket_template_fields')!.primaryKey).toEqual(['template_id', 'fieldId'])
   })
 
   it('dim.staff fetch：POST staff.list（空 body）、payload 行直写（groupInfo JSON 字符串化）', async () => {
@@ -201,6 +201,31 @@ describe('DIM_TASKS 任务声明', () => {
       // 透传正确性由任务源码补齐，此用例主要钉 payload 行落库）。
       const rows = await store.query('SELECT id, name, parentId, rank FROM ticket_categories')
       expect(rows.rows).toEqual([{ id: '1', name: '分类A', parentId: '0', rank: '0' }])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('ticket_template_fields 投影：fieldId 主键列不丢（模板×字段每模板一次调用）', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      fetchMock.mockImplementation((url: string | URL) => {
+        const body = Number(new URL(String(url)).searchParams.get('time') ?? 0) // 占位，路径判断用 path
+        void body
+        const path = String(url)
+        const data = path.includes('template/list')
+          ? [{ id: 7, name: '模板A', createTime: 0, autoFlow: 0, autoStatus: 0, fileStatus: 0, autoGuide: '' }]
+          : [{ id: 77, fieldId: 5001, name: '紧急度', type: 0, required: 1, customer: 0, description: '', prefill: '' }]
+        return Promise.resolve(new Response(JSON.stringify({ code: 200, message: JSON.stringify(data) }),
+          { status: 200, headers: { 'content-type': 'application/json' } }))
+      })
+      const store = await fresh()
+      const r = await runTask(dimById('dim.ticket_template_fields') as SyncTask, ctx(store))
+      expect(r.rows.written).toBe(1)
+      const rows = await store.query('SELECT template_id, fieldId, name FROM ticket_template_fields')
+      expect(rows.rows).toEqual([{ template_id: '7', fieldId: '5001', name: '紧急度' }])
       await store.close()
     } finally {
       vi.unstubAllGlobals()
