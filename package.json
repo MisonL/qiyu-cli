@@ -23,9 +23,15 @@
     "ai-agent",
     "customer-service"
   ],
-  "engines": { "node": ">=20.10" },
-  "bin": { "qiyu": "dist/cli.js" },
-  "files": ["dist"],
+  "engines": {
+    "node": ">=20.10"
+  },
+  "bin": {
+    "qiyu": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc && node scripts/copy-params.mjs",
     "prepare": "npm run build",
@@ -37,5 +43,8 @@
     "typescript": "^5.6.0",
     "vitest": "^2.1.0",
     "yaml": "2.9.1"
+  },
+  "optionalDependencies": {
+    "@duckdb/node-api": "1.5.6-r.1"
   }
 }
