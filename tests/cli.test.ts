@@ -26,13 +26,13 @@ describe('命令行入口', () => {
   it('未知子命令返回用法错误码 2', async () => {
     expect(await run(['不存在的命令'])).toBe(2)
     expect(err).toContain('未知子命令：不存在的命令')
-    // ⚠️ 这里**只**断言"走到了「可用子命令：」这条分支"，**不**断言列表里具体有哪些命令。
-    // 原因是本文件在**任务 1 就被创建**，而 `COMMANDS` 此时是**空表**（auth 到任务 10、
-    // api 到任务 11 才挂载）。空表时正确输出是「可用子命令：（暂无）」，挂载后才是
-    // 「可用子命令：auth、api」—— **正确输出本身随任务推进变化**，所以不存在一条
-    // 断言能同时在两种状态下成立。曾经这里写过 `toMatch(/可用子命令：[\s\S]*auth/)`，
-    // 那是**错的**：它在任务 1 必然失败（空表拿不到 auth），与步骤 5「预期 PASS」矛盾。
-    // → 列表**内容**的断言在任务 11（`api` 挂载后）单独引入，见该任务的测试。
+    // ⚠️ 这里**只**断言"走到了「可用子命令：」这条分支"，早期任务不断言列表里具体有哪些命令。
+    // 原因是本文件在**任务 1 就被创建**，`COMMANDS` 从空表逐步挂载 —— 空表时正确输出是
+    // 「可用子命令：（暂无）」，挂载后才列出具体命令 —— 正确输出本身随任务推进变化。
+    // 现在（store 挂载后）列表已含 auth、api、store，其内容在下方
+    // 「store 子命令注册 → 未知子命令消息含 store」用例中单独锚定。
+    // 曾经这里写过 `toMatch(/可用子命令：[\s\S]*auth/)`，
+    // 那在任务 1 必然失败（空表拿不到 auth），与步骤 5「预期 PASS」矛盾。
     //
     // 关于 `Object.keys(COMMANDS).join('、') || '（暂无）'` 的 `||`→`&&` 变异：
     // 它确实无法在本文件里用一条断言钉死（理由同上）。本计划**如实记录这个覆盖缺口**，
@@ -254,5 +254,38 @@ describe('入口退出行为（架构不变量）', () => {
     // 就不是可执行脚本。
     expect(src.split('\n')[0], 'shebang 必须是第一行（归属注释不能挤在它前面）')
       .toBe('#!/usr/bin/env node')
+  })
+})
+
+describe('store 子命令注册', () => {
+  it('store 进 COMMANDS 且 dispatch 可达（store --help → 0）', async () => {
+    const { run } = await import('../src/cli.js')
+    let o = ''
+    vi.spyOn(process.stdout, 'write').mockImplementation((s) => { o += s; return true })
+    expect(await run(['store', '--help'])).toBe(0)
+    expect(o).toMatch(/store init/)
+  })
+  it('顶层 --help 含两条 store 用法', async () => {
+    const { run } = await import('../src/cli.js')
+    let o = ''
+    vi.spyOn(process.stdout, 'write').mockImplementation((s) => { o += s; return true })
+    await run(['--help'])
+    expect(o).toMatch(/store init/)
+    expect(o).toMatch(/store status/)
+  })
+  it('未知子命令消息含 store', async () => {
+    const { run } = await import('../src/cli.js')
+    let e = ''
+    vi.spyOn(process.stderr, 'write').mockImplementation((s) => { e += s; return true })
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    await run(['nope'])
+    expect(e).toMatch(/store/)
+  })
+  it('顶层 USAGE 的 store 行含 --backend 占位（spec §8.3 第 1 处逐字）', async () => {
+    const { run } = await import('../src/cli.js')
+    let o = ''
+    vi.spyOn(process.stdout, 'write').mockImplementation((s) => { o += s; return true })
+    await run(['--help'])
+    expect(o).toMatch(/\[--backend <name>\]/)
   })
 })

@@ -4,10 +4,12 @@ import { realpathSync } from 'node:fs'
 import { authCommand } from './commands/auth.js'
 import { fail, usageFail, describeArgs } from './output.js'
 import { apiCommand } from './commands/api.js'
+import { storeCommand } from './commands/store.js'
 
 const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   auth: authCommand,
   api: apiCommand,
+  store: storeCommand,
 }
 
 /**
@@ -23,11 +25,16 @@ const USAGE = `用法：qiyu <子命令> [参数]
   api call <id> [--body <JSON>] [--yes] [--no-validate] [--strict]
                            调用接口；危险接口必须加 --yes
   api schema <id>         查看接口的请求参数表与响应形状
+  store init [--db <path>] [--profile <name>] [--backend <name>]
+                           初始化本地数据库（DuckDB）
+  store status [--db <path>] [--profile <name>] [--backend <name>]
+                           查看数据库状态与各表行数
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
      数字码（如 14009），也可能是本 CLI 合成的词（usage / network / internal /
-     auth_missing / confirm_required / local_rate_limit / unknown）。合成词查不到官方错误码表。
+     auth_missing / confirm_required / store_locked / store_not_initialized /
+     local_rate_limit / unknown）。合成词查不到官方错误码表。
 
 退出码：0 成功 · 1 业务错误 · 2 用法错误 · 3 网络错误 · 4 需要 --yes
 `

@@ -1,0 +1,82 @@
+// tests/store/schema.test.ts
+import { describe, it, expect } from 'vitest'
+import { TABLES, MIGRATIONS, LATEST_VERSION, ddlFor, tableByName } from '../../src/store/schema.js'
+
+describe('TABLES —— 表定义', () => {
+  it('恰好四张表：schema_version/sync_state/sync_gaps/tags', () => {
+    expect(TABLES.map((t) => t.name).sort()).toEqual(['schema_version', 'sync_gaps', 'sync_state', 'tags'])
+  })
+
+  it('tags 列恰为 id/name/color，全 NOT NULL，id 为 VARCHAR 主键', () => {
+    const t = tableByName('tags')!
+    expect(t.columns.map((c) => c.name)).toEqual(['id', 'name', 'color'])
+    expect(t.columns.every((c) => c.nullable === false)).toBe(true)
+    expect(t.columns.find((c) => c.name === 'id')!.type).toBe('VARCHAR')
+    expect(t.primaryKey).toEqual(['id'])
+  })
+
+  it('sync_state 六列（含 locked_by/locked_at）', () => {
+    const t = tableByName('sync_state')!
+    expect(t.columns.map((c) => c.name)).toEqual(
+      ['dataset', 'watermark', 'range_status', 'last_error', 'locked_by', 'locked_at'])
+    expect(t.primaryKey).toEqual(['dataset'])
+  })
+
+  it('sync_gaps 主键为 (dataset, range_start)', () => {
+    expect(tableByName('sync_gaps')!.primaryKey).toEqual(['dataset', 'range_start'])
+  })
+
+  it('全部 ID 列为 VARCHAR（无 BIGINT）', () => {
+    for (const t of TABLES) {
+      for (const c of t.columns) {
+        expect(['VARCHAR', 'INTEGER']).toContain(c.type)
+        if (c.name === 'id' || c.name.endsWith('_id') || c.name === 'dataset') {
+          expect(c.type, `${t.name}.${c.name}`).toBe('VARCHAR')
+        }
+      }
+    }
+  })
+
+  it('每列都有 sensitive 键且为 boolean（C1 全 false；true 分支待 E/D）', () => {
+    for (const t of TABLES) {
+      for (const c of t.columns) {
+        expect(typeof (c.sensitive ?? false), `${t.name}.${c.name}`).toBe('boolean')
+      }
+    }
+  })
+
+  it('schema_version.version 是 INTEGER（迁移序号，非 ID 列）', () => {
+    expect(tableByName('schema_version')!.columns[0]).toEqual({ name: 'version', type: 'INTEGER', nullable: false, sensitive: false })
+  })
+})
+
+describe('ddlFor —— 生成建表语句', () => {
+  it('含主键与 NOT NULL', () => {
+    const sql = ddlFor(tableByName('tags')!)
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS "tags"/)
+    expect(sql).toMatch(/"id" VARCHAR NOT NULL/)
+    expect(sql).toMatch(/PRIMARY KEY \("id"\)/)
+  })
+
+  it('复合主键正确渲染', () => {
+    expect(ddlFor(tableByName('sync_gaps')!)).toMatch(/PRIMARY KEY \("dataset", "range_start"\)/)
+  })
+})
+
+describe('MIGRATIONS —— 迁移', () => {
+  it('版本号从 1 起连续、LATEST_VERSION 为最大值', () => {
+    const vs = MIGRATIONS.map((m) => m.version).sort((a, b) => a - b)
+    expect(vs[0]).toBe(1)
+    for (let i = 1; i < vs.length; i++) expect(vs[i]).toBe(vs[i - 1] + 1)
+    expect(LATEST_VERSION).toBe(vs[vs.length - 1])
+  })
+
+  it('v1 迁移建出全部 TABLES（对拍 ddlFor 的表名集合）', async () => {
+    const ran: string[] = []
+    const m1 = MIGRATIONS.find((m) => m.version === 1)!
+    await m1.up(async (sql) => { ran.push(sql) })
+    for (const t of TABLES) {
+      expect(ran.some((s) => s.includes(`"${t.name}"`)), `缺 ${t.name} 的建表语句`).toBe(true)
+    }
+  })
+})

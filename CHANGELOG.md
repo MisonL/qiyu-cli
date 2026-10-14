@@ -12,6 +12,9 @@
 - 注册表补全至 154 条接口（150 个文档页 + 4 个文档外接口），并新增每接口的 `params/` 参数表。
 - `qiyu api schema <id>` —— 查看接口请求参数表与响应形状
 - `api call` 的 body 分级校验
+- `store init` / `store status`（`qiyu store init` / `qiyu store status`）—— 初始化本地数据库（DuckDB）与查看各表行数
+- `Store` 抽象与 DuckDB 后端、`~/.config/qiyu/config.json` 存储配置支持
+- 新增错误 kind：`store_locked` / `store_not_initialized`（退出码 1）
 
 ## [0.1.0] - 2026-10-09
 

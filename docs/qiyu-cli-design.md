@@ -1159,9 +1159,9 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 
 ### 9.5 状态码
 
-- `kind: "store_not_initialized"` + 指向 `qiyu sync run` 的提示
+- `kind: "store_not_initialized"` + 指向 `qiyu sync run` 的提示（C1 阶段指向 `qiyu store init`；D 交付后改为 `qiyu sync run`）
 - `kind: "auth_missing"` + `retryable: false` + 指向 §4.2 的提示
-- `kind: "store_locked"` + 说明正在同步的提示
+- `kind: "store_locked"` + 说明正在同步的提示（C1 阶段：写进程持锁，无同步概念；D 交付后为同步窗口）
 
 ### 9.6 机器人会话生命周期（实测）
 
@@ -1756,7 +1756,7 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 | `rate_limit`（retry_after > 60） | **不要 sleep**；改为查询本地数据库 |
 | `needs_confirmation`（退出码 4） | **停下来**，向人类复述该操作及其目标，**绝不自动追加 `--yes`** |
 | `ambiguous` | 把候选交给人类，**不得自行选择** |
-| `store_locked` | 正在同步中；稍后重试或查询缓存 |
+| `store_locked` | 正在同步中；稍后重试或查询缓存（C1 阶段无「查询缓存」能力：写进程持锁，退避后重试即可；D 交付后缓存查询生效） |
 
 **E. 禁止事项**：不要读取配置文件（其中含 appSecret），不要使用 `--pretty`/`--table`，不要盲目重试，不要在未先确认新鲜度的情况下下结论
 

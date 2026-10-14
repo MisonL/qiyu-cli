@@ -25,7 +25,7 @@ const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
      数字码（如 14009），也可能是本 CLI 合成的词（usage / network / internal /
-     auth_missing / confirm_required / local_rate_limit / unknown）。合成词查不到官方错误码表。
+     auth_missing / confirm_required / store_locked / store_not_initialized / local_rate_limit / unknown）。合成词查不到官方错误码表。
 
 退出码：0 成功 · 1 业务错误 · 2 用法错误 · 3 网络错误 · 4 需要 --yes
 `
