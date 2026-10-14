@@ -377,26 +377,71 @@ describe('duckdb —— init 与关闭', () => {
     }
   })
 
-  it('写者撞锁：不重试、立即抛 store_locked（注入 sleep 证明未调用；子进程持真锁）', async () => {
-    // ⚠️ 偏差修正：实测空库文件（不存在时由子进程新建）不会撞锁——锁冲突只在库文件
-    // 已存在时发生（与读者用例带 seed 步骤一致）。先 seed 建库再让子进程持锁。
-    const mod = (await import('@duckdb/node-api')) as unknown as { DuckDBInstance: { create: (p: string, o?: unknown) => Promise<{ connect: () => Promise<{ run: (sql: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> } }
-    const seed = await mod.DuckDBInstance.create(cfg.path)
-    const seedConn = await seed.connect()
-    await seedConn.run('CREATE TABLE t (a INTEGER)')
-    seedConn.closeSync()
-    seed.closeSync()
-    const holder = await spawnLockHolder(cfg.path)
-    try {
-      const sleep = vi.fn(async () => {})
-      await expect(createDuckDbStore(cfg, 'rw', { sleep, now: () => 0 })).rejects.toMatchObject({
-        kind: 'store_locked',
-        retryable: true,
-        hint: expect.stringMatching(/写锁/),
+  it('写者撞锁：不重试、立即抛 store_locked（注入 sleep 证明未调用；跨进程持真锁 + 按轮换全新路径重试 ≤5 轮）', { timeout: 60000 }, async () => {
+    // ⚠️ 回移 T7 方案（tests/commands/store.test.ts 同款）：@duckdb/node-api 有
+    // **进程内单例缓存** —— 测试进程打开过的库路径再开一律命中缓存、绕过文件锁，
+    // 同进程 seed 再撞锁是间歇红根因。改为：
+    // ① 持锁者直接对**全新路径**持锁（DuckDBInstance.create 会建文件，无需 seed）；
+    // ② 打印 'locked' 时锁可能尚未落盘 —— 用独立子进程校验 CONFLICT；
+    // ③ 极少数情况下校验 CONFLICT 后写者仍能打开（锁落盘竞态窗口）——每轮换
+    //    全新路径重试，最多 5 轮。锁生效是平台保证，重试只对冲竞态窗口。
+    // 被测语义不变：kind=store_locked、retryable=true、写者不退避（sleep 未调用）。
+    const { spawn } = await import('node:child_process')
+    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
+    const spawnHolder = async (dbPath: string) => {
+      const child = spawn(process.execPath, ['-e', `
+        import(${JSON.stringify(pkgUrl.href)}).then(async ({ DuckDBInstance }) => {
+          const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
+          console.log('locked')
+          setInterval(() => {}, 1 << 30)
+          await new Promise(() => {})
+        })`], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let o = ''
+      child.stdout?.on('data', (d) => { o += String(d) })
+      const ok = await new Promise<boolean>((resolve) => {
+        const iv = setInterval(() => { if (o.includes('locked')) { clearInterval(iv); resolve(true) } }, 100)
+        setTimeout(() => { clearInterval(iv); resolve(false) }, 5000)
       })
-      expect(sleep).not.toHaveBeenCalled()   // 写者不退避（spec §5.2）
+      if (!ok) { child.kill('SIGKILL'); throw new Error(`锁持有者未能启动：${o.slice(0, 200)}`) }
+      return child
+    }
+    // 独立子进程校验锁已真正落盘（绕开本进程实例缓存）：
+    const lockVerdict = async (dbPath: string): Promise<string> => {
+      const chk = spawn(process.execPath, ['-e', `
+        import(${JSON.stringify(pkgUrl.href)}).then(({ DuckDBInstance }) =>
+          DuckDBInstance.create(${JSON.stringify(dbPath)}))
+          .then(() => console.log('OPENED'))
+          .catch(() => console.log('CONFLICT'))`], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let co = ''
+      chk.stdout?.on('data', (d) => { co += String(d) })
+      return await new Promise<string>((resolve) => {
+        chk.on('close', () => resolve(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
+        setTimeout(() => { chk.kill('SIGKILL'); resolve('TIMEOUT') }, 10000)
+      })
+    }
+    let holder: import('node:child_process').ChildProcess | undefined
+    try {
+      let asserted = false
+      for (let round = 0; round < 5 && !asserted; round++) {
+        const p = join(dir, `w-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
+        if (holder) holder.kill('SIGKILL')
+        holder = await spawnHolder(p)
+        if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        const sleep = vi.fn(async () => {})
+        try {
+          await expect(createDuckDbStore({ ...cfg, path: p }, 'rw', { sleep, now: () => 0 }))
+            .rejects.toMatchObject({
+              kind: 'store_locked',
+              retryable: true,
+              hint: expect.stringMatching(/写锁/),
+            })
+          expect(sleep).not.toHaveBeenCalled()   // 写者不退避（spec §5.2）
+          asserted = true
+        } catch { /* 锁竞态窗口（CONFLICT 后仍打开），换轮重来 */ }
+      }
+      expect(asserted, '5 轮内未取得「锁生效且写者撞锁」——锁落盘竞态超预期').toBe(true)
     } finally {
-      holder.kill('SIGKILL')
+      holder?.kill('SIGKILL')
     }
   })
 
