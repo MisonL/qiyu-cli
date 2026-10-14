@@ -8,8 +8,9 @@ export interface ColumnDef {
 }
 export interface TableDef { name: string; columns: ColumnDef[]; primaryKey: string[] }
 
-const col = (name: string, type: 'VARCHAR' | 'INTEGER', nullable = true): ColumnDef =>
-  ({ name, type, nullable, sensitive: false })
+const col = (name: string, type: 'VARCHAR' | 'INTEGER', nullable = true,
+  sensitive = false): ColumnDef =>
+  ({ name, type, nullable, sensitive })
 
 export const TABLES: TableDef[] = [
   { name: 'schema_version', columns: [col('version', 'INTEGER', false)], primaryKey: ['version'] },
@@ -160,6 +161,28 @@ export const TABLES: TableDef[] = [
       col('synchronized_at', 'VARCHAR')],
     primaryKey: ['stat_date'],
   },
+  // —— D：工单表批次（迁移 v6 建；spec §5.2 末行/§5.5）——
+  // 工单行线上有 27 个键、文档只有 16 个（设计稿 §6.2：connectionId/crm*/holder* 等未文档化
+  // 字段 + 漂移频繁）→ 业务字段整体收敛进 payload JSON 字符串列（与报表批次同一取舍）：
+  // 键列保证 JOIN 与红线 1，payload 保真全部业务字段。主键全业务键（红线 1）：
+  // tickets=ticket_id、ticket_logs=(ticket_id, log_id)。
+  // ⚠️ PII 列（工单域的真正载体与文档列出项，设计稿 §6.5：会话导出与工单域字段名互不相交）
+  // 标 sensitive: true —— crmUserPhone/crmUserName 非空率 78–81%/100%，userMobile/userName/
+  // userEmail 存在于 100% 但非空率 0%（保护不得只挂真载体，也要按实测清单兜住全列）。
+  {
+    name: 'tickets',
+    columns: [col('ticket_id', 'VARCHAR', false), col('payload', 'VARCHAR'),
+      col('crmUserName', 'VARCHAR', true, true), col('crmUserPhone', 'VARCHAR', true, true),
+      col('crmUserEmail', 'VARCHAR', true, true), col('userMobile', 'VARCHAR', true, true),
+      col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['ticket_id'],
+  },
+  {
+    name: 'ticket_logs',
+    columns: [col('ticket_id', 'VARCHAR', false), col('log_id', 'VARCHAR', false),
+      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['ticket_id', 'log_id'],
+  },
 ]
 
 export function tableByName(name: string): TableDef | undefined {
@@ -222,6 +245,15 @@ export const MIGRATIONS: Migration[] = [
       for (const name of ['daily_overview', 'staff_workload', 'staff_quality',
         'staff_satisfaction', 'staff_attendance', 'order_performance',
         'staff_salary_detail', 'robot_summary', 'transfer_human']) {
+        await exec(ddlFor(tableByName(name)!))
+      }
+    },
+  },
+  // D-T9 迁移：工单表 2 张（tickets/ticket_logs，键列 + payload 收敛 + PII 敏感列）。
+  {
+    version: 6,
+    up: async (exec) => {
+      for (const name of ['tickets', 'ticket_logs']) {
         await exec(ddlFor(tableByName(name)!))
       }
     },

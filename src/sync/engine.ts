@@ -26,6 +26,9 @@ import type {
 
 const DAY = 86_400_000
 
+/** 回看毫秒数：水位续跑的起点回退量（overlapDays 天；0 = 不回看）。 */
+const overlapDaysOf = (task: SyncTask): number => (task.overlapDays ?? 0) * DAY
+
 /** 窗口级 gap 的 reason（sync_gaps.reason 的引擎侧取值 + 任务 gapHint 的业务 reason）。 */
 type WindowGapReason = 'count_mismatch' | 'fetch_failed' | 'write_failed' | 'rate_limit_local'
 
@@ -122,13 +125,17 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     throw new RangeError(`任务 ${task.id} 的 maxWindowDays 非法：${task.maxWindowDays}（必须为正数）`)
   }
 
-  // —— 范围合成：水位续跑（watermark+1ms）——
+  // —— 范围合成：水位续跑（watermark+1ms；有重叠时再回看 overlapDays 天）——
   const state = await readWatermark(store, task.id)
   const requested = ctx.rangeOverride ?? { start: 0, end: clock() }
   let rangeStart = requested.start
   if (state.watermark !== null) {
     const wm = Date.parse(state.watermark)
-    if (!Number.isNaN(wm)) rangeStart = Math.max(requested.start, wm + 1)
+    if (!Number.isNaN(wm)) {
+      // T9 裁定接线：overlapDays 是「回看重叠」——水位续跑的窗口起点 = watermark+1 − overlap。
+      // 工单按操作时间增量时，3 天回看覆盖乱序到达的状态变更/日志（upsert 幂等吸收重叠行）。
+      rangeStart = Math.max(requested.start, wm + 1 - overlapDaysOf(task))
+    }
   }
   const resolvedRange: Range = { start: rangeStart, end: Math.max(requested.end, rangeStart) }
   if (resolvedRange.end <= resolvedRange.start) {
@@ -137,7 +144,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   }
 
   // —— 切窗 + 跳过包含窗（T2 裁定接线）——
-  const overlapMs = (task.overlapDays ?? 0) * DAY
+  const overlapMs = overlapDaysOf(task)
   const raw = sliceByMaxWindow(resolvedRange, task.maxWindowDays, task.overlapDays ?? 0)
   const windows = skipContained(raw, overlapMs)
 
@@ -342,7 +349,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
       if (!Number.isNaN(wm)) rangeStart = Math.max(requested.start, wm + 1)
     }
     const resolvedRange: Range = { start: rangeStart, end: Math.max(requested.end, rangeStart) }
-    const overlapMs = (task.overlapDays ?? 0) * DAY
+    const overlapMs = overlapDaysOf(task)
     const windows = resolvedRange.end <= resolvedRange.start
       ? []
       : skipContained(sliceByMaxWindow(resolvedRange, task.maxWindowDays, task.overlapDays ?? 0), overlapMs)

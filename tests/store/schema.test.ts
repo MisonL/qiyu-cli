@@ -3,13 +3,14 @@ import { describe, it, expect } from 'vitest'
 import { TABLES, MIGRATIONS, LATEST_VERSION, ddlFor, tableByName } from '../../src/store/schema.js'
 
 describe('TABLES —— 表定义', () => {
-  it('恰好十九张表：v1 四张 + v3 批次六张维度表 + v5 批次九张报表表', () => {
+  it('恰好二十一张表：v1 四张 + v3 批次六张维度表 + v5 批次九张报表表 + v6 批次两张工单表', () => {
     expect(TABLES.map((t) => t.name).sort()).toEqual([
       'daily_overview', 'order_performance', 'robot_summary',
       'schema_version', 'staff', 'staff_attendance', 'staff_group_members', 'staff_groups',
       'staff_quality', 'staff_salary_detail', 'staff_satisfaction', 'staff_workload',
       'sync_gaps', 'sync_state', 'tags',
-      'ticket_categories', 'ticket_template_fields', 'ticket_templates', 'transfer_human'])
+      'ticket_categories', 'ticket_logs', 'ticket_template_fields', 'ticket_templates',
+      'tickets', 'transfer_human'])
   })
 
   it('tags 列恰为 id/name/color，全 NOT NULL，id 为 VARCHAR 主键', () => {

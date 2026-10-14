@@ -29,8 +29,8 @@ describe('duckdb —— 建表与查询', () => {
     expect(await s.tables()).toEqual(['daily_overview', 'order_performance', 'robot_summary',
       'schema_version', 'staff', 'staff_attendance', 'staff_group_members', 'staff_groups',
       'staff_quality', 'staff_salary_detail', 'staff_satisfaction', 'staff_workload',
-      'sync_gaps', 'sync_state', 'tags', 'ticket_categories', 'ticket_template_fields',
-      'ticket_templates', 'transfer_human'])
+      'sync_gaps', 'sync_state', 'tags', 'ticket_categories', 'ticket_logs',
+      'ticket_template_fields', 'ticket_templates', 'tickets', 'transfer_human'])
     await s.close()
   })
 
@@ -257,9 +257,9 @@ describe('duckdb —— init 与关闭', () => {
       .mockReturnValue([...real, { version: 99, up: async () => { throw new Error('注入的迁移失败') } }] as never)
     const s1 = await createDuckDbStore(cfg, 'rw')
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
-    expect(await s1.count('schema_version')).toBe(5)   // v1/v2/v3/v4/v5 已记、99 未记（失败不推进）
+    expect(await s1.count('schema_version')).toBe(6)   // v1..v6 已记、99 未记（失败不推进）
     await s1.close()
-    // 恢复真实迁移，重新 init → 重放路径只补 99（真实清单无 99，MAX 保持 5）
+    // 恢复真实迁移，重新 init → 重放路径只补 99（真实清单无 99，MAX 保持 6）
     failingSpy.mockRestore()
     // ⚠️ J-M1 实测裁决（controller 以 vitest 2.1.9 真跑探测）：对本地 ESM 模块命名空间
     // 的具名导出做 `vi.spyOn(mod, 'MIGRATIONS', 'get')` **可用**——vitest 的模块转换
@@ -270,7 +270,7 @@ describe('duckdb —— init 与关闭', () => {
     const s2 = await createDuckDbStore(cfg, 'rw')
     await s2.init()
     const v = await s2.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    expect(Number(v.rows[0].v)).toBe(5)   // v1+v2+v3(维度表)+v4+v5(报表表)，MAX=5
+    expect(Number(v.rows[0].v)).toBe(6)   // v1+v2+v3(维度表)+v4+v5(报表表)+v6(工单表)，MAX=6
     await s2.close()
   })
 
