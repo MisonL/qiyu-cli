@@ -333,6 +333,57 @@ describe('全删重插幂等（runTask 快照全链路，真库）', () => {
     }
   })
 
+  it('翻页上限保护：非空页但 isEnd 恒 0 → 有限次调用后显式抛错（绝不挂起/死循环）', async () => {
+    // 恒返回同一页（total=2 → 上限 ceil(2/1000)+5 = 6 页）：非空页、isEnd 恒 0
+    const same = { id: 11, groupId: 'g1', robotId: 1000001, robotName: 'A', type: 1, refId: 11, pointId: null }
+    const fetchMock = vi.fn().mockImplementation(() => okC({ total: 2, data: [same], isEnd: 0 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      await expect(knowledgeById('knowledge.items')!
+        .fetch({ start: 0, end: 1, index: 0, total: 1 }, ctx(store)))
+        .rejects.toThrow(/翻页超限/)
+      // 上限 = ceil(2/1000)+5 = 6：第 7 次尝试前抛出（不是挂起，也不是无限调用）
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(7)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('翻页上限保护（total 未知）：载荷无 total 键 → 保守 1000 页上限内显式抛错', async () => {
+    const same = { id: 11, groupId: 'g1', robotId: 1000001, robotName: 'A', type: 1, refId: 11, pointId: null }
+    const fetchMock = vi.fn().mockImplementation(() => okC({ data: [same], isEnd: 0 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      await expect(knowledgeById('knowledge.items')!
+        .fetch({ start: 0, end: 1, index: 0, total: 1 }, ctx(store)))
+        .rejects.toThrow(/翻页超限/)
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(1001)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('type 列数字直通：落库后为 number 1（不因 JSON.stringify 变 "1" 依赖隐式转型）', async () => {
+    const page = [{ id: 11, groupId: 'g1', robotId: 1000001, robotName: 'A', type: 1, refId: 11, pointId: null }]
+    const fetchMock = vi.fn().mockImplementation(() => okC({ total: 1, data: page, isEnd: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(knowledgeById('knowledge.items')!, ctx(store))
+      expect(r.status).toBe('complete')
+      const rows = await store.query('SELECT type FROM knowledge_items WHERE id = \'11\'')
+      expect(rows.rows[0]!.type).toBe(1)          // number，不是字符串 "1"
+      expect(typeof rows.rows[0]!.type).toBe('number')
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('缺 id 的脏行：丢弃且不计入 fetched（与 apiCount 口径一致）', async () => {
     const page = [{ id: 21, groupId: 'g1', robotId: 1000001, robotName: 'A', type: 1, refId: 21, pointId: null },
       { groupId: 'g2', robotId: 1000001, robotName: 'A', type: 1, refId: 0, pointId: null }]   // 缺 id → 丢弃

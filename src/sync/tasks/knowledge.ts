@@ -72,6 +72,9 @@ async function callPaced(endpointId: string, body: unknown, ctx: FetchCtx,
  *   · mid 从 0 起，每页后 = 本页末行 id（服务端语义：下一批 **严格大于** mid）；
  *   · isEnd=1 终止；size 恒 1000；
  *   · 空页但 isEnd=0 → 终止循环并显式失败（mid 已无可推进依据，继续翻只会死循环）；
+ *   · **翻页上限保护**：maxPages = ceil(total/size) + 5 余量（total 未知时保守 1000 页）
+ *     ——非空页但 isEnd 恒 0、或末行 id 缺失致 mid=NaN 原地打转的响应形态漂移，
+ *     都在有限次调用后显式失败，绝不挂起；
  *   · 各页声明 total 必须一致、结束时累计行数必须等于 total——「看似成功的短读」
  *     是最危险的静默失败方向（配对核对的前置事实检查）。
  */
@@ -79,7 +82,17 @@ async function pagedCursor(endpointId: string, ctx: FetchCtx): Promise<Record<st
   const out: Record<string, unknown>[] = []
   let mid = 0
   let declared: number | null = null
+  let page = 0
   for (;;) {
+    // 上限在发请求前判定：声明 total 已知 → ceil(total/size)+5；未知 → 保守 1000 页
+    const maxPages = declared !== null
+      ? Math.ceil(declared / PAGE_SIZE) + 5
+      : 1000
+    if (page >= maxPages) {
+      throw new Error(`接口 ${endpointId} 翻页超限（${page} 页 > 上限 ${maxPages}，声明 total=` +
+        `${String(declared)}，已取 ${out.length} 行）：isEnd 恒 0 或游标未推进（响应形态漂移），拒绝落库`)
+    }
+    page++
     const res = await callPaced(endpointId, { mid, size: PAGE_SIZE }, ctx)
     const p = res.payload as { total?: unknown; data?: unknown; isEnd?: unknown } | null
     if (p === null || typeof p !== 'object' || !Array.isArray(p.data)) {
@@ -116,18 +129,23 @@ async function pagedCursor(endpointId: string, ctx: FetchCtx): Promise<Record<st
  * 脏行守卫 + 键列提取（按映射表投影）。缺键（undefined）的行丢弃——脏单行不致断流
  * 的统一取舍；**键存在但值为 null 是合法数据**（pointId 仅 37.6% 行有值、robot_name
  * 可空——设计稿 §10.5 实测），落库为 null，绝不因此丢行。
+ * ⚠️ INTEGER 列（numericCols 中的）**数字直通**、不做 JSON.stringify——否则 number 1
+ * 会被字符串化成 "1" 落 INTEGER 列（依赖 DuckDB 隐式转型是脆弱行为）；VARCHAR 列的
+ * 非字符串值（ID 是 BIGINT）才字符串化（BIGINT 精度红线）。
  */
 function projectRows(rows: Record<string, unknown>[],
   keys: Record<string, (r: Record<string, unknown>) => unknown>,
-  nowIso: string): Record<string, unknown>[] {
+  numericCols: ReadonlySet<string>, nowIso: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = []
   for (const r of rows) {
     const mapped: Record<string, unknown> = {}
     let ok = true
     for (const [col, get] of Object.entries(keys)) {
-      if (get(r) === undefined) { ok = false; break }   // 键缺失 → 脏行；null 是合法值
-      const v = get(r)
-      mapped[col] = v === null || v === undefined ? null : typeof v === 'string' ? v : JSON.stringify(v)
+      const v = get(r)   // 只取一次（键缺失判别与取值同一来源）
+      if (v === undefined) { ok = false; break }   // 键缺失 → 脏行；null 是合法值
+      mapped[col] = v === null ? null
+        : numericCols.has(col) ? Number(v)
+        : typeof v === 'string' ? v : JSON.stringify(v)
     }
     if (!ok) continue   // 键缺失行：丢弃且不计入 fetched（与 apiCount 口径一致）
     // 其余字段整体收敛进 payload（22 键对 16 键文档漂移——payload 保真全部业务字段）
@@ -150,14 +168,16 @@ function flattenTree(robotId: string, nodes: unknown, level: number,
   }
 }
 
-/** knowledge_items / knowledge_points 共用的游标快照 fetch。 */
+/** knowledge_items / knowledge_points 共用的游标快照 fetch。numericCols 是 INTEGER 列集（数字直通）。 */
 function fetchCursor(taskId: string, endpointId: string,
-  keys: Record<string, (r: Record<string, unknown>) => unknown>): SyncTask['fetch'] {
+  keys: Record<string, (r: Record<string, unknown>) => unknown>,
+  numericCols: string[] = []): SyncTask['fetch'] {
+  const numeric = new Set(numericCols)
   return async (w, ctx) => {
     assertNoRobotId(w, taskId)
     const nowIso = new Date().toISOString()
     const rows = await pagedCursor(endpointId, ctx)
-    const mapped = projectRows(rows, keys, nowIso)
+    const mapped = projectRows(rows, keys, numeric, nowIso)
     return { rows: mapped, apiCount: mapped.length }
   }
 }
@@ -179,7 +199,7 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
       group_id: (r) => r.groupId,
       ref_id: (r) => r.refId,
       point_id: (r) => r.pointId,
-    }),
+    }, ['type']),
   },
   {
     id: 'knowledge.points', table: 'knowledge_points', kind: 'snapshot',
