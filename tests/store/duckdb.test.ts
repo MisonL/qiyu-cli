@@ -24,9 +24,11 @@ async function fresh(): Promise<Store> {
 }
 
 describe('duckdb —— 建表与查询', () => {
-  it('init 建出四张表（tables() 排序）', async () => {
+  it('init 建出全部表（tables() 排序：v3 批次维度表随迁移落库）', async () => {
     const s = await fresh()
-    expect(await s.tables()).toEqual(['schema_version', 'sync_gaps', 'sync_state', 'tags'])
+    expect(await s.tables()).toEqual(['schema_version', 'staff', 'staff_group_members',
+      'staff_groups', 'sync_gaps', 'sync_state', 'tags', 'ticket_categories',
+      'ticket_template_fields', 'ticket_templates'])
     await s.close()
   })
 
@@ -249,13 +251,13 @@ describe('duckdb —— init 与关闭', () => {
     const schema = await import('../../src/store/schema.js')
     const real = schema.MIGRATIONS
     const failingSpy = vi.spyOn(schema, 'MIGRATIONS', 'get')
-      // ⚠️ D-T3 起真实清单已有 v2，注入失败条目改用 version 3（真实清单跳到 v4，3 不撞号）。
-      .mockReturnValue([...real, { version: 3, up: async () => { throw new Error('注入的迁移失败') } }] as never)
+      // ⚠️ D-T6 起真实清单已有 v3（维度表 DDL），注入失败条目改用 99（不撞号）。
+      .mockReturnValue([...real, { version: 99, up: async () => { throw new Error('注入的迁移失败') } }] as never)
     const s1 = await createDuckDbStore(cfg, 'rw')
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
-    expect(await s1.count('schema_version')).toBe(2)   // v1/v2 已记、v3 未记（失败不推进）
+    expect(await s1.count('schema_version')).toBe(4)   // v1/v2/v3/v4 已记、99 未记（失败不推进）
     await s1.close()
-    // 恢复真实迁移，重新 init → 重放路径只补 v3（真实清单无 v3，MAX 保持 2）
+    // 恢复真实迁移，重新 init → 重放路径只补 99（真实清单无 99，MAX 保持 4）
     failingSpy.mockRestore()
     // ⚠️ J-M1 实测裁决（controller 以 vitest 2.1.9 真跑探测）：对本地 ESM 模块命名空间
     // 的具名导出做 `vi.spyOn(mod, 'MIGRATIONS', 'get')` **可用**——vitest 的模块转换
@@ -266,7 +268,7 @@ describe('duckdb —— init 与关闭', () => {
     const s2 = await createDuckDbStore(cfg, 'rw')
     await s2.init()
     const v = await s2.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    expect(Number(v.rows[0].v)).toBe(4)   // D-T4 起 v1+v2+v4，MAX=4（v3 空档预留给 T6）
+    expect(Number(v.rows[0].v)).toBe(4)   // v1+v2+v3(维度表)+v4，MAX=4
     await s2.close()
   })
 

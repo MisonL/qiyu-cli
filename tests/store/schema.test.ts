@@ -3,8 +3,11 @@ import { describe, it, expect } from 'vitest'
 import { TABLES, MIGRATIONS, LATEST_VERSION, ddlFor, tableByName } from '../../src/store/schema.js'
 
 describe('TABLES —— 表定义', () => {
-  it('恰好四张表：schema_version/sync_state/sync_gaps/tags', () => {
-    expect(TABLES.map((t) => t.name).sort()).toEqual(['schema_version', 'sync_gaps', 'sync_state', 'tags'])
+  it('恰好十张表：v1 四张 + v3 批次六张维度表', () => {
+    expect(TABLES.map((t) => t.name).sort()).toEqual([
+      'schema_version', 'staff', 'staff_group_members', 'staff_groups',
+      'sync_gaps', 'sync_state', 'tags',
+      'ticket_categories', 'ticket_template_fields', 'ticket_templates'])
   })
 
   it('tags 列恰为 id/name/color，全 NOT NULL，id 为 VARCHAR 主键', () => {
@@ -73,12 +76,25 @@ describe('MIGRATIONS —— 迁移', () => {
     expect(LATEST_VERSION).toBe(vs[vs.length - 1])
   })
 
-  it('v1 迁移建出全部 TABLES（对拍 ddlFor 的表名集合）', async () => {
+  it('v1 迁移只建 v1 四张（v3 批次维度表不进 v1）', async () => {
     const ran: string[] = []
     const m1 = MIGRATIONS.find((m) => m.version === 1)!
     await m1.up(async (sql) => { ran.push(sql) })
-    for (const t of TABLES) {
-      expect(ran.some((s) => s.includes(`"${t.name}"`)), `缺 ${t.name} 的建表语句`).toBe(true)
+    expect(ran.length).toBe(4)
+    for (const name of ['schema_version', 'sync_state', 'sync_gaps', 'tags']) {
+      expect(ran.some((s) => s.includes(`"${name}"`)), `v1 缺 ${name}`).toBe(true)
+    }
+    expect(ran.some((s) => s.includes('"staff"'))).toBe(false)
+  })
+
+  it('v3 迁移建出六张维度表（tags 已在 v1、不在 v3）', async () => {
+    const ran: string[] = []
+    const m3 = MIGRATIONS.find((m) => m.version === 3)!
+    await m3.up(async (sql) => { ran.push(sql) })
+    expect(ran.length).toBe(6)
+    for (const name of ['staff', 'staff_groups', 'staff_group_members',
+      'ticket_categories', 'ticket_templates', 'ticket_template_fields']) {
+      expect(ran.some((s) => s.includes(`"${name}"`)), `v3 缺 ${name}`).toBe(true)
     }
   })
 })
