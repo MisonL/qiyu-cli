@@ -26,7 +26,8 @@ async function fresh(): Promise<Store> {
 describe('duckdb —— 建表与查询', () => {
   it('init 建出全部表（tables() 排序：v3 批次维度表随迁移落库）', async () => {
     const s = await fresh()
-    expect(await s.tables()).toEqual(['daily_overview', 'order_performance', 'robot_summary',
+    expect(await s.tables()).toEqual(['daily_overview', 'knowledge_categories', 'knowledge_items',
+      'knowledge_points', 'order_performance', 'robot_summary',
       'schema_version', 'sessions', 'staff', 'staff_attendance', 'staff_group_members',
       'staff_groups', 'staff_quality', 'staff_salary_detail', 'staff_satisfaction',
       'staff_workload', 'sync_gaps', 'sync_state', 'tags', 'ticket_categories', 'ticket_logs',
@@ -257,7 +258,7 @@ describe('duckdb —— init 与关闭', () => {
       .mockReturnValue([...real, { version: 99, up: async () => { throw new Error('注入的迁移失败') } }] as never)
     const s1 = await createDuckDbStore(cfg, 'rw')
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
-    expect(await s1.count('schema_version')).toBe(7)   // v1..v7 已记、99 未记（失败不推进）
+    expect(await s1.count('schema_version')).toBe(8)   // v1..v8 已记、99 未记（失败不推进）
     await s1.close()
     // 恢复真实迁移，重新 init → 重放路径只补 99（真实清单无 99，MAX 保持 7）
     failingSpy.mockRestore()
@@ -270,7 +271,7 @@ describe('duckdb —— init 与关闭', () => {
     const s2 = await createDuckDbStore(cfg, 'rw')
     await s2.init()
     const v = await s2.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    expect(Number(v.rows[0].v)).toBe(7)   // v1+v2+v3(维度表)+v4+v5(报表表)+v6(工单表)+v7(sessions)，MAX=7
+    expect(Number(v.rows[0].v)).toBe(8)   // v1+v2+v3(维度表)+v4+v5(报表表)+v6(工单表)+v7(sessions)+v8(知识库表)，MAX=8
     await s2.close()
   })
 

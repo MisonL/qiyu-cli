@@ -3,9 +3,10 @@ import { describe, it, expect } from 'vitest'
 import { TABLES, MIGRATIONS, LATEST_VERSION, ddlFor, tableByName } from '../../src/store/schema.js'
 
 describe('TABLES —— 表定义', () => {
-  it('恰好二十二张表：v1 四张 + v3 批次六张维度表 + v5 批次九张报表表 + v6 批次两张工单表 + v7 sessions', () => {
+  it('恰好二十五张表：v1 四张 + v3 批次六张维度表 + v5 批次九张报表表 + v6 批次两张工单表 + v7 sessions + v8 批次三张知识库表', () => {
     expect(TABLES.map((t) => t.name).sort()).toEqual([
-      'daily_overview', 'order_performance', 'robot_summary',
+      'daily_overview', 'knowledge_categories', 'knowledge_items', 'knowledge_points',
+      'order_performance', 'robot_summary',
       'schema_version', 'sessions', 'staff', 'staff_attendance', 'staff_group_members',
       'staff_groups', 'staff_quality', 'staff_salary_detail', 'staff_satisfaction',
       'staff_workload', 'sync_gaps', 'sync_state', 'tags',

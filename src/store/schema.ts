@@ -204,6 +204,38 @@ export const TABLES: TableDef[] = [
       col('synchronized_at', 'VARCHAR')],
     primaryKey: ['session_id'],
   },
+  // —— D：知识库表批次（迁移 v8 建；设计稿 §10.5 实测字段普查，spec §5.4）——
+  // knowledge_items 是**全部机器人的并集**（robot.data.knowledge 企业级全量），
+  // knowledge_categories **按 robotId 隔离**（ai.knowledge.getCategoryTree）——
+  // 两个接口语义不同，主键形态随之分叉：items/points=各自 id（groupId 全局唯一但
+  // 主键保持上游业务键 id，红线 1）；categories 必须 (robot_id, category_id)
+  //（类目 id 空间按机器人划分，单列主键会让跨机器人同名类目互相覆盖，§10.5.9）。
+  // 与报表/工单批次同一取舍：业务字段整体收敛进 payload JSON 字符串列（items 实测 22 键、
+  // 文档只列 16 键——未文档化的 groupId/robotId/robotName 是承重字段，以键列提升保护），
+  // 键列保证 JOIN 与红线 1。无 PII 列（知识库域字段与会话/工单 PII 清单零交集）。
+  {
+    name: 'knowledge_items',
+    columns: [col('id', 'VARCHAR', false), col('robot_id', 'VARCHAR', false),
+      col('robot_name', 'VARCHAR'), col('type', 'INTEGER'), col('group_id', 'VARCHAR', false),
+      col('ref_id', 'VARCHAR', false), col('point_id', 'VARCHAR'),
+      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['id'],
+  },
+  {
+    // kpoint 实测 309/309 全字段存在且**无 robotId 键**（无法从 kpoint 反查机器人归属，
+    // 只能经 knowledge_items.point_id 反向推断，§10.5.7）——不建 robot_id 列。
+    name: 'knowledge_points',
+    columns: [col('id', 'VARCHAR', false), col('payload', 'VARCHAR'),
+      col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['id'],
+  },
+  {
+    name: 'knowledge_categories',
+    columns: [col('robot_id', 'VARCHAR', false), col('category_id', 'VARCHAR', false),
+      col('name', 'VARCHAR'), col('parent_id', 'VARCHAR'), col('level', 'INTEGER'),
+      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['robot_id', 'category_id'],
+  },
 ]
 
 export function tableByName(name: string): TableDef | undefined {
@@ -284,6 +316,15 @@ export const MIGRATIONS: Migration[] = [
     version: 7,
     up: async (exec) => {
       await exec(ddlFor(tableByName('sessions')!))
+    },
+  },
+  // D-T11 迁移：知识库 3 表（knowledge_items/knowledge_points/knowledge_categories）。
+  {
+    version: 8,
+    up: async (exec) => {
+      for (const name of ['knowledge_items', 'knowledge_points', 'knowledge_categories']) {
+        await exec(ddlFor(tableByName(name)!))
+      }
     },
   },
 ]

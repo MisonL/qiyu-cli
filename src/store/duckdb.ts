@@ -9,6 +9,8 @@
 // D/E 扩展时须保持并**更新此计数**。D-T1 追加 delete 原语后为 9 处
 //（duckdb.ts 7：INSERT×2 / DELETE×1 / SELECT×4；commands/store.ts 2：SELECT×2）。
 // D-T3 追加：src/sync/state.ts 常量 SELECT 3 处（水位/缺口读取），不在上述 9 处内。
+// D-T11 追加：src/sync/tasks/knowledge.ts 常量 SELECT 1 处
+//（knowledge.categories 的驱动序 SELECT DISTINCT robot_id），不在上述 9 处内。
 import { MIGRATIONS, tableByName, type TableDef } from './schema.js'
 import { retryWithBackoff, isLockError } from './retry.js'
 import type { QueryResult, Store, StoreConfig, StoreMode, WriteTx } from './types.js'
