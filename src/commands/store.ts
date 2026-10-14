@@ -37,9 +37,14 @@ function parseFlags(argv: string[]): { db?: string; profile?: string; backend?: 
   return out
 }
 
-function thrownToExit(e: unknown): number {
+export function thrownToExit(e: unknown): number {
   const err = e as { kind?: string; message?: string; hint?: string; retryable?: boolean }
-  if (err.kind && err.kind !== 'usage') {
+  // usage 类错误（store 层预检抛出，如未知列/缺列/连接已关闭）：归 usageFail 双通道、
+  // 退出码 2 —— 这是用法错误不是环境故障（M1 修：此前被下方排除条件挡住后落 internal）。
+  if (err.kind === 'usage') {
+    return usageFail(err.message ?? String(e), err.hint)
+  }
+  if (err.kind) {
     return fail({ code: err.kind, kind: err.kind, retryable: err.retryable ?? false,
       message: err.message ?? String(e), hint: err.hint })
   }
@@ -163,7 +168,8 @@ export async function storeCommand(argv: string[]): Promise<number> {
   // status
   // ⚠️ statSync 异常按 errno 分流（K 组 M6）：EACCES 误报「请先运行 init」会把
   // 只读路径的权限错误引导向写操作（init），Agent 必然再失败一次 —— 归因必须准。
-  try { statSync(config.path) } catch (e) {
+  let st: ReturnType<typeof statSync>
+  try { st = statSync(config.path) } catch (e) {
     const code = (e as { code?: string }).code
     if (code === 'ENOENT') {
       return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
@@ -174,7 +180,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
       message: `无法访问 ${config.path}：${e instanceof Error ? e.message : String(e)}`,
       hint: '请检查路径权限（status 是只读命令，不需要写权限）' })
   }
-  if (!statSync(config.path).isFile()) {
+  if (!st.isFile()) {
     // ⚠️ P 组 P-H2：目录成因**不能**引导向 store init（init 也拒绝目录 → 死循环）——
     // 独立 hint，与「不存在」成因分形。
     return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,

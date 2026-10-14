@@ -6,6 +6,9 @@ import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { TABLES } from '../../src/store/schema.js'
 import type { Store, StoreConfig } from '../../src/store/types.js'
 
+// L1 对冲：本文件全部用例走真库（DuckDB 冷启动偶发 >5s），统一放宽到 15s。
+vi.setConfig({ testTimeout: 15_000 })
+
 let dir = ''
 let cfg: StoreConfig
 beforeEach(() => {
@@ -13,40 +16,6 @@ beforeEach(() => {
   cfg = { backend: 'duckdb', path: join(dir, 'q.db'), readOnlyRetryMs: 30000, batchSize: 1000 }
 })
 afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
-
-/** 跨进程持锁者（第四轮实测：同进程双开不撞锁，锁只在跨进程成立）。
- *  spawn 一个 node 子进程用裸 DuckDBInstance 持有写锁；打印 'locked' 后用
- *  空 setInterval **仅保活**（防子进程退出释放锁——不保持的子进程会退出、
- *  锁随之释放，测试就会「测了个寂寞」）；父进程以 'locked' 标志确认启动成功
- *  （M 组 M-2 校正：没有向父进程发心跳的通道，也无须有）。返回 ChildProcess，
- *  调用方 SIGKILL。
- *  ⚠️ 安全前提（R 组 R3）：路径经 JSON.stringify 内嵌为 JS 字符串字面量 + spawn
- *  数组形态**不经 shell**——两者共同保证无注入面；勿改 shell:true 或改单引号拼接。
- *  Task 7 的命令级撞锁测试也用它 —— duckdb.test.ts 通过相对路径 import 本文件
- *  的同名导出不可行（测试文件互 import 会拉起整个 suite），故 Task 7 用
- *  `vi.hoisted` 之外的方式：**直接内联同一 spawn 逻辑**（见 tests/commands/store.test.ts
- *  的局部 helper，逐字一致除累积变量名；两处实现是有意为之的测试夹具复制，非业务重复）。 */
-async function spawnLockHolder(dbPath: string): Promise<import('node:child_process').ChildProcess> {
-  const { spawn } = await import('node:child_process')
-  // ⚠️ 用 new URL(..., import.meta.url).href（自动百分号编码）——手工拼 file:// + pathname
-  // 在含空格的仓库路径下会坏（K 组 L1）；与 store.test.ts 的夹具写法保持一致。
-  const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
-  const child = spawn(process.execPath, ['-e', `
-    import(${JSON.stringify(pkgUrl.href)}).then(async ({ DuckDBInstance }) => {
-      const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
-      console.log('locked')
-      setInterval(() => {}, 1 << 30)
-      await new Promise(() => {})
-    })`], { stdio: ['ignore', 'pipe', 'pipe'] })
-  let out = ''
-  child.stdout?.on('data', (d) => { out += String(d) })
-  const ok = await new Promise<boolean>((resolve) => {
-    const iv = setInterval(() => { if (out.includes('locked')) { clearInterval(iv); resolve(true) } }, 100)
-    setTimeout(() => { clearInterval(iv); resolve(false) }, 5000)
-  })
-  if (!ok) { child.kill('SIGKILL'); throw new Error(`锁持有者未能启动：${out.slice(0, 200)}`) }
-  return child
-}
 
 async function fresh(): Promise<Store> {
   const s = await createDuckDbStore(cfg, 'rw')
@@ -150,9 +119,9 @@ describe('duckdb —— upsert 契约', () => {
 
   // ⚠️ N 组 N6 实测：本用例真库耗时 ≈2.7s（25000 行 2 条 upsert 语句）——
   // 5s testTimeout 内但余量 <40%，单独放宽到 15s 防慢机器/冷启动抖动。
-  it('batchSize 巨值时单语句参数恒 ≤65000（二次切批硬顶，Q 组 Q-高-1：实测 1M 参数单语句 43s）', { timeout: 15_000 }, async () => {
-    // batchSize=25000、tags 3 列：参数硬顶 65000 → floor(65000/3)=21666 行/语句
-    // → 25000 行拆 2 条语句（切批与 batchSize 大小无关，硬顶恒生效——Q-高-1）。
+  it('batchSize 大于硬顶时被 65000 参数硬顶二次切住（M2：行数 = min(batchSize, floor(65000/列数))）', { timeout: 15_000 }, async () => {
+    // batchSize=25000、tags 3 列：硬顶 floor(65000/3)=21666 行/语句
+    // → 25000 行拆 2 条语句（超大 batchSize 仍被硬顶切住）。
     const s = await createDuckDbStore({ ...cfg, batchSize: 25000 }, 'rw')
     await s.init()
     const rows = Array.from({ length: 25000 }, (_, i) => ({ id: String(i), name: `n${i}`, color: '#000000' }))
@@ -161,6 +130,19 @@ describe('duckdb —— upsert 契约', () => {
     expect(n).toBe(25000)
     expect(spy.mock.calls.length).toBe(2)
     expect(await s.count('tags')).toBe(25000)
+    await s.close()
+  })
+
+  it('batchSize 小于硬顶时按 batchSize 切批（M2：首选切批尺寸恢复生效）', { timeout: 15_000 }, async () => {
+    // batchSize=600、tags 3 列：硬顶 21666 行/语句远未触及 → 2500 行拆 ceil(2500/600)=5 条语句。
+    const s = await createDuckDbStore({ ...cfg, batchSize: 600 }, 'rw')
+    await s.init()
+    const rows = Array.from({ length: 2500 }, (_, i) => ({ id: String(i), name: `n${i}`, color: '#000000' }))
+    const spy = vi.spyOn(s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }, 'execSql')
+    const n = await s.upsert('tags', rows)
+    expect(n).toBe(2500)
+    expect(spy.mock.calls.length).toBe(5)   // BEGIN/COMMIT 闭包直调，spy 只数数据语句
+    expect(await s.count('tags')).toBe(2500)
     await s.close()
   })
 
@@ -347,33 +329,74 @@ describe('duckdb —— init 与关闭', () => {
     await s.close()
   })
 
-  it('读者撞锁：退避超限 → 包装 store_locked + hint（验收 35，注入假时钟；子进程持真锁）', async () => {
-    // ⚠️ **锁只在跨进程成立**（第四轮实测）：同进程双开不撞锁，必须 spawn 子进程持锁。
-    // 子进程打印 'locked' + 心跳证明存活，父进程 createDuckDbStore('ro') 命中
-    // Conflicting lock → 退避（假时钟）→ 超限 → store_locked。
-    const mod = (await import('@duckdb/node-api')) as unknown as { DuckDBInstance: { create: (p: string, o?: unknown) => Promise<{ connect: () => Promise<{ run: (sql: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> } }
-    const seed = await mod.DuckDBInstance.create(cfg.path)
-    const seedConn = await seed.connect()
-    await seedConn.run('CREATE TABLE t (a INTEGER)')
-    // ⚠️ N 组 N1 实测：**connection 也要 closeSync** —— 只关 instance 不关 conn，
-    // 锁随进程存活、跨进程子进程必撞锁（锁永不超时释放）。connection 的是
-    // closeSync()（同步，无 close()）。
-    seedConn.closeSync()
-    seed.closeSync()
-    const holder = await spawnLockHolder(cfg.path)
-    try {
-      let t = 0
-      await expect(createDuckDbStore({ ...cfg, readOnlyRetryMs: 1000 }, 'ro', {
-        sleep: async (ms) => { t += ms }, now: () => t,
-      })).rejects.toMatchObject({
-        kind: 'store_locked',
-        retryable: true,
-        // hint 逐字（P 组 P-M2 改：前半句复述 message 已删，给第二动作）
-        hint: '请稍后重试；等待上限可经配置文件 readOnlyRetryMs（默认 30000 毫秒）调整，或用 --db 指向其他数据库文件',
-        message: expect.stringMatching(/被写进程占用/),
+  it('读者撞锁：退避超限 → 包装 store_locked + hint（验收 35，注入假时钟；跨进程持真锁 + 按轮换全新路径重试 ≤5 轮）', { timeout: 60000 }, async () => {
+    // ⚠️ 回移 T7 方案（同文件写者用例同款，M3 修间歇红）：@duckdb/node-api 有
+    // **进程内单例缓存** —— 测试进程打开过的库路径再开一律命中缓存、绕过文件锁，
+    // 同进程 seed 再撞锁是间歇红根因。改为：
+    // ① 持锁者直接对**全新路径**持锁（DuckDBInstance.create 会建文件，无需 seed）；
+    // ② 打印 'locked' 时锁可能尚未落盘 —— 用独立子进程校验 CONFLICT；
+    // ③ 极少数情况下校验 CONFLICT 后读者仍能打开（锁落盘竞态窗口）——每轮换
+    //    全新路径重试，最多 5 轮。锁生效是平台保证，重试只对冲竞态窗口。
+    // 被测语义不变（验收 35）：kind=store_locked、retryable=true、假时钟退避超限。
+    const { spawn } = await import('node:child_process')
+    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
+    const spawnHolder = async (dbPath: string) => {
+      const child = spawn(process.execPath, ['-e', `
+        import(${JSON.stringify(pkgUrl.href)}).then(async ({ DuckDBInstance }) => {
+          const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
+          console.log('locked')
+          setInterval(() => {}, 1 << 30)
+          await new Promise(() => {})
+        })`], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let o = ''
+      child.stdout?.on('data', (d) => { o += String(d) })
+      const ok = await new Promise<boolean>((resolve) => {
+        const iv = setInterval(() => { if (o.includes('locked')) { clearInterval(iv); resolve(true) } }, 100)
+        setTimeout(() => { clearInterval(iv); resolve(false) }, 5000)
       })
+      if (!ok) { child.kill('SIGKILL'); throw new Error(`锁持有者未能启动：${o.slice(0, 200)}`) }
+      return child
+    }
+    // 独立子进程校验锁已真正落盘（绕开本进程实例缓存）：
+    const lockVerdict = async (dbPath: string): Promise<string> => {
+      const chk = spawn(process.execPath, ['-e', `
+        import(${JSON.stringify(pkgUrl.href)}).then(({ DuckDBInstance }) =>
+          DuckDBInstance.create(${JSON.stringify(dbPath)}))
+          .then(() => console.log('OPENED'))
+          .catch(() => console.log('CONFLICT'))`], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let co = ''
+      chk.stdout?.on('data', (d) => { co += String(d) })
+      return await new Promise<string>((resolve) => {
+        chk.on('close', () => resolve(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
+        setTimeout(() => { chk.kill('SIGKILL'); resolve('TIMEOUT') }, 10000)
+      })
+    }
+    let holder: import('node:child_process').ChildProcess | undefined
+    try {
+      let asserted = false
+      for (let round = 0; round < 5 && !asserted; round++) {
+        const p = join(dir, `r-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
+        if (holder) holder.kill('SIGKILL')
+        holder = await spawnHolder(p)
+        if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        let t = 0
+        try {
+          await expect(createDuckDbStore({ ...cfg, path: p, readOnlyRetryMs: 1000 }, 'ro', {
+            sleep: async (ms) => { t += ms }, now: () => t,
+          })).rejects.toMatchObject({
+            kind: 'store_locked',
+            retryable: true,
+            // hint 逐字（P 组 P-M2 改：前半句复述 message 已删，给第二动作）
+            hint: '请稍后重试；等待上限可经配置文件 readOnlyRetryMs（默认 30000 毫秒）调整，或用 --db 指向其他数据库文件',
+            message: expect.stringMatching(/被写进程占用/),
+          })
+          expect(t).toBeGreaterThan(0)   // 读者确实走了退避（与写者「不退避」分形）
+          asserted = true
+        } catch { /* 锁竞态窗口（CONFLICT 后仍打开），换轮重来 */ }
+      }
+      expect(asserted, '5 轮内未取得「锁生效且读者撞锁」——锁落盘竞态超预期').toBe(true)
     } finally {
-      holder.kill('SIGKILL')
+      holder?.kill('SIGKILL')
     }
   })
 

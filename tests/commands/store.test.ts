@@ -322,4 +322,40 @@ describe('store 命令面与 help', () => {
     expect(await storeCommand(['query', 'SELECT 1'])).toBe(2)
     expect(err).toMatch(/未知子命令/)
   })
+
+  it('thrownToExit 的 usage 分流：kind=usage 的错误走 usageFail 双通道、退出码 2（M1）', async () => {
+    // C1 运行时路径不触发 store 层 usage 错误（upsert 尚无命令入口），直接构造
+    // kind:'usage' 的错误对象注入 thrownToExit —— 用 vi.doMock 替换 openStore 抛出。
+    expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
+    out = ''; err = ''
+    vi.resetModules()
+    vi.doMock('../../src/store/index.js', async (importOriginal) => {
+      const orig = await importOriginal<typeof import('../../src/store/index.js')>()
+      const { createDuckDbStore } = await import('../../src/store/duckdb.js')
+      return {
+        ...orig,
+        openStore: async (cfg: unknown, mode: unknown) => {
+          const s = await createDuckDbStore(cfg as never, mode as never)
+          // store 层 usage 错误形态（duckdb.ts 的 usage() 构造：kind='usage' + hint）
+          const e = new Error('未知表：nope')
+          ;(e as { kind?: string }).kind = 'usage'
+          ;(e as { hint?: string }).hint = '请检查表名'
+          vi.spyOn(s as unknown as { init: () => Promise<void> }, 'init').mockRejectedValue(e)
+          return s
+        },
+      }
+    })
+    const { storeCommand: mockedCommand } = await import('../../src/commands/store.js')
+    try {
+      expect(await mockedCommand(['init', '--db', dbPath()])).toBe(2)
+      // usageFail 双通道：stderr 纯文本 + stdout JSON（code/kind=usage）
+      expect(err).toMatch(/未知表/)
+      const e = JSON.parse(out).error
+      expect(e.code).toBe('usage')
+      expect(e.kind).toBe('usage')
+      expect(e.hint).toBe('请检查表名')
+    } finally {
+      vi.doUnmock('../../src/store/index.js')
+    }
+  })
 })

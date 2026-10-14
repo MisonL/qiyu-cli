@@ -40,7 +40,7 @@ function depError(e: unknown): Error {
   return err
 }
 
-/** usage 错误（退出码 2）：带 kind 供命令层经 mapThrownToExit 归 usage。 */
+/** usage 错误（退出码 2）：带 kind 供命令层经 thrownToExit 归 usageFail 双通道。 */
 function usage(msg: string): Error {
   const e = new Error(msg)
   ;(e as { kind?: string }).kind = 'usage'
@@ -166,12 +166,16 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const setClause = nonKey.map((x) => `"${x}" = excluded."${x}"`).join(', ')
     const pk = t.primaryKey.map((x) => `"${x}"`).join(', ')
     let written = 0
-    // ⚠️ 切批规则（Q 组 Q-高-1 修订：从「batchSize 超限才切」改为「单语句参数恒 ≤65000」
-    // —— batchSize 配大不会提速反而 O(N²) 劣化（实测 1M 参数单语句 43s），硬顶必须无条件生效）。
+    // ⚠️ 切批规则（M2 修，与 spec §5.3 对齐）：**batchSize 是首选切批尺寸**，
+    // 65000 参数硬顶无条件兜底 —— 实际行数 = min(batchSize, floor(65000/cols))。
+    // （Q 组 Q-高-1 的实测仍成立：1M 参数单语句 43s，硬顶必须恒生效、batchSize
+    // 配大也不能越过；但 batchSize 原义是「多值 INSERT 每批行数」（types.ts/§5.3），
+    // 小于硬顶时必须生效，此前实现把它完全忽略是契约偏离。）
     // 65000 是保守值：实测该版本上限 ≥70000，勿据此放大（Q 组 Q-低-1）。
-    const maxRowsPerStmt = Math.max(1, Math.floor(65000 / cols.length))
-    for (let i = 0; i < rows.length; i += maxRowsPerStmt) {
-      const batch = rows.slice(i, i + maxRowsPerStmt)
+    const hardCap = Math.max(1, Math.floor(65000 / cols.length))
+    const rowsPerStmt = Math.max(1, Math.min(cfg.batchSize, hardCap))
+    for (let i = 0; i < rows.length; i += rowsPerStmt) {
+      const batch = rows.slice(i, i + rowsPerStmt)
       const placeholders = batch.map(() => `(${cols.map(() => '?').join(', ')})`).join(', ')
       const params = batch.flatMap((r) => cols.map((k) => r[k] ?? null))
       await store.execSql(

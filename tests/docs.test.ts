@@ -85,23 +85,28 @@ describe('readme.test.ts —— C1 追加断言（防文档说假话）', () => 
 })
 
 describe('锚定断言（钉住 spec §8.3 的具体落点，防只改一半）', () => {
-  it('路线图锚定：四个分点各自出现 C1 改文关键词（I 组 M7：§2.3 两处 / §六.2 / §八.2 / §五.2）', () => {
+  // L3 修：不再按行号切片（文档上方插行即假红），改为「按行内容找锚行、在锚行上断言」。
+  const lineWith = (s: string, re: RegExp): string => s.split('\n').find((l) => re.test(l)) ?? ''
+  it('路线图锚定：四个分点各自出现 C1 改文关键词（I 组 M7：§2.3 两处 / §六.2 / §八.2）', () => {
     const s = read('docs/superpowers/specs/2026-10-09-后续交付路线图-design.md')
-    // 按行号切片断言（行号以 spec §8.3 列的为准；若文档行漂移，实施者先对行号）
-    const lines = s.split('\n')
-    const sliceAround = (n: number, span = 6): string => lines.slice(Math.max(0, n - span), n + span).join('\n')
-    expect(sliceAround(38)).toMatch(/store init/)     // §2.3 第一处
-    expect(sliceAround(40)).toMatch(/store status/)   // §2.3 第二处
-    expect(sliceAround(143)).toMatch(/DuckDB|store/)  // §六.2
-    expect(sliceAround(160)).toMatch(/store status|describe/)  // §八.2
+    // §2.3：「store/ 只有命令级示例…已解决（C1）」行 —— init/status 同行出现
+    const l23 = lineWith(s, /store\/` 只有命令级示例/)
+    expect(l23).toMatch(/store init/)
+    expect(l23).toMatch(/store status/)
+    // §六.2：「C 原计划与 A 并行」行 —— C1 已交付标注 + DuckDB + store 命令
+    const l62 = lineWith(s, /原计划与.*并行.*关键路径|C` 原计划与 A 并行/)
+    expect(l62).toMatch(/C1 已交付/)
+    expect(l62).toMatch(/DuckDB/)
+    // §八.2：「Store 的完整接口签名与 DDL」行 —— store status 可查表清单
+    expect(lineWith(s, /的完整接口签名与 DDL/)).toMatch(/store status/)
   })
-  it('设计稿锚定：§9.5 与 §11.2 两处都含 C1 交付标注（L 组 H3：spec §8.3 第 12 处要求两处都改，只锚 §11.2 会漏改 §9.5）', () => {
+  it('设计稿锚定：§11.2 错误处理表与全文两处 C1 阶段标注都在（L 组 H3；L3 修：按行内容锚定）', () => {
     const s = read('docs/qiyu-cli-design.md')
-    const lines = s.split('\n')
-    // §11.2 错误处理表（锚点 :1759）
-    expect(lines.slice(1759 - 8, 1759 + 8).join('\n')).toMatch(/C1|存储层/)
-    // §9.5 同步引擎一节：全文件内两处 C1 阶段标注（§9.5 锚点行实施者按 §9.5 标题定位，
-    // 此处用「至少两处 C1 标注」的结构性断言兜底，防止只改一半）
+    // §11.2 错误处理表的 store_locked 行：表行锚定 + 行内含 C1 阶段标注
+    const lockedRow = lineWith(s, /\| `store_locked` \|/)
+    expect(lockedRow).toMatch(/C1 阶段/)
+    // §9.5 同步引擎一节：全文件内两处 C1 阶段标注（§11.2 一处 + §9.5 一处），
+    // 结构性断言兜底防止只改一半。
     const marks = s.match(/C1 阶段|C1 交付|C1：已交付/g) ?? []
     expect(marks.length).toBeGreaterThanOrEqual(2)
   })
