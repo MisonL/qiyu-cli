@@ -15,7 +15,7 @@ import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { runTask } from '../../src/sync/engine.js'
 import { RateGate } from '../../src/sync/rate-gate.js'
 import { TICKET_TASKS, taskById as ticketById, ticketBody } from '../../src/sync/tasks/tickets.js'
-import { advanceWatermark, readWatermark } from '../../src/sync/state.js'
+import { advanceWatermark, listGaps, readWatermark } from '../../src/sync/state.js'
 import { __resetBuckets } from '../../src/core/http.js'
 import { tableByName } from '../../src/store/schema.js'
 import type { RunCtx, SyncTask, WindowRef } from '../../src/sync/types.js'
@@ -225,6 +225,27 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
       expect(r.rows).toEqual({ fetched: 1, written: 1 })
       const rows = await store.query('SELECT ticket_id, log_id FROM ticket_logs')
       expect(rows.rows).toEqual([{ ticket_id: '900001', log_id: '11' }])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('ticket.logs 形态漂移：log 载荷非数组且无 data → 显式失败（不静默 complete，fix 中-1 钉死）', async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => okC({ total: 1, tickets: [{ id: 900001 }] }))
+      .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
+        code: 200, message: 'OK', data: null,   // data 键存在但不是数组 → 第三形态
+      }), { status: 200, headers: { 'content-type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(ticketById('ticket.logs')!, ctx(store))
+      expect(r.status, '形态漂移必须可见：引擎记 gap 后 partial，绝不静默 complete').toBe('partial')
+      const gaps = await listGaps(store, 'ticket.logs')
+      expect(gaps.length).toBe(1)
+      expect(gaps[0].reason).toBe('fetch_failed')
+      expect(gaps[0].detail).toMatch(/data 数组|null/)
       await store.close()
     } finally {
       vi.unstubAllGlobals()

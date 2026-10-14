@@ -157,12 +157,20 @@ async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult
   const out: Record<string, unknown>[] = []
   for (const tid of touched) {
     const res = await callPaced('ticket.log', { ticketId: Number(tid) }, ctx)
-    // ticket.log 信封未实测（registry envelope=null）→ 宽松模式载荷；data 数组形态按实测 §10.3
-    const rows = Array.isArray(res.payload)
-      ? res.payload as Record<string, unknown>[]
-      : Array.isArray((res.payload as Record<string, unknown> | null)?.data)
-        ? (res.payload as Record<string, unknown>).data as Record<string, unknown>[]
-        : []
+    // ticket.log 信封未实测（registry envelope=null）→ 宽松模式载荷；data 数组形态按实测 §10.3。
+    // 其余形态视为响应形态漂移，显式失败（与 reports.ts 的 searchPayload 同口径）——
+    // 静默按空处理会把整单日志吞成 complete。
+    let rows: Record<string, unknown>[]
+    if (Array.isArray(res.payload)) {
+      rows = res.payload as Record<string, unknown>[]
+    } else if (Array.isArray((res.payload as Record<string, unknown> | null)?.data)) {
+      rows = (res.payload as Record<string, unknown>).data as Record<string, unknown>[]
+    } else {
+      const shape = res.payload === null || res.payload === undefined
+        ? 'null'
+        : Array.isArray(res.payload) ? 'array' : typeof res.payload
+      throw new Error(`接口 ticket.log 返回的载荷既不是数组也没有 data 数组（实测形态为顶层 data，得到 ${shape}），拒绝落库`)
+    }
     for (const r of rows) {
       const logId = r.id
       if (logId === null || logId === undefined) continue   // 键缺失行：丢弃且不计入 fetched

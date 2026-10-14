@@ -12,7 +12,7 @@
 //      必须跳过**（Review Focus 4），空行跳过
 // 去重契约：**按 session.id，绝不能按导出任务 key**（服务端按（企业,窗口）复用结果，
 // 同参数重复创建返回不同 key 相同数据）——本函数只返回行，去重由 upsert(session_id) 幂等吸收。
-import { unzipSync, strFromU8 } from 'fflate'
+import { strFromU8 } from 'fflate'
 import { call } from '../../core/http.js'
 import { byId } from '../../core/registry/index.js'
 import type { Range } from '../windowing.js'
@@ -59,23 +59,33 @@ export async function unzipPasswordZip(zip: Uint8Array, appKey: string): Promise
 
 interface ZipEntry { comp: Uint8Array; crcOrSize: number }
 
-/** 定位第一个 deflate 方法的本地文件头条目（导出 zip 内是 session.txt/message.txt 两个 JSONL）。 */
+/** 定位名为 session.txt 的条目（导出 zip 内是 session.txt/message.txt 两个 JSONL——
+ * 只吃会话，message.txt 即使排在前面也不取；找不到显式抛错）。 */
 function findEntry(zip: Uint8Array): ZipEntry {
   const u16 = (o: number): number => zip[o] | (zip[o + 1] << 8)
   const u32 = (o: number): number => (zip[o] | (zip[o + 1] << 8) | (zip[o + 2] << 16) | (zip[o + 3] << 24)) >>> 0
   if (u32(0) !== 0x04034b50) throw new Error('不是 zip 容器（本地文件头签名不符）')
-  const flags = u16(6)
-  const method = u16(8)
-  const csize = u32(18)
-  const crcStored = u32(14)
-  const nlen = u16(26)
-  const elen = u16(28)
-  if (!(flags & 0x1)) throw new Error('导出 zip 未加密（与实测形态不符，注册表/文档假设失效）')
-  if (method !== 8) throw new Error(`不支持的压缩方法：${method}（预期 deflate=8）`)
-  const dataStart = 30 + nlen + elen
-  // flags bit3（数据描述符）时本地头 crc/csize 置 0，真实 crc 在 central directory ——
-  // 校验字节回退用「无 crc 可对」的 size 校验形态（0），解密侧按其语义处理。
-  return { comp: zip.subarray(dataStart, dataStart + csize), crcOrSize: (flags & 0x8) ? 0 : crcStored }
+  // 逐条目扫本地文件头（30 字节定长 + 名 + 扩展），按名字匹配 session.txt
+  let o = 0
+  while (o + 30 <= zip.length && u32(o) === 0x04034b50) {
+    const flags = u16(o + 6)
+    const method = u16(o + 8)
+    const csize = u32(o + 18)
+    const crcStored = u32(o + 14)
+    const nlen = u16(o + 26)
+    const elen = u16(o + 28)
+    const name = strFromU8(zip.subarray(o + 30, o + 30 + nlen))
+    if (name === 'session.txt') {
+      if (!(flags & 0x1)) throw new Error('导出 zip 未加密（与实测形态不符，注册表/文档假设失效）')
+      if (method !== 8) throw new Error(`不支持的压缩方法：${method}（预期 deflate=8）`)
+      const dataStart = o + 30 + nlen + elen
+      // flags bit3（数据描述符）时本地头 crc/csize 置 0，真实 crc 在 central directory ——
+      // 校验字节回退用「无 crc 可对」的 size 校验形态（0），解密侧按其语义处理。
+      return { comp: zip.subarray(dataStart, dataStart + csize), crcOrSize: (flags & 0x8) ? 0 : crcStored }
+    }
+    o = o + 30 + nlen + elen + csize
+  }
+  throw new Error('导出 zip 内没有 session.txt 条目（响应形态漂移？）')
 }
 
 /** ZipCrypto 解密：密钥由密码初始化，逐字节流式更新；校验字节匹配则剥掉 12 字节头。 */

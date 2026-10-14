@@ -39,8 +39,10 @@ export function deriveSessionType(staffId: unknown): string | null {
   return 'human'
 }
 
-/** 按列集投影：行补 session_id/session_type/categoryDetail/PII 列；缺 id 行丢弃（不计入 fetched）。 */
-function sessionRow(src: Record<string, unknown>, nowIso: string): Record<string, unknown> | null {
+/** 按列集投影：行补 session_id/session_type/categoryDetail/PII 列；缺 id 行丢弃（不计入 fetched）。
+ * ⚠️ 本函数是纯投影（红线 1：同输入同输出）—— synchronized_at 从输入行透传
+ *（fetch 在进 enrich 前统一盖章，enrich 直测两调用相等）；输入无戳则为 null（列可空）。 */
+function sessionRow(src: Record<string, unknown>): Record<string, unknown> | null {
   const id = src.id ?? src.session_id
   if (id === null || id === undefined) return null   // 键缺失行：丢弃且不计入 fetched（与 apiCount 口径一致）
   return {
@@ -58,7 +60,7 @@ function sessionRow(src: Record<string, unknown>, nowIso: string): Record<string
     fromIp: strOrNull(src.fromIp),
     userIpCity: strOrNull(src.userIpCity),
     userCrmInfo: strOrNull(src.userCrmInfo),
-    synchronized_at: nowIso,
+    synchronized_at: (src.synchronized_at as string | null | undefined) ?? null,
   }
 }
 
@@ -84,17 +86,20 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
     pollIntervalMs: sctx.pollIntervalMs,
     maxPolls: sctx.maxPolls,
   })
-  // 原始行直出（session.id 键、未投影）——列投影/派生经任务 enrich（红线 1：确定性派生）
-  return { rows: sessions, apiCount: sessions.length }
+  // synchronized_at 在 fetch 侧按窗统一盖章（单值、确定性于本窗）——enrich 是纯投影
+  //（红线 1：同输入行永远同输出），只透传该戳；原始行直出（session.id 键、未投影）。
+  const stamped = sessions.map((r) => ({ ...r, synchronized_at: nowIso }))
+  return { rows: stamped, apiCount: sessions.length }
 }
 
 /**
  * enrich：投影 + 确定性派生（红线 1 推论：同输入行永远同输出）。
  * 派生 session_type（staffId 数字判别）+ categoryDetail 归一化；缺 id 行返回 null
- *（丢弃且不计入 fetched——与 apiCount 口径一致）。
+ *（丢弃且不计入 fetched——与 apiCount 口径一致）。synchronized_at 从输入行透传
+ *（fetch 已统一盖章），无戳直测时为 null —— 本函数不含任何时钟读取。
  */
 function enrichSession(src: Record<string, unknown>): Record<string, unknown> | null {
-  return sessionRow(src, new Date().toISOString())
+  return sessionRow(src)
 }
 
 export const SESSIONS_TASKS: SyncTask[] = [

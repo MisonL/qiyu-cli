@@ -68,11 +68,11 @@ function crc32(buf: Uint8Array): number {
   return (c ^ 0xFFFFFFFF) >>> 0
 }
 
-/** 单文件 ZipCrypto 加密 zip（deflate 方法），密码即密钥种子 —— 测试合成专用。 */
-function makeEncryptedZip(name: string, content: string, password: string): Uint8Array {
+/** 单条目的 ZipCrypto 加密数据（加密头 12 字节 + deflate 密文），密码即密钥种子。 */
+function encryptEntry(content: string, password: string): { enc: Uint8Array; crc: number; rawLen: number } {
   const raw = strToU8(content)
   const comp = deflateSync(raw, { level: 6 })
-  // ZipCrypto 密钥初始化与更新（PKWARE APPNOTE）
+  // ZipCrypto 密钥初始化与更新（PKWARE APPNOTE）—— 密钥按条目重置（标准行为）
   const keys = [0x12345678, 0x23456789, 0x34567890]
   const upd = (b: number): void => {
     keys[0] = ((keys[0] >>> 8) ^ CRC_TABLE[(keys[0] ^ b) & 0xFF]) >>> 0
@@ -100,49 +100,69 @@ function makeEncryptedZip(name: string, content: string, password: string): Uint
     enc[hdr.length + i] = comp[i] ^ stream(keys)
     upd(comp[i])
   }
-  // —— 拼本地文件头 + central directory + EOCD（无数据描述符：crc 直接写本地头）——
-  const nameBytes = strToU8(name)
-  const le = (v: number, bytes: number): Uint8Array => {
-    const a = new Uint8Array(bytes)
-    for (let i = 0; i < bytes; i++) a[i] = (v >>> (8 * i)) & 0xFF
-    return a
+  return { enc, crc, rawLen: raw.length }
+}
+
+const le = (v: number, bytes: number): Uint8Array => {
+  const a = new Uint8Array(bytes)
+  for (let i = 0; i < bytes; i++) a[i] = (v >>> (8 * i)) & 0xFF
+  return a
+}
+
+/** 多文件 ZipCrypto 加密 zip（deflate 方法，无数据描述符）—— 测试合成专用。
+ * entries 顺序即容器内条目顺序（message.txt 在前的用例靠它构造）。 */
+function makeEncryptedZip(entries: Array<{ name: string; content: string }>, password: string): Uint8Array {
+  const bodies: Uint8Array[] = []
+  const cds: Uint8Array[] = []
+  let offset = 0
+  for (const { name, content } of entries) {
+    const { enc, crc, rawLen } = encryptEntry(content, password)
+    const nameBytes = strToU8(name)
+    const lfh = new Uint8Array(30 + nameBytes.length)
+    lfh.set([0x50, 0x4B, 0x03, 0x04])
+    lfh.set(le(20, 2), 4)        // version
+    lfh.set(le(0x0001, 2), 6)    // flags: bit0 加密
+    lfh.set(le(8, 2), 8)         // method deflate
+    lfh.set(le(0, 4), 10)        // time/date
+    lfh.set(le(crc, 4), 14)      // crc（无数据描述符，直接写）
+    lfh.set(le(enc.length, 4), 18)
+    lfh.set(le(rawLen, 4), 22)
+    lfh.set(le(nameBytes.length, 2), 26)
+    lfh.set(le(0, 2), 28)
+    lfh.set(nameBytes, 30)
+    const body = new Uint8Array(lfh.length + enc.length)
+    body.set(lfh); body.set(enc, lfh.length)
+    const cd = new Uint8Array(46 + nameBytes.length)
+    cd.set([0x50, 0x4B, 0x01, 0x02])
+    cd.set(le(20, 2), 4); cd.set(le(20, 2), 6)
+    cd.set(le(0x0001, 2), 8)
+    cd.set(le(8, 2), 10)
+    cd.set(le(0, 4), 12)
+    cd.set(le(crc, 4), 16)
+    cd.set(le(enc.length, 4), 20)
+    cd.set(le(rawLen, 4), 24)
+    cd.set(le(nameBytes.length, 2), 28)
+    cd.set(le(0, 2), 30); cd.set(le(0, 2), 32); cd.set(le(0, 2), 34)
+    cd.set(le(0, 2), 36); cd.set(le(0, 4), 38)
+    cd.set(le(offset, 4), 42)   // local header offset
+    cd.set(nameBytes, 46)
+    bodies.push(body); cds.push(cd)
+    offset += body.length
   }
-  const lfh = new Uint8Array(30 + nameBytes.length)
-  lfh.set([0x50, 0x4B, 0x03, 0x04])
-  lfh.set(le(20, 2), 4)        // version
-  lfh.set(le(0x0001, 2), 6)    // flags: bit0 加密
-  lfh.set(le(8, 2), 8)         // method deflate
-  lfh.set(le(0, 4), 10)        // time/date
-  lfh.set(le(crc, 4), 14)      // crc（无数据描述符，直接写）
-  lfh.set(le(enc.length, 4), 18)
-  lfh.set(le(raw.length, 4), 22)
-  lfh.set(le(nameBytes.length, 2), 26)
-  lfh.set(le(0, 2), 28)
-  lfh.set(nameBytes, 30)
-  const body = new Uint8Array(lfh.length + enc.length)
-  body.set(lfh); body.set(enc, lfh.length)
-  const cd = new Uint8Array(46 + nameBytes.length)
-  cd.set([0x50, 0x4B, 0x01, 0x02])
-  cd.set(le(20, 2), 4); cd.set(le(20, 2), 6)
-  cd.set(le(0x0001, 2), 8)
-  cd.set(le(8, 2), 10)
-  cd.set(le(0, 4), 12)
-  cd.set(le(crc, 4), 16)
-  cd.set(le(enc.length, 4), 20)
-  cd.set(le(raw.length, 4), 24)
-  cd.set(le(nameBytes.length, 2), 28)
-  cd.set(le(0, 2), 30); cd.set(le(0, 2), 32); cd.set(le(0, 2), 34)
-  cd.set(le(0, 2), 36); cd.set(le(0, 4), 38)
-  cd.set(le(0, 4), 42)   // local header offset = 0
-  cd.set(nameBytes, 46)
+  const body = new Uint8Array(bodies.reduce((n, b) => n + b.length, 0))
+  let o = 0
+  for (const b of bodies) { body.set(b, o); o += b.length }
+  const cdAll = new Uint8Array(cds.reduce((n, c) => n + c.length, 0))
+  o = 0
+  for (const c of cds) { cdAll.set(c, o); o += c.length }
   const eocd = new Uint8Array(22)
   eocd.set([0x50, 0x4B, 0x05, 0x06])
-  eocd.set(le(0, 2), 8)          // 盘号
-  eocd.set(le(1, 2), 10)         // central directory 条目数
-  eocd.set(le(cd.length, 4), 12) // central directory 大小
-  eocd.set(le(body.length, 4), 16) // central directory 偏移 = local body 之后
-  const out = new Uint8Array(body.length + cd.length + eocd.length)
-  out.set(body); out.set(cd, body.length); out.set(eocd, body.length + cd.length)
+  eocd.set(le(0, 2), 8)            // 盘号
+  eocd.set(le(entries.length, 2), 10)   // central directory 条目数
+  eocd.set(le(cdAll.length, 4), 12)     // central directory 大小
+  eocd.set(le(body.length, 4), 16)      // central directory 偏移 = local body 之后
+  const out = new Uint8Array(body.length + cdAll.length + eocd.length)
+  out.set(body); out.set(cdAll, body.length); out.set(eocd, body.length + cdAll.length)
   return out
 }
 
@@ -179,7 +199,7 @@ describe('parseJsonl（Review Focus 4 钉死）', () => {
 
 describe('zip 解压（密码 = appKey 前 12 字符）', () => {
   it('合成加密 zip → 解出 session.txt → parse（12 字符密码往返）', async () => {
-    const zip = makeEncryptedZip('session.txt', `${JSON.stringify(SESSION_ROW)}\n${TAIL_LINE}\n`, APP_KEY.slice(0, 12))
+    const zip = makeEncryptedZip([{ name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n${TAIL_LINE}\n` }], APP_KEY.slice(0, 12))
     const text = await unzipPasswordZip(zip, APP_KEY)
     const r = parseJsonl(text)
     expect(r.rows).toEqual([SESSION_ROW])
@@ -187,8 +207,23 @@ describe('zip 解压（密码 = appKey 前 12 字符）', () => {
   })
 
   it('错密码 → 显式失败（不静默给乱码）', async () => {
-    const zip = makeEncryptedZip('session.txt', `${JSON.stringify(SESSION_ROW)}\n`, APP_KEY.slice(0, 12))
+    const zip = makeEncryptedZip([{ name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n` }], APP_KEY.slice(0, 12))
     await expect(unzipPasswordZip(zip, 'wrong-password')).rejects.toThrow()
+  })
+
+  it('两条件目（message.txt 在前）→ 按名匹配只解出 session.txt（fix 中-3 钉死）', async () => {
+    const zip = makeEncryptedZip([
+      { name: 'message.txt', content: 'not the file you want' },
+      { name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n` },
+    ], APP_KEY.slice(0, 12))
+    const text = await unzipPasswordZip(zip, APP_KEY)
+    const r = parseJsonl(text)
+    expect(r.rows).toEqual([SESSION_ROW])
+  })
+
+  it('zip 内没有 session.txt → 显式抛错（不静默取第一个条目）', async () => {
+    const zip = makeEncryptedZip([{ name: 'message.txt', content: 'x' }], APP_KEY.slice(0, 12))
+    await expect(unzipPasswordZip(zip, APP_KEY)).rejects.toThrow(/session.txt/)
   })
 })
 
@@ -199,8 +234,7 @@ describe('runExportPipeline —— 四步流水线 mock', () => {
   }
 
   it('create 返回 key → check 先 14403 后成功链接 → fetchZip 返回合成 zip → 行落库（session.id 主键 upsert）', async () => {
-    const zip = makeEncryptedZip('session.txt',
-      `${JSON.stringify(SESSION_ROW)}\n${TAIL_LINE}\n`, APP_KEY.slice(0, 12))
+    const zip = makeEncryptedZip([{ name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n${TAIL_LINE}\n` }], APP_KEY.slice(0, 12))
     const fetchMock = vi.fn()
       // 1. create：{code:200, message:"<任务key>"}（形状 A，key 在 message）
       .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
@@ -306,7 +340,7 @@ describe('schema v7 迁移 —— sessions 表', () => {
 describe('sessions 任务全链路（重叠去重按 session.id）', () => {
   function mkZip(rows: unknown[]): Uint8Array {
     const lines = rows.map((r) => JSON.stringify(r))
-    return makeEncryptedZip('session.txt', `${lines.join('\n')}\n${TAIL_LINE}\n`, APP_KEY.slice(0, 12))
+    return makeEncryptedZip([{ name: 'session.txt', content: `${lines.join('\n')}\n${TAIL_LINE}\n` }], APP_KEY.slice(0, 12))
   }
   function mocksFor(_zip: Uint8Array): ReturnType<typeof vi.fn> {
     // 按调用序循环供给 create → check（多窗口流水线各自走一遍同一序列；zip 由 fetchZip 注入）
