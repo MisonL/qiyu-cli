@@ -293,6 +293,33 @@ describe('duckdb —— init 与关闭', () => {
     await ro.close()
   })
 
+  it('close 后跨进程可立即重开（N1 钉死：close 必须真释放锁）', async () => {
+    const s = await fresh()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    await s.close()
+    // 全新 node 子进程以 rw 打开同一路径：若 close 未释放锁（只关 instance 不关
+    // connection），子进程必报 Conflicting lock —— spawn 数组形态不经 shell（R3）。
+    const { spawn } = await import('node:child_process')
+    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
+    const child = spawn(process.execPath, ['-e', `
+      import(${JSON.stringify(pkgUrl.href)}).then(async ({ DuckDBInstance }) => {
+        const inst = await DuckDBInstance.create(${JSON.stringify(cfg.path)})
+        const conn = await inst.connect()
+        await conn.runAndReadAll('SELECT COUNT(*) FROM tags')
+        console.log('reopened')
+        conn.closeSync()
+        inst.closeSync()
+        process.exit(0)
+      }).catch((e) => { console.error(e.message); process.exit(1) })`], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout?.on('data', (d) => { out += String(d) })
+    child.stderr?.on('data', (d) => { out += String(d) })
+    const code: number = await new Promise((resolve) => { child.on('exit', (c) => resolve(c ?? -1)) })
+    expect(code).toBe(0)
+    expect(out).toContain('reopened')
+    expect(out).not.toContain('Conflicting lock')
+  })
+
   it('close 后调用 → usage 错误（不裸崩）', async () => {
     const s = await fresh()
     await s.close()

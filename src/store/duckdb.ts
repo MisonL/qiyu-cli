@@ -125,9 +125,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
 
   // ⚠️ 所有语句执行收敛到这一个方法 —— 测试 spy 的落点（spec §5.3）。
   // ⚠️ **挂载与调用契约（v3.1 定死，消除二选一）**：
-  // ① store 的所有方法体**必须经 `store.execSql(...)` 调用**（属性查找发生在调用时，
-  //    vi.spyOn 替换后即命中 spy）——闭包直调 execSql 会绕过 spy，「1000 行批量 1 条语句」
-  //    断言形同虚设（v1 计划实测缺陷，D/E/F 三组独立发现）；
+  // ① store 的方法体**双轨调用**：数据语句（SELECT/INSERT 等）必须经 `store.execSql(...)`
+  //    （属性查找发生在调用时，vi.spyOn 替换后即命中 spy）；事务控制语句
+  //    BEGIN/COMMIT/ROLLBACK 闭包直调 execSql（否则 spy 数到事务壳、断言
+  //    「1000 行 1 条语句」必红——T5 实测裁定）——闭包直调数据语句会绕过 spy，
+  //    「1000 行批量 1 条语句」断言形同虚设（v1 计划实测缺陷，D/E/F 三组独立发现）；
   // ② `Object.defineProperty` 必须 `writable: true, configurable: true` —— 默认
   //    configurable:false 会让 vi.spyOn 重定义属性时直接抛 TypeError；
   // ③ 挂为**不可枚举**（不污染 JSON 输出与接口形状）。
@@ -287,11 +289,15 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       closed = true
       // ⚠️ 真实 API 是 **closeSync()**（同步方法）——`close?.()` 会静默跳过、连接泄漏
       //（第四轮实测：instance 原型只有 connect/closeSync）。包 try 防次生错误掩盖原结果。
+      // ⚠️ N1 实测：**connection 与 instance 都要 closeSync** —— 只关 instance 不关 conn，
+      // 锁随进程存活、永不超时释放；先关 conn 再关 inst。
+      try { (conn as { closeSync?: () => void }).closeSync?.() } catch { /* 清理期错误不掩盖 */ }
       try { (inst as { closeSync?: () => void }).closeSync?.() } catch { /* 清理期错误不掩盖 */ }
     },
   } as unknown as Store & { execSql: typeof execSql }
   // ⚠️ 挂载契约见上方 execSql 注释：不可枚举 + writable + configurable（缺 configurable
-  // 会让 vi.spyOn 重定义时抛 TypeError）；方法体一律 store.execSql(...)（属性调用时查找）。
+  // 会让 vi.spyOn 重定义时抛 TypeError）；数据语句一律 store.execSql(...)（属性调用时
+  // 查找），事务控制语句闭包直调（双轨，见上方契约①）。
   Object.defineProperty(store, 'execSql', { value: execSql, enumerable: false, writable: true, configurable: true })
   return store
 }
