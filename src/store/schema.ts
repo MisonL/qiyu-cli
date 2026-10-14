@@ -183,6 +183,27 @@ export const TABLES: TableDef[] = [
       col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['ticket_id', 'log_id'],
   },
+  // —— D：会话表批次（迁移 v7 建；设计稿 §7.5 实测字段全集）——
+  // session.txt 实测 90 个顶层键（71 恒存在 + 19 条件出现，private/raw 验证样本已做键普查、
+  // 不入仓库）——与报表批次同一取舍：业务字段整体收敛进 payload JSON 字符串列，固定键列 +
+  // 派生列保证 JOIN 与分析。主键 session_id（上游业务键，红线 1）；
+  // session_type 是本地确定性派生列（enrich 按 staffId 数字判别），不进主键（红线 1 推论）。
+  // ⚠️ PII 列 sensitive: true 按设计稿 §6.5 实测清单（不是按名称模式泛化）：
+  // userPhone 4640/4687、userName 4687/4687、userCrmInfo 4520/4687（JSON 字符串 blob，
+  // 整体视为敏感）、fromIp/userIpCity 4642/4687、userAddress/userEmail 稀疏。
+  // categoryDetail 归一化（" / " → "/"）由 enrich 在落库前完成（列存归一化后的值）。
+  {
+    name: 'sessions',
+    columns: [col('session_id', 'VARCHAR', false), col('payload', 'VARCHAR'),
+      col('staffId', 'VARCHAR'), col('startTime', 'VARCHAR'), col('endTime', 'VARCHAR'),
+      col('session_type', 'VARCHAR'), col('categoryDetail', 'VARCHAR'),
+      col('userPhone', 'VARCHAR', true, true), col('userName', 'VARCHAR', true, true),
+      col('userEmail', 'VARCHAR', true, true), col('userAddress', 'VARCHAR', true, true),
+      col('fromIp', 'VARCHAR', true, true), col('userIpCity', 'VARCHAR', true, true),
+      col('userCrmInfo', 'VARCHAR', true, true),
+      col('synchronized_at', 'VARCHAR')],
+    primaryKey: ['session_id'],
+  },
 ]
 
 export function tableByName(name: string): TableDef | undefined {
@@ -256,6 +277,13 @@ export const MIGRATIONS: Migration[] = [
       for (const name of ['tickets', 'ticket_logs']) {
         await exec(ddlFor(tableByName(name)!))
       }
+    },
+  },
+  // D-T10 迁移：sessions 表（键列 + payload 收敛 + session_type 派生列 + PII 敏感列）。
+  {
+    version: 7,
+    up: async (exec) => {
+      await exec(ddlFor(tableByName('sessions')!))
     },
   },
 ]
