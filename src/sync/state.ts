@@ -49,26 +49,49 @@ function stateRow(dataset: string, watermark: string | null, rangeStatus: RangeS
  *（WriteTx 无 query——防线分层，读改写的「读」在事务外完成），markPending
  * 保留其 watermark —— 清成 null 会让中断后重跑从 0 全量拉（API 成本巨大）。
  * existing 缺省/null 或全空（无既有行）时水位为 null（首跑）。
+ *
+ * `lock`（E 中-1 引擎侧）：本轮写者盖章 —— 与 markPending 同一行同一事务写入，
+ * 两者都写 sync_state 同一主键，分开写会互相清掉对方的列（先写锁再置 pending 会
+ * 清锁，先置 pending 再写锁会把 pending 覆回旧状态）。
  */
 export async function markPending(tx: WriteTx, dataset: string,
-  existing?: WatermarkState | null): Promise<void> {
+  existing?: WatermarkState | null, lock?: { by: string; at: string }): Promise<void> {
+  const lockedBy = lock?.by ?? null
+  const lockedAt = lock?.at ?? null
   const hasRow = existing !== null && existing !== undefined
     && !(existing.watermark === null && existing.rangeStatus === null && existing.lastSyncedAt === null)
   if (!hasRow) {
-    await tx.upsert('sync_state', [stateRow(dataset, null, 'pending', null, null, null, null)])
+    await tx.upsert('sync_state', [stateRow(dataset, null, 'pending', null, lockedBy, lockedAt, null)])
     return
   }
-  await tx.upsert('sync_state', [stateRow(dataset, existing.watermark, 'pending', null, null, null, existing.lastSyncedAt)])
+  await tx.upsert('sync_state', [stateRow(dataset, existing.watermark, 'pending', null,
+    lockedBy, lockedAt, existing.lastSyncedAt)])
 }
 
 /**
  * 推进水位：写 watermark、range_status=complete 与同步时间。
  * @param range 预留参数，当前不落库；水位值由调用方 stringify 后经 watermark 传入。
+ * lock（E 中-1）：本轮写者盖章原样保留 —— 水位行与锁列同在 sync_state 同一主键行上，
+ * 引擎在 markPending 盖的章不能在推进水位时被抹掉（引擎把同一个 lock 对象传两处）。
  */
 export async function advanceWatermark(tx: WriteTx, dataset: string, watermark: string,
-  range: { start: string | number; end: string | number }, syncedAt: string): Promise<void> {
+  range: { start: string | number; end: string | number }, syncedAt: string,
+  lock?: { by: string; at: string }): Promise<void> {
   void range
-  await tx.upsert('sync_state', [stateRow(dataset, watermark, 'complete', null, null, null, syncedAt)])
+  await tx.upsert('sync_state', [stateRow(dataset, watermark, 'complete', null,
+    lock?.by ?? null, lock?.at ?? null, syncedAt)])
+}
+
+/**
+ * 清空该 dataset 的写者锁（E 中-1 引擎侧）。`existing` 由调用方在事务外读出：
+ * **锁列之外的列按 existing 回写** —— 清章绝不顺带丢掉水位或区间状态
+ *（sync_state 是单行全列 upsert，少写一列就等于把那一列清成 null）。
+ */
+export async function clearLock(tx: WriteTx, dataset: string,
+  existing: WatermarkState | null): Promise<void> {
+  await tx.upsert('sync_state', [stateRow(dataset,
+    existing?.watermark ?? null, existing?.rangeStatus ?? null, null,
+    null, null, existing?.lastSyncedAt ?? null)])
 }
 
 /** 记录/覆盖一条缺口（同 dataset+range_start 靠主键幂等覆盖）。 */

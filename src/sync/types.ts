@@ -24,7 +24,17 @@ export type { Range }
 
 /** 写策略（spec §4.2）：报表按范围删旧插新；维度/会话/知识库按主键幂等 upsert。 */
 export type WriteStrategy =
-  | { kind: 'deleteRangeInsert'; rangeColumns: string[] }
+  | {
+    kind: 'deleteRangeInsert'
+    rangeColumns: string[]
+    /**
+     * 范围列的对齐口径：'shanghaiDay' = 删除边界按上海自然日零点对齐。
+     * 必须与行内日期列（stat_date/work_date）的写法同源——若行按天对齐而删除按毫秒
+     * 对齐，`--full`（start=0）与增量（start=水位+1）的删除范围互不覆盖，
+     * 同一个业务日会留下两行（A 中-2 的键分裂）。
+     */
+    rangeAlign?: 'shanghaiDay'
+  }
   | { kind: 'upsertRows' }
 
 /** fetch 结果：rows 是未 enrich 的原始行；apiCount 是 API 侧声称的行数（配对核对基准）。 */
@@ -72,9 +82,33 @@ export interface SyncTask {
   overlapDays?: number
   /** 红线 1：只能在上游业务键。 */
   primaryKey: string[]
+  /**
+   * 限频闸门的键：该任务**主要**调用的注册表 endpoint id（与 fetch 实际路径同源）。
+   * 同路径的多个任务必须声明同一值（`tickets.search` / `ticket.logs` → `ticket.search`），
+   * 否则冷却各记一份、同路径交替调用照样超发（B 中-6）。缺省回退任务 id。
+   */
+  endpoint?: string
   fetch: (w: WindowRef, ctx: FetchCtx) => Promise<FetchResult>
   write: WriteStrategy
   enrich?: EnrichFn
+  /**
+   * 窗口末端上限（声明式，只给少数接口）：'shanghaiYesterday' = 窗口 end 不得晚于
+   * 上海「昨天 00:00」。实测 `staffAttendance` / `statistic.performance` 的 `endTime`
+   * 晚于今天 0:00 直接报 `14501 endTime is invalid`，且今天 0:00 这条边界不稳定
+   *（同一取值时而 200 时而 14501）→ 留整日余量：当天数据不做，次日自动补上。
+   * 上限同时作用于窗口末端与水位推进（end 与 deletion 同源），不会留下「水位越过了
+   * 但数据没拉」的空洞。
+   */
+  windowEndClamp?: 'shanghaiYesterday'
+  /**
+   * 窗口起点的下界（声明式，只给少数接口）：`now − N 天`。
+   * 实测 `ticket.search` 的 `opStart` 被服务端**静默钳到「当前时刻前约 31 天」**——
+   * 而引擎在「--full / 仅 --until / 首跑水位为空」时合成的起点是 0（哨兵，不是真实日期），
+   * 发出去只会拿到一段被服务端静默改写过的窗口（客户端以为「从最早开始」，实际是
+   * 「服务端说了算」）。声明本字段后，引擎把**哨兵起点（≤0）**抬到下界，抬升结果
+   * 如实回显在 resolved_range 里；显式**正数**起点（--since/--until 时刻）原样照发。
+   */
+  windowStartFloorDays?: number
   /** 报表按天轮转标记（spec §5.2，Task 7 消费；T5 落类型位）。 */
   reportDayRotation?: boolean
 }
@@ -91,10 +125,21 @@ export interface GapInfo {
 export interface RunCtx {
   store: Store
   credentials: Credentials
-  /** 持久化限频闸门（endpointId 取任务 id）。 */
+  /**
+   * 持久化限频闸门。**键是 endpoint id**（不是 task id —— B 中-6 的修复口径）：
+   * 闸门按路径拦调用、`RATE_LIMITS` 按路径登记，而任务与接口是多对一
+   *（`tickets.search` / `ticket.logs` 同走 `ticket.search` 路径）。引擎取任务的
+   * `endpoint` 声明，缺省回退任务 id（未声明 endpoint 的测试假任务仍可用）。
+   */
   gate: RateGate
   /** 注入时钟（毫秒），D 层确定性测试的钉子。 */
   clock: () => number
+  /**
+   * 引擎侧时钟（毫秒）。`clock` 是**任务层**的盖章时钟（synchronized_at / gap 记录），
+   * 在命令层注入固定值让输出可断言；本字段是**引擎自己**的「现在」——窗口上界、
+   * 昨日零点钳制、锁盖章都读它。缺省 = clock（未注入时两者同源，行为不变）。
+   */
+  now?: () => number
   /** 进度回调（人读 stderr 的落点，Task 13 接线）。 */
   onProgress?: (line: string) => void
   /** 显式范围覆盖（--full/--since/--until 的合成落点，Task 13 接线）；缺省从水位续跑到 clock 当前。 */
