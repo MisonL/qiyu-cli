@@ -2,7 +2,7 @@
 // D-T3：水位与缺口的状态层 —— 红线 3 的落点。
 // 写函数只接受 WriteTx（由引擎放进同一 transaction 闭包，同事务原子提交）；
 // 读函数只接受 Store。SQL 全部为代码内常量（同 query 红线）——
-// 本文件的常量 SELECT 调用点共 3 处，不在 duckdb.ts 的 9 处基线计数内。
+// 本文件的常量 SELECT 调用点共 4 处，不在 duckdb.ts 的 9 处基线计数内。
 import type { Store, WriteTx } from '../store/types.js'
 
 export type RangeStatus = 'pending' | 'complete' | null
@@ -87,7 +87,7 @@ export async function clearGap(tx: WriteTx, dataset: string, rangeStart: string)
 
 /** 列出缺口；传 dataset 则只列该 dataset，按 dataset+range_start 排序。 */
 export async function listGaps(store: Store, dataset?: string): Promise<GapRow[]> {
-  // 常量 SQL 调用点 2-3/3
+  // 常量 SQL 调用点 2-3/4
   const sql = dataset === undefined
     ? 'SELECT dataset, range_start, range_end, reason, recorded_at, detail FROM sync_gaps ORDER BY dataset, range_start'
     : 'SELECT dataset, range_start, range_end, reason, recorded_at, detail FROM sync_gaps WHERE dataset = ? ORDER BY dataset, range_start'
@@ -100,4 +100,33 @@ export async function listGaps(store: Store, dataset?: string): Promise<GapRow[]
     recordedAt: row.recorded_at as string,
     detail: (row.detail as string | null) ?? null,
   }))
+}
+
+/** sync_state 全量行（含锁列）：sync status / verify / install 前置探测的批量读视图。 */
+export interface StateRow extends WatermarkState {
+  dataset: string
+  lockedBy: string | null
+  lockedAt: string | null
+}
+
+/**
+ * 读全部 sync_state 行，按 dataset 键控（含 `__ratelimit__:` 冷却行——调用方按前缀
+ * 自行排除）。status/verify/install 一次查询取代 N 次 readWatermark（21 任务）。
+ */
+export async function listWatermarks(store: Store): Promise<Map<string, StateRow>> {
+  // 常量 SQL 调用点 4/4
+  const r = await store.query(
+    'SELECT dataset, watermark, range_status, last_synced_at, locked_by, locked_at FROM sync_state')
+  const out = new Map<string, StateRow>()
+  for (const row of r.rows) {
+    out.set(row.dataset as string, {
+      dataset: row.dataset as string,
+      watermark: (row.watermark as string | null) ?? null,
+      rangeStatus: (row.range_status as RangeStatus) ?? null,
+      lastSyncedAt: (row.last_synced_at as string | null) ?? null,
+      lockedBy: (row.locked_by as string | null) ?? null,
+      lockedAt: (row.locked_at as string | null) ?? null,
+    })
+  }
+  return out
 }

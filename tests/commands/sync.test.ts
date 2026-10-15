@@ -1,10 +1,12 @@
 // tests/commands/sync.test.ts —— D-T12：sync tasks 子命令形态（骨架沿 store.ts）。
 // D-T13 追加：sync run 子命令 —— 区间参数/输出契约/进度/退出码/store 未初始化。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import { syncCommand } from '../../src/commands/sync.js'
+import { __setPlatform, __setRun, __resetScheduleDeps } from '../../src/schedule/install.js'
+import { advanceWatermark, markPending, recordGap } from '../../src/sync/state.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { __resetBuckets } from '../../src/core/http.js'
 import { __setSleep as setReportSleep } from '../../src/sync/tasks/reports.js'
@@ -30,8 +32,12 @@ beforeEach(() => {
   __resetBuckets()
   setReportSleep(async () => { __resetBuckets() })
   setKnowledgeSleep(async () => { __resetBuckets() })
+  // T14：调度命令的平台与外部命令注入——默认 darwin + 不触真系统的假 runner
+  __setPlatform(() => 'darwin')
+  __setRun(runMock)
+  runMock.mockClear()
 })
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }) })
+afterEach(() => { __resetScheduleDeps(); vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }) })
 const data = (): Record<string, unknown> => JSON.parse(out).data
 const dbPath = (): string => join(dir, 'q.db')
 
@@ -530,5 +536,334 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+})
+
+// —— D-T14：sync status / verify / install / uninstall ——
+
+/** install/uninstall 测试共用的注入 runner 句柄（beforeEach 里 __setRun 装入的就是它）。 */
+const runMock = vi.fn()
+
+describe('sync status', () => {
+  it('输出每任务 {task,watermark,range_status,last_synced_at,gaps_count,locked}（真库预置 sync_state/gaps）', async () => {
+    const s = await fresh()
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', '2026-10-14T00:00:00.000Z', { start: 0, end: 1 }, '2026-10-14T10:00:00.000Z')
+      await markPending(tx, 'reports.overview')
+      await recordGap(tx, 'reports.overview', '100', '200', 'fetch_failed', '网络抖动', { now: () => 0 })
+    })
+    await s.close()
+    expect(await syncCommand(['status', '--db', dbPath()])).toBe(0)
+    const tasks = data().tasks as Array<Record<string, unknown>>
+    expect(tasks.length).toBe(21)   // 缺省全部任务
+    const staff = tasks.find((t) => t.task === 'dim.staff')!
+    expect(staff.watermark).toBe('2026-10-14T00:00:00.000Z')
+    expect(staff.range_status).toBe('complete')
+    expect(staff.last_synced_at).toBe('2026-10-14T10:00:00.000Z')
+    expect(staff.gaps_count).toBe(0)
+    expect(staff.locked).toBe(false)
+    const overview = tasks.find((t) => t.task === 'reports.overview')!
+    expect(overview.range_status).toBe('pending')
+    expect(overview.gaps_count).toBe(1)
+    expect(overview.watermark).toBeNull()
+    // 限频冷却行（__ratelimit__: 前缀）不是任务，不出现
+    expect(tasks.some((t) => String(t.task).startsWith('__ratelimit__'))).toBe(false)
+  })
+
+  it('指定任务子集只列该任务；未知任务 → 2', async () => {
+    const s = await fresh()
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', 'w1', { start: 0, end: 1 }, 't1')
+    })
+    await s.close()
+    expect(await syncCommand(['status', 'dim.staff', '--db', dbPath()])).toBe(0)
+    const tasks = data().tasks as Array<Record<string, unknown>>
+    expect(tasks.length).toBe(1)
+    expect(tasks[0]!.task).toBe('dim.staff')
+
+    out = ''
+    expect(await syncCommand(['status', 'nope.nope', '--db', dbPath()])).toBe(2)
+    expect(JSON.parse(out).error.kind).toBe('usage')
+    expect(JSON.parse(out).error.message).toMatch(/nope\.nope/)
+  })
+
+  it('locked 来自 sync_state.locked_by（引擎盖章为真）', async () => {
+    const s = await fresh()
+    await s.upsert('sync_state', [{ dataset: 'dim.staff', watermark: 'w', range_status: 'complete',
+      last_error: null, locked_by: 'pid 42', locked_at: '2026-10-15T00:00:00.000Z',
+      last_synced_at: 't', next_allowed_at: null, last_rate_limited_at: null }])
+    await s.close()
+    expect(await syncCommand(['status', 'dim.staff', '--db', dbPath()])).toBe(0)
+    const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+    expect(t.locked).toBe(true)
+  })
+
+  it('库文件不存在 → 1 + store_not_initialized + hint 指向 sync run（D 交付后 status 的 hint，spec §9.5）', async () => {
+    expect(await syncCommand(['status', '--db', join(dir, 'missing.db')])).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('store_not_initialized')
+    expect(e.hint).toMatch(/sync run/)
+  })
+})
+
+describe('sync verify', () => {
+  const staffRows = () => [
+    { id: 1000001, realname: '甲', nickname: '甲', username: 'a', role: 'admin', roleId: 1,
+      status: 1, createtime: 1690000000000, updateTime: 1690000000000, email: null, phone: null,
+      workNumber: 'W1', maxServiceCount: 6, skillScoreChat: 0, skillScoreIpcc: 0, groupInfo: [] },
+    { id: 1000002, realname: '乙', nickname: '乙', username: 'b', role: 'staff', roleId: 2,
+      status: 1, createtime: 1690000000000, updateTime: 1690000000000, email: null, phone: null,
+      workNumber: 'W2', maxServiceCount: 6, skillScoreChat: 0, skillScoreIpcc: 0, groupInfo: [] },
+  ]
+
+  it('快照任务三方一致 → drift=[] 退出码 0，local_rows=expected_from_api、state 一致', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => okA(staffRows()))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      expect(await syncCommand(['run', 'dim.staff', '--db', dbPath(), '--full', '--quiet'])).toBe(0)
+      out = ''
+      const code = await syncCommand(['verify', 'dim.staff', '--db', dbPath()])
+      expect(code).toBe(0)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.task).toBe('dim.staff')
+      expect(t.local_rows).toBe(2)
+      expect(t.expected_from_api).toBe(2)
+      expect(t.state_windows_consistent).toBe(true)
+      expect(t.drift).toEqual([])
+      // 快照核对的取数就是任务 fetch（同端点，无其他请求）
+      expect(fetchMock.mock.calls.every((c) => String(c[0]).includes('staff/list/new'))).toBe(true)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('快照任务本地与上游不符 → drift 非空（count_mismatch）退出码 1', async () => {
+    const staff3 = { id: 1000003, realname: '丙', nickname: '丙', username: 'c', role: 'staff', roleId: 2,
+      status: 1, createtime: 1690000000000, updateTime: 1690000000000, email: null, phone: null,
+      workNumber: 'W3', maxServiceCount: 6, skillScoreChat: 0, skillScoreIpcc: 0, groupInfo: [] }
+    // 先 2 行（run 落库本地 2 行），之后 3 行（verify 上游变 3 → count_mismatch）
+    const fetchMock = vi.fn().mockImplementationOnce(() => okA(staffRows()))
+      .mockImplementation(() => okA([...staffRows(), staff3]))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      // 本地 2 行
+      expect(await syncCommand(['run', 'dim.staff', '--db', dbPath(), '--full', '--quiet'])).toBe(0)
+      // 上游变 3 行 → count_mismatch
+      out = ''
+      const code = await syncCommand(['verify', 'dim.staff', '--db', dbPath()])
+      expect(code).toBe(1)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.local_rows).toBe(2)
+      expect(t.expected_from_api).toBe(3)
+      expect(t.state_windows_consistent).toBe(true)
+      const drift = t.drift as Array<Record<string, unknown>>
+      expect(drift.length).toBe(1)
+      expect(drift[0]!.kind).toBe('count_mismatch')
+      expect(String(drift[0]!.detail)).toMatch(/2/)
+      expect(String(drift[0]!.detail)).toMatch(/3/)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('上游请求失败 → drift fetch_failed 退出码 1（无法核对 ≠ 一致）', async () => {
+    // 先正常 2 行（run 落库），之后 verify 上游抛错
+    const fetchMock = vi.fn().mockImplementationOnce(() => okA(staffRows()))
+      .mockImplementation(() => { throw new Error('fetch failed') })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      expect(await syncCommand(['run', 'dim.staff', '--db', dbPath(), '--full', '--quiet'])).toBe(0)
+      out = ''
+      expect(await syncCommand(['verify', 'dim.staff', '--db', dbPath()])).toBe(1)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.expected_from_api).toBeNull()
+      const drift = t.drift as Array<Record<string, unknown>>
+      expect(drift.map((d) => d.kind)).toContain('fetch_failed')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('windowed：complete → expected_from_api=null + drift=[]；pending → drift 非空且 detail 说明核对方式', async () => {
+    const s = await fresh()
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'tickets.search', '2026-10-14T00:00:00.000Z', { start: 0, end: 1 }, '2026-10-14T10:00:00.000Z')
+    })
+    await s.close()
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      // windowed 不做上游重拉：零网络
+      const code = await syncCommand(['verify', 'tickets.search', '--db', dbPath()])
+      expect(code).toBe(0)
+      expect(fetchMock.mock.calls.length).toBe(0)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.expected_from_api).toBeNull()
+      expect(t.state_windows_consistent).toBe(true)
+      expect(t.drift).toEqual([])
+
+      // pending（最后一次运行中断）→ drift 非空，detail 说明 windowed 的核对方式
+      const s2 = await fresh()
+      await s2.transaction(async (tx) => { await markPending(tx, 'tickets.search') })
+      await s2.close()
+      out = ''
+      expect(await syncCommand(['verify', 'tickets.search', '--db', dbPath()])).toBe(1)
+      const t2 = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t2.state_windows_consistent).toBe(false)
+      const drift = t2.drift as Array<Record<string, unknown>>
+      expect(drift.length).toBeGreaterThan(0)
+      expect(JSON.stringify(drift)).toMatch(/sync run/)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('快照任务选中但缺凭证 → 1 + auth_missing；纯 windowed 不需要凭证', async () => {
+    vi.stubEnv('QIYU_APP_KEY', '')
+    vi.stubEnv('QIYU_APP_SECRET', '')
+    await fresh().then((s) => s.close())
+    expect(await syncCommand(['verify', 'dim.staff', '--db', dbPath()])).toBe(1)
+    expect(JSON.parse(out).error.kind).toBe('auth_missing')
+    // windowed-only：零网络也不碰凭证（sync_state 空 → drift 退 1，但不是 auth_missing）
+    out = ''
+    expect(await syncCommand(['verify', 'tickets.search', '--db', dbPath()])).toBe(1)
+    expect(JSON.parse(out).ok).toBe(true)
+  })
+
+  it('未知任务 → 2', async () => {
+    expect(await syncCommand(['verify', 'nope.nope', '--db', dbPath()])).toBe(2)
+    expect(JSON.parse(out).error.kind).toBe('usage')
+  })
+})
+
+describe('sync install', () => {
+  /** 预置「已同步过」的库：sync_state 有真实数据集行（install 的前置探测）。 */
+  async function seedSynced(): Promise<void> {
+    const s = await fresh()
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', '2026-10-14T00:00:00.000Z', { start: 0, end: 1 }, '2026-10-14T10:00:00.000Z')
+    })
+    await s.close()
+  }
+
+  it('dry-run：stdout JSON 内含 plist 文本、零文件写入、退出码 0', async () => {
+    await seedSynced()
+    const code = await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])
+    expect(code).toBe(0)
+    const d = data()
+    expect(d.platform).toBe('darwin')
+    expect(d.schedule).toBe('*/30 * * * *')
+    expect(d.dry_run).toBe(true)
+    const entries = d.entries as Array<{ path: string; content: string }>
+    expect(entries[0]!.path).toBe(join(dir, 'Library', 'LaunchAgents', 'com.qiyu-cli.sync.plist'))
+    expect(entries[0]!.content).toMatch(/<key>Label<\/key><string>com\.qiyu-cli\.sync<\/string>/)
+    expect(entries[0]!.content).toMatch(/<key>Minute<\/key><array><integer>0<\/integer><integer>30<\/integer><\/array>/)
+    expect(entries[0]!.content).toMatch(/<string>sync<\/string><string>run<\/string>/)
+    // 零文件写入
+    expect(existsSync(entries[0]!.path)).toBe(false)
+    // 未执行外部命令
+    expect(runMock).not.toHaveBeenCalled()
+  })
+
+  it('--yes：写 plist 到 HOME、执行 launchctl load（注入 runner），写入内容与 dry-run 一致', async () => {
+    await seedSynced()
+    expect(await syncCommand(['install', '--schedule', '0 2 * * *', '--db', dbPath()])).toBe(0)
+    const dryContent = (data().entries as Array<{ content: string }>)[0]!.content
+    out = ''
+    const code = await syncCommand(['install', '--schedule', '0 2 * * *', '--db', dbPath(), '--yes'])
+    expect(code).toBe(0)
+    const d = data()
+    expect(d.dry_run).toBe(false)
+    const installed = d.installed as string[]
+    expect(installed).toEqual([join(dir, 'Library', 'LaunchAgents', 'com.qiyu-cli.sync.plist')])
+    expect(readFileSync(installed[0]!, 'utf8')).toBe(dryContent)
+    expect(runMock).toHaveBeenCalledWith(['launchctl', 'load', installed[0]!])
+  })
+
+  it('缺 --schedule → 2；非法 cron → 2', async () => {
+    await seedSynced()
+    expect(await syncCommand(['install', '--db', dbPath()])).toBe(2)
+    expect(JSON.parse(out).error.message).toMatch(/--schedule/)
+    out = ''
+    expect(await syncCommand(['install', '--schedule', '不是 cron', '--db', dbPath()])).toBe(2)
+    expect(JSON.parse(out).error.kind).toBe('usage')
+  })
+
+  it('库未初始化 → 1 + hint 先跑一次 sync run；已初始化但从未同步 → 1 + sync_not_run + hint', async () => {
+    expect(await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', join(dir, 'none.db')])).toBe(1)
+    let e = JSON.parse(out).error
+    expect(e.kind).toBe('store_not_initialized')
+    expect(e.hint).toMatch(/sync run/)
+
+    await fresh().then((s) => s.close())   // 已建库、零同步记录
+    out = ''
+    expect(await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])).toBe(1)
+    e = JSON.parse(out).error
+    expect(e.kind).toBe('sync_not_run')
+    expect(e.hint).toMatch(/sync run/)
+  })
+
+  it('平台注入 linux → 写 service+timer 两个文件', async () => {
+    __setPlatform(() => 'linux')
+    await seedSynced()
+    const code = await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath(), '--yes'])
+    expect(code).toBe(0)
+    const installed = data().installed as string[]
+    expect([...installed].sort()).toEqual([
+      join(dir, '.config', 'systemd', 'user', 'qiyu-sync.service'),
+      join(dir, '.config', 'systemd', 'user', 'qiyu-sync.timer'),
+    ])
+    expect(readFileSync(installed[0]!, 'utf8')).toMatch(/\[Unit\]/)
+    expect(runMock).toHaveBeenCalledWith(['systemctl', '--user', 'daemon-reload'])
+  })
+
+  it('外部命令失败 → 退出码 1 且命令结果如实透出', async () => {
+    await seedSynced()
+    __setRun(vi.fn(() => { throw new Error('launchctl: load failed') }))
+    const code = await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath(), '--yes'])
+    expect(code).toBe(1)
+    const cmds = data().commands as Array<{ ok: boolean; error: string }>
+    expect(cmds[0]!.ok).toBe(false)
+    expect(cmds[0]!.error).toMatch(/launchctl/)
+    // 文件已写入（写入与加载是两步，加载失败不回滚文件）
+    expect(existsSync(join(dir, 'Library', 'LaunchAgents', 'com.qiyu-cli.sync.plist'))).toBe(true)
+  })
+})
+
+describe('sync uninstall', () => {
+  const plistPath = (): string => join(dir, 'Library', 'LaunchAgents', 'com.qiyu-cli.sync.plist')
+
+  it('dry-run：列出将删除路径与存在性、文件仍在、零执行', async () => {
+    mkdirSync(dirname(plistPath()), { recursive: true })
+    writeFileSync(plistPath(), '<plist/>')
+    const code = await syncCommand(['uninstall'])
+    expect(code).toBe(0)
+    const d = data()
+    expect(d.dry_run).toBe(true)
+    const remove = d.remove as Array<{ path: string; exists: boolean }>
+    expect(remove[0]!.path).toBe(plistPath())
+    expect(remove[0]!.exists).toBe(true)
+    expect(existsSync(plistPath())).toBe(true)
+    expect(runMock).not.toHaveBeenCalled()
+  })
+
+  it('--yes：先执行 launchctl unload、删除文件', async () => {
+    mkdirSync(dirname(plistPath()), { recursive: true })
+    writeFileSync(plistPath(), '<plist/>')
+    const code = await syncCommand(['uninstall', '--yes'])
+    expect(code).toBe(0)
+    const removed = data().removed as string[]
+    expect(removed).toEqual([plistPath()])
+    expect(existsSync(plistPath())).toBe(false)
+    expect(runMock).toHaveBeenCalledWith(['launchctl', 'unload', plistPath()])
+  })
+
+  it('未安装 → removed 空、退出码 0、不执行外部命令', async () => {
+    expect(await syncCommand(['uninstall', '--yes'])).toBe(0)
+    expect((data().removed as string[])).toEqual([])
+    expect(runMock).not.toHaveBeenCalled()
   })
 })
