@@ -198,6 +198,24 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
     }
   })
 
+  it('windowed 任务全窗失败 → 退出码 1（partial 不掩盖全失败，T13 fix 中-1）', async () => {
+    // tickets.search 1 窗（--since 1d）全窗失败：引擎权威产出 partial（windows
+    // succeeded=0/failed=1），但「全部任务都没有任何成功窗口」必须退 1。
+    const fetchMock = vi.fn().mockImplementation(() => { throw new Error('fetch failed') })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(),
+        '--since', '1d', '--quiet'])
+      expect(code).toBe(1)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.status).toBe('partial')     // 引擎层语义不变
+      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('全失败 → 退出码 1（snapshot 快照任务 fetch 抛错）', async () => {
     const fetchMock = vi.fn().mockImplementation(() => { throw new Error('fetch failed') })
     vi.stubGlobal('fetch', fetchMock)
@@ -250,13 +268,15 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
 describe('sync run —— 区间参数（--full/--since/--until）', () => {
   it('--since 30d 相对时间按 Asia/Shanghai 解析并回显 resolved_range（固定时钟）', async () => {
     // 固定时钟：2026-10-15T02:00:00+08:00 = 2026-10-14T18:00:00Z
+    // ⚠️ 用 tickets.search（工单域无限频）：报表的假空重试会撞 30s 本地桶把窗口
+    // 打成失败（中-1 后退 1）——区间解析语义与任务无关。
     const CLOCK = Date.UTC(2026, 9, 14, 18, 0, 0)
     vi.useFakeTimers({ now: CLOCK })
     try {
-      const fetchMock = vi.fn().mockImplementation(() => okC({ total: 0, result: [] }))
+      const fetchMock = vi.fn().mockImplementation(() => okC({ total: 0, tickets: [] }))
       vi.stubGlobal('fetch', fetchMock)
       await fresh().then((s) => s.close())
-      const code = await syncCommand(['run', 'reports.overview', '--db', dbPath(),
+      const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(),
         '--since', '30d', '--quiet'])
       expect(code).toBe(0)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
@@ -274,10 +294,10 @@ describe('sync run —— 区间参数（--full/--since/--until）', () => {
     const CLOCK = Date.UTC(2026, 9, 14, 18, 0, 0)
     vi.useFakeTimers({ now: CLOCK })
     try {
-      const fetchMock = vi.fn().mockImplementation(() => okC({ total: 0, result: [] }))
+      const fetchMock = vi.fn().mockImplementation(() => okC({ total: 0, tickets: [] }))
       vi.stubGlobal('fetch', fetchMock)
       await fresh().then((s) => s.close())
-      const code = await syncCommand(['run', 'reports.overview', '--db', dbPath(),
+      const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(),
         '--since', '2026-09-01', '--until', '2026-09-20', '--quiet'])
       expect(code).toBe(0)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
@@ -383,12 +403,12 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
       // create + check + zip 三次调用
       const code = await syncCommand(['run', 'sessions.export', '--db', dbPath(),
         '--since', '1d', '--quiet'])
-      expect(code).toBe(0)
-      // ⚠️ windowed 任务全窗失败引擎也报 partial（T5 brief 权威：'failed' 只留给快照
-      // gate 拦截路径）；「全失败退 1」按快照任务语义判定（本文件全失败用例）。
+      // 单任务全窗失败（partial + succeeded=0）→ 退 1（T13 fix 中-1 的补判口径）
+      expect(code).toBe(1)
       expect(fetchMock.mock.calls.length).toBe(3)   // create + check + zip 下载
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('partial')
+      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
       expect((t.gaps as Array<{ detail: string }>)[0]!.detail).toMatch(/zip/i)
     } finally {
       vi.unstubAllGlobals()

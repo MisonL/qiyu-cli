@@ -168,6 +168,15 @@ function flattenTree(robotId: string, nodes: unknown, level: number,
   }
 }
 
+/**
+ * 类目树拍平的共享入口（T13 接线）：从根（level=1）拍平一棵 getCategoryTree 响应。
+ * 编排层的 robotId 注入路径消费同一实现——复制投影会让行形态在两处漂移。
+ */
+export function flattenCategoryTree(robotId: string, payload: unknown,
+  out: Record<string, unknown>[], nowIso: string): void {
+  flattenTree(robotId, payload, 1, null, out, nowIso)
+}
+
 /** knowledge_items / knowledge_points 共用的游标快照 fetch。numericCols 是 INTEGER 列集（数字直通）。 */
 function fetchCursor(taskId: string, endpointId: string,
   keys: Record<string, (r: Record<string, unknown>) => unknown>,

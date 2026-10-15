@@ -129,47 +129,31 @@ function wireSessions(task: SyncTask, opts: { maxPolls?: number }): SyncTask {
 
 /**
  * 给 knowledge.categories 包装 fetch：注入手工 robotId（StoreConfig.options.
- * knowledgeRobotIds）。注入的 id 与 items 的 DISTINCT 取并集——items 已覆盖的机器人
- * 照常驱动，注入的补上发现盲区（知识库为空的机器人不在 items 里）。
+ * knowledgeRobotIds）——发现盲区的兜底（知识库为空的机器人不在 items 驱动序里）。
+ * 注入语义：items 驱动失败（表空）时改用注入 id 逐机器人拉取；items 非空时注入
+ * id 不生效（避免伪造驱动行污染 items 表）。
  */
-function wireCategories(task: SyncTask, robotIds: number[]): SyncTask {
+function wireCategories(task: SyncTask, robotIds: number[], clock: () => number): SyncTask {
   if (task.id !== 'knowledge.categories' || robotIds.length === 0) return task
   const orig = task.fetch
   return {
     ...task,
     fetch: async (w, c) => {
-      // 预置注入 id 的驱动行？否——驱动序在任务 fetch 内部查 DISTINCT；这里改为在
-      // fetch 前把注入 id 补进 items 表不可取（污染数据表）。
-      // 正确落点：任务 fetch 的 DISTINCT 结果是唯一驱动源，注入面由任务声明提供 ——
-      // knowledge.ts 的 categories fetch 会读取 ctx（FetchCtx 无配置通道）。
-      // 因此本层直接实现注入语义：先跑原 fetch（items 驱动），失败（items 空）且
-      // 有注入 id 时改用注入 id 逐机器人拉取 —— 两路结果在任务层外合成。
       try {
         return await orig(w, c)
       } catch (e) {
         if (!/knowledge_items 表为空/.test((e as Error).message)) throw e
       }
-      // 注入路径：逐机器人调 getCategoryTree，行投影与任务层同形（payload/level 等）。
+      // 注入路径：行拍平消费任务层的共享实现（flattenCategoryTree），不复制投影。
       const { call } = await import('../core/http.js')
       const { byId } = await import('../core/registry/index.js')
-      const nowIso = new Date().toISOString()
+      const { flattenCategoryTree } = await import('../sync/tasks/knowledge.js')
+      const nowIso = new Date(clock()).toISOString()
       const rows: Record<string, unknown>[] = []
       for (const rid of robotIds) {
         const res = await call(byId('ai.knowledge.getCategoryTree'), { robotId: rid },
           { credentials: c.credentials })
-        const flat = (payload: unknown, level: number, parent: string | null): void => {
-          if (!Array.isArray(payload)) return
-          for (const n of payload as Record<string, unknown>[]) {
-            if (n.id === null || n.id === undefined) continue
-            const sid = String(n.id)
-            rows.push({ robot_id: String(rid), category_id: sid,
-              name: typeof n.name === 'string' ? n.name : null,
-              parent_id: parent, level,
-              payload: JSON.stringify(n), synchronized_at: nowIso })
-            flat(n.children, level + 1, sid)
-          }
-        }
-        flat(res.payload, 1, null)
+        flattenCategoryTree(String(rid), res.payload, rows, nowIso)
       }
       return { rows, apiCount: rows.length }
     },
@@ -335,7 +319,7 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     // —— 分组执行：reportDayRotation 批量走轮转，其余逐任务 ——
     const rotated = selected.filter((t) => t.reportDayRotation)
     const plain = selected.filter((t) => !t.reportDayRotation)
-      .map((t) => wireCategories(wireSessions(t, {}), robotIds))
+      .map((t) => wireCategories(wireSessions(t, {}), robotIds, clock))
 
     const results: TaskRunResult[] = []
     if (rotated.length > 0) {
@@ -353,7 +337,11 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       const st = await readWatermark(store, r.taskId)
       tasksOut.push(taskOut(r, st.watermark, st.lastSyncedAt))
     }
-    const allFailed = results.every((r) => r.status === 'failed')
+    // 全失败判定（T13 fix 中-1）：引擎对 windowed 全窗失败权威产出 partial（'failed'
+    // 只留给快照 gate 拦截路径）——「全失败」必须补判窗口级：succeeded=0 且 failed>0
+    // 的任务与 status='failed' 并列计入退出码 1。
+    const allFailed = results.every((r) =>
+      r.status === 'failed' || (r.windows.succeeded === 0 && r.windows.failed > 0))
     const code = ok({ tasks: tasksOut, truncated: false })
     // stderr 汇总（spec §二：核对不符等在 run 结束的 stderr 汇总中列出）
     if (flags['--quiet'] === undefined) {
