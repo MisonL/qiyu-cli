@@ -114,12 +114,13 @@ function okC(payload: unknown) {
 describe('sync run —— 单任务输出契约（spec §七）', () => {
   it('mock 维表任务：逐字段断言输出形态 {tasks:[{task,status,windows,rows,resolved_range,watermark,gaps}], truncated:false}', async () => {
     // staff.list.new 返回 2 行（fetchAll 直接吃 data 数组）
+    // D 低-1：role 按实测统一为整型（staff.list 实测 role 是 0/1/-2 的 int，不是 'admin'/'staff'）
     const fetchMock = vi.fn().mockImplementation(() => okA([
-      { id: 1000001, realname: '测试甲', nickname: '甲', username: 'test-a', role: 'admin',
+      { id: 1000001, realname: '测试甲', nickname: '甲', username: 'test-a', role: 1,
         roleId: 1, status: 1, createtime: 1690000000000, updateTime: 1690000000000,
         email: null, phone: null, workNumber: 'W001', maxServiceCount: 6,
         skillScoreChat: 0, skillScoreIpcc: 0, groupInfo: [{ groupId: 1, groupName: 'G' }] },
-      { id: 1000002, realname: '测试乙', nickname: '乙', username: 'test-b', role: 'staff',
+      { id: 1000002, realname: '测试乙', nickname: '乙', username: 'test-b', role: 0,
         roleId: 2, status: 1, createtime: 1690000000000, updateTime: 1690000000000,
         email: null, phone: null, workNumber: 'W002', maxServiceCount: 6,
         skillScoreChat: 0, skillScoreIpcc: 0, groupInfo: [] },
@@ -673,11 +674,12 @@ describe('sync status', () => {
 })
 
 describe('sync verify', () => {
+  // D 低-1：role 按实测统一为整型（staff.list 实测 role 是 0/1/-2 的 int）
   const staffRows = () => [
-    { id: 1000001, realname: '甲', nickname: '甲', username: 'a', role: 'admin', roleId: 1,
+    { id: 1000001, realname: '甲', nickname: '甲', username: 'a', role: 1, roleId: 1,
       status: 1, createtime: 1690000000000, updateTime: 1690000000000, email: null, phone: null,
       workNumber: 'W1', maxServiceCount: 6, skillScoreChat: 0, skillScoreIpcc: 0, groupInfo: [] },
-    { id: 1000002, realname: '乙', nickname: '乙', username: 'b', role: 'staff', roleId: 2,
+    { id: 1000002, realname: '乙', nickname: '乙', username: 'b', role: 0, roleId: 2,
       status: 1, createtime: 1690000000000, updateTime: 1690000000000, email: null, phone: null,
       workNumber: 'W2', maxServiceCount: 6, skillScoreChat: 0, skillScoreIpcc: 0, groupInfo: [] },
   ]
@@ -705,7 +707,7 @@ describe('sync verify', () => {
   })
 
   it('快照任务本地与上游不符 → drift 非空（count_mismatch）退出码 1', async () => {
-    const staff3 = { id: 1000003, realname: '丙', nickname: '丙', username: 'c', role: 'staff', roleId: 2,
+    const staff3 = { id: 1000003, realname: '丙', nickname: '丙', username: 'c', role: 0, roleId: 2,
       status: 1, createtime: 1690000000000, updateTime: 1690000000000, email: null, phone: null,
       workNumber: 'W3', maxServiceCount: 6, skillScoreChat: 0, skillScoreIpcc: 0, groupInfo: [] }
     // 先 2 行（run 落库本地 2 行），之后 3 行（verify 上游变 3 → count_mismatch）
