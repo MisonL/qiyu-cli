@@ -57,7 +57,7 @@ function assertNoRobotId(w: WindowRef, taskId: string): void {
  *   · 各页声明 total 必须一致、结束时累计行数必须等于 total——「看似成功的短读」
  *     是最危险的静默失败方向（配对核对的前置事实检查）。
  */
-async function pagedCursor(endpointId: string, ctx: FetchCtx, taskId: string): Promise<Record<string, unknown>[]> {
+async function pagedCursor(endpointId: string, ctx: FetchCtx): Promise<Record<string, unknown>[]> {
   const out: Record<string, unknown>[] = []
   let mid = 0
   let declared: number | null = null
@@ -72,7 +72,8 @@ async function pagedCursor(endpointId: string, ctx: FetchCtx, taskId: string): P
         `${String(declared)}，已取 ${out.length} 行）：isEnd 恒 0 或游标未推进（响应形态漂移），拒绝落库`)
     }
     page++
-    const res = await callPaced(endpointId, { mid, size: PAGE_SIZE }, ctx, taskId)
+    // B 中-6：callPaced 的键就是 endpoint id（闸门按路径拦）——任务 id 不参与。
+    const res = await callPaced(endpointId, { mid, size: PAGE_SIZE }, ctx)
     const p = res.payload as { total?: unknown; data?: unknown; isEnd?: unknown } | null
     if (p === null || typeof p !== 'object' || !Array.isArray(p.data)) {
       throw new Error(`接口 ${endpointId} 载荷缺 data 数组（响应形态漂移？），拒绝落库`)
@@ -164,7 +165,7 @@ function fetchCursor(taskId: string, endpointId: string,
   return async (w, ctx) => {
     assertNoRobotId(w, taskId)
     const nowIso = nowIsoOf(ctx)
-    const rows = await pagedCursor(endpointId, ctx, taskId)
+    const rows = await pagedCursor(endpointId, ctx)
     const mapped = projectRows(rows, keys, numeric, nowIso)
     return { rows: mapped, apiCount: mapped.length }
   }
@@ -175,6 +176,7 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
     id: 'knowledge.items', table: 'knowledge_items', kind: 'snapshot',
     watermark: { field: 'synchronized_at', initial: null },
     primaryKey: ['id'],
+    endpoint: 'robot.data.knowledge',
     write: { kind: 'upsertRows' },
     // 企业级全量（全部机器人并集）；robotId 被静默忽略 → fetch 守卫拒绝透传。
     // 键列：id/robot_id/robot_name/group_id/ref_id/point_id（groupId 是知识实体真正的
@@ -193,6 +195,7 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
     id: 'knowledge.points', table: 'knowledge_points', kind: 'snapshot',
     watermark: { field: 'synchronized_at', initial: null },
     primaryKey: ['id'],
+    endpoint: 'robot.data.kpoint',
     write: { kind: 'upsertRows' },
     // kpoint 实测全字段存在且无 robotId 键（归属只能经 items.point_id 反推）——
     // 单键列 id 即可（全字段都在 payload 里保真）。
@@ -203,6 +206,7 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
   {
     id: 'knowledge.categories', table: 'knowledge_categories', kind: 'snapshot',
     watermark: { field: 'synchronized_at', initial: null },
+    endpoint: 'ai.knowledge.getCategoryTree',
     // 主键必须含 robot_id（类目 id 空间按机器人划分，§10.5.9——单列主键会跨机器人覆盖）
     primaryKey: ['robot_id', 'category_id'],
     write: { kind: 'upsertRows' },
@@ -222,8 +226,7 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
       }
       const out: Record<string, unknown>[] = []
       for (const rid of robotIds) {
-        const res = await callPaced('ai.knowledge.getCategoryTree', { robotId: Number(rid) },
-          ctx, 'knowledge.categories')
+        const res = await callPaced('ai.knowledge.getCategoryTree', { robotId: Number(rid) }, ctx)
         // 形状 A：data 直接是树数组；空树机器人整个丢 data 键（not_found）→ 0 行合法
         if (res.payload === undefined || res.payload === null) continue
         flattenTree(rid, res.payload, 1, null, out, nowIso)

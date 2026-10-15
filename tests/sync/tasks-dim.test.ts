@@ -113,6 +113,59 @@ describe('DIM_TASKS 任务声明', () => {
     expect(dimById('dim.ticket_template_fields')!.primaryKey).toEqual(['template_id', 'fieldId'])
   })
 
+  it('B 中-6：每个任务声明 endpoint（闸门键 = 注册表路径，不是任务 id）', () => {
+    for (const t of DIM_TASKS) {
+      expect(t.endpoint, `${t.id} endpoint`).toBeTruthy()
+      expect(t.endpoint, `${t.id} endpoint 不得是任务 id`).not.toBe(t.id)
+    }
+    // 同路径的两个任务声明同一把键（同路径共享冷却）
+    expect(dimById('dim.staff_groups')!.endpoint).toBe('staff.group.list.new')
+    expect(dimById('dim.staff_group_members')!.endpoint).toBe('staff.group.list.new')
+  })
+
+  it('C 中-14：staffIdList 非数组 → 跳过该组 + gapHint 落 sync_gaps（不再静默 continue）', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      fetchMock.mockReturnValue(Promise.resolve(new Response(JSON.stringify({
+        code: 200, message: 'OK',
+        data: [
+          { id: 1000001, name: '售前组', staffIdList: [1000002] },
+          { id: 1000002, name: '形态漂移组', staffIdList: 'not-an-array' },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })))
+      const store = await fresh()
+      const r = await runTask(dimById('dim.staff_group_members') as SyncTask, ctx(store))
+      expect(r.status).toBe('complete')       // 成功窗 + 提示性 gap
+      expect(r.rows.written).toBe(1)
+      expect(r.gaps.length).toBe(1)
+      expect(r.gaps[0].reason).toBe('staff_id_list_malformed')
+      expect(r.gaps[0].detail).toMatch(/1000002/)   // 出问题的组 id 可见
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 低-7：空串主键（dim.staff 的 id）→ 显式失败，绝不写空串同键行', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      fetchMock.mockReturnValue(Promise.resolve(new Response(JSON.stringify({
+        code: 200, message: 'OK',
+        data: [{ id: '', realname: '空 id' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })))
+      const store = await fresh()
+      const r = await runTask(dimById('dim.staff') as SyncTask, ctx(store))
+      expect(r.status).toBe('failed')
+      expect(r.gaps[0].detail).toMatch(/空的主键列/)
+      expect(await store.count('staff')).toBe(0)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('dim.staff fetch：POST staff.list（空 body）、payload 行直写（groupInfo JSON 字符串化）', async () => {
     // http mock 照 tests/core/http.test.ts：stubGlobal fetch + 形状 A 信封
     const fetchMock = vi.fn()
