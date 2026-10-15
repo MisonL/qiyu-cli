@@ -18,7 +18,10 @@ export const DEFAULTS = {
 /** 已知键白名单 —— 未知键 fail-closed（spec §3.3）。 */
 const KNOWN_TOP = new Set(['defaultProfile', 'profiles'])
 const KNOWN_PROFILE = new Set(['store'])
-const KNOWN_STORE = new Set(['backend', 'path', 'readOnlyRetryMs', 'batchSize'])
+// ⚠️ options（D-T13）：配置面的「透传不校验内容」键——StoreConfig.options 的落点。
+// config 层只保证它是对象、原样透传（消费方如 sync run 的 knowledgeRobotIds 自行
+// 校验内容）；放 KNOWN_STORE 让未知键检查放行。
+const KNOWN_STORE = new Set(['backend', 'path', 'readOnlyRetryMs', 'batchSize', 'options'])
 
 function assertKnownKeys(obj: Record<string, unknown>, known: Set<string>, prefix: string): void {
   for (const k of Object.keys(obj)) {
@@ -104,6 +107,11 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
     const store = (prof.store ?? {}) as Record<string, unknown>
     if (store !== null && typeof store === 'object' && !Array.isArray(store)) {
       assertKnownKeys(store, KNOWN_STORE, `profiles.${name}.store.`)
+      // options：透传不校验内容（D-T13），但形态必须是对象（数组/标量显式拒绝）。
+      if (store.options !== undefined &&
+          (store.options === null || typeof store.options !== 'object' || Array.isArray(store.options))) {
+        throw new Error(`配置文件 profiles.${name}.store.options 必须是对象`)
+      }
     }
   }
 
@@ -143,7 +151,13 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
   const finalPath = isAbsolute(expanded) ? expanded : join(home, expanded)
 
   return {
-    config: { backend: rawBackend as BackendName, path: finalPath, readOnlyRetryMs, batchSize },
+    config: {
+      backend: rawBackend as BackendName, path: finalPath, readOnlyRetryMs, batchSize,
+      // options 透传不校验内容（D-T13）：消费方（sync run 的 knowledgeRobotIds 等）自校验。
+      ...(storeBlock.options !== undefined
+        ? { options: storeBlock.options as Record<string, unknown> }
+        : {}),
+    },
     configPath,
     configExists,
   }

@@ -334,6 +334,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
   // —— 各任务的范围合成与切窗（与 runWindowed 同口径）——
   const plans: Array<{
     task: SyncTask; windows: Range[]; state: Awaited<ReturnType<typeof readWatermark>>
+    resolvedRange: Range
     gaps: GapInfo[]; succeeded: number; failed: number; fetched: number; written: number
   }> = []
   for (const task of tasks) {
@@ -354,7 +355,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
       ? []
       : skipContained(sliceByMaxWindow(resolvedRange, task.maxWindowDays, task.overlapDays ?? 0), overlapMs)
     await store.transaction(async (tx) => { await markPending(tx, task.id, state) })
-    plans.push({ task, windows, state, gaps: [], succeeded: 0, failed: 0, fetched: 0, written: 0 })
+    plans.push({ task, windows, state, resolvedRange, gaps: [], succeeded: 0, failed: 0, fetched: 0, written: 0 })
   }
 
   const maxRounds = plans.reduce((m, p) => Math.max(m, p.windows.length), 0)
@@ -415,11 +416,12 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
   }
 
   // —— 汇总（空窗任务 total=0、complete，与 runWindowed 空跑语义一致）——
+  // T13 接线（T7 报告遗留）：resolvedRange 回显各任务的真实合成范围，不再是粗粒度汇总。
   return plans.map((p) => ({
     taskId: p.task.id,
     windows: { total: p.windows.length, succeeded: p.succeeded, failed: p.failed },
     rows: { fetched: p.fetched, written: p.written },
-    resolvedRange: { start: 0, end: clock() },
+    resolvedRange: p.resolvedRange,
     gaps: p.gaps,
     status: p.failed === 0 ? 'complete' as const : 'partial' as const,
   }))

@@ -1,12 +1,16 @@
-// src/commands/sync.ts —— D-T12：sync 命令（当前只有 tasks 子命令；run/status 等后续任务挂载）。
+// src/commands/sync.ts —— D-T12：sync 命令骨架；D-T13：run 子命令挂载。
 // 骨架沿 store.ts：parseFlags → usageFail/fail 双通道 → thrownToExit 扩展。
+// --pretty 统一裁决（T12 遗留 minor，T13 落地）：沿 api.ts 族——承诺过、未实现的
+// flag 一律 usageFail 显式拒绝（退出码 2），顶层/子命令级/run/tasks 同答，无豁免集。
 import { SYNC_TASKS, UNSUPPORTED_DATASETS } from '../sync/registry.js'
 import { ok, usageFail } from '../output.js'
+import { runSyncRun, SYNC_RUN_USAGE } from './sync-run.js'
 
 const USAGE = `用法：qiyu sync <子命令> [参数]
 
 子命令：
   sync tasks               列出全部同步任务与不支持的实时快照数据集
+  sync run [任务...]        同步数据进本地库（--full / --since / --until / --quiet）
 `
 
 const KNOWN = new Set(['--help', '-h', '--pretty'])
@@ -14,7 +18,7 @@ const KNOWN = new Set(['--help', '-h', '--pretty'])
 function parseFlags(argv: string[]): { rest: string[] } {
   const out: { rest: string[] } = { rest: [] }
   for (const a of argv) {
-    // 当前 tasks 子命令无带值 flag；出现带值 flag 形态 → 未知参数（留给后续子命令扩展）。
+    // tasks 子命令无带值 flag；出现带值 flag 形态 → 未知参数。
     out.rest.push(a)
   }
   return out
@@ -28,17 +32,21 @@ export async function syncCommand(argv: string[]): Promise<number> {
     process.stdout.write(USAGE)
     return 0
   }
-  if (sub !== 'tasks') {
-    if (sub === '--pretty') return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
-    return usageFail(`未知子命令：${sub}\n可用子命令：tasks`)
+  if (sub === '--pretty') {
+    return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
   }
+  if (sub !== 'tasks' && sub !== 'run') {
+    return usageFail(`未知子命令：${sub}\n可用子命令：tasks、run`)
+  }
+  if (sub === 'run') return runSyncRun(rest)
+  // —— tasks ——
   if (rest.includes('--help') || rest.includes('-h')) {
     const rawRest = rest.filter((a) => !KNOWN.has(a))
     if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
     process.stdout.write(USAGE)
     return 0
   }
-  if (rest.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
+  if (rest.includes('--pretty')) return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
 
   const flags = parseFlags(rest)
   if (flags.rest.length > 0) return usageFail(`未知参数：${flags.rest.join(' ')}`)
@@ -56,3 +64,5 @@ export async function syncCommand(argv: string[]): Promise<number> {
   const unsupported = UNSUPPORTED_DATASETS.map((u) => ({ id: u.id, unsupported: u.reason }))
   return ok({ tasks, unsupported })
 }
+
+export { SYNC_RUN_USAGE }
