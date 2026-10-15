@@ -266,17 +266,71 @@ describe('deleteRangeInsert 写策略', () => {
   })
 })
 
-describe('限频闸门接线', () => {
-  it('冷却期内 gate.acquire 抛 rate_limit_local → 任务 failed、不 fetch', async () => {
+describe('限频闸门接线（中-2：慢不是错 + 失败窗不越过水位）', () => {
+  it('①gate 冷却 → 按 retryAfter 等待后重试本窗：无 gap、窗口 complete（慢不是错）', async () => {
     const store = await fresh()
-    const gate = new RateGate(store, () => 0)
+    let now = 0
+    const gate = new RateGate(store, () => now)
+    await gate.penalize('reports.overview', 60)   // 冷却至 now + 60s
+    let fetched = 0
+    const waits: number[] = []
+    const t = fakeTask({ fetch: async () => {
+      fetched++
+      return { rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }
+    } })
+    const r = await runTask(t, ctx(store, {
+      gate, clock: () => now,
+      // 注入 sleep = 推进注入时钟（gate 读同一时钟）：等待一次后冷却到期 → 重试成功
+      sleep: async (ms) => { waits.push(ms); now += ms },
+    }))
+    expect(waits).toEqual([60_000])     // 精确等待 retryAfter 一次
+    expect(fetched).toBe(1)             // 等待后真的拉取了
+    expect(r.status).toBe('complete')
+    expect(r.gaps).toEqual([])
+    expect(r.windows).toEqual({ total: 1, succeeded: 1, failed: 0 })
+    await store.close()
+  })
+
+  it('冷却持续未到点（等待不推进时钟）→ 有界 3 次等待重试后记 gap、不 fetch', async () => {
+    const store = await fresh()
+    const gate = new RateGate(store, () => 0)   // 时钟冻结 → 冷却永不到期
     await gate.penalize('reports.overview', 60)
     let fetched = 0
+    const waits: number[] = []
     const t = fakeTask({ fetch: async () => { fetched++; return { rows: [], apiCount: 0 } } })
-    const r = await runTask(t, ctx(store, { gate }))
-    expect(fetched).toBe(0)
-    // brief 权威：窗口级失败（含 gate 拦截）→ partial；'failed' 留给循环无法进入的异常路径
+    const r = await runTask(t, ctx(store, {
+      gate, sleep: async (ms) => { waits.push(ms) },
+    }))
+    expect(waits).toEqual([60_000, 60_000, 60_000])   // 有界：恰好 3 次等待重试
+    expect(fetched).toBe(0)                           // 不碰网络
     expect(r.status).toBe('partial')
+    expect(r.gaps.map((g) => g.reason)).toEqual(['rate_limit_local'])
+    await store.close()
+  })
+
+  it('②窗 2 失败 → 水位停在窗 1 末（不是窗 3 末）；后续成功窗不越过失败窗，续跑回补', async () => {
+    const store = await fresh()
+    const fetchedStarts: number[] = []
+    const t = fakeTask({
+      maxWindowDays: 7,
+      fetch: async (w) => {
+        if (!fetchedStarts.includes(w.start)) fetchedStarts.push(w.start)
+        if (w.start === 7 * DAY) throw new Error('窗 2 上游 500')
+        return { rows: [{ id: `w${w.start}`, name: 'A', color: '#666666' }], apiCount: 1 }
+      },
+    })
+    const r = await runTask(t, { ...ctx(store), rangeOverride: { start: 0, end: 21 * DAY } })
+    expect(r.windows).toEqual({ total: 3, succeeded: 2, failed: 1 })
+    expect(r.status).toBe('partial')
+    // 水位 = 最后一个连续成功窗的 end（窗 1），窗 3 成功也不越过失败窗推到窗 3 末
+    expect((await readWatermark(store, t.id)).watermark)
+      .toBe(new Date(7 * DAY).toISOString())
+    // 窗 3 的数据仍然落库（失败窗隔离不丢后续窗数据）
+    expect(await store.count('tags')).toBe(2)
+    // 增量续跑从水位 +1 起 → 失败窗（[7d,14d]）被回补，gap 不再被永久越过
+    const r2 = await runTask(t, { ...ctx(store), rangeOverride: { start: 0, end: 21 * DAY } })
+    expect(fetchedStarts).toContain(7 * DAY + 1)
+    expect(r2.status).toBe('complete')
     await store.close()
   })
 })

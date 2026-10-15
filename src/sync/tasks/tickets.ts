@@ -15,16 +15,14 @@
 //   ⑤ limit=500 精确兑现、offset 可一直翻到 total（无 9245 之墙，实测推翻）。
 // 工单行线上 27 键且漂移频繁 → 业务字段收敛进 payload JSON 字符串列（schema.ts 工单批次注释）。
 // ticket.log 无分页（limit/pageNo/pageSize 全被忽略），按窗口内 touched 工单逐张全量拉。
-import { call } from '../../core/http.js'
-import { byId } from '../../core/registry/index.js'
+import { callPaced, nowIsoOf } from './pace.js'
 import type { SyncTask, FetchResult, FetchCtx, WindowRef } from '../types.js'
 
 /** 窗口起止的 ISO（与引擎水位/删除范围的值同形——T5 验收项）。 */
 const isoOf = (ms: number): string => new Date(ms).toISOString()
 
-let sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
-/** 仅测试用：替换等待实现（多窗连跑撞本地令牌桶时按 retryAfter 等待，默认真实 30s，不可测）。 */
-export function __setSleep(fn: (ms: number) => Promise<void>): void { sleep = fn }
+/** 限频节流与测试 sleep 注入收敛至共享 pace.ts（中-1）。 */
+export { __setSleep } from './pace.js'
 
 /**
  * op 参数守卫（Review Focus 1 钉死）：构造请求体之前校验窗口两端齐全且有序。
@@ -49,25 +47,6 @@ function usageError(msg: string): Error {
   ;(e as { kind?: string }).kind = 'usage'
   ;(e as { hint?: string }).hint = '这是同步任务的本地窗口参数问题（op 参数对必须齐全有序），修正后重跑'
   return e
-}
-
-/**
- * 带冷却重试的调用：任务内多次调用（翻页/逐工单）会撞进程内令牌桶
- *（工单域实测无服务端限频，本地未登记 → 桶不拦；但保守起见仍按 retryAfter 等待重试，
- * 宁可慢不超发）。测试经 __setSleep 注入零等待。
- */
-async function callPaced(endpointId: string, body: unknown, ctx: FetchCtx,
-  attempt = 0): Promise<{ payload: unknown }> {
-  try {
-    return await call(byId(endpointId), body, { credentials: ctx.credentials })
-  } catch (e) {
-    const rl = e as { code?: string; retryAfter?: { seconds?: number } }
-    if (rl.code === 'local_rate_limit' && attempt < 3) {
-      await sleep(((rl.retryAfter?.seconds ?? 30) + 1) * 1000)
-      return callPaced(endpointId, body, ctx, attempt + 1)
-    }
-    throw e
-  }
 }
 
 /**
@@ -116,11 +95,12 @@ const strOrNull = (v: unknown): string | null =>
 /** tickets.search 任务 fetch：op 守卫 → limit=500 分页（total 收敛）→ 投影落库（upsertRows）。 */
 async function fetchTickets(w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
   assertOpWindow(w)
-  const nowIso = new Date().toISOString()
+  const nowIso = nowIsoOf(ctx)
   const out: Record<string, unknown>[] = []
   let offset = 0
   for (;;) {
-    const res = await callPaced('ticket.search', ticketBody('tickets.search', w, offset), ctx)
+    const res = await callPaced('ticket.search', ticketBody('tickets.search', w, offset), ctx,
+      'tickets.search')
     const { total, tickets } = searchPayload(res.payload, 'ticket.search')
     for (const r of tickets) {
       const row = ticketRow(r, nowIso)
@@ -140,12 +120,13 @@ async function fetchTickets(w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
  */
 async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
   assertOpWindow(w)
-  const nowIso = new Date().toISOString()
+  const nowIso = nowIsoOf(ctx)
   // —— touched 工单：与 tickets.search 同窗同分页 ——
   const touched: string[] = []
   let offset = 0
   for (;;) {
-    const res = await callPaced('ticket.search', ticketBody('tickets.search', w, offset), ctx)
+    const res = await callPaced('ticket.search', ticketBody('tickets.search', w, offset), ctx,
+      'ticket.logs')
     const { total, tickets } = searchPayload(res.payload, 'ticket.search')
     for (const r of tickets) {
       if (r.id !== null && r.id !== undefined) touched.push(String(r.id))
@@ -156,7 +137,7 @@ async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult
   // —— 逐单拉日志 ——
   const out: Record<string, unknown>[] = []
   for (const tid of touched) {
-    const res = await callPaced('ticket.log', { ticketId: Number(tid) }, ctx)
+    const res = await callPaced('ticket.log', { ticketId: Number(tid) }, ctx, 'ticket.logs')
     // ticket.log 信封未实测（registry envelope=null）→ 宽松模式载荷；data 数组形态按实测 §10.3。
     // 其余形态视为响应形态漂移，显式失败（与 reports.ts 的 searchPayload 同口径）——
     // 静默按空处理会把整单日志吞成 complete。

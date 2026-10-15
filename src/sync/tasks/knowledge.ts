@@ -14,16 +14,14 @@
 //      （形状 A not_found）——是「知识库无类目」的合法状态，0 行、不报错；
 //   ⑤ 计数红线：**测试断言不变量，不硬编码实测行数**（12778 等计数会漂移）。
 // 全部 kind=snapshot：幂等来自引擎快照路径的全删重插（engine.ts runSnapshot）。
-import { call } from '../../core/http.js'
-import { byId } from '../../core/registry/index.js'
+import { callPaced, nowIsoOf } from './pace.js'
 import type { SyncTask, FetchResult, FetchCtx, WindowRef } from '../types.js'
 
 /** 单页上限（文档与实测一致：size 一次最多 1000）。 */
 const PAGE_SIZE = 1000
 
-let sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
-/** 仅测试用：替换等待实现（翻页/逐机器人撞 180 秒本地冷却时按 retryAfter 等待，不可测）。 */
-export function __setSleep(fn: (ms: number) => Promise<void>): void { sleep = fn }
+/** 限频节流与测试 sleep 注入收敛至共享 pace.ts（中-1）。 */
+export { __setSleep } from './pace.js'
 
 /** usage 错误（退出码 2）：本地参数问题，重试无用（形态与 tickets.ts 一致）。 */
 function usageError(msg: string, hint: string): Error {
@@ -49,25 +47,6 @@ function assertNoRobotId(w: WindowRef, taskId: string): void {
 }
 
 /**
- * 带冷却重试的调用：任务内多次调用（翻页/逐机器人）会撞进程内令牌桶
- *（robot.data.knowledge 冷却实测长达 180 秒）——真实同步里按 retryAfter 等待后重试
- *（宁可慢，不超发）；测试经 __setSleep 注入零等待。有界重试，防冷却行坏数据死循环。
- */
-async function callPaced(endpointId: string, body: unknown, ctx: FetchCtx,
-  attempt = 0): Promise<{ payload: unknown }> {
-  try {
-    return await call(byId(endpointId), body, { credentials: ctx.credentials })
-  } catch (e) {
-    const rl = e as { code?: string; retryAfter?: { seconds?: number } }
-    if (rl.code === 'local_rate_limit' && attempt < 3) {
-      await sleep(((rl.retryAfter?.seconds ?? 30) + 1) * 1000)
-      return callPaced(endpointId, body, ctx, attempt + 1)
-    }
-    throw e
-  }
-}
-
-/**
  * 游标分页拉取形状 C 载荷（{total, data[], isEnd}），带 total 核对：
  *   · mid 从 0 起，每页后 = 本页末行 id（服务端语义：下一批 **严格大于** mid）；
  *   · isEnd=1 终止；size 恒 1000；
@@ -78,7 +57,7 @@ async function callPaced(endpointId: string, body: unknown, ctx: FetchCtx,
  *   · 各页声明 total 必须一致、结束时累计行数必须等于 total——「看似成功的短读」
  *     是最危险的静默失败方向（配对核对的前置事实检查）。
  */
-async function pagedCursor(endpointId: string, ctx: FetchCtx): Promise<Record<string, unknown>[]> {
+async function pagedCursor(endpointId: string, ctx: FetchCtx, taskId: string): Promise<Record<string, unknown>[]> {
   const out: Record<string, unknown>[] = []
   let mid = 0
   let declared: number | null = null
@@ -93,7 +72,7 @@ async function pagedCursor(endpointId: string, ctx: FetchCtx): Promise<Record<st
         `${String(declared)}，已取 ${out.length} 行）：isEnd 恒 0 或游标未推进（响应形态漂移），拒绝落库`)
     }
     page++
-    const res = await callPaced(endpointId, { mid, size: PAGE_SIZE }, ctx)
+    const res = await callPaced(endpointId, { mid, size: PAGE_SIZE }, ctx, taskId)
     const p = res.payload as { total?: unknown; data?: unknown; isEnd?: unknown } | null
     if (p === null || typeof p !== 'object' || !Array.isArray(p.data)) {
       throw new Error(`接口 ${endpointId} 载荷缺 data 数组（响应形态漂移？），拒绝落库`)
@@ -184,8 +163,8 @@ function fetchCursor(taskId: string, endpointId: string,
   const numeric = new Set(numericCols)
   return async (w, ctx) => {
     assertNoRobotId(w, taskId)
-    const nowIso = new Date().toISOString()
-    const rows = await pagedCursor(endpointId, ctx)
+    const nowIso = nowIsoOf(ctx)
+    const rows = await pagedCursor(endpointId, ctx, taskId)
     const mapped = projectRows(rows, keys, numeric, nowIso)
     return { rows: mapped, apiCount: mapped.length }
   }
@@ -234,7 +213,7 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
     fetch: async (w, ctx) => {
       assertNoRobotId(w, 'knowledge.categories')
       void w
-      const nowIso = new Date().toISOString()
+      const nowIso = nowIsoOf(ctx)
       const r = await ctx.store.query('SELECT DISTINCT robot_id FROM knowledge_items ORDER BY robot_id')
       const robotIds = r.rows.map((x) => String(x.robot_id))
       if (robotIds.length === 0) {
@@ -243,7 +222,8 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
       }
       const out: Record<string, unknown>[] = []
       for (const rid of robotIds) {
-        const res = await callPaced('ai.knowledge.getCategoryTree', { robotId: Number(rid) }, ctx)
+        const res = await callPaced('ai.knowledge.getCategoryTree', { robotId: Number(rid) },
+          ctx, 'knowledge.categories')
         // 形状 A：data 直接是树数组；空树机器人整个丢 data 键（not_found）→ 0 行合法
         if (res.payload === undefined || res.payload === null) continue
         flattenTree(rid, res.payload, 1, null, out, nowIso)

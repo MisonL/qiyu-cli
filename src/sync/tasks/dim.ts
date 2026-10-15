@@ -5,6 +5,7 @@
 // 落库行按 TABLES 列集显式投影（缺列补 null）——响应多出的键不进库，缺的键不炸 upsert。
 import { call } from '../../core/http.js'
 import { byId } from '../../core/registry/index.js'
+import { nowIsoOf } from './pace.js'
 import type { SyncTask, FetchResult, FetchCtx, WindowRef } from '../types.js'
 
 /** 信封归一化结果 → 行数组；payload 不是数组视为响应形态漂移，显式失败。 */
@@ -65,7 +66,7 @@ export const DIM_TASKS: SyncTask[] = [
     // role 文档标必填但实测 status/role 都省略时返回全部 330 行（§6.2）——不传，取全量。
     // groupInfo 列表 → JSON 字符串列（project 统一 JSON.stringify，非字符串值均适用）。
     fetch: (w, ctx) =>
-      fetchAll('staff.list.new', {}, STAFF_COLS, ctx, new Date().toISOString()),
+      fetchAll('staff.list.new', {}, STAFF_COLS, ctx, nowIsoOf(ctx)),
   },
   {
     id: 'dim.staff_groups', table: 'staff_groups', kind: 'snapshot',
@@ -74,7 +75,7 @@ export const DIM_TASKS: SyncTask[] = [
     write: { kind: 'upsertRows' },
     // staff:true 取 staffIdList（成员关系单独落 staff_group_members，本表不存）。
     fetch: (w, ctx) =>
-      fetchAll('staff.group.list.new', { staff: true }, STAFF_GROUP_COLS, ctx, new Date().toISOString()),
+      fetchAll('staff.group.list.new', { staff: true }, STAFF_GROUP_COLS, ctx, nowIsoOf(ctx)),
   },
   {
     id: 'dim.staff_group_members', table: 'staff_group_members', kind: 'snapshot',
@@ -85,7 +86,7 @@ export const DIM_TASKS: SyncTask[] = [
     // 不用 staff.group.members 接口（实测 9/33 组缺人）。
     fetch: async (w, ctx) => {
       void w
-      const nowIso = new Date().toISOString()
+      const nowIso = nowIsoOf(ctx)
       const res = await call(byId('staff.group.list.new'), { staff: true },
         { credentials: ctx.credentials })
       const groups = rowsOf(res, 'staff.group.list.new')
@@ -107,7 +108,7 @@ export const DIM_TASKS: SyncTask[] = [
     write: { kind: 'upsertRows' },
     // 文档标 type 必填（2=工单分类）；响应列名是 parentId，落库保持原名。
     fetch: (w, ctx) =>
-      fetchAll('category.list', { type: 2 }, CATEGORY_COLS, ctx, new Date().toISOString()),
+      fetchAll('category.list', { type: 2 }, CATEGORY_COLS, ctx, nowIsoOf(ctx)),
   },
   {
     id: 'dim.ticket_templates', table: 'ticket_templates', kind: 'snapshot',
@@ -116,7 +117,7 @@ export const DIM_TASKS: SyncTask[] = [
     write: { kind: 'upsertRows' },
     // 文档标 status 必填（-1=全部状态）；响应 status 全为 1、不携带信息 → 不建列。
     fetch: (w, ctx) =>
-      fetchAll('ticket.template.list', { status: -1 }, TEMPLATE_COLS, ctx, new Date().toISOString()),
+      fetchAll('ticket.template.list', { status: -1 }, TEMPLATE_COLS, ctx, nowIsoOf(ctx)),
   },
   {
     id: 'dim.ticket_template_fields', table: 'ticket_template_fields', kind: 'snapshot',
@@ -126,7 +127,7 @@ export const DIM_TASKS: SyncTask[] = [
     // 每模板一次调用（接口按 templateId 取字段）；行补 template_id 列（主键 template_id+fieldId，fieldId 是响应键）。
     fetch: async (w, ctx) => {
       void w
-      const nowIso = new Date().toISOString()
+      const nowIso = nowIsoOf(ctx)
       const tres = await call(byId('ticket.template.list'), { status: -1 },
         { credentials: ctx.credentials })
       const templates = rowsOf(tres, 'ticket.template.list')

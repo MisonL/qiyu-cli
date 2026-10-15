@@ -43,6 +43,10 @@ export type WindowRef = Range & { index: number; total: number }
 export interface FetchCtx {
   store: Store
   credentials: { appKey: string; appSecret: string }
+  /** 持久化限频闸门（引擎注入）：远端限频命中时任务层写冷却；缺省退化为纯等待（中-1）。 */
+  gate?: RateGate
+  /** 注入时钟（毫秒）：任务层 synchronized_at 盖章的确定性来源（低-4）；缺省真实时间。 */
+  clock?: () => number
 }
 
 /**
@@ -95,4 +99,6 @@ export interface RunCtx {
   onProgress?: (line: string) => void
   /** 显式范围覆盖（--full/--since/--until 的合成落点，Task 13 接线）；缺省从水位续跑到 clock 当前。 */
   rangeOverride?: Range
+  /** 限频等待注入点（中-2①）：gate 冷却等待的 sleep 实现；缺省真实 setTimeout，测试注入假时钟推进。 */
+  sleep?: (ms: number) => Promise<void>
 }

@@ -6,33 +6,15 @@
 // 业务字段收敛进 payload JSON 字符串列（表设计见 schema.ts 报表批次注释）。
 import { call } from '../../core/http.js'
 import { byId } from '../../core/registry/index.js'
+import { callPaced, nowIsoOf } from './pace.js'
 import type { Store } from '../../store/types.js'
 import type { SyncTask, FetchResult, FetchCtx, WindowRef } from '../types.js'
 
 /** 窗口起止的 ISO（与引擎 deleteRangeInsert 的范围值同形——T5 验收项）。 */
 const isoOf = (ms: number): string => new Date(ms).toISOString()
 
-let sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
-/** 仅测试用：替换等待实现（分页/逐客服的限频等待默认真实 30s，不可测）。 */
-export function __setSleep(fn: (ms: number) => Promise<void>): void { sleep = fn }
-
-/**
- * 带冷却重试的调用：同窗口内的第 2+ 次调用（翻页/逐客服）会撞进程内令牌桶
- *（同路径 30 秒）——真实同步里按 retryAfter 等待后重试（宁可慢，不超发）；
- * 测试经 __setSleep 注入零等待。有界重试，防冷却行坏数据导致死循环。
- */
-async function callPaced(taskId: string, body: unknown, ctx: FetchCtx, attempt = 0): Promise<{ payload: unknown }> {
-  try {
-    return await call(byId(endpointOf(taskId)), body, { credentials: ctx.credentials })
-  } catch (e) {
-    const rl = e as { code?: string; retryAfter?: { seconds?: number } }
-    if (rl.code === 'local_rate_limit' && attempt < 3) {
-      await sleep(((rl.retryAfter?.seconds ?? 30) + 1) * 1000)
-      return callPaced(taskId, body, ctx, attempt + 1)
-    }
-    throw e
-  }
-}
+/** 测试注入点收敛至共享 pace.ts（中-1）：reports/knowledge/tickets 共用同一 sleep。 */
+export { __setSleep } from './pace.js'
 
 /** 通用窗口请求体：startTime/endTime 恒为毫秒（传秒会静默降级）。 */
 function timeBody(w: WindowRef): Record<string, unknown> {
@@ -105,7 +87,7 @@ function staffRow(w: WindowRef, r: Record<string, unknown>, nowIso: string): Rec
 
 /** 分页 + per-staff 投影（staffworklod / staff_satisfaction）。 */
 async function fetchPagedStaff(taskId: string, w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
-  const nowIso = new Date().toISOString()
+  const nowIso = nowIsoOf(ctx)
   const { rows } = await pagedRaw(taskId, w, ctx)
   const mapped = rows
     .map((r) => staffRow(w, r, nowIso))
@@ -130,7 +112,7 @@ async function pagedRaw(taskId: string, w: WindowRef, ctx: FetchCtx): Promise<{
   let page = 1
   for (;;) {
     const body = { ...reportBody(taskId, w), page }
-    const res = await callPaced(taskId, body, ctx)
+    const res = await callPaced(endpointOf(taskId), body, ctx, taskId)
     const { rows, sum: s } = payloadRows(taskId, res.payload)
     if (s) sum = s
     out.push(...rows)
@@ -141,8 +123,6 @@ async function pagedRaw(taskId: string, w: WindowRef, ctx: FetchCtx): Promise<{
   }
   return { rows: out, sum }
 }
-
-/** stat_date + payload 的通用行投影（键列由各任务补齐）。 */
 
 /** 任务 id → 注册表 endpoint id。 */
 function endpointOf(taskId: string): string {
@@ -163,7 +143,7 @@ function endpointOf(taskId: string): string {
 /** 普通报表 fetch（result/全局行形态）：stat_date=窗口起点 ISO；staffId 键取不到时用 'sum' 哨兵。 */
 function fetchSimple(taskId: string, perStaff: boolean): SyncTask['fetch'] {
   return async (w, ctx) => {
-    const nowIso = new Date().toISOString()
+    const nowIso = nowIsoOf(ctx)
     const res = await call(byId(endpointOf(taskId)), reportBody(taskId, w),
       { credentials: ctx.credentials })
     const { rows, sum } = payloadRows(taskId, res.payload)
@@ -238,7 +218,7 @@ export const REPORT_TASKS: SyncTask[] = [
     // ⚠️ 请求体恒含 startTime（reportBody 已保证）——省略会静默降级为天粒度、少抓 ~10 倍。
     // 分页 total 收敛拉满（单页 pageSize=1000，31d 实测 17765 行 → 两页），再抽 hour_ts。
     fetch: async (w, ctx) => {
-      const nowIso = new Date().toISOString()
+      const nowIso = nowIsoOf(ctx)
       const { rows } = await pagedRaw('reports.staff_attendance', w, ctx)
       const mapped: Record<string, unknown>[] = []
       for (const r of rows) {
@@ -263,7 +243,7 @@ export const REPORT_TASKS: SyncTask[] = [
     // sum 全局行按 controller 裁定落同表哨兵 order_id='sum'（与 staff_quality 一致）。
     fetch: async (w, ctx) => {
       try {
-        const nowIso = new Date().toISOString()
+        const nowIso = nowIsoOf(ctx)
         const { rows, sum } = await pagedRaw('reports.order_performance', w, ctx)
         const mapped: Record<string, unknown>[] = []
         for (const r of rows) {
@@ -297,11 +277,12 @@ export const REPORT_TASKS: SyncTask[] = [
       if (ids.length === 0) {
         throw new Error('staff 表为空：staff_salary_detail 按客服驱动，请先同步 dim.staff 任务')
       }
-      const nowIso = new Date().toISOString()
+      const nowIso = nowIsoOf(ctx)
       const out: Record<string, unknown>[] = []
       for (const sid of ids) {
         const body = { ...reportBody('reports.staff_salary_detail', w), staffId: Number(sid) }
-        const res = await callPaced('reports.staff_salary_detail', body, ctx)
+        const res = await callPaced(endpointOf('reports.staff_salary_detail'), body, ctx,
+          'reports.staff_salary_detail')
         const { rows, sum } = payloadRows('reports.staff_salary_detail', res.payload)
         for (const r of rows) {
           out.push({ ...baseRow(w, r, nowIso), staff_id: sid, work_date: isoOf(w.start) })

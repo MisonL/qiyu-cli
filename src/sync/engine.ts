@@ -8,12 +8,16 @@
 //     任何一步失败整体回滚，水位绝不领先于数据；
 //   红线 1（主键业务键）：由任务声明与写策略吸收，引擎不做主键派生。
 // 单窗失败记 gap 后继续下一窗（故障隔离）；部分失败 → partial，全失败 → failed。
+// 中-2 修复（final 审查）钉进本文件的两条编排语义：
+//   ① 限频「慢不是错」：本地冷却未到点不再立即记 gap 放弃本窗 —— 按 retryAfter 等待
+//     （ctx.sleep 注入可测）后有界重试本窗；预算耗尽才记 rate_limit_local gap。
+//   ② 失败窗不越过：水位只在「连续成功窗序列」上推进 —— 失败窗截断序列后水位冻结
+//     在断链前的末端（后续窗照常执行/落库），增量续跑从冻结处回补失败窗，不再永久越过。
 //
 // T2 裁定接线：sliceByMaxWindow 在截断末窗场景会补出被前一窗重叠端完全覆盖的包含窗
 //（如 [62,63]⊂[60,63]）——引擎循环跳过 `cur.start >= prev.end − overlapMs` 的窗，
 // 省一次 API 调用，数据不变。
 // T2 低-1 防御接线：maxWindowDays ≤ 0 在引擎入口即抛（windowMs ≤ 0 无意义）。
-import type { RateGate } from './rate-gate.js'
 import type { Range } from './windowing.js'
 import type { Store, WriteTx } from '../store/types.js'
 import {
@@ -63,9 +67,6 @@ function applyEnrich(task: SyncTask, rows: Record<string, unknown>[]): {
   return { kept, dropped }
 }
 
-/** 水位值 = 窗口终点 ISO（stat_date 等语义由任务声明保证与窗口同形）。 */
-const watermarkValue = (w: Range): string => new Date(w.end).toISOString()
-
 /** 本窗 gap 落库 + 收集（独立事务：本窗已回滚，gap 不能混进失败事务）。 */
 async function storeGap(ctx: RunCtx, task: SyncTask, w: Range,
   reason: WindowGapReason, detail: string, gaps: GapInfo[]): Promise<void> {
@@ -76,9 +77,36 @@ async function storeGap(ctx: RunCtx, task: SyncTask, w: Range,
   gaps.push(info)
 }
 
-/** 单窗原子提交（红线 3）：写数据 + 推水位 + 清缺口。配对不符在此抛出 → 整体回滚。 */
+/**
+ * 限频闸门获取（中-2①「慢不是错」）：冷却中不再立即记 gap 放弃本窗 ——
+ * 按 retryAfter 等待（注入 sleep 可测）后重试 acquire，最多 GATE_WAIT_BUDGET 次；
+ * 预算耗尽才抛出（调用方记 rate_limit_local gap）。等待是纯时钟推进，不碰网络，
+ * 不会超发；预算只封顶「单窗在 gate 上空转的次数」，冷却行坏数据时有限步终止。
+ */
+const GATE_WAIT_BUDGET = 3
+
+async function acquireGated(ctx: RunCtx, taskId: string): Promise<void> {
+  for (let waits = 0; ; waits++) {
+    try {
+      await ctx.gate.acquire(taskId)
+      return
+    } catch (e) {
+      if ((e as { kind?: string }).kind !== 'rate_limit_local' || waits >= GATE_WAIT_BUDGET) throw e
+      await engineSleep(ctx, (e as { retryAfter?: number }).retryAfter ?? 1000)
+    }
+  }
+}
+
+/**
+ * 单窗原子提交（红线 3）：写数据 + 推水位 + 清缺口。配对不符在此抛出 → 整体回滚。
+ * watermarkMs（中-2②）：事务内 advanceWatermark 的推进值 = min(连续成功末端, 本窗
+ * end) 的实现形态 —— 连续成功序列上恒为本窗 end（窗按 end 升序）；断链后冻结在
+ * 失败窗之前的连续成功末端，水位绝不越过失败窗，增量续跑从冻结处回补。
+ * null = 断链且本轮尚无任何成功窗 → 不推水位（保持 markPending 的既有状态），
+ * 数据与清缺口照常提交 —— 绝不伪造推进点。红线 3 不变：推进仍在数据同一事务内。
+ */
 async function commitWindow(ctx: RunCtx, task: SyncTask, w: Range,
-  kept: Record<string, unknown>[], expected: number): Promise<number> {
+  kept: Record<string, unknown>[], expected: number, watermarkMs: number | null): Promise<number> {
   return ctx.store.transaction(async (tx) => {
     const written = await writeRows(task, tx, kept, w)
     if (written !== expected) {
@@ -87,7 +115,11 @@ async function commitWindow(ctx: RunCtx, task: SyncTask, w: Range,
         new Error(`配对核对不符：应写 ${expected} 行，实际写入 ${written} 行`),
         { code: 'count_mismatch' })
     }
-    await advanceWatermark(tx, task.id, watermarkValue(w), w, new Date(ctx.clock()).toISOString())
+    // null = 本轮尚无连续成功窗（首个窗即失败）→ 不推水位（保持 markPending 的既有
+    // 状态），只落数据与清缺口 —— 绝不伪造推进点；下次续跑从头重拉，自愈失败窗。
+    if (watermarkMs !== null) {
+      await advanceWatermark(tx, task.id, new Date(watermarkMs).toISOString(), w, new Date(ctx.clock()).toISOString())
+    }
     await clearGap(tx, task.id, String(w.start))
     return written
   })
@@ -101,8 +133,14 @@ async function fetchWithFakeEmptyRetry(task: SyncTask, ref: WindowRef, ctx: RunC
 }
 
 function fetchCtx(ctx: RunCtx): FetchCtx {
-  return { store: ctx.store, credentials: ctx.credentials }
+  // gate/clock 注入（中-1/低-4）：任务层远端限频经持久化闸门写冷却、
+  // synchronized_at 盖章走注入时钟（与引擎的确定性测试面同源）。
+  return { store: ctx.store, credentials: ctx.credentials, gate: ctx.gate, clock: ctx.clock }
 }
+
+/** 引擎层限频等待（中-2①）：默认真实 setTimeout；ctx.sleep 可注入（测试假时钟）。 */
+const engineSleep = (ctx: RunCtx, ms: number): Promise<void> =>
+  ctx.sleep !== undefined ? ctx.sleep(ms) : new Promise<void>((r) => setTimeout(r, ms))
 
 /**
  * 运行一个同步任务（spec §6.1 的 run(task)）。
@@ -116,7 +154,7 @@ export async function runTask(task: SyncTask, ctx: RunCtx): Promise<TaskRunResul
 
 /** windowed 任务：读水位 → 切窗 → 逐窗 {gate → fetch → 同事务落库/推水位/清缺口 → 核对}。 */
 async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> {
-  const { store, gate, clock } = ctx
+  const { store, clock } = ctx
   const progress = ctx.onProgress ?? (() => {})
   const gaps: GapInfo[] = []
 
@@ -155,18 +193,26 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   let failed = 0
   let fetchedTotal = 0
   let writtenTotal = 0
+  // —— 水位推进上限（中-2②：失败窗不再被水位永久越过）——
+  // contiguousEnd = 最后一个连续成功窗的 end。连续成功序列上每窗成功即推进到本窗
+  // 末；一旦出现失败窗（gate 等待超限/fetch/落库），序列断链、水位冻结在断链前
+  // 的末端（后续窗仍照常尝试执行、数据仍落库，但水位不越过失败窗）——
+  // 增量续跑从冻结处重拉失败窗，gap 可自愈。
+  let contiguousEnd: number | null = null
+  let contiguousBroken = false
 
   for (let i = 0; i < windows.length; i++) {
     const w = windows[i]
     const ref: WindowRef = { ...w, index: i, total: windows.length }
     progress(`[${task.id}] 窗口 ${i + 1}/${windows.length}: ${new Date(w.start).toISOString()} ~ ${new Date(w.end).toISOString()}`)
 
-    // —— 限频闸门（持久化冷却，未到点快速失败不碰网络）——
+    // —— 限频闸门（持久化冷却；慢不是错：等待后重试本窗，预算耗尽才记 gap）——
     try {
-      await gate.acquire(task.id)
+      await acquireGated(ctx, task.id)
     } catch (e) {
       if ((e as { kind?: string }).kind === 'rate_limit_local') {
         failed++
+        contiguousBroken = true
         await storeGap(ctx, task, w, 'rate_limit_local', (e as Error).message, gaps)
         continue
       }
@@ -179,6 +225,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       fetchRes = await fetchWithFakeEmptyRetry(task, ref, ctx)
     } catch (e) {
       failed++
+      contiguousBroken = true
       await storeGap(ctx, task, w, 'fetch_failed', (e as Error).message, gaps)
       continue
     }
@@ -191,11 +238,15 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     const { kept } = applyEnrich(task, fetchRes.rows)
     fetchedTotal += fetchRes.rows.length
     const expected = fetchRes.apiCount !== undefined ? fetchRes.apiCount : kept.length
+    // 推进值（中-2②）：未断链 = 本窗 end（连续成功序列上前进）；断链后冻结在
+    // 断链前的连续成功末端（可能为本轮首窗前 → null → 不推水位）。
+    const watermarkMs = contiguousBroken ? contiguousEnd : w.end
     let written = 0
     try {
-      written = await commitWindow(ctx, task, w, kept, expected)
+      written = await commitWindow(ctx, task, w, kept, expected, watermarkMs)
     } catch (e) {
       failed++
+      contiguousBroken = true
       const isMismatch = (e as { code?: string }).code === 'count_mismatch'
       // 行数统计口径（brief 钉死用例）：mismatch 时 written 记「应写行数」（kept）——
       // 实际行已随事务回滚，计入的是本窗参与核对的落库意图行数。
@@ -204,6 +255,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
         (e as Error).message, gaps)
       continue
     }
+    if (!contiguousBroken) contiguousEnd = w.end
 
     // —— gapHint（如 order_performance 的 orders:null 筛选失败，spec §5.2）：成功窗也落提示 ——
     // T5 裁定（T7 接线）：透传 hint 的原始 reason（filter_matched_no_staff 等），
@@ -231,7 +283,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
 
 /** snapshot 任务：单次全量拉取 → 一个事务内全删重插 + 推水位（spec §5.4）。 */
 async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> {
-  const { store, gate, clock } = ctx
+  const { store, clock } = ctx
   const progress = ctx.onProgress ?? (() => {})
   const gaps: GapInfo[] = []
   const now = clock()
@@ -239,7 +291,7 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   const ref: WindowRef = { start: 0, end: now, index: 0, total: 1 }
 
   try {
-    await gate.acquire(task.id)
+    await acquireGated(ctx, task.id)
   } catch (e) {
     if ((e as { kind?: string }).kind === 'rate_limit_local') {
       await storeGap(ctx, task, resolvedRange, 'rate_limit_local', (e as Error).message, gaps)
@@ -328,7 +380,7 @@ function skipContained(windows: Range[], overlapMs: number): Range[] {
  * 单任务请用 runTask；本函数面向 REPORT_TASKS 这类 reportDayRotation 批量入口。
  */
 export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRunResult[]> {
-  const { store, gate, clock } = ctx
+  const { store, clock } = ctx
   const progress = ctx.onProgress ?? (() => {})
 
   // —— 各任务的范围合成与切窗（与 runWindowed 同口径）——
@@ -336,6 +388,8 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
     task: SyncTask; windows: Range[]; state: Awaited<ReturnType<typeof readWatermark>>
     resolvedRange: Range
     gaps: GapInfo[]; succeeded: number; failed: number; fetched: number; written: number
+    // 中-2②（同 runWindowed）：连续成功末端 + 断链标记 —— 失败窗后水位冻结。
+    contiguousEnd: number | null; contiguousBroken: boolean
   }> = []
   for (const task of tasks) {
     if (task.kind !== 'windowed') throw new RangeError(`轮转调度只接受 windowed 任务：${task.id}`)
@@ -355,7 +409,8 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
       ? []
       : skipContained(sliceByMaxWindow(resolvedRange, task.maxWindowDays, task.overlapDays ?? 0), overlapMs)
     await store.transaction(async (tx) => { await markPending(tx, task.id, state) })
-    plans.push({ task, windows, state, resolvedRange, gaps: [], succeeded: 0, failed: 0, fetched: 0, written: 0 })
+    plans.push({ task, windows, state, resolvedRange, gaps: [], succeeded: 0, failed: 0, fetched: 0, written: 0,
+      contiguousEnd: null, contiguousBroken: false })
   }
 
   const maxRounds = plans.reduce((m, p) => Math.max(m, p.windows.length), 0)
@@ -370,12 +425,13 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
       const ref: WindowRef = { ...w, index: round, total: windows.length }
       progress(`[${task.id}] 轮转 round ${round + 1}/${maxRounds}: ${new Date(w.start).toISOString()} ~ ${new Date(w.end).toISOString()}`)
 
-      // 限频闸门（同 runWindowed）
+      // 限频闸门（同 runWindowed：慢不是错，等待后重试，预算耗尽才记 gap）
       try {
-        await gate.acquire(task.id)
+        await acquireGated(ctx, task.id)
       } catch (e) {
         if ((e as { kind?: string }).kind === 'rate_limit_local') {
           plan.failed++
+          plan.contiguousBroken = true
           await storeGap(ctx, task, w, 'rate_limit_local', (e as Error).message, plan.gaps)
           continue
         }
@@ -388,6 +444,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
         fetchRes = await fetchWithFakeEmptyRetry(task, ref, ctx)
       } catch (e) {
         plan.failed++
+        plan.contiguousBroken = true
         await storeGap(ctx, task, w, 'fetch_failed', (e as Error).message, plan.gaps)
         continue
       }
@@ -395,12 +452,17 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
       const { kept } = applyEnrich(task, fetchRes.rows)
       plan.fetched += fetchRes.rows.length
       const expected = fetchRes.apiCount !== undefined ? fetchRes.apiCount : kept.length
+      // 推进值（中-2②，同 runWindowed）：未断链 = 本窗 end；断链后冻结在连续成功末端
+      //（可能为 null → 不推水位）。
+      const watermarkMs = plan.contiguousBroken ? plan.contiguousEnd : w.end
       try {
-        const written = await commitWindow(ctx, task, w, kept, expected)
+        const written = await commitWindow(ctx, task, w, kept, expected, watermarkMs)
         plan.written += written
         plan.succeeded++
+        if (!plan.contiguousBroken) plan.contiguousEnd = w.end
       } catch (e) {
         plan.failed++
+        plan.contiguousBroken = true
         const isMismatch = (e as { code?: string }).code === 'count_mismatch'
         plan.written += kept.length
         await storeGap(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',

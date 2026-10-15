@@ -11,6 +11,7 @@
 //      为 E 的 JOIN 铺路；哨兵值「未分类」「无效会话」是中文单段值，归一化不触及。
 // 列投影按 TABLES sessions 列集（payload 收敛 + 键列/时间列/PII 敏感列提升）。
 import { runExportPipeline } from './pipeline.js'
+import { nowIsoOf } from './pace.js'
 import type { SyncTask, FetchResult, FetchCtx } from '../types.js'
 
 const isoOf = (ms: number): string => new Date(ms).toISOString()
@@ -79,7 +80,7 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
   if (!sctx.fetchZip) {
     throw new Error('sessions.export 需要 fetchZip 注入（下载走 ZIP 二进制通道，与 JSON 信封层不同构）——生产接线归 sync run 编排层')
   }
-  const nowIso = new Date().toISOString()
+  const nowIso = nowIsoOf(ctx)
   const { sessions } = await runExportPipeline(w, {
     credentials: ctx.credentials,
     fetchZip: sctx.fetchZip,
