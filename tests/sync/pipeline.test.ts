@@ -109,9 +109,12 @@ const le = (v: number, bytes: number): Uint8Array => {
   return a
 }
 
-/** 多文件 ZipCrypto 加密 zip（deflate 方法，无数据描述符）—— 测试合成专用。
- * entries 顺序即容器内条目顺序（message.txt 在前的用例靠它构造）。 */
-function makeEncryptedZip(entries: Array<{ name: string; content: string }>, password: string): Uint8Array {
+/** 多文件 ZipCrypto 加密 zip（deflate 方法）—— 测试合成专用。
+ * entries 顺序即容器内条目顺序（message.txt 在前的用例靠它构造）。
+ * bit3=true 时本地头 crc/csize 置 0、置数据描述符标志位，真实 crc 只写在 central directory
+ *（D 中-1：实现必须回中央目录取真 crc 校验密码，否则错密码静默吐乱码）。 */
+function makeEncryptedZip(entries: Array<{ name: string; content: string }>, password: string,
+  bit3 = false): Uint8Array {
   const bodies: Uint8Array[] = []
   const cds: Uint8Array[] = []
   let offset = 0
@@ -121,12 +124,12 @@ function makeEncryptedZip(entries: Array<{ name: string; content: string }>, pas
     const lfh = new Uint8Array(30 + nameBytes.length)
     lfh.set([0x50, 0x4B, 0x03, 0x04])
     lfh.set(le(20, 2), 4)        // version
-    lfh.set(le(0x0001, 2), 6)    // flags: bit0 加密
+    lfh.set(le(bit3 ? 0x0009 : 0x0001, 2), 6)   // flags: bit0 加密（+bit3 数据描述符）
     lfh.set(le(8, 2), 8)         // method deflate
     lfh.set(le(0, 4), 10)        // time/date
-    lfh.set(le(crc, 4), 14)      // crc（无数据描述符，直接写）
-    lfh.set(le(enc.length, 4), 18)
-    lfh.set(le(rawLen, 4), 22)
+    lfh.set(le(bit3 ? 0 : crc, 4), 14)          // bit3 时本地头 crc=0（真实值在中央目录）
+    lfh.set(le(bit3 ? 0 : enc.length, 4), 18)   // bit3 时本地头 csize=0
+    lfh.set(le(bit3 ? 0 : rawLen, 4), 22)       // bit3 时本地头 usize=0
     lfh.set(le(nameBytes.length, 2), 26)
     lfh.set(le(0, 2), 28)
     lfh.set(nameBytes, 30)
@@ -195,6 +198,21 @@ describe('parseJsonl（Review Focus 4 钉死）', () => {
     expect(ok.tailSkipped).toBe(false)
     expect(() => parseJsonl('not json at all')).toThrow()
   })
+
+  it('F 中-1：解析失败的错误消息只带行号/长度，绝不回显行原文（PII 红线）', () => {
+    const pii = JSON.stringify({ id: 1, userPhone: '13800001111', userName: '张三', fromIp: '1.2.3.4' })
+    let msg = ''
+    try {
+      parseJsonl(`${JSON.stringify({ id: 0 })}\n{broken ${pii}`)
+    } catch (e) { msg = (e as Error).message }
+    expect(msg).toMatch(/第 2 行/)
+    expect(msg).toMatch(/不回显/)
+    // 行内容（PII 片段）绝不能出现在错误消息里
+    expect(msg).not.toContain('13800001111')
+    expect(msg).not.toContain('张三')
+    expect(msg).not.toContain('1.2.3.4')
+    expect(msg).not.toContain(pii)
+  })
 })
 
 describe('zip 解压（密码 = appKey 前 12 字符）', () => {
@@ -224,6 +242,22 @@ describe('zip 解压（密码 = appKey 前 12 字符）', () => {
   it('zip 内没有 session.txt → 显式抛错（不静默取第一个条目）', async () => {
     const zip = makeEncryptedZip([{ name: 'message.txt', content: 'x' }], APP_KEY.slice(0, 12))
     await expect(unzipPasswordZip(zip, APP_KEY)).rejects.toThrow(/session.txt/)
+  })
+
+  it('D 中-1：bit3 数据描述符（本地头 crc=0）→ 真密码仍可解（crc 从中央目录取）', async () => {
+    const zip = makeEncryptedZip(
+      [{ name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n` }],
+      APP_KEY.slice(0, 12), true)
+    const text = await unzipPasswordZip(zip, APP_KEY)
+    const r = parseJsonl(text)
+    expect(r.rows).toEqual([SESSION_ROW])
+  })
+
+  it('D 中-1：bit3 数据描述符 + 错密码 → 显式失败（绝不静默吐乱码）', async () => {
+    const zip = makeEncryptedZip(
+      [{ name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n` }],
+      APP_KEY.slice(0, 12), true)
+    await expect(unzipPasswordZip(zip, 'wrong-password-xx')).rejects.toThrow(/密码错误/)
   })
 })
 
@@ -258,6 +292,81 @@ describe('runExportPipeline —— 四步流水线 mock', () => {
       }))
       expect(fetchMock.mock.calls.length).toBe(3)
       expect(r.sessions).toEqual([SESSION_ROW])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('D 中-2：窗口无效（start==end / start>end / 非有限数）→ usage、零请求', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const base = pipeCtx(store, {
+        credentials: { appKey: APP_KEY, appSecret: 'test-secret' },
+        fetchZip: async () => new Uint8Array(),
+        pollIntervalMs: 0,
+      })
+      await expect(runExportPipeline({ start: DAY, end: DAY }, base)).rejects.toMatchObject({ kind: 'usage' })
+      await expect(runExportPipeline({ start: DAY, end: 0 }, base)).rejects.toMatchObject({ kind: 'usage' })
+      await expect(runExportPipeline({ start: Number.NaN, end: DAY }, base)).rejects.toMatchObject({ kind: 'usage' })
+      expect(fetchMock.mock.calls.length, '本地参数问题绝不发请求').toBe(0)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('D 中-2：create 载荷无可用 message（形态漂移）→ 显式失败', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({
+      code: 200, message: 'OK',   // 无 data、message 是 'OK'（占位）→ messageOf 无可用载荷
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))))
+    try {
+      const store = await fresh()
+      await expect(runExportPipeline({ start: 0, end: DAY }, pipeCtx(store, {
+        credentials: { appKey: APP_KEY, appSecret: 'test-secret' },
+        fetchZip: async () => new Uint8Array(),
+        pollIntervalMs: 0,
+      }))).rejects.toThrow(/message 载荷/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('D 中-2：导出 zip 未加密（bit0 缺失）→ 显式失败（注册表假设失效可见）', async () => {
+    // 明文 zip：本地头无 bit0（直接 deflateSync，不加密）
+    const content = `${JSON.stringify(SESSION_ROW)}\n`
+    const comp = deflateSync(strToU8(content), { level: 6 })
+    const nameBytes = strToU8('session.txt')
+    const lfh = new Uint8Array(30 + nameBytes.length)
+    lfh.set([0x50, 0x4B, 0x03, 0x04])
+    lfh.set(le(20, 2), 4)
+    lfh.set(le(0, 2), 6)            // flags = 0：未加密
+    lfh.set(le(8, 2), 8)
+    lfh.set(le(crc32(strToU8(content)), 4), 14)
+    lfh.set(le(comp.length, 4), 18)
+    lfh.set(le(strToU8(content).length, 4), 22)
+    lfh.set(le(nameBytes.length, 2), 26)
+    lfh.set(nameBytes, 30)
+    const zip = new Uint8Array(lfh.length + comp.length)
+    zip.set(lfh); zip.set(comp, lfh.length)
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
+        code: 200, message: 'task-key-0009',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })))
+      .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
+        code: 200, message: 'https://qiyukf.com/export/plain.zip',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      await expect(runExportPipeline({ start: 0, end: DAY }, pipeCtx(store, {
+        credentials: { appKey: APP_KEY, appSecret: 'test-secret' },
+        fetchZip: async () => zip,
+        pollIntervalMs: 0,
+      }))).rejects.toThrow(/未加密/)
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -308,6 +417,17 @@ describe('SESSIONS_TASKS 任务声明', () => {
     expect(e(mk(1, -1000002))).toMatchObject({ session_id: '1', session_type: 'robot' })
     expect(e(mk(2, -1))).toMatchObject({ session_id: '2', session_type: 'internal' })
     expect(e(mk(3, 1000002))).toMatchObject({ session_id: '3', session_type: 'human' })
+  })
+
+  it('enrich（C 中-6/C 低-7）：staffId=0 不静默判 human（未知形态落 null）；空串/缺 id 行丢弃', () => {
+    const t = sessionsById('sessions.export')!
+    const e = t.enrich!
+    // staffId=0 是实测样本中从未出现的形态：静默归 human 会伪造「人工接待」的事实
+    expect(e({ session_id: '4', staffId: '0' })).toMatchObject({ session_type: null })
+    expect(e({ session_id: '5', staffId: 0 })).toMatchObject({ session_type: null })
+    // 空串/缺 id 行：丢弃且不计入 fetched（返回 null）
+    expect(e({ session_id: '', staffId: '1000002' })).toBeNull()
+    expect(e({ staffId: '1000002' })).toBeNull()
   })
 
   it('enrich：categoryDetail "a / b / c / d" → "a/b/c/d"（归一化），且同输入同输出（确定性）', async () => {

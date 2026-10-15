@@ -19,6 +19,9 @@ const isoOf = (ms: number): string => new Date(ms).toISOString()
 const strOrNull = (v: unknown): string | null =>
   v === null || v === undefined ? null : typeof v === 'string' ? v : JSON.stringify(v)
 
+/** 空串主键/键列拒绝（C 低-7）：`''` 是合法的 VARCHAR 值，会写出一行能被反复覆盖的同键行。 */
+const isEmptyKey = (v: unknown): boolean => v === null || v === undefined || v === ''
+
 /** categoryDetail 归一化："a / b / c / d" → "a/b/c/d"（导出 " / " 带空格 → /one 无空格）。 */
 export function normalizeCategoryDetail(v: unknown): string | null {
   if (v === null || v === undefined || v === '') return null
@@ -30,13 +33,17 @@ export function normalizeCategoryDetail(v: unknown): string | null {
  * session_type 判别（设计稿 §7.5：staffId 是唯一精确字段）：
  * staffId 数字 < -1 → robot；== -1 → internal；> 0 → human。
  * staffId 落库为 VARCHAR —— 判别必须基于数字比较（字符串比较会判错负数）。
+ * ⚠️ C 中-6：`staffId === 0` **不得**静默落成 'human' —— 0 不是任何已知的判别分支
+ *（实测样本只有 < -1 / == -1 / > 0 三类，0 从未出现），静默归到 human 会伪造出一个
+ * 「人工接待」的事实。按「未知形态」显式落 null，让该行在按 session_type 过滤时可见地缺失。
  */
 export function deriveSessionType(staffId: unknown): string | null {
-  if (staffId === null || staffId === undefined || staffId === '') return null
+  if (isEmptyKey(staffId)) return null
   const n = Number(staffId)
   if (!Number.isFinite(n)) return null
   if (n < -1) return 'robot'
   if (n === -1) return 'internal'
+  if (n === 0) return null   // 未知形态：不猜（C 中-6）
   return 'human'
 }
 
@@ -45,7 +52,8 @@ export function deriveSessionType(staffId: unknown): string | null {
  *（fetch 在进 enrich 前统一盖章，enrich 直测两调用相等）；输入无戳则为 null（列可空）。 */
 function sessionRow(src: Record<string, unknown>): Record<string, unknown> | null {
   const id = src.id ?? src.session_id
-  if (id === null || id === undefined) return null   // 键缺失行：丢弃且不计入 fetched（与 apiCount 口径一致）
+  // 键缺失/空串行：丢弃且不计入 fetched（与 apiCount 口径一致；C 低-7）
+  if (isEmptyKey(id)) return null
   return {
     session_id: String(id),
     payload: JSON.stringify(src),
@@ -86,6 +94,9 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
     fetchZip: sctx.fetchZip,
     pollIntervalMs: sctx.pollIntervalMs,
     maxPolls: sctx.maxPolls,
+    // B 高-1：gate/clock 传进流水线 —— create/check 的远端限频要落持久化冷却行。
+    gate: ctx.gate,
+    clock: ctx.clock,
   })
   // synchronized_at 在 fetch 侧按窗统一盖章（单值、确定性于本窗）——enrich 是纯投影
   //（红线 1：同输入行永远同输出），只透传该戳；原始行直出（session.id 键、未投影）。
@@ -110,6 +121,8 @@ export const SESSIONS_TASKS: SyncTask[] = [
     // 水位 endTime：导出按 endTime 过滤（按 startTime 会漏——实测 14/17 行越界）
     watermark: { field: 'endTime', initial: null },
     primaryKey: ['session_id'],
+    // 闸门键 = 主驱动路径（create 是限频的那一个：10 秒 6 次）；check 显式登记为无限频。
+    endpoint: 'export.session',
     write: { kind: 'upsertRows' },
     fetch: fetchSessions,
     enrich: enrichSession,
