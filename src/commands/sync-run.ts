@@ -3,8 +3,11 @@
 //   ① fetchZip 生产接线：sessions 任务的下载通道在本层注入 —— 全局 fetch 拉 ZIP 二进制
 //      （下载链接是带签名的临时 URL，服务端已授权，不附加 query；凭证缺失在编排入口
 //      已显式失败，管线不会进入）。
-//   ② 任务排序：显式拓扑序 —— dim → reports/tickets/sessions（windowed）→ knowledge
-//     （items/points 先于 categories，驱动序来自 items 落库；显式排序不靠报错兜底）。
+//   ② 任务排序：显式拓扑序 + 分组交错 —— 按 orderTasks 的 rank 分层执行（层间升序、
+//     层内 rotated 批（runRotated）先行 + plain 逐个）：dim(0) → reports/tickets/
+//     sessions(1) → knowledge（items/points(2) 先于 categories(3)，驱动序来自 items
+//     落库；显式排序不靠报错兜底）。dim 先于报表是硬约束：staff_salary_detail 按
+//     staff 表逐客服驱动，缺 dim 首跑必败。
 //   ③ robotId 注入：StoreConfig.options.knowledgeRobotIds（number[]）在配置层透传、
 //      本层传给 categories 任务消费（发现盲区的手工兜底路径）。
 //   ④ --pretty 统一裁决：沿 api.ts 族——承诺过、未实现的 flag 一律 usageFail 显式拒绝，
@@ -88,19 +91,23 @@ export function parseTimeArg(arg: string, clock: () => number,
 }
 
 /**
- * 显式任务排序（审查裁定：不靠报错兜底）。
+ * 任务分层 rank（orderTasks 与执行分层共用的唯一来源，审查裁定：不靠报错兜底）。
  * 键序：dim(0) → windowed 报表/工单/会话(1) → knowledge.items/points(2) →
  * knowledge.categories(3，驱动序来自 items 落库)。
- * 调用方传入的任务 id 顺序仅决定同键内次序；缺省（全量跑）按注册表声明序。
+ */
+function taskRank(t: SyncTask): number {
+  if (t.id.startsWith('dim.')) return 0
+  if (t.id === 'knowledge.categories') return 3
+  if (t.id.startsWith('knowledge.')) return 2
+  return 1
+}
+
+/**
+ * 显式任务排序：按 taskRank 分层（键序见上）。
+ * 调用方传入的任务 id 顺序仅决定同层内次序（sort 稳定）；缺省（全量跑）按注册表声明序。
  */
 export function orderTasks(tasks: SyncTask[]): SyncTask[] {
-  const rank = (t: SyncTask): number => {
-    if (t.id.startsWith('dim.')) return 0
-    if (t.id === 'knowledge.categories') return 3
-    if (t.id.startsWith('knowledge.')) return 2
-    return 1
-  }
-  return [...tasks].sort((a, b) => rank(a) - rank(b))
+  return [...tasks].sort((a, b) => taskRank(a) - taskRank(b))
 }
 
 /** fetchZip 生产接线（T10 报告的接线义务）：全局 fetch 拉 ZIP 二进制字节。 */
@@ -316,19 +323,26 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       ? (line: string): void => { process.stderr.write(line + '\n') }
       : undefined
 
-    // —— 分组执行：reportDayRotation 批量走轮转，其余逐任务 ——
-    const rotated = selected.filter((t) => t.reportDayRotation)
-    const plain = selected.filter((t) => !t.reportDayRotation)
-      .map((t) => wireCategories(wireSessions(t, {}), robotIds, clock))
-
+    // —— 分层交错执行（高-1 修复）：selected 已按 taskRank 有序，这里按 rank 分段 ——
+    // 每段内：reportDayRotation 批走 runRotated（同一天背靠背、避开同路径 30s 冷却），
+    // 其余逐个 runTask。段间严格串行 ⇒ rank=0 的 dim 先落库，rank=1 的报表才驱动
+    // staff 表（staff_salary_detail 缺 dim 首跑必败），knowledge 的 items/points(2)
+    // 先于 categories(3)。两组不再整体前后排列（那会把 dim 排到报表之后）。
     const results: TaskRunResult[] = []
-    if (rotated.length > 0) {
-      results.push(...await runRotated(rotated, {
-        ...ctxBase, rangeOverride, onProgress,
-      }))
-    }
-    for (const t of plain) {
-      results.push(await runTask(t, { ...ctxBase, rangeOverride, onProgress }))
+    const ranks = [...new Set(selected.map((t) => taskRank(t)))].sort((a, b) => a - b)
+    for (const rank of ranks) {
+      const layer = selected.filter((t) => taskRank(t) === rank)
+      const rotated = layer.filter((t) => t.reportDayRotation)
+      const plain = layer.filter((t) => !t.reportDayRotation)
+        .map((t) => wireCategories(wireSessions(t, {}), robotIds, clock))
+      if (rotated.length > 0) {
+        results.push(...await runRotated(rotated, {
+          ...ctxBase, rangeOverride, onProgress,
+        }))
+      }
+      for (const t of plain) {
+        results.push(await runTask(t, { ...ctxBase, rangeOverride, onProgress }))
+      }
     }
 
     // —— 输出（spec §七）——

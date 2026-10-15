@@ -5,6 +5,8 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { syncCommand } from '../../src/commands/sync.js'
+import { orderTasks } from '../../src/commands/sync-run.js'
+import { taskById, SYNC_TASKS } from '../../src/sync/registry.js'
 import { __setPlatform, __setRun, __resetScheduleDeps } from '../../src/schedule/install.js'
 import { advanceWatermark, markPending, recordGap } from '../../src/sync/state.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
@@ -385,6 +387,62 @@ describe('sync run —— store 与凭证前置检查', () => {
 })
 
 describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注入）', () => {
+  it('orderTasks 分层 rank：dim(0) < 报表/工单/会话(1) < knowledge.items/points(2) < categories(3)', () => {
+    // 直接单测（final 审查高-1：此前 orderTasks 无直接测试）。
+    // 故意乱序传入，断言输出严格按 rank 分层、同层内保持输入相对次序（稳定排序）。
+    const t = (id: string) => taskById(id)!
+    const ordered = orderTasks([
+      t('knowledge.categories'), t('reports.overview'), t('knowledge.items'),
+      t('tickets.search'), t('dim.staff'), t('sessions.export'),
+      t('knowledge.points'), t('dim.ticket_templates'),
+    ])
+    expect(ordered.map((x) => x.id)).toEqual([
+      'dim.staff', 'dim.ticket_templates',          // rank 0（输入序保持）
+      'reports.overview', 'tickets.search', 'sessions.export',   // rank 1
+      'knowledge.items', 'knowledge.points',        // rank 2
+      'knowledge.categories',                       // rank 3
+    ])
+  })
+
+  it('缺省全量：执行序 dim 在报表之前（staff_salary_detail 按 staff 表驱动，分层交错修复高-1）', { timeout: 120000 }, async () => {
+    // 用 stderr 进度行捕获真实执行序：runSyncRun 的 onProgress 写 stderr（beforeEach
+    // 已 mock 进 err），逐行抽 "[taskId] " 得到任务首次执行的顺序。--since 1d 控制窗数。
+    // stat 域全抛错让报表任务失败（不影响排序断言），其余任务 mock 正常。
+    const fetchMock = vi.fn().mockImplementation((url: unknown) => {
+      const u = String(url)
+      if (u.includes('/openapi/statistic/')) throw new Error('fetch failed')   // 报表 9 任务
+      if (u.includes('robot/data/knowledge')) return okC({ total: 0, data: [], isEnd: 1 })
+      if (u.includes('robot/data/kpoint')) return okC({ total: 0, data: [], isEnd: 1 })
+      if (u.includes('getCategoryTree')) return okA([])   // 空树
+      return okA([{ id: 1000001, name: '测试' }])          // 维表/组（形状 A）
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      const code = await syncCommand(['run', '--db', dbPath(), '--since', '1d'])
+      expect(code).toBe(0)   // dim/knowledge 成功 → 部分成功退 0
+      const seen: string[] = []
+      for (const m of err.matchAll(/\[([a-z_.]+)\] /g)) {
+        const id = m[1]!
+        if (!seen.includes(id)) seen.push(id)
+      }
+      // 分层交错铁律（高-1）：全部 dim 先于任何报表；knowledge.items 先于 categories。
+      const dimIdx = seen.findIndex((x) => x.startsWith('dim.'))
+      const reportIdx = seen.findIndex((x) => x.startsWith('reports.'))
+      expect(dimIdx).toBeGreaterThanOrEqual(0)
+      expect(reportIdx).toBeGreaterThan(dimIdx)
+      // 钉死用例锚点：staff_salary_detail（staff 表驱动的报表）在 dim.staff 之后执行
+      expect(seen.indexOf('reports.staff_salary_detail'))
+        .toBeGreaterThan(seen.indexOf('dim.staff'))
+      expect(seen.indexOf('knowledge.items'))
+        .toBeLessThan(seen.indexOf('knowledge.categories'))
+      // 修复前形态（rotated 全批先跑）会让 dim 排在 reports 之后——用相对序反向断言：
+      expect(seen.indexOf('reports.overview')).toBeGreaterThan(dimIdx)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('sessions.export 端到端：fetchZip 生产接线生效（mock create/check/zip 下载三段）', async () => {
     // 下载 URL mock：fetchZip 用全局 fetch 拉 zip —— 返回一个未加密、未压缩容量的假 zip 不可行，
     // 生产 fetchZip 只负责下载字节；解压密码错误在 unzip 阶段显式失败 —— 这里断言
