@@ -24,6 +24,10 @@ import type { Store, StoreConfig } from '../../src/store/types.js'
 vi.setConfig({ testTimeout: 15_000 })
 
 const DAY = 86_400_000
+/** 固定时钟（2023-11-14T22:13:20Z）：窗口一律相对 NOW 表达 ——
+ * 修复批 1 起 tickets 声明了 windowStartFloorDays=31（C 中-2），
+ * 相对 1970 的小毫秒窗口会被下界/守卫正确拒绝，测试必须用真实量级的时间戳。 */
+const NOW = 1_700_000_000_000
 
 let dir = ''
 let cfg: StoreConfig
@@ -45,10 +49,18 @@ function ctx(store: Store, over: Partial<RunCtx> = {}): RunCtx {
     store,
     credentials: { appKey: 'test-key', appSecret: 'test-secret' },
     gate: new RateGate(store, () => 0),
-    clock: () => 1_700_000_000_000,
-    rangeOverride: over.rangeOverride ?? { start: 0, end: DAY },
+    clock: () => NOW,
+    // 缺省走「有真实起点的 1 天窗」（op 守卫要求 start>0）。
+    rangeOverride: over.rangeOverride ?? { start: NOW - DAY, end: NOW },
     ...over,
   }
+}
+
+/** 无 rangeOverride 的上下文（水位续跑 / 首跑下界路径）。 */
+function ctxNoOverride(store: Store, over: Partial<RunCtx> = {}): RunCtx {
+  const c = ctx(store, over)
+  delete c.rangeOverride
+  return c
 }
 
 describe('schema v6 迁移 —— tickets / ticket_logs 两张表', () => {
@@ -107,9 +119,11 @@ describe('op 参数守卫（Review Focus 1 钉死：客户端 usage，零请求�
       // 三种静默全量形态：opEnd 缺失、opEnd=0、opStart>opEnd（顺序颠倒）。
       // 守卫在 fetch 内部构造 body 之前 —— 引擎与 T13 编排层同样被拦。
       for (const [label, ref] of [
-        ['opEnd 缺失', { start: 0, index: 0, total: 1 } as unknown as WindowRef],
-        ['opEnd=0', { start: 0, end: 0, index: 0, total: 1 } as WindowRef],
-        ['顺序颠倒', { start: DAY, end: 0, index: 0, total: 1 } as WindowRef],
+        ['opEnd 缺失', { start: NOW - DAY, index: 0, total: 1 } as unknown as WindowRef],
+        ['opEnd=0', { start: NOW - DAY, end: 0, index: 0, total: 1 } as WindowRef],
+        ['顺序颠倒', { start: NOW, end: NOW - DAY, index: 0, total: 1 } as WindowRef],
+        // C 中-2：opStart=0（1970 哨兵）同样必须拦下 —— 服务端会静默钳到 now−31d
+        ['opStart<=0', { start: 0, end: NOW, index: 0, total: 1 } as WindowRef],
       ] as Array<[string, WindowRef]>) {
         await expect(t.fetch(ref, { store, credentials: cred }), label)
           .rejects.toMatchObject({ kind: 'usage' })
@@ -150,7 +164,7 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
     try {
       const store = await fresh()
       const r = await runTask(ticketById('tickets.search')!, ctx(store, {
-        rangeOverride: { start: 0, end: 90 * DAY },
+        rangeOverride: { start: NOW - 90 * DAY, end: NOW },
       }))
       expect(r.windows.total).toBe(4)
       expect(r.status).toBe('complete')
@@ -162,10 +176,10 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
 
   it('回看重叠 3 天：预置水位后续跑，首个窗口起点 = watermark − 3 天', async () => {
     const store = await fresh()
-    // 预置水位在 10d（上一轮已同步到 10d）
+    // 预置水位在 NOW − 10 天（上一轮已同步到那里）
     await store.transaction(async (tx) => {
-      await advanceWatermark(tx, 'tickets.search', new Date(10 * DAY).toISOString(),
-        { start: 0, end: 10 * DAY }, new Date().toISOString())
+      await advanceWatermark(tx, 'tickets.search', new Date(NOW - 10 * DAY).toISOString(),
+        { start: 0, end: NOW - 10 * DAY }, new Date().toISOString())
     })
     const starts: number[] = []
     vi.stubGlobal('fetch', vi.fn(() => okC({ total: 0, tickets: [] })))
@@ -173,11 +187,53 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
       const t: SyncTask = { ...ticketById('tickets.search')! }
       const orig = t.fetch
       t.fetch = async (w, c) => { starts.push(w.start); return orig(w, c) }
-      await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 14 * DAY } }))
-      // 水位 10d，3 天回看 → 首窗起点 = 水位续跑起点（watermark+1ms）− 3 天 = 7d+1ms
-      expect(starts[0]).toBe(7 * DAY + 1)
+      // 无显式区间 → 水位续跑路径（B 中-5：显式区间优先于水位，这里刻意不给区间）
+      await runTask(t, ctxNoOverride(store))
+      // 水位 NOW−10d，3 天回看 → 首窗起点 = (水位+1ms) − 3 天 = NOW − 13d + 1ms
+      expect(starts[0]).toBe(NOW - 13 * DAY + 1)
       expect((await readWatermark(store, 'tickets.search')).watermark)
-        .toBe(new Date(14 * DAY).toISOString())
+        .toBe(new Date(NOW).toISOString())
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 中-2：首跑（水位为空、无显式区间）起点抬到 now − 31 天，不再发 opStart=0', async () => {
+    const store = await fresh()
+    const bodies: Array<Record<string, unknown>> = []
+    vi.stubGlobal('fetch', vi.fn((_url: unknown, init: unknown) => {
+      bodies.push(JSON.parse(String((init as { body?: string }).body ?? '{}')) as Record<string, unknown>)
+      return okC({ total: 0, tickets: [] })
+    }))
+    try {
+      const r = await runTask(ticketById('tickets.search')!, ctxNoOverride(store))
+      expect(r.status).toBe('complete')
+      // 抬升后的起点如实回显（31 天前），绝不是 1970
+      expect(r.resolvedRange.start).toBe(NOW - 31 * DAY)
+      // 每个窗口的 opStart 都是正数（守卫不会被触发）
+      expect(bodies.length).toBeGreaterThan(0)
+      for (const b of bodies) expect(Number(b.opStart)).toBeGreaterThan(0)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 中-2：请求的 end 早于下界（--until 指向更早）→ 不抬升、显式失败落 gap（不静默 0 窗 complete）', async () => {
+    const store = await fresh()
+    vi.stubGlobal('fetch', vi.fn(() => okC({ total: 0, tickets: [] })))
+    try {
+      // end 落在下界之前 40 天 → 抬升会把「拿不到的历史」变成「0 窗 complete」；
+      // 正确行为是保持哨兵起点 → 守卫显式失败 → gap 可见。
+      const r = await runTask(ticketById('tickets.search')!, ctx(store, {
+        rangeOverride: { start: 0, end: NOW - 40 * DAY },
+      }))
+      expect(r.status).toBe('partial')
+      expect(r.resolvedRange.start).toBe(0)
+      expect(r.gaps.length).toBeGreaterThan(0)
+      expect(r.gaps[0].reason).toBe('fetch_failed')
+      expect(r.gaps[0].detail).toMatch(/op 窗口无效/)
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -193,7 +249,9 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const r = await runTask(ticketById('tickets.search')!, ctx(store))
+      const r = await runTask(ticketById('tickets.search')!, ctx(store, {
+        rangeOverride: { start: NOW - DAY, end: NOW },
+      }))
       expect(r.status).toBe('complete')
       expect(r.rows.written).toBe(3)
       expect(fetchMock.mock.calls.length).toBe(2)
@@ -220,7 +278,9 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const r = await runTask(ticketById('ticket.logs')!, ctx(store))
+      const r = await runTask(ticketById('ticket.logs')!, ctx(store, {
+        rangeOverride: { start: NOW - DAY, end: NOW },
+      }))
       expect(r.status).toBe('complete')
       expect(r.rows).toEqual({ fetched: 1, written: 1 })
       const rows = await store.query('SELECT ticket_id, log_id FROM ticket_logs')
@@ -240,12 +300,76 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const r = await runTask(ticketById('ticket.logs')!, ctx(store))
+      const r = await runTask(ticketById('ticket.logs')!, ctx(store, {
+        rangeOverride: { start: NOW - DAY, end: NOW },
+      }))
       expect(r.status, '形态漂移必须可见：引擎记 gap 后 partial，绝不静默 complete').toBe('partial')
       const gaps = await listGaps(store, 'ticket.logs')
       expect(gaps.length).toBe(1)
       expect(gaps[0].reason).toBe('fetch_failed')
       expect(gaps[0].detail).toMatch(/data 数组|null/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 中-3：分页短读（声明 total=5 只拿到 1 行 → 空页）→ 显式失败落 gap，不当合法空窗', async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => okC({ total: 5, tickets: [{ id: 900001 }] }))
+      .mockImplementationOnce(() => okC({ total: 5, tickets: [] }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(ticketById('tickets.search')!, ctx(store, {
+        rangeOverride: { start: NOW - DAY, end: NOW },
+      }))
+      expect(r.status).toBe('partial')
+      expect(r.rows.written).toBe(0)          // 本窗回滚，绝不半写
+      const gaps = await listGaps(store, 'tickets.search')
+      expect(gaps.length).toBe(1)
+      expect(gaps[0].detail).toMatch(/短读/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 中-13：total 恒大于已取行数（每页只回 1 行）→ 翻页上限终止，不无限翻页', async () => {
+    // 声明 total=3000（上限 = ceil(3000/500)+5 = 11 页），每页只回 1 行且永不收敛 ——
+    // 没有上限就是无限翻页（服务端 limit=500 精确兑现，这里模拟形态漂移）。
+    const fetchMock = vi.fn(() => okC({ total: 3000, tickets: [{ id: 900000 }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(ticketById('tickets.search')!, ctx(store, {
+        rangeOverride: { start: NOW - DAY, end: NOW },
+      }))
+      expect(r.status).toBe('partial')
+      // 有界：初次 + 10 次（上限 11 页）——绝不无限翻页
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(11)
+      const gaps = await listGaps(store, 'tickets.search')
+      expect(gaps[0].detail).toMatch(/翻页超限/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 低-7：空串/缺 id 的工单行丢弃（空串会写成能被反复覆盖的同键行）', async () => {
+    const fetchMock = vi.fn(() => okC({
+      total: 3, tickets: [{ id: '' }, { id: null }, { id: 900001 }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(ticketById('tickets.search')!, ctx(store, {
+        rangeOverride: { start: NOW - DAY, end: NOW },
+      }))
+      expect(r.status).toBe('complete')
+      expect(r.rows.written).toBe(1)
+      const rows = await store.query('SELECT ticket_id FROM tickets')
+      expect(rows.rows).toEqual([{ ticket_id: '900001' }])
       await store.close()
     } finally {
       vi.unstubAllGlobals()

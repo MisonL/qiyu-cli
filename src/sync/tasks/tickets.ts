@@ -30,11 +30,16 @@ export { __setSleep } from './pace.js'
  * 实测 {opStart: now-1d, opEnd: now} → total 100 vs {opStart: now-1d, opEnd: 0} → total 2885）；
  * opStart > opEnd（顺序颠倒）同样静默失效。三者都必须在**客户端**拦下 —— 请求发出去
  * 信封层判不出异常， Agent 会拿着全量数据误以为窗口过滤生效了。
+ * ⚠️ C 中-2：`opStart <= 0` 也必须拒绝 —— 0/负数不是真实时间戳（1970 是哨兵不是日期），
+ * 且 opStart 早于「now − 31 天」会被服务端**静默钳制**（窗口解释权交给服务端）。
+ * 首跑/--full 的起点由引擎的 `windowStartFloorDays` 抬到 now − 31 天（见任务声明），
+ * 走到这里时必然是正数；走到这里仍是 0 的，只可能是显式给了 0 起点 —— 显式失败。
  */
 function assertOpWindow(w: WindowRef): void {
   // opEnd 取 0 或缺省的形态：窗口起点非负恒成立，故 opEnd<=0 只可能是「未有效赋值」
-  if (!Number.isFinite(w.end) || w.end <= 0 || !Number.isFinite(w.start) || w.start < 0) {
-    throw usageError(`工单 op 窗口无效：opEnd 缺省或为 0 时服务端会静默返回全量（窗口 start=${w.start}, end=${w.end}）`)
+  if (!Number.isFinite(w.end) || w.end <= 0 || !Number.isFinite(w.start) || w.start <= 0) {
+    throw usageError(`工单 op 窗口无效：opEnd 缺省/为 0 时服务端会静默返回全量，` +
+      `opStart<=0（1970 哨兵）会被静默钳制（窗口 start=${w.start}, end=${w.end}）`)
   }
   if (w.start > w.end) {
     throw usageError(`工单 op 窗口顺序颠倒（opStart > opEnd 会静默失效）：start=${w.start} > end=${w.end}`)
@@ -74,10 +79,55 @@ function searchPayload(payload: unknown, endpointId: string): { total: number; t
     tickets: o.tickets as Record<string, unknown>[] }
 }
 
+/** 每页上限（实测 limit=500 精确兑现）。 */
+const PAGE_SIZE = 500
+/** 页数上限兜底（C 中-3/中-13，与 reports/knowledge 同口径）。 */
+const MAX_PAGES_FALLBACK = 1000
+
+/** 空串主键拒绝（C 低-7）：`''` 会写进 VARCHAR 主键列，且空串行还能反复覆盖同键。 */
+const isEmptyKey = (v: unknown): boolean => v === null || v === undefined || v === ''
+
+/**
+ * 窗口内工单原始行的分页拉取（tickets.search / ticket.logs 的 touched 集合同源）：
+ * limit=500 精确兑现、offset 按**返回行数**推进（不按投影后行数 —— 丢脏行不会让游标原地打转）、
+ * total 收敛即停。
+ * 终检（C 中-3）：循环退出必须满足「已取原始行数 >= 声明 total」——上游声明 total=100 却
+ * 提前返回 0 行的短读是最危险的静默失败方向（会被当合法空窗），此处显式失败。
+ * 页数上限（C 中-13）：`total 恒大于已取行数`的响应形态漂移在有限次调用后终止，绝不无限翻页。
+ */
+async function searchAllPages(w: WindowRef, ctx: FetchCtx): Promise<Record<string, unknown>[]> {
+  const raw: Record<string, unknown>[] = []
+  let declared: number | null = null
+  let offset = 0
+  for (let page = 1; ; page++) {
+    const maxPages = declared !== null ? Math.ceil(declared / PAGE_SIZE) + 5 : MAX_PAGES_FALLBACK
+    if (page > maxPages) {
+      throw new Error(`接口 ticket.search 翻页超限（${page - 1} 页 > 上限 ${maxPages}，声明 ` +
+        `total=${String(declared)}，已取 ${raw.length} 行）：total 与已取行数不收敛，拒绝落库`)
+    }
+    const res = await callPaced('ticket.search', ticketBody('tickets.search', w, offset), ctx)
+    const { total, tickets } = searchPayload(res.payload, 'ticket.search')
+    if (declared === null) declared = total
+    else if (total !== declared) {
+      throw new Error(`接口 ticket.search 各页声明 total 漂移（${declared} → ${total}）：` +
+        '遍历期间上游数据变更，拒绝落库（重跑即可）')
+    }
+    raw.push(...tickets)
+    if (raw.length >= declared || tickets.length === 0) break
+    offset += tickets.length
+  }
+  if (raw.length < (declared ?? 0)) {
+    throw new Error(`接口 ticket.search 分页短读：声明 total=${String(declared)}，实取 ${raw.length} 行` +
+      '（响应形态漂移/遍历期间上游变更），拒绝落库——重跑即可')
+  }
+  return raw
+}
+
 /** 行投影：ticket_id 主键列（响应键 id）；payload 收敛 + PII 敏感列提升。 */
 function ticketRow(src: Record<string, unknown>, nowIso: string): Record<string, unknown> | null {
   const id = src.id
-  if (id === null || id === undefined) return null   // 键缺失行：丢弃且不计入 fetched（与 apiCount 口径一致）
+  // 键缺失/空串行：丢弃且不计入 fetched（与 apiCount 口径一致；C 低-7 空串会被当成同键反复覆盖）
+  if (isEmptyKey(id)) return null
   return {
     ticket_id: String(id),
     payload: JSON.stringify(src),
@@ -92,23 +142,14 @@ function ticketRow(src: Record<string, unknown>, nowIso: string): Record<string,
 const strOrNull = (v: unknown): string | null =>
   v === null || v === undefined ? null : typeof v === 'string' ? v : JSON.stringify(v)
 
-/** tickets.search 任务 fetch：op 守卫 → limit=500 分页（total 收敛）→ 投影落库（upsertRows）。 */
+/** tickets.search 任务 fetch：op 守卫 → limit=500 分页（total 收敛 + 短读终检）→ 投影落库。 */
 async function fetchTickets(w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
   assertOpWindow(w)
   const nowIso = nowIsoOf(ctx)
   const out: Record<string, unknown>[] = []
-  let offset = 0
-  for (;;) {
-    const res = await callPaced('ticket.search', ticketBody('tickets.search', w, offset), ctx,
-      'tickets.search')
-    const { total, tickets } = searchPayload(res.payload, 'ticket.search')
-    for (const r of tickets) {
-      const row = ticketRow(r, nowIso)
-      if (row) out.push(row)
-    }
-    // total 与已取行数收敛即停（total 缺省视为单页；offset 可一直翻到 total，无固定之墙）
-    if (out.length >= total || tickets.length === 0) break
-    offset += tickets.length
+  for (const r of await searchAllPages(w, ctx)) {
+    const row = ticketRow(r, nowIso)
+    if (row) out.push(row)
   }
   return { rows: out, apiCount: out.length }
 }
@@ -121,23 +162,15 @@ async function fetchTickets(w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
 async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
   assertOpWindow(w)
   const nowIso = nowIsoOf(ctx)
-  // —— touched 工单：与 tickets.search 同窗同分页 ——
+  // —— touched 工单：与 tickets.search 同窗同分页（同一份实现，短读/翻页上限语义一致）——
   const touched: string[] = []
-  let offset = 0
-  for (;;) {
-    const res = await callPaced('ticket.search', ticketBody('tickets.search', w, offset), ctx,
-      'ticket.logs')
-    const { total, tickets } = searchPayload(res.payload, 'ticket.search')
-    for (const r of tickets) {
-      if (r.id !== null && r.id !== undefined) touched.push(String(r.id))
-    }
-    if (touched.length >= total || tickets.length === 0) break
-    offset += tickets.length
+  for (const r of await searchAllPages(w, ctx)) {
+    if (!isEmptyKey(r.id)) touched.push(String(r.id))
   }
   // —— 逐单拉日志 ——
   const out: Record<string, unknown>[] = []
   for (const tid of touched) {
-    const res = await callPaced('ticket.log', { ticketId: Number(tid) }, ctx, 'ticket.logs')
+    const res = await callPaced('ticket.log', { ticketId: Number(tid) }, ctx)
     // ticket.log 信封未实测（registry envelope=null）→ 宽松模式载荷；data 数组形态按实测 §10.3。
     // 其余形态视为响应形态漂移，显式失败（与 reports.ts 的 searchPayload 同口径）——
     // 静默按空处理会把整单日志吞成 complete。
@@ -154,7 +187,7 @@ async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult
     }
     for (const r of rows) {
       const logId = r.id
-      if (logId === null || logId === undefined) continue   // 键缺失行：丢弃且不计入 fetched
+      if (isEmptyKey(logId)) continue   // 键缺失/空串行：丢弃且不计入 fetched（C 低-7）
       out.push({ ticket_id: tid, log_id: String(logId), payload: JSON.stringify(r), synchronized_at: nowIso })
     }
   }
@@ -167,6 +200,10 @@ export const TICKET_TASKS: SyncTask[] = [
     maxWindowDays: 31, overlapDays: 3,
     watermark: { field: 'op_end', initial: null },
     primaryKey: ['ticket_id'],
+    endpoint: 'ticket.search',
+    // C 中-2：首跑/--full 的起点是 0（哨兵）→ 引擎抬到 now − 31 天
+    //（服务端对更早的 opStart 静默钳制，发 1970 只是把窗口解释权交给服务端）。
+    windowStartFloorDays: 31,
     write: { kind: 'upsertRows' },
     fetch: fetchTickets,
   },
@@ -176,6 +213,10 @@ export const TICKET_TASKS: SyncTask[] = [
     // 水位沿用 tickets 的 op 窗口推进（spec §5.5：没有 logs 表就回答不了处理量/时长）
     watermark: { field: 'op_end', initial: null },
     primaryKey: ['ticket_id', 'log_id'],
+    // 同路径任务共享冷却（B 中-6）：touched 集合与逐单日志都经 ticket.search / ticket.log，
+    // 闸门键取主要驱动路径 ticket.search（与 tickets.search 任务同键，交替调用照样被拦）。
+    endpoint: 'ticket.search',
+    windowStartFloorDays: 31,
     write: { kind: 'upsertRows' },
     fetch: fetchTicketLogs,
   },

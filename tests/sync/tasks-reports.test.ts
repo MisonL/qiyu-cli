@@ -11,6 +11,7 @@ import { RateGate } from '../../src/sync/rate-gate.js'
 import { REPORT_TASKS, taskById as reportById } from '../../src/sync/tasks/reports.js'
 import { reportBody, __setSleep } from '../../src/sync/tasks/reports.js'
 import { listGaps, readWatermark } from '../../src/sync/state.js'
+import { shanghaiYesterdayStart } from '../../src/sync/day.js'
 import { __resetBuckets } from '../../src/core/http.js'
 import type { RunCtx, SyncTask, WindowRef } from '../../src/sync/types.js'
 import type { Store, StoreConfig } from '../../src/store/types.js'
@@ -111,7 +112,11 @@ describe('REPORT_TASKS 任务声明', () => {
     for (const t of REPORT_TASKS) {
       expect(t.kind, `${t.id} kind`).toBe('windowed')
       expect(t.reportDayRotation, `${t.id} 轮转标记`).toBe(true)
-      expect(t.write, `${t.id} 写策略`).toEqual({ kind: 'deleteRangeInsert', rangeColumns: ['stat_date'] })
+      // A 中-2 钉死：删除边界与行内日期列同口径（上海天对齐）——
+      // 否则 --full（start=0）与增量（水位+1ms）对同一业务日的删除范围互不覆盖。
+      expect(t.write, `${t.id} 写策略`).toEqual({
+        kind: 'deleteRangeInsert', rangeColumns: ['stat_date'], rangeAlign: 'shanghaiDay',
+      })
       expect(t.primaryKey.length, `${t.id} 主键非空`).toBeGreaterThan(0)
     }
     expect(reportById('reports.overview')!.table).toBe('daily_overview')
@@ -124,9 +129,26 @@ describe('REPORT_TASKS 任务声明', () => {
     expect(byId('reports.staff_attendance')!.maxWindowDays).toBe(31)
     expect(byId('reports.robot_summary')!.maxWindowDays).toBe(31)
     expect(byId('reports.order_performance')!.maxWindowDays).toBe(365)
-    expect(byId('reports.transfer_human')!.maxWindowDays).toBe(365)
+    // G 中-2：实测恰好 365 天被拒（14500），364 天也不稳定 → 压到 360 留余量
+    expect(byId('reports.transfer_human')!.maxWindowDays).toBe(360)
     // salaryDetail 只覆盖窗口起始日 → 窗口切 1 天
     expect(byId('reports.staff_salary_detail')!.maxWindowDays).toBe(1)
+  })
+
+  it('G 高-1：attendance/performance 声明 windowEndClamp（endTime 越界 14501）；其余任务不钳', () => {
+    const clamped = ['reports.staff_attendance', 'reports.order_performance']
+    for (const t of REPORT_TASKS) {
+      expect(t.windowEndClamp ?? null, `${t.id} windowEndClamp`).toBe(
+        clamped.includes(t.id) ? 'shanghaiYesterday' : null)
+    }
+  })
+
+  it('B 中-6：每个任务声明 endpoint（闸门键 = 注册表路径）', () => {
+    const byId = (id: string): SyncTask => reportById(id)!
+    expect(byId('reports.overview')!.endpoint).toBe('statistic.overview')
+    expect(byId('reports.staff_salary_detail')!.endpoint).toBe('statistic.salaryDetail')
+    expect(byId('reports.transfer_human')!.endpoint).toBe('ai.statistic.transferHuman')
+    for (const t of REPORT_TASKS) expect(t.endpoint, `${t.id} endpoint`).toBeTruthy()
   })
 
   it('考勤任务请求体恒含 startTime（静默降级防护钉死）', () => {
@@ -186,11 +208,14 @@ describe('报表任务 fetch（http mock）', () => {
   })
 
   it('staff_attendance：分页 total 收敛拉满（两页）+ hour_ts 取响应 date，apiCount 与 total 一致', async () => {
-    // 首页 2 行（total=3）→ 第二页 1 行（total=3 收敛停）——单页实现会静默截掉第 3 行
+    // 首页 2 行（total=3）→ 第二页 1 行（total=3 收敛停）——单页实现会静默截掉第 3 行。
+    // hour_ts 用真实量级（小时对齐毫秒戳 ≈1.7e12）：C 中-4 守卫对秒级 ts（≤1e11）按脏行丢弃。
     const row = (id: number, ts: number) => ({ staffId: id, date: ts, loginDuration: 3600001 })
+    const H = 3_600_000
+    const BASE = 1_700_000_000_000 - (1_700_000_000_000 % H)   // 小时对齐
     const fetchMock = respondQueue([
-      () => okC({ result: [row(1000002, 3_600_000), row(1000002, 7_200_000)], total: 3 }),
-      () => okC({ result: [row(1000002, 10_800_000)], total: 3 }),
+      () => okC({ result: [row(1000002, BASE), row(1000002, BASE + H)], total: 3 }),
+      () => okC({ result: [row(1000002, BASE + 2 * H)], total: 3 }),
     ])
     vi.stubGlobal('fetch', fetchMock)
     try {
@@ -200,12 +225,43 @@ describe('报表任务 fetch（http mock）', () => {
       expect(fetchMock.mock.calls.length).toBe(2)   // page1 + page2（page2 撞本地桶，等满冷却后重试成功）
       expect(r.status).toBe('complete')
       expect(r.rows).toEqual({ fetched: 3, written: 3 })   // apiCount 与 total 一致
+      // G 高-1：请求体 endTime ≤ 昨天 0:00（Asia/Shanghai）——窗口 end 被钳制后发出
+      const body1 = JSON.parse(String((fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}'))
+      const yesterday0 = shanghaiYesterdayStart(1_700_000_000_000)
+      expect(Number(body1.endTime)).toBeLessThanOrEqual(yesterday0)
       const rows = await store.query('SELECT staff_id, hour_ts FROM staff_attendance ORDER BY hour_ts')
       expect(rows.rows).toEqual([
-        { staff_id: '1000002', hour_ts: new Date(3_600_000).toISOString() },
-        { staff_id: '1000002', hour_ts: new Date(7_200_000).toISOString() },
-        { staff_id: '1000002', hour_ts: new Date(10_800_000).toISOString() },
+        { staff_id: '1000002', hour_ts: new Date(BASE).toISOString() },
+        { staff_id: '1000002', hour_ts: new Date(BASE + H).toISOString() },
+        { staff_id: '1000002', hour_ts: new Date(BASE + 2 * H).toISOString() },
       ])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 中-4：脏时间戳（非数字/秒级 ts）→ 逐行丢弃、不断整窗；秒级不落 1970', async () => {
+    const row = (id: number, ts: unknown) => ({ staffId: id, date: ts, loginDuration: 1 })
+    const H = 3_600_000
+    const BASE = 1_700_000_000_000 - (1_700_000_000_000 % H)
+    const fetchMock = respondQueue([
+      () => okC({ result: [
+        row(1000002, 'not-a-number'),   // 非数字 → 丢
+        row(1000002, 1_700_000_000),    // 秒级 ts（10 位）→ 形态不符丢，绝不落 1970
+        row(1000002, BASE),             // 合法
+      ], total: 3 }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.staff_attendance')!, ctx(store))
+      expect(r.status).toBe('complete')
+      // fetched 只计**投影后**的行（脏行在 fetch 内丢弃、不计入 apiCount —— 与各任务
+      // 「丢弃行不计入 fetched」的统一口径一致）
+      expect(r.rows).toEqual({ fetched: 1, written: 1 })
+      const rows = await store.query('SELECT hour_ts FROM staff_attendance')
+      expect(rows.rows).toEqual([{ hour_ts: new Date(BASE).toISOString() }])
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -229,6 +285,89 @@ describe('报表任务 fetch（http mock）', () => {
       expect(rows.rows.every((x) => typeof x.order_id === 'string' && x.order_id.length > 0)).toBe(true)
       const sumRow = await store.query("SELECT payload FROM order_performance WHERE order_id = 'sum'")
       expect(JSON.parse(sumRow.rows[0].payload as string)).toEqual({ sellMoney: 30 })
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('B 高-1：报表取数经 callPaced —— 远端 14009 触发 gate.penalize(endpointId) 后重试成功', async () => {
+    // 第一次：形状 C 的 14009 限频信封（core 抛 kind=rate_limit）；第二次：正常载荷。
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
+        code: 14009, message: 'too frequent',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })))
+      .mockImplementationOnce(() => okC({ sessions: 7 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const penalize = vi.fn(async () => {})
+      const gate = { penalize, acquire: async () => {} } as unknown as RateGate
+      const r = await runTask(reportById('reports.overview')!, ctx(store, { gate }))
+      expect(r.status).toBe('complete')
+      expect(r.rows.written).toBe(1)
+      // B 中-6：penalize 的键是 endpoint id（不是任务 id 'reports.overview'）
+      expect(penalize).toHaveBeenCalled()
+      expect(penalize.mock.calls.every((c) => c[0] === 'statistic.overview')).toBe(true)
+      expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 中-5：载荷为 null（形状漂移）→ 显式失败，绝不按空窗 complete', async () => {
+    const fetchMock = respondQueue([() => okC(null)])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const t = reportById('reports.overview')!
+      await expect(t.fetch({ start: 0, end: DAY, index: 0, total: 1 },
+        { store, credentials: ctx(store).credentials })).rejects.toThrow(/未返回载荷/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('C 中-3：分页短读（声明 total=3 只拿到 1 行 → 空页）→ 显式失败', async () => {
+    const fetchMock = respondQueue([
+      () => okC({ result: [{ staffId: 1000002, x: 1 }], total: 3 }),
+      () => okC({ result: [], total: 3 }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const t = reportById('reports.staff_workload')!
+      await expect(t.fetch({ start: 0, end: DAY, index: 0, total: 1 },
+        { store, credentials: ctx(store).credentials })).rejects.toThrow(/短读/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('A 中-2：--full 与增量对同一上海自然日 → 只留一行（日期列与删除范围同口径）', async () => {
+    // 两个不同的毫秒起点，落在**同一个**上海自然日（+08:00 的 03:00 与 05:00）
+    const day0 = shanghaiYesterdayStart(1_700_000_000_000)   // 上海某日 00:00
+    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const t = reportById('reports.overview')!
+      const r1 = await runTask(t, ctx(store, {
+        rangeOverride: { start: day0 + 3 * 3_600_000, end: day0 + 4 * 3_600_000 },
+      }))
+      expect(r1.rows.written).toBe(1)
+      // 增量：起点在同一天内偏后 2 小时（水位 +1ms 的真实形态）
+      const r2 = await runTask(t, ctx(store, {
+        rangeOverride: { start: day0 + 5 * 3_600_000, end: day0 + 6 * 3_600_000 },
+      }))
+      expect(r2.status).toBe('complete')
+      // 天对齐后 stat_date 相同、删除范围覆盖同一行 → 只留一行（毫秒口径会留两行）
+      const rows = await store.query('SELECT stat_date FROM daily_overview')
+      expect(rows.rows.length).toBe(1)
+      expect(rows.rows[0].stat_date).toBe(new Date(day0).toISOString())
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -336,6 +475,93 @@ describe('按天轮转调度（runRotated）', () => {
     expect(results[1].status).toBe('complete')
     expect((await listGaps(store, 'reports.a')).length).toBe(1)
     await store.close()
+  })
+
+  it('D 中-4：轮转中的限频等待 —— gate 冷却 → 等待后重试本窗（无 gap，complete）', async () => {
+    const store = await fresh()
+    let now = 0
+    const gate = new RateGate(store, () => now)
+    await gate.penalize('statistic.overview', 60)     // 冷却至 now + 60s
+    const waits: number[] = []
+    const fetched: number[] = []
+    const t = rotTask('reports.overview', {
+      endpoint: 'statistic.overview',   // 闸门键 = endpoint id（B 中-6）：penalize 打在同一把键上
+      fetch: async (w) => {
+        fetched.push(w.start)
+        return { rows: [{ stat_date: new Date(w.start).toISOString(), payload: null, synchronized_at: null }], apiCount: 1 }
+      },
+    })
+    const results = await runRotated([t], ctx(store, {
+      gate, clock: () => now,
+      sleep: async (ms) => { waits.push(ms); now += ms },
+      rangeOverride: { start: 0, end: 2 * DAY },
+    }))
+    expect(waits).toEqual([60_000])            // 等待一次后冷却到期
+    expect(fetched.length).toBe(2)             // 两个窗口都真的拉取了
+    expect(results[0].status).toBe('complete')
+    expect(results[0].gaps).toEqual([])
+    await store.close()
+  })
+
+  it('D 中-4：轮转中的限频 gap —— 冷却永不到期 → 有界等待后记 rate_limit_local gap、不 fetch', async () => {
+    const store = await fresh()
+    const gate = new RateGate(store, () => 0)   // 时钟冻结：冷却永不到期
+    await gate.penalize('statistic.overview', 60)
+    let fetched = 0
+    const t = rotTask('reports.overview', {
+      endpoint: 'statistic.overview',
+      fetch: async () => { fetched++; return { rows: [], apiCount: 0 } },
+    })
+    const results = await runRotated([t], ctx(store, {
+      gate, sleep: async () => {}, rangeOverride: { start: 0, end: 2 * DAY },
+    }))
+    expect(fetched).toBe(0)                      // 绝不碰网络
+    expect(results[0].status).toBe('partial')
+    expect(results[0].gaps.map((g) => g.reason)).toEqual(['rate_limit_local', 'rate_limit_local'])
+    await store.close()
+  })
+
+  it('D 中-4：轮转中的水位冻结 —— 某任务某窗失败后水位停在连续成功末端，后续窗不越过', async () => {
+    const store = await fresh()
+    const t = rotTask('reports.overview', {
+      fetch: async (w) => {
+        if (w.index === 1) throw new Error('上游 500')
+        return { rows: [{ stat_date: new Date(w.start).toISOString(), payload: null, synchronized_at: null }], apiCount: 1 }
+      },
+    })
+    const results = await runRotated([t], ctx(store, { rangeOverride: { start: 0, end: 3 * DAY } }))
+    expect(results[0].status).toBe('partial')
+    expect(results[0].windows).toEqual({ total: 3, succeeded: 2, failed: 1 })
+    // 水位 = 窗 1 末（1 天），窗 3 成功也不越过失败窗
+    expect((await readWatermark(store, 'reports.overview')).watermark)
+      .toBe(new Date(DAY).toISOString())
+    // 失败窗隔离：窗 3 数据仍落库
+    expect(await store.count('daily_overview')).toBe(2)
+    await store.close()
+  })
+
+  it('D 中-5：callPaced 全链路 —— 真实 14009 → penalize 落持久化冷却行（sync_state）', async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
+        code: 14009, message: 'too frequent',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })))
+      .mockImplementationOnce(() => okC({ sessions: 5 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.overview')!, ctx(store))
+      expect(r.status).toBe('complete')
+      // 冷却行以 **endpoint id** 落库（B 中-6）：dataset = __ratelimit__:<endpointId>
+      const rows = await store.query(
+        'SELECT dataset, watermark, last_rate_limited_at FROM sync_state WHERE dataset = ?',
+        ['__ratelimit__:statistic.overview'])
+      expect(rows.rows.length).toBe(1)
+      expect(rows.rows[0].watermark).toBeTruthy()
+      expect(rows.rows[0].last_rate_limited_at).toBeTruthy()
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('gapHint 透传原始 reason（T5 裁定接线：filter_matched_no_staff 落 sync_gaps）', async () => {
