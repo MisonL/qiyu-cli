@@ -318,22 +318,30 @@ describe('sync run —— 区间参数（--full/--since/--until）', () => {
     }
   })
 
-  it('--full 全区间重刷（起点归零；窗口数按 31 天上限切分）', { timeout: 120000 }, async () => {
-    // 全历史 → ~668 个 31 天窗；mock 全空 → 假空重试后 complete。
-    // ⚠️ 用 tickets.search（工单域实测无限频）：报表接口有 30s 本地令牌桶，
-    // 668 窗逐窗推进会被限频打断（partial）——那属限频编排语义，不归本用例。
+  it('--full 全区间重刷（C 中-2：哨兵起点 0 抬到接口下界 now−31 天；窗口数按 31 天上限切分）', { timeout: 120000 }, async () => {
+    // 下界抬升后的窗口数 = 31 天/31 天上限 = 1~2 窗；mock 全空 → 假空重试后 complete。
+    // ⚠️ 用 tickets.search（工单域实测无限频）：报表接口有 30s 本地令牌桶，会被限频打断。
+    // ⚠️ 修复批 1（C 中-2）的最小跨所有权改动：--full 的 start=0 是哨兵（1970 无数据，
+    // opStart 还会被服务端静默钳到 now−31d），tickets.search 声明 windowStartFloorDays=31
+    // 后起点抬到 now−31d，抬升如实回显在 resolved_range —— 断言从「1970 起点 + 200+ 窗」
+    // 改为「下界起点 + ≤2 窗」。src/commands/ 本身零改动（抬升发生在引擎层，任务声明式）。
     const fetchMock = vi.fn().mockImplementation(() => okC({ total: 0, tickets: [] }))
     vi.stubGlobal('fetch', fetchMock)
     try {
       await fresh().then((s) => s.close())
+      const before = Date.now()
       const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(),
         '--full', '--quiet'])
       expect(code).toBe(0)
+      const after = Date.now()
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       const rr = t.resolved_range as [string, string]
-      expect(rr[0]).toBe('1970-01-01T08:00:00+08:00')
+      // 起点 = now − 31 天（± 运行时刻的秒级偏移），绝不是 1970
+      const startMs = Date.parse(rr[0])
+      expect(startMs).toBeGreaterThan(before - 31 * 86_400_000 - 5000)
+      expect(startMs).toBeLessThan(after - 31 * 86_400_000 + 5000)
       expect(t.status).toBe('complete')
-      expect((t.windows as { total: number }).total).toBeGreaterThan(200)
+      expect((t.windows as { total: number }).total).toBeLessThanOrEqual(2)
     } finally {
       vi.unstubAllGlobals()
     }
