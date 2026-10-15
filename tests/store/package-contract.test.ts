@@ -21,4 +21,8 @@ describe('依赖契约 —— DuckDB 必须是可选依赖', () => {
     }
     expect(Object.keys(lock.packages ?? {}).some((k) => k.includes('@duckdb/node-api'))).toBe(true)
   })
+
+  it('fflate 是唯一常规依赖（D-T10：会话导出解压）；@duckdb/node-api 不在 dependencies', () => {
+    expect(pkg.dependencies).toEqual({ fflate: '^0.8.3' })
+  })
 })

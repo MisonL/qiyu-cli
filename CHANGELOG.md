@@ -15,6 +15,13 @@
 - `store init` / `store status`（`qiyu store init` / `qiyu store status`）—— 初始化本地数据库（DuckDB）与查看各表行数
 - `Store` 抽象与 DuckDB 后端、`~/.config/qiyu/config.json` 存储配置支持
 - 新增错误 kind：`store_locked` / `store_not_initialized`（退出码 1）
+- `qiyu sync` —— 本地数据仓库同步引擎（`sync tasks` / `sync run` / `sync status` / `sync verify` / `sync install` / `sync uninstall`）：
+  21 个任务覆盖维度/报表/工单/会话/知识库数据集，增量水位与断点续跑、缺口落 `sync_gaps`、
+  `pending/complete` 区分「未同步」与「空数据」、水位与数据落库同事务、
+  会话导出 create→poll→download→unzip→parse 流水线、`sync verify` 快照三方一致性核对
+- `sync install` / `sync uninstall` —— 跨平台定时调度（macOS launchd / Linux systemd user / Windows schtasks），默认 dry-run，`--yes` 才写入/删除
+- 新增错误 kind：`rate_limit_local`（本地限频冷却，`retry_after` 精确到毫秒且跨进程持久化）
+- 新增常规依赖：`fflate`（会话导出的加密 zip 解压）——`@duckdb/node-api` 仍为可选依赖
 
 ## [0.1.0] - 2026-10-09
 

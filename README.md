@@ -7,7 +7,7 @@ JSON、用退出码表达该做什么、错误按语义分类、危险操作有�
 七鱼 API 的 26 种响应信封、3 种分页和一堆静默失败，就能正确调用。
 
 > **本仓库仍在早期**：已实现「认证 + 通用 API 通道」＋ API 参数校验（`api schema`/body 分级校验）＋ 存储基础（见[当前状态](#当前状态)）。
-> 本地数据仓库的同步与查询尚未实现（存储基础已交付，见[当前状态](#当前状态)）。
+> 本地数据仓库的**同步**（`qiyu sync`）已交付，见[当前状态](#当前状态)；**查询**（`qiyu query`）尚未实现。
 
 ## 为什么需要它
 
@@ -39,7 +39,7 @@ git clone https://github.com/MisonL/qiyu-cli.git
 cd qiyu-cli && npm install && npm run build
 ```
 
-> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。
+> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令是唯一引入常规依赖的部分：`fflate`（会话导出的加密 zip 解压）。
 
 ## 配置凭证
 
@@ -153,8 +153,11 @@ qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
 本仓库实现了设计稿中的**前两个子项目**：认证与通用 API 通道、API 参数校验（`api schema`/body 分级校验）。
 
 **已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
-限频感知（`retry_after`）、本地数据仓库基础——`store init` / `store status`（存储层已交付，
-含 `Store` 抽象、DuckDB 后端、schema 迁移与 `store_locked`/`store_not_initialized` 错误分类）。
+限频感知（`retry_after`）、本地数据仓库——`store init` / `store status`（存储层已交付，
+含 `Store` 抽象、DuckDB 后端、schema 迁移与 `store_locked`/`store_not_initialized` 错误分类）
+与同步引擎——`sync tasks` / `sync run` / `sync status` / `sync verify` / `sync install` / `sync uninstall`
+（21 个任务覆盖维度/报表/工单/会话/知识库数据集；增量水位、断点续跑、缺口记录、本地限频冷却持久化、
+跨平台调度安装；会话导出走 create→poll→download→unzip→parse 流水线）。
 
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
@@ -167,7 +170,7 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 
 - `auth login`（配置文件写入）——目前只支持环境变量；
 - `--pretty`（人类可读输出）——目前只输出紧凑 JSON；
-- 本地数据仓库的**同步**（`qiyu sync`）与**查询**（`qiyu query`）——存储基础（初始化/状态查看两条命令）已可用，见「当前状态」；
+- 本地数据仓库的**查询**（`qiyu query`）——存储与同步（`store init/status`、`sync` 六个子命令）已可用，见「当前状态」；
 
 `api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
@@ -196,8 +199,10 @@ npm test                  # 运行测试
 src/
   cli.ts                入口与顶层分派
   output.ts             输出契约（ok / fail / usageFail，退出码）
-  commands/             子命令（auth / api / store）
   store/                存储抽象（src/store/：Store 接口、DuckDB 后端、schema 与迁移）
+  sync/                 同步引擎（src/sync/：引擎、状态、限频门、窗口切分、任务注册表与 21 个任务）
+  schedule/             跨平台调度安装（launchd / systemd / schtasks）
+  commands/             子命令（auth / api / store / sync）
   core/
     sign.ts             七鱼签名（checksum = SHA1(appSecret + md5(body) + time)）
     http.ts             请求构建、重试、限频

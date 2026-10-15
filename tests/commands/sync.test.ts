@@ -231,7 +231,7 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
       expect(code).toBe(1)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('failed')
-      expect(t.gaps.length).toBe(1)
+      expect((t.gaps as unknown[]).length).toBe(1)
     } finally {
       vi.unstubAllGlobals()
     }
@@ -331,7 +331,7 @@ describe('sync run —— 区间参数（--full/--since/--until）', () => {
       const rr = t.resolved_range as [string, string]
       expect(rr[0]).toBe('1970-01-01T08:00:00+08:00')
       expect(t.status).toBe('complete')
-      expect(t.windows.total).toBeGreaterThan(200)
+      expect((t.windows as { total: number }).total).toBeGreaterThan(200)
     } finally {
       vi.unstubAllGlobals()
     }

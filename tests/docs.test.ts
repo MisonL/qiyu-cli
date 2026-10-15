@@ -111,3 +111,55 @@ describe('锚定断言（钉住 spec §8.3 的具体落点，防只改一半）'
     expect(marks.length).toBeGreaterThanOrEqual(2)
   })
 })
+
+describe('D 同步引擎交付联动 —— 不得说假话（D-T15）', () => {
+  it('cli.ts 顶层 USAGE 列全 sync 六个子命令（T14 遗留补全）', () => {
+    const s = read('src/cli.ts')
+    for (const sub of ['sync tasks', 'sync run', 'sync status', 'sync verify', 'sync install', 'sync uninstall']) {
+      expect(s, `USAGE 缺 ${sub}`).toMatch(new RegExp(sub.replace(' ', '\\s+')))
+    }
+  })
+  it('README 含 sync 子命令与同步引擎目录', () => {
+    const md = read('README.md')
+    expect(md).toMatch(/sync run/)
+    expect(md).toMatch(/sync status/)
+    expect(md).toMatch(/sync verify/)
+    expect(md).toMatch(/src\/sync\//)
+  })
+  it('README 横幅与「尚未实现」清单：同步已交付、查询仍未实现', () => {
+    const md = read('README.md')
+    expect(md).toMatch(/同步.*已交付|已交付.*同步/)
+    const notYet = /\*\*尚未实现\*\*（调用时[\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
+    expect(notYet).not.toMatch(/sync run/)
+    expect(notYet).toMatch(/query/)
+  })
+  it('README 依赖分述：fflate 是 sync 引入的唯一常规依赖', () => {
+    expect(read('README.md')).toMatch(/fflate/)
+  })
+  it('CHANGELOG [未发布] 段内含 sync 命令与 fflate 条目（反引号命令形态，防误命中）', () => {
+    const md = read('CHANGELOG.md')
+    const unreleased = /## \[未发布\][\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
+    expect(unreleased).toMatch(/`sync (run|verify|install)`/)
+    expect(unreleased).toMatch(/fflate/)
+    expect(unreleased).toMatch(/rate_limit_local/)
+  })
+  it('路线图 §四.D 标注已交付且 E 未关闭（整节不得假勾）', () => {
+    const s = read('docs/superpowers/specs/2026-10-09-后续交付路线图-design.md')
+    expect(s).toMatch(/### D\. 同步引擎（`sync\/`）—— ✅ 已交付/)
+    expect(s).not.toMatch(/### E\..*已交付/)
+  })
+  it('路线图 §六.3：D 已交付 + §六.4：E 已解锁', () => {
+    const s = read('docs/superpowers/specs/2026-10-09-后续交付路线图-design.md')
+    const l3 = s.split('\n').find((l) => /D 已交付（2026-10-15/.test(l)) ?? ''
+    expect(l3).toMatch(/D 已交付/)
+    const l4 = s.split('\n').find((l) => /已解锁（C1、D 均已交付）/.test(l)) ?? ''
+    expect(l4).toMatch(/已解锁/)
+  })
+  it('设计稿状态行含 D 交付标注', () => {
+    expect(read('docs/qiyu-cli-design.md')).toMatch(/状态：实施中.*D 同步引擎.*已交付/)
+  })
+  it('分层规则已扩展：layering.test.ts 含 sync 不 import commands 规则', () => {
+    const s = read('tests/store/layering.test.ts')
+    expect(s).toMatch(/sync\/ 不得 import commands\//)
+  })
+})
