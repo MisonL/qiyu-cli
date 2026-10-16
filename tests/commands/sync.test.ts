@@ -900,6 +900,27 @@ describe('sync install', () => {
     // 文件已写入（写入与加载是两步，加载失败不回滚文件）
     expect(existsSync(join(dir, 'Library', 'LaunchAgents', 'com.qiyu-cli.sync.plist'))).toBe(true)
   })
+
+  it('修复批 4 #4：--db 透传进调度命令（探测目标与调度执行同一库）', async () => {
+    await seedSynced()
+    const code = await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])
+    expect(code).toBe(0)
+    const content = (data().entries as Array<{ content: string }>)[0]!.content
+    // ProgramArguments 里 sync run 之后跟着用户给的 --db <同一个路径>
+    expect(content).toMatch(new RegExp(`<string>--db</string><string>${dbPath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`))
+    // 未给存储参数时不追加（另一条路径：--db 必须给，因为默认路径在 HOME 下 —— 这里
+    // 用 --profile 断言「只透传显式给出者」）
+    out = ''
+    const cfgDir = join(dir, '.config', 'qiyu')
+    mkdirSync(cfgDir, { recursive: true })
+    writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
+      profiles: { default: { store: { path: dbPath() } } },
+    }))
+    expect(await syncCommand(['install', '--schedule', '*/30 * * * *'])).toBe(0)
+    const bare = (data().entries as Array<{ content: string }>)[0]!.content
+    expect(bare).not.toMatch(/<string>--db<\/string>/)
+    expect(bare).toMatch(/<string>sync<\/string><string>run<\/string><\/array>/)
+  })
 })
 
 describe('sync uninstall', () => {

@@ -361,6 +361,9 @@ async function syncVerify(argv: string[]): Promise<number> {
 
 const RATELIMIT_PREFIX = '__ratelimit__:'
 
+/** install 要透传进调度命令的存储定位参数（修复批 4 #4）。 */
+const STORE_FLAGS = ['--db', '--profile', '--backend'] as const
+
 /**
  * install 前置探测（E 高-1）：库已初始化（statGuard + schema_version）**且存在真实成功证据**。
  * ⚠️ 判据是 `range_status='complete'` 或 `last_synced_at` 非空 —— 不是「sync_state 里有行」：
@@ -432,6 +435,10 @@ async function syncInstall(argv: string[]): Promise<number> {
     plan = planInstall(platform, schedule, {
       home: homedir(),
       exec: entry ? [process.execPath, entry] : ['qiyu'],
+      // 修复批 4 #4：用户显式给出的存储定位参数必须进调度命令 —— 上面的前置探测
+      // 用的是同一个库，调度命令跑默认库会让「探测通过」与「实际同步」指向两个库。
+      // 只透传显式给出者（不给默认值：默认路径的解析留给运行时，避免默认值漂移）。
+      storeArgs: STORE_FLAGS.flatMap((f) => (parsed.values[f] === undefined ? [] : [f, parsed.values[f]!])),
     })
   } catch (e) { return usageFail((e as Error).message) }
 

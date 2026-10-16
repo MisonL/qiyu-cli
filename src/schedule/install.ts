@@ -164,9 +164,14 @@ export const LAUNCHD_LABEL = 'com.qiyu-cli.sync'
 export const SYSTEMD_NAMES = { service: 'qiyu-sync.service', timer: 'qiyu-sync.timer' } as const
 export const SCHTASKS_TASK_NAME = 'qiyu-cli-sync'
 
-/** 调度条目要运行的命令（sync run）。 */
-function runArgs(exec: string[]): string[] {
-  return [...exec, 'sync', 'run']
+/**
+ * 调度条目要运行的命令（sync run + 用户显式给出的存储定位参数）。
+ * ⚠️ 修复批 4 #4：`sync install --db /x.duckdb` 的前置探测用的是 /x.duckdb，若调度的
+ * 命令不带同一组参数，装出来的计划会跑**默认库** —— 探测的目标与调度执行的目标
+ * 必须是同一个库。只透传用户**显式给出**的存储参数（不给默认值，避免默认值漂移）。
+ */
+function runArgs(exec: string[], storeArgs: string[] = []): string[] {
+  return [...exec, 'sync', 'run', ...storeArgs]
 }
 
 /** launchd 单键的 XML：单值 <integer>，多值 <array>。 */
@@ -220,7 +225,13 @@ function systemdOnCalendar(spec: CronSpec): string[] {
   return [`${dateOf(spec.day)} ${time}`]
 }
 
-/** 值列是否为「从 0 起的等差数列」（cron 步进语义，可映射 schtasks /MO）。 */
+/** 值列是否为「从 0 起的等差数列」（cron 步进语义，可映射 schtasks /MO）。
+ * 修复批 4 #7：schtasks `/MO N` **不在每小时/每天边界重置**（cron 的步进写法在
+ * 每小时重置）——「每 7 分钟」在 cron 里每小时重置、在 schtasks 里不重置，装出来的
+ * 计划会漂移（第 2 小时从 07 分起、第 3 小时从 14 分起……），违反「绝不静默装出
+ * 错误时间的计划」。判据：`(fullMax + 1) % step !== 0` → 落 unmappable。
+ * 例：每 30 分钟 → 值列 [0,30]，60 % 30 === 0 → 可映射；每 7 分钟 → [0,7,…,56]，
+ * 60 % 7 !== 0 → 不可映射。小时侧同理（24 % step）。 */
 function progressionStep(values: number[], fullMax: number): number | null {
   if (values.length < 2) return null
   if (values[0] !== 0) return null
@@ -231,6 +242,8 @@ function progressionStep(values: number[], fullMax: number): number | null {
   }
   // 覆盖到值域末端（*/30 → [0,30] 收尾于 59 语义下不算，cron 步进覆盖 0..max-1）
   if (values[values.length - 1]! + step <= fullMax) return null
+  // 修复批 4 #7：步进必须整除值域宽度（schtasks 不重置 → 不整除即漂移）
+  if ((fullMax + 1) % step !== 0) return null
   return step
 }
 
@@ -254,14 +267,21 @@ function schtasksScheduleArgs(spec: CronSpec): string[] {
     if (spec.minute.wildcard && spec.hour.wildcard) {
       return ['/SC', 'MINUTE', '/MO', '1']
     }
+    // 修复批 4 #8：`/SC HOURLY /MO N` 的判据是「固定分钟 + 小时步进」——
+    // `* */2 * * *`（每分钟、每 2 小时）不能映射：schtasks 没有「每分钟但只在
+    // 第 2 小时」的形态，强制映射会把语义收窄成「每 2 小时跑一次」（见下 unmappable）。
+    // `0 */2 * * *`（每 2 小时的第 0 分）→ `/SC HOURLY /MO 2 /ST 00:00`。
+    if (!spec.minute.wildcard && !spec.hour.wildcard && spec.minute.values.length === 1) {
+      const step = progressionStep(spec.hour.values, 23)
+      if (step !== null) {
+        return ['/SC', 'HOURLY', '/MO', String(step), '/ST', `00:${pad2(spec.minute.values[0]!)}`]
+      }
+    }
+    // 每分钟 + 小时受限 → schtasks 无可等价形态（语义会收窄），显式拒绝
+    if (spec.minute.wildcard && !spec.hour.wildcard) throw unmappable()
     if (!spec.minute.wildcard && spec.hour.wildcard) {
       const step = progressionStep(spec.minute.values, 59)
       if (step !== null) return ['/SC', 'MINUTE', '/MO', String(step)]
-      throw unmappable()
-    }
-    if (spec.minute.wildcard && !spec.hour.wildcard) {
-      const step = progressionStep(spec.hour.values, 23)
-      if (step !== null) return ['/SC', 'HOURLY', '/MO', String(step), '/ST', `00:${pad2(spec.minute.values[0]!)}`]
       throw unmappable()
     }
     if (!spec.minute.wildcard && !spec.hour.wildcard
@@ -277,15 +297,21 @@ function unmappable(): Error {
     + '请在 Windows 任务计划程序中手工创建，或换一个可映射的时刻')
 }
 
-function crontabLine(schedule: string, exec: string[]): string {
-  return `${schedule} ${runArgs(exec).map(shellQuote).join(' ')}`
+function crontabLine(schedule: string, exec: string[], storeArgs: string[] = []): string {
+  return `${schedule} ${runArgs(exec, storeArgs).map(shellQuote).join(' ')}`
 }
 
-/** 生成安装计划（纯函数，不写 fs）。 */
+/**
+ * 生成安装计划（纯函数，不写 fs）。
+ * `storeArgs`（修复批 4 #4）：命令层把用户显式给出的存储定位参数（--db/--profile/
+ * --backend）原样透传进来，进 runArgs —— 调度命令与前置探测同一库。缺省空数组 =
+ * 用户未给存储参数，调度命令不追加任何存储参数（默认值解析留给运行时，绝不在此
+ * 硬编码一个默认路径 —— 那会引入默认值漂移：命令层默认变了而调度条目不变）。
+ */
 export function planInstall(platform: Platform, schedule: string,
-  opts: { home: string; exec: string[] }): InstallPlan {
+  opts: { home: string; exec: string[]; storeArgs?: string[] }): InstallPlan {
   const spec = parseCron(schedule)
-  const run = runArgs(opts.exec)
+  const run = runArgs(opts.exec, opts.storeArgs ?? [])
 
   if (platform === 'darwin') {
     const dir = `${opts.home}/Library/LaunchAgents`
@@ -347,7 +373,7 @@ WantedBy=timers.target
         ['systemctl', '--user', 'daemon-reload'],
         ['systemctl', '--user', 'enable', '--now', SYSTEMD_NAMES.timer],
       ],
-      notes: [`crontab 兜底（无 systemd 用户会话时手工可用）：${crontabLine(schedule, opts.exec)}`,
+      notes: [`crontab 兜底（无 systemd 用户会话时手工可用）：${crontabLine(schedule, opts.exec, opts.storeArgs ?? [])}`,
         '安装后需执行上面的 systemctl 命令（daemon-reload + enable --now）定时器才会运行。'],
     }
   }

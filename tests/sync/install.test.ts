@@ -86,6 +86,24 @@ describe('planInstall darwin —— launchd plist', () => {
     expect(c).toMatch(/&amp;/)
     expect(c).toMatch(/&lt;b&gt;/)
   })
+  it('修复批 4 #4：storeArgs 进 ProgramArguments（三平台一致）', () => {
+    const storeArgs = ['--db', '/tmp/q.db', '--profile', 'default']
+    const darwin = planInstall('darwin', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs })
+    const c = darwin.entries[0]!.content
+    // 逐参数 <string> 元素（不是拼成一串）——launchd 不做 shell 解析
+    expect(c).toMatch(/<string>sync<\/string><string>run<\/string><string>--db<\/string><string>\/tmp\/q\.db<\/string><string>--profile<\/string><string>default<\/string>/)
+    const linux = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs })
+    const svc = linux.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!
+    expect(svc.content).toMatch(/ExecStart=.* sync run --db \/tmp\/q\.db --profile default/)
+    expect(linux.notes.some((n) => n.includes('sync run --db /tmp/q.db --profile default'))).toBe(true)
+  })
+  it('修复批 4 #4：未给存储参数 → 三平台都不追加（不引入默认值漂移）', () => {
+    const darwin = planInstall('darwin', '0 2 * * *', { home: HOME, exec: EXEC })
+    expect(darwin.entries[0]!.content).toMatch(/<string>sync<\/string><string>run<\/string><\/array>/)
+    const linux = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC })
+    const svc = linux.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!
+    expect(svc.content).toMatch(/ExecStart=.* sync run\n/)
+  })
   it('Day/Hour/Month/Weekday 的多值字段 → 键内数组（launchd 键内 OR；静默丢值 = 装错时刻）', () => {
     const p = planInstall('darwin', '0 9 1,15 * 1,5', { home: HOME, exec: EXEC })
     const c = p.entries[0]!.content
@@ -155,10 +173,44 @@ describe('planInstall win32 —— schtasks 命令行', () => {
     expect(cmd[cmd.indexOf('/SC') + 1]).toBe('MINUTE')
     expect(cmd[cmd.indexOf('/MO') + 1]).toBe('1')
   })
+  it('修复批 4 #7：步进必须整除值域宽度（schtasks /MO 不在小时/天边界重置）', () => {
+    // */30（分钟，60 % 30 == 0）可映射
+    const ok = planInstall('win32', '*/30 * * * *', { home: HOME, exec: EXEC }).commands[0]!
+    expect(ok[ok.indexOf('/SC') + 1]).toBe('MINUTE')
+    expect(ok[ok.indexOf('/MO') + 1]).toBe('30')
+    // */7（60 % 7 != 0）→ cron 每小时重置、schtasks 不重置 → 漂移，显式拒绝
+    expect(() => planInstall('win32', '*/7 * * * *', { home: HOME, exec: EXEC }))
+      .toThrow(/schtasks/)
+    // 小时侧同理：*/6（24 % 6 == 0）可映射、*/5（24 % 5 != 0）拒绝
+    const h = planInstall('win32', '0 */6 * * *', { home: HOME, exec: EXEC }).commands[0]!
+    expect(h[h.indexOf('/SC') + 1]).toBe('HOURLY')
+    expect(h[h.indexOf('/MO') + 1]).toBe('6')
+    expect(() => planInstall('win32', '0 */5 * * *', { home: HOME, exec: EXEC }))
+      .toThrow(/schtasks/)
+  })
+  it('修复批 4 #8：HOURLY 判据是「固定分钟 + 小时步进」', () => {
+    // 0 */2 * * *（每 2 小时的第 0 分）→ HOURLY /MO 2 /ST 00:00
+    const cmd = planInstall('win32', '0 */2 * * *', { home: HOME, exec: EXEC }).commands[0]!
+    expect(cmd[cmd.indexOf('/SC') + 1]).toBe('HOURLY')
+    expect(cmd[cmd.indexOf('/MO') + 1]).toBe('2')
+    expect(cmd[cmd.indexOf('/ST') + 1]).toBe('00:00')
+    // * */2 * * *（每分钟、每 2 小时）→ 无法等价映射（语义收窄），显式拒绝
+    expect(() => planInstall('win32', '* */2 * * *', { home: HOME, exec: EXEC }))
+      .toThrow(/schtasks/)
+  })
   it('无法映射的 cron 显式抛错（不静默装错计划）', () => {
     // 两个小时点 + 两个分钟点 → schtasks 无对应形态
     expect(() => planInstall('win32', '0,30 2,4 * * *', { home: HOME, exec: EXEC }))
       .toThrow(/schtasks/)
+  })
+  it('修复批 4 #4：storeArgs 透传进 /TR 命令（未给出时不追加）', () => {
+    const withArgs = planInstall('win32', '0 2 * * *',
+      { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/q.db'] }).commands[0]!
+    const tr = String(withArgs[withArgs.indexOf('/TR') + 1])
+    expect(tr).toMatch(/sync run --db \/tmp\/q\.db$/)
+    // 未给存储参数 → 不追加（不引入默认值漂移）
+    const bare = planInstall('win32', '0 2 * * *', { home: HOME, exec: EXEC }).commands[0]!
+    expect(String(bare[bare.indexOf('/TR') + 1])).toMatch(/sync run$/)
   })
 })
 
