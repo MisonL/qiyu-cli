@@ -8,7 +8,7 @@ import { syncCommand } from '../../src/commands/sync.js'
 import { orderTasks } from '../../src/commands/sync-run.js'
 import { taskById, SYNC_TASKS } from '../../src/sync/registry.js'
 import { __setPlatform, __setRun, __resetScheduleDeps } from '../../src/schedule/install.js'
-import { advanceWatermark, markPending, recordGap } from '../../src/sync/state.js'
+import { advanceWatermark, markPending, recordGap, readWatermark } from '../../src/sync/state.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { __resetBuckets } from '../../src/core/http.js'
 import { __setSleep as setReportSleep } from '../../src/sync/tasks/reports.js'
@@ -658,18 +658,19 @@ describe('sync status', () => {
     const s = await fresh()
     await s.upsert('sync_state', [{ dataset: 'dim.staff', watermark: 'w', range_status: 'complete',
       last_error: null, locked_by: 'pid 42', locked_at: '2026-10-15T00:00:00.000Z',
-      last_synced_at: 't', next_allowed_at: null, last_rate_limited_at: null }])
+      last_synced_at: 't', next_allowed_at: null, last_rate_limited_at: null,
+      resolved_range_start: null, resolved_range_end: null }])
     await s.close()
     expect(await syncCommand(['status', 'dim.staff', '--db', dbPath()])).toBe(0)
     const t = (data().tasks as Array<Record<string, unknown>>)[0]!
     expect(t.locked).toBe(true)
   })
 
-  it('库文件不存在 → 1 + store_not_initialized + hint 指向 sync run（D 交付后 status 的 hint，spec §9.5）', async () => {
+  it('库文件不存在 → 1 + store_not_initialized + hint 指 store init（C-12：与 spec §九 同口径）', async () => {
     expect(await syncCommand(['status', '--db', join(dir, 'missing.db')])).toBe(1)
     const e = JSON.parse(out).error
     expect(e.kind).toBe('store_not_initialized')
-    expect(e.hint).toMatch(/sync run/)
+    expect(e.hint).toMatch(/store init/)
   })
 })
 
@@ -860,11 +861,11 @@ describe('sync install', () => {
     expect(JSON.parse(out).error.kind).toBe('usage')
   })
 
-  it('库未初始化 → 1 + hint 先跑一次 sync run；已初始化但从未同步 → 1 + sync_not_run + hint', async () => {
+  it('库未初始化 → 1 + store_not_initialized + hint 指 store init；有库但无成功证据 → 1 + sync_not_run + hint', async () => {
     expect(await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', join(dir, 'none.db')])).toBe(1)
     let e = JSON.parse(out).error
     expect(e.kind).toBe('store_not_initialized')
-    expect(e.hint).toMatch(/sync run/)
+    expect(e.hint).toMatch(/store init/)
 
     await fresh().then((s) => s.close())   // 已建库、零同步记录
     out = ''
@@ -933,5 +934,251 @@ describe('sync uninstall', () => {
     expect(await syncCommand(['uninstall', '--yes'])).toBe(0)
     expect((data().removed as string[])).toEqual([])
     expect(runMock).not.toHaveBeenCalled()
+  })
+})
+
+// ————————————————————————————————————————————————————————————————
+// 修复批 2 —— 命令层 / 契约诚实性 / 安全出口（逐条钉死用例）
+// ————————————————————————————————————————————————————————————————
+
+describe('修复批 2 · E 高-1：install 前置探测要真实成功证据', () => {
+  it('只有 pending 行（引擎在窗口执行前落行）→ 拒绝安装（sync_not_run）', async () => {
+    // 全败的 run 同样留下 pending 行 —— 「有行」不等于「跑通过」。
+    const s = await fresh()
+    await s.transaction(async (tx) => { await markPending(tx, 'dim.staff') })
+    await s.close()
+    const code = await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])
+    expect(code).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('sync_not_run')
+    expect(e.message).toMatch(/尚未成功同步/)
+    expect(e.hint).toMatch(/sync run/)
+  })
+
+  it('冷却行（__ratelimit__:）不算成功证据 → 仍拒绝', async () => {
+    const s = await fresh()
+    await s.upsert('sync_state', [{ dataset: '__ratelimit__:statistic.overview',
+      watermark: '2026-10-14T00:00:00.000Z', range_status: 'complete', last_error: null,
+      locked_by: null, locked_at: null, last_synced_at: '2026-10-14T00:00:00.000Z',
+      next_allowed_at: '2026-10-14T00:00:00.000Z', last_rate_limited_at: '2026-10-14T00:00:00.000Z',
+      resolved_range_start: null, resolved_range_end: null }])
+    await s.close()
+    expect(await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])).toBe(1)
+    expect(JSON.parse(out).error.kind).toBe('sync_not_run')
+  })
+
+  it('有 complete 行 → 放行（dry-run 正常产出计划）', async () => {
+    const s = await fresh()
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', '2026-10-14T00:00:00.000Z', { start: 0, end: 1 }, '2026-10-14T10:00:00.000Z')
+    })
+    await s.close()
+    expect(await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])).toBe(0)
+    expect(data().dry_run).toBe(true)
+  })
+
+  it('有 last_synced_at 非空的行（range_status 已翻 pending）→ 同样放行', async () => {
+    // 中断/失败重跑会把 range_status 打回 pending，但 last_synced_at 仍是「成功过」的证据。
+    const s = await fresh()
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', '2026-10-14T00:00:00.000Z', { start: 0, end: 1 }, '2026-10-14T10:00:00.000Z')
+    })
+    const st = await readWatermark(s, 'dim.staff')
+    await s.transaction(async (tx) => { await markPending(tx, 'dim.staff', st) })
+    await s.close()
+    expect(await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])).toBe(0)
+  })
+})
+
+describe('修复批 2 · C-12/E 中-4：hint 口径统一 + status 的 resolved_range / gaps', () => {
+  it('store_not_initialized 的 hint 三处同口径（status/verify/install 均指 qiyu store init）', async () => {
+    const missing = join(dir, 'missing.db')
+    for (const argv of [['status', '--db', missing], ['verify', 'dim.staff', '--db', missing],
+      ['install', '--schedule', '*/30 * * * *', '--db', missing]]) {
+      out = ''
+      expect(await syncCommand(argv)).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind, argv.join(' ')).toBe('store_not_initialized')
+      expect(e.hint, argv.join(' ')).toMatch(/qiyu store init/)
+      expect(e.hint, argv.join(' ')).not.toMatch(/sync run/)
+    }
+  })
+
+  it('run 后 status 能看到上次覆盖区间（resolved_range）+ 逐条缺口（gaps）', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => okC({ total: 0, tickets: [] }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      const before = Date.now()
+      expect(await syncCommand(['run', 'tickets.search', '--db', dbPath(), '--since', '1d', '--quiet'])).toBe(0)
+      out = ''
+      expect(await syncCommand(['status', 'tickets.search', '--db', dbPath()])).toBe(0)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      // resolved_range 形态与 run 的 resolved_range 一致（+08:00 ISO 二元组）
+      const rr = t.resolved_range as [string, string]
+      expect(rr[0]).toMatch(/\+08:00$/)
+      expect(rr[1]).toMatch(/\+08:00$/)
+      expect(Date.parse(rr[0])).toBeGreaterThan(before - 86_400_000 - 5000)
+      expect(Date.parse(rr[1])).toBeGreaterThanOrEqual(Date.parse(rr[0]))
+      expect(t.gaps).toEqual([])
+      expect(t.gaps_count).toBe(0)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('status 的 gaps 逐条输出 {range,reason,detail,recorded_at}，gaps_count 保留', async () => {
+    const s = await fresh()
+    await s.transaction(async (tx) => {
+      await recordGap(tx, 'reports.overview', '100', '200', 'fetch_failed', '网络抖动', { now: () => 0 })
+    })
+    await s.close()
+    expect(await syncCommand(['status', 'reports.overview', '--db', dbPath()])).toBe(0)
+    const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+    const gaps = t.gaps as Array<Record<string, unknown>>
+    expect(gaps.length).toBe(1)
+    expect(gaps[0]!.range).toEqual(['100', '200'])
+    expect(gaps[0]!.reason).toBe('fetch_failed')
+    expect(gaps[0]!.detail).toBe('网络抖动')
+    expect(gaps[0]!.recorded_at).toBe(new Date(0).toISOString())
+    expect(t.gaps_count).toBe(1)
+  })
+
+  it('失败重跑（markPending）不清掉上次覆盖区间（G2 保形回写）', async () => {
+    const okFetch = vi.fn().mockImplementation(() => okC({ total: 0, tickets: [] }))
+    vi.stubGlobal('fetch', okFetch)
+    try {
+      await fresh().then((s) => s.close())
+      expect(await syncCommand(['run', 'tickets.search', '--db', dbPath(), '--since', '1d', '--quiet'])).toBe(0)
+      // 第二轮全败：markPending 翻 pending、releaseLock 清章 —— 区间必须原样保留
+      vi.stubGlobal('fetch', vi.fn().mockImplementation(() => { throw new Error('fetch failed') }))
+      out = ''
+      expect(await syncCommand(['run', 'tickets.search', '--db', dbPath(), '--since', '1d', '--quiet'])).toBe(1)
+      out = ''
+      expect(await syncCommand(['status', 'tickets.search', '--db', dbPath()])).toBe(0)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.resolved_range).not.toBeNull()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('修复批 2 · E 中-2/C-11：gap 区间与 resolved_range 同走上海 ISO', () => {
+  it('sync run 的 gaps[].range 是 +08:00 ISO（不再是 epoch 毫秒字符串）', async () => {
+    // ⚠️ 不用假时钟：http 层的退避重试是真实 setTimeout，冻结时钟下会挂住
+    //（既有「全窗失败」用例同样走真实时钟）。
+    const fetchMock = vi.fn().mockImplementation(() => { throw new Error('fetch failed') })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      expect(await syncCommand(['run', 'tickets.search', '--db', dbPath(), '--since', '1d', '--quiet'])).toBe(1)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      const gaps = t.gaps as Array<{ range: [string, string] }>
+      expect(gaps.length).toBe(1)
+      // 与 resolved_range 同形态（上海 +08:00 ISO）：同一字段族的两种值不再各写一套解析
+      expect(gaps[0]!.range[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?\+08:00$/)
+      expect(gaps[0]!.range[1]).toMatch(/\+08:00$/)
+      const rr = t.resolved_range as [string, string]
+      expect(rr[0]).toMatch(/\+08:00$/)
+      expect(Date.parse(gaps[0]!.range[0])).toBeGreaterThan(Date.now() - 86_400_000 - 5000)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('修复批 2 · B 中-5 命令层补口：请求区间早于接口下界 → 显式提示', () => {
+  it('--until 早于接口可得下界 → tasks[].notes 与 stderr 都明说「区间不可得」', async () => {
+    const CLOCK = Date.UTC(2026, 9, 14, 18, 0, 0)   // 2026-10-15T02:00+08:00
+    vi.useFakeTimers({ now: CLOCK })
+    const fetchMock = vi.fn().mockImplementation(() => okC({ total: 0, tickets: [] }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      // 40 天前的日期早于 tickets.search 的 31 天下界（windowStartFloorDays=31）
+      const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(),
+        '--until', '2026-09-05'])
+      expect([0, 1]).toContain(code)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      const notes = t.notes as string[]
+      expect(notes.length).toBe(1)
+      expect(notes[0]).toMatch(/早于该接口可得数据的最早边界/)
+      expect(notes[0]).toMatch(/上游物理上给不出数据/)
+      expect(err).toMatch(/提示：/)
+    } finally {
+      vi.unstubAllGlobals()
+      vi.useRealTimers()
+    }
+  })
+
+  it('区间落在下界之内（--since 1d）→ notes 为空数组（不误报）', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => okC({ total: 0, tickets: [] }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      expect(await syncCommand(['run', 'tickets.search', '--db', dbPath(), '--since', '1d', '--quiet'])).toBe(0)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.notes).toEqual([])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('修复批 2 · D 高-1/F 中-2：sensitive 标注的运行时出口', () => {
+  it('sync tasks 输出每任务的 sensitive_columns（payload 在列内、非敏感列不误入）', async () => {
+    expect(await syncCommand(['tasks'])).toBe(0)
+    const tasks = data().tasks as Array<Record<string, unknown>>
+    const sessions = tasks.find((t) => t.id === 'sessions.export')!
+    const cols = sessions.sensitive_columns as string[]
+    // payload 是 PII 的完整副本 —— 必须与七个单列一起被标出（否则 E 按列脱敏整列绕过）
+    expect(cols).toContain('payload')
+    for (const name of ['userPhone', 'userName', 'userEmail', 'userAddress', 'fromIp',
+      'userIpCity', 'userCrmInfo']) {
+      expect(cols, name).toContain(name)
+    }
+    // 非敏感列不误入（不按名称模式泛化）
+    expect(cols).not.toContain('staffId')
+    expect(cols).not.toContain('session_id')
+
+    const tickets = tasks.find((t) => t.id === 'tickets.search')!
+    expect(tickets.sensitive_columns).toContain('payload')
+    expect(tickets.sensitive_columns).toContain('crmUserPhone')
+    expect(tickets.sensitive_columns).not.toContain('ticket_id')
+
+    // 无 PII 的表 → 空数组（键恒在，形态稳定）
+    const dim = tasks.find((t) => t.id === 'dim.staff')!
+    expect(dim.sensitive_columns).toEqual([])
+  })
+})
+
+describe('修复批 2 · B 低-1：init 失败也要 close store', () => {
+  it('迁移失败 → 退出码 1 且 store 已关闭（连接与 instance 不泄漏）', async () => {
+    const storeMod = await import('../../src/store/index.js')
+    const schemaMod = await import('../../src/store/schema.js')
+    const realOpen = storeMod.openStore
+    const closeSpies: Array<ReturnType<typeof vi.fn>> = []
+    const openSpy = vi.spyOn(storeMod, 'openStore').mockImplementation(async (cfg, mode) => {
+      const s = await realOpen(cfg, mode)
+      const orig = s.close.bind(s)          // 先抓原方法：直接包 s.close 会自递归
+      const closeSpy = vi.fn(() => orig())
+      ;(s as { close: () => Promise<void> }).close = closeSpy as unknown as () => Promise<void>
+      closeSpies.push(closeSpy)
+      return s
+    })
+    // 注入一个必失败的迁移版本（99，不与真实清单撞号）——openStore 成功、init 抛错。
+    const realMigrations = schemaMod.MIGRATIONS
+    const migSpy = vi.spyOn(schemaMod, 'MIGRATIONS', 'get').mockReturnValue(
+      [...realMigrations, { version: 99, up: async () => { throw new Error('注入的迁移失败') } }] as never)
+    try {
+      const code = await syncCommand(['run', 'dim.staff', '--db', dbPath(), '--quiet'])
+      expect(code).toBe(1)
+      expect(closeSpies.length).toBe(1)
+      expect(closeSpies[0]).toHaveBeenCalledTimes(1)
+    } finally {
+      migSpy.mockRestore()
+      openSpy.mockRestore()
+    }
   })
 })

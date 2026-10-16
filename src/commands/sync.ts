@@ -12,9 +12,13 @@
 //     drift 非空时 detail 说明核对方式；
 //   · install/uninstall 的平台条目生成与命令执行在 src/schedule/install.ts，
 //     平台检测与外部命令均为注入点（__setPlatform/__setRun）；
-//   · install 前置探测：库已初始化（schema_version 存在）且跑通过一次 sync run
-//     （sync_state 有非冷却行）——hint 一律指 `qiyu sync run`（spec §9.5：D 交付后
-//     store_not_initialized 的 hint 改指 sync run，sync run 首跑会自动建库）。
+//   · install 前置探测（E 高-1）：**必须存在真实成功证据** —— sync_state 有
+//     `range_status='complete'` 或 `last_synced_at` 非空的行。引擎在窗口执行前就
+//     markPending 落行，所以「有行」不等于「跑通过」：全败的 run 同样留下 pending 行，
+//     按「有行」放行会把调度器装在一个从未成功同步的库上（探测名不副实）。
+//   · store_not_initialized 的 hint 一律指 `qiyu store init`（spec §九：D 交付后
+//     仍指 store init —— `sync run` 首跑虽会自动建库，但「初始化存储」的最小命令是
+//     store init；本文件内三处出口同口径）。
 // 输出键一律下划线命名（spec §七：range_status / gaps_count / local_rows /
 // expected_from_api / state_windows_consistent）——本仓 Agent 契约的统一形态。
 import { homedir } from 'node:os'
@@ -25,9 +29,10 @@ import { listGaps, listWatermarks } from '../sync/state.js'
 import type { SyncTask } from '../sync/types.js'
 import { resolveStoreConfig } from '../store/config.js'
 import { openStore } from '../store/index.js'
+import { tableByName } from '../store/schema.js'
 import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail } from '../output.js'
-import { runSyncRun, SYNC_RUN_USAGE } from './sync-run.js'
+import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso } from './sync-run.js'
 import { thrownToExit } from './store.js'
 import {
   currentPlatform, runScheduleCommand, planInstall, planUninstall,
@@ -39,9 +44,12 @@ const USAGE = `用法：qiyu sync <子命令> [参数]
 
 子命令：
   sync tasks               列出全部同步任务与不支持的实时快照数据集
+                           （每条含 sensitive_columns：该表标注 sensitive 的 PII 列清单）
   sync run [任务...]        同步数据进本地库（--full / --since / --until / --quiet）
-  sync status [任务...]     水位、区间状态、缺口与锁（只读；缺省全部任务）
+  sync status [任务...]     水位、区间状态（resolved_range）、缺口（gaps）、锁（只读；缺省全部任务）
   sync verify [任务...]     核对本地与远端一致性（快照三方核对；drift 非空退出码 1）
+                           快照任务给 expected_from_api（上游行数）；windowed 任务不做上游
+                           全量重拉、该字段恒为 null，只以本地行数与 sync_state 成功状态核对
   sync install --schedule CRON [--yes]
                            生成并安装系统调度条目（默认 dry-run，--yes 才写入）
   sync uninstall [--yes]   移除系统调度条目（默认 dry-run，--yes 才删除）
@@ -49,7 +57,8 @@ const USAGE = `用法：qiyu sync <子命令> [参数]
 CRON 为 5 段（分 时 日 月 周），支持 * / 数字 / a-b / a-b/k / */k / 逗号列表。
 存储定位：--db / --profile / --backend（store 命令同族）。
 install 的平台形态：darwin=launchd plist、linux=systemd unit+timer（crontab 兜底）、
-win32=schtasks。安装前置：库已初始化且跑通过一次 sync run。
+win32=schtasks。安装前置：库已初始化且**至少成功同步过一次**（sync_state 有
+range_status=complete 或 last_synced_at 非空的行；全败的 run 只留 pending，不算跑通）。
 `
 
 const KNOWN = new Set(['--help', '-h', '--pretty'])
@@ -119,7 +128,7 @@ function resolveConfig(flags: StoreFlags): { path: string; backend: string; conf
   return { path: resolved.config.path, backend: resolved.config.backend, config: resolved.config }
 }
 
-/** 只读命令的库前置检查（statSync 分流沿 store status；hint 按 spec §9.5 指 sync run）。 */
+/** 只读命令的库前置检查（statSync 分流沿 store status；hint 统一指 store init，spec §九）。 */
 function statGuard(path: string): number | null {
   let st: ReturnType<typeof statSync>
   try { st = statSync(path) } catch (e) {
@@ -127,7 +136,7 @@ function statGuard(path: string): number | null {
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库文件不存在：${path}`,
-        hint: '数据库尚未初始化。请先运行一次同步（首次运行会自动建库）：qiyu sync run',
+        hint: '数据库尚未初始化。请先运行：qiyu store init',
       })
     }
     return fail({
@@ -159,7 +168,7 @@ async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?
       return { code: fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行 qiyu sync run',
+        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
       }) }
     }
     return { store }
@@ -170,6 +179,18 @@ async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?
 }
 
 // —— sync status ——
+
+/**
+ * sync_state 的 resolved_range 列（epoch 毫秒字符串）→ [ISO, ISO] 输出（G2）。
+ * 两端都有值才输出；任一端缺失（v9 前的旧记录 / 从未成功推进）为 null ——
+ * 与 run 的 resolved_range 同形态（上海 +08:00 ISO）。
+ */
+function resolvedRangeOut(st: { resolvedRangeStart?: string | null; resolvedRangeEnd?: string | null } | undefined): [string, string] | null {
+  const s = st?.resolvedRangeStart
+  const e = st?.resolvedRangeEnd
+  if (s === null || s === undefined || e === null || e === undefined) return null
+  return [msToShanghaiIso(s), msToShanghaiIso(e)]
+}
 
 async function syncStatus(argv: string[]): Promise<number> {
   const help = subHelp(argv)
@@ -194,16 +215,32 @@ async function syncStatus(argv: string[]): Promise<number> {
   try {
     const states = await listWatermarks(store)
     const gaps = await listGaps(store)
-    const gapCounts = new Map<string, number>()
-    for (const g of gaps) gapCounts.set(g.dataset, (gapCounts.get(g.dataset) ?? 0) + 1)
+    const gapsByTask = new Map<string, Array<{ range: [string, string | null]; reason: string; detail: string | null; recorded_at: string }>>()
+    for (const g of gaps) {
+      const list = gapsByTask.get(g.dataset) ?? []
+      // 缺口区间原样回显（sync_gaps 存的是引擎写入的毫秒字符串；这里不二次格式化，
+      // 与 run 输出的 ISO 形态差异见 spec §七——status 是状态面、run 是结果面）。
+      list.push({
+        range: [g.rangeStart, g.rangeEnd],
+        reason: g.reason, detail: g.detail, recorded_at: g.recordedAt,
+      })
+      gapsByTask.set(g.dataset, list)
+    }
     const tasksOut = tasks.map((t) => {
       const st = states.get(t.id)
+      const taskGaps = gapsByTask.get(t.id) ?? []
       return {
         task: t.id,
         watermark: st?.watermark ?? null,
         range_status: st?.rangeStatus ?? null,
         last_synced_at: st?.lastSyncedAt ?? null,
-        gaps_count: gapCounts.get(t.id) ?? 0,
+        // G2 义务（spec §八.2/§十一.17）：上次成功推进覆盖的区间，形态与 sync run 的
+        // resolved_range 一致（[ISO, ISO]；列空 = 尚无成功推进或 v9 前的旧记录）。
+        resolved_range: resolvedRangeOut(st),
+        // 历史缺口的读取通道（spec §三「水位、区间状态、缺口、锁」）：逐条输出，
+        // gaps_count 保留为计数快照（既有消费者不破坏）。
+        gaps: taskGaps,
+        gaps_count: taskGaps.length,
         // 锁列（sync_state.locked_by）——引擎盖章后为真；活跃写锁由本命令自身的
         // ro 打开失败（store_locked）表达（DuckDB 单写者模型）。
         locked: (st?.lockedBy ?? null) !== null,
@@ -324,7 +361,14 @@ async function syncVerify(argv: string[]): Promise<number> {
 
 const RATELIMIT_PREFIX = '__ratelimit__:'
 
-/** install 前置探测：库已初始化（statGuard + schema_version）且跑通过一次 sync run。 */
+/**
+ * install 前置探测（E 高-1）：库已初始化（statGuard + schema_version）**且存在真实成功证据**。
+ * ⚠️ 判据是 `range_status='complete'` 或 `last_synced_at` 非空 —— 不是「sync_state 里有行」：
+ * 引擎在**任何窗口执行之前**就 markPending 落行（runWindowed/planRotation/runSnapshot），
+ * 所以一个全败的 run 同样留下 pending 行。按「有行」放行等于把调度器装在一个从未成功
+ * 同步过的库上，探测名不副实（且 hint 会劝用户「先跑通一次」却已经被放行）。
+ * 冷却行（`__ratelimit__:` 前缀）本就不是任务行，按前缀排除。
+ */
 async function probeSynced(config: Parameters<typeof openStore>[0], path: string): Promise<number | null> {
   const guarded = statGuard(path)
   if (guarded !== null) return guarded
@@ -333,12 +377,14 @@ async function probeSynced(config: Parameters<typeof openStore>[0], path: string
   const store = opened.store
   try {
     const states = await listWatermarks(store)
-    const hasHistory = [...states.keys()].some((k) => !k.startsWith(RATELIMIT_PREFIX))
-    if (!hasHistory) {
+    const hasSuccess = [...states.values()].some((s) =>
+      !s.dataset.startsWith(RATELIMIT_PREFIX)
+      && (s.rangeStatus === 'complete' || s.lastSyncedAt !== null))
+    if (!hasSuccess) {
       return fail({
         code: 'sync_not_run', kind: 'sync_not_run', retryable: false,
-        message: '尚未运行过同步（sync_state 无任何数据集记录）',
-        hint: '安装调度前请先跑通一次：qiyu sync run',
+        message: '尚未成功同步过任何任务（sync_state 无 range_status=complete 且无 last_synced_at 的记录）',
+        hint: '安装调度前请先跑通一次同步：qiyu sync run',
       })
     }
     return null
@@ -510,6 +556,9 @@ export async function syncCommand(argv: string[]): Promise<number> {
   } catch (e) { return usageFail((e as Error).message) }
 
   // tasks：只暴露声明元数据，函数字段（fetch/write/enrich）不进 JSON。
+  // sensitive_columns（D 高-1/F 中-2）：按 tableByName 取该表的 PII 列清单 —— 这是
+  // `sensitive: true` 标记的**运行时出口**（E 的 `db describe` 之外，Agent 现在就能
+  // 从 sync tasks 知道哪些列不该 SELECT *）。闭集来自 schema.ts 的列声明，不按名称泛化。
   const tasks = SYNC_TASKS.map((t) => ({
     id: t.id,
     table: t.table,
@@ -518,6 +567,8 @@ export async function syncCommand(argv: string[]): Promise<number> {
     maxWindowDays: t.maxWindowDays ?? null,
     overlapDays: t.overlapDays ?? null,
     primaryKey: t.primaryKey,
+    sensitive_columns: (tableByName(t.table)?.columns ?? [])
+      .filter((c) => c.sensitive === true).map((c) => c.name),
   }))
   const unsupported = UNSUPPORTED_DATASETS.map((u) => ({ id: u.id, unsupported: u.reason }))
   return ok({ tasks, unsupported })
