@@ -170,6 +170,15 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区�
 `payload` 列在列内，它是整行 PII 的完整副本，不要 `SELECT *`）。本阶段**没有**任务的
 启用/停用机制：注册表里的任务总是全部执行（选定任务靠命令行显式列出）。
 
+**聚合报表按天切片（窗口 1 天）**：九个报表接口返回的是**窗口聚合值**（`overview` 一行
+全局汇总、`staffworklod` 每客服一行、`transferHuman` 恒 1 行），响应里的 `date` 原文是
+"this date has no specific meaning, it only indicates the start time of the current query"
+——多天窗口会把 N 天汇总标成某一天（`daily_overview` 的「每日概览」会读到 31 天累计值）。
+所以窗口上限是 **1 天**（唯一例外：`staff_attendance`/考勤响应逐行带可信小时戳，保持
+31 天窗口、`stat_date` 按该行时间戳推导）。**代价如实写在明处：窗口数 = 天数**，
+`sync run --full` 对报表任务会从 1970 起切出**上万窗**（≈ 56 年 × 每天 1 窗，每窗至少
+一次调用）——首跑与回补历史请用 `--since/--until` 限定区间（如 `--since 30d` = 30 窗/任务）。
+
 ## 安全
 
 - **危险操作硬门禁**：标记为 `dangerous` 的接口在缺少 `--yes` 时，**绝不发出任何请求**：body 合法则返回退出码 4，body 缺必填/非对象则**先**报参数错误（退出码 2），并给出 `confirm_required` / `confirm_arg` / `risk` / `target` 四个字段。

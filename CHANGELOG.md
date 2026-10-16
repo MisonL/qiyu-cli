@@ -28,6 +28,33 @@
 - 同步 schema 迁移 v9：`sync_state` 补 `resolved_range_start`/`resolved_range_end` 两列
 - `store_not_initialized` 的 hint 统一为 `qiyu store init`（C1 与同步引擎同口径）
 
+### 修复
+
+- **聚合报表按天切片（窗口 1 天）**：九个报表接口返回窗口聚合值、响应 `date` 只表示
+  「本次查询的起点」，多天窗口会把 N 天汇总标成第 1 天且水位每月才推进一次 →
+  `overview`/`staff_workload`/`staff_quality`/`staff_satisfaction`/`robot_summary`/
+  `transfer_human`/`order_performance`/`staff_salary_detail` 窗口上限改为 1 天；
+  考勤保持 31 天（响应逐行带可信小时戳）但 `stat_date` 改由该行时间戳推导。
+  窗口数 = 天数：`--full` 对报表任务会切出上万窗，回补历史请用 `--since/--until`
+- **断链后 `resolved_range` 不再谎报覆盖**：水位冻结在连续成功末端时，覆盖区间同样
+  冻结（此前会回显到失败窗之后的窗口末，`sync status` 输出失真）
+- **`deleteRangeInsert` 删除上界越界一天**：天对齐删除上界改为 `dayOf(end − 1ms)`
+  （半开窗口的最后一个瞬时）——`--until` 指定日期 / 昨天零点钳制这类「end 恰在日界」
+  的窗口此前会多删**下一天**的行，而本轮不重拉
+- **知识库快照丢行不再静默**：缺键行被丢弃（快照全删重插下从表里消失）时记 gap
+  `knowledge_row_malformed`（detail 含行数）
+- **`sync install` 把存储参数写进调度命令**：`--db`/`--profile`/`--backend` 随
+  launchd/systemd/crontab/schtasks 条目透传——此前前置探测用指定库、调度任务却跑默认库
+- **schtasks 映射修正**：步进要求整除周期（`*/7` 分钟在 cron 每小时重置、schtasks 不
+  重置 → 拒绝映射，绝不错位）；`HOURLY` 判据改为「固定分钟 + 小时步进」
+  （`0 */2 * * *` 可映射、`* */2 * * *` 显式拒绝而非静默收窄）
+- **zip 解压**：条目定位改以中央目录为唯一来源（修复 bit3 数据描述符下第二个条目
+  `session.txt` 找不到）；ZipCrypto 校验字节在 bit3 时接受 DOS 修改时间高字节
+  （此前恒与 CRC 高字节比较，合法包被判「密码错误」）；解压后用中央目录 CRC 全量校验
+- **导出包下载加 120 秒超时**：签名 URL 挂起不再让 `sync run` 永久挂住、写锁不释放
+- **`knowledgeRobotIds` 整数组校验**：非法元素（非正整数）退出码 2 并指出非法值，
+  不再静默过滤成空数组（注入面静默失效）
+
 ## [0.1.0] - 2026-10-09
 
 首个版本：认证与通用 API 通道。
