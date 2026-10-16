@@ -7,10 +7,21 @@ import type { Store, WriteTx } from '../store/types.js'
 
 export type RangeStatus = 'pending' | 'complete' | null
 
-export interface WatermarkState {
+export interface WatermarkState extends ResolvedRangeState {
   watermark: string | null
   rangeStatus: RangeStatus
   lastSyncedAt: string | null
+}
+
+/**
+ * G2 落点（spec §八.2）：sync_state 里「上次成功推进覆盖的区间」（epoch 毫秒字符串）。
+ * ⚠️ 与水位同命：markPending / clearLock 必须把已有值**原样回写**（sync_state 是单行
+ * 全列 upsert，少写一列就等于把那一列清成 null）—— 否则每一轮新 run 的 markPending
+ * 或收尾的 clearLock 都会把上次覆盖区间抹掉，G2 字段永远读不到东西。
+ */
+export interface ResolvedRangeState {
+  resolvedRangeStart: string | null
+  resolvedRangeEnd: string | null
 }
 
 export interface GapRow {
@@ -25,22 +36,30 @@ export interface GapRow {
 /** 读某 dataset 的水位状态行；不存在时全空。 */
 export async function readWatermark(store: Store, dataset: string): Promise<WatermarkState> {
   // 常量 SQL 调用点 1/3
-  const r = await store.query('SELECT watermark, range_status, last_synced_at FROM sync_state WHERE dataset = ?', [dataset])
+  const r = await store.query(
+    'SELECT watermark, range_status, last_synced_at, resolved_range_start, resolved_range_end FROM sync_state WHERE dataset = ?',
+    [dataset])
   const row = r.rows[0]
-  if (!row) return { watermark: null, rangeStatus: null, lastSyncedAt: null }
+  if (!row) {
+    return { watermark: null, rangeStatus: null, lastSyncedAt: null, resolvedRangeStart: null, resolvedRangeEnd: null }
+  }
   return {
     watermark: (row.watermark as string | null) ?? null,
     rangeStatus: (row.range_status as RangeStatus) ?? null,
     lastSyncedAt: (row.last_synced_at as string | null) ?? null,
+    resolvedRangeStart: (row.resolved_range_start as string | null) ?? null,
+    resolvedRangeEnd: (row.resolved_range_end as string | null) ?? null,
   }
 }
 
 /** sync_state 行的完整列集（Store.upsert 契约：每行必须完整列集）。 */
 function stateRow(dataset: string, watermark: string | null, rangeStatus: RangeStatus,
-  lastError: string | null, lockedBy: string | null, lockedAt: string | null, lastSyncedAt: string | null) {
-  // D-T4 起 sync_state 共 9 列：next_allowed_at / last_rate_limited_at 属限频闸门
-  //（src/sync/rate-gate.ts）专用，水位行恒为 null。
-  return { dataset, watermark, range_status: rangeStatus, last_error: lastError, locked_by: lockedBy, locked_at: lockedAt, last_synced_at: lastSyncedAt, next_allowed_at: null, last_rate_limited_at: null }
+  lastError: string | null, lockedBy: string | null, lockedAt: string | null, lastSyncedAt: string | null,
+  rangeStart: string | null = null, rangeEnd: string | null = null) {
+  // D-T4 起 sync_state 共 9 列（+G2 两列 = 11 列）：next_allowed_at / last_rate_limited_at
+  // 属限频闸门（src/sync/rate-gate.ts）专用，水位行恒为 null；
+  // resolved_range_start/end 只在 advanceWatermark 有值（G2 义务，spec §八.2）。
+  return { dataset, watermark, range_status: rangeStatus, last_error: lastError, locked_by: lockedBy, locked_at: lockedAt, last_synced_at: lastSyncedAt, next_allowed_at: null, last_rate_limited_at: null, resolved_range_start: rangeStart, resolved_range_end: rangeEnd }
 }
 
 /**
@@ -65,33 +84,39 @@ export async function markPending(tx: WriteTx, dataset: string,
     return
   }
   await tx.upsert('sync_state', [stateRow(dataset, existing.watermark, 'pending', null,
-    lockedBy, lockedAt, existing.lastSyncedAt)])
+    lockedBy, lockedAt, existing.lastSyncedAt,
+    existing.resolvedRangeStart ?? null, existing.resolvedRangeEnd ?? null)])
 }
 
 /**
- * 推进水位：写 watermark、range_status=complete 与同步时间。
- * @param range 预留参数，当前不落库；水位值由调用方 stringify 后经 watermark 传入。
+ * 推进水位：写 watermark、range_status=complete、同步时间**与覆盖区间**（G2 义务）。
+ * @param range 本次成功推进覆盖的区间（引擎传入本窗 `w` 或快照的 resolvedRange）——
+ * 落 sync_state.resolved_range_start/end（epoch 毫秒字符串，`sync status` 的
+ * resolved_range 输出即由此格式化而来，spec §八.2/§十一.17）。
+ * 水位值由调用方 stringify 后经 watermark 传入。
  * lock（E 中-1）：本轮写者盖章原样保留 —— 水位行与锁列同在 sync_state 同一主键行上，
  * 引擎在 markPending 盖的章不能在推进水位时被抹掉（引擎把同一个 lock 对象传两处）。
  */
 export async function advanceWatermark(tx: WriteTx, dataset: string, watermark: string,
   range: { start: string | number; end: string | number }, syncedAt: string,
   lock?: { by: string; at: string }): Promise<void> {
-  void range
   await tx.upsert('sync_state', [stateRow(dataset, watermark, 'complete', null,
-    lock?.by ?? null, lock?.at ?? null, syncedAt)])
+    lock?.by ?? null, lock?.at ?? null, syncedAt,
+    String(range.start), String(range.end))])
 }
 
 /**
  * 清空该 dataset 的写者锁（E 中-1 引擎侧）。`existing` 由调用方在事务外读出：
  * **锁列之外的列按 existing 回写** —— 清章绝不顺带丢掉水位或区间状态
  *（sync_state 是单行全列 upsert，少写一列就等于把那一列清成 null）。
+ * G2：resolved_range_start/end 同属「锁列之外的列」，必须一并保形回写。
  */
 export async function clearLock(tx: WriteTx, dataset: string,
   existing: WatermarkState | null): Promise<void> {
   await tx.upsert('sync_state', [stateRow(dataset,
     existing?.watermark ?? null, existing?.rangeStatus ?? null, null,
-    null, null, existing?.lastSyncedAt ?? null)])
+    null, null, existing?.lastSyncedAt ?? null,
+    existing?.resolvedRangeStart ?? null, existing?.resolvedRangeEnd ?? null)])
 }
 
 /** 记录/覆盖一条缺口（同 dataset+range_start 靠主键幂等覆盖）。 */
@@ -126,7 +151,7 @@ export async function listGaps(store: Store, dataset?: string): Promise<GapRow[]
 }
 
 /** sync_state 全量行（含锁列）：sync status / verify / install 前置探测的批量读视图。 */
-export interface StateRow extends WatermarkState {
+export interface StateRow extends WatermarkState, ResolvedRangeState {
   dataset: string
   lockedBy: string | null
   lockedAt: string | null
@@ -139,7 +164,7 @@ export interface StateRow extends WatermarkState {
 export async function listWatermarks(store: Store): Promise<Map<string, StateRow>> {
   // 常量 SQL 调用点 4/4
   const r = await store.query(
-    'SELECT dataset, watermark, range_status, last_synced_at, locked_by, locked_at FROM sync_state')
+    'SELECT dataset, watermark, range_status, last_synced_at, locked_by, locked_at, resolved_range_start, resolved_range_end FROM sync_state')
   const out = new Map<string, StateRow>()
   for (const row of r.rows) {
     out.set(row.dataset as string, {
@@ -149,6 +174,8 @@ export async function listWatermarks(store: Store): Promise<Map<string, StateRow
       lastSyncedAt: (row.last_synced_at as string | null) ?? null,
       lockedBy: (row.locked_by as string | null) ?? null,
       lockedAt: (row.locked_at as string | null) ?? null,
+      resolvedRangeStart: (row.resolved_range_start as string | null) ?? null,
+      resolvedRangeEnd: (row.resolved_range_end as string | null) ?? null,
     })
   }
   return out

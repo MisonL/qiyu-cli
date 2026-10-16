@@ -9,6 +9,7 @@ import {
   markPending,
   recordGap,
   clearGap,
+  clearLock,
   listGaps,
 } from '../../src/sync/state.js'
 import type { WatermarkState } from '../../src/sync/state.js'
@@ -86,7 +87,29 @@ describe('sync/state —— 水位与缺口', () => {
   it('不存在的 dataset 返回全空状态', async () => {
     const store = await fresh()
     const s = await readWatermark(store, 'nope')
-    expect(s).toEqual({ watermark: null, rangeStatus: null, lastSyncedAt: null })
+    expect(s).toEqual({ watermark: null, rangeStatus: null, lastSyncedAt: null,
+      resolvedRangeStart: null, resolvedRangeEnd: null })
+    await store.close()
+  })
+
+  it('advanceWatermark 落 G2 区间（resolved_range_start/end）；markPending/clearLock 保形回写', async () => {
+    const store = await fresh()
+    await store.transaction(async (tx) => {
+      await advanceWatermark(tx, 'reports.overview', '2026-10-13',
+        { start: 1_700_000_000_000, end: 1_700_086_400_000 }, '2026-10-14T10:00:00+08:00')
+    })
+    let s = await readWatermark(store, 'reports.overview')
+    expect(s.resolvedRangeStart).toBe('1700000000000')
+    expect(s.resolvedRangeEnd).toBe('1700086400000')
+    // 新一轮 pending：区间必须原样保留（sync_state 单行全列 upsert，少写一列即清空）
+    await store.transaction(async (tx) => { await markPending(tx, 'reports.overview', s) })
+    s = await readWatermark(store, 'reports.overview')
+    expect(s.rangeStatus).toBe('pending')
+    expect(s.resolvedRangeStart).toBe('1700000000000')
+    // 清写者锁同样不得抹掉区间
+    await store.transaction(async (tx) => { await clearLock(tx, 'reports.overview', s) })
+    s = await readWatermark(store, 'reports.overview')
+    expect(s.resolvedRangeEnd).toBe('1700086400000')
     await store.close()
   })
 

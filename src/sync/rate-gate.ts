@@ -39,7 +39,9 @@ export async function writeCooldown(tx: WriteTx, endpointId: string, untilMs: nu
   const untilIso = new Date(untilMs).toISOString()
   // last_rate_limited_at 同样取注入时钟（默认 Date.now）—— 纯 clock 注入下可确定性断言。
   const limitedAtIso = new Date(opts.now?.() ?? Date.now()).toISOString()
-  // upsert 契约：每行必须完整列集（sync_state 共 9 列）。
+  // upsert 契约：每行必须完整列集（sync_state 共 11 列 —— T4 的限频两列 + G2 的区间两列）。
+  // ⚠️ 修复批 2 的最小跨所有权改动：v9 迁移给 sync_state 加了 resolved_range_start/end，
+  // 本行的完整列集随之补 null（冷却行没有覆盖区间）。
   await tx.upsert('sync_state', [{
     dataset: RATELIMIT_PREFIX + endpointId,
     watermark: untilIso,
@@ -50,6 +52,8 @@ export async function writeCooldown(tx: WriteTx, endpointId: string, untilMs: nu
     last_synced_at: null,
     next_allowed_at: untilIso,
     last_rate_limited_at: limitedAtIso,
+    resolved_range_start: null,
+    resolved_range_end: null,
   }])
 }
 

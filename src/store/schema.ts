@@ -3,7 +3,10 @@ export interface ColumnDef {
   name: string
   type: 'VARCHAR' | 'INTEGER'
   nullable: boolean
-  /** ⚠️ E 交付前无运行时读取者 —— 是给 E 的 `db describe` 的预置位（spec §6.2）。 */
+  /**
+   * PII 列标记（spec §6.2/§6.5）：`db describe`（E）与 `sync tasks`（D 命令层）的
+   * 读取出口——E 按列脱敏时**只认这个标记**，所以漏标 = 整列不脱敏。
+   */
   sensitive?: boolean
 }
 export interface TableDef { name: string; columns: ColumnDef[]; primaryKey: string[] }
@@ -23,7 +26,10 @@ export const TABLES: TableDef[] = [
       // D-T4：持久化限频闸门 —— 冷却行（dataset=__ratelimit__:<endpointId>）的
       // 下次可调用时间（watermark 列存同一 ISO 截止时间，两列冗余以备演进）与
       // 最近一次被限频时间。
-      col('next_allowed_at', 'VARCHAR'), col('last_rate_limited_at', 'VARCHAR')],
+      col('next_allowed_at', 'VARCHAR'), col('last_rate_limited_at', 'VARCHAR'),
+      // G2 义务（spec §八.2/§十一.17）：上次成功推进覆盖的区间（ISO 字符串）——
+      // `sync status` 的 resolved_range 输出来源，Agent 可据此判断数据新鲜度。
+      col('resolved_range_start', 'VARCHAR'), col('resolved_range_end', 'VARCHAR')],
     primaryKey: ['dataset'],
   },
   {
@@ -169,9 +175,11 @@ export const TABLES: TableDef[] = [
   // ⚠️ PII 列（工单域的真正载体与文档列出项，设计稿 §6.5：会话导出与工单域字段名互不相交）
   // 标 sensitive: true —— crmUserPhone/crmUserName 非空率 78–81%/100%，userMobile/userName/
   // userEmail 存在于 100% 但非空率 0%（保护不得只挂真载体，也要按实测清单兜住全列）。
+  // ⚠️ `payload` 列**也是** PII 载体：它是整行业务的 JSON 完整副本（含 crmUserPhone 等）——
+  // 不标 sensitive 会让「按列脱敏」的 E 从这一列把全部 PII 原样读出（整列绕过）。
   {
     name: 'tickets',
-    columns: [col('ticket_id', 'VARCHAR', false), col('payload', 'VARCHAR'),
+    columns: [col('ticket_id', 'VARCHAR', false), col('payload', 'VARCHAR', true, true),
       col('crmUserName', 'VARCHAR', true, true), col('crmUserPhone', 'VARCHAR', true, true),
       col('crmUserEmail', 'VARCHAR', true, true), col('userMobile', 'VARCHAR', true, true),
       col('synchronized_at', 'VARCHAR')],
@@ -191,10 +199,12 @@ export const TABLES: TableDef[] = [
   // ⚠️ PII 列 sensitive: true 按设计稿 §6.5 实测清单（不是按名称模式泛化）：
   // userPhone 4640/4687、userName 4687/4687、userCrmInfo 4520/4687（JSON 字符串 blob，
   // 整体视为敏感）、fromIp/userIpCity 4642/4687、userAddress/userEmail 稀疏。
+  // ⚠️ `payload` 列同样是 PII 的**完整副本**（session.txt 全 90 键逐字 JSON）——
+  // 不标 sensitive 等于把上面七个单列的保护整个绕开（E 按列脱敏只认标记）。
   // categoryDetail 归一化（" / " → "/"）由 enrich 在落库前完成（列存归一化后的值）。
   {
     name: 'sessions',
-    columns: [col('session_id', 'VARCHAR', false), col('payload', 'VARCHAR'),
+    columns: [col('session_id', 'VARCHAR', false), col('payload', 'VARCHAR', true, true),
       col('staffId', 'VARCHAR'), col('startTime', 'VARCHAR'), col('endTime', 'VARCHAR'),
       col('session_type', 'VARCHAR'), col('categoryDetail', 'VARCHAR'),
       col('userPhone', 'VARCHAR', true, true), col('userName', 'VARCHAR', true, true),
@@ -325,6 +335,17 @@ export const MIGRATIONS: Migration[] = [
       for (const name of ['knowledge_items', 'knowledge_points', 'knowledge_categories']) {
         await exec(ddlFor(tableByName(name)!))
       }
+    },
+  },
+  // 修复批 2 迁移（G2 义务，spec §八.2/§十一.17）：sync_state 补
+  // resolved_range_start/resolved_range_end 两列（上次成功推进覆盖的区间）。
+  // 函数式 ALTER + IF NOT EXISTS（与 v2/v4 同款幂等：新库 v1 建表时 TABLES 已含这两列，
+  // v1 + v9 连放不炸）。编号说明：v2/v3-v8 的实际占用见 spec §八 —— 本批顺延到 v9。
+  {
+    version: 9,
+    up: async (exec) => {
+      await exec('ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_start" VARCHAR')
+      await exec('ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_end" VARCHAR')
     },
   },
 ]

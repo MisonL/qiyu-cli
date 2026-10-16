@@ -73,7 +73,7 @@ describe('store init', () => {
     expect(d.backend).toBe('duckdb')
     expect(typeof d.config_path).toBe('string')
     expect(d.config_exists).toBe(false)
-    expect(d.schema_version).toBe(8)
+    expect(d.schema_version).toBe(9)
     expect(d.tables).toEqual(['daily_overview', 'knowledge_categories', 'knowledge_items',
       'knowledge_points', 'order_performance', 'robot_summary',
       'schema_version', 'sessions', 'staff', 'staff_attendance', 'staff_group_members',
@@ -117,7 +117,7 @@ describe('store status', () => {
     expect(d.backend).toBe('duckdb')
     expect(typeof d.config_path).toBe('string')
     expect(d.config_exists).toBe(false)
-    expect(d.schema_version).toBe(8)
+    expect(d.schema_version).toBe(9)
     expect(Array.isArray(d.tables)).toBe(true)
     const t0 = (d.tables as Array<Record<string, unknown>>)[0]
     expect(t0).toHaveProperty('name')
@@ -237,7 +237,7 @@ describe('store 命令面与 help', () => {
     // status：只读跟随符号链接打开真实库（spec §7.2 无此防线）
     out = ''
     expect(await storeCommand(['status', '--db', link])).toBe(0)
-    expect(data().schema_version).toBe(8)
+    expect(data().schema_version).toBe(9)
   })
 
   it('父目录创建失败 → 1 + message 含路径与底层原因（验收 41，fs 注入）', async () => {

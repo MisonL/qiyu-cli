@@ -153,10 +153,12 @@ describe('duckdb —— upsert 契约', () => {
 
   it('null 到 nullable 列 → 正常写入并读回 null（显式 null ≠ 缺列）', async () => {
     const s = await fresh()
-    // D-T4 起 sync_state 共 9 列：完整列集须含 next_allowed_at / last_rate_limited_at。
+    // G2（v9）起 sync_state 共 11 列：完整列集须含 next_allowed_at / last_rate_limited_at
+    // 与 resolved_range_start / resolved_range_end。
     await s.upsert('sync_state', [{ dataset: 'tags', watermark: null, range_status: null,
       last_error: null, locked_by: null, locked_at: null, last_synced_at: null,
-      next_allowed_at: null, last_rate_limited_at: null }])
+      next_allowed_at: null, last_rate_limited_at: null,
+      resolved_range_start: null, resolved_range_end: null }])
     const r = await s.query('SELECT watermark, range_status FROM sync_state WHERE dataset = ?', ['tags'])
     expect(r.rows[0].watermark).toBeNull()
     expect(await s.count('sync_state')).toBe(1)
@@ -258,9 +260,9 @@ describe('duckdb —— init 与关闭', () => {
       .mockReturnValue([...real, { version: 99, up: async () => { throw new Error('注入的迁移失败') } }] as never)
     const s1 = await createDuckDbStore(cfg, 'rw')
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
-    expect(await s1.count('schema_version')).toBe(8)   // v1..v8 已记、99 未记（失败不推进）
+    expect(await s1.count('schema_version')).toBe(9)   // v1..v9 已记、99 未记（失败不推进）
     await s1.close()
-    // 恢复真实迁移，重新 init → 重放路径只补 99（真实清单无 99，MAX 保持 7）
+    // 恢复真实迁移，重新 init → 重放路径只补 99（真实清单无 99，MAX 保持 8）
     failingSpy.mockRestore()
     // ⚠️ J-M1 实测裁决（controller 以 vitest 2.1.9 真跑探测）：对本地 ESM 模块命名空间
     // 的具名导出做 `vi.spyOn(mod, 'MIGRATIONS', 'get')` **可用**——vitest 的模块转换
@@ -271,7 +273,8 @@ describe('duckdb —— init 与关闭', () => {
     const s2 = await createDuckDbStore(cfg, 'rw')
     await s2.init()
     const v = await s2.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    expect(Number(v.rows[0].v)).toBe(8)   // v1+v2+v3(维度表)+v4+v5(报表表)+v6(工单表)+v7(sessions)+v8(知识库表)，MAX=8
+    // v1..v9（v9=修复批 2 的 G2 区间两列）：MAX=9
+    expect(Number(v.rows[0].v)).toBe(9)
     await s2.close()
   })
 

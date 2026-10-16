@@ -22,11 +22,11 @@ describe('TABLES —— 表定义', () => {
     expect(t.primaryKey).toEqual(['id'])
   })
 
-  it('sync_state 九列（D-T3 加 last_synced_at，D-T4 加 next_allowed_at/last_rate_limited_at）', () => {
+  it('sync_state 十一列（D-T3 last_synced_at、D-T4 限频两列、G2 resolved_range 两列）', () => {
     const t = tableByName('sync_state')!
     expect(t.columns.map((c) => c.name)).toEqual(
       ['dataset', 'watermark', 'range_status', 'last_error', 'locked_by', 'locked_at', 'last_synced_at',
-        'next_allowed_at', 'last_rate_limited_at'])
+        'next_allowed_at', 'last_rate_limited_at', 'resolved_range_start', 'resolved_range_end'])
     expect(t.primaryKey).toEqual(['dataset'])
   })
 
@@ -51,6 +51,18 @@ describe('TABLES —— 表定义', () => {
         expect(typeof (c.sensitive ?? false), `${t.name}.${c.name}`).toBe('boolean')
       }
     }
+  })
+
+  it('payload 列在 PII 表上标 sensitive（D 高-1/F 中-2：它是 PII 的完整副本，漏标 = 整列绕过脱敏）', () => {
+    for (const name of ['sessions', 'tickets']) {
+      const c = tableByName(name)!.columns.find((x) => x.name === 'payload')!
+      expect(c.sensitive, `${name}.payload`).toBe(true)
+    }
+    // 无 PII 的表不误标（知识库域与会话/工单 PII 清单零交集）
+    expect(tableByName('knowledge_items')!.columns.find((c) => c.name === 'payload')!.sensitive)
+      .toBe(false)
+    expect(tableByName('daily_overview')!.columns.find((c) => c.name === 'payload')!.sensitive)
+      .toBe(false)
   })
 
   it('schema_version.version 是 INTEGER（迁移序号，非 ID 列）', () => {
@@ -100,5 +112,14 @@ describe('MIGRATIONS —— 迁移', () => {
       'ticket_categories', 'ticket_templates', 'ticket_template_fields']) {
       expect(ran.some((s) => s.includes(`"${name}"`)), `v3 缺 ${name}`).toBe(true)
     }
+  })
+
+  it('v9 迁移给 sync_state 补 resolved_range 两列（函数式 ALTER、幂等形态）', async () => {
+    const ran: string[] = []
+    const m9 = MIGRATIONS.find((m) => m.version === 9)!
+    await m9.up(async (sql) => { ran.push(sql) })
+    expect(ran.length).toBe(2)
+    expect(ran[0]).toMatch(/ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_start" VARCHAR/)
+    expect(ran[1]).toMatch(/ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_end" VARCHAR/)
   })
 })
