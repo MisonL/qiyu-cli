@@ -1147,6 +1147,11 @@ describe('修复批 2 · D 高-1/F 中-2：sensitive 标注的运行时出口', 
     expect(tickets.sensitive_columns).toContain('crmUserPhone')
     expect(tickets.sensitive_columns).not.toContain('ticket_id')
 
+    // 修复批 3：ticket.logs 的 payload 也是 PII 完整副本（ccList/toMailList/operatorId/正文）
+    // —— 该任务的敏感列出口恰好是 ['payload']（键列不误入）
+    const logs = tasks.find((t) => t.id === 'ticket.logs')!
+    expect(logs.sensitive_columns).toEqual(['payload'])
+
     // 无 PII 的表 → 空数组（键恒在，形态稳定）
     const dim = tasks.find((t) => t.id === 'dim.staff')!
     expect(dim.sensitive_columns).toEqual([])

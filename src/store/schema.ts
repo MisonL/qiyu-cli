@@ -187,8 +187,15 @@ export const TABLES: TableDef[] = [
   },
   {
     name: 'ticket_logs',
+    // ⚠️ payload 同样是 PII 的完整副本，标 sensitive: true（修复批 3）——`ticket.log` 行携带
+    // `ccList`/`toMailList`（邮箱清单）、`operatorId` 与日志正文（设计稿 §10.3 实测字段表：
+    // 「六个字段未文档化…attachments/nodeName/preHolder/targetStaff/ccList/toMailList 稀疏存在」），
+    // 与 tickets/sessions 的 payload 同类：不标等于让 E 的按列脱敏从这一列整列绕过。
+    // **判定依据是设计稿的实测字段（§10.3/§10.4），不是本行的重测** —— 标注意义与
+    // tickets/sessions 一致（PII 完整副本），故按同规处理；若将来复测发现该行不含 PII，
+    // 撤标需连同本节注释一起改（不留「标了但没依据」的状态）。
     columns: [col('ticket_id', 'VARCHAR', false), col('log_id', 'VARCHAR', false),
-      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+      col('payload', 'VARCHAR', true, true), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['ticket_id', 'log_id'],
   },
   // —— D：会话表批次（迁移 v7 建；设计稿 §7.5 实测字段全集）——

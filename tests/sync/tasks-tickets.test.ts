@@ -87,6 +87,15 @@ describe('schema v6 迁移 —— tickets / ticket_logs 两张表', () => {
       expect(t.columns.find((c) => c.name === name)?.sensitive, `${name}`).toBe(true)
     }
   })
+
+  it('ticket_logs.payload 标注 sensitive: true（修复批 3：日志行是 PII 完整副本 —— ccList/toMailList/operatorId/正文）', () => {
+    const t = tableByName('ticket_logs')!
+    const payload = t.columns.find((c) => c.name === 'payload')!
+    expect(payload.sensitive).toBe(true)
+    // 键列不误标（sensitive 标记是 PII 载体标记，不是「整表敏感」）
+    expect(t.columns.find((c) => c.name === 'ticket_id')?.sensitive).toBe(false)
+    expect(t.columns.find((c) => c.name === 'log_id')?.sensitive).toBe(false)
+  })
 })
 
 describe('TICKET_TASKS 任务声明', () => {

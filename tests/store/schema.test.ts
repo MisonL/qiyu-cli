@@ -53,8 +53,10 @@ describe('TABLES —— 表定义', () => {
     }
   })
 
-  it('payload 列在 PII 表上标 sensitive（D 高-1/F 中-2：它是 PII 的完整副本，漏标 = 整列绕过脱敏）', () => {
-    for (const name of ['sessions', 'tickets']) {
+  it('payload 列在 PII 表上标 sensitive（D 高-1/F 中-2 + 修复批 3：它是 PII 的完整副本，漏标 = 整列绕过脱敏）', () => {
+    // ticket_logs 在修复批 3 加入：`ticket.log` 行携带 ccList/toMailList（邮箱清单）、
+    // operatorId 与日志正文（设计稿 §10.3/§10.4 实测字段）——与 tickets/sessions 的 payload 同类。
+    for (const name of ['sessions', 'tickets', 'ticket_logs']) {
       const c = tableByName(name)!.columns.find((x) => x.name === 'payload')!
       expect(c.sensitive, `${name}.payload`).toBe(true)
     }
