@@ -297,4 +297,17 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
     expect(md).toMatch(/windowAlign: 'shanghaiDay'/)
     expect(md).toMatch(/上海日界对齐/)
   })
+
+  it('批 5 复审 N1-b/N1-c：三处「对齐后每窗恰是整日 / --full 不放大」的不实措辞不得回归', () => {
+    // 复审实证：epoch 0 在上海是 1969-12-31 16:00（不是 1970-01-01 0 点），
+    // 故 --full 首窗是 16 小时残段、窗数至多 +1；非日界 --since 的首窗也是残段
+    //（其日行靠「水位续跑起点落日界 → 该日整体重拉」闭环，不是靠窗宽）。
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    expect(s).toMatch(/起点 0（= 上海 1969-12-31 16:00）/)
+    expect(s).not.toMatch(/起点 0 恰为上海 1970-01-01 0 点/)
+    expect(s).not.toMatch(/日对齐不放大窗数/)
+    const md = read('README.md')
+    expect(md).not.toMatch(/每窗恰是一整个业务日，「每日概览」/)
+    expect(md).toMatch(/非日界的\n?首窗是不足一天的残段/)
+  })
 })

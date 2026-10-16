@@ -352,7 +352,8 @@ function clampWindowEnd(windows: Range[], limit: number): Range[] {
 function sliceShanghaiDayAligned(range: Range, maxWindowDays: number): Range[] {
   const stepMs = maxWindowDays * DAY
   const out: Range[] = []
-  // 首段起点 = 上海日 0 点（可能早于 range.start 最多 <1 天——对齐的代价）。
+  // 首段网格起点 = 上海日 0 点（可能早于 range.start 最多 <1 天，但下一行的 max
+  // 会把窗 start 钳回 range.start —— 产出的首窗 start 恒等于 range.start）。
   let d = shanghaiDayStart(range.start)
   // 防御（理论不可达：调用方保证 start < end 且 range.start ≥ 0）：首段起点倒挂时
   // 退回 range.start，绝不产出生成死循环的空步进。
@@ -414,9 +415,10 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   }
 
   // —— 切窗 + 末端钳制 + 跳过包含窗（T2 裁定接线 / G 高-1 / 修复批 5 #1 日对齐）——
-  // 日对齐分支（windowAlign='shanghaiDay'）的窗边界全是上海日界：首窗 start 可能早于
-  // rangeStart 最多 <1 天（对齐的代价，见 sliceShanghaiDayAligned）。⚠️ 保持现状：
-  // resolved_range.start 仍是水位起点语义（rangeStart），不因对齐回退。
+  // 日对齐分支（windowAlign='shanghaiDay'）的窗边界全是上海日界：**首窗 start 恒等于
+  // rangeStart**（网格起点被 max 钳回，2026-10-17 复审探针 4000 组实测 0 例外）、
+  // 末窗 end 恒等于 rangeEnd——对齐只影响**中间**窗的边界。resolved_range.start
+  // 仍是水位起点语义（rangeStart），不因对齐回退。
   const limit = windowEndLimit(task, now)
   const overlapMs = overlapDaysOf(task)
   const raw = sliceForTask(task, resolvedRange, task.maxWindowDays)
