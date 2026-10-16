@@ -68,8 +68,10 @@ function crc32(buf: Uint8Array): number {
   return (c ^ 0xFFFFFFFF) >>> 0
 }
 
-/** 单条目的 ZipCrypto 加密数据（加密头 12 字节 + deflate 密文），密码即密钥种子。 */
-function encryptEntry(content: string, password: string): { enc: Uint8Array; crc: number; rawLen: number } {
+/** 单条目的 ZipCrypto 加密数据（加密头 12 字节 + deflate 密文），密码即密钥种子。
+ * checkByte 缺省 = CRC 高字节（非 bit3 写法）；bit3 时按 PKWARE 约定传修改时间高字节。 */
+function encryptEntry(content: string, password: string,
+  checkByte?: number): { enc: Uint8Array; crc: number; rawLen: number } {
   const raw = strToU8(content)
   const comp = deflateSync(raw, { level: 6 })
   // ZipCrypto 密钥初始化与更新（PKWARE APPNOTE）—— 密钥按条目重置（标准行为）
@@ -82,11 +84,11 @@ function encryptEntry(content: string, password: string): { enc: Uint8Array; crc
   }
   for (const ch of strToU8(password)) upd(ch)
   const crc = crc32(raw)
-  // 加密头 12 字节：11 随机 + 1 校验字节（= crc 高字节）—— ZipCrypto 对整个明文流
+  // 加密头 12 字节：11 随机 + 1 校验字节 —— ZipCrypto 对整个明文流
   //（含这 12 字节头）连续加密，密钥状态跨头/体连续
   const hdr = new Uint8Array(12)
   for (let i = 0; i < 11; i++) hdr[i] = (i * 37 + 11) & 0xFF
-  hdr[11] = (crc >>> 24) & 0xFF
+  hdr[11] = checkByte ?? ((crc >>> 24) & 0xFF)
   const enc = new Uint8Array(hdr.length + comp.length)
   const stream = (K: number[]): number => {
     const k = ((K[2] | 2) & 0xFFFF) >>> 0
@@ -111,36 +113,47 @@ const le = (v: number, bytes: number): Uint8Array => {
 
 /** 多文件 ZipCrypto 加密 zip（deflate 方法）—— 测试合成专用。
  * entries 顺序即容器内条目顺序（message.txt 在前的用例靠它构造）。
- * bit3=true 时本地头 crc/csize 置 0、置数据描述符标志位，真实 crc 只写在 central directory
- *（D 中-1：实现必须回中央目录取真 crc 校验密码，否则错密码静默吐乱码）。 */
+ * bit3=true 时本地头 crc/csize 置 0、置数据描述符标志位，真实 crc 只写在 central directory；
+ * 且按 PKWARE/Info-ZIP 约定把**加密头校验字节写成 DOS 修改时间高字节**（modTime=0x3A20
+ * → 0x3A）——写入方在 bit3 下无法预先知道 CRC（修复批 4 #6）。数据区后补一个 12 字节
+ * 数据描述符（可选记录，真实写入器会写；条目定位不得依赖它）。 */
 function makeEncryptedZip(entries: Array<{ name: string; content: string }>, password: string,
   bit3 = false): Uint8Array {
+  const MOD_TIME = 0x3A20   // 合成 DOS 修改时间：高字节 0x3A（≠ 任何真实 CRC 高字节的概率极高）
   const bodies: Uint8Array[] = []
   const cds: Uint8Array[] = []
   let offset = 0
   for (const { name, content } of entries) {
-    const { enc, crc, rawLen } = encryptEntry(content, password)
+    const { enc, crc, rawLen } = encryptEntry(content, password,
+      bit3 ? ((MOD_TIME >>> 8) & 0xFF) : undefined)
     const nameBytes = strToU8(name)
     const lfh = new Uint8Array(30 + nameBytes.length)
     lfh.set([0x50, 0x4B, 0x03, 0x04])
     lfh.set(le(20, 2), 4)        // version
     lfh.set(le(bit3 ? 0x0009 : 0x0001, 2), 6)   // flags: bit0 加密（+bit3 数据描述符）
     lfh.set(le(8, 2), 8)         // method deflate
-    lfh.set(le(0, 4), 10)        // time/date
+    lfh.set(le(0, 2), 10); lfh.set(le(0, 2), 12)   // time/date（非 bit3 时为 0）
+    if (bit3) lfh.set(le(MOD_TIME, 2), 10)         // bit3：加密头校验字节来源
     lfh.set(le(bit3 ? 0 : crc, 4), 14)          // bit3 时本地头 crc=0（真实值在中央目录）
     lfh.set(le(bit3 ? 0 : enc.length, 4), 18)   // bit3 时本地头 csize=0
     lfh.set(le(bit3 ? 0 : rawLen, 4), 22)       // bit3 时本地头 usize=0
     lfh.set(le(nameBytes.length, 2), 26)
     lfh.set(le(0, 2), 28)
     lfh.set(nameBytes, 30)
-    const body = new Uint8Array(lfh.length + enc.length)
-    body.set(lfh); body.set(enc, lfh.length)
+    // 数据描述符（bit3）：[可选签名][crc][csize][usize]，紧跟在数据之后
+    const dd = bit3 ? new Uint8Array(16) : new Uint8Array(0)
+    if (bit3) {
+      dd.set(le(0x08074b50, 4), 0)
+      dd.set(le(crc, 4), 4); dd.set(le(enc.length, 4), 8); dd.set(le(rawLen, 4), 12)
+    }
+    const body = new Uint8Array(lfh.length + enc.length + dd.length)
+    body.set(lfh); body.set(enc, lfh.length); body.set(dd, lfh.length + enc.length)
     const cd = new Uint8Array(46 + nameBytes.length)
     cd.set([0x50, 0x4B, 0x01, 0x02])
     cd.set(le(20, 2), 4); cd.set(le(20, 2), 6)
     cd.set(le(0x0001, 2), 8)
     cd.set(le(8, 2), 10)
-    cd.set(le(0, 4), 12)
+    if (bit3) cd.set(le(MOD_TIME, 2), 12)
     cd.set(le(crc, 4), 16)
     cd.set(le(enc.length, 4), 20)
     cd.set(le(rawLen, 4), 24)
@@ -272,6 +285,31 @@ describe('zip 解压（密码 = appKey 前 12 字符）', () => {
       APP_KEY.slice(0, 12), true)
     await expect(unzipPasswordZip(zip, 'wrong-password-xx')).rejects.toThrow(/密码错误/)
   })
+
+  it('修复批 4 #5：两条目 + bit3（session.txt 在后）→ 以中央目录定位仍能取到', async () => {
+    // 旧实现的本地头步进遇 bit3 会落在数据描述符上（签名不符）→ 循环退出 →
+    // session.txt 永远找不到（旧的 bit3 用例只有单条目，掩盖了这条路径）。
+    const zip = makeEncryptedZip([
+      { name: 'message.txt', content: '先去的那条消息文件' },
+      { name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n${TAIL_LINE}\n` },
+    ], APP_KEY.slice(0, 12), true)
+    const text = await unzipPasswordZip(zip, APP_KEY)
+    const r = parseJsonl(text)
+    expect(r.rows).toEqual([SESSION_ROW])
+    expect(r.fixture).toBe(TAIL_LINE)
+  })
+
+  it('修复批 4 #6：bit3 且加密头写的是修改时间高字节 → 合法包可解（CRC 由解压结果全量校验）', async () => {
+    // PKWARE/Info-ZIP 约定：bit3 时写入方无法预知 CRC → 第 12 字节写 DOS 修改时间高字节。
+    // 旧实现恒与 CRC 高字节比较 → 把合法包判成「密码错误」。
+    const zip = makeEncryptedZip(
+      [{ name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n` }],
+      APP_KEY.slice(0, 12), true)
+    const text = await unzipPasswordZip(zip, APP_KEY)
+    expect(parseJsonl(text).rows).toEqual([SESSION_ROW])
+    // 错密码仍显式失败（校验字节是时间字节时同样拦得住）
+    await expect(unzipPasswordZip(zip, 'wrong-password-xx')).rejects.toThrow(/密码错误/)
+  })
 })
 
 describe('runExportPipeline —— 四步流水线 mock', () => {
@@ -353,7 +391,9 @@ describe('runExportPipeline —— 四步流水线 mock', () => {
   })
 
   it('D 中-2：导出 zip 未加密（bit0 缺失）→ 显式失败（注册表假设失效可见）', async () => {
-    // 明文 zip：本地头无 bit0（直接 deflateSync，不加密）
+    // 明文 zip：本地头无 bit0（直接 deflateSync，不加密）。带合法 EOCD + 中央目录，
+    // 让失败落在「未加密」这条守卫上（与修复批 4 #5 的定位改造一致：先定位条目、
+    // 再读 flags；只有没有 central directory 的畸形 zip 才报缺 EOCD）。
     const content = `${JSON.stringify(SESSION_ROW)}\n`
     const comp = deflateSync(strToU8(content), { level: 6 })
     const nameBytes = strToU8('session.txt')
@@ -367,8 +407,27 @@ describe('runExportPipeline —— 四步流水线 mock', () => {
     lfh.set(le(strToU8(content).length, 4), 22)
     lfh.set(le(nameBytes.length, 2), 26)
     lfh.set(nameBytes, 30)
-    const zip = new Uint8Array(lfh.length + comp.length)
-    zip.set(lfh); zip.set(comp, lfh.length)
+    const body = new Uint8Array(lfh.length + comp.length)
+    body.set(lfh); body.set(comp, lfh.length)
+    // 中央目录：cd 的 flags 字段必须与本地头一致（0）——bit3=false 的条目
+    const cd = new Uint8Array(46 + nameBytes.length)
+    cd.set([0x50, 0x4B, 0x01, 0x02])
+    cd.set(le(20, 2), 4); cd.set(le(20, 2), 6)
+    cd.set(le(0x0001, 2), 8)
+    cd.set(le(8, 2), 10)
+    cd.set(le(crc32(strToU8(content)), 4), 16)
+    cd.set(le(comp.length, 4), 20)
+    cd.set(le(strToU8(content).length, 4), 24)
+    cd.set(le(nameBytes.length, 2), 28)
+    cd.set(le(0, 4), 42)
+    cd.set(nameBytes, 46)
+    const eocd = new Uint8Array(22)
+    eocd.set([0x50, 0x4B, 0x05, 0x06])
+    eocd.set(le(1, 2), 10)
+    eocd.set(le(cd.length, 4), 12)
+    eocd.set(le(body.length, 4), 16)
+    const zip = new Uint8Array(body.length + cd.length + eocd.length)
+    zip.set(body); zip.set(cd, body.length); zip.set(eocd, body.length + cd.length)
     const fetchMock = vi.fn()
       .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
         code: 200, message: 'task-key-0009',

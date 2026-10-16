@@ -54,57 +54,90 @@ function messageOf(res: { payload: unknown; messageText: string }, endpointId: s
  * 失败，绝不静默吐乱码。
  * F 低-4：解出的字节用 Node 内置 TextDecoder 解码（不再引 fflate 的 strFromU8 ——
  * 解压/解密路径本来就是零依赖实现，只有这一处解码借了 fflate）。
+ * 修复批 4 #6：解压后**用中央目录的 CRC 校验** inflate 结果（crc 非 0 时）——ZipCrypto
+ * 的校验字节只有 1 字节、错密码有 1/256 的概率蒙对，CRC 是全量的兜底。
+ * ⚠️ crc === 0 时不做比对（写入方未提供 CRC —— 例如某些流式写入器连数据描述符里
+ * 也写 0）：此时「解压自身失败」仍是兜底（错密码几乎必然让 inflate 报结构错误）。
+ * 这条取舍是刻意的：宁可在 crc 缺失时少一层校验，也绝不把 0 当成「真实 CRC」去比对
+ * （那会把合法包一律判错）。
  */
 export async function unzipPasswordZip(zip: Uint8Array, appKey: string): Promise<string> {
   const password = appKey.slice(0, 12)
   const entry = findEntry(zip)
-  const raw = zipDecrypt(entry.comp, password, entry.crcOrSize)
+  const raw = zipDecrypt(entry.comp, password, entry)
   const inflated = await inflateRaw(raw)
+  if (entry.crc !== 0) {
+    const actual = crc32Of(inflated)
+    if (actual !== entry.crc) {
+      throw new Error(`zip 解压结果 CRC 不符（期望 ${entry.crc.toString(16)}，实得 ${actual.toString(16)}）` +
+        '——密码或数据已损坏，拒绝落库')
+    }
+  }
   return new TextDecoder().decode(inflated)
 }
 
-interface ZipEntry { comp: Uint8Array; crcOrSize: number }
-
-/** 定位名为 session.txt 的条目（导出 zip 内是 session.txt/message.txt 两个 JSONL——
- * 只吃会话，message.txt 即使排在前面也不取；找不到显式抛错）。 */
-function findEntry(zip: Uint8Array): ZipEntry {
-  const u16 = (o: number): number => zip[o] | (zip[o + 1] << 8)
-  const u32 = (o: number): number => (zip[o] | (zip[o + 1] << 8) | (zip[o + 2] << 16) | (zip[o + 3] << 24)) >>> 0
-  if (u32(0) !== 0x04034b50) throw new Error('不是 zip 容器（本地文件头签名不符）')
-  const decoder = new TextDecoder()
-  // 逐条目扫本地文件头（30 字节定长 + 名 + 扩展），按名字匹配 session.txt
-  let o = 0
-  while (o + 30 <= zip.length && u32(o) === 0x04034b50) {
-    const flags = u16(o + 6)
-    const method = u16(o + 8)
-    const nlen = u16(o + 26)
-    const elen = u16(o + 28)
-    const name = decoder.decode(zip.subarray(o + 30, o + 30 + nlen))
-    // flags bit3（数据描述符）：本地头的 crc 与 csize 都置 0，真实值只在 central directory。
-    // ⚠️ D 中-1：此时**绝不能退化成「不校验、长度按 0 算」**——crc=0 会让错密码静默吐
-    // 乱码，csize=0 会让本地头扫描原地打转（把密文当文件头读）。必须回中央目录取
-    // 真实 crc + csize；取不到就显式失败（响应形态漂移，宁可失败不给乱码）。
-    const cd = (flags & 0x8) !== 0 ? centralEntry(zip, name) : null
-    const csize = cd !== null ? cd.csize : u32(o + 18)
-    const crcStored = cd !== null ? cd.crc : u32(o + 14)
-    if (name === 'session.txt') {
-      if (!(flags & 0x1)) throw new Error('导出 zip 未加密（与实测形态不符，注册表/文档假设失效）')
-      if (method !== 8) throw new Error(`不支持的压缩方法：${method}（预期 deflate=8）`)
-      const dataStart = o + 30 + nlen + elen
-      return { comp: zip.subarray(dataStart, dataStart + csize), crcOrSize: crcStored }
-    }
-    o = o + 30 + nlen + elen + csize
-  }
-  throw new Error('导出 zip 内没有 session.txt 条目（响应形态漂移？）')
+interface ZipEntry {
+  /** 加密数据区（12 字节加密头 + 密文）。 */
+  comp: Uint8Array
+  /** 中央目录里的 CRC-32（0 = 写入方未提供）。 */
+  crc: number
+  /** 本地头通用标志（bit0 加密、bit3 数据描述符）。 */
+  flags: number
+  /** 本地头偏移 10 的 DOS 修改时间（u16）——bit3 时 ZipCrypto 校验字节的来源之一。 */
+  modTime: number
+  /** 本地头里的压缩方法。 */
+  method: number
 }
 
 /**
- * 从 central directory 取指定条目的真实 CRC 与压缩长度（bit3 数据描述符形态的唯一来源）。
- * 路径：EOCD（尾部 22 字节定长 + 可选注释）→ CD 起始偏移/条目数 → 逐条 CD 记录
- *（46 字节定长 + 名 + 扩展 + 注释）按名匹配。找不到/结构不符 → 显式抛错：宁可失败，
- * 也绝不在「无校验字节可对」的状态下把错密码的乱码当数据吐出去。
+ * 定位名为 session.txt 的条目（导出 zip 内是 session.txt/message.txt 两个 JSONL——
+ * 只吃会话，message.txt 即使排在前面也不取；找不到显式抛错）。
+ *
+ * 修复批 4 #5：**以中央目录为唯一定位来源**。此前逐条目扫本地文件头，遇到 bit3
+ *（数据描述符）时本地头 crc/csize 均为 0，步进 `o += 30 + nlen + elen + csize` 会落在
+ * 数据描述符上（签名 0x04034b50 之后是 crc/size 字段）→ 循环退出 → **session.txt 永远
+ * 找不到**（实测导出 zip 是 message.txt + session.txt 两条目，若写入方用数据描述符即中招；
+ * 旧的 bit3 用例只有单条目，掩盖了这条路径）。
+ * 现在：EOCD → 中央目录条目（按名匹配）→ 该条目的本地头偏移（CD 偏移 42）+ CD 的
+ * csize/crc → 直接算数据起点。数据描述符有无都不影响定位（它夹在数据与下一条目之间，
+ * 我们不靠步进遍历）。
  */
-function centralEntry(zip: Uint8Array, name: string): { crc: number; csize: number } {
+function findEntry(zip: Uint8Array): ZipEntry {
+  const u16 = (o: number): number => zip[o] | (zip[o + 1] << 8)
+  const u32 = (o: number): number => (zip[o] | (zip[o + 1] << 8) | (zip[o + 2] << 16) | (zip[o + 3] << 24)) >>> 0
+  const cd = centralDirectoryEntry(zip, 'session.txt')
+  const local = cd.localOffset
+  if (local + 30 > zip.length || u32(local) !== 0x04034b50) {
+    throw new Error('zip 本地文件头偏移不符（中央目录指向的不是本地头）——响应形态漂移，拒绝落库')
+  }
+  const flags = u16(local + 6)
+  const method = u16(local + 8)
+  const modTime = u16(local + 10)
+  const nlen = u16(local + 26)
+  const elen = u16(local + 28)
+  if (!(flags & 0x1)) throw new Error('导出 zip 未加密（与实测形态不符，注册表/文档假设失效）')
+  if (method !== 8) throw new Error(`不支持的压缩方法：${method}（预期 deflate=8）`)
+  const dataStart = local + 30 + nlen + elen
+  if (dataStart + cd.csize > zip.length) {
+    throw new Error('zip 声明长度超出文件边界（中央目录与本地头不一致）——拒绝落库')
+  }
+  return {
+    comp: zip.subarray(dataStart, dataStart + cd.csize),
+    crc: cd.crc, flags, modTime, method,
+  }
+}
+
+/**
+ * 中央目录里按名取条目：路径 EOCD（尾部 22 字节定长 + 可选注释，签名 0x06054b50）
+ * → CD 起始偏移/条目数 → 逐条 CD 记录（46 字节定长 + 名 + 扩展 + 注释）按名匹配。
+ * 返回 CD 里的 crc / csize / 本地头偏移（偏移 42）。找不到/结构不符 → 显式抛错：
+ * 宁可失败，也绝不在「无校验字节可对」的状态下把错密码的乱码当数据吐出去。
+ * 修复批 4 #5：本函数从「bit3 的兜底补查」升格为**唯一定位来源**（原逐条目本地头
+ * 扫描已删除——两步定位必然漂移）。非 bit3 时 CD 的 crc/csize 与本地头一致
+ *（APPNOTE 要求），故对本形态无行为变化。
+ */
+function centralDirectoryEntry(zip: Uint8Array, name: string):
+{ crc: number; csize: number; localOffset: number } {
   const u16 = (o: number): number => zip[o] | (zip[o + 1] << 8)
   const u32 = (o: number): number => (zip[o] | (zip[o + 1] << 8) | (zip[o + 2] << 16) | (zip[o + 3] << 24)) >>> 0
   // EOCD 从尾往前找（签名 0x06054b50；注释最长 64KB）
@@ -124,14 +157,25 @@ function centralEntry(zip: Uint8Array, name: string): { crc: number; csize: numb
     const elen = u16(o + 30)
     const clen = u16(o + 32)
     const entryName = decoder.decode(zip.subarray(o + 46, o + 46 + nlen))
-    if (entryName === name) return { crc: u32(o + 16), csize: u32(o + 20) }
+    if (entryName === name) {
+      return { crc: u32(o + 16), csize: u32(o + 20), localOffset: u32(o + 42) }
+    }
     o = o + 46 + nlen + elen + clen
   }
   throw new Error(`zip central directory 内没有 ${name} 条目——无法校验解压密码，拒绝落库`)
 }
 
-/** ZipCrypto 解密：密钥由密码初始化，逐字节流式更新；校验字节匹配则剥掉 12 字节头。 */
-function zipDecrypt(comp: Uint8Array, password: string, crcHigh: number): Uint8Array {
+/**
+ * ZipCrypto 解密：密钥由密码初始化，逐字节流式更新；校验字节匹配则剥掉 12 字节头。
+ * 修复批 4 #6：校验字节的来源取决于 bit3（数据描述符）——
+ *   · bit3 置位：CRC 被推迟到数据描述符，写入方**无法预先知道** CRC →
+ *     PKWARE/Info-ZIP 的约定是把加密头第 12 字节写成 **DOS 修改时间的高字节**
+ *     （`modTime >>> 8`）。此前恒与 CRC 高字节比较，合法的 bit3 包会被判「密码错误」。
+ *   · bit3 未置位：只有 CRC 高字节一种写法（仍是唯一判据）。
+ * 两者都接受（兼容不同写入方）：bit3 时 `check === timeHigh || check === crcHigh`。
+ * crc === 0（写入方未提供）时不把 0 当真实 CRC 参与比对（否则会把合法包判错）。
+ */
+function zipDecrypt(comp: Uint8Array, password: string, entry: ZipEntry): Uint8Array {
   const CRC_TABLE = crcTable()
   const keys = [0x12345678, 0x23456789, 0x34567890]
   const upd = (b: number): void => {
@@ -149,12 +193,24 @@ function zipDecrypt(comp: Uint8Array, password: string, crcHigh: number): Uint8A
     upd(p)
     out[i] = p
   }
-  // 校验字节 = 加密头最后一字节明文；有 crc 时应等于 crc 高字节。
+  // 校验字节 = 加密头最后一字节明文
   const check = out[11]
-  if (crcHigh !== 0 && check !== ((crcHigh >>> 24) & 0xFF)) {
+  const crcHigh = entry.crc === 0 ? null : ((entry.crc >>> 24) & 0xFF)
+  const accepted: number[] = []
+  if ((entry.flags & 0x8) !== 0) accepted.push((entry.modTime >>> 8) & 0xFF)   // bit3：修改时间高字节
+  if (crcHigh !== null) accepted.push(crcHigh)
+  if (accepted.length > 0 && !accepted.includes(check)) {
     throw new Error('zip 解压密码错误（校验字节不匹配）——密码应为 appKey 前 12 字符')
   }
   return out.subarray(12)
+}
+
+/** CRC-32（与 zip 同多项式）。解压结果的全量校验用（修复批 4 #6）。 */
+function crc32Of(buf: Uint8Array): number {
+  const t = crcTable()
+  let c = 0xFFFFFFFF
+  for (const b of buf) c = (c >>> 8) ^ t[(c ^ b) & 0xFF]!
+  return (c ^ 0xFFFFFFFF) >>> 0
 }
 
 let table: Uint32Array | null = null
