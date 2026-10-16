@@ -240,10 +240,12 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
     }
   })
 
-  it('多任务缺省 = 全部 21 任务照跑；某任务失败不影响其余（故障隔离、退出码 0）', { timeout: 120000 }, async () => {
+  it('多任务缺省 = 全部 21 任务照跑；某任务失败不影响其余（故障隔离、退出码 0）', { timeout: 300000 }, async () => {
     // dim 族 2 个形状 A 快照接口正常返回；statistic.overview 的接口全抛错；知识库正常返回。
-    // fetch 按路径分派：报表路径 → 抛错；knowledge/kpoint → 成功；getCategoryTree → 空树；
-    // 其余（含 dim A 端点）→ 成功信封。--since 40d 控制窗数（windowed 2 窗）。
+    // ⚠️ 报表任务自修复批 4 #1 起**按天切片**（窗口 1 天）：--since 40d = 40 窗/任务，
+    // 每窗 1 次调用 + 假空重试 → 调用量与耗时随窗数线性增长，故窗口收窄到 2d
+    //（2 窗/任务）；窗数语义由 tests/sync/tasks-reports.test.ts 专测，本用例只验
+    // 「21 任务全跑、故障隔离」。
     const fetchMock = vi.fn().mockImplementation((url: unknown) => {
       const u = String(url)
       if (u.includes('/openapi/statistic/')) throw new Error('fetch failed')
@@ -259,7 +261,7 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
     vi.stubGlobal('fetch', fetchMock)
     try {
       await fresh().then((s) => s.close())
-      const code = await syncCommand(['run', '--db', dbPath(), '--since', '40d', '--quiet'])
+      const code = await syncCommand(['run', '--db', dbPath(), '--since', '2d', '--quiet'])
       expect(code).toBe(0)   // 有任务成功 → 部分成功也是 0
       const tasks = data().tasks as Array<Record<string, unknown>>
       expect(tasks.length).toBe(21)
@@ -452,7 +454,7 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
     }
   })
 
-  it('sessions.export 端到端：fetchZip 生产接线生效（mock create/check/zip 下载三段）', async () => {
+  it('sessions.export 端到端：fetchZip 生产接线生效（mock create/check/zip 下载三段）', { timeout: 120000 }, async () => {
     // 下载 URL mock：fetchZip 用全局 fetch 拉 zip —— 返回一个未加密、未压缩容量的假 zip 不可行，
     // 生产 fetchZip 只负责下载字节；解压密码错误在 unzip 阶段显式失败 —— 这里断言
     // 「fetchZip 请求真的发出」（T10 的显式失败 hint 不再出现，接线已生效）。
@@ -469,6 +471,10 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
       // 但 fetchZip 已被真实调用 —— 接线断言的落点）
       .mockImplementationOnce(() => Promise.resolve(new Response('NOT-A-ZIP',
         { status: 200 })))
+      // 假空重试：第一窗失败后引擎重跑同一窗（本用例只关心失败路径的调用形态）
+      .mockImplementation(() => Promise.resolve(new Response(
+        JSON.stringify({ code: 200, message: 'https://qiyukf.com/export/x.zip' }),
+        { status: 200, headers: { 'content-type': 'application/json' } })))
     vi.stubGlobal('fetch', fetchMock)
     try {
       await fresh().then((s) => s.close())
@@ -478,7 +484,8 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
         '--since', '1d', '--quiet'])
       // 单任务全窗失败（partial + succeeded=0）→ 退 1（T13 fix 中-1 的补判口径）
       expect(code).toBe(1)
-      expect(fetchMock.mock.calls.length).toBe(3)   // create + check + zip 下载
+      // create + check + zip 下载（首窗失败即停；调用数只受本任务形态驱动）
+      expect(fetchMock.mock.calls.length).toBe(3)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('partial')
       expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
