@@ -163,3 +163,63 @@ describe('D 同步引擎交付联动 —— 不得说假话（D-T15）', () => {
     expect(s).toMatch(/sync\/ 不得 import commands\//)
   })
 })
+
+describe('修复批 2 文档联动 —— 契约诚实性收口（锚内容不锚行号）', () => {
+  it('D spec §七：enabled 已从输出契约移除并注明无启用机制', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    // 输出契约里不得再承诺 enabled 字段
+    expect(s).not.toMatch(/`\{enabled, kind, table/)
+    // 且必须写明「本阶段无启用机制」
+    expect(s).toMatch(/本阶段无启用\/停用机制/)
+  })
+
+  it('D spec §七：ok 双轨语义与 notes/gaps/resolved_range/sensitive_columns 已写明', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    expect(s).toMatch(/`ok:true` 与退出码 1 的双轨语义/)
+    expect(s).toMatch(/sensitive_columns/)
+    expect(s).toMatch(/`notes`（修复批 2 新增）/)
+  })
+
+  it('D spec §九：store_not_initialized 的 hint 口径 = qiyu store init（与 C1 同）', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    expect(s).toMatch(/hint \*\*一律指 `qiyu store init`\*\*/)
+  })
+
+  it('D spec §八：迁移编号实况（v9 的 G2 两列）已记录', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    expect(s).toMatch(/v9（sync_state 补 resolved_range_start\/end 两列/)
+  })
+
+  it('设计稿 §9.5：hint 口径与 D 交付后同指 store init（不再承诺改指 sync run）', () => {
+    const s = read('docs/qiyu-cli-design.md')
+    const l = s.split('\n').find((x) => /`kind: "store_not_initialized"`/.test(x)) ?? ''
+    expect(l).toMatch(/qiyu store init/)
+    expect(l).toMatch(/同口径/)
+  })
+
+  it('README 输出契约段：ok 双轨 + sync 输出（resolved_range/gaps/sensitive_columns）', () => {
+    const md = read('README.md')
+    expect(md).toMatch(/`ok` 与退出码的双轨语义/)
+    expect(md).toMatch(/resolved_range/)
+    expect(md).toMatch(/sensitive_columns/)
+    // verify 的 expected_from_api 说明（E 中-6）：windowed 恒为 null + 核对方式
+    expect(md).toMatch(/该字段恒为 `null`/)
+    // 无启用/停用机制必须写明（防止 README 出现「启用任务」的过度承诺）
+    expect(md).toMatch(/没有\*\*任务的\s*启用\/停用机制/)
+    expect(md).not.toMatch(/启用\/停用任务/)
+  })
+
+  it('CHANGELOG [未发布]：批 2 条目（v9 迁移 + sensitive_columns + resolved_range）在段内', () => {
+    const md = read('CHANGELOG.md')
+    const unreleased = /## \[未发布\][\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
+    expect(unreleased).toMatch(/迁移 v9/)
+    expect(unreleased).toMatch(/sensitive_columns/)
+    expect(unreleased).toMatch(/resolved_range/)
+  })
+
+  it('sync 命令帮助文案：install 前置与 verify 的 expected_from_api 说明已写进 usage', () => {
+    const s = read('src/commands/sync.ts')
+    expect(s).toMatch(/至少成功同步过一次/)
+    expect(s).toMatch(/该字段恒为 null/)
+  })
+})

@@ -90,6 +90,14 @@ qiyu store init [--db <path>] [--profile <name>] [--backend <name>]
                                      初始化本地数据库（DuckDB）
 qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
                                      查看数据库状态与各表行数
+qiyu sync tasks                      列出全部同步任务（含敏感列清单）与不支持的数据集
+qiyu sync run [任务...] [--full] [--since T] [--until T] [--quiet]
+                                     同步数据进本地库（缺省全部任务；进度走 stderr）
+qiyu sync status [任务...]           水位、区间状态（resolved_range）、缺口（gaps）、锁
+qiyu sync verify [任务...]           核对本地与远端一致性（drift 非空退出码 1）
+qiyu sync install --schedule CRON [--yes]
+                                     安装系统调度条目（默认 dry-run）
+qiyu sync uninstall [--yes]          移除系统调度条目（默认 dry-run）
 ```
 
 ## 输出契约
@@ -139,6 +147,29 @@ qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
 每张表的名字与行数。`store status` 的每次调用都要对各表做全表 `COUNT`（行数无缓存），
 轮询代价与数据量成正比，Agent 不应把它当作高频健康检查来用。
 
+### sync 命令的输出
+
+`sync run` 的 stdout 是 `{tasks:[...], truncated:false}`，每个任务含 `task` / `status`
+（complete/partial/failed）/ `windows` / `rows` / `resolved_range`（Asia/Shanghai 的
+`+08:00` ISO 二元组）/ `watermark` / `last_synced_at` / `gaps` / `notes`。`gaps[].range`
+与 `resolved_range` 同形态（同一套时间解析）；`notes` 是中文说明数组（恒在，常为空），
+例如「请求区间早于接口可得数据的最早边界」——把「区间不可得」与「同步故障」分开。
+
+**`ok` 与退出码的双轨语义**：`ok:true` 表示「命令已产出结果」，**退出码才是成败的权威
+判据**。全失败（退出码 1）与 `sync verify` 的 drift 非空（退出码 1）时 stdout 仍是
+`{ok:true,data:...}`——缺口/漂移就是它要报告的内容。请先看退出码，再看 `data`。
+
+`sync status` 每任务输出 `{task, watermark, range_status, last_synced_at, resolved_range,
+gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区间（形态同 run 的
+`resolved_range`），`gaps` 是历史缺口逐条 `{range, reason, detail, recorded_at}`。
+`sync verify` 输出 `{task, local_rows, expected_from_api, state_windows_consistent, drift}`：
+**`expected_from_api` 只对快照任务有意义**（上游 fetch 的行数）；windowed 任务不做上游
+全量重拉，该字段恒为 `null`，核对方式是「本地行数 ↔ sync_state 成功状态」的一致性
+（`state_windows_consistent`）——两种任务的核对方式不同，读 drift 前先看任务 kind。
+`sync tasks` 每任务含 `sensitive_columns`——该表标注为敏感的 PII 列清单（会话/工单的
+`payload` 列在列内，它是整行 PII 的完整副本，不要 `SELECT *`）。本阶段**没有**任务的
+启用/停用机制：注册表里的任务总是全部执行（选定任务靠命令行显式列出）。
+
 ## 安全
 
 - **危险操作硬门禁**：标记为 `dangerous` 的接口在缺少 `--yes` 时，**绝不发出任何请求**：body 合法则返回退出码 4，body 缺必填/非对象则**先**报参数错误（退出码 2），并给出 `confirm_required` / `confirm_arg` / `risk` / `target` 四个字段。
@@ -158,6 +189,8 @@ qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
 与同步引擎——`sync tasks` / `sync run` / `sync status` / `sync verify` / `sync install` / `sync uninstall`
 （21 个任务覆盖维度/报表/工单/会话/知识库数据集；增量水位、断点续跑、缺口记录、本地限频冷却持久化、
 跨平台调度安装；会话导出走 create→poll→download→unzip→parse 流水线）。
+`sync install` 的安装前置是**至少成功同步过一次**（sync_state 有 `range_status=complete`
+或 `last_synced_at` 非空的行——全败的 run 只留 pending，不算跑通）。
 
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
