@@ -81,7 +81,7 @@ function okA(data: unknown) {
 /** 真 Response 不可复用 body——按调用序出列的 mock 工厂。 */
 function respondQueue(resps: (() => Promise<Response>)[]) {
   let i = 0
-  return vi.fn(() => (i < resps.length ? resps[i++]() : Promise.reject(new Error('mock 响应耗尽'))))
+  return vi.fn((_url: unknown, _init?: unknown) => (i < resps.length ? resps[i++]() : Promise.reject(new Error('mock 响应耗尽'))))
 }
 
 describe('schema v5 迁移 —— 9 张报表表', () => {
@@ -153,7 +153,7 @@ describe('REPORT_TASKS 任务声明', () => {
 
   it('修复批 4 #1 + 批 5 #1：多天范围按上海日界切窗（端点是日界，首末钳到 range）', async () => {
     const store = await fresh()
-    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
     vi.stubGlobal('fetch', fetchMock)
     try {
       // 3 天范围 → overview 按天切片，且 windowAlign 让**端点落在上海日界**：
@@ -183,7 +183,7 @@ describe('REPORT_TASKS 任务声明', () => {
   })
 
   it('修复批 4 #1：聚合报表的 3 天范围 → 3 个不同 stat_date（不再全落窗口首日）', async () => {
-    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
@@ -207,7 +207,7 @@ describe('REPORT_TASKS 任务声明', () => {
   it('修复批 5 #1：非日界起点（18:23）→ 日对齐窗（首窗 [起点, 次日0点)）', async () => {
     // 水位续跑（watermark+1ms）/ 任意时刻 --since 的典型错相位：起点 18:23。
     // 日对齐后：首窗 [18:23, 次日 0 点)、第二窗整日、末窗 [日界, 次日 18:23)
-    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
@@ -240,7 +240,7 @@ describe('REPORT_TASKS 任务声明', () => {
   })
 
   it('修复批 5 #1：水位续跑起点落到日界（不是水位+1ms）——水位所在日整体重拉', async () => {
-    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
@@ -458,7 +458,7 @@ describe('报表任务 fetch（http mock）', () => {
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const penalize = vi.fn(async () => {})
+      const penalize = vi.fn((_endpointId: string) => Promise.resolve())
       const gate = { penalize, acquire: async () => {} } as unknown as RateGate
       const r = await runTask(reportById('reports.overview')!, dayCtx(store, { gate }))
       expect(r.status).toBe('complete')
@@ -507,7 +507,7 @@ describe('报表任务 fetch（http mock）', () => {
   it('A 中-2：--full 与增量对同一上海自然日 → 只留一行（日期列与删除范围同口径）', async () => {
     // 两个不同的毫秒起点，落在**同一个**上海自然日（+08:00 的 03:00 与 05:00）
     const day0 = shanghaiYesterdayStart(1_700_000_000_000)   // 上海某日 00:00
-    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()

@@ -508,15 +508,16 @@ describe('store_locked 撞锁重试（B 中-4，spec §6.3）', () => {
     const store = await fresh()
     const waits: number[] = []
     let txCalls = 0
-    const realTx = store.transaction.bind(store)
+    const realTx = store.transaction.bind(store) as unknown as
+      (fn: (tx: Parameters<typeof store.transaction>[0]) => Promise<unknown>) => Promise<unknown>
     // 前 2 次 BEGIN 即抛 store_locked（另一写者持锁），第 3 次放行
     const patched = store as unknown as { transaction: unknown }
-    patched.transaction = async <T,>(fn: (tx: Parameters<typeof realTx>[0]) => Promise<T>): Promise<T> => {
+    patched.transaction = (fn: (tx: Parameters<typeof store.transaction>[0]) => Promise<unknown>): Promise<unknown> => {
       txCalls++
       if (txCalls <= 2) {
         throw Object.assign(new Error('database is locked'), { kind: 'store_locked' })
       }
-      return realTx(fn) as Promise<T>
+      return realTx(fn)
     }
     try {
       const t = fakeTask({ fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }) })
