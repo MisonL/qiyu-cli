@@ -37,7 +37,7 @@ import type { WatermarkState } from './state.js'
 import { sliceByMaxWindow } from './windowing.js'
 import { isLockError } from '../store/retry.js'
 import { clampGateWait } from './rate-gate.js'
-import { shanghaiDayIso, shanghaiYesterdayStart } from './day.js'
+import { shanghaiDayIso, shanghaiDayStart, shanghaiYesterdayStart } from './day.js'
 import type {
   SyncTask, RunCtx, TaskRunResult, GapInfo, WindowRef, FetchCtx, FetchResult,
 } from './types.js'
@@ -94,7 +94,13 @@ function resolveRangeStart(task: SyncTask, ctx: RunCtx, state: WatermarkState,
     if (!Number.isNaN(wm)) {
       // T9 裁定接线：overlapDays 是「回看重叠」——水位续跑的窗口起点 = watermark+1 − overlap。
       // 工单按操作时间增量时，3 天回看覆盖乱序到达的状态变更/日志（upsert 幂等吸收重叠行）。
-      start = Math.max(start, wm + 1 - overlapDaysOf(task))
+      const raw = wm + 1 - overlapDaysOf(task)
+      // 修复批 5 #1（日对齐任务）：续跑起点落到**上海日界**（向下取整到当日 0:00）——
+      // 水位所在那一天整体重拉，写出的 stat_date 行才是全天聚合。若按 raw（水位+1ms）
+      // 起，首窗是 [水位+1ms, 次日0点) 的半天切片，会把该日的全天行覆盖成半天聚合
+      // （「每日概览」语义每天漂移的根因）。显式区间（--since/--until/--full）不走此
+      // 分支：调用方给的起点原样照发（B 中-5，见 floorRangeStart）。
+      start = Math.max(start, task.windowAlign === 'shanghaiDay' ? shanghaiDayStart(raw) : raw)
     }
   }
   return floorRangeStart(task, start, requested.end, nowMs)
@@ -329,6 +335,50 @@ function clampWindowEnd(windows: Range[], limit: number): Range[] {
 }
 
 /**
+ * 声明了 `windowAlign: 'shanghaiDay'` 的任务的**段式日对齐切片**（修复批 5 #1）：
+ * 从 `shanghaiDayStart(range.start)`（上海日 0 点）起按 `maxWindowDays` 天的步长推进，
+ * 每段 `[d, d + N天)`；**首段钳 start 到 range.start、末段钳 end 到 range.end**（半开
+ * `[start, end)` 语义不变，末段 end 恰为 range.end）——除被钳的首尾边界外，每个窗的
+ * start/end 都是上海日界。
+ *
+ * 与 overlapDays 的关系（刻意不设防但写明）：对齐只决定窗的**边界**，不改变重叠语义
+ * ——overlapDays=0 的报表任务每段互不重叠；若将来有 overlapDays > 0 的任务声明此项，
+ * 重叠窗同样落在对齐网格上（`skipContained` 的包含窗判据按真实重叠毫秒数算，不受影响）。
+ *
+ * 与 `sliceByMaxWindow` 的分界：日对齐只对声明了 `windowAlign` 的任务生效（报表 8 任务）；
+ * 其余任务（工单 tickets，overlapDays=3、水位 +1ms 任意起点）走原 `sliceByMaxWindow`
+ * ——引擎既有任意起点切片结构、3 天回看重叠用例是回归锚。
+ */
+function sliceShanghaiDayAligned(range: Range, maxWindowDays: number): Range[] {
+  const stepMs = maxWindowDays * DAY
+  const out: Range[] = []
+  // 首段起点 = 上海日 0 点（可能早于 range.start 最多 <1 天——对齐的代价）。
+  let d = shanghaiDayStart(range.start)
+  // 防御（理论不可达：调用方保证 start < end 且 range.start ≥ 0）：首段起点倒挂时
+  // 退回 range.start，绝不产出生成死循环的空步进。
+  if (d > range.start) d = range.start
+  while (d < range.end) {
+    const start = Math.max(d, range.start)          // 首段钳到 range.start
+    const end = Math.min(d + stepMs, range.end)     // 末段钳到 range.end
+    out.push({ start, end })
+    d += stepMs
+  }
+  return out
+}
+
+/**
+ * 任务感知的切片（runWindowed 与 planRotation 共用，修复批 5 #1 的唯一落点）：
+ * 声明了 `windowAlign: 'shanghaiDay'` 的任务走段式日对齐；其余走原 `sliceByMaxWindow`。
+ * 两处执行路径必须同函数，否则 rotated 与单任务语义分叉。
+ * `maxWindowDays` 由调用方在入口校验后传入（两处都有 T2 低-1 的非法值防御）。
+ */
+function sliceForTask(task: SyncTask, range: Range, maxWindowDays: number): Range[] {
+  return task.windowAlign === 'shanghaiDay'
+    ? sliceShanghaiDayAligned(range, maxWindowDays)
+    : sliceByMaxWindow(range, maxWindowDays, task.overlapDays ?? 0)
+}
+
+/**
  * 运行一个同步任务（spec §6.1 的 run(task)）。
  * 范围合成：ctx.rangeOverride 优先（--full/--since/--until 的落点）——**显式区间优先于
  * 水位**（B 中-5：--since 是「把这段历史回补一遍」的指令，被水位抬升会让它静默缩成
@@ -363,10 +413,13 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       rows: { fetched: 0, written: 0 }, resolvedRange, gaps, status: 'complete' }
   }
 
-  // —— 切窗 + 末端钳制 + 跳过包含窗（T2 裁定接线 / G 高-1）——
+  // —— 切窗 + 末端钳制 + 跳过包含窗（T2 裁定接线 / G 高-1 / 修复批 5 #1 日对齐）——
+  // 日对齐分支（windowAlign='shanghaiDay'）的窗边界全是上海日界：首窗 start 可能早于
+  // rangeStart 最多 <1 天（对齐的代价，见 sliceShanghaiDayAligned）。⚠️ 保持现状：
+  // resolved_range.start 仍是水位起点语义（rangeStart），不因对齐回退。
   const limit = windowEndLimit(task, now)
   const overlapMs = overlapDaysOf(task)
-  const raw = sliceByMaxWindow(resolvedRange, task.maxWindowDays, task.overlapDays ?? 0)
+  const raw = sliceForTask(task, resolvedRange, task.maxWindowDays)
   const windows = skipContained(clampWindowEnd(raw, limit), overlapMs)
   // 可拉范围 = 请求范围 ∩ 末端上限：resolved_range 如实回显「这轮实际覆盖到哪」——
   // 回显一个没覆盖到的 end 会让 Agent 以为今天的数据已同步（G 高-1 的静默面）。
@@ -673,8 +726,8 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
   const limit = windowEndLimit(task, now)
   const windows = resolvedRange.end <= resolvedRange.start
     ? []
-    : skipContained(clampWindowEnd(sliceByMaxWindow(resolvedRange, task.maxWindowDays,
-      task.overlapDays ?? 0), limit), overlapMs)
+    : skipContained(clampWindowEnd(sliceForTask(task, resolvedRange, task.maxWindowDays), limit),
+      overlapMs)
   const outRange: Range = { start: rangeStart,
     end: Math.max(rangeStart, Math.min(resolvedRange.end, limit)) }
   const lock = { by: lockOwner(), at: new Date(now).toISOString() }

@@ -112,6 +112,20 @@ export interface SyncTask {
    */
   windowEndClamp?: 'shanghaiYesterday'
   /**
+   * 窗口边界对齐（声明式，只给 stat_date 为主键的聚合报表）：'shanghaiDay' =
+   * 每个切出的窗都是上海自然日边界 `[某日 0:00, 另一日 0:00)`（首窗 start 允许被钳到
+   * range.start、末窗 end 允许被钳到 range.end）。
+   * 为什么必须有：窗口起点来自水位续跑（`watermark+1ms`）或任意时刻的 `--since` 时，
+   * 窗形如 `[今天18:23, 明天18:23)` —— 只写一行 `stat_date=dayOf(start)`，拉到的却是
+   * 跨两天的聚合值；而 `deleteRangeInsert` 的删除范围是 `[dayOf(start), dayOf(end−1ms)]`
+   * = 两天，会把「明天」日的行删掉而不重写（该日数据是上次 run 的切片聚合）。
+   * 「每日概览」因此只在对齐 run 下才是精确全天值。声明本字段 = **该表的按日行集
+   * 必须与按日窗口闭环**（对齐与 overlapDays 无关：报表任务 overlapDays=0；若将来有
+   * overlapDays > 0 的任务声明此项，重叠窗同样落在对齐网格上——对齐只决定边界，
+   * 不改变重叠语义，跳过包含窗的判据仍按真实重叠毫秒数算）。
+   */
+  windowAlign?: 'shanghaiDay'
+  /**
    * 窗口起点的下界（声明式，只给少数接口）：`now − N 天`。
    * 实测 `ticket.search` 的 `opStart` 被服务端**静默钳到「当前时刻前约 31 天」**——
    * 而引擎在「--full / 仅 --until / 首跑水位为空」时合成的起点是 0（哨兵，不是真实日期），
