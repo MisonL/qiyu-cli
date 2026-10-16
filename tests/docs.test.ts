@@ -278,3 +278,23 @@ describe('修复批 4 文档联动 —— 按天切片与代价写在明处（�
     expect(unreleased).toMatch(/knowledgeRobotIds/)
   })
 })
+
+describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容不锚行号）', () => {
+  it('D spec §5.4：快照丢行与导出窗口核对的三条 reason 已点名（可分派体系写全）', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    // 知识库快照丢行的 reason（detail 含行数与任务 id；全删重插下必须可查）
+    expect(s).toMatch(/knowledge_row_malformed/)
+    // 会话导出两会话端窗口核对的既有 reason（此前只散在代码/CHANGELOG）
+    expect(s).toMatch(/export_fixture_unreported/)
+    expect(s).toMatch(/export_window_mismatch/)
+  })
+
+  it('D spec §5.2 + README：窗口按上海日界对齐（windowAlign）写在明处', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    expect(s).toMatch(/windowAlign: 'shanghaiDay'/)
+    expect(s).toMatch(/上海日界对齐/)
+    const md = read('README.md')
+    expect(md).toMatch(/windowAlign: 'shanghaiDay'/)
+    expect(md).toMatch(/上海日界对齐/)
+  })
+})
