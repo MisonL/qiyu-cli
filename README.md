@@ -39,7 +39,7 @@ git clone https://github.com/MisonL/qiyu-cli.git
 cd qiyu-cli && npm install && npm run build
 ```
 
-> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令是唯一引入常规依赖的部分：`fflate`（会话导出的加密 zip 解压）。
+> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
 
 ## 配置凭证
 

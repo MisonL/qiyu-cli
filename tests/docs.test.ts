@@ -133,15 +133,28 @@ describe('D 同步引擎交付联动 —— 不得说假话（D-T15）', () => {
     expect(notYet).not.toMatch(/sync run/)
     expect(notYet).toMatch(/query/)
   })
-  it('README 依赖分述：fflate 是 sync 引入的唯一常规依赖', () => {
-    expect(read('README.md')).toMatch(/fflate/)
+  it('README 依赖分述：sync 零常规运行时依赖（fflate 只在 devDependencies，仅测试夹具用）', () => {
+    const md = read('README.md')
+    expect(md).toMatch(/零常规运行时依赖/)
+    expect(md).toMatch(/DecompressionStream/)
+    expect(md).toMatch(/devDependencies/)
+    // 旧口径（「唯一引入常规依赖」）不得残留 —— 声明与实际依赖位置必须一致
+    expect(md).not.toMatch(/唯一引入常规依赖/)
   })
   it('CHANGELOG [未发布] 段内含 sync 命令与 fflate 条目（反引号命令形态，防误命中）', () => {
     const md = read('CHANGELOG.md')
     const unreleased = /## \[未发布\][\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
     expect(unreleased).toMatch(/`sync (run|verify|install)`/)
     expect(unreleased).toMatch(/fflate/)
+    expect(unreleased).toMatch(/开发依赖/)
     expect(unreleased).toMatch(/rate_limit_local/)
+  })
+  it('设计稿 §7.1 命令面：sync tasks 不再承诺「启用/停用」（E 中-3 裁定的设计稿落点）', () => {
+    const s = read('docs/qiyu-cli-design.md')
+    // 本阶段无启用/停用机制（spec §三 修订）——设计稿行的措辞与 spec 同义
+    expect(s).not.toMatch(/ync tasks\s+# 列出可用任务、启用\/停用/)
+    const dLine = s.split('\n').find((l) => /sync tasks/.test(l) && /#/.test(l)) ?? ''
+    expect(dLine).toMatch(/列出可用任务（含每任务敏感列出口）/)
   })
   it('路线图 §四.D 标注已交付且 E 未关闭（整节不得假勾）', () => {
     const s = read('docs/superpowers/specs/2026-10-09-后续交付路线图-design.md')

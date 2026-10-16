@@ -669,7 +669,7 @@ qiyu sync run [task]            # 增量同步
 qiyu sync run --full [task]     # 全量重刷（重新冲刷一个区间）
 qiyu sync run --since --until   # 指定一个区间
 qiyu sync status                # 水位、最近一次结果、缺口、是否加锁
-qiyu sync tasks                 # 列出可用任务、启用/停用
+qiyu sync tasks                 # 列出可用任务（含每任务敏感列出口）
 qiyu sync verify [task]         # 校验本地与远端一致性
 ```
 
