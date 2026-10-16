@@ -19,6 +19,18 @@
 //   · C 中-3：分页短读终检（total 与累计行数核对）+ 页数上限（对齐 knowledge 口径）；
 //   · C 中-4：staff_attendance 的脏时间戳逐行丢弃，不再抛 RangeError 断整窗；
 //   · C 低-7：空串主键行拒绝。
+//
+// 修复批 4（CodeRabbit #1）——**聚合报表按天切片（maxWindowDays=1）**：
+//   这些接口返回的是**窗口聚合值**（overview=一行全局汇总、staffworklod=每客服一行、
+//   transferHuman 恒 1 行），响应里的 `date` 字段原文是
+//   "this date has no specific meaning, it only indicates the start time of the current query"。
+//   因此多天窗口 = 一条多天聚合被标在某一天：`daily_overview` 会把 31 天汇总写成第 1 天
+//   （E 的「每日概览」读到 31 天累计值），且 deleteRangeInsert 按 stat_date 删范围时
+//   下一次不同起点的窗口删不到旧行（陈旧行残留）。水位字段是 query_start ——
+//   按天窗口才能每日推进。按天切片后窗口数 = 天数（--full 从 1970 起会切出上万窗，
+//   见 spec §5.2 与 README 的量级说明）。
+//   唯一例外：staff_attendance 的响应**有逐行可信时间戳**（`date` 按小时对齐）——
+//   保持 31 天窗口（一行一小时 ≈ 1.7 万行/窗），但 stat_date 由该行的 hour_ts 推导。
 import { callPaced, nowIsoOf } from './pace.js'
 import { shanghaiDayIso } from '../day.js'
 import type { Store } from '../../store/types.js'
@@ -123,9 +135,13 @@ async function fetchPagedStaff(taskId: string, w: WindowRef, ctx: FetchCtx): Pro
  * ⚠️ 日期列按**上海自然日零点**写（A 中-2）：窗口起点是毫秒级（水位+1ms、--since 的
  * 任意时刻），直接写 `isoOf(w.start)` 会让同一业务日在 --full 与增量下得到两个不同的
  * 键值，两行并存。天对齐后同一业务日恒为同一个键，upsert/删除范围都能覆盖它。
+ * dayMs（修复批 4，可选）：写 stat_date 所依据的**毫秒时刻**，缺省取窗口起点。
+ * 仅 staff_attendance 传入（响应自带逐行可信时间戳 hour_ts —— 该任务的 31 天窗口里
+ * 行分布在多个自然日，只用窗口起点会把 31 天的考勤全标成第 1 天）。
  */
-function baseRow(w: WindowRef, src: Record<string, unknown>, nowIso: string): Record<string, unknown> {
-  return { stat_date: shanghaiDayIso(w.start), payload: JSON.stringify(src), synchronized_at: nowIso }
+function baseRow(w: WindowRef, src: Record<string, unknown>, nowIso: string,
+  dayMs?: number): Record<string, unknown> {
+  return { stat_date: shanghaiDayIso(dayMs ?? w.start), payload: JSON.stringify(src), synchronized_at: nowIso }
 }
 
 /**
@@ -237,7 +253,9 @@ const RANGE_INSERT: SyncTask['write'] = { kind: 'deleteRangeInsert', rangeColumn
 export const REPORT_TASKS: SyncTask[] = [
   {
     id: 'reports.overview', table: 'daily_overview', kind: 'windowed',
-    maxWindowDays: 31, overlapDays: 0,
+    // 窗口聚合接口（一行全局汇总，响应 date 无语义）→ 按天切片：多天窗口会把
+    // N 天汇总标成第 1 天、水位每月才推进一次（修复批 4，CodeRabbit #1）
+    maxWindowDays: 1, overlapDays: 0,
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date'], reportDayRotation: true,
     endpoint: 'statistic.overview',
@@ -246,7 +264,7 @@ export const REPORT_TASKS: SyncTask[] = [
   },
   {
     id: 'reports.staff_workload', table: 'staff_workload', kind: 'windowed',
-    maxWindowDays: 31, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0,
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     endpoint: 'statistic.staffworklod',
@@ -256,7 +274,7 @@ export const REPORT_TASKS: SyncTask[] = [
   },
   {
     id: 'reports.staff_quality', table: 'staff_quality', kind: 'windowed',
-    maxWindowDays: 31, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0,
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     endpoint: 'statistic.staffquality',
@@ -265,7 +283,7 @@ export const REPORT_TASKS: SyncTask[] = [
   },
   {
     id: 'reports.staff_satisfaction', table: 'staff_satisfaction', kind: 'windowed',
-    maxWindowDays: 31, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0,
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     endpoint: 'statistic.satisfaction.report',
@@ -274,6 +292,8 @@ export const REPORT_TASKS: SyncTask[] = [
   },
   {
     id: 'reports.staff_attendance', table: 'staff_attendance', kind: 'windowed',
+    // 逐行可信时间戳（`date` 按小时对齐，落 hour_ts）→ 31 天窗口可行（≈1.7 万行/窗）；
+    // stat_date 由该行的 hour_ts 推导（不是窗口起点）——它跟随该行自己的业务日
     maxWindowDays: 31, overlapDays: 0,
     watermark: { field: 'stat_date', initial: null },
     // hour_ts 是响应内唯一可信日期字段（小时对齐时间戳）
@@ -297,15 +317,20 @@ export const REPORT_TASKS: SyncTask[] = [
         // 形态不符即丢弃（小时对齐的毫秒戳约 1.7e12，秒级差 1000 倍，判据取 > 1e11）。
         const n = Number(ts)
         if (isEmptyKey(sid) || !Number.isFinite(n) || n <= 1e11) continue
-        mapped.push({ ...baseRow(w, r, nowIso), staff_id: String(sid), hour_ts: new Date(n).toISOString() })
+        // 修复批 4：stat_date 按**本行的 hour_ts** 推导上海日（不再用窗口起点）——
+        // 31 天窗口里行跨多个自然日，用窗口起点会把它们全标成窗口首日。
+        // 删除范围仍是 [dayOf(w.start), dayOf(w.end)]（writeRows 的天对齐边界），
+        // 覆盖窗内所有天 → 与本行的 stat_date 一致。
+        mapped.push({ ...baseRow(w, r, nowIso, n), staff_id: String(sid), hour_ts: new Date(n).toISOString() })
       }
       return { rows: mapped, apiCount: mapped.length }
     },
   },
   {
     id: 'reports.order_performance', table: 'order_performance', kind: 'windowed',
-    // 365 天是实测上限（floor(span/86400000) > 365 才拒）——order_performance 用满
-    maxWindowDays: 365, overlapDays: 0,
+    // 365 是接口的**跨度上限**，不是窗口大小：绩效行没有逐单时间字段（响应 date 无语义），
+    // 多天窗口同样会把 N 天聚合标成首日 → 与其余聚合报表统一按天切片（修复批 4 扩展①）。
+    maxWindowDays: 1, overlapDays: 0,
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['order_id'], reportDayRotation: true,
     endpoint: 'statistic.performance',
@@ -373,7 +398,8 @@ export const REPORT_TASKS: SyncTask[] = [
   },
   {
     id: 'reports.robot_summary', table: 'robot_summary', kind: 'windowed',
-    maxWindowDays: 31, overlapDays: 0,
+    // 窗口聚合（一行全局汇总、响应 date 无语义）→ 按天切片（修复批 4 #1）
+    maxWindowDays: 1, overlapDays: 0,
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date'], reportDayRotation: true,
     endpoint: 'robot.statistic.summary',
@@ -384,8 +410,10 @@ export const REPORT_TASKS: SyncTask[] = [
   {
     id: 'reports.transfer_human', table: 'transfer_human', kind: 'windowed',
     // G 中-2：实测**恰好 365 天**被拒（14500 起止时间不能超过365天），且 364 天也会
-    // 报 Internal error（边界不稳定）→ 按设计稿 §13 的建议压到 360 天留余量。
-    maxWindowDays: 360, overlapDays: 0,
+    // 报 Internal error（边界不稳定）→ 360 天曾是接口跨度上限。但响应恒 1 行聚合值、
+    // 无逐行时间字段 → 窗口必须按天切片（修复批 4 #1，与其余聚合报表同口径）；
+    // 按天窗口天然远低于 360 天，接口跨度上限不再是约束。
+    maxWindowDays: 1, overlapDays: 0,
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date'], reportDayRotation: true,
     endpoint: 'ai.statistic.transferHuman',

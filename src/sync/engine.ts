@@ -111,12 +111,22 @@ function failDetail(label: string, e: unknown): string {
   return `${label}（底层：${raw}）`
 }
 
-/** 写策略落地（事务内调用）：deleteRangeInsert 按范围列删旧 + upsert；upsertRows 直接 upsert。 */
+/**
+ * 写策略落地（事务内调用）：deleteRangeInsert 按范围列删旧 + upsert；upsertRows 直接 upsert。
+ * ⚠️ 窗口是**半开** [start, end)，而删除条件是闭区间 —— 天对齐分支的上界必须取
+ * `dayIso(end − 1ms)`（窗口内最后一个瞬时所在的自然日），否则 end 恰落在日界
+ *（`--until` 指定日期 / windowEndClamp 钳到昨天 0:00 / 日对齐水位都会产生）时
+ * `dayIso(end)` = 下一天零点，删除会多删**下一天**的行：`--since D0 --until D2`
+ * 的第二窗 end=D2 零点 → 删除范围含 D2 → D2 日已同步的行被删而本轮不重拉（D2 在
+ * 请求区间外，永久损失）。`end − 1ms` 后：1 天窗 [D, D+1) → 删除恰好 [D, D]，
+ * 31 天考勤窗 [D0, D0+31d) → [D0, D0+30]（= 31 天），与写入行集一致。
+ */
 async function writeRows(task: SyncTask, ops: Pick<WriteTx, 'delete' | 'upsert'>,
   rows: Record<string, unknown>[], range: Range): Promise<number> {
   if (task.write.kind === 'deleteRangeInsert') {
-    const from = task.write.rangeAlign === 'shanghaiDay' ? shanghaiDayIso(range.start) : new Date(range.start).toISOString()
-    const to = task.write.rangeAlign === 'shanghaiDay' ? shanghaiDayIso(range.end) : new Date(range.end).toISOString()
+    const dayAligned = task.write.rangeAlign === 'shanghaiDay'
+    const from = dayAligned ? shanghaiDayIso(range.start) : new Date(range.start).toISOString()
+    const to = dayAligned ? shanghaiDayIso(range.end - 1) : new Date(range.end).toISOString()
     // where 是可信代码常量（同 query 红线）：列名来自任务声明（代码级），值参数化绑定。
     // 范围边界与行内日期列同口径（rangeAlign）：行写「上海天对齐的日期列」时，删除范围
     // 也必须是天对齐边界——否则 --full 与增量对同一业务日的删除范围互不覆盖（A 中-2）。
@@ -246,15 +256,18 @@ async function acquireGated(ctx: RunCtx, task: SyncTask): Promise<void> {
 
 /**
  * 单窗原子提交（红线 3）：写数据 + 推水位 + 清缺口。配对不符在此抛出 → 整体回滚。
- * watermarkMs（中-2②）：事务内 advanceWatermark 的推进值 = min(连续成功末端, 本窗
- * end) 的实现形态 —— 连续成功序列上恒为本窗 end（窗按 end 升序）；断链后冻结在
- * 失败窗之前的连续成功末端，水位绝不越过失败窗，增量续跑从冻结处回补。
+ * watermarkRange（中-2② + 修复批 4 #2）：事务内 advanceWatermark 的**推进值**（水位）
+ * 与**覆盖区间**（resolved_range）的唯一来源 —— 未断链 = 本窗 end；断链后冻结在
+ * 连续成功末端（水位绝不越过失败窗）。两者必须同源，否则 `sync status` 会谎报覆盖。
  * null = 断链且本轮尚无任何成功窗 → 不推水位（保持 markPending 的既有状态），
  * 数据与清缺口照常提交 —— 绝不伪造推进点。红线 3 不变：推进仍在数据同一事务内。
  * lock（E 中-1）：写者盖章随成功行保形回写（否则第一窗成功就把章抹了）。
+ * ⚠️ resolved_range 的**末端**是「上次成功推进到的时刻」，与删除边界（天对齐下
+ * 取 `dayOf(end−1ms)`，见 writeRows）刻意不同：前者是位置、后者是行集覆盖，
+ * 混同会让末端出现 −1ms 这种既非水位也非日界的怪值。
  */
 async function commitWindow(ctx: RunCtx, task: SyncTask, w: Range,
-  kept: Record<string, unknown>[], expected: number, watermarkMs: number | null,
+  kept: Record<string, unknown>[], expected: number, watermarkRange: Range | null,
   lock: { by: string; at: string }): Promise<number> {
   const commit = (): Promise<number> => ctx.store.transaction(async (tx) => {
     const written = await writeRows(task, tx, kept, w)
@@ -266,8 +279,8 @@ async function commitWindow(ctx: RunCtx, task: SyncTask, w: Range,
     }
     // null = 本轮尚无连续成功窗（首个窗即失败）→ 不推水位（保持 markPending 的既有
     // 状态），只落数据与清缺口 —— 绝不伪造推进点；下次续跑从头重拉，自愈失败窗。
-    if (watermarkMs !== null) {
-      await advanceWatermark(tx, task.id, new Date(watermarkMs).toISOString(), w,
+    if (watermarkRange !== null) {
+      await advanceWatermark(tx, task.id, new Date(watermarkRange.end).toISOString(), watermarkRange,
         new Date(nowOf(ctx)).toISOString(), lock)
     }
     await clearGap(tx, task.id, String(w.start))
@@ -386,6 +399,9 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     // 增量续跑从冻结处重拉失败窗，gap 可自愈。
     let contiguousEnd: number | null = null
     let contiguousBroken = false
+    // resolved_range 的末端（与水位同源，见循环内注释）：逐窗推进；断链时冻结在
+    // 连续成功末端（可能为 null = 本轮无任何成功窗 → 回显到连续成功起点为止/未覆盖）。
+    let resolvedEndOut: number | null = null
 
     for (let i = 0; i < windows.length; i++) {
       const w = windows[i]
@@ -424,12 +440,19 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       const { kept } = applyEnrich(task, fetchRes.rows)
       fetchedTotal += fetchRes.rows.length
       const expected = fetchRes.apiCount !== undefined ? fetchRes.apiCount : kept.length
-      // 推进值（中-2②）：未断链 = 本窗 end（连续成功序列上前进）；断链后冻结在
-      // 断链前的连续成功末端（可能为本轮首窗前 → null → 不推水位）。
+      // —— 推进值与 resolved_range（中-2② + 修复批 4 #2）——
+      // 推进值：未断链 = 本窗 end（连续成功序列上前进）；断链后冻结在断链前的连续
+      // 成功末端（可能为本轮首窗前 → null → 不推水位）。
       const watermarkMs = contiguousBroken ? contiguousEnd : w.end
+      // resolved_range 的**末端**必须与水位同源：断链时水位停在连续成功末端
+      // （早于本窗 end），若 resolved_range 仍报本窗末，`sync status` 会谎报覆盖
+      // 到失败窗之后 —— 与水位、与实际删除过的区间全都对不上（修复批 4 #2）。
+      const watermarkRange: Range | null = watermarkMs === null
+        ? null
+        : { start: rangeStart, end: watermarkMs }
       let written = 0
       try {
-        written = await withRetries(ctx, () => commitWindow(ctx, task, w, kept, expected, watermarkMs, lock),
+        written = await withRetries(ctx, () => commitWindow(ctx, task, w, kept, expected, watermarkRange, lock),
           isTransient)
       } catch (e) {
         failed++
@@ -442,6 +465,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
           isMismatch ? (e as Error).message : failDetail('落库失败', e), gaps)
         continue
       }
+      resolvedEndOut = watermarkMs
       if (!contiguousBroken) contiguousEnd = w.end
 
       // —— gapHint（如 order_performance 的 orders:null 筛选失败，spec §5.2）：成功窗也落提示 ——
@@ -461,7 +485,12 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       taskId: task.id,
       windows: { total: windows.length, succeeded, failed },
       rows: { fetched: fetchedTotal, written: writtenTotal },
-      resolvedRange: outRange, gaps,
+      // 末端与水位同源（见上）：断链时 = 连续成功末端，未断链 = 本窗 end。
+      // ⚠️ 末端是「上次成功推进到的时刻」，与删除边界（天对齐下取 dayOf(end−1ms)，
+      // 见 writeRows）刻意不同：前者是位置、后者是行集覆盖，混同会让末端出现
+      // −1ms 这种既非水位也非日界的怪值。
+      resolvedRange: { start: outRange.start, end: resolvedEndOut ?? outRange.start },
+      gaps,
       // brief 权威：有任何窗口失败 → partial（单窗失败也 partial，brief 红线 3 钉死用例）；
       // 'failed' 留给连窗口循环都无法进入的异常路径（见 runSnapshot 的 gate 拦截分支）。
       status: failed === 0 ? 'complete' : 'partial',
@@ -624,6 +653,8 @@ interface RotationPlan {
   // 中-2②（同 runWindowed）：连续成功末端 + 断链标记 —— 失败窗后水位冻结。
   contiguousEnd: number | null
   contiguousBroken: boolean
+  // resolved_range 的末端（与水位同源，修复批 4 #2）：本轮已成功推进到的位置。
+  resolvedEnd: number | null
 }
 
 async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<RotationPlan> {
@@ -652,13 +683,15 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
   //（verify 会把 pending 判成未完成）。
   if (windows.length === 0) {
     return { task, state, resolvedRange: outRange, windows, lock, gaps: [], succeeded: 0,
-      failed: 0, fetched: 0, written: 0, contiguousEnd: null, contiguousBroken: false }
+      failed: 0, fetched: 0, written: 0, contiguousEnd: null, contiguousBroken: false,
+      resolvedEnd: null }
   }
   await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
     await markPending(tx, task.id, state, lock)
   }))
   return { task, state, resolvedRange: outRange, windows, lock, gaps: [], succeeded: 0,
-    failed: 0, fetched: 0, written: 0, contiguousEnd: null, contiguousBroken: false }
+    failed: 0, fetched: 0, written: 0, contiguousEnd: null, contiguousBroken: false,
+    resolvedEnd: null }
 }
 
 /**
@@ -721,13 +754,17 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
         plan.fetched += fetchRes.rows.length
         const expected = fetchRes.apiCount !== undefined ? fetchRes.apiCount : kept.length
         // 推进值（中-2②，同 runWindowed）：未断链 = 本窗 end；断链后冻结在连续成功末端
-        //（可能为 null → 不推水位）。
+        //（可能为 null → 不推水位）。区间起点与 runWindowed 同源（plan.resolvedRange.start）。
         const watermarkMs = plan.contiguousBroken ? plan.contiguousEnd : w.end
+        const watermarkRange: Range | null = watermarkMs === null
+          ? null
+          : { start: plan.resolvedRange.start, end: watermarkMs }
         try {
           const written = await withRetries(
-            ctx, () => commitWindow(ctx, task, w, kept, expected, watermarkMs, plan.lock), isTransient)
+            ctx, () => commitWindow(ctx, task, w, kept, expected, watermarkRange, plan.lock), isTransient)
           plan.written += written
           plan.succeeded++
+          plan.resolvedEnd = watermarkMs
           if (!plan.contiguousBroken) plan.contiguousEnd = w.end
         } catch (e) {
           plan.failed++
@@ -752,11 +789,14 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
 
   // —— 汇总（空窗任务 total=0、complete，与 runWindowed 空跑语义一致）——
   // T13 接线（T7 报告遗留）：resolvedRange 回显各任务的真实合成范围，不再是粗粒度汇总。
+  // 末端与水位同源（修复批 4 #2）：断链时 = 连续成功末端（resolvedEnd），未断链 = 请求末。
+  // ⚠️ 末端是「上次成功推进到的时刻」，与删除边界（天对齐下取 dayOf(end−1ms)，
+  // 见 writeRows）刻意不同：前者是位置、后者是行集覆盖。
   return plans.map((p) => ({
     taskId: p.task.id,
     windows: { total: p.windows.length, succeeded: p.succeeded, failed: p.failed },
     rows: { fetched: p.fetched, written: p.written },
-    resolvedRange: p.resolvedRange,
+    resolvedRange: { start: p.resolvedRange.start, end: p.resolvedEnd ?? p.resolvedRange.start },
     gaps: p.gaps,
     status: p.failed === 0 ? 'complete' as const : 'partial' as const,
   }))

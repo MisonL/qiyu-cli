@@ -11,7 +11,7 @@ import { RateGate } from '../../src/sync/rate-gate.js'
 import { REPORT_TASKS, taskById as reportById } from '../../src/sync/tasks/reports.js'
 import { reportBody, __setSleep } from '../../src/sync/tasks/reports.js'
 import { listGaps, readWatermark } from '../../src/sync/state.js'
-import { shanghaiYesterdayStart } from '../../src/sync/day.js'
+import { shanghaiYesterdayStart, shanghaiDayStart, shanghaiDayIso } from '../../src/sync/day.js'
 import { __resetBuckets } from '../../src/core/http.js'
 import type { RunCtx, SyncTask, WindowRef } from '../../src/sync/types.js'
 import type { Store, StoreConfig } from '../../src/store/types.js'
@@ -120,19 +120,63 @@ describe('REPORT_TASKS 任务声明', () => {
       expect(t.primaryKey.length, `${t.id} 主键非空`).toBeGreaterThan(0)
     }
     expect(reportById('reports.overview')!.table).toBe('daily_overview')
-    // 窗口上限按实测逐接口注册（spec §7.4.1：严格形式对两族判定式都安全）
+    // 窗口上限：**聚合报表按天切片**（修复批 4 #1）——这些接口返回窗口聚合值
+    //（overview 一行全局汇总 / staffworklod 每客服一行 / transferHuman 恒 1 行），
+    // 响应 date 无语义 → 多天窗口会把 N 天汇总标成第 1 天、水位每月才推进一次。
     const byId = (id: string): SyncTask => reportById(id)!
-    expect(byId('reports.overview')!.maxWindowDays).toBe(31)
-    expect(byId('reports.staff_workload')!.maxWindowDays).toBe(31)
-    expect(byId('reports.staff_quality')!.maxWindowDays).toBe(31)
-    expect(byId('reports.staff_satisfaction')!.maxWindowDays).toBe(31)
+    for (const id of ['reports.overview', 'reports.staff_workload', 'reports.staff_quality',
+      'reports.staff_satisfaction', 'reports.robot_summary', 'reports.transfer_human',
+      'reports.order_performance', 'reports.staff_salary_detail']) {
+      expect(byId(id)!.maxWindowDays, `${id} 按天切片`).toBe(1)
+    }
+    // 唯一例外：staff_attendance 的响应**有逐行可信时间戳**（date 按小时对齐）→
+    // 保持 31 天窗口（一行一小时 ≈ 1.7 万行/窗），stat_date 由该行 hour_ts 推导。
     expect(byId('reports.staff_attendance')!.maxWindowDays).toBe(31)
-    expect(byId('reports.robot_summary')!.maxWindowDays).toBe(31)
-    expect(byId('reports.order_performance')!.maxWindowDays).toBe(365)
-    // G 中-2：实测恰好 365 天被拒（14500），364 天也不稳定 → 压到 360 留余量
-    expect(byId('reports.transfer_human')!.maxWindowDays).toBe(360)
-    // salaryDetail 只覆盖窗口起始日 → 窗口切 1 天
-    expect(byId('reports.staff_salary_detail')!.maxWindowDays).toBe(1)
+  })
+
+  it('修复批 4 #1：多天范围 → 窗口数 == 天数（按天切片）', async () => {
+    const store = await fresh()
+    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      // 3 天范围 → overview 切 3 窗，每窗恰好一天（多天聚合被标成某一天的问题
+      // 在此被结构性排除）
+      const t = reportById('reports.overview')!
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 3 * DAY } }))
+      expect(r.windows).toEqual({ total: 3, succeeded: 3, failed: 0 })
+      const durations = fetchMock.mock.calls.map((c) => {
+        const b = JSON.parse(String((c[1] as { body?: string }).body ?? '{}'))
+        return Number(b.endTime) - Number(b.startTime)
+      })
+      expect(durations).toEqual([DAY, DAY, DAY])
+      // 水位推进到第 3 天末（按天窗口才能每日推进）
+      expect((await readWatermark(store, t.id)).watermark).toBe(new Date(3 * DAY).toISOString())
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('修复批 4 #1：聚合报表的 3 天范围 → 3 个不同 stat_date（不再全落窗口首日）', async () => {
+    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      // 三个连续的上海自然日 0 点起（日界上：--until 指定日期 / windowEndClamp /
+      // 日对齐水位都会产生这种边界）——统计按天切片时窗口端点恰是日界
+      const d0 = shanghaiDayStart(1_700_000_000_000)
+      const r = await runTask(reportById('reports.overview')!,
+        ctx(store, { rangeOverride: { start: d0, end: d0 + 3 * DAY } }))
+      expect(r.status).toBe('complete')
+      const rows = await store.query('SELECT stat_date FROM daily_overview ORDER BY stat_date')
+      // 3 天 = 3 个业务日各一行（此前 31 天窗会把所有行标成窗口首日）
+      expect(rows.rows.map((x) => x.stat_date)).toEqual([
+        shanghaiDayIso(d0), shanghaiDayIso(d0 + DAY), shanghaiDayIso(d0 + 2 * DAY),
+      ])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('G 高-1：attendance/performance 声明 windowEndClamp（endTime 越界 14501）；其余任务不钳', () => {
@@ -235,6 +279,34 @@ describe('报表任务 fetch（http mock）', () => {
         { staff_id: '1000002', hour_ts: new Date(BASE + H).toISOString() },
         { staff_id: '1000002', hour_ts: new Date(BASE + 2 * H).toISOString() },
       ])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('修复批 4 扩展②：staff_attendance 的 stat_date 由本行 hour_ts 推导（不再全落窗口首日）', async () => {
+    // 31 天窗口里行跨多个自然日：stat_date 跟随该行自己的业务日（此前用窗口起点，
+    // 整窗的行都会被标成窗口首日）
+    const H = 3_600_000
+    const day0 = shanghaiDayStart(1_700_000_000_000)
+    const r1 = day0 + 3 * H
+    const r2 = day0 + 27 * H   // 次日 03:00（同一窗口内的另一自然日）
+    const row = (id: number, ts: number) => ({ staffId: id, date: ts, loginDuration: 1 })
+    const fetchMock = respondQueue([() => okC({ result: [row(1000002, r1), row(1000002, r2)], total: 2 })])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.staff_attendance')!, ctx(store))
+      expect(r.status).toBe('complete')
+      const rows = await store.query(
+        'SELECT staff_id, hour_ts, stat_date FROM staff_attendance ORDER BY hour_ts')
+      expect(rows.rows).toEqual([
+        { staff_id: '1000002', hour_ts: new Date(r1).toISOString(), stat_date: shanghaiDayIso(r1) },
+        { staff_id: '1000002', hour_ts: new Date(r2).toISOString(), stat_date: shanghaiDayIso(r2) },
+      ])
+      // 两行落在不同业务日（窗口起点口径下会完全相同 —— 本用例的判别力所在）
+      expect(rows.rows[0]!.stat_date).not.toBe(rows.rows[1]!.stat_date)
       await store.close()
     } finally {
       vi.unstubAllGlobals()

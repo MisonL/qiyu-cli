@@ -9,6 +9,7 @@ import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { runTask } from '../../src/sync/engine.js'
 import { listGaps, readWatermark } from '../../src/sync/state.js'
 import { RateGate } from '../../src/sync/rate-gate.js'
+import { shanghaiDayStart, shanghaiDayIso } from '../../src/sync/day.js'
 import type { SyncTask, RunCtx } from '../../src/sync/types.js'
 import type { Store, StoreConfig } from '../../src/store/types.js'
 
@@ -294,6 +295,58 @@ describe('deleteRangeInsert 写策略', () => {
     ])
     await store.close()
   })
+
+  it('修复批 4 #11：天对齐删除上界 = dayOf(end−1ms)（半开窗口不多删下一天）', async () => {
+    const store = await fresh()
+    // 窗口 [D, D+DAY) 恰在日界上（--until 指定日期 / windowEndClamp 都会产生）。
+    // 删除上界若取 dayOf(end) = D+1 → 会把 D+1 日的行一起删掉（而本窗不重拉 D+1）。
+    const d0 = shanghaiDayStart(1_700_000_000_000)
+    // 用真实报表表（daily_overview 有 stat_date 列），形态与报表任务一致
+    const t = fakeTask({
+      table: 'daily_overview',
+      primaryKey: ['stat_date'],
+      write: { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'], rangeAlign: 'shanghaiDay' },
+      fetch: async () => ({
+        rows: [{ stat_date: shanghaiDayIso(d0), payload: '{"v":1}', synchronized_at: null }],
+        apiCount: 1,
+      }),
+    })
+    // 预置：本日（D，应被删后重写）、次日（D+1，本窗范围外，必须保留）
+    await store.upsert('daily_overview', [
+      { stat_date: shanghaiDayIso(d0), payload: '{"v":0}', synchronized_at: null },
+      { stat_date: shanghaiDayIso(d0 + DAY), payload: '{"next":1}', synchronized_at: null },
+    ])
+    const r = await runTask(t, { ...ctx(store), rangeOverride: { start: d0, end: d0 + DAY } })
+    expect(r.rows.written).toBe(1)
+    const rows = await store.query('SELECT stat_date, payload FROM daily_overview ORDER BY stat_date')
+    // D 日旧行被删（重写为新行）、D+1 日行仍在 —— 半开窗口 [D, D+1) 的删除边界
+    expect(rows.rows).toEqual([
+      { stat_date: shanghaiDayIso(d0), payload: '{"v":1}' },
+      { stat_date: shanghaiDayIso(d0 + DAY), payload: '{"next":1}' },
+    ])
+    await store.close()
+  })
+
+  it('修复批 4 #11：resolved_range 末端 = 水位（不是删除上界；两者刻意不同）', async () => {
+    const store = await fresh()
+    const d0 = shanghaiDayStart(1_700_000_000_000)
+    const t = fakeTask({
+      table: 'daily_overview',
+      primaryKey: ['stat_date'],
+      write: { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'], rangeAlign: 'shanghaiDay' },
+      fetch: async () => ({
+        rows: [{ stat_date: shanghaiDayIso(d0), payload: '{"v":1}', synchronized_at: null }],
+        apiCount: 1,
+      }),
+    })
+    const r = await runTask(t, { ...ctx(store), rangeOverride: { start: d0, end: d0 + DAY } })
+    // 末端是「上次成功推进到的时刻」= 本窗 end（水位），而不是删除边界 dayOf(end−1)
+    expect(r.resolvedRange.end).toBe(d0 + DAY)
+    const st = await readWatermark(store, t.id)
+    expect(st.watermark).toBe(new Date(d0 + DAY).toISOString())
+    expect(st.resolvedRangeEnd).toBe(String(d0 + DAY))
+    await store.close()
+  })
 })
 
 describe('限频闸门接线（中-2：慢不是错 + 失败窗不越过水位）', () => {
@@ -363,6 +416,32 @@ describe('限频闸门接线（中-2：慢不是错 + 失败窗不越过水位�
     const r2 = await runTask(t, c2)
     expect(fetchedStarts).toContain(7 * DAY + 1)
     expect(r2.status).toBe('complete')
+    await store.close()
+  })
+
+  it('修复批 4 #2：断链后 resolved_range 末端 == 水位（不越过失败窗）', async () => {
+    const store = await fresh()
+    const t = fakeTask({
+      maxWindowDays: 7,
+      fetch: async (w) => {
+        if (w.start === 7 * DAY) throw new Error('窗 2 上游 500')
+        return { rows: [{ id: `w${w.start}`, name: 'A', color: '#666666' }], apiCount: 1 }
+      },
+    })
+    const r = await runTask(t, { ...ctx(store), rangeOverride: { start: 0, end: 21 * DAY } })
+    expect(r.status).toBe('partial')
+    expect(r.windows).toEqual({ total: 3, succeeded: 2, failed: 1 })
+    // resolved_range 末端 = 连续成功末端（窗 1 末），与水位一致 —— 不谎报覆盖到本窗末
+    expect(r.resolvedRange.end).toBe(7 * DAY)
+    expect((await readWatermark(store, t.id)).watermark).toBe(new Date(r.resolvedRange.end).toISOString())
+    // 未断链路径（全窗成功）→ 末端 = 请求末（不回归）
+    const ok = fakeTask({
+      maxWindowDays: 7,
+      fetch: async (w) => ({ rows: [{ id: `w${w.start}`, name: 'A', color: '#666666' }], apiCount: 1 }),
+    })
+    const r2 = await runTask(ok, { ...ctx(store), rangeOverride: { start: 0, end: 21 * DAY } })
+    expect(r2.status).toBe('complete')
+    expect(r2.resolvedRange.end).toBe(21 * DAY)
     await store.close()
   })
 })
