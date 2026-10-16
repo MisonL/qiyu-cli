@@ -399,6 +399,45 @@ describe('全删重插幂等（runTask 快照全链路，真库）', () => {
     }
   })
 
+  it('修复批 4 #3：缺键行在快照下消失 → gapHint 落 sync_gaps（detail 含行数）', async () => {
+    // 快照全删重插：被丢弃的行从表里消失且无任何痕迹（apiCount 只计投影后行数，
+    // 配对核对恒等）——必须显式记 gap，让「丢行」可查。
+    const page = [{ id: 21, groupId: 'g1', robotId: 1000001, robotName: 'A', type: 1, refId: 21, pointId: null },
+      { groupId: 'g2', robotId: 1000001, robotName: 'A', type: 1, refId: 0, pointId: null }]   // 缺 id → 丢弃
+    const fetchMock = vi.fn().mockImplementation(() => okC({ total: 2, data: page, isEnd: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(knowledgeById('knowledge.items')!, ctx(store))
+      expect(r.status).toBe('complete')   // gapHint 不把窗口打成失败（提示 ≠ 失败）
+      expect(r.gaps.length).toBe(1)
+      expect(r.gaps[0]!.reason).toBe('knowledge_row_malformed')
+      expect(r.gaps[0]!.detail).toMatch(/1 行缺键列被丢弃/)
+      // gap 落库（sync_gaps 可查）
+      const gaps = await store.query('SELECT dataset, reason, detail FROM sync_gaps')
+      expect(gaps.rows.length).toBe(1)
+      expect(String(gaps.rows[0]!.detail)).toMatch(/1 行缺键列被丢弃/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('修复批 4 #3：无缺键行 → 无 gap（不误报）', async () => {
+    const page = [{ id: 21, groupId: 'g1', robotId: 1000001, robotName: 'A', type: 1, refId: 21, pointId: null }]
+    const fetchMock = vi.fn().mockImplementation(() => okC({ total: 1, data: page, isEnd: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(knowledgeById('knowledge.items')!, ctx(store))
+      expect(r.status).toBe('complete')
+      expect(r.gaps).toEqual([])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('categories 全链路：items 驱动 + 树拍平落库；重跑幂等（全删重插）', async () => {
     const store = await fresh()
     const stamp = '2026-10-15T00:00:00.000Z'

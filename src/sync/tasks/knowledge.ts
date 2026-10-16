@@ -112,11 +112,15 @@ async function pagedCursor(endpointId: string, ctx: FetchCtx): Promise<Record<st
  * ⚠️ INTEGER 列（numericCols 中的）**数字直通**、不做 JSON.stringify——否则 number 1
  * 会被字符串化成 "1" 落 INTEGER 列（依赖 DuckDB 隐式转型是脆弱行为）；VARCHAR 列的
  * 非字符串值（ID 是 BIGINT）才字符串化（BIGINT 精度红线）。
+ * 返回 `{ rows, dropped }`（修复批 4 #3）——快照任务全删重插，被丢弃的行从表里消失
+ * 且无任何痕迹；dropped > 0 时调用方必须用 gapHint 把这件事记进 sync_gaps（口径同
+ * dim.staff_group_members 的 C-14），绝不静默丢行。
  */
 function projectRows(rows: Record<string, unknown>[],
   keys: Record<string, (r: Record<string, unknown>) => unknown>,
-  numericCols: ReadonlySet<string>, nowIso: string): Record<string, unknown>[] {
+  numericCols: ReadonlySet<string>, nowIso: string): { rows: Record<string, unknown>[]; dropped: number } {
   const out: Record<string, unknown>[] = []
+  let dropped = 0
   for (const r of rows) {
     const mapped: Record<string, unknown> = {}
     let ok = true
@@ -127,11 +131,11 @@ function projectRows(rows: Record<string, unknown>[],
         : numericCols.has(col) ? Number(v)
         : typeof v === 'string' ? v : JSON.stringify(v)
     }
-    if (!ok) continue   // 键缺失行：丢弃且不计入 fetched（与 apiCount 口径一致）
+    if (!ok) { dropped++; continue }   // 键缺失行：丢弃且不计入 fetched（与 apiCount 口径一致）
     // 其余字段整体收敛进 payload（22 键对 16 键文档漂移——payload 保真全部业务字段）
     out.push({ ...mapped, payload: JSON.stringify(r), synchronized_at: nowIso })
   }
-  return out
+  return { rows: out, dropped }
 }
 
 /** 类目树拍平（children 在叶子上为 null，实测形态——空数组/null 都没有子节点）。 */
@@ -157,7 +161,11 @@ export function flattenCategoryTree(robotId: string, payload: unknown,
   flattenTree(robotId, payload, 1, null, out, nowIso)
 }
 
-/** knowledge_items / knowledge_points 共用的游标快照 fetch。numericCols 是 INTEGER 列集（数字直通）。 */
+/**
+ * knowledge_items / knowledge_points 共用的游标快照 fetch。numericCols 是 INTEGER 列集（数字直通）。
+ * 修复批 4 #3：projectRows 丢弃的缺键行在快照（全删重插）下**从表里消失**，而
+ * `apiCount: mapped.length` 让配对核对恒等（丢行不留痕）→ dropped > 0 时显式记 gapHint。
+ */
 function fetchCursor(taskId: string, endpointId: string,
   keys: Record<string, (r: Record<string, unknown>) => unknown>,
   numericCols: string[] = []): SyncTask['fetch'] {
@@ -166,8 +174,19 @@ function fetchCursor(taskId: string, endpointId: string,
     assertNoRobotId(w, taskId)
     const nowIso = nowIsoOf(ctx)
     const rows = await pagedCursor(endpointId, ctx)
-    const mapped = projectRows(rows, keys, numeric, nowIso)
-    return { rows: mapped, apiCount: mapped.length }
+    const { rows: mapped, dropped } = projectRows(rows, keys, numeric, nowIso)
+    return {
+      rows: mapped, apiCount: mapped.length,
+      ...(dropped > 0
+        ? {
+          gapHint: {
+            reason: 'knowledge_row_malformed',
+            detail: `${taskId}: ${dropped} 行缺键列被丢弃（快照全删重插下这些行已消失）——` +
+              `接口 ${endpointId} 的响应形态漂移，请核对`,
+          },
+        }
+        : {}),
+    }
   }
 }
 
