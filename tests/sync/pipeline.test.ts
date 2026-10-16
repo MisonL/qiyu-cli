@@ -14,8 +14,8 @@ import { deflateSync, strToU8 } from 'fflate'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { runTask } from '../../src/sync/engine.js'
 import { RateGate } from '../../src/sync/rate-gate.js'
-import { parseJsonl, unzipPasswordZip, runExportPipeline, type PipelineCtx } from '../../src/sync/tasks/pipeline.js'
-import { SESSIONS_TASKS, taskById as sessionsById } from '../../src/sync/tasks/sessions.js'
+import { parseJsonl, parseExportFixture, unzipPasswordZip, runExportPipeline, type PipelineCtx } from '../../src/sync/tasks/pipeline.js'
+import { SESSIONS_TASKS, taskById as sessionsById, assertFixtureGranularity } from '../../src/sync/tasks/sessions.js'
 import { __resetBuckets } from '../../src/core/http.js'
 import { tableByName } from '../../src/store/schema.js'
 import type { RunCtx, SyncTask } from '../../src/sync/types.js'
@@ -176,8 +176,12 @@ const SESSION_ROW = {
 }
 const TAIL_LINE = `startTime=${SESSION_ROW.startTime},endTime=${SESSION_ROW.endTime}`
 
+/** 尾部标记行 = 导出自己的窗口声明（C-8）：端到端用例必须让它声明**请求的那个窗口**，
+ * 否则任务层的窗口核对会（正确地）判形态漂移。 */
+const tailFor = (w: { start: number; end: number }): string => `startTime=${w.start},endTime=${w.end}`
+
 describe('parseJsonl（Review Focus 4 钉死）', () => {
-  it('2 合法行 + 尾行标记 + 空行 → rows=2、tailSkipped=true', () => {
+  it('2 合法行 + 尾行标记 + 空行 → rows=2、tailSkipped=true、fixture 带出尾行原文（C-8）', () => {
     const text = [
       JSON.stringify({ id: 1, staffId: 1000002 }),
       '',
@@ -191,12 +195,21 @@ describe('parseJsonl（Review Focus 4 钉死）', () => {
       { id: 2, staffId: -1000002 },
     ])
     expect(r.tailSkipped).toBe(true)
+    // C-8：原文不再是丢弃物 —— 它是导出自己的窗口声明，由任务层与请求窗口核对
+    expect(r.fixture).toBe(TAIL_LINE)
+    expect(parseExportFixture(r.fixture!)).toEqual({
+      start: SESSION_ROW.startTime, end: SESSION_ROW.endTime,
+    })
   })
 
-  it('无尾行（纯合法行）→ tailSkipped=false；非 JSON 且非尾行 → 显式失败', () => {
+  it('无尾行（纯合法行）→ tailSkipped=false、fixture 缺省；非 JSON 且非尾行 → 显式失败', () => {
     const ok = parseJsonl(JSON.stringify({ id: 1 }))
     expect(ok.tailSkipped).toBe(false)
+    expect(ok.fixture).toBeUndefined()
     expect(() => parseJsonl('not json at all')).toThrow()
+    // 形似但不是该形态（超宽数字 / 多字段）→ 不算尾标记，按形态漂移显式失败
+    expect(() => parseJsonl(`startTime=${'9'.repeat(20)},endTime=1`)).toThrow(/第 1 行/)
+    expect(() => parseJsonl('startTime=1,endTime=2,total=3')).toThrow(/第 1 行/)
   })
 
   it('F 中-1：解析失败的错误消息只带行号/长度，绝不回显行原文（PII 红线）', () => {
@@ -268,7 +281,9 @@ describe('runExportPipeline —— 四步流水线 mock', () => {
   }
 
   it('create 返回 key → check 先 14403 后成功链接 → fetchZip 返回合成 zip → 行落库（session.id 主键 upsert）', async () => {
-    const zip = makeEncryptedZip([{ name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n${TAIL_LINE}\n` }], APP_KEY.slice(0, 12))
+    // 尾标记声明请求窗口 [0, DAY]（C-8）：流水线把它带出为 fixture，不再 void 丢弃
+    const W = { start: 0, end: DAY }
+    const zip = makeEncryptedZip([{ name: 'session.txt', content: `${JSON.stringify(SESSION_ROW)}\n${tailFor(W)}\n` }], APP_KEY.slice(0, 12))
     const fetchMock = vi.fn()
       // 1. create：{code:200, message:"<任务key>"}（形状 A，key 在 message）
       .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
@@ -292,6 +307,8 @@ describe('runExportPipeline —— 四步流水线 mock', () => {
       }))
       expect(fetchMock.mock.calls.length).toBe(3)
       expect(r.sessions).toEqual([SESSION_ROW])
+      // C-8 新出口：尾标记原文随流水线返回（不再在 pipeline 内被丢弃）
+      expect(r.fixture).toBe(tailFor(W))
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -458,11 +475,18 @@ describe('schema v7 迁移 —— sessions 表', () => {
 })
 
 describe('sessions 任务全链路（重叠去重按 session.id）', () => {
-  function mkZip(rows: unknown[]): Uint8Array {
+  /** 合成导出 zip：rows + 尾标记行（声明 `declared` 窗口 —— 正常形态是它与请求窗口一致）。 */
+  function mkZip(rows: unknown[], declared: { start: number; end: number }): Uint8Array {
     const lines = rows.map((r) => JSON.stringify(r))
-    return makeEncryptedZip([{ name: 'session.txt', content: `${lines.join('\n')}\n${TAIL_LINE}\n` }], APP_KEY.slice(0, 12))
+    return makeEncryptedZip([{ name: 'session.txt', content: `${lines.join('\n')}\n${tailFor(declared)}\n` }], APP_KEY.slice(0, 12))
   }
-  function mocksFor(_zip: Uint8Array): ReturnType<typeof vi.fn> {
+  /** 包装任务 fetch：fetchZip 按**本窗请求窗口**合成 zip（多窗用例每窗各自的声明不同）。 */
+  function withZip(t: SyncTask, rows: unknown[]): SyncTask {
+    const orig = t.fetch
+    return { ...t, fetch: async (w, c) => orig(w, { ...c,
+      fetchZip: async () => mkZip(rows, w), pollIntervalMs: 0 } as never) }
+  }
+  function mocksFor(): ReturnType<typeof vi.fn> {
     // 按调用序循环供给 create → check（多窗口流水线各自走一遍同一序列；zip 由 fetchZip 注入）
     let i = 0
     return vi.fn(() => {
@@ -474,19 +498,19 @@ describe('sessions 任务全链路（重叠去重按 session.id）', () => {
 
   it('两窗口含同 session.id → 落库行数 1（upsert 幂等吸收重叠；去重按 session.id 不按任务 key）', async () => {
     const row = { ...SESSION_ROW }
-    const fetchMock = mocksFor(mkZip([row]))
+    const fetchMock = mocksFor()
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const t: SyncTask = { ...sessionsById('sessions.export')! }
-      const orig = t.fetch
-      t.fetch = async (w, c) => orig(w, { ...c,
-        fetchZip: async () => mkZip([row]), pollIntervalMs: 0 } as never)
+      const t = withZip(sessionsById('sessions.export')!, [row])
       const ctx1 = ctx(store, { rangeOverride: { start: 0, end: 6 * DAY } })
       const r1 = await runTask(t, ctx1)
       const r2 = await runTask(t, { ...ctx1, rangeOverride: { start: 5 * DAY, end: 11 * DAY } })
       expect(r1.status).toBe('complete')
       expect(r2.status).toBe('complete')
+      // 正常形态（尾标记声明 = 请求窗口）不产生任何缺口（C-8：核对通过 = 无 gap）
+      expect(r1.gaps).toEqual([])
+      expect(r2.gaps).toEqual([])
       expect(await store.count('sessions')).toBe(1)   // 同 id 两窗口重叠 → 1 行
       await store.close()
     } finally {
@@ -495,14 +519,11 @@ describe('sessions 任务全链路（重叠去重按 session.id）', () => {
   })
 
   it('流水线行落库：session.id → session_id VARCHAR 主键、派生 session_type 落库', async () => {
-    const fetchMock = mocksFor(mkZip([SESSION_ROW]))
+    const fetchMock = mocksFor()
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const t: SyncTask = { ...sessionsById('sessions.export')! }
-      const orig = t.fetch
-      t.fetch = async (w, c) => orig(w, { ...c,
-        fetchZip: async () => mkZip([SESSION_ROW]), pollIntervalMs: 0 } as never)
+      const t = withZip(sessionsById('sessions.export')!, [SESSION_ROW])
       const r = await runTask(t, ctx(store, {
         rangeOverride: { start: 0, end: 6 * DAY },
       }))
@@ -516,5 +537,115 @@ describe('sessions 任务全链路（重叠去重按 session.id）', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+})
+
+describe('C-8：尾部标记行（导出窗口声明）与请求窗口核对', () => {
+  function mkZipWith(content: string): Uint8Array {
+    return makeEncryptedZip([{ name: 'session.txt', content }], APP_KEY.slice(0, 12))
+  }
+  /** create/check/zip 三段 mock（zip 由注入的 fetchZip 供给，不走全局 fetch）。 */
+  function stubCreateCheck(): ReturnType<typeof vi.fn> {
+    let i = 0
+    const m = vi.fn(() => {
+      const msg = i++ % 2 === 0 ? 'task-key-c8' : 'https://qiyukf.com/export/c8.zip'
+      return Promise.resolve(new Response(JSON.stringify({ code: 200, message: msg }),
+        { status: 200, headers: { 'content-type': 'application/json' } }))
+    })
+    vi.stubGlobal('fetch', m)
+    return m
+  }
+  function withContent(t: SyncTask, content: string): SyncTask {
+    const orig = t.fetch
+    return { ...t, fetch: async (w, c) => orig(w, { ...c,
+      fetchZip: async () => mkZipWith(content), pollIntervalMs: 0 } as never) }
+  }
+
+  it('① 非空会话 + 尾标记声明的窗口不覆盖请求 → 显式抛错（含「格式漂移」与 fixture）、窗口失败、水位不推', async () => {
+    // 导出声明的是一段与请求无交集的历史窗口 —— 行数再多也不可信，宁可失败
+    const W = { start: 0, end: 6 * DAY }
+    const stale = 'startTime=1700000000000,endTime=1700086400000'
+    stubCreateCheck()
+    try {
+      const store = await fresh()
+      const t = withContent(sessionsById('sessions.export')!,
+        `${JSON.stringify(SESSION_ROW)}\n${stale}\n`)
+      const r = await runTask(t, ctx(store, { rangeOverride: W }))
+      expect(r.status).toBe('partial')
+      expect(r.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
+      expect(r.gaps.length).toBe(1)
+      expect(r.gaps[0]!.reason).toBe('fetch_failed')
+      // failDetail 中文包装 + 消息含「格式漂移」与 fixture 原文（原文在 detail 里可见）
+      expect(r.gaps[0]!.detail).toMatch(/格式漂移/)
+      expect(r.gaps[0]!.detail).toContain(stale)
+      // 可疑数据绝不落库（水位与数据同事务：本窗失败 → 什么都没写）
+      expect(await store.count('sessions')).toBe(0)
+      const gaps = await store.query('SELECT reason, detail FROM sync_gaps')
+      expect(gaps.rows.length).toBe(1)
+      expect(String(gaps.rows[0]!.detail)).toMatch(/格式漂移/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('② 空会话 + 无尾标记 → gap 落 sync_gaps（reason=export_fixture_unreported，中文说明可见）', async () => {
+    // 空窗且导出流没有窗口声明：可能是真空、也可能被截断 —— 不判失败，但绝不静默
+    const m = stubCreateCheck()
+    try {
+      const store = await fresh()
+      // 空窗会触发引擎的假空重试一次（fetch 再来一遍）—— zip 内容恒为空窗形态
+      const t = withContent(sessionsById('sessions.export')!, '')
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: DAY } }))
+      expect(r.status).toBe('complete')          // gapHint 不把窗口打成失败（提示 ≠ 失败）
+      expect(r.windows).toEqual({ total: 1, succeeded: 1, failed: 0 })
+      expect(m.mock.calls.length).toBe(4)        // create+check × 2（假空重试）
+      expect(r.gaps.length).toBe(1)
+      expect(r.gaps[0]!.reason).toBe('export_fixture_unreported')
+      expect(r.gaps[0]!.detail).toMatch(/未上报尾部标记行/)
+      expect(r.gaps[0]!.detail).toMatch(/空窗可能确实是空/)
+      const gaps = await store.query('SELECT dataset, reason, detail FROM sync_gaps')
+      expect(gaps.rows.length).toBe(1)
+      expect(gaps.rows[0]!.dataset).toBe('sessions.export')
+      expect(String(gaps.rows[0]!.detail)).toMatch(/未上报尾部标记行/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('③ 尾标记声明的窗口宽于请求 → gap（export_window_mismatch）+ 引擎把 fixture 原文拼进 detail', async () => {
+    const W = { start: DAY, end: 2 * DAY }
+    const wider = `startTime=${DAY - 1},endTime=${2 * DAY + 1}`
+    stubCreateCheck()
+    try {
+      const store = await fresh()
+      const t = withContent(sessionsById('sessions.export')!,
+        `${JSON.stringify(SESSION_ROW)}\n${wider}\n`)
+      const r = await runTask(t, ctx(store, { rangeOverride: W }))
+      // 数据仍落库（重叠由 session_id 幂等吸收），但「窗口被改宽」可见
+      expect(r.status).toBe('complete')
+      expect(await store.count('sessions')).toBe(1)
+      expect(r.gaps.length).toBe(1)
+      expect(r.gaps[0]!.reason).toBe('export_window_mismatch')
+      expect(r.gaps[0]!.detail).toMatch(/宽于请求窗口/)
+      // 引擎侧 fixture 拼接（gapHintDetail）：原文在 detail 尾部可见
+      expect(r.gaps[0]!.detail).toContain(`（fixture：${wider}）`)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('fixture 检测面的粒度断言（C-8）：maxWindowDays ≤6 通过；≥7 或缺失 → 载入期失败并写明理由', () => {
+    const t = sessionsById('sessions.export')!
+    expect(() => assertFixtureGranularity(t)).not.toThrow()      // 声明的 6 天
+    expect(t.maxWindowDays).toBe(6)
+    expect(() => assertFixtureGranularity({ ...t, maxWindowDays: 7 }))
+      .toThrow(/fixture 检测面已失效/)
+    expect(() => assertFixtureGranularity({ ...t, maxWindowDays: 30 }))
+      .toThrow(/143\.5h 通过 \/ 144\.0h 报 14004/)
+    expect(() => assertFixtureGranularity({ ...t, maxWindowDays: undefined }))
+      .toThrow(/fixture 检测面已失效/)
   })
 })

@@ -43,7 +43,18 @@ export interface FetchResult {
   /** API 侧行数（配对核对基准）；缺省取 enrich 过滤后的应写行数。 */
   apiCount?: number
   /** 引擎可在此窗口记一条 gap（如 order_performance 的 orders:null 筛选失败，spec §5.2）。 */
-  gapHint?: { reason: string; detail: string }
+  gapHint?: {
+    reason: string
+    detail: string
+    /**
+     * 会话导出尾部标记行原文（C-8）：`startTime=…,endTime=…`，**导出自己的窗口声明**，
+     * 实测样本里恰好一行、紧随全部 JSON 行之后（4687 行 + 1 行；声明 24h 窗口）。
+     * 引擎落 `sync_gaps` 前把它追加进 detail（`（fixture：…）`）——「为什么可疑」与
+     * 「可疑的那行原文」在同一条缺口里可见。该行只有两个整数时间戳、不含 PII，
+     * 长度由形态限死（≤16 位十进制 × 2 + 常量 ≈ 54 字符）。
+     */
+    fixture?: string
+  }
 }
 
 /** 窗口引用：fetch 的入参（半开区间毫秒时间戳）。 */

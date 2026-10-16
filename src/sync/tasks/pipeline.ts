@@ -9,7 +9,8 @@
 //      测试 mock 注入合成 zip（生产实现归 T13 接线）
 //   4. unzip + parse：解压密码 = appKey 前 12 字符（ZipCrypto，实测样本验证）；
 //      session.txt 是 JSONL，**末尾有一行非 JSON 尾部标记 `startTime=...,endTime=...`
-//      必须跳过**（Review Focus 4），空行跳过
+//      必须跳过**（Review Focus 4），空行跳过。该行是**导出自己声明的窗口**（C-8）——
+//      之前它被 `void` 丢弃，现在随返回值带出供任务层与请求窗口核对（见 parseExportFixture）。
 // 去重契约：**按 session.id，绝不能按导出任务 key**（服务端按（企业,窗口）复用结果，
 // 同参数重复创建返回不同 key 相同数据）——本函数只返回行，去重由 upsert(session_id) 幂等吸收。
 import { callPaced } from './pace.js'
@@ -190,22 +191,38 @@ async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
 }
 
 /**
- * JSONL 解析（Review Focus 4 钉死）：逐行 JSON；空行跳过；
- * 末尾非 JSON 尾部标记行（`startTime=...,endTime=...`）跳过并置 tailSkipped=true。
+ * 导出尾部标记行（C-8）：`startTime=…,endTime=…` 的两个毫秒时间戳 = **导出自己的窗口声明**。
+ * 实测（private/raw/session.txt，4687 行样本）：文件里恰好一行，紧随全部 JSON 行之后，
+ * 声明一个 24h 窗口且边界不落在整日/整分上 —— 与「客户端传什么窗口」同形（1 天窗口调用）。
+ * 形态判定与解析共用本函数：parseJsonl 的「跳过尾行」与任务层的窗口核对不会各写一套正则。
+ * 数值宽度上限 16 位十进制（epoch 毫秒 13 位）同时是**长度上界**：该行最多 ~54 字符，
+ * 不存在「无限长原文」——更宽的数字串不是这个形态，按形态漂移显式失败（不静默截断放行）。
+ */
+export function parseExportFixture(line: string): { start: number; end: number } | null {
+  const m = /^startTime=(\d{1,16}),endTime=(\d{1,16})$/.exec(line)
+  return m === null ? null : { start: Number(m[1]), end: Number(m[2]) }
+}
+
+/** JSONL 解析（Review Focus 4 钉死）：逐行 JSON；空行跳过；
+ * 末尾非 JSON 尾部标记行（`startTime=...,endTime=...`）跳过并置 tailSkipped=true、
+ * 原文带出为 fixture（C-8：该信号此前被调用方 `void` 丢弃，任务层无从核对导出窗口）。
  * 非 JSON 且非尾行 → 显式失败（响应形态漂移必须可见，不能静默丢行）。
  * ⚠️ F 中-1：错误消息**只带行号与长度，不带原文** —— session.txt 的每一行都是 PII
  *（电话/邮箱/地址/IP/CRM 备注），而错误消息会进 stdout、日志与 Agent 上下文；
  * 把行内容截 80 字符贴出去等于把 PII 抄了一份出去（仓库存放区域不可控）。
+ * 尾部标记行是唯一的例外（它只有两个整数时间戳、无 PII，且长度由形态限死 ≤54 字符）。
  */
-export function parseJsonl(text: string): { rows: Record<string, unknown>[]; tailSkipped: boolean } {
+export function parseJsonl(text: string): { rows: Record<string, unknown>[]; tailSkipped: boolean; fixture?: string } {
   const rows: Record<string, unknown>[] = []
   let tailSkipped = false
+  let fixture: string | undefined
   const lines = text.split('\n')
   for (let i = 0; i < lines.length; i++) {
     const s = lines[i].trim()
     if (s === '') continue
-    if (/^startTime=\d+,endTime=\d+$/.test(s)) {
+    if (parseExportFixture(s) !== null) {
       tailSkipped = true
+      fixture = s
       continue
     }
     try {
@@ -216,15 +233,17 @@ export function parseJsonl(text: string): { rows: Record<string, unknown>[]; tai
         `该行长度 ${s.length} 字节。原始行内容不回显（含用户 PII），请直接查看导出文件对应行`)
     }
   }
-  return { rows, tailSkipped }
+  return { rows, tailSkipped, ...(fixture === undefined ? {} : { fixture }) }
 }
 
 /**
  * 四步流水线：create → poll → download(ctx.fetchZip) → unzip + parse。
- * 返回的 sessions 是未 enrich 的原始行（列投影/派生在 sessions.ts 的任务层）。
+ * 返回的 sessions 是未 enrich 的原始行（列投影/派生在 sessions.ts 的任务层）；
+ * `fixture` 是导出尾部标记行的原文（C-8：**不再 `void` 丢弃** —— 它是导出自己声明的
+ * 窗口，交由调用方与请求窗口核对；缺失/不符都在任务层有出口）。
  */
 export async function runExportPipeline(w: Range,
-  ctx: PipelineCtx): Promise<{ sessions: Record<string, unknown>[] }> {
+  ctx: PipelineCtx): Promise<{ sessions: Record<string, unknown>[]; fixture?: string }> {
   if (!Number.isFinite(w.start) || !Number.isFinite(w.end) || w.end <= w.start) {
     throw usage(`会话导出窗口无效：start=${w.start}, end=${w.end}（start==end / start>end / 超限同为 14004，无法区分——必须本地保证有效）`)
   }
@@ -257,10 +276,8 @@ export async function runExportPipeline(w: Range,
   // —— 3/4. download + unzip + parse ——
   const zip = await ctx.fetchZip(link)
   const text = await unzipPasswordZip(zip, ctx.credentials.appKey)
-  const { rows, tailSkipped } = parseJsonl(text)
-  // 尾行标记是导出完整性的产物：缺失不报错（历史样本可能无），但如实透出供上层记录。
-  void tailSkipped
-  return { sessions: rows }
+  const { rows, fixture } = parseJsonl(text)
+  return { sessions: rows, ...(fixture === undefined ? {} : { fixture }) }
 }
 
 /** usage 错误（退出码 2）：本地窗口参数问题，重试无用。 */

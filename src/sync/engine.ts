@@ -210,6 +210,15 @@ async function storeGap(ctx: RunCtx, task: SyncTask, w: Range,
 }
 
 /**
+ * gapHint → sync_gaps.detail（C-8）：hint 带 `fixture`（会话导出的尾部标记行原文）时
+ * 追加标注 —— 「为什么可疑」在 detail 正文、「可疑的那行原文」在其后，同一行可见。
+ * 不带 fixture 的 hint（dim 的 staffIdList 形态漂移等）detail 原样落库，行为不变。
+ */
+function gapHintDetail(hint: { detail: string; fixture?: string }): string {
+  return hint.fixture === undefined ? hint.detail : `${hint.detail}（fixture：${hint.fixture}）`
+}
+
+/**
  * 限频闸门获取（中-2①「慢不是错」）：冷却中不再立即记 gap 放弃本窗 ——
  * 按 retryAfter 等待（注入 sleep 可测）后重试 acquire，最多 GATE_WAIT_BUDGET 次；
  * 预算耗尽才抛出（调用方记 rate_limit_local gap）。等待是纯时钟推进，不碰网络，
@@ -440,7 +449,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       // 不压成统一 fetch_failed——缺口原因在 sync_gaps 里必须可分派。
       if (fetchRes.gapHint) {
         await storeGap(ctx, task, w, fetchRes.gapHint.reason as WindowGapReason,
-          fetchRes.gapHint.detail, gaps)
+          gapHintDetail(fetchRes.gapHint), gaps)
       }
 
       succeeded++
@@ -547,7 +556,7 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     // 缺口原因在 sync_gaps 里必须可分派（与 runWindowed 的 gapHint 路径同口径）。
     if (fetchRes.gapHint) {
       await storeGap(ctx, task, resolvedRange, fetchRes.gapHint.reason as WindowGapReason,
-        fetchRes.gapHint.detail, gaps)
+        gapHintDetail(fetchRes.gapHint), gaps)
     }
     progress(`[${task.id}] 快照完成：拉取 ${fetchRes.rows.length} 行，写入 ${written} 行`)
     return snapshotResult(task, resolvedRange, gaps, fetchRes.rows.length, written, 1, 0,
@@ -731,7 +740,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
         }
         if (fetchRes.gapHint) {
           await storeGap(ctx, task, w, fetchRes.gapHint.reason as WindowGapReason,
-            fetchRes.gapHint.detail, plan.gaps)
+            gapHintDetail(fetchRes.gapHint), plan.gaps)
         }
         progress(`[${task.id}] 轮转 round ${round + 1}/${maxRounds} 完成：拉取 ${fetchRes.rows.length} 行，写入 ${kept.length} 行`)
       }
