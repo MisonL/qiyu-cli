@@ -45,6 +45,18 @@ function shanghaiIso(ms: number): string {
   return (msPart === 0 ? iso.replace('.000Z', 'Z') : iso).replace('Z', '+08:00')
 }
 
+/**
+ * 时间值 → 上海 ISO（**全命令层统一的时间回显口径**，E 中-2/C-11）。
+ * 入参可能是引擎产出的 epoch 毫秒（number 或数字字符串），也可能是已经 ISO 化的
+ * 字符串（sync_state.resolved_range_* 的存量值）——数值走上海 ISO，非数值原样回显。
+ * gap 的 range 此前直接输出毫秒字符串，与 resolved_range 的 +08:00 ISO 形态不一致，
+ * Agent 得按字段各写一套解析——本函数是两侧的同一落点。
+ */
+export function msToShanghaiIso(v: string | number): string {
+  const n = typeof v === 'number' ? v : Number(v)
+  return Number.isFinite(n) && String(v).trim() !== '' ? shanghaiIso(n) : String(v)
+}
+
 /** 引擎产出的毫秒区间 → 上海 ISO 区间数组。 */
 function rangeOut(r: { start: number; end: number }): [string, string] {
   return [shanghaiIso(r.start), shanghaiIso(r.end)]
@@ -168,7 +180,8 @@ function wireCategories(task: SyncTask, robotIds: number[], clock: () => number)
 }
 
 /** 任务条目 → 输出形态（spec §七字段名）。 */
-function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: string | null) {
+function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: string | null,
+  notes: string[] = []) {
   return {
     task: r.taskId,
     status: r.status,
@@ -177,9 +190,15 @@ function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: strin
     resolved_range: rangeOut(r.resolvedRange),
     watermark,
     last_synced_at: lastSyncedAt,
+    // gap 区间与 resolved_range 同走上海 ISO（E 中-2/C-11：时间形态在命令层统一，
+    // 不动引擎——引擎产出的毫秒字符串在格式化层转换）。
     gaps: r.gaps.map((g) => ({
-      range: [g.rangeStart, g.rangeEnd], reason: g.reason, detail: g.detail,
+      range: [msToShanghaiIso(g.rangeStart), msToShanghaiIso(g.rangeEnd)],
+      reason: g.reason, detail: g.detail,
     })),
+    // 命令层的按任务说明（恒在，可为空数组）：当前唯一生产者是「请求区间早于接口下界」
+    //（见 runSyncRun 的 floorNote）——把「区间不可得」与「同步故障」在输出里分开。
+    notes,
   }
 }
 
@@ -253,6 +272,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
   }
 
   // —— store 打开（rw 单写者）——
+  // ⚠️ close 覆盖 openStore 之后的**所有**路径（B 低-1，沿 store.ts 的 C1 形态）：
+  // 迁移失败 / 他人库 / 后续任何异常，连接与 DuckDB instance 都必须在 finally 释放 ——
+  // 此前 close 只挂在第二个 try 的 finally 上，第一个 try（open+init）失败即泄漏。
   let resolved
   try {
     resolved = resolveStoreConfig({
@@ -260,13 +282,13 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       env: { QIYU_DB_PATH: process.env.QIYU_DB_PATH, QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND, QIYU_PROFILE: process.env.QIYU_PROFILE },
     })
   } catch (e) { return usageFail((e as Error).message) }
-  let store: Store
+  let store: Store | undefined
   try {
-    store = await openStore(resolved.config, 'rw')
-    await store.init()
-  } catch (e) { return storeInitFail(e) }
+    try {
+      store = await openStore(resolved.config, 'rw')
+      await store.init()
+    } catch (e) { return storeInitFail(e) }
 
-  try {
     // —— 区间合成（时钟注入点：parseTimeArg 接受 clock；Nd/yesterday 已带区间，
     //     YYYY-MM-DD/ISO 只给起点 → end=clock 当前或配对的另一端）——
     let rangeOverride: { start: number; end: number } | undefined
@@ -329,6 +351,29 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     // staff 表（staff_salary_detail 缺 dim 首跑必败），knowledge 的 items/points(2)
     // 先于 categories(3)。两组不再整体前后排列（那会把 dim 排到报表之后）。
     const results: TaskRunResult[] = []
+    // 按任务的「请求区间早于接口下界」说明（B 中-5 命令层补口）：
+    // 声明了 windowStartFloorDays 的任务（接口物理上只提供最近 N 天，如 `ticket.search`
+    // 的 `opStart` 被服务端静默钳到 now−31 天），当**整个请求区间**早于该下界时，这段历史
+    // 上游给不出数据 —— 结果形态可能是任务层守卫显式失败（落 gap、partial），也可能是
+    // 服务端静默改写窗口（客户端以为同步了 [a,b]，实际拿到的是别的窗口）。两种都不该让
+    // Agent 误读成「同步故障」或「这段已同步」→ 本层在此补 notes 把话说在明处。
+    // 判据只取「end 早于下界」（请求区间整体不可得）；与下界部分重叠（start 在下界之前、
+    // end 在下界之后）的显式正数起点是引擎「原样照发」的既定语义（批 1 裁定），不在本层改写。
+    const floorNotes = new Map<string, string[]>()
+    if (rangeOverride !== undefined) {
+      for (const t of selected) {
+        if (t.windowStartFloorDays === undefined) continue
+        const floor = clock() - t.windowStartFloorDays * DAY
+        if (rangeOverride.end <= floor) {
+          floorNotes.set(t.id, [
+            `请求区间结束于 ${shanghaiIso(rangeOverride.end)}，早于该接口可得数据的最早边界 ` +
+            `${shanghaiIso(floor)}（now − ${t.windowStartFloorDays} 天）：这段区间上游物理上给不出数据 ——` +
+            `结果要么是任务层守卫显式失败（落 gap、partial），要么是服务端把窗口静默改写；` +
+            `两者都不代表「请求的区间已同步」，请勿据此判断数据完整。`,
+          ])
+        }
+      }
+    }
     const ranks = [...new Set(selected.map((t) => taskRank(t)))].sort((a, b) => a - b)
     for (const rank of ranks) {
       const layer = selected.filter((t) => taskRank(t) === rank)
@@ -349,7 +394,7 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     const tasksOut = []
     for (const r of results) {
       const st = await readWatermark(store, r.taskId)
-      tasksOut.push(taskOut(r, st.watermark, st.lastSyncedAt))
+      tasksOut.push(taskOut(r, st.watermark, st.lastSyncedAt, floorNotes.get(r.taskId) ?? []))
     }
     // 全失败判定（T13 fix 中-1）：引擎对 windowed 全窗失败权威产出 partial（'failed'
     // 只留给快照 gate 拦截路径）——「全失败」必须补判窗口级：succeeded=0 且 failed>0
@@ -357,12 +402,16 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     const allFailed = results.every((r) =>
       r.status === 'failed' || (r.windows.succeeded === 0 && r.windows.failed > 0))
     const code = ok({ tasks: tasksOut, truncated: false })
-    // stderr 汇总（spec §二：核对不符等在 run 结束的 stderr 汇总中列出）
+    // stderr 汇总（spec §二：核对不符等在 run 结束的 stderr 汇总中列出；下界裁剪的
+    // notes 同样进 stderr——--quiet 时只看 stdout 的 tasks[].notes）。
     if (flags['--quiet'] === undefined) {
       for (const r of results) {
         if (r.gaps.length > 0) {
           process.stderr.write(`[${r.taskId}] ${r.gaps.length} 个缺口：` +
             r.gaps.map((g) => g.reason).join('、') + '\n')
+        }
+        for (const n of floorNotes.get(r.taskId) ?? []) {
+          process.stderr.write(`[${r.taskId}] 提示：${n}\n`)
         }
       }
     }
@@ -370,7 +419,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
   } catch (e) {
     return thrownToExit(e)
   } finally {
-    await store.close()
+    // openStore 之前的失败（resolveStoreConfig/凭证/flag）已在更早的 return 处理，
+    // 不会进这里；走到本 finally 时 store 可能仍为 undefined（openStore 自身抛错）。
+    if (store !== undefined) await store.close()
   }
 }
 
@@ -384,6 +435,7 @@ export const SYNC_RUN_USAGE = `用法：qiyu sync run [任务...] [参数]
   --quiet                       关闭 stderr 进度
   --db / --profile / --backend  存储定位（store 命令同族）
 
-进度走 stderr；stdout 是 {tasks:[…], truncated:false}。
+进度与提示走 stderr；stdout 是 {tasks:[…], truncated:false}，每任务含 resolved_range
+（+08:00 ISO）、gaps（同 ISO 形态）与 notes（请求区间早于接口可得下界等说明，空数组为常态）。
 部分成功退出码 0；全部失败 1；用法错误 2。中断在事务边界安全（kill 后续跑）。
 `

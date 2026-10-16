@@ -174,7 +174,10 @@ export async function storeCommand(argv: string[]): Promise<number> {
     if (code === 'ENOENT') {
       return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库文件不存在：${config.path}`, hint: '数据库尚未初始化。请先运行：qiyu store init' })
-      // ⚠️ D 交付时按 spec §7.2 把本 hint 改指 `qiyu sync run`（并同步设计稿 §9.5/§11.2）
+      // ⚠️ 修复批 2 裁定：D 交付后本 hint **不改指** `qiyu sync run`（设计稿 §9.5 的
+      // 「D 交付后改指 sync run」不再采纳）——「初始化存储」的最小命令是 store init，
+      // 且 sync status/verify 是只读命令，指它们跑一次写操作并非必要。
+      // 同步侧（sync status/verify/install、sync run 的 storeInitFail）与 C1 同口径。
     }
     return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
       message: `无法访问 ${config.path}：${e instanceof Error ? e.message : String(e)}`,
