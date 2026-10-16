@@ -495,6 +495,51 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
     }
   })
 
+  it('修复批 4 #9：下载超时（AbortError）→ 显式失败、写锁释放（不永久挂住）', { timeout: 120000 }, async () => {
+    // 签名 URL 挂起：生产 fetchZip 带 AbortSignal.timeout(120s)；这里 mock 直接抛
+    // TimeoutError 等价模拟（真实等待 120 秒不可测）——断言中文可读消息 + 锁释放。
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => Promise.resolve(new Response(
+        JSON.stringify({ code: 200, message: 'task-key-1' }),
+        { status: 200, headers: { 'content-type': 'application/json' } })))
+      .mockImplementationOnce(() => Promise.resolve(new Response(
+        JSON.stringify({ code: 200, message: 'https://qiyukf.com/export/slow.zip' }),
+        { status: 200, headers: { 'content-type': 'application/json' } })))
+      .mockImplementationOnce(() => {
+        throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })
+      })
+      .mockImplementation(() => Promise.resolve(new Response(
+        JSON.stringify({ code: 200, message: 'https://qiyukf.com/export/slow.zip' }),
+        { status: 200, headers: { 'content-type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      const code = await syncCommand(['run', 'sessions.export', '--db', dbPath(),
+        '--since', '1d', '--quiet'])
+      expect(code).toBe(1)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.status).toBe('partial')
+      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
+      // 中文可读消息（超时不再是一个裸英文 AbortError）
+      expect((t.gaps as Array<{ detail: string }>)[0]!.detail).toMatch(/下载超时/)
+      // 生产接线真的带上了超时 signal（mock 忽略它，但参数必须存在 —— 否则
+      // 挂起的请求会永久卡住 sync run）
+      const zipCall = fetchMock.mock.calls.find((c) => String(c[0]).includes('slow.zip'))!
+      expect((zipCall[1] as { signal?: unknown }).signal).toBeInstanceOf(AbortSignal)
+      // 写锁已释放（不永久挂住）：sync_state.locked_by / locked_at 均清空
+      const s = await fresh()
+      const st = await readWatermark(s, 'sessions.export')
+      expect(st.watermark).toBeNull()   // 失败窗不推水位
+      const rows = await s.query('SELECT locked_by, locked_at FROM sync_state WHERE dataset = ?',
+        ['sessions.export'])
+      expect(rows.rows[0]!.locked_by).toBeNull()
+      expect(rows.rows[0]!.locked_at).toBeNull()
+      await s.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('知识库任务排序：items 先于 categories（items 为空时 categories 不会先跑报任务序错误）', async () => {
     const order: string[] = []
     const fetchMock = vi.fn().mockImplementation((url: unknown) => {
@@ -580,6 +625,43 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
       const s = await fresh()
       expect(await s.count('knowledge_categories')).toBe(1)
       await s.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('修复批 4 #10：knowledgeRobotIds 非法元素 → 退出码 2（整数组校验，不静默过滤）', async () => {
+    // 任一元素不是正整数即 usageFail —— 此前 map(Number).filter 会把 ["abc", -1]
+    // 静默丢成空数组（用户 typo 了 robotId 却毫无反馈）。
+    const cfgDir = join(dir, '.config', 'qiyu')
+    mkdirSync(cfgDir, { recursive: true })
+    const writeCfg = (ids: unknown): void => {
+      writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
+        profiles: { default: { store: { path: dbPath(), options: { knowledgeRobotIds: ids } } } },
+      }))
+    }
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      for (const ids of [['abc'], [-1], [1.5], [0], ['1000009']]) {
+        writeCfg(ids)
+        out = ''
+        expect(await syncCommand(['run', 'knowledge.categories', '--db', dbPath(), '--quiet']),
+          `knowledgeRobotIds=${JSON.stringify(ids)}`).toBe(2)
+        expect(JSON.parse(out).error.kind).toBe('usage')
+        expect(JSON.parse(out).error.message).toMatch(/knowledgeRobotIds/)
+      }
+      // 合法正整数 → 正常执行（零请求：categories 的 items 驱动序在 fetch 前就失败）
+      writeCfg([1000009])
+      out = ''
+      expect(await syncCommand(['run', 'knowledge.categories', '--db', dbPath(), '--quiet'])).toBe(1)
+      expect(JSON.parse(out).ok).toBe(true)
+      // 非数组 → 既有错误分支保留
+      writeCfg('1000009')
+      out = ''
+      expect(await syncCommand(['run', 'knowledge.categories', '--db', dbPath(), '--quiet'])).toBe(2)
+      expect(JSON.parse(out).error.message).toMatch(/数字数组/)
     } finally {
       vi.unstubAllGlobals()
     }

@@ -125,9 +125,26 @@ export function orderTasks(tasks: SyncTask[]): SyncTask[] {
   return [...tasks].sort((a, b) => taskRank(a) - taskRank(b))
 }
 
-/** fetchZip 生产接线（T10 报告的接线义务）：全局 fetch 拉 ZIP 二进制字节。 */
+/**
+ * fetchZip 生产接线（T10 报告的接线义务）：全局 fetch 拉 ZIP 二进制字节。
+ * 修复批 4 #9：**必须有超时** —— 签名 URL 挂起时 `sync run` 会永久挂住、写锁不释放
+ *（abort 后引擎记 fetch_failed gap、水位冻结，锁由 finally 清掉）。
+ * `AbortSignal.timeout` 是 Node ≥17.3 的内置能力（engines 已声明 ≥20.10）。
+ */
+const DOWNLOAD_TIMEOUT_MS = 120_000
+
 async function downloadZip(url: string): Promise<Uint8Array> {
-  const res = await fetch(url)
+  let res: Response
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) })
+  } catch (e) {
+    // AbortError/TimeoutError → 中文可读消息（由引擎的 failDetail 包装后进 gap detail）
+    if ((e as { name?: string }).name === 'TimeoutError' || (e as { name?: string }).name === 'AbortError') {
+      throw new Error(`导出包下载超时（${DOWNLOAD_TIMEOUT_MS / 1000} 秒未完成）：` +
+        '下载链接可能已失效或网络不可达，重跑本任务即可（导出结果在服务端可复用）')
+    }
+    throw e
+  }
   if (!res.ok) {
     throw new Error(`导出包下载失败：HTTP ${res.status}（链接可能已失效——重新同步即可）`)
   }
@@ -331,12 +348,22 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     // —— robotId 注入面（配置层透传，本层消费）——
     const opts = resolved.config.options as Record<string, unknown> | undefined
     const rawIds = opts?.knowledgeRobotIds
-    const robotIds = Array.isArray(rawIds)
-      ? rawIds.map((x) => Number(x)).filter((x) => Number.isInteger(x) && x > 0)
-      : []
+    // 修复批 4 #10：**整数组校验** —— 任一元素不是正整数即 usageFail（退出码 2）。
+    // 此前 `map(Number).filter(...)` 会把 `["abc", -1]` 静默丢成空数组：用户 typo
+    // 了 robotId 却毫无反馈（注入面静默失效）。非数组的错误分支保留。
     if (rawIds !== undefined && !Array.isArray(rawIds)) {
       return usageFail('配置文件 store.options.knowledgeRobotIds 必须是数字数组')
     }
+    if (Array.isArray(rawIds)) {
+      const bad = rawIds.find((x) => !Number.isInteger(x) || (x as number) <= 0)
+      if (bad !== undefined) {
+        return usageFail(
+          `配置文件 store.options.knowledgeRobotIds 必须是正整数数组（非法元素：${String(bad)}）`)
+      }
+    }
+    const robotIds = Array.isArray(rawIds)
+      ? rawIds.map((x) => Number(x)).filter((x) => Number.isInteger(x) && x > 0)
+      : []
 
     const ctxBase = {
       store,
