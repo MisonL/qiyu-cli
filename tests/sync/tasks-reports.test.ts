@@ -13,7 +13,7 @@ import { reportBody, __setSleep } from '../../src/sync/tasks/reports.js'
 import { listGaps, readWatermark } from '../../src/sync/state.js'
 import { shanghaiYesterdayStart, shanghaiDayStart, shanghaiDayIso } from '../../src/sync/day.js'
 import { __resetBuckets } from '../../src/core/http.js'
-import type { RunCtx, SyncTask, WindowRef } from '../../src/sync/types.js'
+import type { RunCtx, Range, SyncTask, WindowRef } from '../../src/sync/types.js'
 import type { Store, StoreConfig } from '../../src/store/types.js'
 
 vi.setConfig({ testTimeout: 15_000 })
@@ -49,6 +49,18 @@ function ctx(store: Store, over: Partial<RunCtx> = {}): RunCtx {
     rangeOverride: over.rangeOverride ?? { start: 0, end: DAY },
     ...over,
   }
+}
+
+// windowAlign（修复批 5 #1）之后，声明日对齐的报表任务窗口端点必须落在上海日界上：
+// 「一天」= 上海 0 点到次日 0 点。固定时钟 1.7e12 下的「昨天 0 点 ~ 今天 0 点」既是整日，
+// 又 ≤ windowEndClamp（attendance/performance 只允许拉到昨天 0 点）——两种任务共用。
+const YDAY0 = shanghaiYesterdayStart(1_700_000_000_000)
+/** 单个上海自然日 [昨天 0:00, 今天 0:00)：日对齐任务的最小完备窗口。 */
+const DAY_RANGE: Range = { start: YDAY0 - DAY, end: YDAY0 }
+
+/** 单日、日对齐的运行上下文（windowAlign 任务的常规测试范围）。 */
+function dayCtx(store: Store, over: Partial<RunCtx> = {}): RunCtx {
+  return ctx(store, { rangeOverride: DAY_RANGE, ...over })
 }
 
 const REPORT_TABLES = ['daily_overview', 'staff_workload', 'staff_quality', 'staff_satisfaction',
@@ -128,27 +140,40 @@ describe('REPORT_TASKS 任务声明', () => {
       'reports.staff_satisfaction', 'reports.robot_summary', 'reports.transfer_human',
       'reports.order_performance', 'reports.staff_salary_detail']) {
       expect(byId(id)!.maxWindowDays, `${id} 按天切片`).toBe(1)
+      // 修复批 5 #1：按天切片还须**按上海日界对齐**（windowAlign）——stat_date 主键的
+      // 按日行集必须与按日窗口闭环（水位+1ms / 任意时刻 --since 的错相位窗会删末日行不重写）
+      expect(byId(id)!.windowAlign, `${id} 日对齐`).toBe('shanghaiDay')
     }
     // 唯一例外：staff_attendance 的响应**有逐行可信时间戳**（date 按小时对齐）→
-    // 保持 31 天窗口（一行一小时 ≈ 1.7 万行/窗），stat_date 由该行 hour_ts 推导。
+    // 保持 31 天窗口（一行一小时 ≈ 1.7 万行/窗），stat_date 由该行 hour_ts 推导——
+    // 主键 (staff_id, hour_ts) 行集幂等，stat_date 只是辅助列，窗内小时行跨日无害
     expect(byId('reports.staff_attendance')!.maxWindowDays).toBe(31)
+    expect(byId('reports.staff_attendance')!.windowAlign).toBeUndefined()
   })
 
-  it('修复批 4 #1：多天范围 → 窗口数 == 天数（按天切片）', async () => {
+  it('修复批 4 #1 + 批 5 #1：多天范围按上海日界切窗（端点是日界，首末钳到 range）', async () => {
     const store = await fresh()
     const fetchMock = vi.fn(() => okC({ sessions: 1 }))
     vi.stubGlobal('fetch', fetchMock)
     try {
-      // 3 天范围 → overview 切 3 窗，每窗恰好一天（多天聚合被标成某一天的问题
-      // 在此被结构性排除）
+      // 3 天范围 → overview 按天切片，且 windowAlign 让**端点落在上海日界**：
+      // start=0 是 1970-01-01 08:00（上海 0 点 +8h，非日界）→ 首窗 start 钳到 range.start(0)、
+      // 中间窗整日、末窗 end 钳到 range.end(3d，同样非日界)——多天聚合被标成某一天、
+      // 删除范围与写入行集按日闭环的问题在此被结构性排除。
       const t = reportById('reports.overview')!
       const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 3 * DAY } }))
-      expect(r.windows).toEqual({ total: 3, succeeded: 3, failed: 0 })
-      const durations = fetchMock.mock.calls.map((c) => {
+      expect(r.windows).toEqual({ total: 4, succeeded: 4, failed: 0 })
+      const sh0 = shanghaiDayStart(0)   // 上海 1970-01-01 00:00（= -8h）
+      const pairs = fetchMock.mock.calls.map((c) => {
         const b = JSON.parse(String((c[1] as { body?: string }).body ?? '{}'))
-        return Number(b.endTime) - Number(b.startTime)
+        return [Number(b.startTime), Number(b.endTime)]
       })
-      expect(durations).toEqual([DAY, DAY, DAY])
+      expect(pairs).toEqual([
+        [0, sh0 + DAY],                     // 首窗：start 钳到 range.start，end = 上海日界
+        [sh0 + DAY, sh0 + 2 * DAY],         // 整日
+        [sh0 + 2 * DAY, sh0 + 3 * DAY],     // 整日
+        [sh0 + 3 * DAY, 3 * DAY],           // 末窗：start 日界，end 钳到 range.end
+      ])
       // 水位推进到第 3 天末（按天窗口才能每日推进）
       expect((await readWatermark(store, t.id)).watermark).toBe(new Date(3 * DAY).toISOString())
       await store.close()
@@ -173,6 +198,66 @@ describe('REPORT_TASKS 任务声明', () => {
       expect(rows.rows.map((x) => x.stat_date)).toEqual([
         shanghaiDayIso(d0), shanghaiDayIso(d0 + DAY), shanghaiDayIso(d0 + 2 * DAY),
       ])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('修复批 5 #1：非日界起点（18:23）→ 日对齐窗（首窗 [起点, 次日0点)）', async () => {
+    // 水位续跑（watermark+1ms）/ 任意时刻 --since 的典型错相位：起点 18:23。
+    // 日对齐后：首窗 [18:23, 次日 0 点)、第二窗整日、末窗 [日界, 次日 18:23)
+    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const d = shanghaiDayStart(1_700_000_000_000)
+      const start = d + 18 * 3_600_000 + 23 * 60_000 + 1000   // 18:23:01
+      const end = d + 2 * DAY + 18 * 3_600_000 + 23 * 60_000 + 1000
+      const r = await runTask(reportById('reports.overview')!,
+        ctx(store, { rangeOverride: { start, end } }))
+      expect(r.status).toBe('complete')
+      const pairs = fetchMock.mock.calls.map((c) => {
+        const b = JSON.parse(String((c[1] as { body?: string }).body ?? '{}'))
+        return [Number(b.startTime), Number(b.endTime)]
+      })
+      // 每段端点都是上海日界（首窗 start 与末窗 end 被钳到 range 两端）
+      expect(pairs).toEqual([
+        [start, d + DAY],            // 首窗：[18:23:01, 次日 0 点)
+        [d + DAY, d + 2 * DAY],      // 整日
+        [d + 2 * DAY, end],          // 末窗：[日界, 18:23:01)
+      ])
+      // 关键回归：旧实现（sliceByMaxWindow）的窗是 [start, start+1d) 的错相位窗，
+      // 删掉「次日」日的行却不重写——日对齐后每窗 start/end 都是日界（首尾钳制除外）
+      for (const [s, e] of pairs) {
+        expect(s === start || shanghaiDayStart(s) === s, `窗 start 是日界：${s}`).toBe(true)
+        expect(e === end || shanghaiDayStart(e) === e, `窗 end 是日界：${e}`).toBe(true)
+      }
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('修复批 5 #1：水位续跑起点落到日界（不是水位+1ms）——水位所在日整体重拉', async () => {
+    const fetchMock = vi.fn(() => okC({ sessions: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const d0 = shanghaiDayStart(1_700_000_000_000)
+      // 预置水位 = d0+3d（任意时刻推进后的水位，非日界）；clock 冻结在 d0+5d
+      await store.transaction(async (tx) => {
+        const { advanceWatermark } = await import('../../src/sync/state.js')
+        await advanceWatermark(tx, 'reports.overview', new Date(d0 + 3 * DAY).toISOString(),
+          { start: d0, end: d0 + 3 * DAY }, new Date().toISOString())
+      })
+      const c = ctx(store, { clock: () => d0 + 5 * DAY })
+      delete c.rangeOverride
+      await runTask(reportById('reports.overview')!, c)
+      const first = JSON.parse(String((fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}'))
+      // 首窗 start = 水位所在日的 0 点（不是水位+1ms）——水位所在日整体重拉，
+      // 该日的 stat_date 行才是全天聚合
+      expect(Number(first.startTime)).toBe(d0 + 3 * DAY)
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -239,7 +324,7 @@ describe('报表任务 fetch（http mock）', () => {
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const r = await runTask(reportById('reports.overview')!, ctx(store))
+      const r = await runTask(reportById('reports.overview')!, dayCtx(store))
       expect(r.status).toBe('complete')
       expect(r.rows.written).toBe(1)
       const rows = await store.query('SELECT stat_date, payload FROM daily_overview')
@@ -348,7 +433,7 @@ describe('报表任务 fetch（http mock）', () => {
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const r = await runTask(reportById('reports.order_performance')!, ctx(store))
+      const r = await runTask(reportById('reports.order_performance')!, dayCtx(store))
       expect(r.status).toBe('complete')
       expect(r.rows.written).toBe(3)
       const rows = await store.query('SELECT order_id, stat_date FROM order_performance ORDER BY order_id')
@@ -375,7 +460,7 @@ describe('报表任务 fetch（http mock）', () => {
       const store = await fresh()
       const penalize = vi.fn(async () => {})
       const gate = { penalize, acquire: async () => {} } as unknown as RateGate
-      const r = await runTask(reportById('reports.overview')!, ctx(store, { gate }))
+      const r = await runTask(reportById('reports.overview')!, dayCtx(store, { gate }))
       expect(r.status).toBe('complete')
       expect(r.rows.written).toBe(1)
       // B 中-6：penalize 的键是 endpoint id（不是任务 id 'reports.overview'）
@@ -458,7 +543,7 @@ describe('报表任务 fetch（http mock）', () => {
         role: '0', roleId: '30', status: '1', createtime: '0', updateTime: '0', email: null,
         phone: null, workNumber: null, maxServiceCount: null, skillScoreChat: null,
         skillScoreIpcc: null, groupInfo: null, synchronized_at: stamp }])
-      const r = await runTask(reportById('reports.staff_salary_detail')!, ctx(store))
+      const r = await runTask(reportById('reports.staff_salary_detail')!, dayCtx(store))
       expect(r.status).toBe('complete')
       expect(r.rows.written).toBe(1)
       const rows = await store.query('SELECT staff_id, work_date FROM staff_salary_detail ORDER BY staff_id')
@@ -612,6 +697,29 @@ describe('按天轮转调度（runRotated）', () => {
     await store.close()
   })
 
+  it('修复批 5 #1：轮转路径与单任务同口径 —— windowAlign 任务在 runRotated 上也按日界切窗', async () => {
+    const store = await fresh()
+    const gate = { acquire: async () => {} } as unknown as RateGate
+    const d0 = shanghaiDayStart(1_700_000_000_000)
+    const windows: Array<[number, number]> = []
+    // rotTask 缺省不声明 windowAlign；声明后轮转路径必须与 runWindowed 同口径
+    //（两条执行路径共用 sliceForTask，否则语义分叉）
+    const t = rotTask('reports.aligned', {
+      windowAlign: 'shanghaiDay',
+      fetch: async (w) => {
+        windows.push([w.start, w.end])
+        return { rows: [{ stat_date: new Date(w.start).toISOString(), payload: null, synchronized_at: null }], apiCount: 1 }
+      },
+    })
+    const start = d0 + 2 * DAY + 3_600_000   // 非日界起点（+1h）
+    await runRotated([t], ctx(store, { gate, rangeOverride: { start, end: d0 + 4 * DAY } }))
+    expect(windows).toEqual([
+      [start, d0 + 3 * DAY],        // 首窗钳到 range.start，end 是日界
+      [d0 + 3 * DAY, d0 + 4 * DAY], // 整日
+    ])
+    await store.close()
+  })
+
   it('D 中-5：callPaced 全链路 —— 真实 14009 → penalize 落持久化冷却行（sync_state）', async () => {
     const fetchMock = vi.fn()
       .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
@@ -621,7 +729,7 @@ describe('按天轮转调度（runRotated）', () => {
     vi.stubGlobal('fetch', fetchMock)
     try {
       const store = await fresh()
-      const r = await runTask(reportById('reports.overview')!, ctx(store))
+      const r = await runTask(reportById('reports.overview')!, dayCtx(store))
       expect(r.status).toBe('complete')
       // 冷却行以 **endpoint id** 落库（B 中-6）：dataset = __ratelimit__:<endpointId>
       const rows = await store.query(

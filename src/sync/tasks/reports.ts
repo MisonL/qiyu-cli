@@ -31,6 +31,23 @@
 //   见 spec §5.2 与 README 的量级说明）。
 //   唯一例外：staff_attendance 的响应**有逐行可信时间戳**（`date` 按小时对齐）——
 //   保持 31 天窗口（一行一小时 ≈ 1.7 万行/窗），但 stat_date 由该行的 hour_ts 推导。
+//
+// 修复批 5（复审 N1）——**窗口按上海日界对齐（windowAlign: 'shanghaiDay'）**：
+//   按天切片（maxWindowDays=1）只保证「窗宽 ≤ 1 天」；窗口**起点**仍来自水位续跑
+//   （watermark+1ms）或任意时刻的 --since —— 窗形如 [今天18:23, 明天18:23)：只写一行
+//   stat_date=dayOf(start)（今天），拉到的却是跨两天的聚合值，而删除范围是
+//   [dayOf(start), dayOf(end−1ms)]=两天 → 「明天」日的行被删掉却不重写（该日数据是上次
+//   run 的切片聚合）。「每日概览」因此只在日对齐 run（--until 日期 / 日界水位）下才是
+//   精确全天值，常规晚间 run 下语义每天漂移。
+//   声明 windowAlign 后：引擎按上海日界网格切窗（首窗 start 允许被 range.start 钳制、
+//   末窗 end 钳到 range.end），水位续跑的起点也落到日界（水位所在日整体重拉）——
+//   每窗恰是一整个业务日。
+//   **声明它 = 「该表的按日行集必须与按日窗口闭环」**（stat_date 行 ↔ 按日窗一一对应，
+//   删除范围与写入行集同源）。
+//   ⚠️ 边界：staff_attendance **不声明**——主键是 staff_id+hour_ts（行集本身幂等），
+//   stat_date 只是由行内 hour_ts 派生的辅助列；31 天窗里的小时行跨自然日无害
+//   （删除范围 [dayOf(w.start), dayOf(w.end−1ms)] 覆盖窗内所有天，与每行的 stat_date 一致）。
+//   它的接口有**逐行可信时间戳**，按天切片反而白白放大 31 倍窗口数。
 import { callPaced, nowIsoOf } from './pace.js'
 import { shanghaiDayIso } from '../day.js'
 import type { Store } from '../../store/types.js'
@@ -255,7 +272,7 @@ export const REPORT_TASKS: SyncTask[] = [
     id: 'reports.overview', table: 'daily_overview', kind: 'windowed',
     // 窗口聚合接口（一行全局汇总，响应 date 无语义）→ 按天切片：多天窗口会把
     // N 天汇总标成第 1 天、水位每月才推进一次（修复批 4，CodeRabbit #1）
-    maxWindowDays: 1, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0, windowAlign: 'shanghaiDay',
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date'], reportDayRotation: true,
     endpoint: 'statistic.overview',
@@ -264,7 +281,7 @@ export const REPORT_TASKS: SyncTask[] = [
   },
   {
     id: 'reports.staff_workload', table: 'staff_workload', kind: 'windowed',
-    maxWindowDays: 1, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0, windowAlign: 'shanghaiDay',
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     endpoint: 'statistic.staffworklod',
@@ -274,7 +291,7 @@ export const REPORT_TASKS: SyncTask[] = [
   },
   {
     id: 'reports.staff_quality', table: 'staff_quality', kind: 'windowed',
-    maxWindowDays: 1, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0, windowAlign: 'shanghaiDay',
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     endpoint: 'statistic.staffquality',
@@ -283,7 +300,7 @@ export const REPORT_TASKS: SyncTask[] = [
   },
   {
     id: 'reports.staff_satisfaction', table: 'staff_satisfaction', kind: 'windowed',
-    maxWindowDays: 1, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0, windowAlign: 'shanghaiDay',
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     endpoint: 'statistic.satisfaction.report',
@@ -330,7 +347,7 @@ export const REPORT_TASKS: SyncTask[] = [
     id: 'reports.order_performance', table: 'order_performance', kind: 'windowed',
     // 365 是接口的**跨度上限**，不是窗口大小：绩效行没有逐单时间字段（响应 date 无语义），
     // 多天窗口同样会把 N 天聚合标成首日 → 与其余聚合报表统一按天切片（修复批 4 扩展①）。
-    maxWindowDays: 1, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0, windowAlign: 'shanghaiDay',
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['order_id'], reportDayRotation: true,
     endpoint: 'statistic.performance',
@@ -366,7 +383,7 @@ export const REPORT_TASKS: SyncTask[] = [
   {
     id: 'reports.staff_salary_detail', table: 'staff_salary_detail', kind: 'windowed',
     // 只覆盖窗口起始日 → 窗口切 1 天（每窗 = 一天的「客服 × 起始日」驱动）
-    maxWindowDays: 1, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0, windowAlign: 'shanghaiDay',
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['staff_id', 'work_date'], reportDayRotation: true,
     endpoint: 'statistic.salaryDetail',
@@ -399,7 +416,7 @@ export const REPORT_TASKS: SyncTask[] = [
   {
     id: 'reports.robot_summary', table: 'robot_summary', kind: 'windowed',
     // 窗口聚合（一行全局汇总、响应 date 无语义）→ 按天切片（修复批 4 #1）
-    maxWindowDays: 1, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0, windowAlign: 'shanghaiDay',
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date'], reportDayRotation: true,
     endpoint: 'robot.statistic.summary',
@@ -413,7 +430,7 @@ export const REPORT_TASKS: SyncTask[] = [
     // 报 Internal error（边界不稳定）→ 360 天曾是接口跨度上限。但响应恒 1 行聚合值、
     // 无逐行时间字段 → 窗口必须按天切片（修复批 4 #1，与其余聚合报表同口径）；
     // 按天窗口天然远低于 360 天，接口跨度上限不再是约束。
-    maxWindowDays: 1, overlapDays: 0,
+    maxWindowDays: 1, overlapDays: 0, windowAlign: 'shanghaiDay',
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['stat_date'], reportDayRotation: true,
     endpoint: 'ai.statistic.transferHuman',
