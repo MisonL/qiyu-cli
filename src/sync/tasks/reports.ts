@@ -19,7 +19,6 @@
 //   · C 中-3：分页短读终检（total 与累计行数核对）+ 页数上限（对齐 knowledge 口径）；
 //   · C 中-4：staff_attendance 的脏时间戳逐行丢弃，不再抛 RangeError 断整窗；
 //   · C 低-7：空串主键行拒绝。
-import { byId } from '../../core/registry/index.js'
 import { callPaced, nowIsoOf } from './pace.js'
 import { shanghaiDayIso } from '../day.js'
 import type { Store } from '../../store/types.js'

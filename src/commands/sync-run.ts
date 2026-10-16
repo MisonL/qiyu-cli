@@ -23,6 +23,9 @@ import { runTask, runRotated } from '../sync/engine.js'
 import { SYNC_TASKS, taskById } from '../sync/registry.js'
 import type { SyncTask, RunCtx, TaskRunResult } from '../sync/types.js'
 import { readWatermark } from '../sync/state.js'
+// callPaced 静态导入（范围外发现③）：wireCategories 的注入路径也必须过任务层的限频闸门 ——
+// 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
+import { callPaced } from '../sync/tasks/pace.js'
 import { ok, fail, usageFail } from '../output.js'
 import { thrownToExit } from './store.js'
 import type { Store } from '../store/types.js'
@@ -163,15 +166,15 @@ function wireCategories(task: SyncTask, robotIds: number[], clock: () => number)
       } catch (e) {
         if (!/knowledge_items 表为空/.test((e as Error).message)) throw e
       }
-      // 注入路径：行拍平消费任务层的共享实现（flattenCategoryTree），不复制投影。
-      const { call } = await import('../core/http.js')
-      const { byId } = await import('../core/registry/index.js')
+      // 注入路径：行拍平消费任务层的共享实现（flattenCategoryTree），不复制投影；
+      // 取数走任务层的 callPaced —— `ai.knowledge.getCategoryTree` 限频 1 次/秒，
+      // 裸 call 会让远端 14009 不落冷却行、本地令牌桶的拒绝直接冒泡成 fetch_failed gap
+      // （B 高-1 的同一口径：所有任务层取数都必须经 callPaced）。
       const { flattenCategoryTree } = await import('../sync/tasks/knowledge.js')
       const nowIso = new Date(clock()).toISOString()
       const rows: Record<string, unknown>[] = []
       for (const rid of robotIds) {
-        const res = await call(byId('ai.knowledge.getCategoryTree'), { robotId: rid },
-          { credentials: c.credentials })
+        const res = await callPaced('ai.knowledge.getCategoryTree', { robotId: rid }, c)
         flattenCategoryTree(String(rid), res.payload, rows, nowIso)
       }
       return { rows, apiCount: rows.length }
