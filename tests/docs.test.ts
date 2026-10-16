@@ -236,3 +236,45 @@ describe('修复批 2 文档联动 —— 契约诚实性收口（锚内容不�
     expect(s).toMatch(/该字段恒为 null/)
   })
 })
+
+describe('修复批 4 文档联动 —— 按天切片与代价写在明处（锚内容不锚行号）', () => {
+  it('D spec §5.2：聚合报表按天切片（窗口 1 天）与量级提醒已写明', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    // 按天切片的结论 + 依据（响应 date 无语义）
+    expect(s).toMatch(/聚合报表按天切片（窗口 1 天）/)
+    expect(s).toMatch(/it only indicates the start time of the current query/)
+    // 表格里的窗口上限已改对：按天切片的行写 1、考勤保持 31 并注明 stat_date 推导
+    expect(s).toMatch(/\*\*1\*\*（按天切片）/)
+    expect(s).toMatch(/\| `staff_attendance` \| `statistic\.staffAttendance` \| 31 \|/)
+    expect(s).toMatch(/`stat_date` 由本行 `hour_ts` 推导/)
+    // --full 量级提醒 + 建议（只写代价，不改行为）
+    expect(s).toMatch(/量级提醒/)
+    expect(s).toMatch(/上万窗/)
+    expect(s).toMatch(/`--since\/--until` 限定区间/)
+    // 删除边界口径（半开窗口）与 resolved_range 末端语义
+    expect(s).toMatch(/`dayOf\(end − 1ms\)`/)
+    expect(s).toMatch(/`resolved_range` 的末端仍是\*\*水位\*\*/)
+    // 旧口径不得残留（窗口上限 31 的旧表行、transfer_human 的 365 精确比较）
+    expect(s).not.toMatch(/365d 是精确比较/)
+    expect(s).not.toMatch(/\| `daily_overview` \| `statistic\.overview` \| 31 \|/)
+  })
+
+  it('README：同步输出契约段写明按天切片与 --full 量级建议', () => {
+    const md = read('README.md')
+    expect(md).toMatch(/聚合报表按天切片（窗口 1 天）/)
+    expect(md).toMatch(/窗口数 = 天数/)
+    expect(md).toMatch(/上万窗/)
+    expect(md).toMatch(/`--since\/--until` 限定区间|--since 30d/)
+  })
+
+  it('CHANGELOG [未发布]：批 4 的修复条目在段内（按天切片 / 删除上界 / 超时 / 中央目录）', () => {
+    const md = read('CHANGELOG.md')
+    const unreleased = /## \[未发布\][\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
+    expect(unreleased).toMatch(/### 修复/)
+    expect(unreleased).toMatch(/聚合报表按天切片/)
+    expect(unreleased).toMatch(/删除上界越界一天/)
+    expect(unreleased).toMatch(/下载加 120 秒超时/)
+    expect(unreleased).toMatch(/中央目录/)
+    expect(unreleased).toMatch(/knowledgeRobotIds/)
+  })
+})
