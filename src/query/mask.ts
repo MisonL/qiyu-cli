@@ -18,7 +18,10 @@ export type MaskRule = 'phone' | 'email' | 'ip' | 'full'
 
 export interface MaskOutcome {
   rows: Record<string, unknown>[]
-  /** 本次**实际被保护**的列名（列名级命中 + 值级兜底实际改过值的列），按输出列序。 */
+  /**
+   * 本次**实际脱敏**的列名（spec line 217：至少有一行的值在脱敏前后不同），按输出列序。
+   * 全 null / 行内缺键 / 非字符串值（原样返回）的列不出现 —— Agent 据此判断输出是否被改写。
+   */
   maskedColumns: string[]
   warnings: string[]
 }
@@ -34,15 +37,16 @@ export interface MaskInput {
   noMask?: boolean
 }
 
-/** spec §7.1：无格式敏感值的整值替换标记。 */
-const FULL = '<已脱敏>'
+/** spec §7.1：无格式敏感值的整值替换标记。导出供命令层/测试复用，避免文案漂移。 */
+export const FULL = '<已脱敏>'
 
 /** spec §7.1 的三个可识别形态。均无 g 标志 —— test 不携带 lastIndex 状态。 */
 const PHONE_RE = /^1\d{10}$/
 const EMAIL_RE = /^[^@\s]+@[^@\s]+$/
 const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/
 
-const NO_MASK_WARNING = '输出包含未脱敏的客户 PII；不要写入日志或对外报表'
+/** --no-mask 的 PII 风险警告（spec §7.2）。导出供命令层/测试复用。 */
+export const NO_MASK_WARNING = '输出包含未脱敏的客户 PII；不要写入日志或对外报表'
 /** 缺口警告上限（spec §7.2：去重、上限 5 条）。 */
 const WARNING_LIMIT = 5
 
@@ -94,9 +98,12 @@ function piiRuleOf(s: string): MaskRule | null {
   return null
 }
 
-/** 递归遍历 JSON 解析结果的所有字符串叶子（对象与数组），任一命中 PII 形态即真。 */
+/**
+ * 递归遍历 JSON 解析结果的所有字符串叶子（对象与数组），任一命中 PII 形态即真。
+ * 叶子先 trim 再判：与 maskCellByValue 的直接值路径一致，`" 13800138000 "` 也算命中。
+ */
 function hasPiiLeaf(value: unknown): boolean {
-  if (typeof value === 'string') return piiRuleOf(value) !== null
+  if (typeof value === 'string') return piiRuleOf(value.trim()) !== null
   if (Array.isArray(value)) return value.some(hasPiiLeaf)
   if (value !== null && typeof value === 'object') return Object.values(value).some(hasPiiLeaf)
   return false
@@ -106,7 +113,9 @@ function hasPiiLeaf(value: unknown): boolean {
  * `--sql` 值级兜底（spec §7.2 第 2 层）—— 只对未被列名级命中的列调用。
  * - trim 后以 `{`/`[` 开头且 JSON.parse 成功 → 遍历全部字符串叶子，任一命中即整值 `<已脱敏>`；
  *   无命中 → 原值不变（报表 payload 的数字 JSON 因此不会被误杀）。
- * - 否则（含 parse 失败）按普通字符串匹配手机号/邮箱/IPv4 → 按 §7.1 对应规则转换。
+ * - trim 后以 `{`/`[` 开头但 JSON.parse 失败 → 直接 `<已脱敏>`：畸形 JSON 按普通字符串走
+ *   邮箱规则只会改写匹配到的那一段，其余字段（含潜在 PII）原样留在输出里；整值替换才不漏。
+ * - 否则按普通字符串匹配手机号/邮箱/IPv4 → 按 §7.1 对应规则转换。
  * ⚠️ JSON 分支必须在直接匹配之前：spec 的邮箱正则 `^[^@\s]+@[^@\s]+$` 会整串命中
  * 无空白、恰含一个 `@` 的 JSON（如 `{"email":"a@x.com"}`），先走直接匹配会把整段 JSON
  * 按邮箱规则改成 `{***@x.com"}` —— 既不是整值替换，还会把其余字段原样留在输出里。
@@ -119,7 +128,7 @@ function maskCellByValue(v: unknown): unknown {
     try {
       return hasPiiLeaf(JSON.parse(t)) ? FULL : v
     } catch {
-      // JSON.parse 失败 → 不做 JSON 分支，按普通字符串处理
+      return FULL // 畸形 JSON：无法逐字段判定，整值替换是唯一不漏的选择
     }
   }
   const direct = piiRuleOf(t)
@@ -157,16 +166,21 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     const sensitive = new Set(
       mode.table.columns.filter((c) => c.sensitive).map((c) => c.name))
     const hit = columns.filter((name) => sensitive.has(name))
+    // maskedColumns 只收「至少有一行的值在脱敏前后不同」的列（spec line 217：
+    // 实际脱敏，Agent 据此判断输出是否被改写）。全 null / 行内缺键的列不算。
+    const changed = new Set<string>()
     const outRows = rows.map((row) => {
       const out = { ...row }
       for (const name of hit) {
         // 行里缺这个键就不凭空造一个（输出列与行键正常一致，防御性跳过）
-        if (name in out) out[name] = maskValue(out[name], ruleForColumn(name))
+        if (!(name in out)) continue
+        const before = out[name]
+        out[name] = maskValue(before, ruleForColumn(name))
+        if (out[name] !== before) changed.add(name)
       }
       return out
     })
-    // 列名级命中即计入（即使本行该列全为 null —— 它仍是受保护列）
-    return { rows: outRows, maskedColumns: hit, warnings: [] }
+    return { rows: outRows, maskedColumns: hit.filter((n) => changed.has(n)), warnings: [] }
   }
 
   // --sql 通道：列名级（主防线）+ 值级兜底（别名绕过）。
@@ -174,21 +188,20 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 不会命中 `sessions.userName`（驼峰）——这是「精确」而非「忽略大小写」的理由。
   const sensitiveNames = sqlSensitiveNames(mode.tables)
   const nameHit = new Set(columns.filter((name) => sensitiveNames.includes(name)))
-  const changedByValue = new Set<string>()
+  // 实际改写追踪（两条分支共用）：maskedColumns 只收「至少有一行的值在脱敏前后不同」的列。
+  const changed = new Set<string>()
 
   const outRows = rows.map((row) => {
     const out = { ...row }
     for (const name of columns) {
       if (!(name in out)) continue
+      const before = out[name]
       if (nameHit.has(name)) {
-        out[name] = maskValue(out[name], ruleForColumn(name))
+        out[name] = maskValue(before, ruleForColumn(name))
       } else {
-        const masked = maskCellByValue(out[name])
-        if (masked !== out[name]) {
-          out[name] = masked
-          changedByValue.add(name)
-        }
+        out[name] = maskCellByValue(before)
       }
+      if (out[name] !== before) changed.add(name)
     }
     return out
   })
@@ -196,6 +209,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 缺口警告：SQL 文本按词边界命中敏感列名（除 payload），但该名不在输出列名中。
   // 典型：SELECT userPhone AS p、concat(userName,'x') AS n（spec §7.2「缺口声明」）。
   // ⚠️ 这是警告不是防护：姓名/地址无法值级检测，别名场景仍会漏。
+  // ⚠️ 大小写敏感是刻意的：加 `i` 会让 `SELECT username FROM staff` 误报 `userName`
+  //（staff.username 不是敏感列），要消除需真正解析 SQL 标识符，超出本纯函数的职责。
   const warnings: string[] = []
   for (const name of sensitiveNames) {
     if (warnings.length >= WARNING_LIMIT) break
@@ -207,6 +222,6 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       '建议用 `qiyu query --table` 或保持列名原样')
   }
 
-  const maskedColumns = columns.filter((n) => nameHit.has(n) || changedByValue.has(n))
+  const maskedColumns = columns.filter((n) => changed.has(n))
   return { rows: outRows, maskedColumns, warnings }
 }

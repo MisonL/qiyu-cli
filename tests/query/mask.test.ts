@@ -4,11 +4,8 @@
 // ⚠️ 列名一律取自 src/store/schema.ts 的真实元数据 —— 脱敏是元数据驱动的，
 //    测试断言的是「按标记脱敏」，不是测试里自己维护的列名清单。
 import { describe, it, expect } from 'vitest'
-import { maskQueryRows, maskValue, ruleForColumn } from '../../src/query/mask.js'
+import { FULL, NO_MASK_WARNING, maskQueryRows, maskValue, ruleForColumn } from '../../src/query/mask.js'
 import { TABLES, tableByName } from '../../src/store/schema.js'
-
-const FULL = '<已脱敏>'
-const NO_MASK_WARNING = '输出包含未脱敏的客户 PII；不要写入日志或对外报表'
 
 describe('maskValue 四规则（spec §7.1）', () => {
   it('手机号 → 138****1234；邮箱 → a***@x.com；IPv4 → 末段打码', () => {
@@ -110,7 +107,7 @@ describe('query --table 通道：精确', () => {
     expect(out.warnings).toEqual([])
   })
 
-  it('不在 TableDef 的额外输出列不脱敏也不报错；敏感列全为 null 时仍计入 maskedColumns', () => {
+  it('不在 TableDef 的额外输出列不脱敏也不报错；敏感列全为 null 时不计入 maskedColumns', () => {
     const row = { session_id: 's-2', userPhone: null, extra: '13800138000' }
     const out = maskQueryRows({
       rows: [row], columns: ['session_id', 'userPhone', 'extra'],
@@ -119,9 +116,23 @@ describe('query --table 通道：精确', () => {
     expect(out.rows[0].userPhone).toBeNull()
     // --table 通道没有值级兜底：未知列原样返回（spec §7.2「精确」）
     expect(out.rows[0].extra).toBe('13800138000')
-    // 列名级命中即计入（即使本行值为 null，该列仍是受保护列）
-    expect(out.maskedColumns).toEqual(['userPhone'])
+    // spec line 217「实际脱敏」：本行输出一个字节都没改 → 空清单（Agent 据此判断是否被改写）
+    expect(out.maskedColumns).toEqual([])
     expect(out.warnings).toEqual([])
+  })
+
+  it('maskedColumns 跨行合并：某列只要有一行被改写就计入，全 null 的列不计入', () => {
+    const out = maskQueryRows({
+      rows: [
+        { session_id: 's-3', userPhone: null, userName: '张三' },
+        { session_id: 's-4', userPhone: '13800138000', userName: null },
+      ],
+      columns: ['session_id', 'userPhone', 'userName'],
+      mode: { kind: 'table', table: sessions },
+    })
+    expect(out.rows[0].userPhone).toBeNull()
+    expect(out.rows[1].userName).toBeNull()
+    expect(out.maskedColumns).toEqual(['userPhone', 'userName'])
   })
 })
 
@@ -173,15 +184,23 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     expect(session.rows[0].payload).toBe(FULL)
     expect(session.maskedColumns).toEqual(['payload'])
 
-    // 数组根命中；JSON.parse 失败 → 不做 JSON 分支，按普通字符串原样
+    // 数组根命中；畸形 JSON（parse 失败）无法逐字段判定 → 整值 <已脱敏>，不留半段原值
     const mixed = maskQueryRows({
       rows: [{ payload: '["13800138000"]' }, { payload: '{"broken' }],
       columns: ['payload'],
       mode: sqlMode('SELECT payload FROM sessions'),
     })
     expect(mixed.rows[0].payload).toBe(FULL)
-    expect(mixed.rows[1].payload).toBe('{"broken')
+    expect(mixed.rows[1].payload).toBe(FULL)
     expect(mixed.maskedColumns).toEqual(['payload'])
+
+    // JSON 叶子带空白也要识别（hasPiiLeaf 先 trim 再判，与直接值路径一致）
+    const padded = maskQueryRows({
+      rows: [{ payload: '{"userPhone":" 13800138000 "}' }], columns: ['payload'],
+      mode: sqlMode('SELECT payload FROM sessions'),
+    })
+    expect(padded.rows[0].payload).toBe(FULL)
+    expect(padded.maskedColumns).toEqual(['payload'])
   })
 
   it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5、词边界、精确大小写）', () => {
@@ -193,17 +212,20 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     expect(one.warnings[0]).toContain('userPhone')
     expect(one.warnings[0]).toContain('脱敏可能不完整')
 
-    // 同一列引用两次 → 去重后一条
+    // 同一列引用两次 → 去重后一条。
+    // 注：columns 刻意只列 ['p'] —— 真实查询里 SELECT userPhone, userPhone AS p 会输出两列
+    //（userPhone 与 p），这里模拟「引用两次但输出列名都不匹配」的形态，专测警告去重。
     const dup = maskQueryRows({
       rows: [{ p: '13800138000' }], columns: ['p'],
       mode: sqlMode('SELECT userPhone, userPhone AS p FROM sessions'),
     })
     expect(dup.warnings).toHaveLength(1)
 
-    // 6 个敏感列被引用且都不在输出 → 上限 5 条
+    // 6 个敏感列全部被引用且都以别名输出 → 上限 5 条（columns 与 SQL 输出一一对应）
     const six = maskQueryRows({
-      rows: [{ p: '13800138000' }], columns: ['p'],
-      mode: sqlMode('SELECT userName, userPhone, userEmail, userAddress, fromIp, userIpCity AS p FROM sessions'),
+      rows: [{ a: '张三', b: '13800138000', c: 'a@x.com', d: '上海', e: '10.2.3.4', f: '上海' }],
+      columns: ['a', 'b', 'c', 'd', 'e', 'f'],
+      mode: sqlMode('SELECT userName AS a, userPhone AS b, userEmail AS c, userAddress AS d, fromIp AS e, userIpCity AS f FROM sessions'),
     })
     expect(six.warnings).toHaveLength(5)
 
