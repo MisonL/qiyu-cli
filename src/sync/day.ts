@@ -1,5 +1,5 @@
 // src/sync/day.ts
-// Asia/Shanghai 自然日对齐（天数换算的唯一定义点）。
+// Asia/Shanghai 自然日对齐（历史导入点，定义见 core/time）。
 // G2/§6.2 联动：`--since/--until` 的日期按上海零点解析、报表日期列按上海天对齐、
 // attendance/performance 的 endTime 上限是「昨天 00:00」——三处必须同源，否则
 // 「同一业务日」在不同层得到不同的毫秒值（A 中-2 的键分裂根因）。

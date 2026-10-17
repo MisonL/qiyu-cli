@@ -4,7 +4,8 @@
 // attendance/performance 的 endTime 上限是「昨天 00:00」——三处必须同源，否则
 // 「同一业务日」在不同层得到不同的毫秒值（A 中-2 的键分裂根因）。
 // E 起 `query/` 与 `sync/` 共用本模块（query 不得 import sync，故下沉 core）。
-// Asia/Shanghai 无夏令时（恒 +08:00），固定偏移即可精确换算，无 Intl 依赖。
+// Asia/Shanghai 无夏令时（恒 +08:00）：自然日对齐用固定偏移、不依赖 Intl；
+// `shanghaiToday` 例外用 Intl 取上海日期键。
 /** 上海固定偏移（毫秒）。 */
 export const SHANGHAI_OFFSET_MS = 8 * 3_600_000
 /** 一天的毫秒数。 */
@@ -48,6 +49,8 @@ export function shanghaiIso(ms: number): string {
  * 入参可能是引擎产出的 epoch 毫秒（number 或数字字符串），也可能是 ISO 8601
  * 字符串（`iso-day`/`iso-instant` 列的 MIN/MAX 形态）——两者都统一为 +08:00 ISO；
  * 无法解析为时间的字符串原样回显（非时间值不吞掉）。
+ * ⚠️ ISO 分支只接受带时区的 ISO 8601 字符串；日期-only（`YYYY-MM-DD`）会被
+ * `Date.parse` 按 UTC 解析、再偏 8 小时——调用方不得喂日期-only 值。
  * gap 的 range 此前直接输出毫秒字符串，与 resolved_range 的 +08:00 ISO 形态不一致，
  * Agent 得按字段各写一套解析——本函数是两侧的同一落点。
  */
