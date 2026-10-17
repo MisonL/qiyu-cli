@@ -3,11 +3,15 @@
 //
 // ⚠️ 三层缺一不可（spec §5.4 全部实测）：
 //   layer1 语句白名单：extractStatements 条数闸门 + prepare().statementType ∈ {SELECT, EXPLAIN}
+//     + type=4 追加「无 ANALYZE 记号」闸门（EXPLAIN ANALYZE 会真正执行内层语句，探针 16）
 //   layer2 文件/网络封锁：enable_external_access=false + lock_configuration=true
 //   layer3 只读打开：DuckDBInstance.create(path, { access_mode: 'READ_ONLY' })
 // 每层单独都有实测穿透：仅 layer3 时 read_csv / COPY TO 仍成功（tests/query/sandbox.test.ts
 // 「三层对照」用例钉死）；仅 layer2 时 INSERT/CREATE/DROP 不碰文件系统、照写不误；
-// 仅 layer1 时 EXPLAIN ANALYZE（报告为 4）会真正执行内层语句。三者叠加才是完整防线。
+// 纯 EXPLAIN 的内层写/文件访问仍会尝试执行（分别由 layer3/layer2 兜底）。三者叠加才是完整防线。
+// ⚠️ EXPLAIN ANALYZE 是特例：内层 CALL/PRAGMA 改的是**实例级配置**（如 enable_profiling），
+// 不碰文件、不是库写 —— layer2/3 都拦不住，且会把 profile 树打到 stdout 破坏「stdout 只出
+// JSON」的契约。所以必须在 layer1 直接拒绝（见 hasAnalyzeToken）。
 //
 // ⚠️ 分层约束（spec §5.1）：本文件不 import `sync/`、`commands/`、`store/duckdb.ts` 的
 // Store 实现。唯一从 duckdb.ts 借的是纯函数 `isModuleNotFound`（无状态、不触碰 Store），
@@ -115,13 +119,15 @@ type SandboxError = Error & {
 function sandboxError(
   kind: ErrorKind,
   message: string,
-  extra: { code?: string; hint?: string; retryable?: boolean } = {},
+  extra: { code?: string; hint?: string; retryable?: boolean; cause?: unknown } = {},
 ): SandboxError {
   const e = new Error(message) as SandboxError
   e.kind = kind
   if (extra.code !== undefined) e.code = extra.code
   if (extra.hint !== undefined) e.hint = extra.hint
   if (extra.retryable !== undefined) e.retryable = extra.retryable
+  // 原生错误原文（裁决 R9）：Task 5 的 classifyDuckDbError 从这里补算表/列候选。
+  if (extra.cause !== undefined) e.cause = extra.cause
   return e
 }
 
@@ -156,21 +162,141 @@ function typeName(t: number): string {
 }
 
 /**
+ * 剥掉 SQL 里的注释与字符串/标识符字面量，只留下「可能承载关键字」的骨架。
+ *
+ * 为什么要剥（而不是直接对原文查 ANALYZE）：
+ *   `EXPLAIN SELECT 'ANALYZE' AS s` / `EXPLAIN SELECT 1 AS "ANALYZE"` / 注释里的
+ *   ANALYZE 都是合法且无害的 —— 直接查会把它们误拒。
+ * `keepDoubleQuoted`：保留双引号标识符原文。EXPLAIN 的选项名可以被双引号包裹
+ *   （实测 `EXPLAIN ("ANALYZE")` 同样执行内层），选项列表必须按原文检查；
+ *   其余位置则把 `"…"` 当作普通字面量剥掉（列名/别名里的 ANALYZE 不误伤）。
+ * 剥不干净的怪输入（未闭合引号/注释、dollar 引号不配对）→ malformed，
+ * 由调用方拒绝（fail closed）。
+ */
+function stripSqlNoise(sql: string, keepDoubleQuoted: boolean): { skeleton: string; malformed: boolean } {
+  let out = ''
+  let i = 0
+  const n = sql.length
+  while (i < n) {
+    const ch = sql[i]
+    const next = i + 1 < n ? sql[i + 1] : ''
+    // 行注释：-- 到行尾（\n 保留，避免把两行关键字粘成一个词）
+    if (ch === '-' && next === '-') {
+      const nl = sql.indexOf('\n', i + 2)
+      if (nl === -1) break
+      out += '\n'
+      i = nl + 1
+      continue
+    }
+    // 块注释：/* … */（DuckDB 不嵌套；未闭合 → malformed）
+    if (ch === '/' && next === '*') {
+      const end = sql.indexOf('*/', i + 2)
+      if (end === -1) return { skeleton: out, malformed: true }
+      out += ' '
+      i = end + 2
+      continue
+    }
+    // 单引号字符串：'' 为转义
+    if (ch === "'") {
+      i += 1
+      let closed = false
+      while (i < n) {
+        if (sql[i] === "'") {
+          if (i + 1 < n && sql[i + 1] === "'") { i += 2; continue }
+          i += 1
+          closed = true
+          break
+        }
+        i += 1
+      }
+      if (!closed) return { skeleton: out, malformed: true }
+      out += " '' "
+      continue
+    }
+    // 双引号标识符："" 为转义
+    if (ch === '"') {
+      const start = i
+      i += 1
+      let closed = false
+      while (i < n) {
+        if (sql[i] === '"') {
+          if (i + 1 < n && sql[i + 1] === '"') { i += 2; continue }
+          i += 1
+          closed = true
+          break
+        }
+        i += 1
+      }
+      if (!closed) return { skeleton: out, malformed: true }
+      out += keepDoubleQuoted ? ` ${sql.slice(start, i)} ` : " '' "
+      continue
+    }
+    // dollar 引号：$tag$ … $tag$（tag 可为空；标签内只允许标识符字符）
+    if (ch === '$') {
+      const m = /^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/.exec(sql.slice(i))
+      if (m) {
+        const tag = m[0]
+        const end = sql.indexOf(tag, i + tag.length)
+        if (end === -1) return { skeleton: out, malformed: true }
+        out += " '' "
+        i = end + tag.length
+        continue
+      }
+    }
+    out += ch
+    i += 1
+  }
+  return { skeleton: out, malformed: false }
+}
+
+/**
+ * type=4 的内层闸门：语句骨架里出现 ANALYZE 记号即视为「EXPLAIN ANALYZE 家族」。
+ *
+ * 实测（@duckdb/node-api 1.5.6-r.1，spec §5.3 探针 16）：
+ *   · `EXPLAIN ANALYZE CALL enable_profiling()` → 报告 type=4，且**真正执行**内层 CALL，
+ *     把实例配置 enable_profiling 改成 query_tree —— 之后每条查询的 profile 树都打到
+ *     stdout，直接破坏「stdout 只出 JSON」的契约；
+ *   · `EXPLAIN (ANALYZE)`、`EXPLAIN (ANALYZE false)`、`EXPLAIN (ANALYZE, FORMAT JSON)`、
+ *     `EXPLAIN ("ANALYZE")`、`EXPLAIN ANALYSE`（同义拼写）同样执行内层；选项值不影响；
+ *   · 纯 `EXPLAIN CALL …` 不执行内层（配置不变）。
+ * 所以按记号一刀切拒绝；双引号标识符只在 EXPLAIN 选项列表位置按原文检查
+ *（`EXPLAIN SELECT 1 AS "ANALYZE"` 这类列名/别名不误伤）。DuckDB 还接受英式拼写
+ * ANALYSE，一并覆盖。极端误拒（列名恰叫 analyze 且被 EXPLAIN）是 fail closed，
+ * hint 里说明去掉 ANALYZE 即可。
+ */
+function hasAnalyzeToken(sql: string): boolean {
+  // ① 普通骨架：字符串/标识符/注释全部剥掉后查裸记号。
+  const bare = stripSqlNoise(sql, false)
+  if (bare.malformed) return true // 解析不了的怪输入：宁可拒绝
+  if (/\bANALY[ZS]E\b/i.test(bare.skeleton)) return true
+
+  // ② EXPLAIN 选项列表：双引号保留原文，`("ANALYZE")` 也会执行内层。
+  const quoted = stripSqlNoise(sql, true)
+  if (quoted.malformed) return true
+  const opts = /^\s*EXPLAIN\s*\(([^)]*)\)/i.exec(quoted.skeleton)
+  return opts !== null && /\bANALY[ZS]E\b/i.test(opts[1])
+}
+
+/**
  * prepare 期原生错误 → 粗分类（spec §十一；细化由 Task 5 的 classifyDuckDbError 负责）。
  * layer2 的拦截就发生在 prepare 期（`Permission Error: … file system operations are
  * disabled by configuration`），所以这里必须把「文件/网络访问」与普通 SQL 错误分开。
+ * ⚠️ 只认 layer2 的两个特征串，不能把泛化的 `Permission Error` 也算进来 ——
+ * 读库文件本身的 OS 权限错误也带这个前缀，误报成「沙箱拦截」会误导用户。
  */
 function mapPrepareError(e: unknown): SandboxError {
   const msg = e instanceof Error ? e.message : String(e)
-  if (/Permission Error|file system operations are disabled|Cannot access file/i.test(msg)) {
+  if (/file system operations are disabled|Cannot access file/i.test(msg)) {
     return sandboxError('usage', '该语句尝试访问文件或网络，已被只读沙箱拦截', {
       code: 'sandbox_blocked',
       hint: '沙箱只允许读取数据库内的数据：read_csv / read_text / glob / COPY TO / ATTACH / EXPORT / INSTALL 均不可用',
     })
   }
+  // 裁决 R9：把原生错误挂在 cause 上，Task 5 从原文补算表/列候选（message 格式保持不变）。
   return sandboxError('usage', `SQL 无法执行：${msg}`, {
     code: 'query_error',
     hint: '请检查表名、列名与 SQL 语法',
+    cause: e,
   })
 }
 
@@ -324,16 +450,31 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
       }
 
       // layer1-④：类型白名单。DESCRIBE / SHOW / PRAGMA table_info / PRAGMA database_list
-      // 都报告为 1（只读形态，放行）；EXPLAIN ANALYZE 报告为 4 且会真正执行内层语句 ——
-      // 允许它，靠 layer2/3 兜底（这正是「三层缺一不可」的实证场景）。
+      // 都报告为 1（只读形态，放行）。`typeof` 守卫：注入的假模块若把 StatementType 的值
+      // 给成字符串，不能让它静默地把所有语句都挡掉。
       const ST = mod.StatementType ?? {}
-      const SELECT = ST.SELECT ?? 1   // 实测值：SELECT=1
-      const EXPLAIN = ST.EXPLAIN ?? 4 // 实测值：EXPLAIN=4
+      const SELECT = typeof ST.SELECT === 'number' ? ST.SELECT : 1   // 实测值：SELECT=1
+      const EXPLAIN = typeof ST.EXPLAIN === 'number' ? ST.EXPLAIN : 4 // 实测值：EXPLAIN=4
       if (p.statementType !== SELECT && p.statementType !== EXPLAIN) {
         throw sandboxError('usage', `只读沙箱不接受 ${typeName(p.statementType)} 语句`, {
           code: 'sandbox_blocked',
           hint: '只允许 SELECT / DESCRIBE / SHOW / EXPLAIN 等只读查询',
         })
+      }
+
+      // layer1-⑤：EXPLAIN ANALYZE 内层执行闸门（spec §5.3 探针 16）。ANALYZE 会让 DuckDB
+      // **真正执行**内层语句；内层 CALL/PRAGMA 改的是实例级配置（不碰文件、不是库写），
+      // layer2/3 都拦不住。纯 EXPLAIN（无 ANALYZE）不执行内层，放行。
+      // 只对 type=4 扫描：普通 SELECT 里叫 analyze 的列别名是合法的。
+      if (p.statementType === EXPLAIN && hasAnalyzeToken(sql)) {
+        throw sandboxError(
+          'usage',
+          'EXPLAIN ANALYZE 会真正执行内层语句，沙箱不接受；去掉 ANALYZE 即可查看执行计划',
+          {
+            code: 'sandbox_blocked',
+            hint: '请改用不带 ANALYZE 的纯 EXPLAIN 查看执行计划',
+          },
+        )
       }
 
       // 执行：runAndReadUntil 按 chunk 倍数读、**不精确限行**（请求 10 行实测返回 2048 行），

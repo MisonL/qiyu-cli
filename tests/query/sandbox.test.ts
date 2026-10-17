@@ -219,23 +219,104 @@ describe('三层对照（缺一不可）', () => {
     expect(existsSync(out)).toBe(false)
   })
 
-  it('EXPLAIN ANALYZE（type=4）会真正执行内层语句，靠 layer3/layer2 兜底且无副作用', async () => {
-    // spec §5.3：EXPLAIN ANALYZE 报告为 4、会真正执行内层语句 —— layer1 放行它，
-    // 内层写被 READ_ONLY 拒、内层文件访问在 prepare 期被 layer2 拒。这是「三层缺一不可」
-    // 的实证场景，spec 要求单列验收。
+  it('纯 EXPLAIN 不执行内层：内层写由 layer3 拒、内层文件访问由 layer2 拒', async () => {
+    // spec §5.3：EXPLAIN ANALYZE 会真正执行内层语句，已由 layer1 的 ANALYZE 闸门直接拒绝
+    //（见下一个 describe）；纯 EXPLAIN 不执行内层，但仍要演示「三层缺一不可」：
+    // 纯 EXPLAIN 的内层写由 layer3（READ_ONLY）拒，内层文件访问在 prepare 期由 layer2 拒。
     const { dir, path } = await mkDb()
     const out = join(dir, 'explain-out.csv')
     await withSandbox(path, async (s) => {
-      // 内层写：layer1 放行，执行期被 layer3（READ_ONLY）拒绝 → 不得修改表
-      await expectReject(s.run("EXPLAIN ANALYZE INSERT INTO t VALUES (9, 'w')"), { kind: 'internal' })
+      // 内层写：layer1 放行（type=4），执行期被 layer3（READ_ONLY）拒绝 → 不得修改表
+      await expectReject(s.run("EXPLAIN INSERT INTO t VALUES (9, 'w')"), { kind: 'internal' })
       // 内层文件访问：prepare 期就被 layer2 拒绝
-      await expectReject(s.run(`EXPLAIN ANALYZE COPY t TO '${out}'`), {
+      await expectReject(s.run(`EXPLAIN COPY t TO '${out}'`), {
         kind: 'usage', code: 'sandbox_blocked',
       })
       const r = await s.run('SELECT COUNT(*) AS n FROM t')
       expect(Number(r.rows[0].n)).toBe(3)
     })
     expect(existsSync(out)).toBe(false)
+  })
+})
+
+describe('EXPLAIN ANALYZE 内层执行绕过（layer1 追加闸门，spec §5.3 探针 16）', () => {
+  it('EXPLAIN ANALYZE CALL enable_profiling() 被拒，且实例配置未被修改', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      await expectReject(s.run('EXPLAIN ANALYZE CALL enable_profiling()'), {
+        kind: 'usage', code: 'sandbox_blocked', match: /ANALYZE/,
+      })
+      // 副作用断言：绕过成立时这里会变成 'query_tree'，后续每条查询的 profile 树会打到 stdout
+      const r = await s.run("SELECT current_setting('enable_profiling') AS v")
+      expect(r.rows[0].v).toBeNull()
+    })
+  })
+
+  it('括号形态 (ANALYZE) / (ANALYZE false) / ("ANALYZE") 与 ANALYSE 拼写同样被拒', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      // ("ANALYZE") 实测同样是有效选项名并会执行内层；ANALYSE 是 DuckDB 接受的同义拼写
+      const variants = [
+        'EXPLAIN (ANALYZE) CALL enable_profiling()',
+        'EXPLAIN (ANALYZE false) CALL enable_profiling()',
+        'EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1',
+        'EXPLAIN ("ANALYZE") CALL enable_profiling()',
+        'EXPLAIN ANALYSE CALL enable_profiling()',
+        'EXPLAIN ANALYZE PRAGMA enable_profiling',
+        'EXPLAIN /*c*/ ANALYZE CALL enable_profiling()',
+        'EXPLAIN/**/ANALYZE CALL enable_profiling()',
+      ]
+      for (const sql of variants) {
+        await expectReject(s.run(sql), { kind: 'usage', code: 'sandbox_blocked', match: /ANALYZE/ })
+      }
+      const r = await s.run("SELECT current_setting('enable_profiling') AS v")
+      expect(r.rows[0].v).toBeNull()
+    })
+  })
+
+  it('EXPLAIN ANALYZE SELECT 被拒；纯 EXPLAIN SELECT 放行', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      await expectReject(s.run('EXPLAIN ANALYZE SELECT * FROM t'), {
+        kind: 'usage', code: 'sandbox_blocked', match: /ANALYZE/,
+      })
+      const r = await s.run('EXPLAIN SELECT * FROM t')
+      expect(r.rows.length).toBeGreaterThan(0)
+    })
+  })
+
+  it('字符串/标识符/注释里的 ANALYZE 不误伤', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      const allowed = [
+        "EXPLAIN SELECT 'ANALYZE' AS s",
+        "EXPLAIN SELECT 'it''s ANALYZE' AS s",
+        'EXPLAIN SELECT 1 AS "ANALYZE"',
+        'EXPLAIN SELECT $$ANALYZE$$ AS s',
+        'EXPLAIN /* ANALYZE */ SELECT 1',
+        'EXPLAIN -- ANALYZE\nSELECT 1',
+      ]
+      for (const sql of allowed) {
+        const r = await s.run(sql)
+        expect(r.rows.length, sql).toBeGreaterThan(0)
+      }
+      // 普通 SELECT 不做记号扫描：列别名 analyze 合法
+      expect((await s.run('SELECT 1 AS analyze')).rows).toEqual([{ analyze: 1 }])
+      // 引号包裹的列名恰好叫 ANALYZE：不按内层闸门拒绝，照常走到 binder（列不存在 → query_error）
+      await expectReject(s.run('EXPLAIN SELECT "ANALYZE" FROM t'), {
+        kind: 'usage', code: 'query_error',
+      })
+    })
+  })
+
+  it('纯 EXPLAIN CALL 不执行内层：放行且配置仍为 null', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      const r = await s.run('EXPLAIN CALL enable_profiling()')
+      expect(r.rows.length).toBeGreaterThan(0)
+      const v = await s.run("SELECT current_setting('enable_profiling') AS v")
+      expect(v.rows[0].v).toBeNull()
+    })
   })
 })
 
@@ -453,6 +534,120 @@ describe('openSandbox 的错误路径', () => {
     await s.close()
     await s.close() // 第二次 close 不得抛
     await expectReject(s.run('SELECT 1'), { kind: 'usage' })
+  })
+
+  it('close() 真正释放文件锁：随后以 READ_WRITE 打开同一文件成功', async () => {
+    // 只关 instance 不关 conn 时锁会随进程滞留（store/duckdb.ts:305 的教训）——
+    // 用「rw 能否打开」作外部证据，比断言 closeSync 被调用更接近事实。
+    const { path } = await mkDb()
+    const s = await openSandbox(cfgFor(path))
+    await s.close()
+    const { DuckDBInstance } = await import('@duckdb/node-api')
+    const inst = await DuckDBInstance.create(path, { access_mode: 'READ_WRITE' })
+    try {
+      const conn = await inst.connect()
+      try {
+        await conn.run("INSERT INTO t VALUES (4, 'w')")
+        const r = await conn.runAndReadAll('SELECT COUNT(*) AS n FROM t')
+        expect(Number(r.getRowObjectsJson()[0].n)).toBe(4)
+      } finally {
+        conn.closeSync()
+      }
+    } finally {
+      inst.closeSync()
+    }
+  })
+
+  it('prepare 期错误挂上 cause（原生原文），供 Task 5 补算表/列候选', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      const e = await expectReject(s.run('SELECT * FROM nosuchtable'), {
+        kind: 'usage', code: 'query_error',
+      })
+      expect(e.cause, 'cause 必须是原生 Error').toBeInstanceOf(Error)
+      expect((e.cause as Error).message).toMatch(/nosuchtable/)
+      // message 仍是「中文前缀 + 原生原文」，格式未变
+      expect(e.message).toMatch(/^SQL 无法执行：/)
+    })
+  })
+
+  it('Permission 之外的普通错误不被误分类为 sandbox_blocked（收窄后的映射）', async () => {
+    // 只有 layer2 的两个签名（file system operations are disabled / Cannot access file）
+    // 才归 sandbox_blocked；其它带 "Permission" 字样的原生错误照常走 query_error。
+    const fakeMod = {
+      DuckDBInstance: {
+        create: async () => ({
+          connect: async () => ({
+            run: async () => ({}),
+            runAndReadAll: async () => ({
+              getRowObjectsJson: () => [{ ea: false, lc: true }],
+              columnNames: () => [] as string[],
+            }),
+            extractStatements: async () => ({
+              count: 1,
+              prepare: async () => {
+                throw new Error('Permission Error: opening database file: Operation not permitted')
+              },
+            }),
+            interrupt: () => {},
+            closeSync: () => {},
+          }),
+          closeSync: () => {},
+        }),
+      },
+      StatementType: {},
+    }
+    const importer = async (): Promise<unknown> => fakeMod
+    const s = await openSandbox(cfgFor('/nonexistent/q.db'), { importer })
+    try {
+      const e = await expectReject(s.run('SELECT 1'), {
+        kind: 'usage', code: 'query_error', match: /Operation not permitted/,
+      })
+      expect(e.code).not.toBe('sandbox_blocked')
+    } finally {
+      await s.close()
+    }
+  })
+
+  it('StatementType 的值为字符串时回退常量（不静默挡掉一切）', async () => {
+    // 假模块把 StatementType 给成字符串：SELECT 仍应放行（回退 1），而不是全被拒。
+    const fakeMod = {
+      DuckDBInstance: {
+        create: async () => ({
+          connect: async () => ({
+            run: async () => ({}),
+            runAndReadAll: async () => ({
+              getRowObjectsJson: () => [{ ea: false, lc: true }],
+              columnNames: () => ['x'],
+            }),
+            extractStatements: async () => ({
+              count: 1,
+              prepare: async () => ({
+                statementType: 1,
+                parameterCount: 0,
+                bind: () => {},
+                runAndReadUntil: async () => ({
+                  getRowObjectsJson: () => [{ x: 1 }],
+                  columnNames: () => ['x'],
+                }),
+                destroySync: () => {},
+              }),
+            }),
+            interrupt: () => {},
+            closeSync: () => {},
+          }),
+          closeSync: () => {},
+        }),
+      },
+      StatementType: { SELECT: '1', EXPLAIN: '4' },
+    }
+    const importer = async (): Promise<unknown> => fakeMod
+    const s = await openSandbox(cfgFor('/nonexistent/q.db'), { importer })
+    try {
+      expect((await s.run('SELECT 1 AS x')).rows).toEqual([{ x: 1 }])
+    } finally {
+      await s.close()
+    }
   })
 
   it('库不存在 → store_not_initialized（不裸崩，hint 指 store init）', async () => {
