@@ -105,11 +105,15 @@ export function suggestNames(input: string, names: readonly string[], max = CAND
   return scored.slice(0, max).map((s) => s.name)
 }
 
-/** 原生候选：`Did you mean "x"?` 或 `Candidate bindings: "a", "b"`（探针 15 正则）。 */
+/**
+ * 原生候选：`Did you mean "x"?`、`Candidate bindings: "a", "b"` 或
+ * `Candidate tables: "t"`（探针 15 + 审查实测）。
+ * ⚠️ 容忍双冒号变体 `Candidate bindings: : "payload"`（DuckDB 1.5.6-r.1 实测）。
+ */
 function nativeCandidates(msg: string): string[] {
   const didYouMean = /Did you mean "([^"]+)"/.exec(msg)
   if (didYouMean) return [didYouMean[1]]
-  const bindings = /Candidate bindings: ((?:"[^"]+"(?:,\s*)?)+)/.exec(msg)
+  const bindings = /Candidate (?:bindings|tables):\s*:?\s*((?:"[^"]+"(?:,\s*)?)+)/.exec(msg)
   if (bindings) return [...bindings[1].matchAll(/"([^"]+)"/g)].map((m) => m[1])
   return []
 }
@@ -138,12 +142,18 @@ function candidateHint(candidates: string[]): string {
   return `候选：${shown.join('、')}${suffix}`
 }
 
+// —— 表/列不存在的四种原生形态（探针 15 + 审查实测，1.5.6-r.1）——
+// ① `Catalog Error: Table with name sessons does not exist!`
+// ② `Binder Error: Referenced table "sessons" not found!`（限定名 `sessons.paylod`）
+// ③ `Binder Error: Table "sessions" does not have a column named "paylod"`
+// ④ `Referenced column "paylod" (was) not found …`（无 FROM 时多一个 `was`）
 const TABLE_NAME_RE = /Catalog Error: Table with name ([^\s]+) does not exist/
-const COLUMN_NAME_RE = /Binder Error: Referenced column "([^"]+)" not found/
+const TABLE_REF_RE = /Binder Error: Referenced table "([^"]+)" not found/
+const COLUMN_NAMED_RE = /Binder Error: Table "[^"]+" does not have a column named "([^"]+)"/
+const COLUMN_NAME_RE = /Referenced column "([^"]+)" (?:was )?not found/
 
 /** 表不存在的中文消息 + 候选 hint（原生分支与 cause 补算分支共用，裁决 R9）。 */
-function tableNotFound(msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
-  const name = TABLE_NAME_RE.exec(msg)![1]
+function tableNotFound(name: string, msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
   const candidates = mergeCandidates(
     // 多要一个：只有知道「还有第 6 个」才能决定 hint 末尾加不加「等」。
     suggestNames(name, tables.map((t) => t.name), CANDIDATE_LIMIT + 1),
@@ -156,8 +166,7 @@ function tableNotFound(msg: string, tables: readonly TableDef[]): { message: str
 }
 
 /** 列不存在的中文消息 + 候选 hint（候选池 = 全部表的全部列名：SQL 不告诉我们 FROM 哪张表）。 */
-function columnNotFound(msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
-  const name = COLUMN_NAME_RE.exec(msg)![1]
+function columnNotFound(name: string, msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
   const allColumns = [...new Set(tables.flatMap((t) => t.columns.map((c) => c.name)))]
   const candidates = mergeCandidates(
     suggestNames(name, allColumns, CANDIDATE_LIMIT + 1),
@@ -172,10 +181,27 @@ function columnNotFound(msg: string, tables: readonly TableDef[]): { message: st
 }
 
 /**
+ * 原文 → 表/列不存在的 { message, hint }（四种形态统一入口）。
+ * 不是表/列不存在时返回 null —— 调用方自行决定后续分派。
+ */
+function missingNameFailure(
+  msg: string,
+  tables: readonly TableDef[],
+): { message: string; hint: string } | null {
+  const byTableName = TABLE_NAME_RE.exec(msg) ?? TABLE_REF_RE.exec(msg)
+  if (byTableName) return tableNotFound(byTableName[1], msg, tables)
+  const byColumn = COLUMN_NAMED_RE.exec(msg) ?? COLUMN_NAME_RE.exec(msg)
+  if (byColumn) return columnNotFound(byColumn[1], msg, tables)
+  return null
+}
+
+/**
  * 原生错误 → QueryFailure（spec §十一 分派表）。
  *
- * 分派顺序有意义：先透传已分类错误，再按原文形态分流 —— layer2 的 `Permission Error`
- * 必须先于泛化的 Binder/Catalog 分支，否则文件访问会被误报成 SQL 写错。
+ * 分派顺序有意义：先透传已分类错误，再按原文形态分流。
+ * ⚠️ layer2 的判定与 sandbox 对齐（`sandbox.ts` 的收窄裁决）：只认「配置禁用了文件系统」
+ * 的措辞，**不认裸 `Permission Error`** —— 读库文件本身的 OS 权限错误也带这个前缀，
+ * 误报成「已被只读沙箱拦截」会把环境问题（退出码 1）说成用法问题（退出码 2）。
  * `retryable` 一律 false：这些都是确定性错误，重试同一个查询只会得到同样的结果。
  */
 export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): QueryFailure {
@@ -195,14 +221,18 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
     if (classified.hint !== undefined) f.hint = classified.hint
     if (classified.cause !== undefined && classified.cause !== null) {
       const causeMsg = errorText(classified.cause)
-      if (TABLE_NAME_RE.test(causeMsg)) {
-        const { message, hint } = tableNotFound(causeMsg, tables)
-        f.message = message
-        f.hint = hint
-      } else if (COLUMN_NAME_RE.test(causeMsg)) {
-        const { message, hint } = columnNotFound(causeMsg, tables)
-        f.message = message
-        f.hint = hint
+      // 表/列不存在只对 usage 补算（sandbox 的 prepare 期包装；Minor #6 守卫）。
+      if (classified.kind === 'usage') {
+        const refined = missingNameFailure(causeMsg, tables)
+        if (refined) {
+          f.message = refined.message
+          f.hint = refined.hint
+        }
+      }
+      // R11：sandbox 的执行期 catch 把 OOM 包成 internal 且（修复后）挂 cause ——
+      // message 保持 sandbox 原文，只补可操作 hint。
+      if (classified.kind === 'internal' && /Out of Memory Error/i.test(causeMsg)) {
+        f.hint = '缩小时间范围或加过滤条件'
       }
     }
     return f
@@ -211,28 +241,35 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
   const msg = errorText(e)
 
   // ② layer2 拦截（文件/网络）：spec §十一 行 4。
-  if (/Permission Error|file system operations are disabled|Cannot access file/i.test(msg)) {
+  // ⚠️ 与 sandbox.ts 的收窄裁决对齐：裸 `Permission Error` 不算（可能是库文件的 OS
+  // 权限问题），只认「文件系统操作被配置禁用」的两种措辞。
+  if (/file system operations are disabled|Cannot access file/i.test(msg)) {
     return {
       kind: 'usage', code: 'sandbox_blocked', retryable: false,
       message: '该语句尝试访问文件或网络，已被只读沙箱拦截',
     }
   }
 
-  // ③ 表不存在：spec §十一 行 5。
-  if (TABLE_NAME_RE.test(msg)) {
-    return { kind: 'usage', code: 'query_error', retryable: false, ...tableNotFound(msg, tables) }
+  // ③ 表/列不存在：spec §十一 行 5（四种原生形态统一走 missingNameFailure）。
+  const missing = missingNameFailure(msg, tables)
+  if (missing) {
+    return { kind: 'usage', code: 'query_error', retryable: false, ...missing }
   }
 
-  // ④ 列不存在：spec §十一 行 5。
-  if (COLUMN_NAME_RE.test(msg)) {
-    return { kind: 'usage', code: 'query_error', retryable: false, ...columnNotFound(msg, tables) }
-  }
-
-  // ⑤ SQL 语法错：spec §十一 行 6 —— 中文包装 + 底层原文（原文自带位置信息，保留全部行）。
+  // ④ SQL 语法错：spec §十一 行 6 —— 中文包装 + 底层原文（原文自带位置信息，保留全部行）。
   if (/Parser Error/i.test(msg)) {
     return {
       kind: 'usage', code: 'query_error', retryable: false,
       message: `SQL 语法错误：${msg}`,
+    }
+  }
+
+  // ⑤ 未绑参：spec §十一 行 6（「SQL 语法错 / 未绑参」同归 usage/query_error）。
+  if (/Expected \d+ parameters/i.test(msg)) {
+    return {
+      kind: 'usage', code: 'query_error', retryable: false,
+      message: `SQL 参数个数不匹配：${msg}`,
+      hint: '请把过滤条件写成字面量；参数化查询仅供 CLI 内部代码使用',
     }
   }
 

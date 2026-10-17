@@ -49,6 +49,17 @@ describe('原生报错 → 中文 + 候选（spec §十一）', () => {
     })
   })
 
+  it('裸 Permission Error（OS 权限问题）不得误报 sandbox_blocked', () => {
+    // 审查实测形态：读库文件本身被 OS 拒绝，前缀同为 Permission Error。
+    // 与 sandbox.ts 的收窄裁决对齐：只认「文件系统操作被配置禁用」的措辞。
+    const f = classifyDuckDbError(
+      new Error('Permission Error: opening database file: Operation not permitted'), TABLES,
+    )
+    expect(f.code).not.toBe('sandbox_blocked')
+    expect(f.kind).toBe('internal')
+    expect(f.message.startsWith('查询执行失败')).toBe(true)
+  })
+
   it('Parser/Binder/Catalog 其它 → usage query_error，含底层原文', () => {
     // 语法错：中文前缀 + 原生原文（不裸透）
     const parser = classifyDuckDbError(new Error('Parser Error: syntax error at or near "SELEC"'), TABLES)
@@ -143,6 +154,50 @@ describe('原生报错 → 中文 + 候选（spec §十一）', () => {
   })
 })
 
+// 审查实测的四种真实形态（@duckdb/node-api 1.5.6-r.1，原文逐字）。
+describe('限定名 / Candidate tables / 无 FROM 变体 → 候选不丢', () => {
+  it('Table "sessions" does not have a column named "paylod" + 双冒号 Candidate bindings → 列候选', () => {
+    const e = new Error(
+      'Binder Error: Table "sessions" does not have a column named "paylod"\n' +
+      'Candidate bindings: : "payload"\n\n' +
+      'LINE 1: SELECT sessions.paylod FROM sessions',
+    )
+    const f = classifyDuckDbError(e, TABLES)
+    expect(f).toMatchObject({ kind: 'usage', code: 'query_error', message: '列 paylod 不存在' })
+    expect(f.hint).toBe('候选：payload')
+  })
+
+  it('Referenced table "sessons" not found + Candidate tables → 表候选', () => {
+    const e = new Error(
+      'Binder Error: Referenced table "sessons" not found!\n' +
+      'Candidate tables: "sessions"\n\n' +
+      'LINE 1: SELECT sessons.paylod FROM sessions',
+    )
+    const f = classifyDuckDbError(e, TABLES)
+    expect(f).toMatchObject({ kind: 'usage', code: 'query_error', message: '表 sessons 不存在' })
+    expect(f.hint).toBe('候选：sessions')
+  })
+
+  it('无 FROM 的 "was not found because the FROM clause is missing" → 列候选', () => {
+    const e = new Error(
+      'Binder Error: Referenced column "paylod" was not found because the FROM clause is missing',
+    )
+    const f = classifyDuckDbError(e, TABLES)
+    expect(f).toMatchObject({ kind: 'usage', code: 'query_error', message: '列 paylod 不存在' })
+    expect(f.hint).toBe('候选：payload')
+  })
+
+  it('未绑参（Expected N parameters）→ usage + query_error + 参数化提示', () => {
+    const f = classifyDuckDbError(
+      new Error('Invalid Input Error: Expected 1 parameters, but none were supplied'), TABLES,
+    )
+    expect(f.kind).toBe('usage')
+    expect(f.code).toBe('query_error')
+    expect(f.message.startsWith('SQL 参数个数不匹配')).toBe(true)
+    expect(f.hint).toContain('参数化查询仅供 CLI 内部代码使用')
+  })
+})
+
 describe('suggestNames：前缀优先，其次编辑距离 ≤ 2', () => {
   it('sessons → sessions；完全不相干 → 空数组（不硬凑）', () => {
     expect(suggestNames('sessons', ['sessions', 'tickets'])).toEqual(['sessions'])
@@ -158,6 +213,12 @@ describe('suggestNames：前缀优先，其次编辑距离 ≤ 2', () => {
     expect(suggestNames('sessions', ['sessions'])).toEqual([])
     expect(suggestNames('paylod', ['payload', 'payload', 'session_id'])).toEqual(['payload'])
     expect(suggestNames('a', ['ab', 'ac', 'ad', 'ae', 'af', 'ag'], 3)).toEqual(['ab', 'ac', 'ad'])
+  })
+
+  it('空输入 / max<=0 / 空名字池 → 空数组', () => {
+    expect(suggestNames('', ['sessions'])).toEqual([])
+    expect(suggestNames('sessons', ['sessions'], 0)).toEqual([])
+    expect(suggestNames('sessons', [], 5)).toEqual([])
   })
 })
 
@@ -190,6 +251,17 @@ describe('已分类错误原样透传（sandbox 抛出的 kind/code/hint/retryab
     expect(f.retryable).toBe(false)
     expect(f.message.startsWith('查询执行失败')).toBe(true)
     expect(f.message).toContain('Could not convert string "abc" to INT32')
+  })
+
+  it('非 Error 抛出（字符串 / null）→ internal 中文包装，不崩溃', () => {
+    const str = classifyDuckDbError('boom', TABLES)
+    expect(str.kind).toBe('internal')
+    expect(str.message.startsWith('查询执行失败')).toBe(true)
+    expect(str.message).toContain('boom')
+
+    const nil = classifyDuckDbError(null, TABLES)
+    expect(nil.kind).toBe('internal')
+    expect(nil.message.startsWith('查询执行失败')).toBe(true)
   })
 })
 
@@ -238,6 +310,28 @@ describe('sandbox 包装错误：cause 带原生表/列错误时补算中文消�
       message: '查询执行失败：查询被中断', hint: 'sandbox 给的 hint',
     })
   })
+
+  it('kind 不是 usage 时 cause 的表/列错误不补算（Minor #6 守卫）', () => {
+    const e = Object.assign(new Error('查询执行失败：Catalog Error: Table with name sessons does not exist!'), {
+      kind: 'internal', code: 'internal', cause: native('Catalog Error: Table with name sessons does not exist!'),
+    })
+    expect(classifyDuckDbError(e, TABLES)).toEqual({
+      kind: 'internal', code: 'internal', retryable: false,
+      message: '查询执行失败：Catalog Error: Table with name sessons does not exist!',
+    })
+  })
+
+  it('R11：internal + cause 含 Out of Memory Error → 补「缩小范围」hint，message 不变', () => {
+    const e = Object.assign(new Error('查询执行失败：Out of Memory Error: failed to allocate 8.0 GiB'), {
+      kind: 'internal', code: 'internal', retryable: false,
+      cause: native('Out of Memory Error: failed to allocate data of size 8.0 GiB'),
+    })
+    expect(classifyDuckDbError(e, TABLES)).toEqual({
+      kind: 'internal', code: 'internal', retryable: false,
+      message: '查询执行失败：Out of Memory Error: failed to allocate 8.0 GiB',
+      hint: '缩小时间范围或加过滤条件',
+    })
+  })
 })
 
 describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码 1', () => {
@@ -280,6 +374,19 @@ describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码
     expect(JSON.parse(out).error).toMatchObject({
       code: 'query_timeout', kind: 'query_timeout', hint: '请缩小时间范围',
     })
+    expect(err).toBe('')
+  })
+
+  it('internal 路径 → 退出码 1、stdout JSON 含 code/kind/retryable/message/hint、stderr 空', () => {
+    const e = new Error('Out of Memory Error: failed to allocate data of size 8.0 GiB')
+    expect(thrownToQueryExit(e, TABLES)).toBe(1)
+    const j = JSON.parse(out)
+    expect(j.ok).toBe(false)
+    expect(j.error).toMatchObject({
+      code: 'internal', kind: 'internal', retryable: false,
+      hint: '缩小时间范围或加过滤条件',
+    })
+    expect(j.error.message.startsWith('查询内存不足')).toBe(true)
     expect(err).toBe('')
   })
 })
