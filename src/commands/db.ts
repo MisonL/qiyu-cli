@@ -1,4 +1,5 @@
-// src/commands/db.ts —— E 组查询命令骨架；Task 6：`db tables`（spec §8.1）。
+// src/commands/db.ts —— E 组查询命令骨架；Task 6：`db tables`（spec §8.1），
+// Task 7：`db describe`（spec §8.2）。
 //
 // 形态沿 store.ts / sync.ts：parseFlags（值位守卫）→ usageFail/fail 双通道 →
 // 查询层统一错误出口 thrownToQueryExit。
@@ -12,13 +13,16 @@
 //   · `time_range` 的 min/max **所有 kind** 都经 `msToShanghaiIso` 输出 `+08:00`
 //     形态（裁决 R1）：iso-day/iso-instant 的 MIN/MAX 是 ISO 字符串，epoch-ms 是
 //     数字字符串（BIGINT 经 JSON 层），三者统一为同一形态。
+//   · `db describe` 的列清单同样以 `TABLES` 为权威；声明有而库中无的表**仍输出声明
+//     元数据**（`row_count`/`time_range` 为 null + warning，裁决 R5）——Agent 需要知道
+//     该表应该有什么列，才能判断是没同步还是没建库。
 import { statSync } from 'node:fs'
 import { resolveStoreConfig } from '../store/config.js'
 import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
-import { thrownToQueryExit } from '../query/errors.js'
-import { TABLES } from '../store/schema.js'
-import type { TableDef } from '../store/schema.js'
+import { suggestNames, thrownToQueryExit } from '../query/errors.js'
+import { TABLES, tableByName } from '../store/schema.js'
+import type { ColumnDef, TableDef } from '../store/schema.js'
 import { msToShanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail, sanitizeControlChars } from '../output.js'
 
@@ -220,6 +224,139 @@ async function dbTables(argv: string[]): Promise<number> {
   }
 }
 
+/** 单列的对外形态（spec §8.2）：恰好七个键，缺省字段显式 `null`（`sensitive` 缺省 false）。 */
+function describeColumn(c: ColumnDef): {
+  name: string; type: string; nullable: boolean; sensitive: boolean
+  unit: string | null; observed_enum: Array<string | number> | null; note: string | null
+} {
+  return {
+    name: c.name,
+    type: c.type,
+    nullable: c.nullable,
+    sensitive: c.sensitive ?? false,
+    unit: c.unit ?? null,
+    observed_enum: c.observed_enum ?? null,
+    note: c.note ?? null,
+  }
+}
+
+async function dbDescribe(argv: string[]): Promise<number> {
+  // 子命令级次序沿 dbTables：--help 分流 → --pretty 显式拒绝 → parseFlags → 位置参数。
+  if (argv.includes('--help') || argv.includes('-h')) {
+    const rawRest = argv.filter((a) => !KNOWN.has(a))
+    if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
+    process.stdout.write(USAGE)
+    return 0
+  }
+  if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
+
+  let flags: ReturnType<typeof parseFlags>
+  try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+
+  // 未知 flag（`--bogus`）会落进 rest —— 先按 `-` 前缀挑出来，避免被当成表名。
+  const flagish = flags.rest.filter((a) => a.startsWith('-'))
+  if (flagish.length > 0) return usageFail(`未知参数：${flagish.join(' ')}`)
+  if (flags.rest.length === 0) {
+    return usageFail(`缺少表名：请给 db describe <表>\n可用表：${TABLES.map((t) => t.name).join('、')}`)
+  }
+  if (flags.rest.length > 1) return usageFail(`未知参数：${flags.rest.slice(1).join(' ')}`)
+
+  // spec §8.2「未知 → usage + 候选」：闭集校验先于一切 I/O（不打开库就知道表名拼错）。
+  // 候选来自 `TABLES`（前缀/编辑距离，大小写不敏感），不裸透 DuckDB 英文原文。
+  const name = sanitizeControlChars(flags.rest[0])
+  const table = tableByName(name)
+  if (table === undefined) {
+    const candidates = suggestNames(name, TABLES.map((t) => t.name))
+    return usageFail(`未知表：${name}`,
+      candidates.length > 0 ? `候选：${candidates.join('、')}` : '用 `qiyu db tables` 查看可用表')
+  }
+
+  let config
+  try {
+    config = resolveStoreConfig({
+      flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
+      env: {
+        QIYU_DB_PATH: process.env.QIYU_DB_PATH,
+        QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
+        QIYU_PROFILE: process.env.QIYU_PROFILE,
+      },
+    }).config
+  } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+
+  const guarded = statGuard(config.path)
+  if (guarded !== null) return guarded
+
+  let session: SandboxSession
+  try {
+    session = await openSandbox(config)
+  } catch (e) { return thrownToQueryExit(e, TABLES) }
+
+  try {
+    // 库结构校验与 db tables 同款（spec §十一）：缺 schema_version = 不是本 CLI 的库。
+    const sv = await session.run(
+      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
+    if (sv.rows.length === 0) {
+      return fail({
+        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
+        message: `数据库结构不完整（缺表）：${config.path}`,
+        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
+      })
+    }
+
+    // 表名来自 `TABLES` 闭集（代码内常量），拼进字面量安全；用户输入只用于上面的闭集查找。
+    const present = (await session.run(
+      `SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='${table.name}'`))
+      .rows.length > 0
+
+    const warnings: string[] = []
+    let rowCount: number | null = null
+    let timeRange: { min: string; max: string } | null = null
+
+    if (!present) {
+      // R5：声明有但库中无 → 仍输出声明元数据，不报错（Agent 靠列清单判断
+      // 「没同步」还是「没建库」）。此时 row_count/time_range 无从得知，置 null。
+      warnings.push(`表 ${table.name} 在库中不存在（未同步或未建库）；以下为声明元数据`)
+    } else {
+      const r = await session.run(`SELECT COUNT(*) AS n FROM "${table.name}"`)
+      // ⚠️ COUNT 是 BIGINT，经 getRowObjectsJson() 是**字符串** —— 必须 Number() 收敛。
+      rowCount = Number((r.rows[0] ?? {}).n)
+      timeRange = await timeRangeOf(session, table)
+
+      // 实际列集核对（spec §8.2「声明与实况的差异不得静默」）。
+      const actual = (await session.run(
+        `SELECT column_name FROM information_schema.columns WHERE table_schema='main' AND table_name='${table.name}'`))
+        .rows.map((row) => String(row.column_name))
+      const actualSet = new Set(actual)
+      const declaredSet = new Set(table.columns.map((c) => c.name))
+      const missing = table.columns.map((c) => c.name).filter((n) => !actualSet.has(n))
+      const extra = actual.filter((n) => !declaredSet.has(n)).sort()
+      if (missing.length > 0 || extra.length > 0) {
+        const parts: string[] = []
+        if (extra.length > 0) parts.push(`多列 ${extra.join('、')}`)
+        if (missing.length > 0) parts.push(`少列 ${missing.join('、')}`)
+        warnings.push(`表 ${table.name} 实际${parts.join('、')}——可能来自旧版 CLI 或库损坏`)
+      }
+    }
+
+    return ok({
+      table: table.name,
+      grain: table.grain,
+      primary_key: table.primaryKey,
+      // 无时间列 → null（不编造）；有则只出 name/kind 两个键。
+      time_column: table.timeColumn === undefined
+        ? null : { name: table.timeColumn.name, kind: table.timeColumn.kind },
+      row_count: rowCount,
+      time_range: timeRange,
+      columns: table.columns.map(describeColumn),
+      pii_columns: piiColumnsOf(table),
+    }, { notice: PII_NOTICE, warnings })
+  } catch (e) {
+    return thrownToQueryExit(e, TABLES)
+  } finally {
+    await session.close()
+  }
+}
+
 export async function dbCommand(argv: string[]): Promise<number> {
   const [sub, ...rest] = argv
   if (sub === undefined || sub === '--help' || sub === '-h') {
@@ -234,10 +371,5 @@ export async function dbCommand(argv: string[]): Promise<number> {
   if (sub !== 'tables' && sub !== 'describe') {
     return usageFail(`未知子命令：${sub}\n可用子命令：tables、describe`)
   }
-  // ⚠️ 不指向 `qiyu db --help`：USAGE 把 describe 列为正常子命令，查帮助得不到
-  // 「尚未实现」的信息（循环指向）。这里直接给当前可用的替代动作。
-  if (sub === 'describe') {
-    return usageFail('db describe 尚未实现；暂可用 `qiyu db tables` 查看表清单与 PII 列')
-  }
-  return dbTables(rest)
+  return sub === 'describe' ? dbDescribe(rest) : dbTables(rest)
 }

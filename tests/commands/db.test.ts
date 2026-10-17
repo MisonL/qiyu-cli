@@ -204,15 +204,8 @@ describe('db tables', () => {
     expect(await dbCommand(['bogus'])).toBe(2)
     expect(err).toMatch(/未知子命令/)
 
-    // describe 是已声明子命令、尚未实现（Task 7 填）：usage 2，不是「未知子命令」；
-    // 占位消息必须给当前可用的替代动作（不能循环指向 --help，复审 Minor #3）
-    out = ''; err = ''
-    expect(await dbCommand(['describe'])).toBe(2)
-    expect(err).toMatch(/尚未实现/)
-    expect(err).toMatch(/qiyu db tables/)
-
-    // 无子命令 / --help / tables --help → USAGE 走 stdout、退出码 0
-    for (const argv of [[], ['--help'], ['tables', '--help']]) {
+    // 无子命令 / --help / tables --help / describe --help → USAGE 走 stdout、退出码 0
+    for (const argv of [[], ['--help'], ['tables', '--help'], ['describe', '--help']]) {
       out = ''; err = ''
       expect(await dbCommand(argv), argv.join(' ')).toBe(0)
       expect(out).toMatch(/db tables/)
@@ -255,5 +248,170 @@ describe('db tables', () => {
     e = errorOf()
     expect(e.kind).toBe('store_not_initialized')
     expect(e.hint).toMatch(/换 --db 路径/)
+  })
+})
+
+// —— E-T7：`db describe <表>`（spec §8.2）——
+type ColumnOut = {
+  name: string; type: string; nullable: boolean; sensitive: boolean
+  unit: string | null; observed_enum: Array<string | number> | null; note: string | null
+}
+type DescribeOut = {
+  table: string; grain: string; primary_key: string[]
+  time_column: { name: string; kind: string } | null
+  row_count: number | null
+  time_range: { min: string; max: string } | null
+  columns: ColumnOut[]
+  pii_columns: string[]
+}
+
+const SESSIONS_PII = ['payload', 'userPhone', 'userName', 'userEmail',
+  'userAddress', 'fromIp', 'userIpCity', 'userCrmInfo']
+const sessionsDef = (): (typeof TABLES)[number] => TABLES.find((t) => t.name === 'sessions')!
+
+describe('db describe', () => {
+  it('db describe sessions：7 键逐列 + sensitive/observed_enum/时间列/row_count/PII 列', async () => {
+    await seed()
+    expect(await dbCommand(['describe', 'sessions', '--db', dbPath()])).toBe(0)
+
+    const d = data() as DescribeOut
+    // data 恰好八个键（多/少键都是 Agent 契约变更）
+    expect(Object.keys(d).sort()).toEqual(
+      ['columns', 'grain', 'pii_columns', 'primary_key', 'row_count', 'table', 'time_column', 'time_range'])
+    expect(d.table).toBe('sessions')
+    expect(d.grain).toBe('每个会话一行（含机器人/人工/内部会话）')
+    expect(d.primary_key).toEqual(['session_id'])
+    expect(d.time_column).toEqual({ name: 'startTime', kind: 'epoch-ms' })
+    // row_count 是 BIGINT → 命令层必须 Number() 收敛成数字
+    expect(typeof d.row_count).toBe('number')
+    expect(d.row_count).toBe(2)
+    expect(d.time_range).toEqual({ min: '2026-08-15T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00' })
+
+    // 列清单与顺序以 TABLES 为权威
+    expect(d.columns.map((c) => c.name)).toEqual(sessionsDef().columns.map((c) => c.name))
+    for (const c of d.columns) {
+      // 每列恰好七个键；缺省字段显式 null（sensitive 缺省 false）
+      expect(Object.keys(c).sort(), c.name)
+        .toEqual(['name', 'note', 'nullable', 'observed_enum', 'sensitive', 'type', 'unit'])
+      expect(typeof c.nullable, c.name).toBe('boolean')
+      expect(typeof c.sensitive, c.name).toBe('boolean')
+    }
+    const byName = new Map(d.columns.map((c) => [c.name, c]))
+    // 观测枚举只出现在有实测出处的列（spec §8.2：命名刻意不叫 enum）
+    expect(byName.get('session_type')).toMatchObject({
+      type: 'VARCHAR', nullable: true, sensitive: false, unit: null,
+      observed_enum: ['robot', 'internal', 'human'],
+    })
+    expect(byName.get('session_type')!.note).toBeTruthy()
+    // 无附加元数据的 PII 列：unit/observed_enum/note 显式 null，不是缺键
+    expect(byName.get('userPhone')).toEqual({
+      name: 'userPhone', type: 'VARCHAR', nullable: true, sensitive: true,
+      unit: null, observed_enum: null, note: null,
+    })
+    // 时间列的 unit 与 timeColumn 呼应
+    expect(byName.get('startTime')!.unit).toBe('epoch 毫秒数字字符串')
+
+    expect(d.pii_columns).toEqual(SESSIONS_PII)
+    expect(meta().notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
+    expect(meta().warnings).toEqual([])
+  })
+
+  it('无时间列 → time_column/time_range 均 null；meta 恒有 notice 与 warnings', async () => {
+    await seed()
+    expect(await dbCommand(['describe', 'schema_version', '--db', dbPath()])).toBe(0)
+
+    const d = data() as DescribeOut
+    expect(d.time_column).toBeNull()
+    expect(d.time_range).toBeNull()          // 无 timeColumn → 不编造范围
+    expect(d.row_count).toBe(MIGRATIONS.length)
+    expect(d.pii_columns).toEqual([])
+
+    const m = meta()
+    expect(Object.keys(m).sort()).toEqual(['notice', 'warnings'])
+    expect(m.notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
+    expect(m.warnings).toEqual([])
+  })
+
+  it('未知表 → usage 2 + 候选（sessons → sessions）；缺表名 / 多余位置参数 → usage 2', async () => {
+    await seed()
+    // 拼错一个字符 → 候选来自 TABLES（不裸透 DuckDB 英文）。
+    // ⚠️ 不给 --db：闭集校验先于任何 I/O（走到开库会得到 store_not_initialized 退出码 1）
+    expect(await dbCommand(['describe', 'sessons'])).toBe(2)
+    let e = errorOf()
+    expect(e.kind).toBe('usage')
+    expect(e.message).toMatch(/sessons/)
+    expect(e.hint).toMatch(/sessions/)
+    expect(err).toMatch(/sessons/)             // usageFail 双通道：stderr 有 message（hint 只在 JSON）
+
+    // 完全不相干 → 不硬凑候选，指向表清单
+    out = ''; err = ''
+    expect(await dbCommand(['describe', 'zzzzzz', '--db', dbPath()])).toBe(2)
+    e = errorOf()
+    expect(e.hint).toMatch(/qiyu db tables/)
+
+    // 缺表名
+    out = ''; err = ''
+    expect(await dbCommand(['describe', '--db', dbPath()])).toBe(2)
+    expect(err).toMatch(/缺少表名/)
+
+    // 多余位置参数
+    out = ''; err = ''
+    expect(await dbCommand(['describe', 'sessions', 'extra', '--db', dbPath()])).toBe(2)
+    expect(err).toMatch(/未知参数/)
+
+    // 未知 flag 不得被当成表名；--pretty 沿全族显式拒绝
+    out = ''; err = ''
+    expect(await dbCommand(['describe', 'sessions', '--bogus', '--db', dbPath()])).toBe(2)
+    expect(err).toMatch(/未知参数：--bogus/)
+    out = ''; err = ''
+    expect(await dbCommand(['describe', 'sessions', '--pretty', '--db', dbPath()])).toBe(2)
+    expect(err).toMatch(/--pretty/)
+  })
+
+  it('实际列集与 TABLES 不一致 → meta.warnings 点名多列/少列；列清单仍以声明为权威', async () => {
+    const s = await fresh()
+    try {
+      await s.query('ALTER TABLE "sessions" DROP COLUMN "userCrmInfo"')
+      await s.query('ALTER TABLE "sessions" ADD COLUMN "rogue_col" VARCHAR')
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['describe', 'sessions', '--db', dbPath()])).toBe(0)
+
+    const text = (meta().warnings as string[]).join('\n')
+    expect(text).toMatch(/少列/)
+    expect(text).toMatch(/userCrmInfo/)
+    expect(text).toMatch(/多列/)
+    expect(text).toMatch(/rogue_col/)
+    expect(text).toMatch(/旧版 CLI 或库损坏/)
+    // 列清单来自 TABLES：库中少了列也不缩减输出
+    expect((data() as DescribeOut).columns.map((c) => c.name)).toContain('userCrmInfo')
+  })
+
+  it('R5：声明有但库中无 → 仍输出声明元数据（row_count/time_range null）+ warning，退出码 0', async () => {
+    const s = await fresh()
+    try {
+      await s.query('DROP TABLE "sessions"')
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['describe', 'sessions', '--db', dbPath()])).toBe(0)
+
+    const d = data() as DescribeOut
+    expect(d.row_count).toBeNull()
+    expect(d.time_range).toBeNull()
+    // 声明元数据照常：Agent 需要知道该表「应该」有什么列，才能判断是没同步还是没建库
+    expect(d.columns).toHaveLength(sessionsDef().columns.length)
+    expect(d.pii_columns).toEqual(SESSIONS_PII)
+    expect(d.time_column).toEqual({ name: 'startTime', kind: 'epoch-ms' })
+
+    const warnings = meta().warnings as string[]
+    // 表都不在，列集核对无从谈起 —— 只留一条「表不存在」警告，不制造「少列」噪音
+    expect(warnings).toHaveLength(1)
+    const text = warnings.join('\n')
+    expect(text).toMatch(/sessions/)
+    expect(text).toMatch(/不存在/)
+    expect(text).toMatch(/声明元数据/)
+    expect(meta().notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
   })
 })
