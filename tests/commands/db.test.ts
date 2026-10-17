@@ -145,6 +145,21 @@ describe('db tables', () => {
     } finally {
       await s.close()
     }
+    // 行为式证据（复审 Minor #2）：迁移已到最新版后 store.init() 只重放
+    // `version > MAX(version)` 的迁移 → 被删的 sessions **不会**被重建。
+    // 这是「store init 不一定能修」的硬证据，不是文案自证。
+    const s2 = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s2.init()
+      const remaining = (await s2.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"))
+        .rows.map((r) => String(r.table_name))
+      expect(remaining).not.toContain('sessions')
+      expect(remaining).toContain('rogue_table')
+    } finally {
+      await s2.close()
+    }
     expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
 
     const names = (data().tables as TableOut[]).map((t) => t.name)
@@ -161,6 +176,9 @@ describe('db tables', () => {
     expect(text).toMatch(/rogue_table/)
     // Important #1：不得承诺 store init 一定能修 —— 迁移已完成时被删的表 init 不会重建
     expect(text).toMatch(/不会重建/)
+    // 旧的不实承诺不得被保留（复审 Minor #2：否定式断言）
+    expect(text).not.toMatch(/可运行 qiyu store init 补齐建表/)
+    expect(text).not.toMatch(/需重建库或重新同步/)   // 重新同步单独无法重建被删表
   })
 
   it('未知参数 / --pretty / 值位缺失 → usage 退出码 2；--help → 0', async () => {
@@ -186,10 +204,12 @@ describe('db tables', () => {
     expect(await dbCommand(['bogus'])).toBe(2)
     expect(err).toMatch(/未知子命令/)
 
-    // describe 是已声明子命令、尚未实现（Task 7 填）：usage 2，不是「未知子命令」
+    // describe 是已声明子命令、尚未实现（Task 7 填）：usage 2，不是「未知子命令」；
+    // 占位消息必须给当前可用的替代动作（不能循环指向 --help，复审 Minor #3）
     out = ''; err = ''
     expect(await dbCommand(['describe'])).toBe(2)
     expect(err).toMatch(/尚未实现/)
+    expect(err).toMatch(/qiyu db tables/)
 
     // 无子命令 / --help / tables --help → USAGE 走 stdout、退出码 0
     for (const argv of [[], ['--help'], ['tables', '--help']]) {

@@ -181,7 +181,8 @@ async function dbTables(argv: string[]): Promise<number> {
       // 重建（迁移已跳过，返回 ok 而表仍缺）——那是「成功但无效」的修复。
       warnings.push(`声明有而库中无：${declaredMissing.join('、')}。`
         + '这些表不出现在 tables 中。若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
-        + '若迁移已完成而表被删或损坏，store init 不会重建该表——需重建库或重新同步')
+        + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
+        + '——需重建库（删除库文件后重新 qiyu store init 并重新同步）')
     }
     const undeclared = actualNames.filter((n) => !declaredSet.has(n)).sort()
     if (undeclared.length > 0) {
@@ -233,6 +234,10 @@ export async function dbCommand(argv: string[]): Promise<number> {
   if (sub !== 'tables' && sub !== 'describe') {
     return usageFail(`未知子命令：${sub}\n可用子命令：tables、describe`)
   }
-  if (sub === 'describe') return usageFail('db describe 尚未实现（见 qiyu db --help；将在后续版本提供）')
+  // ⚠️ 不指向 `qiyu db --help`：USAGE 把 describe 列为正常子命令，查帮助得不到
+  // 「尚未实现」的信息（循环指向）。这里直接给当前可用的替代动作。
+  if (sub === 'describe') {
+    return usageFail('db describe 尚未实现；暂可用 `qiyu db tables` 查看表清单与 PII 列')
+  }
   return dbTables(rest)
 }
