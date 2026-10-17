@@ -16,8 +16,10 @@ export interface TaskRunResult {
   /**
    * 窗口计数（修复批 6 #2 起 `skipped` 恒在）：total = succeeded + failed + skipped。
    * skipped = 残段窗（日对齐任务被显式区间钳出的非日界首/末段）——引擎跳过不 fetch、
-   * 不写库、不推水位（半日聚合不写日行，整日值由下轮日对齐 run 补全），但仍如实计数
-   * 可见，绝不静默消失。
+   * 不写库、不推水位（半日聚合不写日行）：末残段的整日值由下轮日对齐 run 补全
+   *（水位停在末整日窗 end、续跑起点落回日界）；首残段不落日行也**不补**（该半日段
+   * 没有合法落点，属显式 --since 区间的边界语义，要覆盖该日请给更宽的 --since）。
+   * 跳过窗仍如实计数可见，绝不静默消失。
    */
   windows: { total: number; succeeded: number; failed: number; skipped: number }
   rows: { fetched: number; written: number }

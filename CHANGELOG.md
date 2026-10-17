@@ -62,7 +62,8 @@
 - **残段窗跳过（`windows.skipped`）**：日对齐报表任务被显式区间（`--since/--until/--full`）
   钳出的非日界首末段（如 `--since 30d` 的 `[起点11:15, 次日0点)`）装的是半日聚合值，
   写 `stat_date` 日行会覆盖该日的整日聚合 → 引擎跳过不 fetch、不写库、不推水位
-  （整日值由下轮日对齐 run 补全）；跳过窗计入 `total` 并标 `skipped`、逐窗 stderr
+  （末残段由下轮日对齐 run 补全；首残段不补，要覆盖该日请给更宽的 `--since`）；
+  跳过窗计入 `total` 并标 `skipped`、逐窗 stderr
   进度行，绝不静默消失
 - **`sync install` 固化 env 派生的存储定位**：存储定位走环境变量（`QIYU_DB_PATH`/
   `QIYU_PROFILE`/`QIYU_STORE_BACKEND`）时，把解析出的绝对路径/名称写进调度命令的

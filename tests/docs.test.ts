@@ -301,7 +301,7 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
   it('批 5 复审 N1-b/N1-c：三处「对齐后每窗恰是整日 / --full 不放大」的不实措辞不得回归', () => {
     // 复审实证：epoch 0 在上海是 1969-12-31 16:00（不是 1970-01-01 0 点），
     // 故 --full 首窗是 16 小时残段、窗数至多 +1；非日界 --since 的首窗也是残段
-    //（批 6 #2 起残段窗直接跳过不落库，整日值由下轮日对齐 run 补全 —— 见下一条用例）。
+    //（批 6 #2 起残段窗直接跳过不落库，末残段由下轮日对齐 run 补全 —— 见下一条用例）。
     const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
     expect(s).toMatch(/起点 0（= 上海 1969-12-31 16:00）/)
     expect(s).not.toMatch(/起点 0 恰为上海 1970-01-01 0 点/)
@@ -315,7 +315,7 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
 
   it('批 6 #2 文档联动：残段窗跳过与 windows.skipped 契约写在 spec §5.2/§七 与 README', () => {
     const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
-    // §5.2：残段窗跳过 + 水位语义（半日聚合不落库、整日值下轮补全）
+    // §5.2：残段窗跳过 + 水位语义（半日聚合不落库、末残段由下轮补全）
     expect(s).toMatch(/残段窗跳过/)
     expect(s).toMatch(/跳过不落库/)
     // §七：windows.skipped 字段契约（total = succeeded + failed + skipped）
@@ -323,6 +323,27 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
     expect(s).toMatch(/total = succeeded \+ failed \+ skipped/)
     const md = read('README.md')
     expect(md).toMatch(/windows.*skipped.*total = succeeded \+ failed \+ skipped/s)
+  })
+
+  it('批 7 N-2/N-4：补全承诺限定末残段（首残段不补）+ resolved_range.start 水位起点语义', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    const md = read('README.md')
+    // N-2 正锚：「由下轮日对齐 run 补全」必须带「末残段」限定，且写明首残段处置三要素
+    for (const [name, doc] of [['spec', s], ['README', md]] as const) {
+      // 反锚：任何「由下轮日对齐」出现处的前文必须含「末残段」（无条件补全承诺不得回归）
+      for (const m of doc.matchAll(/由下轮日对齐/g)) {
+        const before = doc.slice(Math.max(0, m.index! - 24), m.index!)
+        expect(before, `${name}: 补全承诺须限定末残段`).toMatch(/末残段/)
+      }
+      expect(doc, `${name}: 末残段正锚`).toMatch(/末残段/)
+      expect(doc, `${name}: 首残段不补`).toMatch(/首残段.*不落日行也\*?\*?不补\*?\*?|首残段.*不补/)
+      expect(doc, `${name}: 恢复路径 = 更宽 --since`).toMatch(/更宽的 `--since`/)
+    }
+    // N-4：resolved_range.start 是水位起点语义（含被跳过的首残段前缀），读方按 end + skipped 判断
+    expect(s).toMatch(/resolved_range\.start` 是\*\*水位起点语义\*\*/)
+    expect(s).toMatch(/按 `resolved_range` 的 end（水位）与 `windows\.skipped` 判断真实覆盖/)
+    expect(md).toMatch(/resolved_range\.start` 是\*\*水位起点语义\*\*/)
+    expect(md).toMatch(/end（水位）与 `skipped` 判断真实覆盖/)
   })
 
   it('批 6 #1 文档联动：sync install 的 env 派生固化与「不继承 shell 环境/不写凭证」写明', () => {
