@@ -1,4 +1,6 @@
 // src/store/schema.ts
+export type TimeColumnKind = 'iso-day' | 'iso-instant' | 'epoch-ms'
+
 export interface ColumnDef {
   name: string
   type: 'VARCHAR' | 'INTEGER'
@@ -8,18 +10,56 @@ export interface ColumnDef {
    * 读取出口——E 按列脱敏时**只认这个标记**，所以漏标 = 整列不脱敏。
    */
   sensitive?: boolean
+  /**
+   * 实测观测到的取值集合。命名刻意不叫 enum：观测集不完整（设计稿 §10.5），
+   * 不得据此做校验——它只是给 Agent 的提示，不是约束。
+   */
+  observed_enum?: Array<string | number>
+  /** 列级单位/编码（E 的 db describe 出口）；缺省 = 未知。 */
+  unit?: string
+  /** 一句话语义。 */
+  note?: string
 }
-export interface TableDef { name: string; columns: ColumnDef[]; primaryKey: string[] }
+
+export interface TableDef {
+  name: string
+  columns: ColumnDef[]
+  primaryKey: string[]
+  /** 粒度描述（E 的 db tables 出口）。 */
+  grain: string
+  /** 业务时间列（E 的 --since/--until 与时间范围出口）；缺省 = 不支持时间过滤。 */
+  timeColumn?: { name: string; kind: TimeColumnKind }
+}
+
+/**
+ * 时间列编码文案（设计稿 §四）：kind 决定存储形态，也决定 E 的比较方式——
+ * iso-day 必须先把 --since 向下取整到上海自然日，直接比较会漏掉当天全天的行。
+ */
+const UNIT_ISO_DAY = '上海自然日 00:00 的 ISO 8601'
+const UNIT_ISO_INSTANT = 'ISO 8601 UTC'
+const UNIT_EPOCH_MS = 'epoch 毫秒数字字符串'
+/** 业务字段整体收敛列（报表/工单/会话/知识库同一取舍）：值为整行 JSON 字符串。 */
+const UNIT_JSON = 'JSON 字符串'
 
 const col = (name: string, type: 'VARCHAR' | 'INTEGER', nullable = true,
   sensitive = false): ColumnDef =>
   ({ name, type, nullable, sensitive })
 
+/** 带附加元数据的列：col 的语义不变，只补 E 的 db describe 出口字段。 */
+const colMeta = (name: string, type: 'VARCHAR' | 'INTEGER', meta: Pick<ColumnDef, 'unit' | 'note' | 'observed_enum'>,
+  nullable = true, sensitive = false): ColumnDef =>
+  ({ ...col(name, type, nullable, sensitive), ...meta })
+
 export const TABLES: TableDef[] = [
-  { name: 'schema_version', columns: [col('version', 'INTEGER', false)], primaryKey: ['version'] },
+  {
+    name: 'schema_version',
+    columns: [col('version', 'INTEGER', false)], primaryKey: ['version'],
+    grain: '迁移版本记录（每版本一行）',
+  },
   {
     name: 'sync_state',
-    columns: [col('dataset', 'VARCHAR', false), col('watermark', 'VARCHAR'), col('range_status', 'VARCHAR'),
+    columns: [col('dataset', 'VARCHAR', false), col('watermark', 'VARCHAR'),
+      colMeta('range_status', 'VARCHAR', { observed_enum: ['pending', 'complete'] }),
       col('last_error', 'VARCHAR'), col('locked_by', 'VARCHAR'), col('locked_at', 'VARCHAR'),
       // D-T3：水位状态的同步时间（readWatermark 的 lastSyncedAt 往返落点）。
       col('last_synced_at', 'VARCHAR'),
@@ -31,6 +71,7 @@ export const TABLES: TableDef[] = [
       // `sync status` 的 resolved_range 输出来源，Agent 可据此判断数据新鲜度。
       col('resolved_range_start', 'VARCHAR'), col('resolved_range_end', 'VARCHAR')],
     primaryKey: ['dataset'],
+    grain: '每个同步任务一行（水位/状态/冷却/覆盖区间）',
   },
   {
     name: 'sync_gaps',
@@ -39,11 +80,13 @@ export const TABLES: TableDef[] = [
       // D-T3：缺口诊断详情（recordGap 的 detail 落点）。
       col('detail', 'VARCHAR')],
     primaryKey: ['dataset', 'range_start'],
+    grain: '每个缺口区间一行',
   },
   {
     name: 'tags',
     columns: [col('id', 'VARCHAR', false), col('name', 'VARCHAR', false), col('color', 'VARCHAR', false)],
     primaryKey: ['id'],
+    grain: '每个标签一行',
   },
   // —— D：维度表批次（迁移 v3 建，列集按设计稿 §6.2 实测字段全集）——
   // 列型只有 VARCHAR/INTEGER；ID 一律 VARCHAR（BIGINT 精度红线）；无 PII 列。
@@ -53,13 +96,19 @@ export const TABLES: TableDef[] = [
     // synchronized_at 由同步任务填写（快照时间），不在上游业务键内。
     name: 'staff',
     columns: [col('id', 'VARCHAR', false), col('realname', 'VARCHAR'), col('nickname', 'VARCHAR'),
-      col('username', 'VARCHAR'), col('role', 'VARCHAR'), col('roleId', 'VARCHAR'),
-      col('status', 'VARCHAR'), col('createtime', 'VARCHAR'), col('updateTime', 'VARCHAR'),
+      col('username', 'VARCHAR'),
+      // role/status 的观测值集（设计稿 §6.2 实测 330 行）：列是 VARCHAR，故枚举按字符串给。
+      // ⚠️ 观测集不完整（role 的 -1 从未观测到，但作为筛选项被接受并返回 0 行）——仅供提示。
+      colMeta('role', 'VARCHAR', { observed_enum: ['0', '1', '2', '-2'] }),
+      col('roleId', 'VARCHAR'),
+      colMeta('status', 'VARCHAR', { observed_enum: ['1', '2', '3'] }),
+      col('createtime', 'VARCHAR'), col('updateTime', 'VARCHAR'),
       col('email', 'VARCHAR'), col('phone', 'VARCHAR'), col('workNumber', 'VARCHAR'),
       col('maxServiceCount', 'VARCHAR'), col('skillScoreChat', 'VARCHAR'),
       col('skillScoreIpcc', 'VARCHAR'), col('groupInfo', 'VARCHAR'),
       col('synchronized_at', 'VARCHAR')],
     primaryKey: ['id'],
+    grain: '每个客服一行',
   },
   {
     // staff.group.list：实测恰 3 键——字段是 id（响应中无 groupId 键）。
@@ -68,6 +117,7 @@ export const TABLES: TableDef[] = [
     columns: [col('id', 'VARCHAR', false), col('name', 'VARCHAR'),
       col('synchronized_at', 'VARCHAR')],
     primaryKey: ['id'],
+    grain: '每个客服组一行',
   },
   {
     // 权威来源是 staff.group.list?staff=true 的 staffIdList（含组管理员）——
@@ -76,6 +126,7 @@ export const TABLES: TableDef[] = [
     columns: [col('group_id', 'VARCHAR', false), col('staff_id', 'VARCHAR', false),
       col('synchronized_at', 'VARCHAR')],
     primaryKey: ['group_id', 'staff_id'],
+    grain: '每个「组 × 客服」关系一行',
   },
   {
     // category.list：扁平返回，树由调用方构建（存储保持扁平）；rank 是稠密全局序号。
@@ -83,6 +134,7 @@ export const TABLES: TableDef[] = [
     columns: [col('id', 'VARCHAR', false), col('name', 'VARCHAR'), col('parentId', 'VARCHAR'),
       col('rank', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['id'],
+    grain: '每个工单分类一行（扁平，树由 parentId 构建）',
   },
   {
     // ticket.template.list：status 全为 1、不携带信息 → 不建列。
@@ -91,6 +143,7 @@ export const TABLES: TableDef[] = [
       col('autoFlow', 'VARCHAR'), col('autoStatus', 'VARCHAR'), col('fileStatus', 'VARCHAR'),
       col('autoGuide', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['id'],
+    grain: '每个工单模板一行',
   },
   {
     // ticket.template.fields：required 是三种状态（int ∈{0,1,2}），不是布尔；
@@ -101,6 +154,7 @@ export const TABLES: TableDef[] = [
       col('required', 'VARCHAR'), col('customer', 'VARCHAR'), col('description', 'VARCHAR'),
       col('prefill', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['template_id', 'fieldId'],
+    grain: '每个「模板 × 字段」一行',
   },
   // —— D：报表表批次（迁移 v5 建；spec §5.2 十一列的 9 张历史报表——
   // realtime_session/realtime_ipcc 是实时快照，不建同步任务、不建表）——
@@ -110,62 +164,89 @@ export const TABLES: TableDef[] = [
   // 按窗口填写（「日期一律由调用方填写」统一结论）。
   {
     name: 'daily_overview',
-    columns: [col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
-      col('synchronized_at', 'VARCHAR')],
+    columns: [colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['stat_date'],
+    grain: '每个上海自然日一行（全局汇总）',
+    timeColumn: { name: 'stat_date', kind: 'iso-day' },
   },
   {
     name: 'staff_workload',
-    columns: [col('stat_date', 'VARCHAR', false), col('staff_id', 'VARCHAR', false),
-      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    columns: [colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      col('staff_id', 'VARCHAR', false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['stat_date', 'staff_id'],
+    grain: '每个「客服 × 上海自然日」一行',
+    timeColumn: { name: 'stat_date', kind: 'iso-day' },
   },
   {
     name: 'staff_quality',
-    columns: [col('stat_date', 'VARCHAR', false), col('staff_id', 'VARCHAR', false),
-      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    columns: [colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      col('staff_id', 'VARCHAR', false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['stat_date', 'staff_id'],
+    grain: '每个「客服 × 上海自然日」一行（含 staff_id=sum 的全局汇总行）',
+    timeColumn: { name: 'stat_date', kind: 'iso-day' },
   },
   {
     name: 'staff_satisfaction',
-    columns: [col('stat_date', 'VARCHAR', false), col('staff_id', 'VARCHAR', false),
-      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    columns: [colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      col('staff_id', 'VARCHAR', false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['stat_date', 'staff_id'],
+    grain: '每个「客服 × 上海自然日」一行',
+    timeColumn: { name: 'stat_date', kind: 'iso-day' },
   },
   {
     // 粒度是客服 × 小时（必须传 startTime，否则静默降级为天粒度少抓 ~10 倍）；
     // hour_ts 是响应内唯一可信的日期字段（该小时按小时对齐的时间戳）。
     name: 'staff_attendance',
-    columns: [col('staff_id', 'VARCHAR', false), col('hour_ts', 'VARCHAR', false),
-      col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
-      col('synchronized_at', 'VARCHAR')],
+    columns: [col('staff_id', 'VARCHAR', false),
+      colMeta('hour_ts', 'VARCHAR', { unit: UNIT_ISO_INSTANT }, false),
+      // 辅助列：由本行 hour_ts 推导的上海自然日（不是窗口起点），故同为 iso-day 编码。
+      colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['staff_id', 'hour_ts'],
+    grain: '每个「客服 × 小时」一行',
+    // 时间列取 hour_ts 而非 stat_date：小时粒度是这张表的本体，stat_date 只是派生辅助列。
+    timeColumn: { name: 'hour_ts', kind: 'iso-instant' },
   },
   {
     name: 'order_performance',
-    columns: [col('order_id', 'VARCHAR', false), col('stat_date', 'VARCHAR', false),
-      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+    columns: [col('order_id', 'VARCHAR', false),
+      colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['order_id'],
+    grain: '每个订单一行（含 order_id=sum 的全局汇总行）',
+    timeColumn: { name: 'stat_date', kind: 'iso-day' },
   },
   {
     // 1 次调用 = 1 个客服，且只覆盖窗口起始的那一天 → work_date = 窗口起始日。
     name: 'staff_salary_detail',
-    columns: [col('staff_id', 'VARCHAR', false), col('work_date', 'VARCHAR', false),
-      col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
-      col('synchronized_at', 'VARCHAR')],
+    columns: [col('staff_id', 'VARCHAR', false),
+      colMeta('work_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['staff_id', 'work_date'],
+    grain: '每个「客服 × 工作日期」一行',
+    // work_date 与 stat_date 同为 iso-day；本期取 stat_date（与其余报表表统一，设计稿 §四）。
+    timeColumn: { name: 'stat_date', kind: 'iso-day' },
   },
   {
     name: 'robot_summary',
-    columns: [col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
-      col('synchronized_at', 'VARCHAR')],
+    columns: [colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['stat_date'],
+    grain: '每个上海自然日一行（机器人汇总）',
+    timeColumn: { name: 'stat_date', kind: 'iso-day' },
   },
   {
     name: 'transfer_human',
-    columns: [col('stat_date', 'VARCHAR', false), col('payload', 'VARCHAR'),
-      col('synchronized_at', 'VARCHAR')],
+    columns: [colMeta('stat_date', 'VARCHAR', { unit: UNIT_ISO_DAY }, false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['stat_date'],
+    grain: '每个上海自然日一行（转人工汇总）',
+    timeColumn: { name: 'stat_date', kind: 'iso-day' },
   },
   // —— D：工单表批次（迁移 v6 建；spec §5.2 末行/§5.5）——
   // 工单行线上有 27 个键、文档只有 16 个（设计稿 §6.2：connectionId/crm*/holder* 等未文档化
@@ -179,11 +260,13 @@ export const TABLES: TableDef[] = [
   // 不标 sensitive 会让「按列脱敏」的 E 从这一列把全部 PII 原样读出（整列绕过）。
   {
     name: 'tickets',
-    columns: [col('ticket_id', 'VARCHAR', false), col('payload', 'VARCHAR', true, true),
+    columns: [col('ticket_id', 'VARCHAR', false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }, true, true),
       col('crmUserName', 'VARCHAR', true, true), col('crmUserPhone', 'VARCHAR', true, true),
       col('crmUserEmail', 'VARCHAR', true, true), col('userMobile', 'VARCHAR', true, true),
       col('synchronized_at', 'VARCHAR')],
     primaryKey: ['ticket_id'],
+    grain: '每个工单一行',
   },
   {
     name: 'ticket_logs',
@@ -195,8 +278,10 @@ export const TABLES: TableDef[] = [
     // tickets/sessions 一致（PII 完整副本），故按同规处理；若将来复测发现该行不含 PII，
     // 撤标需连同本节注释一起改（不留「标了但没依据」的状态）。
     columns: [col('ticket_id', 'VARCHAR', false), col('log_id', 'VARCHAR', false),
-      col('payload', 'VARCHAR', true, true), col('synchronized_at', 'VARCHAR')],
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }, true, true),
+      col('synchronized_at', 'VARCHAR')],
     primaryKey: ['ticket_id', 'log_id'],
+    grain: '每条工单日志一行',
   },
   // —— D：会话表批次（迁移 v7 建；设计稿 §7.5 实测字段全集）——
   // session.txt 实测 90 个顶层键（71 恒存在 + 19 条件出现，private/raw 验证样本已做键普查、
@@ -211,15 +296,26 @@ export const TABLES: TableDef[] = [
   // categoryDetail 归一化（" / " → "/"）由 enrich 在落库前完成（列存归一化后的值）。
   {
     name: 'sessions',
-    columns: [col('session_id', 'VARCHAR', false), col('payload', 'VARCHAR', true, true),
-      col('staffId', 'VARCHAR'), col('startTime', 'VARCHAR'), col('endTime', 'VARCHAR'),
-      col('session_type', 'VARCHAR'), col('categoryDetail', 'VARCHAR'),
+    columns: [col('session_id', 'VARCHAR', false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }, true, true),
+      col('staffId', 'VARCHAR'),
+      // startTime/endTime 经 strOrNull 落库：上游数字被 JSON.stringify 成毫秒数字串。
+      colMeta('startTime', 'VARCHAR', { unit: UNIT_EPOCH_MS }),
+      colMeta('endTime', 'VARCHAR', { unit: UNIT_EPOCH_MS }),
+      colMeta('session_type', 'VARCHAR', {
+        observed_enum: ['robot', 'internal', 'human'],
+        note: '派生列：按 staffId 数字判别（< -1 robot / == -1 internal / > 0 human；0 不猜，落 null）',
+      }),
+      col('categoryDetail', 'VARCHAR'),
       col('userPhone', 'VARCHAR', true, true), col('userName', 'VARCHAR', true, true),
       col('userEmail', 'VARCHAR', true, true), col('userAddress', 'VARCHAR', true, true),
       col('fromIp', 'VARCHAR', true, true), col('userIpCity', 'VARCHAR', true, true),
       col('userCrmInfo', 'VARCHAR', true, true),
       col('synchronized_at', 'VARCHAR')],
     primaryKey: ['session_id'],
+    grain: '每个会话一行（含机器人/人工/内部会话）',
+    // 查询语义 = 会话开始时间；与同步水位的 endTime 不同（水位用 endTime 是因为导出按 endTime 过滤）。
+    timeColumn: { name: 'startTime', kind: 'epoch-ms' },
   },
   // —— D：知识库表批次（迁移 v8 建；设计稿 §10.5 实测字段普查，spec §5.4）——
   // knowledge_items 是**全部机器人的并集**（robot.data.knowledge 企业级全量），
@@ -233,25 +329,33 @@ export const TABLES: TableDef[] = [
   {
     name: 'knowledge_items',
     columns: [col('id', 'VARCHAR', false), col('robot_id', 'VARCHAR', false),
-      col('robot_name', 'VARCHAR'), col('type', 'INTEGER'), col('group_id', 'VARCHAR', false),
+      col('robot_name', 'VARCHAR'),
+      // 设计稿 §10.5 实测：1 = 知识点（标准问）、10 = 相似问（answer 恒空）。
+      colMeta('type', 'INTEGER', { observed_enum: [1, 10] }),
+      col('group_id', 'VARCHAR', false),
       col('ref_id', 'VARCHAR', false), col('point_id', 'VARCHAR'),
-      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }), col('synchronized_at', 'VARCHAR')],
     primaryKey: ['id'],
+    grain: '每个知识库条目一行（含相似问）',
   },
   {
     // kpoint 实测 309/309 全字段存在且**无 robotId 键**（无法从 kpoint 反查机器人归属，
     // 只能经 knowledge_items.point_id 反向推断，§10.5.7）——不建 robot_id 列。
     name: 'knowledge_points',
-    columns: [col('id', 'VARCHAR', false), col('payload', 'VARCHAR'),
+    columns: [col('id', 'VARCHAR', false),
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }),
       col('synchronized_at', 'VARCHAR')],
     primaryKey: ['id'],
+    grain: '每个知识点一行',
   },
   {
     name: 'knowledge_categories',
     columns: [col('robot_id', 'VARCHAR', false), col('category_id', 'VARCHAR', false),
       col('name', 'VARCHAR'), col('parent_id', 'VARCHAR'), col('level', 'INTEGER'),
-      col('payload', 'VARCHAR'), col('synchronized_at', 'VARCHAR')],
+      colMeta('payload', 'VARCHAR', { unit: UNIT_JSON }),
+      col('synchronized_at', 'VARCHAR')],
     primaryKey: ['robot_id', 'category_id'],
+    grain: '每个「机器人 × 分类」一行',
   },
 ]
 

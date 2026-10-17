@@ -68,7 +68,46 @@ describe('TABLES —— 表定义', () => {
   })
 
   it('schema_version.version 是 INTEGER（迁移序号，非 ID 列）', () => {
-    expect(tableByName('schema_version')!.columns[0]).toEqual({ name: 'version', type: 'INTEGER', nullable: false, sensitive: false })
+    // 逐键断言而非整体 toEqual：E 给 ColumnDef 追加了可选元数据键（grain/unit/note/observed_enum），
+    // 整体相等会把「新增可选元数据」误判成列定义变更；语义（名/型/非空/非敏感）逐项保留。
+    const c = tableByName('schema_version')!.columns[0]
+    expect(c.name).toBe('version')
+    expect(c.type).toBe('INTEGER')
+    expect(c.nullable).toBe(false)
+    expect(c.sensitive).toBe(false)
+  })
+})
+
+// —— E 前置：元数据扩展（设计稿 §四）—— 以下断言只读 TS 侧元数据，不碰 DDL/迁移。
+describe('TABLES —— E 元数据扩展', () => {
+  it('每张表都有 grain 声明（E 的 db tables 出口）', () => {
+    for (const t of TABLES) expect(t.grain, t.name).toBeTruthy()
+  })
+  it('timeColumn 只出现在有业务时间列的表上，且 kind 合法', () => {
+    const withTime = TABLES.filter((t) => t.timeColumn).map((t) => t.name).sort()
+    expect(withTime).toEqual(['daily_overview', 'order_performance', 'robot_summary', 'sessions',
+      'staff_attendance', 'staff_quality', 'staff_salary_detail', 'staff_satisfaction',
+      'staff_workload', 'transfer_human'])
+    for (const t of TABLES) {
+      if (t.timeColumn) expect(['iso-day', 'iso-instant', 'epoch-ms']).toContain(t.timeColumn.kind)
+    }
+    expect(tableByName('sessions')!.timeColumn).toEqual({ name: 'startTime', kind: 'epoch-ms' })
+    expect(tableByName('staff_attendance')!.timeColumn).toEqual({ name: 'hour_ts', kind: 'iso-instant' })
+    expect(tableByName('daily_overview')!.timeColumn).toEqual({ name: 'stat_date', kind: 'iso-day' })
+  })
+  it('observed_enum 只出现在有实测出处的列上（不是按名称泛化）', () => {
+    expect(tableByName('sessions')!.columns.find((c) => c.name === 'session_type')!.observed_enum)
+      .toEqual(['robot', 'internal', 'human'])
+    expect(tableByName('sync_state')!.columns.find((c) => c.name === 'range_status')!.observed_enum)
+      .toEqual(['pending', 'complete'])
+    expect(tableByName('knowledge_items')!.columns.find((c) => c.name === 'type')!.observed_enum)
+      .toEqual([1, 10])
+    expect(tableByName('sessions')!.columns.find((c) => c.name === 'userPhone')!.observed_enum)
+      .toBeUndefined()
+  })
+  it('扩展字段不进 DDL（ddlFor 只读 name/type/nullable）', () => {
+    const sql = ddlFor(tableByName('sessions')!)
+    expect(sql).not.toMatch(/grain|observed_enum|note|unit|timeColumn/)
   })
 })
 
