@@ -172,6 +172,14 @@ function typeName(t: number): string {
  *   其余位置则把 `"…"` 当作普通字面量剥掉（列名/别名里的 ANALYZE 不误伤）。
  * 剥不干净的怪输入（未闭合引号/注释、dollar 引号不配对）→ malformed，
  * 由调用方拒绝（fail closed）。
+ *
+ * ⚠️ 两条实测词法事实（复审复现，别改回简化版）：
+ *   1. **行注释的终止符是 `\n` 或 `\r`**：DuckDB 认 `\r`（`EXPLAIN --x\rANALYZE CALL …`
+ *      实测 type=4 且执行内层）。只找 `\n` 会让 `\r` 之后的整段被当成注释丢掉 → 漏判 ANALYZE。
+ *   2. **块注释可嵌套**：实测在块注释里再开一层块注释是合法 SQL（DuckDB 按深度闭合，
+ *      不是「遇到第一个结束标记就收」）；若内层结束后紧跟一个引号，按「第一个结束标记」
+ *      剥会把剩余部分误当字符串字面量 → 漏判 ANALYZE（复审给出的绕过句正是这种形态）。
+ *      必须按深度扫描（开标记 +1、结束标记 −1，深度归零才结束）。
  */
 function stripSqlNoise(sql: string, keepDoubleQuoted: boolean): { skeleton: string; malformed: boolean } {
   let out = ''
@@ -180,20 +188,27 @@ function stripSqlNoise(sql: string, keepDoubleQuoted: boolean): { skeleton: stri
   while (i < n) {
     const ch = sql[i]
     const next = i + 1 < n ? sql[i + 1] : ''
-    // 行注释：-- 到行尾（\n 保留，避免把两行关键字粘成一个词）
+    // 行注释：-- 到 \n 或 \r（实测 DuckDB 两者都终止；\r\n 由先到的 \r 覆盖）
     if (ch === '-' && next === '-') {
-      const nl = sql.indexOf('\n', i + 2)
-      if (nl === -1) break
+      let j = i + 2
+      while (j < n && sql[j] !== '\n' && sql[j] !== '\r') j += 1
+      if (j >= n) break // 注释到输入末尾：后面确实没有内容
       out += '\n'
-      i = nl + 1
+      i = j + 1
       continue
     }
-    // 块注释：/* … */（DuckDB 不嵌套；未闭合 → malformed）
+    // 块注释：/* … */，**按嵌套深度**扫描（实测 DuckDB 支持嵌套；未闭合 → malformed）
     if (ch === '/' && next === '*') {
-      const end = sql.indexOf('*/', i + 2)
-      if (end === -1) return { skeleton: out, malformed: true }
+      let depth = 1
+      let j = i + 2
+      while (j < n && depth > 0) {
+        if (sql[j] === '/' && j + 1 < n && sql[j + 1] === '*') { depth += 1; j += 2; continue }
+        if (sql[j] === '*' && j + 1 < n && sql[j + 1] === '/') { depth -= 1; j += 2; continue }
+        j += 1
+      }
+      if (depth > 0) return { skeleton: out, malformed: true }
       out += ' '
-      i = end + 2
+      i = j
       continue
     }
     // 单引号字符串：'' 为转义

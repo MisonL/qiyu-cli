@@ -309,6 +309,33 @@ describe('EXPLAIN ANALYZE 内层执行绕过（layer1 追加闸门，spec §5.3 
     })
   })
 
+  it('词法边界：-- 由 \\r 终止、块注释可嵌套（复审复现的两条绕过）', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      const variants = [
+        // DuckDB 的行注释在 \r 处同样终止（实测：本语句 type=4 且会执行内层 CALL）
+        'EXPLAIN --x\rANALYZE CALL enable_profiling()',
+        // DuckDB 的块注释可嵌套（实测 `SELECT 1 /* /* */ AS x */` 合法）：
+        // 按「首个 */ 结束」剥会剩下一段被误当字符串，从而漏掉 ANALYZE
+        "EXPLAIN /* /* */ ' */ ANALYZE CALL enable_profiling() -- '",
+        'EXPLAIN --x\r\nANALYZE CALL enable_profiling()',
+      ]
+      for (const sql of variants) {
+        await expectReject(s.run(sql), { kind: 'usage', code: 'sandbox_blocked', match: /ANALYZE/ })
+      }
+      const r = await s.run("SELECT current_setting('enable_profiling') AS v")
+      expect(r.rows[0].v).toBeNull()
+    })
+  })
+
+  it('嵌套块注释里的 ANALYZE 整体剥掉后仍是纯 EXPLAIN（放行）', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      const r = await s.run('EXPLAIN /* /* nested */ ANALYZE */ SELECT 1')
+      expect(r.rows.length).toBeGreaterThan(0)
+    })
+  })
+
   it('纯 EXPLAIN CALL 不执行内层：放行且配置仍为 null', async () => {
     const { path } = await mkDb()
     await withSandbox(path, async (s) => {
