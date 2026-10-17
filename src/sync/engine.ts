@@ -465,10 +465,18 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     // 把 range_status 打成 pending（verify 会把 pending 判成未完成）。
     // 修复批 6 #2：全部窗都是残段（如区间落在单个非日界日内）时，跳过窗仍如实计数
     //（total = skipped，succeeded/failed 0）——「什么都没做」与「做完了」在输出里可分。
+    // 修复批 7 N-1：本路径没有任何成功窗 → resolved_range 与正常路径
+    //（`resolvedEndOut ?? outRange.start`）和轮转汇总（`resolvedEnd ?? start`）同口径，
+    // 收在起点，**不回显未覆盖的请求区间**——全残段 run 报「覆盖整段」会让 Agent 以为
+    // 该段已同步（与 succeeded:0/skipped:total 自相矛盾）。两条子路径：
+    // ① 末端上限之后无可拉数据（rangeStart ≥ limit，批 6 之前唯一可达形态）——outRange
+    //   此时本就退化为 [start, start]（min(end, limit) ≤ limit ≤ start），收口前后等值；
+    // ② 全残段跳过（批 6 新增）——outRange 非退化，必须收口到起点。
     for (const w of skippedResidual) progress(residualNote(task, w))
     return { taskId: task.id,
       windows: { total: skippedResidual.length, succeeded: 0, failed: 0, skipped: skippedResidual.length },
-      rows: { fetched: 0, written: 0 }, resolvedRange: outRange, gaps, status: 'complete' }
+      rows: { fetched: 0, written: 0 },
+      resolvedRange: { start: outRange.start, end: outRange.start }, gaps, status: 'complete' }
   }
 
   // markPending 只翻状态、保留水位（修复轮中-1）：existing 在事务外读出传入；

@@ -1083,6 +1083,52 @@ describe('sync install', () => {
       vi.unstubAllEnvs()
     }
   })
+
+  /** 在任意路径建库并留下成功证据（前置探测要求「库已初始化 + 跑通过」）。 */
+  async function seedAt(path: string): Promise<void> {
+    mkdirSync(dirname(path), { recursive: true })
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    await s.init()
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', '2026-10-14T00:00:00.000Z', { start: 0, end: 1 }, '2026-10-14T10:00:00.000Z')
+    })
+    await s.close()
+  }
+
+  it('修复批 7 N-5：QIYU_DB_PATH 的 ~ 前缀 → 固化为展开后的绝对路径（不含 ~ 原文）', async () => {
+    // HOME 已 stub 到 tmp（beforeEach）；~ 由 resolveStoreConfig 的 expandHome 展开。
+    // 库实际建在展开后的路径上，前置探测与固化值必须是同一个库。
+    const target = join(dir, 'x', 'y.duckdb')
+    await seedAt(target)
+    vi.stubEnv('QIYU_DB_PATH', '~/x/y.duckdb')
+    try {
+      const code = await syncCommand(['install', '--schedule', '*/30 * * * *'])
+      expect(code).toBe(0)
+      const content = (data().entries as Array<{ content: string }>)[0]!.content
+      expect(content).toMatch(new RegExp(`<string>--db</string><string>${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`))
+      // 未展开的原文不得进调度命令
+      expect(content).not.toContain('~/x/y.duckdb')
+      expect(content).not.toMatch(/<string>--db<\/string><string>~/)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('修复批 7 N-5：--yes 路径的 notes 同样含部署事实（不继承 shell 环境 / 不写入任何凭证）', async () => {
+    await seedSynced()
+    vi.stubEnv('QIYU_DB_PATH', dbPath())
+    try {
+      const code = await syncCommand(['install', '--schedule', '*/30 * * * *', '--yes'])
+      expect(code).toBe(0)
+      expect(data().dry_run).toBe(false)
+      const notes = (data().notes as string[]).join('\n')
+      expect(notes).toMatch(/不继承/)
+      expect(notes).toMatch(/不写入任何凭证/)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
 })
 
 describe('sync uninstall', () => {

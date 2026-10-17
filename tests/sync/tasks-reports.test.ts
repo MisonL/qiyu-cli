@@ -572,6 +572,34 @@ describe('报表任务 fetch（http mock）', () => {
     }
   })
 
+  it('修复批 7 N-1：全残段早退不谎报覆盖 —— resolved_range 收在起点（与正常路径同口径）', async () => {
+    // 区间落在单个非日界日内（03:00~06:00）：切片只产出 1 个窗，两端都不是上海日界
+    // → 残段窗全部跳过 → 0 fetch、0 写入。本路径没有任何成功窗，resolved_range
+    // 必须与正常路径（resolvedEndOut ?? start）和轮转汇总（resolvedEnd ?? start）同口径，
+    // 收在起点——回显未覆盖的请求区间会让 Agent 误以为该段已同步。
+    const day0 = shanghaiYesterdayStart(1_700_000_000_000)   // 上海某日 00:00
+    const s0 = day0 + 3 * 3_600_000
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const t = reportById('reports.overview')!
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: s0, end: s0 + 3 * 3_600_000 } }))
+      expect(r.windows).toEqual({ total: 1, succeeded: 0, failed: 0, skipped: 1 })
+      expect(r.rows).toEqual({ fetched: 0, written: 0 })
+      // 无成功窗 → end 收在起点（不回显未覆盖的请求区间 [s0, s0+3h)）
+      expect(r.resolvedRange).toEqual({ start: s0, end: s0 })
+      // 早退不置 pending、不推水位、不落行；状态沿既有语义 complete
+      expect(r.status).toBe('complete')
+      expect((await readWatermark(store, t.id)).watermark).toBeNull()
+      expect(await store.count('daily_overview')).toBe(0)
+      expect(fetchMock).not.toHaveBeenCalled()
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('staff_salary_detail：按 staff 表客服驱动（一次一客服）；staff 表空 → 显式失败', async () => {
     const fetchMock = respondQueue([() => okC({ result: [{ salary: 100 }] })])
     vi.stubGlobal('fetch', fetchMock)
