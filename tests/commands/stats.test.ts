@@ -170,6 +170,27 @@ describe('stats fields', () => {
     expect(declared.normalCount.unit).toBe('count')
   })
 
+  it('字段数超过沙箱行数上限（1000）→ 截断进 warning，不静默', async () => {
+    const s = await fresh()
+    try {
+      // 1005 个字段（远超报表 payload 的实际规模）：观测 SQL 一行 = 一个字段，
+      // 沙箱默认上限 1000 → 必然截断；截断必须如实告知，不能当作完整字段集。
+      const payload: Record<string, number> = {}
+      for (let i = 0; i < 1005; i++) payload[`f${String(i).padStart(4, '0')}`] = i
+      await s.upsert('daily_overview', [{
+        stat_date: '2026-10-01T16:00:00.000Z', payload: JSON.stringify(payload), synchronized_at: null,
+      }])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+
+    expect((data().observed as Observed[]).length).toBe(1000)
+    const warnings = meta().warnings as string[]
+    expect(warnings.join('\n')).toMatch(/1000/)
+    expect(warnings.join('\n')).toMatch(/不完整/)
+  })
+
   it('空表 → observed=[]、unknown_fields=[] + warning；目录声明仍如实给出', async () => {
     const s = await fresh()   // 只建库，不灌任何报表数据
     await s.close()

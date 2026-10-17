@@ -242,6 +242,13 @@ async function statsFields(argv: string[]): Promise<number> {
           + '字段自描述需要 payload 内的 JSON 键；请确认同步写入的是报表原始 JSON')
       }
     }
+    // 观测 SQL 一行 = 一个字段；沙箱默认行数上限 1000，超限会被截断。
+    // 报表 payload 实测几十个键，正常不会触发 —— 但截断不得静默（Agent 会把
+    // 「只看到 1000 个字段」当成事实）。
+    if (result.truncated) {
+      warnings.push('字段数超过单次上限（1000），observed/declared/unknown_fields 只含前 1000 个字段；'
+        + '该表的字段集可能不完整')
+    }
 
     return ok(
       { table, sentinel: SENTINEL, declared: Object.fromEntries(declared), observed, unknown_fields: unknownFields },
