@@ -129,7 +129,7 @@ export function orderTasks(tasks: SyncTask[]): SyncTask[] {
  * fetchZip 生产接线（T10 报告的接线义务）：全局 fetch 拉 ZIP 二进制字节。
  * 修复批 4 #9：**必须有超时** —— 签名 URL 挂起时 `sync run` 会永久挂住、写锁不释放
  *（abort 后引擎记 fetch_failed gap、水位冻结，锁由 finally 清掉）。
- * `AbortSignal.timeout` 是 Node ≥17.3 的内置能力（engines 已声明 ≥20.10）。
+ * `AbortSignal.timeout` 是 Node ≥17.3 的内置能力（engines 已声明 ≥20.12）。
  */
 const DOWNLOAD_TIMEOUT_MS = 120_000
 

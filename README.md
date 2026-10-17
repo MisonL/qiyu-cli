@@ -25,7 +25,8 @@ JSON、用退出码表达该做什么、错误按语义分类、危险操作有�
 
 ## 安装
 
-需要 Node.js ≥ 20.10。
+需要 Node.js ≥ 20.12（会话导出的 zip 解压依赖 `DecompressionStream('deflate-raw')`，
+该格式 Node 20.12 起才被接受；CI 在 20.10 上实测失败后把下限钉在这里）。
 
 ```bash
 # 作为一次性命令运行（推荐）
@@ -262,9 +263,9 @@ npm test                  # 运行测试
 测试覆盖了响应信封归一化、错误分类、签名、脱敏、限频、注册表校验、CLI 契约等。
 所有对外部 API 的调用都用 mock，**测试不联网**。
 
-CI（`.github/workflows/ci.yml`）在 push/PR 到 `main` 时对 Node 20.10（engines 下限）
-与 22（当前 LTS）双版本跑 `npm ci` → `npm run typecheck` → `npm test`；测试并发限制
-来自 `package.json` 的 test 脚本，CI 不另传并发参数。
+CI（`.github/workflows/ci.yml`）在 push/PR 到 `main` 时对 Node 20.12（engines 下限）、
+22（维护期 LTS）与 24（当前 LTS）跑 `npm ci` → `npm run typecheck` → `npm test`；测试并发
+限制来自 `package.json` 的 test 脚本，CI 不另传并发参数。
 
 ### 目录结构
 

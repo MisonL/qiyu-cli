@@ -647,3 +647,50 @@ describe('进度回调', () => {
     await store.close()
   })
 })
+
+describe('整体早于接口下界的区间（CI 实测修正）', () => {
+  it('rangeEnd ≤ floor → 单窗直送守卫：不从 1970 切出数百窗', async () => {
+    const store = await fresh()
+    const now = 1_700_000_000_000
+    const calls: number[] = []
+    const t = fakeTask({
+      // 模拟 tickets.search 的声明面（windowStartFloorDays=31）与 op 守卫
+      //（assertOpWindow：start ≤ 0 抛 usage —— 单窗直送守卫时正是它显式失败）
+      windowStartFloorDays: 31,
+      fetch: async (w) => {
+        calls.push(w.start)
+        if (w.start <= 0) {
+          throw Object.assign(new Error('工单 op 窗口无效'), { kind: 'usage' })
+        }
+        return { rows: [], apiCount: 0 }
+      },
+    })
+    // end 落在下界（now − 31 天）之前 40 天 → 整段不可得
+    const r = await runTask(t, ctx(store, {
+      rangeOverride: { start: 0, end: now - 40 * DAY },
+      clock: () => now,
+    }))
+    // 单窗：不是 702 窗（1970 → end 按 31 天切片的旧行为）
+    expect(r.windows.total).toBe(1)
+    expect(r.windows.failed).toBe(1)
+    expect(calls.length).toBe(1)
+    await store.close()
+  })
+
+  it('rangeEnd > floor（部分可得）→ 仍按切片执行（不误收成单窗）', async () => {
+    const store = await fresh()
+    const now = 1_700_000_000_000
+    const t = fakeTask({
+      windowStartFloorDays: 31,
+      fetch: async () => ({ rows: [], apiCount: 0 }),
+    })
+    const r = await runTask(t, ctx(store, {
+      rangeOverride: { start: 0, end: now - 10 * DAY },
+      clock: () => now,
+    }))
+    // 起点抬到下界（now−31d），窗口数 = ceil(21 天 / 31 天) = 1
+    expect(r.windows.total).toBe(1)
+    expect(r.status).toBe('complete')
+    await store.close()
+  })
+})
