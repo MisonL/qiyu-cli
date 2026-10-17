@@ -456,7 +456,19 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   // 执行集外——runWindowed 与 planRotation 必须同口径（都在切片后过滤）。
   const limit = windowEndLimit(task, now)
   const overlapMs = overlapDaysOf(task)
-  const raw = sliceForTask(task, resolvedRange, task.maxWindowDays)
+  // CI 实测修正（2026-10-17）：请求区间**整体**早于接口下界（rangeEnd ≤ floor）时，
+  // 哨兵起点 0 保持不抬升（floorRangeStart 的既定语义：抬升会把「拿不到的历史」变成
+  // 「0 窗 complete」），但**不得按哨兵起点切窗**——[0, now−40d] 会从 1970 按
+  // maxWindowDays 切出数百窗（702 窗实测），首窗被任务守卫拒绝、其余各发一次无意义
+  // 调用（生产上 opStart 被服务端静默钳到 now−31d，数百窗各拉一遍同一段数据）。
+  // 收成单窗直送守卫：显式失败一次、gap 可见，语义仍是「绝不静默成功」。
+  const floor = task.windowStartFloorDays !== undefined
+    ? now - task.windowStartFloorDays * DAY
+    : null
+  const wholeRangeBelowFloor = floor !== null && rangeStart <= 0 && resolvedRange.end <= floor
+  const raw = wholeRangeBelowFloor
+    ? [resolvedRange]
+    : sliceForTask(task, resolvedRange, task.maxWindowDays)
   const clamped = clampWindowEnd(raw, limit)
   const skippedResidual = clamped.filter((w) => isResidualWindow(task, w))
   const windows = skipContained(

@@ -24,7 +24,7 @@
     "customer-service"
   ],
   "engines": {
-    "node": ">=20.10"
+    "node": ">=20.12"
   },
   "bin": {
     "qiyu": "dist/cli.js"

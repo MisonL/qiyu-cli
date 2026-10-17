@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 // ⚠️ 用 URL 定位 fixture，不用 `import.meta.dirname`（Node ≥ 20.11 才有，
-// 而 engines 是 >=20.10；readFileSync 本就接受 file:// URL）。
+// 而 engines 是 >=20.12；readFileSync 本就接受 file:// URL）。
 // ⚠️ id（pageId）本身已含 `api-` 前缀（见下方 EXPECTED 与任务接口说明），
 // 这里**不能**再拼一个 `api-`，否则变成 `api-api-….md` 找不到文件。
 const pageUrl = (id: string) => new URL(`../fixtures/registry/pages/${id}.md`, import.meta.url)

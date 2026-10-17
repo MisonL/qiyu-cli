@@ -382,3 +382,44 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
     expect(s).toMatch(/不继承你的 shell 环境/)
   })
 })
+
+describe('CI 工作流 —— 承诺的检查必须真的接在 npm 脚本上', () => {
+  it('ci.yml：push/PR 到 main 触发、矩阵覆盖 engines 下限与当前 LTS、三步齐全', () => {
+    const ci = read('.github/workflows/ci.yml')
+    expect(ci).toMatch(/pull_request:/)
+    expect(ci).toMatch(/branches: \[main\]/)
+    // 版本矩阵锚 engines 下限（package.json engines: >=20.12）、维护期 LTS 与当前 LTS
+    expect(ci).toMatch(/'20\.12'/)
+    expect(ci).toMatch(/'22'/)
+    expect(ci).toMatch(/'24'/)
+    // 三步都必须真跑：缺 npm ci 则依赖/构建断裂不可见，缺 typecheck/test 则承诺落空
+    expect(ci).toMatch(/run: npm ci/)
+    expect(ci).toMatch(/run: npm run typecheck/)
+    expect(ci).toMatch(/run: npm test/)
+    // 并发限制复用 package.json 的 test 脚本，CI 不得另传并发参数覆盖它
+    // （注释里说明该约束是允许的；断言只看非注释行）
+    const ciCode = ci.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')
+    expect(ciCode).not.toMatch(/maxWorkers|fileParallelism|--no-file-parallelism/)
+  })
+
+  it('package.json test 脚本自带单进程限制（CI 复用它的前提）', () => {
+    const pkg = JSON.parse(read('package.json')) as { scripts: Record<string, string> }
+    expect(pkg.scripts.test).toMatch(/--maxWorkers=1/)
+    expect(pkg.scripts.test).toMatch(/--no-file-parallelism/)
+    expect(pkg.scripts.typecheck).toMatch(/tsc/)
+  })
+
+  it('engines 下限与 CI 矩阵下限同源（声明的下限必须被真的测到）', () => {
+    const pkg = JSON.parse(read('package.json')) as { engines: { node: string } }
+    const floor = pkg.engines.node.replace(/^>=/, '')
+    const ci = read('.github/workflows/ci.yml')
+    expect(ci).toContain(`'${floor}'`)
+  })
+
+  it('README 开发节与 CHANGELOG [未发布] 写明 CI（文档不说假话）', () => {
+    expect(read('README.md')).toMatch(/\.github\/workflows\/ci\.yml/)
+    const md = read('CHANGELOG.md')
+    const unreleased = /## \[未发布\][\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
+    expect(unreleased).toMatch(/CI（`\.github\/workflows\/ci\.yml`）/)
+  })
+})

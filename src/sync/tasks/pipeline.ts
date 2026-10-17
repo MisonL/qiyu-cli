@@ -228,7 +228,8 @@ function crcTable(): Uint32Array {
 
 /** inflateRaw：zip 的 deflate 流是不带 zlib 头的裸 deflate。 */
 async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
-  // DecompressionStream('deflate-raw') 是 Node ≥17 的内置能力，零依赖。
+  // DecompressionStream('deflate-raw') 自 Node 20.12 起才被接受（20.10/20.11 抛
+  // `format is invalid`，CI 实测确认）——engines 下限即由本能力钉在 >=20.12。
   const ds = new DecompressionStream('deflate-raw')
   const stream = new Blob([data as BlobPart]).stream().pipeThrough(ds)
   const chunks: Uint8Array[] = []
