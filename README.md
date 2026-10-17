@@ -150,10 +150,12 @@ qiyu sync uninstall [--yes]          移除系统调度条目（默认 dry-run�
 ### sync 命令的输出
 
 `sync run` 的 stdout 是 `{tasks:[...], truncated:false}`，每个任务含 `task` / `status`
-（complete/partial/failed）/ `windows` / `rows` / `resolved_range`（Asia/Shanghai 的
-`+08:00` ISO 二元组）/ `watermark` / `last_synced_at` / `gaps` / `notes`。`gaps[].range`
-与 `resolved_range` 同形态（同一套时间解析）；`notes` 是中文说明数组（恒在，常为空），
-例如「请求区间早于接口可得数据的最早边界」——把「区间不可得」与「同步故障」分开。
+（complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped}`，
+`total = succeeded + failed + skipped`，`skipped` 是跳过的残段窗数，见下）/ `rows` /
+`resolved_range`（Asia/Shanghai 的 `+08:00` ISO 二元组）/ `watermark` / `last_synced_at` /
+`gaps` / `notes`。`gaps[].range` 与 `resolved_range` 同形态（同一套时间解析）；
+`notes` 是中文说明数组（恒在，常为空），例如「请求区间早于接口可得数据的最早边界」
+——把「区间不可得」与「同步故障」分开。
 
 **`ok` 与退出码的双轨语义**：`ok:true` 表示「命令已产出结果」，**退出码才是成败的权威
 判据**。全失败（退出码 1）与 `sync verify` 的 drift 非空（退出码 1）时 stdout 仍是
@@ -182,10 +184,20 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区�
 **窗口端点按上海日界对齐**：8 个 `stat_date` 为主键的报表任务（考勤除外）的窗口对齐
 上海自然日 0 点（`windowAlign: 'shanghaiDay'`）——水位续跑（`watermark+1ms`）或任意时刻
 `--since` 产生的「错相位窗」（如 `[今天18:23, 明天18:23)`）只写一行 `stat_date` 却装着
-跨两天聚合、还会把「明天」日的行删掉不重写。对齐后：除被 `--since`/`--until` 钳制的
-首末窗外，每窗恰是一个完整上海自然日，按日增量的「每日概览」日行恒为全天值（非日界的
-首窗是不足一天的残段，其日行以「水位续跑起点落日界 → 该日整体重拉」闭环）。
+跨两天聚合、还会把「明天」日的行删掉不重写。对齐后：每窗恰是一个完整上海自然日，
+按日增量的「每日概览」日行恒为全天值。**显式区间的非日界首末段是残段窗**（如
+`--since 30d` 的首段 `[起点, 次日0点)` 与末段 `[昨天0点, 终点)`、`--full` 起点钳出的
+16 小时段）——引擎**跳过不落库**（半日聚合不写日行，避免覆盖该日的整日聚合值；
+`windows.skipped` 如实计数、每窗一条 stderr 进度行），整日值由下轮日对齐 run 补全
+（水位停在最后一个整日窗末端，续跑起点落回日界）。
 末窗终点被 `--until` 钳制（窗数至多多 1）。
+
+**`sync install` 与调度环境**：调度条目不继承你的 shell 环境——launchd 的用户域不含
+shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，install 会把**解析出的绝对
+路径/名称固化为调度命令的 `--db/--profile/--backend` 参数**（显式 flag 优先；只走配置
+文件或默认值时不固化，调度任务自己读得到 HOME 下的配置文件）。若凭证走
+`QIYU_APP_KEY`/`QIYU_APP_SECRET`，请确认其对该调度上下文可用——调度条目**不写入任何
+凭证**（秘密进 plist/unit 文件是安全红线）。
 
 ## 安全
 

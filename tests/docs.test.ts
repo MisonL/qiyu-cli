@@ -301,13 +301,36 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
   it('批 5 复审 N1-b/N1-c：三处「对齐后每窗恰是整日 / --full 不放大」的不实措辞不得回归', () => {
     // 复审实证：epoch 0 在上海是 1969-12-31 16:00（不是 1970-01-01 0 点），
     // 故 --full 首窗是 16 小时残段、窗数至多 +1；非日界 --since 的首窗也是残段
-    //（其日行靠「水位续跑起点落日界 → 该日整体重拉」闭环，不是靠窗宽）。
+    //（批 6 #2 起残段窗直接跳过不落库，整日值由下轮日对齐 run 补全 —— 见下一条用例）。
     const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
     expect(s).toMatch(/起点 0（= 上海 1969-12-31 16:00）/)
     expect(s).not.toMatch(/起点 0 恰为上海 1970-01-01 0 点/)
     expect(s).not.toMatch(/日对齐不放大窗数/)
     const md = read('README.md')
     expect(md).not.toMatch(/每窗恰是一整个业务日，「每日概览」/)
-    expect(md).toMatch(/非日界的\n?首窗是不足一天的残段/)
+    // 批 6 #2 起措辞升级：残段窗不再「以水位续跑闭环」了事，而是显式跳过不落库
+    expect(md).toMatch(/非日界首末段是残段窗/)
+    expect(md).toMatch(/windows\.skipped/)
+  })
+
+  it('批 6 #2 文档联动：残段窗跳过与 windows.skipped 契约写在 spec §5.2/§七 与 README', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    // §5.2：残段窗跳过 + 水位语义（半日聚合不落库、整日值下轮补全）
+    expect(s).toMatch(/残段窗跳过/)
+    expect(s).toMatch(/跳过不落库/)
+    // §七：windows.skipped 字段契约（total = succeeded + failed + skipped）
+    expect(s).toMatch(/`windows\.skipped`（修复批 6 新增，恒在）/)
+    expect(s).toMatch(/total = succeeded \+ failed \+ skipped/)
+    const md = read('README.md')
+    expect(md).toMatch(/windows.*skipped.*total = succeeded \+ failed \+ skipped/s)
+  })
+
+  it('批 6 #1 文档联动：sync install 的 env 派生固化与「不继承 shell 环境/不写凭证」写明', () => {
+    const md = read('README.md')
+    expect(md).toMatch(/调度条目不继承你的 shell 环境/)
+    expect(md).toMatch(/不写入任何\s*\n?\s*凭证|不写入任何凭证/)
+    expect(md).toMatch(/QIYU_DB_PATH/)
+    const s = read('src/commands/sync.ts')
+    expect(s).toMatch(/不继承你的 shell 环境/)
   })
 })

@@ -59,6 +59,16 @@
   `watermark+1ms` 的错相位窗只写一行 `stat_date` 却拉到跨两天聚合，删除范围会把
   「明天」日的行删掉而不重写，「每日概览」语义每天漂移）；工单（3 天回看重叠、
   任意起点）与考勤（逐行时间戳）不受影响
+- **残段窗跳过（`windows.skipped`）**：日对齐报表任务被显式区间（`--since/--until/--full`）
+  钳出的非日界首末段（如 `--since 30d` 的 `[起点11:15, 次日0点)`）装的是半日聚合值，
+  写 `stat_date` 日行会覆盖该日的整日聚合 → 引擎跳过不 fetch、不写库、不推水位
+  （整日值由下轮日对齐 run 补全）；跳过窗计入 `total` 并标 `skipped`、逐窗 stderr
+  进度行，绝不静默消失
+- **`sync install` 固化 env 派生的存储定位**：存储定位走环境变量（`QIYU_DB_PATH`/
+  `QIYU_PROFILE`/`QIYU_STORE_BACKEND`）时，把解析出的绝对路径/名称写进调度命令的
+  `--db/--profile/--backend`——launchd/schtasks/cron 不继承 shell 环境，此前探测用
+  env 指到的库、调度任务却跑默认库；显式 flag 仍优先，只走配置文件/默认值时不固化。
+  输出 notes 写明「调度条目不继承 shell 环境、不写入任何凭证」的部署事实
 
 ## [0.1.0] - 2026-10-09
 
