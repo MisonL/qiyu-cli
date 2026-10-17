@@ -23,6 +23,9 @@ export type ErrorKind =
   | 'store_locked'
   // 存储层（C1）：库不存在 / 缺表 / 依赖缺失 / 非 DuckDB 文件 / 他人库 —— 退出码 1
   | 'store_not_initialized'
+  // 查询层（E）：只读查询超时（conn.interrupt 生效）—— 退出码 1；
+  // `output.ts` 的 `exitCodeFor` 不设分支，落 default（EXIT.BUSINESS）
+  | 'query_timeout'
 
 export interface QiyuError {
   code: string

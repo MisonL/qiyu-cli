@@ -1,6 +1,6 @@
 // tests/core/errors.test.ts
 import { describe, it, expect } from 'vitest'
-import { classify, redactInternal } from '../../src/core/errors.js'
+import { classify, redactInternal, type ErrorKind } from '../../src/core/errors.js'
 
 describe('错误分类', () => {
   it('14001 鉴权错误不可重试', () => {
@@ -445,5 +445,13 @@ describe('内部信息脱敏', () => {
     const elapsed = Date.now() - t0
     // 上界给得宽松（真实 77ms，阈值 3 秒）—— 只为抓"指数级"回归，不追求精确计时。
     expect(elapsed, `超长 token 脱敏耗时 ${elapsed}ms，疑似正则回溯爆炸`).toBeLessThan(3000)
+  })
+})
+
+describe('ErrorKind 闭集（E 组扩展）', () => {
+  it("'query_timeout' 是合法 kind（只读查询超时，退出码 1）", () => {
+    // 编译期检查：这行赋不进 ErrorKind 就说明联合类型没扩展（E spec §十一）。
+    const k: ErrorKind = 'query_timeout'
+    expect(k).toBe('query_timeout')
   })
 })
