@@ -26,83 +26,18 @@ import { readWatermark } from '../sync/state.js'
 // callPaced 静态导入（范围外发现③）：wireCategories 的注入路径也必须过任务层的限频闸门 ——
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
+import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail } from '../output.js'
 import { thrownToExit } from './store.js'
 import type { Store } from '../store/types.js'
 
-const DAY = 86_400_000
-
-/** 上海固定偏移毫秒（Asia/Shanghai 无夏令时，恒 +08:00 —— 用固定偏移做自然日换算）。 */
-const SHANGHAI_OFFSET_MS = 8 * 3_600_000
-
-const SHANGHAI_DAY = new Intl.DateTimeFormat('en-CA', {
-  timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
-})
-
-/** 毫秒 → 上海时区的 ISO 回显（resolved_range/watermark 的输出形态，spec §九.3）。 */
-function shanghaiIso(ms: number): string {
-  const shifted = new Date(ms + SHANGHAI_OFFSET_MS)
-  // 整秒时省略毫秒段（spec 示例形态 "2026-09-14T00:00:00+08:00"）；带毫秒保留
-  const iso = shifted.toISOString()
-  const msPart = shifted.getUTCMilliseconds()
-  return (msPart === 0 ? iso.replace('.000Z', 'Z') : iso).replace('Z', '+08:00')
-}
-
-/**
- * 时间值 → 上海 ISO（**全命令层统一的时间回显口径**，E 中-2/C-11）。
- * 入参可能是引擎产出的 epoch 毫秒（number 或数字字符串），也可能是已经 ISO 化的
- * 字符串（sync_state.resolved_range_* 的存量值）——数值走上海 ISO，非数值原样回显。
- * gap 的 range 此前直接输出毫秒字符串，与 resolved_range 的 +08:00 ISO 形态不一致，
- * Agent 得按字段各写一套解析——本函数是两侧的同一落点。
- */
-export function msToShanghaiIso(v: string | number): string {
-  const n = typeof v === 'number' ? v : Number(v)
-  return Number.isFinite(n) && String(v).trim() !== '' ? shanghaiIso(n) : String(v)
-}
+// E 起时间助手下沉 core/time（query/ 不得 import sync/，两域同源）；本层保留
+// re-export —— 既有导入点（commands/sync.ts 等）与测试不破。
+export { parseTimeArg, msToShanghaiIso }
 
 /** 引擎产出的毫秒区间 → 上海 ISO 区间数组。 */
 function rangeOut(r: { start: number; end: number }): [string, string] {
   return [shanghaiIso(r.start), shanghaiIso(r.end)]
-}
-
-/** 上海自然日 00:00 → epoch 毫秒（YYYY-MM-DD）。 */
-function shanghaiMidnightUtc(y: number, m: number, d: number): number {
-  return Date.UTC(y, m - 1, d) - SHANGHAI_OFFSET_MS
-}
-
-/** 上海时区的「今天」日期键（YYYY-MM-DD）。 */
-function shanghaiToday(clock: () => number): string {
-  return SHANGHAI_DAY.format(new Date(clock()))
-}
-
-/**
- * 时间参数解析（spec §九.3：相对时间与日期按 Asia/Shanghai 解析，回显 resolved_range）：
- *   · Nd（如 30d）→ 相对时长：end=clock 当前、start=end−N 天（纯时长与时区无关，
- *     按上海自然日切分由引擎窗口逻辑吸收）；
- *   · yesterday → 上海昨天的 00:00（单日窗）；
- *   · YYYY-MM-DD → 上海当天 00:00；
- *   · 其余（完整 ISO 8601）→ Date.parse，NaN 视为用法错误。
- */
-export function parseTimeArg(arg: string, clock: () => number,
-  label: string): { start: number; end: number } | number | null {
-  void label
-  const dur = /^(\d+)d$/.exec(arg)
-  if (dur) {
-    const end = clock()
-    return { start: end - Number(dur[1]) * DAY, end }
-  }
-  if (arg === 'yesterday') {
-    // 上海昨天 00:00 ~ 今天 00:00 的单日窗
-    const today = shanghaiToday(clock)
-    const [ty, tm, td] = today.split('-').map(Number) as [number, number, number]
-    const todayStart = shanghaiMidnightUtc(ty, tm, td)
-    return { start: todayStart - DAY, end: todayStart }
-  }
-  const date = /^(\d{4})-(\d{2})-(\d{2})$/.exec(arg)
-  if (date) return shanghaiMidnightUtc(Number(date[1]), Number(date[2]), Number(date[3]))
-  const full = Date.parse(arg)
-  if (!Number.isNaN(full)) return full
-  return null   // 解析失败 → 调用方 usage
 }
 
 /**
@@ -393,7 +328,7 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     if (rangeOverride !== undefined) {
       for (const t of selected) {
         if (t.windowStartFloorDays === undefined) continue
-        const floor = clock() - t.windowStartFloorDays * DAY
+        const floor = clock() - t.windowStartFloorDays * DAY_MS
         if (rangeOverride.end <= floor) {
           floorNotes.set(t.id, [
             `请求区间结束于 ${shanghaiIso(rangeOverride.end)}，早于该接口可得数据的最早边界 ` +
