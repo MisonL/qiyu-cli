@@ -514,9 +514,12 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
             hint: '请缩小时间范围、加过滤条件，或调大 --timeout',
           })
         }
+        // 裁决 R11：执行期原生错误也挂 cause —— errors.ts 从原文补 OOM 的可操作 hint
+        //（不挂的话「Out of Memory Error → 缩小时间范围」在生产路径永远不触发）。
         throw sandboxError('internal', `查询执行失败：${msg}`, {
           code: 'internal',
           hint: '请检查查询条件；若反复出现请报告此问题',
+          cause: e,
         })
       } finally {
         if (timer !== null) clearTimeout(timer)

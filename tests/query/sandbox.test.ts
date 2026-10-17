@@ -598,6 +598,19 @@ describe('openSandbox 的错误路径', () => {
     })
   })
 
+  it('执行期错误也挂 cause（R11：OOM 的可操作 hint 依赖它）', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      // CAST 失败发生在执行期（prepare 成功）—— 确定性、不依赖内存压力。
+      const e = await expectReject(s.run("SELECT CAST('abc' AS INTEGER) AS n"), {
+        kind: 'internal', code: 'internal',
+      })
+      expect(e.cause, '执行期错误也必须挂原生 Error').toBeInstanceOf(Error)
+      expect((e.cause as Error).message).toMatch(/Conversion Error/i)
+      expect(e.message).toMatch(/^查询执行失败：/)
+    })
+  })
+
   it('Permission 之外的普通错误不被误分类为 sandbox_blocked（收窄后的映射）', async () => {
     // 只有 layer2 的两个签名（file system operations are disabled / Cannot access file）
     // 才归 sandbox_blocked；其它带 "Permission" 字样的原生错误照常走 query_error。
