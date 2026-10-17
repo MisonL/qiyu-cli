@@ -60,8 +60,9 @@ function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
 
 /**
  * 只读命令的库前置检查（ENOENT / 非普通文件 / 权限三分 → 退出码，否则 null）。
- * ⚠️ 与 sync.ts 的私有 statGuard **同款但独立落点**（命令间不互相 import）——
- * 本函数导出给 Task 8/9/10（query/stats）复用，是这一族的单一落点。
+ * ⚠️ 与 sync.ts 的私有 statGuard 同款，但**独立落点**：brief 指定 E 族单一落点
+ * （本函数由 db.ts 导出给 query/stats 复用，避免三份拷贝漂移；不为它抽独立模块，
+ * 两处足够小，YAGNI）。
  * hint 统一指 `qiyu store init`（spec §九）。
  */
 export function statGuard(path: string): number | null {
@@ -155,8 +156,9 @@ async function dbTables(argv: string[]): Promise<number> {
   try {
     // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」；
     // hint 沿 sync.ts openRo 形态：同时指「换 --db 路径」与「qiyu store init」）。
+    // 口径与下方实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
     const sv = await session.run(
-      "SELECT 1 FROM information_schema.tables WHERE table_name='schema_version'")
+      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
     if (sv.rows.length === 0) {
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
@@ -174,8 +176,12 @@ async function dbTables(argv: string[]): Promise<number> {
     const warnings: string[] = []
     const declaredMissing = TABLES.map((t) => t.name).filter((n) => !actualSet.has(n))
     if (declaredMissing.length > 0) {
+      // ⚠️ 不得承诺 store init 一定能修（审查 Important #1）：init 只重放
+      // `version > MAX(version)` 的迁移，已迁移到最新版后被 DROP 的表**不会**被
+      // 重建（迁移已跳过，返回 ok 而表仍缺）——那是「成功但无效」的修复。
       warnings.push(`声明有而库中无：${declaredMissing.join('、')}。`
-        + '这些表不出现在 tables 中（可能建库不完整或库损坏）；可运行 qiyu store init 补齐建表')
+        + '这些表不出现在 tables 中。若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
+        + '若迁移已完成而表被删或损坏，store init 不会重建该表——需重建库或重新同步')
     }
     const undeclared = actualNames.filter((n) => !declaredSet.has(n)).sort()
     if (undeclared.length > 0) {
@@ -227,6 +233,6 @@ export async function dbCommand(argv: string[]): Promise<number> {
   if (sub !== 'tables' && sub !== 'describe') {
     return usageFail(`未知子命令：${sub}\n可用子命令：tables、describe`)
   }
-  if (sub === 'describe') return usageFail('db describe 尚未实现')
+  if (sub === 'describe') return usageFail('db describe 尚未实现（见 qiyu db --help；将在后续版本提供）')
   return dbTables(rest)
 }

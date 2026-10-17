@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { dbCommand } from '../../src/commands/db.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
-import { TABLES } from '../../src/store/schema.js'
+import { TABLES, MIGRATIONS } from '../../src/store/schema.js'
 import type { Store } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/sync.test.ts 同款放宽）。
@@ -92,8 +92,10 @@ describe('db tables', () => {
       // rows 必须是真实数字（BIGINT 经 JSON 层是字符串，命令层必须 Number() 收敛）
       expect(typeof t.rows, t.name).toBe('number')
       expect(t.grain, t.name).toBeTruthy()
+      // 表条目恰好五个键（契约形态，多/少键都是 Agent 契约变更）
+      expect(Object.keys(t).sort(), t.name)
+        .toEqual(['grain', 'name', 'pii_columns', 'rows', 'time_range'])
       expect(Array.isArray(t.pii_columns), t.name).toBe(true)
-      expect('time_range' in t, t.name).toBe(true)
     }
 
     const sessions = tables.find((t) => t.name === 'sessions')!
@@ -104,7 +106,7 @@ describe('db tables', () => {
 
     // 无时间列、无 PII 列的表：time_range null、pii_columns []
     const sv = tables.find((t) => t.name === 'schema_version')!
-    expect(sv.rows).toBe(9)   // 迁移 1–9 各一行
+    expect(sv.rows).toBe(MIGRATIONS.length)   // 每个迁移版本一行（不硬编码 9，下个迁移不会误红）
     expect(sv.grain).toBe('迁移版本记录（每版本一行）')
     expect(sv.time_range).toBeNull()
     expect(sv.pii_columns).toEqual([])
@@ -157,6 +159,8 @@ describe('db tables', () => {
     expect(text).toMatch(/sessions/)
     expect(text).toMatch(/库中有而声明无/)
     expect(text).toMatch(/rogue_table/)
+    // Important #1：不得承诺 store init 一定能修 —— 迁移已完成时被删的表 init 不会重建
+    expect(text).toMatch(/不会重建/)
   })
 
   it('未知参数 / --pretty / 值位缺失 → usage 退出码 2；--help → 0', async () => {
@@ -172,6 +176,11 @@ describe('db tables', () => {
     out = ''; err = ''
     expect(await dbCommand(['tables', '--db'])).toBe(2)   // 值位守卫
     expect(err).toMatch(/--db 缺少取值/)
+
+    // --help 不吞额外参数：未知参数优先于 help
+    out = ''; err = ''
+    expect(await dbCommand(['tables', '--help', '--bogus'])).toBe(2)
+    expect(err).toMatch(/未知参数/)
 
     out = ''; err = ''
     expect(await dbCommand(['bogus'])).toBe(2)
