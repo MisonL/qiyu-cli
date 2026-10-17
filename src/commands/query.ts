@@ -18,7 +18,7 @@ import { thrownToQueryExit } from '../query/errors.js'
 import { maskQueryRows } from '../query/mask.js'
 import { TABLES } from '../store/schema.js'
 import { statGuard } from './db.js'
-import { ok, usageFail, sanitizeControlChars } from '../output.js'
+import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
 
 const USAGE = `用法：qiyu query <查询方式> [参数]
 
@@ -40,6 +40,19 @@ const KNOWN = new Set(['--help', '-h', '--pretty'])
 
 /** 值位参数（缺值或值以 `--` 开头 → 报缺值，防止把下一个 flag 当取值）。 */
 const VALUE_FLAGS = new Set(['--sql', '--table', '--limit', '--timeout', '--db', '--profile', '--backend'])
+
+/**
+ * 全部已知 flag token（含布尔 flag 与 help/pretty）。
+ * 值位守卫用它区分两件事：「取值恰好是下一个 flag」（真缺值）与
+ * 「取值只是以 `--` 开头」（SQL 的行注释，合法输入）。
+ */
+const FLAG_TOKENS = new Set([...VALUE_FLAGS, '--no-mask', '--help', '-h', '--pretty'])
+
+/**
+ * 超时上界 = Node 定时器的最大延迟（2^31−1 ms）。超过它 setTimeout 会**溢出成 1ms**
+ * 立即触发 —— 用户本想「几乎不限时」却得到「立刻超时」，是静默的语义反转，必须拒绝。
+ */
+const TIMEOUT_MAX_MS = 2_147_483_647
 
 /**
  * 0 行警告的触发正则（spec §十）：SQL 文本命中任一业务时间列名即认为这是一次
@@ -64,9 +77,14 @@ function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
     const a = argv[i]
     if (VALUE_FLAGS.has(a)) {
       const v = argv[i + 1]
-      // 值位守卫（沿 store.ts / db.ts）：值位缺失或以 -- 开头 → 报缺值，
+      // 值位守卫（沿 store.ts / db.ts）：值位缺失，或取值**恰好是已知 flag** → 报缺值，
       // 否则 `query --sql --limit 2` 会把 --limit 当成 SQL 文本。
-      if (v === undefined || v.startsWith('--')) throw new Error(`${a} 缺少取值`)
+      // ⚠️ `--sql` 只拒绝「恰好是已知 flag」的值：SQL 以 `--` 开头是合法行注释
+      // （`--sql '-- 注释\nSELECT 1'` 必须能跑）。路径/名字/数字的合法取值不会以 `--`
+      // 开头，所以其余值位参数仍按前缀拒绝。
+      if (v === undefined || (a === '--sql' ? FLAG_TOKENS.has(v) : v.startsWith('--'))) {
+        throw new Error(`${a} 缺少取值`)
+      }
       if (a === '--sql') out.sql = v
       else if (a === '--table') out.table = v
       else if (a === '--limit') out.limit = v
@@ -96,6 +114,7 @@ function parseLimit(raw: string | undefined): number {
  * `--timeout`：非负秒数，0 = 无超时（spec §5.3）。
  * ⚠️ 极小正数（如 0.0001）四舍五入后是 0ms —— 若原样传给沙箱就变成「无超时」，
  * 与用户意图相反；钳到 1ms，保证「给了正数就真的有超时」。
+ * ⚠️ 上界见 `TIMEOUT_MAX_MS`：超过 Node 定时器上限会溢出成立即超时，必须拒绝。
  */
 function parseTimeoutMs(raw: string | undefined): number {
   if (raw === undefined) return 30_000
@@ -104,6 +123,11 @@ function parseTimeoutMs(raw: string | undefined): number {
     throw new Error(`--timeout 必须是非负数（秒，0 = 无超时），收到：${raw}`)
   }
   const ms = Math.round(n * 1000)
+  if (ms > TIMEOUT_MAX_MS) {
+    throw new Error(
+      `--timeout 过大（上限 ${TIMEOUT_MAX_MS / 1000} 秒），收到：${raw}；` +
+      '再大会溢出 Node 定时器、变成立即超时。若想不限时请用 --timeout 0')
+  }
   return n > 0 && ms === 0 ? 1 : ms
 }
 
@@ -121,7 +145,8 @@ export async function queryCommand(argv: string[]): Promise<number> {
 
   let flags: ReturnType<typeof parseFlags>
   try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
-  if (flags.rest.length > 0) return usageFail(`未知参数：${flags.rest.join(' ')}`)
+  // describeArgs：空串/纯空白参数渲染成 `''`/`' '`，不让消息变成「未知参数：」冒号后空白。
+  if (flags.rest.length > 0) return usageFail(`未知参数：${describeArgs(flags.rest)}`)
 
   // —— 查询方式：互斥且至少给一个（spec §六）——
   const { sql, table } = flags
@@ -161,6 +186,23 @@ export async function queryCommand(argv: string[]): Promise<number> {
   } catch (e) { return thrownToQueryExit(e, TABLES) }
 
   try {
+    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
+    // ⚠️ 必须有：合法 DuckDB 但**没有 schema_version** 的库（空库 / 别的工具建的库 /
+    // 迁移没跑完）在沙箱里照样能执行 SQL，于是 `SELECT 1` 会「成功」—— 而 `masked:true`
+    // 的语义建立在本 CLI 的 PII 列集上，对不认识的 schema 这个声明没有依据；
+    // `SELECT * FROM sessions` 更会得到「表不存在，候选：sessions」，把 Agent 引去改 SQL，
+    // 而正确处置是 `qiyu store init`。探测口径与 commands/db.ts 同款（限定 main schema，
+    // 避免同名表在别的 schema 里被误认）。
+    const sv = await session.run(
+      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
+    if (sv.rows.length === 0) {
+      return fail({
+        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
+        message: `数据库结构不完整（缺表）：${config.path}`,
+        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
+      })
+    }
+
     const result = await session.run(sql, { limit, timeoutMs })
     // 脱敏唯一出口（spec §7.2）：列名级 + 值级兜底 + 缺口警告都在 mask.ts 内。
     const masked = maskQueryRows({
