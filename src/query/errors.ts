@@ -9,6 +9,8 @@
 // 三条硬规则：
 //   1. **已带 kind 的错误原样透传** —— 不重新分类。sandbox 的 usage/sandbox_blocked/
 //      query_timeout/store_locked 都是有意分好的，这里再猜一次只会把语义改坏。
+//      唯一例外（裁决 R9）：sandbox 把原生错误挂在 `cause` 上时，kind/code 仍以 sandbox
+//      为准，但「表/列不存在」的中文消息与候选从 cause 原文补算（见 classifyDuckDbError ①）。
 //   2. **不裸透英文**：所有 message 以中文开头，原生原文放在括号/冒号后（spec §十一）。
 //   3. **候选不硬凑**：DuckDB 自己的 `Did you mean "x"` 可能是系统表噪音（探针 15：
 //      未知表时给出 `pg_constraint`）；以 `TABLES` 计算出的候选为先，原生候选只补位。
@@ -38,6 +40,8 @@ interface ClassifiedError {
   code?: string
   hint?: string
   retryable?: boolean
+  /** 原生错误原文（sandbox 在 prepare 期包装时挂上，裁决 R9）。 */
+  cause?: unknown
 }
 
 function asClassified(e: unknown): ClassifiedError | null {
@@ -50,6 +54,7 @@ function asClassified(e: unknown): ClassifiedError | null {
     code: typeof o.code === 'string' ? o.code : undefined,
     hint: typeof o.hint === 'string' ? o.hint : undefined,
     retryable: typeof o.retryable === 'boolean' ? o.retryable : undefined,
+    cause: o.cause,
   }
 }
 
@@ -136,6 +141,36 @@ function candidateHint(candidates: string[]): string {
 const TABLE_NAME_RE = /Catalog Error: Table with name ([^\s]+) does not exist/
 const COLUMN_NAME_RE = /Binder Error: Referenced column "([^"]+)" not found/
 
+/** 表不存在的中文消息 + 候选 hint（原生分支与 cause 补算分支共用，裁决 R9）。 */
+function tableNotFound(msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
+  const name = TABLE_NAME_RE.exec(msg)![1]
+  const candidates = mergeCandidates(
+    // 多要一个：只有知道「还有第 6 个」才能决定 hint 末尾加不加「等」。
+    suggestNames(name, tables.map((t) => t.name), CANDIDATE_LIMIT + 1),
+    nativeCandidates(msg),
+  )
+  return {
+    message: `表 ${name} 不存在`,
+    hint: candidates.length > 0 ? candidateHint(candidates) : '用 `qiyu db tables` 查看可用表',
+  }
+}
+
+/** 列不存在的中文消息 + 候选 hint（候选池 = 全部表的全部列名：SQL 不告诉我们 FROM 哪张表）。 */
+function columnNotFound(msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
+  const name = COLUMN_NAME_RE.exec(msg)![1]
+  const allColumns = [...new Set(tables.flatMap((t) => t.columns.map((c) => c.name)))]
+  const candidates = mergeCandidates(
+    suggestNames(name, allColumns, CANDIDATE_LIMIT + 1),
+    nativeCandidates(msg),
+  )
+  return {
+    message: `列 ${name} 不存在`,
+    hint: candidates.length > 0
+      ? candidateHint(candidates)
+      : '用 `qiyu db describe <表>` 查看列清单',
+  }
+}
+
 /**
  * 原生错误 → QueryFailure（spec §十一 分派表）。
  *
@@ -145,6 +180,10 @@ const COLUMN_NAME_RE = /Binder Error: Referenced column "([^"]+)" not found/
  */
 export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): QueryFailure {
   // ① 已分类错误原样透传（sandbox 的分工：它分类，这里不重新分类）。
+  // ⚠️ 唯一例外（裁决 R9）：sandbox 在 prepare 期把原生 Catalog/Binder 错误包成
+  // `usage`/`query_error` 并把原文挂在 `cause` 上 —— kind/code 仍以 sandbox 为准，
+  // 但「表/列不存在」的中文消息与候选要从 cause 原文补算，否则候选永远算不出来
+  //（Task 8 验收「未知表 → 候选」）。cause 无关时一律不动，message 保持 sandbox 原文。
   const classified = asClassified(e)
   if (classified) {
     const f: QueryFailure = {
@@ -154,6 +193,18 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
       message: classified.message,
     }
     if (classified.hint !== undefined) f.hint = classified.hint
+    if (classified.cause !== undefined && classified.cause !== null) {
+      const causeMsg = errorText(classified.cause)
+      if (TABLE_NAME_RE.test(causeMsg)) {
+        const { message, hint } = tableNotFound(causeMsg, tables)
+        f.message = message
+        f.hint = hint
+      } else if (COLUMN_NAME_RE.test(causeMsg)) {
+        const { message, hint } = columnNotFound(causeMsg, tables)
+        f.message = message
+        f.hint = hint
+      }
+    }
     return f
   }
 
@@ -168,37 +219,13 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
   }
 
   // ③ 表不存在：spec §十一 行 5。
-  const table = TABLE_NAME_RE.exec(msg)
-  if (table) {
-    const name = table[1]
-    const candidates = mergeCandidates(
-      // 多要一个：只有知道「还有第 6 个」才能决定 hint 末尾加不加「等」。
-      suggestNames(name, tables.map((t) => t.name), CANDIDATE_LIMIT + 1),
-      nativeCandidates(msg),
-    )
-    return {
-      kind: 'usage', code: 'query_error', retryable: false,
-      message: `表 ${name} 不存在`,
-      hint: candidates.length > 0 ? candidateHint(candidates) : '用 `qiyu db tables` 查看可用表',
-    }
+  if (TABLE_NAME_RE.test(msg)) {
+    return { kind: 'usage', code: 'query_error', retryable: false, ...tableNotFound(msg, tables) }
   }
 
-  // ④ 列不存在：spec §十一 行 5。候选池是**全部表的全部列名**（SQL 不告诉我们 FROM 哪张表）。
-  const column = COLUMN_NAME_RE.exec(msg)
-  if (column) {
-    const name = column[1]
-    const allColumns = [...new Set(tables.flatMap((t) => t.columns.map((c) => c.name)))]
-    const candidates = mergeCandidates(
-      suggestNames(name, allColumns, CANDIDATE_LIMIT + 1),
-      nativeCandidates(msg),
-    )
-    return {
-      kind: 'usage', code: 'query_error', retryable: false,
-      message: `列 ${name} 不存在`,
-      hint: candidates.length > 0
-        ? candidateHint(candidates)
-        : '用 `qiyu db describe <表>` 查看列清单',
-    }
+  // ④ 列不存在：spec §十一 行 5。
+  if (COLUMN_NAME_RE.test(msg)) {
+    return { kind: 'usage', code: 'query_error', retryable: false, ...columnNotFound(msg, tables) }
   }
 
   // ⑤ SQL 语法错：spec §十一 行 6 —— 中文包装 + 底层原文（原文自带位置信息，保留全部行）。
@@ -243,9 +270,10 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
  * （与 `output.usageFail` 同一契约）。但 `usageFail` 把 code 固定成 `'usage'`，会丢掉
  * spec §十一 分派表的 code 列（`query_error` / `sandbox_blocked`）——而命令层测试
  * （plan Task 8「多语句 / COPY / ATTACH → sandbox_blocked」）正是按 code 断言的。
+ * ⚠️ **这是有意偏离 `usageFail`，不是遗漏**（controller 裁决 R9 concern #2 确认保留）：
  * 故这里复刻 usageFail 的 stderr 写法，stdout 交给 `fail()` 保留真实 code；`fail()`
  * 对 kind='usage' 同样返回退出码 2。其余 kind 直接 `fail({...})`（退出码 1；
- * `query_timeout` 不设特殊分支）。
+ * `query_timeout` 不设特殊分支）。若将来 `output.usageFail` 支持自定义 code，可改回复用它。
  */
 export function thrownToQueryExit(e: unknown, tables: readonly TableDef[]): number {
   const f = classifyDuckDbError(e, tables)

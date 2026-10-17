@@ -193,6 +193,53 @@ describe('已分类错误原样透传（sandbox 抛出的 kind/code/hint/retryab
   })
 })
 
+// 裁决 R9：sandbox 在 prepare 期把原生错误包成 usage/query_error 并挂到 `cause` ——
+// kind/code 以 sandbox 为准，message/hint 从 cause 原文补算（否则候选永远算不出来）。
+describe('sandbox 包装错误：cause 带原生表/列错误时补算中文消息与候选', () => {
+  const native = (text: string): Error => new Error(text)
+
+  it('表不存在：kind/code 保持 sandbox 的 usage/query_error，message/hint 来自 cause', () => {
+    const cause = native(
+      'Catalog Error: Table with name sessons does not exist!\nDid you mean "sessions"?',
+    )
+    const e = Object.assign(
+      new Error('SQL 无法执行：Catalog Error: Table with name sessons does not exist!'),
+      { kind: 'usage', code: 'query_error', retryable: false, cause },
+    )
+    const f = classifyDuckDbError(e, TABLES)
+    expect(f.kind).toBe('usage')
+    expect(f.code).toBe('query_error')
+    expect(f.message).toBe('表 sessons 不存在')
+    expect(f.hint).toBe('候选：sessions')
+  })
+
+  it('列不存在：同理，候选来自 cause 的 Candidate bindings ∪ TABLES 列名', () => {
+    const cause = native(
+      'Binder Error: Referenced column "paylod" not found in FROM clause!\n' +
+      'Candidate bindings: "payload", "session_id"',
+    )
+    const e = Object.assign(
+      new Error('SQL 无法执行：Binder Error: Referenced column "paylod" not found in FROM clause!'),
+      { kind: 'usage', code: 'query_error', cause },
+    )
+    const f = classifyDuckDbError(e, TABLES)
+    expect(f.kind).toBe('usage')
+    expect(f.code).toBe('query_error')
+    expect(f.message).toBe('列 paylod 不存在')
+    expect(f.hint).toBe('候选：payload、session_id')
+  })
+
+  it('cause 是无关错误（如 INTERRUPT）→ message 保持 sandbox 原文不变', () => {
+    const e = Object.assign(new Error('查询执行失败：查询被中断'), {
+      kind: 'usage', code: 'query_error', hint: 'sandbox 给的 hint', cause: native('INTERRUPT Error: query interrupted'),
+    })
+    expect(classifyDuckDbError(e, TABLES)).toEqual({
+      kind: 'usage', code: 'query_error', retryable: false,
+      message: '查询执行失败：查询被中断', hint: 'sandbox 给的 hint',
+    })
+  })
+})
+
 describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码 1', () => {
   let out = ''
   let err = ''
