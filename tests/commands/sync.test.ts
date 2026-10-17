@@ -138,7 +138,7 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
       const t = tasks[0]!
       expect(t.task).toBe('dim.staff')
       expect(t.status).toBe('complete')
-      expect(t.windows).toEqual({ total: 1, succeeded: 1, failed: 0 })
+      expect(t.windows).toEqual({ total: 1, succeeded: 1, failed: 0, skipped: 0 })
       expect(t.rows).toEqual({ fetched: 2, written: 2 })
       expect(t.gaps).toEqual([])
       // resolved_range 是 ISO 数组（快照任务 full 跑 = [epoch? --full 起点, now]）
@@ -192,7 +192,7 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
       expect(code).toBe(0)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('partial')
-      expect(t.windows).toEqual({ total: 2, succeeded: 1, failed: 1 })
+      expect(t.windows).toEqual({ total: 2, succeeded: 1, failed: 1, skipped: 0 })
       const gaps = t.gaps as Array<Record<string, unknown>>
       expect(gaps.length).toBe(1)
       expect(gaps[0]!.reason).toBe('fetch_failed')
@@ -219,7 +219,7 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
       expect(code).toBe(1)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('partial')     // 引擎层语义不变
-      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
+      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })
     } finally {
       vi.unstubAllGlobals()
     }
@@ -488,7 +488,7 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
       expect(fetchMock.mock.calls.length).toBe(3)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('partial')
-      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
+      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })
       expect((t.gaps as Array<{ detail: string }>)[0]!.detail).toMatch(/zip/i)
     } finally {
       vi.unstubAllGlobals()
@@ -519,7 +519,7 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
       expect(code).toBe(1)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('partial')
-      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
+      expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })
       // 中文可读消息（超时不再是一个裸英文 AbortError）
       expect((t.gaps as Array<{ detail: string }>)[0]!.detail).toMatch(/下载超时/)
       // 生产接线真的带上了超时 signal（mock 忽略它，但参数必须存在 —— 否则
@@ -1009,6 +1009,79 @@ describe('sync install', () => {
     const bare = (data().entries as Array<{ content: string }>)[0]!.content
     expect(bare).not.toMatch(/<string>--db<\/string>/)
     expect(bare).toMatch(/<string>sync<\/string><string>run<\/string><\/array>/)
+  })
+
+  it('修复批 6 #1：存储定位走 env（QIYU_DB_PATH）→ 解析出的绝对路径固化为调度命令的 --db', async () => {
+    // 用户不传 --db、shell 里有 QIYU_DB_PATH：前置探测用 env 指到的库，launchd/schtasks
+    // 不继承 shell 环境变量 —— 调度命令必须把解析结果固化成 --db，否则调度任务跑默认库。
+    await seedSynced()
+    vi.stubEnv('QIYU_DB_PATH', dbPath())
+    try {
+      const code = await syncCommand(['install', '--schedule', '*/30 * * * *'])
+      expect(code).toBe(0)
+      const content = (data().entries as Array<{ content: string }>)[0]!.content
+      expect(content).toMatch(new RegExp(`<string>--db</string><string>${dbPath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`))
+      // notes 有「不继承 shell 环境」的部署事实说明（凭证不写入条目）
+      const notes = (data().notes as string[]).join('\n')
+      expect(notes).toMatch(/不继承/)
+      expect(notes).toMatch(/不写入任何凭证/)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('修复批 6 #1：显式 --db 优先于 env（不重复、不冲突）；两者都没给时不追加（批 4 既定）', async () => {
+    await seedSynced()
+    vi.stubEnv('QIYU_DB_PATH', '/should-not-appear.db')
+    try {
+      // 显式 flag 与 env 并存：flag 赢（resolveStoreConfig 的 flags > env），env 值不出现
+      const code = await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])
+      expect(code).toBe(0)
+      const content = (data().entries as Array<{ content: string }>)[0]!.content
+      expect(content).toMatch(new RegExp(`<string>--db</string><string>${dbPath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`))
+      expect(content).not.toMatch(/should-not-appear/)
+      // --db 只出现一次
+      expect(content.match(/<string>--db<\/string>/g)?.length).toBe(1)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+    out = ''
+    // 两者都没给：不追加（默认值固化会引入漂移 —— 批 4 的既定裁定，env 缺席时不改）
+    vi.stubEnv('HOME', dir)   // unstubAllEnvs 会清掉 HOME，重装
+    await fresh().then((s) => s.close())
+    const cfgDir = join(dir, '.config', 'qiyu')
+    mkdirSync(cfgDir, { recursive: true })
+    writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
+      profiles: { default: { store: { path: dbPath() } } },
+    }))
+    const code2 = await syncCommand(['install', '--schedule', '*/30 * * * *'])
+    expect(code2).toBe(0)
+    const bare = (data().entries as Array<{ content: string }>)[0]!.content
+    expect(bare).not.toMatch(/<string>--db<\/string>/)
+  })
+
+  it('修复批 6 #1：QIYU_PROFILE / QIYU_STORE_BACKEND 派生 → 固化 --profile/--backend（flag 未给时）', async () => {
+    await seedSynced()
+    vi.stubEnv('QIYU_DB_PATH', dbPath())
+    vi.stubEnv('QIYU_PROFILE', 'work')
+    vi.stubEnv('QIYU_STORE_BACKEND', 'duckdb')
+    try {
+      const code = await syncCommand(['install', '--schedule', '*/30 * * * *'])
+      expect(code).toBe(0)
+      const content = (data().entries as Array<{ content: string }>)[0]!.content
+      expect(content).toMatch(/<string>--db<\/string>/)
+      expect(content).toMatch(/<string>--profile<\/string><string>work<\/string>/)
+      expect(content).toMatch(/<string>--backend<\/string><string>duckdb<\/string>/)
+      // 显式 flag 同名时固化不发生（flag 原样透传，env 值不叠加）
+      out = ''
+      const code2 = await syncCommand(['install', '--schedule', '*/30 * * * *', '--profile', 'explicit-p'])
+      expect(code2).toBe(0)
+      const c2 = (data().entries as Array<{ content: string }>)[0]!.content
+      expect(c2).toMatch(/<string>--profile<\/string><string>explicit-p<\/string>/)
+      expect(c2).not.toMatch(/<string>work<\/string>/)
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 })
 

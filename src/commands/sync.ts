@@ -365,6 +365,45 @@ const RATELIMIT_PREFIX = '__ratelimit__:'
 const STORE_FLAGS = ['--db', '--profile', '--backend'] as const
 
 /**
+ * 调度条目的存储定位参数（修复批 4 #4 + 批 6 #1）。
+ * 两条来源、一个顺序（flag 在前、env 固化在后；同一 flag 不重复）：
+ *   ① 用户**显式给出**的 flag（`--db/--profile/--backend`）原样透传 —— 批 4 的既定路径；
+ *   ② **env 派生**的存储定位：用户没给对应 flag、但 `QIYU_DB_PATH` / `QIYU_PROFILE` /
+ *      `QIYU_STORE_BACKEND` 有值 —— 把**解析结果**（绝对路径 / profile 名 / backend 名）
+ *      固化为稳定参数。原因：launchd/schtasks/cron 的调度上下文**不继承**你的 shell
+ *      环境变量，前置探测用 env 指到的库、调度任务却跑默认库 —— 探测通过而同步打偏。
+ *      这里只固化「env 派生」：配置文件 store.path（HOME 下，调度任务自己读得到）与
+ *      内置默认值**不固化**（批 4 裁定：默认值固化会引入漂移）。
+ * 实现约束：**不读配置文件内容来生成参数**（配置路径不固化，调度任务自己会读它）；
+ * env 已给但解析失败/为空时由 resolveConfig 在更早处抛 usage，不会走到这里。
+ * 同一 flag 只在 flag 缺席时才补 env 派生值 —— 显式 flag 永远优先（与 resolveStoreConfig
+ * 的 flags > env 优先级一致），不会出现两个 --db。
+ */
+function storeArgsFor(parsed: ParsedFlags, resolved: { path: string; backend: string }): string[] {
+  const args: string[] = []
+  const push = (flag: string, value: string): void => { args.push(flag, value) }
+  // ① 显式 flag 原样透传（批 4 #4）
+  for (const f of STORE_FLAGS) {
+    const v = parsed.values[f]
+    if (v !== undefined) push(f, v)
+  }
+  // ② env 派生 → 固化解析结果（仅当对应 flag 未给）
+  if (parsed.values['--db'] === undefined && process.env.QIYU_DB_PATH !== undefined) {
+    // 固化的是 resolveStoreConfig 解析后的**绝对路径**（env 的相对路径/`~` 已展开）——
+    // 调度任务的 cwd 与 HOME 都可能不同，相对路径会指向别处。
+    push('--db', resolved.path)
+  }
+  if (parsed.values['--profile'] === undefined && process.env.QIYU_PROFILE !== undefined) {
+    push('--profile', process.env.QIYU_PROFILE)
+  }
+  if (parsed.values['--backend'] === undefined && process.env.QIYU_STORE_BACKEND !== undefined) {
+    // backend 当前唯一合法值 duckdb（resolveStoreConfig 已校验），固化解析结果而非原始 env 值。
+    push('--backend', resolved.backend)
+  }
+  return args
+}
+
+/**
  * install 前置探测（E 高-1）：库已初始化（statGuard + schema_version）**且存在真实成功证据**。
  * ⚠️ 判据是 `range_status='complete'` 或 `last_synced_at` 非空 —— 不是「sync_state 里有行」：
  * 引擎在**任何窗口执行之前**就 markPending 落行（runWindowed/planRotation/runSnapshot），
@@ -421,9 +460,10 @@ async function syncInstall(argv: string[]): Promise<number> {
   // 前置探测（dry-run 与 --yes 都查：dry-run 应当预测成功）
   let config: Parameters<typeof openStore>[0]
   let path: string
+  let backend: string
   try {
     const r = resolveConfig({ db: parsed.values['--db'], profile: parsed.values['--profile'], backend: parsed.values['--backend'] })
-    config = r.config; path = r.path
+    config = r.config; path = r.path; backend = r.backend
   } catch (e) { return usageFail((e as Error).message) }
   const probe = await probeSynced(config, path)
   if (probe !== null) return probe
@@ -435,19 +475,24 @@ async function syncInstall(argv: string[]): Promise<number> {
     plan = planInstall(platform, schedule, {
       home: homedir(),
       exec: entry ? [process.execPath, entry] : ['qiyu'],
-      // 修复批 4 #4：用户显式给出的存储定位参数必须进调度命令 —— 上面的前置探测
-      // 用的是同一个库，调度命令跑默认库会让「探测通过」与「实际同步」指向两个库。
-      // 只透传显式给出者（不给默认值：默认路径的解析留给运行时，避免默认值漂移）。
-      storeArgs: STORE_FLAGS.flatMap((f) => (parsed.values[f] === undefined ? [] : [f, parsed.values[f]!])),
+      // 修复批 4 #4 + 批 6 #1：调度命令与前置探测必须是**同一个库** —— 显式 flag 原样
+      // 透传（批 4）；env 派生的存储定位把解析结果固化为稳定参数（批 6，launchd/schtasks
+      // 不继承 shell 环境变量，env 派生不固化会让调度任务跑默认库）。配置文件 store.path
+      // 与内置默认值仍不固化（调度任务读得到 HOME 下的配置文件；默认值固化会引入漂移）。
+      storeArgs: storeArgsFor(parsed, { path, backend }),
     })
   } catch (e) { return usageFail((e as Error).message) }
+
+  // 部署事实（批 6 #1 连带，写进 dry-run 与 --yes 两路输出）：调度条目不继承 shell 环境。
+  const envNote = '调度条目不继承你的 shell 环境：若凭证走 QIYU_APP_KEY / QIYU_APP_SECRET，'
+    + '请确认其对该调度上下文可用（launchd 的用户域不含 shell rc 变量）——本条目不写入任何凭证。'
 
   if (!yes) {
     return ok({
       platform, schedule, dry_run: true,
       entries: plan.entries,
       commands: plan.commands.map((c) => ({ command: commandText(c), executed: false, ok: null, error: null })),
-      notes: [...plan.notes, '这是 dry-run：未写入任何文件、未执行任何命令。加 --yes 实际安装。'],
+      notes: [...plan.notes, envNote, '这是 dry-run：未写入任何文件、未执行任何命令。加 --yes 实际安装。'],
     })
   }
 
@@ -469,7 +514,7 @@ async function syncInstall(argv: string[]): Promise<number> {
   }
   const code = ok({
     platform, schedule, dry_run: false,
-    installed, commands: cmdResults, notes: plan.notes,
+    installed, commands: cmdResults, notes: [...plan.notes, envNote],
   })
   return cmdResults.some((c) => !c.ok) ? 1 : code
 }
