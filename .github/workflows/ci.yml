@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20.10 = package.json engines 声明的下限（验证它不虚）；22 = 当前 LTS。
+        node-version: ['20.10', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      # npm ci 会执行 prepare（= npm run build），构建失败在此暴露。
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      # 单进程限制已在 package.json 的 test 脚本里写死（--maxWorkers=1
+      # --no-file-parallelism），CI 直接复用，不要在这里另传并发参数。
+      - run: npm test

@@ -262,6 +262,10 @@ npm test                  # 运行测试
 测试覆盖了响应信封归一化、错误分类、签名、脱敏、限频、注册表校验、CLI 契约等。
 所有对外部 API 的调用都用 mock，**测试不联网**。
 
+CI（`.github/workflows/ci.yml`）在 push/PR 到 `main` 时对 Node 20.10（engines 下限）
+与 22（当前 LTS）双版本跑 `npm ci` → `npm run typecheck` → `npm test`；测试并发限制
+来自 `package.json` 的 test 脚本，CI 不另传并发参数。
+
 ### 目录结构
 
 ```
