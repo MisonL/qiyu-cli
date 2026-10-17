@@ -13,7 +13,13 @@ export type WriteOps = Pick<Store, 'delete' | 'upsert'>
 /** runTask 的结果（spec §七 sync run 输出的任务条目形态）。 */
 export interface TaskRunResult {
   taskId: string
-  windows: { total: number; succeeded: number; failed: number }
+  /**
+   * 窗口计数（修复批 6 #2 起 `skipped` 恒在）：total = succeeded + failed + skipped。
+   * skipped = 残段窗（日对齐任务被显式区间钳出的非日界首/末段）——引擎跳过不 fetch、
+   * 不写库、不推水位（半日聚合不写日行，整日值由下轮日对齐 run 补全），但仍如实计数
+   * 可见，绝不静默消失。
+   */
+  windows: { total: number; succeeded: number; failed: number; skipped: number }
   rows: { fetched: number; written: number }
   resolvedRange: Range
   gaps: GapInfo[]

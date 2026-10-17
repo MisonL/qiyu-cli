@@ -151,31 +151,31 @@ describe('REPORT_TASKS 任务声明', () => {
     expect(byId('reports.staff_attendance')!.windowAlign).toBeUndefined()
   })
 
-  it('修复批 4 #1 + 批 5 #1：多天范围按上海日界切窗（端点是日界，首末钳到 range）', async () => {
+  it('修复批 4 #1 + 批 5 #1 + 批 6 #2：多天范围按上海日界切窗（首末残段窗跳过）', async () => {
     const store = await fresh()
     const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
     vi.stubGlobal('fetch', fetchMock)
     try {
-      // 3 天范围 → overview 按天切片，且 windowAlign 让**端点落在上海日界**：
-      // start=0 是 1970-01-01 08:00（上海 0 点 +8h，非日界）→ 首窗 start 钳到 range.start(0)、
-      // 中间窗整日、末窗 end 钳到 range.end(3d，同样非日界)——多天聚合被标成某一天、
-      // 删除范围与写入行集按日闭环的问题在此被结构性排除。
+      // 3 天范围（start=0 = 上海 1970-01-01 08:00，非日界）→ overview 按天切片：
+      // 首窗 [0, 上海日界) 是 16 小时残段、末窗 [日界, 3d) 是 16 小时残段 ——
+      // 修复批 6 #2 起两段都 skipped（半日聚合不落日行），中间 2 个整日窗照拉。
       const t = reportById('reports.overview')!
       const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 3 * DAY } }))
-      expect(r.windows).toEqual({ total: 4, succeeded: 4, failed: 0 })
+      expect(r.windows).toEqual({ total: 4, succeeded: 2, failed: 0, skipped: 2 })
       const sh0 = shanghaiDayStart(0)   // 上海 1970-01-01 00:00（= -8h）
       const pairs = fetchMock.mock.calls.map((c) => {
         const b = JSON.parse(String((c[1] as { body?: string }).body ?? '{}'))
         return [Number(b.startTime), Number(b.endTime)]
       })
+      // 残段窗没发请求（fetch 调用数 = 整日窗数）
       expect(pairs).toEqual([
-        [0, sh0 + DAY],                     // 首窗：start 钳到 range.start，end = 上海日界
         [sh0 + DAY, sh0 + 2 * DAY],         // 整日
         [sh0 + 2 * DAY, sh0 + 3 * DAY],     // 整日
-        [sh0 + 3 * DAY, 3 * DAY],           // 末窗：start 日界，end 钳到 range.end
       ])
-      // 水位推进到第 3 天末（按天窗口才能每日推进）
-      expect((await readWatermark(store, t.id)).watermark).toBe(new Date(3 * DAY).toISOString())
+      // 水位 = 最后一个成功整日窗的 end（sh0+3d）——末残段窗 [sh0+3d, 3d) 被跳过、
+      // 不推水位（跳过段不算成功窗），下一轮从该日界续跑补全末日整日窗。
+      expect((await readWatermark(store, t.id)).watermark)
+        .toBe(new Date(sh0 + 3 * DAY).toISOString())
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -204,9 +204,10 @@ describe('REPORT_TASKS 任务声明', () => {
     }
   })
 
-  it('修复批 5 #1：非日界起点（18:23）→ 日对齐窗（首窗 [起点, 次日0点)）', async () => {
+  it('修复批 5 #1 + 批 6 #2：非日界起点（18:23）→ 首末残段窗跳过、只拉整日窗', async () => {
     // 水位续跑（watermark+1ms）/ 任意时刻 --since 的典型错相位：起点 18:23。
-    // 日对齐后：首窗 [18:23, 次日 0 点)、第二窗整日、末窗 [日界, 次日 18:23)
+    // 日对齐切片：首窗 [18:23, 次日 0 点)（残段）、中间整日、末窗 [日界, 18:23)（残段）。
+    // 修复批 6 #2 起首末残段窗**跳过**（半日聚合不落 stat_date 日行），只拉整日窗。
     const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
     vi.stubGlobal('fetch', fetchMock)
     try {
@@ -217,22 +218,59 @@ describe('REPORT_TASKS 任务声明', () => {
       const r = await runTask(reportById('reports.overview')!,
         ctx(store, { rangeOverride: { start, end } }))
       expect(r.status).toBe('complete')
+      expect(r.windows).toEqual({ total: 3, succeeded: 1, failed: 0, skipped: 2 })
       const pairs = fetchMock.mock.calls.map((c) => {
         const b = JSON.parse(String((c[1] as { body?: string }).body ?? '{}'))
         return [Number(b.startTime), Number(b.endTime)]
       })
-      // 每段端点都是上海日界（首窗 start 与末窗 end 被钳到 range 两端）
+      // 残段窗没发请求：唯一调用是整日窗，端点都是上海日界
       expect(pairs).toEqual([
-        [start, d + DAY],            // 首窗：[18:23:01, 次日 0 点)
         [d + DAY, d + 2 * DAY],      // 整日
-        [d + 2 * DAY, end],          // 末窗：[日界, 18:23:01)
       ])
-      // 关键回归：旧实现（sliceByMaxWindow）的窗是 [start, start+1d) 的错相位窗，
-      // 删掉「次日」日的行却不重写——日对齐后每窗 start/end 都是日界（首尾钳制除外）
       for (const [s, e] of pairs) {
-        expect(s === start || shanghaiDayStart(s) === s, `窗 start 是日界：${s}`).toBe(true)
-        expect(e === end || shanghaiDayStart(e) === e, `窗 end 是日界：${e}`).toBe(true)
+        expect(shanghaiDayStart(s), `窗 start 是日界：${s}`).toBe(s)
+        expect(shanghaiDayStart(e), `窗 end 是日界：${e}`).toBe(e)
       }
+      // 水位 = 整日窗 end（跳过段不算成功窗；末日整日值由下轮日对齐续跑补全）
+      expect((await readWatermark(store, reportById('reports.overview')!.id)).watermark)
+        .toBe(new Date(d + 2 * DAY).toISOString())
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('修复批 6 #2：--since 30d 形态（起点 11:15）→ 首末残段窗跳过，只拉整日窗、水位停在末整日窗 end', async () => {
+    // 协调者探针实证的形态：--since 30d 的起点是「今天 11:15」（非日界）。
+    // 31 个日对齐切片里 2 个是残段（首 [11:15, 次日0点)、末 [昨天0点, 今天11:15)），
+    // 其余 29 个是整日窗。残段窗跳过：不 fetch、不写库、不删除、不推水位。
+    const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const now = 1_700_000_000_000
+      const todayStart = shanghaiDayStart(now)
+      const start = todayStart - 30 * DAY + 11 * 3_600_000 + 15 * 60_000   // 30 天前 11:15
+      const end = now                                                     // 今天 11:15 前后
+      const t = reportById('reports.overview')!
+      const r = await runTask(t, ctx(store, { rangeOverride: { start, end } }))
+      // 切片：首残段 + 中间整日 + 末残段（起点/终点都不在日界）
+      // 整日窗 = 从 shanghaiDayStart(start)+1d 到 shanghaiDayStart(end) 之间
+      const firstFullDay = shanghaiDayStart(start) + DAY
+      const lastFullDayEnd = shanghaiDayStart(end)
+      const fullDays = (lastFullDayEnd - firstFullDay) / DAY
+      expect(fullDays).toBe(29)
+      expect(r.windows).toEqual({ total: fullDays + 2, succeeded: fullDays, failed: 0, skipped: 2 })
+      // fetch mock 调用数 == 整日数（残段窗没发请求）
+      expect(fetchMock.mock.calls.length).toBe(fullDays)
+      // 每个请求都是整日窗（端点都是上海日界）
+      for (const c of fetchMock.mock.calls) {
+        const b = JSON.parse(String((c[1] as { body?: string }).body ?? '{}'))
+        expect(shanghaiDayStart(Number(b.startTime))).toBe(Number(b.startTime))
+        expect(shanghaiDayStart(Number(b.endTime))).toBe(Number(b.endTime))
+      }
+      // 水位 end = 最后整日窗的 end（末残段不推进水位）
+      expect((await readWatermark(store, t.id)).watermark).toBe(new Date(lastFullDayEnd).toISOString())
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -504,7 +542,7 @@ describe('报表任务 fetch（http mock）', () => {
     }
   })
 
-  it('A 中-2：--full 与增量对同一上海自然日 → 只留一行（日期列与删除范围同口径）', async () => {
+  it('A 中-2（批 6 #2 更新）：同日两段区间 → 整日窗删除范围同口径、残段窗不再落库', async () => {
     // 两个不同的毫秒起点，落在**同一个**上海自然日（+08:00 的 03:00 与 05:00）
     const day0 = shanghaiYesterdayStart(1_700_000_000_000)   // 上海某日 00:00
     const fetchMock = vi.fn((_url: unknown, _init?: unknown) => okC({ sessions: 1 }))
@@ -512,19 +550,22 @@ describe('报表任务 fetch（http mock）', () => {
     try {
       const store = await fresh()
       const t = reportById('reports.overview')!
+      // 批 6 #2：03:00~次日（单日内的两段）切片出的窗两端都不是日界 → 全部残段跳过，
+      // 半日聚合不落库（旧断言 written=1 的行正是被裁定要消除的半日值日行）。
       const r1 = await runTask(t, ctx(store, {
         rangeOverride: { start: day0 + 3 * 3_600_000, end: day0 + 4 * 3_600_000 },
       }))
-      expect(r1.rows.written).toBe(1)
-      // 增量：起点在同一天内偏后 2 小时（水位 +1ms 的真实形态）
+      expect(r1.windows).toEqual({ total: 1, succeeded: 0, failed: 0, skipped: 1 })
+      expect(r1.rows.written).toBe(0)
+      // 增量：起点在同一天内偏后 2 小时（水位 +1ms 的真实形态）—— 同样整窗残段跳过
       const r2 = await runTask(t, ctx(store, {
         rangeOverride: { start: day0 + 5 * 3_600_000, end: day0 + 6 * 3_600_000 },
       }))
       expect(r2.status).toBe('complete')
-      // 天对齐后 stat_date 相同、删除范围覆盖同一行 → 只留一行（毫秒口径会留两行）
+      expect(r2.rows.written).toBe(0)
+      // 半日聚合从未落库 → 表为空（删除范围与写入行集的闭环在此退化为「无行可删」）
       const rows = await store.query('SELECT stat_date FROM daily_overview')
-      expect(rows.rows.length).toBe(1)
-      expect(rows.rows[0].stat_date).toBe(new Date(day0).toISOString())
+      expect(rows.rows.length).toBe(0)
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -598,9 +639,9 @@ describe('按天轮转调度（runRotated）', () => {
       'reports.a', 'reports.b', 'reports.c',   // 第 2 天
     ])
     expect(results.map((r) => r.status)).toEqual(['complete', 'complete', 'complete'])
-    // 每任务 2 窗全提交、水位推进到第 2 天
+    // 每任务 2 窗全提交、水位推进到第 2 天（rotTask 未声明 windowAlign → 残段过滤不生效）
     for (const r of results) {
-      expect(r.windows).toEqual({ total: 2, succeeded: 2, failed: 0 })
+      expect(r.windows).toEqual({ total: 2, succeeded: 2, failed: 0, skipped: 0 })
       expect((await readWatermark(store, r.taskId)).watermark).not.toBeNull()
     }
     expect(await store.count('daily_overview')).toBe(2)
@@ -688,7 +729,7 @@ describe('按天轮转调度（runRotated）', () => {
     })
     const results = await runRotated([t], ctx(store, { rangeOverride: { start: 0, end: 3 * DAY } }))
     expect(results[0].status).toBe('partial')
-    expect(results[0].windows).toEqual({ total: 3, succeeded: 2, failed: 1 })
+    expect(results[0].windows).toEqual({ total: 3, succeeded: 2, failed: 1, skipped: 0 })
     // 水位 = 窗 1 末（1 天），窗 3 成功也不越过失败窗
     expect((await readWatermark(store, 'reports.overview')).watermark)
       .toBe(new Date(DAY).toISOString())
@@ -697,13 +738,13 @@ describe('按天轮转调度（runRotated）', () => {
     await store.close()
   })
 
-  it('修复批 5 #1：轮转路径与单任务同口径 —— windowAlign 任务在 runRotated 上也按日界切窗', async () => {
+  it('修复批 5 #1 + 批 6 #2：轮转路径与单任务同口径 —— 日对齐 + 残段窗跳过', async () => {
     const store = await fresh()
     const gate = { acquire: async () => {} } as unknown as RateGate
     const d0 = shanghaiDayStart(1_700_000_000_000)
     const windows: Array<[number, number]> = []
     // rotTask 缺省不声明 windowAlign；声明后轮转路径必须与 runWindowed 同口径
-    //（两条执行路径共用 sliceForTask，否则语义分叉）
+    //（两条执行路径共用 sliceForTask + isResidualWindow，否则语义分叉）
     const t = rotTask('reports.aligned', {
       windowAlign: 'shanghaiDay',
       fetch: async (w) => {
@@ -712,11 +753,15 @@ describe('按天轮转调度（runRotated）', () => {
       },
     })
     const start = d0 + 2 * DAY + 3_600_000   // 非日界起点（+1h）
-    await runRotated([t], ctx(store, { gate, rangeOverride: { start, end: d0 + 4 * DAY } }))
+    const results = await runRotated([t],
+      ctx(store, { gate, rangeOverride: { start, end: d0 + 4 * DAY } }))
+    // 首窗 [start, 次日0点) 是残段（批 6 #2 跳过），只拉整日窗
     expect(windows).toEqual([
-      [start, d0 + 3 * DAY],        // 首窗钳到 range.start，end 是日界
       [d0 + 3 * DAY, d0 + 4 * DAY], // 整日
     ])
+    expect(results[0].windows).toEqual({ total: 2, succeeded: 1, failed: 0, skipped: 1 })
+    // 水位 = 整日窗 end（跳过段不推进）
+    expect((await readWatermark(store, t.id)).watermark).toBe(new Date(d0 + 4 * DAY).toISOString())
     await store.close()
   })
 

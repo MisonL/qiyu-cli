@@ -265,7 +265,7 @@ describe('单窗失败隔离', () => {
       },
     })
     const r = await runTask(t, { ...ctx(store), rangeOverride: { start: 0, end: 14 * DAY } })
-    expect(r.windows).toEqual({ total: 2, succeeded: 1, failed: 1 })
+    expect(r.windows).toEqual({ total: 2, succeeded: 1, failed: 1, skipped: 0 })
     expect(r.status).toBe('partial')
     expect(r.gaps.length).toBe(1)
     expect((await listGaps(store, t.id)).length).toBe(1)
@@ -370,7 +370,7 @@ describe('限频闸门接线（中-2：慢不是错 + 失败窗不越过水位�
     expect(fetched).toBe(1)             // 等待后真的拉取了
     expect(r.status).toBe('complete')
     expect(r.gaps).toEqual([])
-    expect(r.windows).toEqual({ total: 1, succeeded: 1, failed: 0 })
+    expect(r.windows).toEqual({ total: 1, succeeded: 1, failed: 0, skipped: 0 })
     await store.close()
   })
 
@@ -403,7 +403,7 @@ describe('限频闸门接线（中-2：慢不是错 + 失败窗不越过水位�
       },
     })
     const r = await runTask(t, { ...ctx(store), rangeOverride: { start: 0, end: 21 * DAY } })
-    expect(r.windows).toEqual({ total: 3, succeeded: 2, failed: 1 })
+    expect(r.windows).toEqual({ total: 3, succeeded: 2, failed: 1, skipped: 0 })
     expect(r.status).toBe('partial')
     // 水位 = 最后一个连续成功窗的 end（窗 1），窗 3 成功也不越过失败窗推到窗 3 末
     expect((await readWatermark(store, t.id)).watermark)
@@ -430,7 +430,7 @@ describe('限频闸门接线（中-2：慢不是错 + 失败窗不越过水位�
     })
     const r = await runTask(t, { ...ctx(store), rangeOverride: { start: 0, end: 21 * DAY } })
     expect(r.status).toBe('partial')
-    expect(r.windows).toEqual({ total: 3, succeeded: 2, failed: 1 })
+    expect(r.windows).toEqual({ total: 3, succeeded: 2, failed: 1, skipped: 0 })
     // resolved_range 末端 = 连续成功末端（窗 1 末），与水位一致 —— 不谎报覆盖到本窗末
     expect(r.resolvedRange.end).toBe(7 * DAY)
     expect((await readWatermark(store, t.id)).watermark).toBe(new Date(r.resolvedRange.end).toISOString())
@@ -582,7 +582,7 @@ describe('快照 gap 清除与计数（C 高-1 / E 高-2）', () => {
     })
     const r1 = await runTask(t, ctx(store))
     expect(r1.status).toBe('failed')
-    expect(r1.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })   // E 高-2：与 status 一致
+    expect(r1.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })   // E 高-2：与 status 一致
     expect((await listGaps(store, t.id)).length).toBe(1)
     // 下一轮成功：快照 gap（键 '0'）在同一事务里被清掉
     const r2 = await runTask(t, ctx(store))

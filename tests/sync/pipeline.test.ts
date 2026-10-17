@@ -631,7 +631,7 @@ describe('C-8：尾部标记行（导出窗口声明）与请求窗口核对', (
         `${JSON.stringify(SESSION_ROW)}\n${stale}\n`)
       const r = await runTask(t, ctx(store, { rangeOverride: W }))
       expect(r.status).toBe('partial')
-      expect(r.windows).toEqual({ total: 1, succeeded: 0, failed: 1 })
+      expect(r.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })
       expect(r.gaps.length).toBe(1)
       expect(r.gaps[0]!.reason).toBe('fetch_failed')
       // failDetail 中文包装 + 消息含「格式漂移」与 fixture 原文（原文在 detail 里可见）
@@ -657,7 +657,7 @@ describe('C-8：尾部标记行（导出窗口声明）与请求窗口核对', (
       const t = withContent(sessionsById('sessions.export')!, '')
       const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: DAY } }))
       expect(r.status).toBe('complete')          // gapHint 不把窗口打成失败（提示 ≠ 失败）
-      expect(r.windows).toEqual({ total: 1, succeeded: 1, failed: 0 })
+      expect(r.windows).toEqual({ total: 1, succeeded: 1, failed: 0, skipped: 0 })
       expect(m.mock.calls.length).toBe(4)        // create+check × 2（假空重试）
       expect(r.gaps.length).toBe(1)
       expect(r.gaps[0]!.reason).toBe('export_fixture_unreported')
