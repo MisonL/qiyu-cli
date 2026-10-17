@@ -346,6 +346,33 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
     expect(md).toMatch(/end（水位）与 `skipped` 判断真实覆盖/)
   })
 
+  it('批 8（CodeRabbit 三轮 4 条）：补全承诺是「可能」不是保证 / 自愈矛盾消除 / 整日限定执行窗 / 样本自洽', () => {
+    const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
+    const md = read('README.md')
+    // 三轮 #2（spec:141）与 #1（README:191）：「可能由…补全」+「不保证下一次 run 补上」，
+    // 无条件/含混的「由下轮日对齐 run 补全」与「下一轮自愈」不得回归
+    for (const [name, doc] of [['spec', s], ['README', md]] as const) {
+      expect(doc, `${name}: 补全是可能而非保证`).toMatch(/可能\*?\*?由/)
+      expect(doc, `${name}: 下轮不保证补上须写明`).toMatch(/不保证|仍未覆盖该整天/)
+      expect(doc, `${name}: 前缀不会自动前移`).toMatch(/不会\s*\n?\s*自动前移|不会自动前移/)
+      expect(doc, `${name}: 旧的自愈承诺不得残留`).not.toMatch(/下一轮\s*\n?\s*对齐起点的 run 自愈|下一轮对齐起点的 run 自愈/)
+    }
+    // 三轮 #3（README:187）：「每窗恰是完整上海自然日」必须限定为实际拉取的窗
+    expect(md).toMatch(/实际拉取的每窗恰是一个完整上海/)
+    expect(md).not.toMatch(/对齐后：每窗恰是一个完整上海/)
+    // 三轮 #4（spec:234）：§七 样本与实现自洽 —— total 31 = 29 整日 + 2 残段，
+    // resolved_range.start 含首残段前缀（11:15 非 0 点）、end=watermark=末整日窗 end、rows=succeeded
+    expect(s).toMatch(/"windows": \{ "total": 31, "succeeded": 29, "failed": 0, "skipped": 2 \}/)
+    expect(s).toMatch(/"resolved_range": \["2026-09-14T11:15:00\+08:00", "2026-10-14T00:00:00\+08:00"\]/)
+    expect(s).toMatch(/"watermark": "2026-10-13T16:00:00\.000Z"/)
+    expect(s).toMatch(/"rows": \{ "fetched": 29, "written": 29 \}/)
+    // CHANGELOG 残段窗条目同口径：补全承诺限定为「可能 + 不保证下一次 run」（本轮收口处）
+    const cl = read('CHANGELOG.md')
+    expect(cl).toMatch(/末残段的整日值可能由其请求区间覆盖该整天的日对齐 run 补全/)
+    expect(cl).toMatch(/不保证「下一次 run」/)
+    expect(cl).toMatch(/首残段不补，要覆盖该日请给更宽的 `--since`/)
+  })
+
   it('批 6 #1 文档联动：sync install 的 env 派生固化与「不继承 shell 环境/不写凭证」写明', () => {
     const md = read('README.md')
     expect(md).toMatch(/调度条目不继承你的 shell 环境/)
