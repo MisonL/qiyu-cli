@@ -28,6 +28,13 @@ describe('分层约束（架构不变量）', () => {
       }
     }
   })
+  it('sync/ 不得 import commands/（引擎与任务不知道命令层，spec §十一.15）', () => {
+    for (const f of walk(join(src, 'sync'))) {
+      for (const m of readFileSync(f, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)) {
+        expect(m[1], `${f} → ${m[1]}`).not.toMatch(/\/commands\/|\.\.\/commands/)
+      }
+    }
+  })
   // ⚠️ 第三条规则（Q 组 Q-中-2）：静态 import 扫描拦不住 commands 层的动态 import ——
   // 「auth/api 完全不加载 @duckdb/node-api」是 Global Constraints 红线，用源文本
   // 字面量扫描补上（覆盖 ~95% 风险；进程级断言成本高，不采用）。

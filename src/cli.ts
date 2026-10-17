@@ -5,11 +5,13 @@ import { authCommand } from './commands/auth.js'
 import { fail, usageFail, describeArgs } from './output.js'
 import { apiCommand } from './commands/api.js'
 import { storeCommand } from './commands/store.js'
+import { syncCommand } from './commands/sync.js'
 
 const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   auth: authCommand,
   api: apiCommand,
   store: storeCommand,
+  sync: syncCommand,
 }
 
 /**
@@ -29,6 +31,14 @@ const USAGE = `用法：qiyu <子命令> [参数]
                            初始化本地数据库（DuckDB）
   store status [--db <path>] [--profile <name>] [--backend <name>]
                            查看数据库状态与各表行数
+  sync tasks               列出全部同步任务与不支持的实时快照数据集
+  sync run [任务...]        同步数据进本地库（--full / --since / --until / --quiet）
+  sync status [任务...]     水位、区间状态、缺口与锁（只读；缺省全部任务）
+  sync verify [任务...]     核对本地与远端一致性（快照三方核对；drift 非空退出码 1）
+  sync install --schedule CRON [--yes]
+                           安装系统定时调度（macOS=launchd / linux=systemd user /
+                           win32=schtasks。默认 dry-run；--yes 才写入）
+  sync uninstall [--yes]   移除系统调度条目（默认 dry-run，--yes 才删除）
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的

@@ -7,7 +7,7 @@ JSON、用退出码表达该做什么、错误按语义分类、危险操作有�
 七鱼 API 的 26 种响应信封、3 种分页和一堆静默失败，就能正确调用。
 
 > **本仓库仍在早期**：已实现「认证 + 通用 API 通道」＋ API 参数校验（`api schema`/body 分级校验）＋ 存储基础（见[当前状态](#当前状态)）。
-> 本地数据仓库的同步与查询尚未实现（存储基础已交付，见[当前状态](#当前状态)）。
+> 本地数据仓库的**同步**（`qiyu sync`）已交付，见[当前状态](#当前状态)；**查询**（`qiyu query`）尚未实现。
 
 ## 为什么需要它
 
@@ -39,7 +39,7 @@ git clone https://github.com/MisonL/qiyu-cli.git
 cd qiyu-cli && npm install && npm run build
 ```
 
-> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。
+> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
 
 ## 配置凭证
 
@@ -90,6 +90,14 @@ qiyu store init [--db <path>] [--profile <name>] [--backend <name>]
                                      初始化本地数据库（DuckDB）
 qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
                                      查看数据库状态与各表行数
+qiyu sync tasks                      列出全部同步任务（含敏感列清单）与不支持的数据集
+qiyu sync run [任务...] [--full] [--since T] [--until T] [--quiet]
+                                     同步数据进本地库（缺省全部任务；进度走 stderr）
+qiyu sync status [任务...]           水位、区间状态（resolved_range）、缺口（gaps）、锁
+qiyu sync verify [任务...]           核对本地与远端一致性（drift 非空退出码 1）
+qiyu sync install --schedule CRON [--yes]
+                                     安装系统调度条目（默认 dry-run）
+qiyu sync uninstall [--yes]          移除系统调度条目（默认 dry-run）
 ```
 
 ## 输出契约
@@ -139,6 +147,65 @@ qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
 每张表的名字与行数。`store status` 的每次调用都要对各表做全表 `COUNT`（行数无缓存），
 轮询代价与数据量成正比，Agent 不应把它当作高频健康检查来用。
 
+### sync 命令的输出
+
+`sync run` 的 stdout 是 `{tasks:[...], truncated:false}`，每个任务含 `task` / `status`
+（complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped}`，
+`total = succeeded + failed + skipped`，`skipped` 是跳过的残段窗数，见下）/ `rows` /
+`resolved_range`（Asia/Shanghai 的 `+08:00` ISO 二元组）/ `watermark` / `last_synced_at` /
+`gaps` / `notes`。`gaps[].range` 与 `resolved_range` 同形态（同一套时间解析）；
+`notes` 是中文说明数组（恒在，常为空），例如「请求区间早于接口可得数据的最早边界」
+——把「区间不可得」与「同步故障」分开。
+
+**`ok` 与退出码的双轨语义**：`ok:true` 表示「命令已产出结果」，**退出码才是成败的权威
+判据**。全失败（退出码 1）与 `sync verify` 的 drift 非空（退出码 1）时 stdout 仍是
+`{ok:true,data:...}`——缺口/漂移就是它要报告的内容。请先看退出码，再看 `data`。
+
+`sync status` 每任务输出 `{task, watermark, range_status, last_synced_at, resolved_range,
+gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区间（形态同 run 的
+`resolved_range`），`gaps` 是历史缺口逐条 `{range, reason, detail, recorded_at}`。
+`sync verify` 输出 `{task, local_rows, expected_from_api, state_windows_consistent, drift}`：
+**`expected_from_api` 只对快照任务有意义**（上游 fetch 的行数）；windowed 任务不做上游
+全量重拉，该字段恒为 `null`，核对方式是「本地行数 ↔ sync_state 成功状态」的一致性
+（`state_windows_consistent`）——两种任务的核对方式不同，读 drift 前先看任务 kind。
+`sync tasks` 每任务含 `sensitive_columns`——该表标注为敏感的 PII 列清单（会话/工单的
+`payload` 列在列内，它是整行 PII 的完整副本，不要 `SELECT *`）。本阶段**没有**任务的
+启用/停用机制：注册表里的任务总是全部执行（选定任务靠命令行显式列出）。
+
+**聚合报表按天切片（窗口 1 天）**：九个报表接口返回的是**窗口聚合值**（`overview` 一行
+全局汇总、`staffworklod` 每客服一行、`transferHuman` 恒 1 行），响应里的 `date` 原文是
+"this date has no specific meaning, it only indicates the start time of the current query"
+——多天窗口会把 N 天汇总标成某一天（`daily_overview` 的「每日概览」会读到 31 天累计值）。
+所以窗口上限是 **1 天**（唯一例外：`staff_attendance`/考勤响应逐行带可信小时戳，保持
+31 天窗口、`stat_date` 按该行时间戳推导）。**代价如实写在明处：窗口数 = 天数**，
+`sync run --full` 对报表任务会从 1970 起切出**上万窗**（≈ 56 年 × 每天 1 窗，每窗至少
+一次调用）——首跑与回补历史请用 `--since/--until` 限定区间（如 `--since 30d` = 30 窗/任务）。
+
+**窗口端点按上海日界对齐**：8 个 `stat_date` 为主键的报表任务（考勤除外）的窗口对齐
+上海自然日 0 点（`windowAlign: 'shanghaiDay'`）——水位续跑（`watermark+1ms`）或任意时刻
+`--since` 产生的「错相位窗」（如 `[今天18:23, 明天18:23)`）只写一行 `stat_date` 却装着
+跨两天聚合、还会把「明天」日的行删掉不重写。对齐后：**实际拉取的每窗恰是一个完整上海
+自然日**，按日增量的「每日概览」日行恒为全天值。**显式区间的非日界首末段是残段窗**（如
+`--since 30d` 的首段 `[起点, 次日0点)` 与末段 `[昨天0点, 终点)`、`--full` 起点钳出的
+16 小时段）——引擎**跳过不落库**（半日聚合不写日行，避免覆盖该日的整日聚合值；
+`windows.skipped` 如实计数、每窗一条 stderr 进度行）。**末残段**的整日值**可能**由其
+请求区间覆盖该整天的日对齐 run 补全（水位停在最后一个整日窗末端；若下一轮的请求区间
+仍未覆盖该整天，该段仍是残段、继续跳过——不保证「下一次 run」就补上）；
+**首残段**不落日行也**不补**——该半日段没有合法落点（写入即半日覆盖整日），属显式
+`--since` 的边界语义（`windows.skipped` 与 stderr 进度行如实可见），要覆盖该日请给
+更宽的 `--since`（起点落到该日 0 点或更早；`resolved_range.start` 的前缀不会自动前移）。
+`resolved_range.start` 是**水位起点语义**（含可能被跳过的首残段前缀，≤ 1 天、不会
+自动前移），表内首个整日行可能是 `> start` 的次日——读方按 `resolved_range`
+的 end（水位）与 `skipped` 判断真实覆盖。
+末窗终点被 `--until` 钳制（窗数至多多 1）。
+
+**`sync install` 与调度环境**：调度条目不继承你的 shell 环境——launchd 的用户域不含
+shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，install 会把**解析出的绝对
+路径/名称固化为调度命令的 `--db/--profile/--backend` 参数**（显式 flag 优先；只走配置
+文件或默认值时不固化，调度任务自己读得到 HOME 下的配置文件）。若凭证走
+`QIYU_APP_KEY`/`QIYU_APP_SECRET`，请确认其对该调度上下文可用——调度条目**不写入任何
+凭证**（秘密进 plist/unit 文件是安全红线）。
+
 ## 安全
 
 - **危险操作硬门禁**：标记为 `dangerous` 的接口在缺少 `--yes` 时，**绝不发出任何请求**：body 合法则返回退出码 4，body 缺必填/非对象则**先**报参数错误（退出码 2），并给出 `confirm_required` / `confirm_arg` / `risk` / `target` 四个字段。
@@ -153,8 +220,13 @@ qiyu store status [--db <path>] [--profile <name>] [--backend <name>]
 本仓库实现了设计稿中的**前两个子项目**：认证与通用 API 通道、API 参数校验（`api schema`/body 分级校验）。
 
 **已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
-限频感知（`retry_after`）、本地数据仓库基础——`store init` / `store status`（存储层已交付，
-含 `Store` 抽象、DuckDB 后端、schema 迁移与 `store_locked`/`store_not_initialized` 错误分类）。
+限频感知（`retry_after`）、本地数据仓库——`store init` / `store status`（存储层已交付，
+含 `Store` 抽象、DuckDB 后端、schema 迁移与 `store_locked`/`store_not_initialized` 错误分类）
+与同步引擎——`sync tasks` / `sync run` / `sync status` / `sync verify` / `sync install` / `sync uninstall`
+（21 个任务覆盖维度/报表/工单/会话/知识库数据集；增量水位、断点续跑、缺口记录、本地限频冷却持久化、
+跨平台调度安装；会话导出走 create→poll→download→unzip→parse 流水线）。
+`sync install` 的安装前置是**至少成功同步过一次**（sync_state 有 `range_status=complete`
+或 `last_synced_at` 非空的行——全败的 run 只留 pending，不算跑通）。
 
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
@@ -167,7 +239,7 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 
 - `auth login`（配置文件写入）——目前只支持环境变量；
 - `--pretty`（人类可读输出）——目前只输出紧凑 JSON；
-- 本地数据仓库的**同步**（`qiyu sync`）与**查询**（`qiyu query`）——存储基础（初始化/状态查看两条命令）已可用，见「当前状态」；
+- 本地数据仓库的**查询**（`qiyu query`）——存储与同步（`store init/status`、`sync` 六个子命令）已可用，见「当前状态」；
 
 `api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
@@ -196,8 +268,10 @@ npm test                  # 运行测试
 src/
   cli.ts                入口与顶层分派
   output.ts             输出契约（ok / fail / usageFail，退出码）
-  commands/             子命令（auth / api / store）
   store/                存储抽象（src/store/：Store 接口、DuckDB 后端、schema 与迁移）
+  sync/                 同步引擎（src/sync/：引擎、状态、限频门、窗口切分、任务注册表与 21 个任务）
+  schedule/             跨平台调度安装（launchd / systemd / schtasks）
+  commands/             子命令（auth / api / store / sync）
   core/
     sign.ts             七鱼签名（checksum = SHA1(appSecret + md5(body) + time)）
     http.ts             请求构建、重试、限频

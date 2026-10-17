@@ -1,7 +1,7 @@
 # qiyu-cli 设计文档
 
 日期：2026-09-30（Version 2）
-状态：待评审
+状态：实施中——A/B/C1/D 已交付（D 同步引擎已交付 2026-10-15，见 `src/sync/`）；E 查询与沙箱、F Skill 未实现
 修订说明：Version 1 的核心论据是错的（见 §13）；Version 2 予以更正，并纳入会话明细同步
 
 > **关于本文档中的实测数据**：本文档中出现的所有 ID（robotId、staffId、groupId、categoryId、会话 ID 等）、人名与业务内容，**均为合成的占位值**，不指向任何真实企业。标注为「实测」的结论（字段行为、分页语义、限频、错误码、统计口径、比例、行数）来自对某个真实七鱼企业账号的**只读**探测，并已做匿名化处理；**其结构性结论可直接复用于任何七鱼企业，但具体数量级会随企业规模而变化**。
@@ -669,7 +669,7 @@ qiyu sync run [task]            # 增量同步
 qiyu sync run --full [task]     # 全量重刷（重新冲刷一个区间）
 qiyu sync run --since --until   # 指定一个区间
 qiyu sync status                # 水位、最近一次结果、缺口、是否加锁
-qiyu sync tasks                 # 列出可用任务、启用/停用
+qiyu sync tasks                 # 列出可用任务（含每任务敏感列出口）
 qiyu sync verify [task]         # 校验本地与远端一致性
 ```
 
@@ -1159,7 +1159,7 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 
 ### 9.5 状态码
 
-- `kind: "store_not_initialized"` + 指向 `qiyu sync run` 的提示（C1 阶段指向 `qiyu store init`；D 交付后改为 `qiyu sync run`）
+- `kind: "store_not_initialized"` + 指向 `qiyu store init` 的提示（C1 阶段与 D 交付后**同口径**：修复批 2 裁定不改指 `qiyu sync run` —— `sync run` 首跑虽会自动建库，但「初始化存储」的最小命令是 store init；C1 与 D 的 `store status`/`sync status`/`sync verify`/`sync install` 四处出口同文案）
 - `kind: "auth_missing"` + `retryable: false` + 指向 §4.2 的提示
 - `kind: "store_locked"` + 说明正在同步的提示（C1 阶段：写进程持锁，无同步概念；D 交付后为同步窗口）
 

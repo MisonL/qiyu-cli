@@ -39,6 +39,8 @@ export interface Store {
    * 返回实际写入行数。
    */
   upsert(table: string, rows: Record<string, unknown>[]): Promise<number>
+  /** 条件删除。where 是可信代码常量（禁外部派生字符串，同 query 红线）；返回删除行数。 */
+  delete(table: string, where: string, params?: unknown[]): Promise<number>
   /** 事务：回调内的写操作原子提交，抛异常整体回滚。不得嵌套（→ usage）。 */
   transaction<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T>
   /**

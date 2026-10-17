@@ -3,8 +3,15 @@ import { describe, it, expect } from 'vitest'
 import { TABLES, MIGRATIONS, LATEST_VERSION, ddlFor, tableByName } from '../../src/store/schema.js'
 
 describe('TABLES —— 表定义', () => {
-  it('恰好四张表：schema_version/sync_state/sync_gaps/tags', () => {
-    expect(TABLES.map((t) => t.name).sort()).toEqual(['schema_version', 'sync_gaps', 'sync_state', 'tags'])
+  it('恰好二十五张表：v1 四张 + v3 批次六张维度表 + v5 批次九张报表表 + v6 批次两张工单表 + v7 sessions + v8 批次三张知识库表', () => {
+    expect(TABLES.map((t) => t.name).sort()).toEqual([
+      'daily_overview', 'knowledge_categories', 'knowledge_items', 'knowledge_points',
+      'order_performance', 'robot_summary',
+      'schema_version', 'sessions', 'staff', 'staff_attendance', 'staff_group_members',
+      'staff_groups', 'staff_quality', 'staff_salary_detail', 'staff_satisfaction',
+      'staff_workload', 'sync_gaps', 'sync_state', 'tags',
+      'ticket_categories', 'ticket_logs', 'ticket_template_fields', 'ticket_templates',
+      'tickets', 'transfer_human'])
   })
 
   it('tags 列恰为 id/name/color，全 NOT NULL，id 为 VARCHAR 主键', () => {
@@ -15,10 +22,11 @@ describe('TABLES —— 表定义', () => {
     expect(t.primaryKey).toEqual(['id'])
   })
 
-  it('sync_state 六列（含 locked_by/locked_at）', () => {
+  it('sync_state 十一列（D-T3 last_synced_at、D-T4 限频两列、G2 resolved_range 两列）', () => {
     const t = tableByName('sync_state')!
     expect(t.columns.map((c) => c.name)).toEqual(
-      ['dataset', 'watermark', 'range_status', 'last_error', 'locked_by', 'locked_at'])
+      ['dataset', 'watermark', 'range_status', 'last_error', 'locked_by', 'locked_at', 'last_synced_at',
+        'next_allowed_at', 'last_rate_limited_at', 'resolved_range_start', 'resolved_range_end'])
     expect(t.primaryKey).toEqual(['dataset'])
   })
 
@@ -45,6 +53,20 @@ describe('TABLES —— 表定义', () => {
     }
   })
 
+  it('payload 列在 PII 表上标 sensitive（D 高-1/F 中-2 + 修复批 3：它是 PII 的完整副本，漏标 = 整列绕过脱敏）', () => {
+    // ticket_logs 在修复批 3 加入：`ticket.log` 行携带 ccList/toMailList（邮箱清单）、
+    // operatorId 与日志正文（设计稿 §10.3/§10.4 实测字段）——与 tickets/sessions 的 payload 同类。
+    for (const name of ['sessions', 'tickets', 'ticket_logs']) {
+      const c = tableByName(name)!.columns.find((x) => x.name === 'payload')!
+      expect(c.sensitive, `${name}.payload`).toBe(true)
+    }
+    // 无 PII 的表不误标（知识库域与会话/工单 PII 清单零交集）
+    expect(tableByName('knowledge_items')!.columns.find((c) => c.name === 'payload')!.sensitive)
+      .toBe(false)
+    expect(tableByName('daily_overview')!.columns.find((c) => c.name === 'payload')!.sensitive)
+      .toBe(false)
+  })
+
   it('schema_version.version 是 INTEGER（迁移序号，非 ID 列）', () => {
     expect(tableByName('schema_version')!.columns[0]).toEqual({ name: 'version', type: 'INTEGER', nullable: false, sensitive: false })
   })
@@ -64,19 +86,42 @@ describe('ddlFor —— 生成建表语句', () => {
 })
 
 describe('MIGRATIONS —— 迁移', () => {
-  it('版本号从 1 起连续、LATEST_VERSION 为最大值', () => {
+  it('版本号从 1 起严格递增、LATEST_VERSION 为最大值', () => {
     const vs = MIGRATIONS.map((m) => m.version).sort((a, b) => a - b)
     expect(vs[0]).toBe(1)
-    for (let i = 1; i < vs.length; i++) expect(vs[i]).toBe(vs[i - 1] + 1)
+    // v3 空档预留给数据表 DDL（T6），跳号是有意的 —— 故只断言严格递增而非连续。
+    for (let i = 1; i < vs.length; i++) expect(vs[i]).toBeGreaterThan(vs[i - 1])
     expect(LATEST_VERSION).toBe(vs[vs.length - 1])
   })
 
-  it('v1 迁移建出全部 TABLES（对拍 ddlFor 的表名集合）', async () => {
+  it('v1 迁移只建 v1 四张（v3 批次维度表不进 v1）', async () => {
     const ran: string[] = []
     const m1 = MIGRATIONS.find((m) => m.version === 1)!
     await m1.up(async (sql) => { ran.push(sql) })
-    for (const t of TABLES) {
-      expect(ran.some((s) => s.includes(`"${t.name}"`)), `缺 ${t.name} 的建表语句`).toBe(true)
+    expect(ran.length).toBe(4)
+    for (const name of ['schema_version', 'sync_state', 'sync_gaps', 'tags']) {
+      expect(ran.some((s) => s.includes(`"${name}"`)), `v1 缺 ${name}`).toBe(true)
     }
+    expect(ran.some((s) => s.includes('"staff"'))).toBe(false)
+  })
+
+  it('v3 迁移建出六张维度表（tags 已在 v1、不在 v3）', async () => {
+    const ran: string[] = []
+    const m3 = MIGRATIONS.find((m) => m.version === 3)!
+    await m3.up(async (sql) => { ran.push(sql) })
+    expect(ran.length).toBe(6)
+    for (const name of ['staff', 'staff_groups', 'staff_group_members',
+      'ticket_categories', 'ticket_templates', 'ticket_template_fields']) {
+      expect(ran.some((s) => s.includes(`"${name}"`)), `v3 缺 ${name}`).toBe(true)
+    }
+  })
+
+  it('v9 迁移给 sync_state 补 resolved_range 两列（函数式 ALTER、幂等形态）', async () => {
+    const ran: string[] = []
+    const m9 = MIGRATIONS.find((m) => m.version === 9)!
+    await m9.up(async (sql) => { ran.push(sql) })
+    expect(ran.length).toBe(2)
+    expect(ran[0]).toMatch(/ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_start" VARCHAR/)
+    expect(ran[1]).toMatch(/ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_end" VARCHAR/)
   })
 })

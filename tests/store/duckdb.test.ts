@@ -24,9 +24,14 @@ async function fresh(): Promise<Store> {
 }
 
 describe('duckdb —— 建表与查询', () => {
-  it('init 建出四张表（tables() 排序）', async () => {
+  it('init 建出全部表（tables() 排序：v3 批次维度表随迁移落库）', async () => {
     const s = await fresh()
-    expect(await s.tables()).toEqual(['schema_version', 'sync_gaps', 'sync_state', 'tags'])
+    expect(await s.tables()).toEqual(['daily_overview', 'knowledge_categories', 'knowledge_items',
+      'knowledge_points', 'order_performance', 'robot_summary',
+      'schema_version', 'sessions', 'staff', 'staff_attendance', 'staff_group_members',
+      'staff_groups', 'staff_quality', 'staff_salary_detail', 'staff_satisfaction',
+      'staff_workload', 'sync_gaps', 'sync_state', 'tags', 'ticket_categories', 'ticket_logs',
+      'ticket_template_fields', 'ticket_templates', 'tickets', 'transfer_human'])
     await s.close()
   })
 
@@ -148,8 +153,12 @@ describe('duckdb —— upsert 契约', () => {
 
   it('null 到 nullable 列 → 正常写入并读回 null（显式 null ≠ 缺列）', async () => {
     const s = await fresh()
+    // G2（v9）起 sync_state 共 11 列：完整列集须含 next_allowed_at / last_rate_limited_at
+    // 与 resolved_range_start / resolved_range_end。
     await s.upsert('sync_state', [{ dataset: 'tags', watermark: null, range_status: null,
-      last_error: null, locked_by: null, locked_at: null }])
+      last_error: null, locked_by: null, locked_at: null, last_synced_at: null,
+      next_allowed_at: null, last_rate_limited_at: null,
+      resolved_range_start: null, resolved_range_end: null }])
     const r = await s.query('SELECT watermark, range_status FROM sync_state WHERE dataset = ?', ['tags'])
     expect(r.rows[0].watermark).toBeNull()
     expect(await s.count('sync_state')).toBe(1)
@@ -247,12 +256,13 @@ describe('duckdb —— init 与关闭', () => {
     const schema = await import('../../src/store/schema.js')
     const real = schema.MIGRATIONS
     const failingSpy = vi.spyOn(schema, 'MIGRATIONS', 'get')
-      .mockReturnValue([...real, { version: 2, up: async () => { throw new Error('注入的迁移失败') } }] as never)
+      // ⚠️ D-T6 起真实清单已有 v3（维度表 DDL），注入失败条目改用 99（不撞号）。
+      .mockReturnValue([...real, { version: 99, up: async () => { throw new Error('注入的迁移失败') } }] as never)
     const s1 = await createDuckDbStore(cfg, 'rw')
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
-    expect(await s1.count('schema_version')).toBe(1)   // v1 已记、v2 未记（失败不推进）
+    expect(await s1.count('schema_version')).toBe(9)   // v1..v9 已记、99 未记（失败不推进）
     await s1.close()
-    // 恢复真实迁移，重新 init → 重放路径只补 v2（真实清单无 v2，MAX 保持 1）
+    // 恢复真实迁移，重新 init → 重放路径只补 99（真实清单无 99，MAX 保持 8）
     failingSpy.mockRestore()
     // ⚠️ J-M1 实测裁决（controller 以 vitest 2.1.9 真跑探测）：对本地 ESM 模块命名空间
     // 的具名导出做 `vi.spyOn(mod, 'MIGRATIONS', 'get')` **可用**——vitest 的模块转换
@@ -263,7 +273,8 @@ describe('duckdb —— init 与关闭', () => {
     const s2 = await createDuckDbStore(cfg, 'rw')
     await s2.init()
     const v = await s2.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    expect(Number(v.rows[0].v)).toBe(1)
+    // v1..v9（v9=修复批 2 的 G2 区间两列）：MAX=9
+    expect(Number(v.rows[0].v)).toBe(9)
     await s2.close()
   })
 
@@ -477,5 +488,30 @@ describe('duckdb —— init 与关闭', () => {
     await expect(s.query("INSERT INTO tags (id, name, color) VALUES ('1', 'A', CAST('x' AS INTEGER))"))
       .rejects.toThrow(/Conversion|类型|bind/i)
     await s.close()
+  })
+
+  it('delete 按条件删行并返回行数（D: 报表按范围删除的基础）', async () => {
+    const store = await fresh()
+    await store.init()
+    await store.upsert('tags', [
+      { id: '1', name: '标签A', color: '#FF0000' },
+      { id: '2', name: '标签B', color: '#00FF00' },
+    ])
+    const n = await store.delete('tags', 'id >= ?', ['2'])
+    expect(n).toBe(1)
+    expect(await store.count('tags')).toBe(1)
+    await store.close()
+  })
+
+  it('delete 未知表 → usage；在事务内则加入事务（回滚可撤）', async () => {
+    const store = await fresh()
+    await store.init()
+    await expect(store.delete('nope', '1=1')).rejects.toMatchObject({ kind: 'usage' })
+    await store.transaction(async (tx) => {
+      await tx.upsert('tags', [{ id: '3', name: '标签C', color: '#0000FF' }])
+      await tx.delete('tags', 'id = ?', ['3'])
+    })
+    expect(await store.count('tags')).toBe(0)
+    await store.close()
   })
 })
