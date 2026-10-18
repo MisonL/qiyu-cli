@@ -78,7 +78,8 @@ async function expectLockReleased(): Promise<void> {
   inst.closeSync()
 }
 
-describe('query --sql · 成功路径（spec §十）', () => {  it('返回 columns/rows 与完整 meta：rows/truncated/limit_applied/masked/masked_columns/mask_warnings/warnings', async () => {
+describe('query --sql · 成功路径（spec §十）', () => {
+  it('返回 columns/rows 与完整 meta：rows/truncated/limit_applied/masked/masked_columns/mask_warnings/warnings', async () => {
     await seed()
     expect(await q('--sql', 'SELECT session_id, startTime FROM sessions ORDER BY session_id')).toBe(0)
 
