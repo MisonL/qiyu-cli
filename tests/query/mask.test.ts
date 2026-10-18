@@ -107,18 +107,28 @@ describe('query --table 通道：精确', () => {
     expect(out.warnings).toEqual([])
   })
 
-  it('不在 TableDef 的额外输出列不脱敏也不报错；敏感列全为 null 时不计入 maskedColumns', () => {
+  it('不在 TableDef 的额外输出列不脱敏但**给警告**；敏感列全为 null 时不计入 maskedColumns', () => {
     const row = { session_id: 's-2', userPhone: null, extra: '13800138000' }
     const out = maskQueryRows({
       rows: [row], columns: ['session_id', 'userPhone', 'extra'],
       mode: { kind: 'table', table: sessions },
     })
     expect(out.rows[0].userPhone).toBeNull()
-    // --table 通道没有值级兜底：未知列原样返回（spec §7.2「精确」）
+    // --table 通道没有值级兜底：未知列原样返回（spec §7.2「精确」）——
+    // 但不得静默（审查 Minor 1）：db describe 对同一漂移会警告，这里只看不说就是
+    // 「`SELECT *` 把库里多出来的 PII 列原样带出且 masked:true」。
     expect(out.rows[0].extra).toBe('13800138000')
+    expect(out.warnings).toHaveLength(1)
+    expect(out.warnings[0]).toMatch(/表定义之外的列 extra/)
+    expect(out.warnings[0]).toMatch(/未做脱敏/)
+    // `count` 是 --group-by 的聚合别名（不在 TableDef.columns），不算漂移列
+    const grouped = maskQueryRows({
+      rows: [{ session_type: 'robot', count: 3 }], columns: ['session_type', 'count'],
+      mode: { kind: 'table', table: sessions },
+    })
+    expect(grouped.warnings).toEqual([])
     // spec line 217「实际脱敏」：本行输出一个字节都没改 → 空清单（Agent 据此判断是否被改写）
     expect(out.maskedColumns).toEqual([])
-    expect(out.warnings).toEqual([])
   })
 
   it('maskedColumns 跨行合并：某列只要有一行被改写就计入，全 null 的列不计入', () => {
@@ -201,6 +211,32 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     })
     expect(padded.rows[0].payload).toBe(FULL)
     expect(padded.maskedColumns).toEqual(['payload'])
+
+    // 审查 I-1：payload 缺口必须点破。值级只认手机号/邮箱/IPv4，姓名/地址会整段原样
+    // 输出——而 `masked_columns` 非空（手机号命中），Agent 看到 masked:true 会以为已脱敏。
+    // 会话/工单的 payload 标了 sensitive → 警告；报表 payload 未标 → 不警告（避免噪音）。
+    expect(session.warnings).toHaveLength(1)
+    expect(session.warnings[0]).toMatch(/payload 列/)
+    expect(session.warnings[0]).toMatch(/姓名\/地址/)
+    expect(session.warnings[0]).toContain('sessions')
+    expect(report.warnings).toEqual([])   // daily_overview 的 payload 不是 PII 载体
+
+    // 无格式载荷（无手机号/邮箱/IP）：payload 原样输出、maskedColumns 为空 ——
+    // 这正是最危险的形态（Agent 看到 masked_columns 空但 masked:true），警告必须仍在。
+    const noFormat = maskQueryRows({
+      rows: [{ payload: '{"userName":"张三","userAddress":"北京市朝阳区"}' }],
+      columns: ['payload'], mode: sqlMode('SELECT payload FROM sessions'),
+    })
+    expect(noFormat.rows[0].payload).not.toBe(FULL)
+    expect(noFormat.maskedColumns).toEqual([])
+    expect(noFormat.warnings).toHaveLength(1)
+
+    // 输出里没有 payload 列（哪怕 SQL 引用了 sessions）→ 无 payload 缺口警告
+    const noPayloadCol = maskQueryRows({
+      rows: [{ session_id: 's-1' }], columns: ['session_id'],
+      mode: sqlMode('SELECT session_id FROM sessions'),
+    })
+    expect(noPayloadCol.warnings).toEqual([])
   })
 
   it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5、词边界、精确大小写）', () => {

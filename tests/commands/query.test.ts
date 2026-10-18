@@ -283,9 +283,18 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     const e = errorOf()
     expect(e.kind).toBe('query_timeout')
     expect(e.code).toBe('query_timeout')
-    expect(String(e.hint)).toMatch(/--timeout|缩小/)
+    // 审查 I-4：hint 不得点名 `--timeout` —— db/query/stats 三命令共用本出口，
+    // 只有 query 认该 flag，建议它等于给 `db tables` 的用户一条走不通的路。
+    expect(String(e.hint)).toMatch(/缩小|收窄/)
+    expect(String(e.hint)).not.toMatch(/--timeout/)
 
     // 超时中断后会话必须已关闭、锁不滞留（M11）——否则后续写进程永远打不开这个库
+    await expectLockReleased()
+
+    // 审查 I-6：极小正数（0.0001 秒 → 0.1ms → 四舍五入为 0ms）必须**仍然超时**，
+    // 而不是被当成 `--timeout 0`（= 不限时，与用户意图相反）。此前该钳制分支无观测。
+    expect(await q('--sql', 'SELECT COUNT(*) FROM range(100000000000)', '--timeout', '0.0001')).toBe(1)
+    expect(errorOf().kind).toBe('query_timeout')
     await expectLockReleased()
 
     // 0 = 无超时（spec §5.3）：用一条**确定性 >1s** 的查询证明 0 不是「0ms 立即超时」，
@@ -628,6 +637,9 @@ describe('query --table · 参数与错误分派（spec §六/§十一）', () =
     expect(await qAt('--table', 'sessons')).toBe(2)
 
     expect(errorOf().kind).toBe('usage')
+    // 闭集校验错误恒为 code:usage（spec §十一：--table 的用法错误不是 SQL 执行错误，
+    // 与 --sql 通道的 query_error 分属两个出口；审查 I-2 改 spec 对齐实现）
+    expect(errorOf().code).toBe('usage')
     expect(err).toMatch(/未知表：sessons/)
     expect(String(errorOf().hint)).toContain('sessions')
   })

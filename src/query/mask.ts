@@ -167,7 +167,18 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
 
   if (mode.kind === 'table') {
     // --table 通道：精确。只认 TableDef 的 sensitive 标记；不在 TableDef.columns 的
-    // 额外输出列（正常不会出现）不脱敏也不报错（spec §7.2 第一条）。
+    // 额外输出列（正常不会出现）不脱敏，但**不得静默**（审查 Minor 1）——`SELECT *` 会把
+    // 库里多出来的列（旧版 CLI 残留、外部工具写入）原样带出，其中可能有 PII 列，
+    // 而 `db describe` 对同一漂移会警告（README「声明与实况的差异不得静默」）。
+    // 只看 TableDef 认不出该列是不是 PII，所以只能给警告、不能脱敏——如实说。
+    // `count` 是 --group-by 的聚合别名（不在 TableDef.columns），不算漂移列。
+    const declared = new Set(mode.table.columns.map((c) => c.name))
+    const undeclared = columns.filter((n) => n !== 'count' && !declared.has(n))
+    const driftWarnings = undeclared.length > 0
+      ? [`输出含表定义之外的列 ${undeclared.join('、')}（可能来自旧版 CLI 或库损坏）：`
+        + '这些列不在 `TABLES` 元数据中，未做脱敏。要核对请用 `qiyu db describe '
+        + mode.table.name + '`']
+      : []
     const sensitive = new Set(
       mode.table.columns.filter((c) => c.sensitive).map((c) => c.name))
     const hit = columns.filter((name) => sensitive.has(name))
@@ -186,7 +197,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       }
       return out
     })
-    return { rows: outRows, maskedColumns: hit.filter((n) => changed.has(n)), warnings: [] }
+    return { rows: outRows, maskedColumns: hit.filter((n) => changed.has(n)), warnings: driftWarnings }
   }
 
   // --sql 通道：列名级（主防线）+ 值级兜底（别名绕过）。
@@ -196,7 +207,6 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const nameHit = new Set(columns.filter((name) => sensitiveNames.includes(name)))
   // 实际改写追踪（两条分支共用）：maskedColumns 只收「至少有一行的值在脱敏前后不同」的列。
   const changed = new Set<string>()
-
   const outRows = rows.map((row) => {
     const out = { ...row }
     for (const name of columns) {
@@ -218,6 +228,29 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // ⚠️ 大小写敏感是刻意的：加 `i` 会让 `SELECT username FROM staff` 误报 `userName`
   //（staff.username 不是敏感列），要消除需真正解析 SQL 标识符，超出本纯函数的职责。
   const warnings: string[] = []
+
+  // payload 缺口（审查 I-1）：payload 刻意不做列名级（文件头取舍），只靠值级 JSON 检测。
+  // 但值级只认手机号/邮箱/IPv4 —— 会话/工单 payload 里的姓名、地址（无格式）会**整段原样**
+  // 输出，且 `masked_columns` 非空（手机号命中）→ Agent 看到 `masked: true` 会误以为
+  // payload 已脱敏。README/CHANGELOG 承诺「两条通道都默认脱敏」，不点破就是承诺了不存在的保护。
+  //
+  // ⚠️ 只在 SQL 点名了「payload 标 sensitive 的表」时警告（与既有缺口警告同一启发式：
+  // 看 SQL 文本，不看语义）。报表表的 payload 是聚合数字 JSON，标了 sensitive 的只有
+  // sessions / tickets / ticket_logs —— 对 `SELECT payload FROM daily_overview` 警告
+  // 是噪音，会让 Agent 学会忽略 mask_warnings。
+  // ⚠️ 不对 payload 脱敏本身（报表 payload 是聚合数字，整值替换会误杀）——只声明缺口。
+  // （noMask 已在函数入口提前返回；payload 不在 sensitiveNames，故无需再查 nameHit。）
+  const payloadPiiTables = mode.tables
+    .filter((t) => t.columns.some((c) => c.name === 'payload' && c.sensitive))
+    .map((t) => t.name)
+    .filter((name) => new RegExp(`\\b${name}\\b`, 'i').test(mode.sql))
+  if (columns.includes('payload') && payloadPiiTables.length > 0) {
+    warnings.push(
+      `输出含 payload 列（SQL 引用了含 PII 的表 ${payloadPiiTables.join('、')}）：`
+      + '本通道只对 payload 做值级检测（手机号/邮箱/IPv4），其中的姓名/地址等无格式 PII 可能未脱敏。'
+      + '要整值替换请用 `qiyu query --table <表>`')
+  }
+
   for (const name of sensitiveNames) {
     if (warnings.length >= WARNING_LIMIT) break
     if (nameHit.has(name)) continue

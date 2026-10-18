@@ -187,6 +187,21 @@ describe('限定名 / Candidate tables / 无 FROM 变体 → 候选不丢', () =
     expect(f.hint).toBe('候选：payload')
   })
 
+  it('Parser Error 回显里含「Referenced column "x" not found」字样时不得误判成列不存在（审查 Minor 20）', () => {
+    // DuckDB 的错误消息会回显 SQL 原文（LINE 1: …）。若用户 SQL 里恰好写了这段字样，
+    // 未锚定 `Binder Error:` 的正则会把它当成真实的列错误 —— 实测原文是 Parser Error。
+    const e = new Error(
+      'Parser Error: syntax error at or near "column"\n\n' +
+      'LINE 1: SELECT 1 WHERE x = Referenced column "zzz" not found\n' +
+      '                                      ^',
+    )
+    const f = classifyDuckDbError(e, TABLES)
+    expect(f.kind).toBe('usage')
+    expect(f.code).toBe('query_error')
+    expect(f.message.startsWith('SQL 语法错误')).toBe(true)
+    expect(f.message).not.toMatch(/列 zzz 不存在/)
+  })
+
   it('未绑参（Expected N parameters）→ usage + query_error + 参数化提示', () => {
     const f = classifyDuckDbError(
       new Error('Invalid Input Error: Expected 1 parameters, but none were supplied'), TABLES,

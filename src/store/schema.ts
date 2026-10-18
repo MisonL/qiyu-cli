@@ -461,5 +461,6 @@ export const MIGRATIONS: Migration[] = [
   },
 ]
 
-// ⚠️ 预留给 E（`db describe <table>` 的列定义展示）消费；C1 无调用方，保留导出（L2）。
+// ⚠️ E 交付后仍无命令层调用方（`db describe` 展示的是 `TABLES` 的列定义，不是迁移版本号）；
+// 现由 `tests/store/schema.test.ts` 与迁移一致性断言消费。保留导出（L2）。
 export const LATEST_VERSION = MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0)

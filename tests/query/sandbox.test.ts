@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { openSandbox, type SandboxSession } from '../../src/query/sandbox.js'
+import { openSandbox, memoryLimitBytes, type SandboxSession } from '../../src/query/sandbox.js'
 import type { StoreConfig } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s，与 tests/store/duckdb.test.ts 同款放宽到 15s。
@@ -348,15 +348,34 @@ describe('EXPLAIN ANALYZE 内层执行绕过（layer1 追加闸门，spec §5.3 
 })
 
 describe('加固自检与顺序', () => {
-  it('current_setting 为 ea=false / lc=true / tz=Asia/Shanghai', async () => {
+  it('current_setting 为 ea=false / lc=true / tz=Asia/Shanghai / ml≥512MiB', async () => {
     const { path } = await mkDb()
     await withSandbox(path, async (s) => {
       const r = await s.run(
         "SELECT current_setting('enable_external_access') AS ea, " +
         "current_setting('lock_configuration') AS lc, " +
-        "current_setting('TimeZone') AS tz")
-      expect(r.rows[0]).toEqual({ ea: false, lc: true, tz: 'Asia/Shanghai' })
+        "current_setting('TimeZone') AS tz, " +
+        "current_setting('memory_limit') AS ml")
+      expect(r.rows[0]).toMatchObject({ ea: false, lc: true, tz: 'Asia/Shanghai' })
+      // 审查 I-5：memory_limit 是 spec §5.2 声明的加固项，但此前无任何测试观测 ——
+      // 删掉 HARDENING_SQL 里那行仍全绿。加固是**封顶**，故断言上限（≤ 2 GiB）：
+      // 未加固时回显是机器内存的 80%（本机 51.1 GiB），删行后这条必红。
+      expect(memoryLimitBytes(r.rows[0].ml)).toBeLessThanOrEqual(2 * 1024 ** 3)
+      expect(memoryLimitBytes(r.rows[0].ml)).toBeGreaterThan(0)
     })
+  })
+
+  it('memoryLimitBytes 解析 DuckDB 的格式化回显；无法解析 → 0（自检据此拒绝服务）', () => {
+    expect(memoryLimitBytes('953.6 MiB')).toBeCloseTo(953.6 * 1024 ** 2, 0)
+    expect(memoryLimitBytes('1.0 GiB')).toBeCloseTo(1024 ** 3, 0)
+    expect(memoryLimitBytes('51.1 GiB')).toBeCloseTo(51.1 * 1024 ** 3, 0)
+    expect(memoryLimitBytes('1024.0 KiB')).toBe(1024 * 1024)
+    expect(memoryLimitBytes('512 B')).toBe(512)
+    // 未设 / 改格式 / 非字符串 → 0，宁可拒绝服务也不放过半加固状态
+    expect(memoryLimitBytes(null)).toBe(0)
+    expect(memoryLimitBytes(undefined)).toBe(0)
+    expect(memoryLimitBytes('unlimited')).toBe(0)
+    expect(memoryLimitBytes('1GB')).toBe(0)   // 注意：回显不带这种写法，认不出就不认
   })
 
   it('lock 之后 SET TimeZone 报 configuration has been locked（顺序敏感的实证）', async () => {
@@ -620,7 +639,7 @@ describe('openSandbox 的错误路径', () => {
           connect: async () => ({
             run: async () => ({}),
             runAndReadAll: async () => ({
-              getRowObjectsJson: () => [{ ea: false, lc: true }],
+              getRowObjectsJson: () => [{ ea: false, lc: true, ml: "953.6 MiB" }],
               columnNames: () => [] as string[],
             }),
             extractStatements: async () => ({
@@ -657,7 +676,7 @@ describe('openSandbox 的错误路径', () => {
           connect: async () => ({
             run: async () => ({}),
             runAndReadAll: async () => ({
-              getRowObjectsJson: () => [{ ea: false, lc: true }],
+              getRowObjectsJson: () => [{ ea: false, lc: true, ml: "953.6 MiB" }],
               columnNames: () => ['x'],
             }),
             extractStatements: async () => ({

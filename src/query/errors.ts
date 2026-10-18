@@ -146,11 +146,15 @@ function candidateHint(candidates: string[]): string {
 // ① `Catalog Error: Table with name sessons does not exist!`
 // ② `Binder Error: Referenced table "sessons" not found!`（限定名 `sessons.paylod`）
 // ③ `Binder Error: Table "sessions" does not have a column named "paylod"`
-// ④ `Referenced column "paylod" (was) not found …`（无 FROM 时多一个 `was`）
+// ④ `Binder Error: Referenced column "paylod" was not found because the FROM clause is missing`
+// 四条都锚定错误类别前缀（`Binder Error:` / `Catalog Error:`）——不能省（审查 Minor 20）：
+// DuckDB 的错误消息会**回显 SQL 原文**（`LINE 1: …`），Parser Error 的报错里若恰好含
+// `Referenced column "x" not found` 字样，无锚的正则会把「语法错」误判成「列不存在」。
+// 实测：`SELECT 1 WHERE x = Referenced column "zzz" not found` → 原文是 Parser Error。
 const TABLE_NAME_RE = /Catalog Error: Table with name ([^\s]+) does not exist/
 const TABLE_REF_RE = /Binder Error: Referenced table "([^"]+)" not found/
 const COLUMN_NAMED_RE = /Binder Error: Table "[^"]+" does not have a column named "([^"]+)"/
-const COLUMN_NAME_RE = /Referenced column "([^"]+)" (?:was )?not found/
+const COLUMN_NAME_RE = /Binder Error: Referenced column "([^"]+)" (?:was )?not found/
 
 /** 表不存在的中文消息 + 候选 hint（原生分支与 cause 补算分支共用，裁决 R9）。 */
 function tableNotFound(name: string, msg: string, tables: readonly TableDef[]): { message: string; hint: string } {

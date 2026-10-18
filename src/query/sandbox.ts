@@ -61,9 +61,26 @@ const HARDENING_SQL = [
 ] as const
 
 // 加固自检（spec §5.2 第 7 步）：防 DuckDB 未来改名导致 layer2 静默失效。
+// 含 memory_limit —— 只读 ea/lc 时「删除 memory_limit 加固行」不会有任何测试/自检
+// 变红（审查 I-5）；它同样是 spec §5.2 声明的加固项，必须自证生效。
 const SELF_CHECK_SQL =
   "SELECT current_setting('enable_external_access') AS ea, " +
-  "current_setting('lock_configuration') AS lc"
+  "current_setting('lock_configuration') AS lc, " +
+  "current_setting('memory_limit') AS ml"
+
+/**
+ * DuckDB 的 memory_limit 回显 → 字节数（实测格式 `953.6 MiB` / `51.1 GiB` / `1.0 GiB`）。
+ * 无法解析（未来改格式、或未设时回显非字符串）→ 返回 0，让自检拒绝服务而不是放过。
+ * 支持 B/KiB/MiB/GiB/TiB（spaced 或紧贴写法都认）。
+ */
+export function memoryLimitBytes(display: unknown): number {
+  if (typeof display !== 'string') return 0
+  const m = /^([\d.]+)\s*(B|KiB|MiB|GiB|TiB)$/.exec(display.trim())
+  if (m === null) return 0
+  const unit = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, TiB: 1024 ** 4 } as const
+  const n = Number(m[1]) * unit[m[2] as keyof typeof unit]
+  return Number.isFinite(n) ? n : 0
+}
 
 // statementType 数值 → 类型名（spec §5.3 映射表；实测值见任务 brief）。
 const TYPE_NAMES: Record<number, string> = {
@@ -374,10 +391,15 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
     for (const sql of HARDENING_SQL) await conn.run(sql)
     const r = await conn.runAndReadAll(SELF_CHECK_SQL)
     const row = r.getRowObjectsJson()[0] ?? {}
-    if (row.ea !== false || row.lc !== true) {
+    // memory_limit 的回显是格式化字符串（实测 `SET memory_limit='1GB'` → "953.6 MiB"，
+    // 未加固时是机器内存的 80%，本机 51.1 GiB），无法回读原值 —— 按**上限**断言（≤ 2 GiB）：
+    // 加固的意义是「封顶」，删掉加固行后默认值必然远超它，自检因此拒绝服务；
+    // 而不是让大排序在不受控的内存下跑（探针 8：128MB 会 OOM，1GB 足够本库任何表）。
+    if (row.ea !== false || row.lc !== true || memoryLimitBytes(row.ml) > 2 * 1024 ** 3) {
       throw sandboxError(
         'internal',
-        `只读沙箱自检失败：enable_external_access=${String(row.ea)}，lock_configuration=${String(row.lc)}`,
+        `只读沙箱自检失败：enable_external_access=${String(row.ea)}，`
+          + `lock_configuration=${String(row.lc)}，memory_limit=${String(row.ml)}`,
         { hint: '当前 DuckDB 版本的配置项可能已改名；请报告此问题，不要在此状态下查询' },
       )
     }
@@ -509,9 +531,12 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
         const msg = e instanceof Error ? e.message : String(e)
         if (/INTERRUPT/i.test(msg)) {
           // 实测：interrupt 约 300ms 生效，中断后连接仍可用（探针 6/9）。
+          // ⚠️ hint 不得点名 `--timeout`（审查 I-4）：只有 `query` 接受该 flag，
+          // `db tables` / `db describe` / `stats fields` 共用本出口，建议一个它们
+          // 不认的参数等于给一条走不通的路（`未知参数：--timeout`，退出码 2）。
           throw sandboxError('query_timeout', `查询超过 ${timeoutMs}ms 未完成，已中断`, {
             code: 'query_timeout',
-            hint: '请缩小时间范围、加过滤条件，或调大 --timeout',
+            hint: '请缩小时间范围或加过滤条件，把查询收窄到能在超时内完成',
           })
         }
         // 裁决 R11：执行期原生错误也挂 cause —— errors.ts 从原文补 OOM 的可操作 hint

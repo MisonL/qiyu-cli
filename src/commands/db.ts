@@ -250,8 +250,23 @@ async function dbTables(argv: string[]): Promise<number> {
       const rows = Number((r.rows[0] ?? {}).n)
       let timeRange: { min: string; max: string } | null = null
       const tc = t.timeColumn
+      // 逐表列核对（审查 I-3）：README 承诺「缺表/缺列/多列逐条进 warnings，不静默」，
+      // 而 describe 才有的逐列核对在 tables 清单里缺失就是静默漂移。列集已在上面
+      // 一次查全库（columnsOf），这里只做集合差，不加往返。
+      const declaredCols = new Set(t.columns.map((c) => c.name))
+      const actualCols = columnsOf.get(t.name) ?? new Set<string>()
+      // 时间列缺了由下面那条专门警告说明（它还要解释 time_range 为何置 null），
+      // 这里排除它，避免同一事实说两遍。
+      const missingCols = [...declaredCols].filter((n) => !actualCols.has(n) && n !== t.timeColumn?.name)
+      const extraCols = [...actualCols].filter((n) => !declaredCols.has(n)).sort()
+      if (missingCols.length > 0 || extraCols.length > 0) {
+        const parts: string[] = []
+        if (extraCols.length > 0) parts.push(`多列 ${extraCols.join('、')}`)
+        if (missingCols.length > 0) parts.push(`少列 ${missingCols.join('、')}`)
+        warnings.push(`表 ${t.name} 实际${parts.join('、')}——可能来自旧版 CLI 或库损坏`)
+      }
       if (tc !== undefined) {
-        if (columnsOf.get(t.name)?.has(tc.name) ?? false) {
+        if (actualCols.has(tc.name)) {
           timeRange = await timeRangeOf(session, t)
         } else {
           warnings.push(`表 ${t.name} 缺少时间列 ${tc.name}（可能来自旧版 CLI 或库损坏），time_range 置 null`)

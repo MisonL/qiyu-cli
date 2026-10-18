@@ -205,6 +205,29 @@ describe('db tables', () => {
     expect(text).toMatch(/startTime/)
   })
 
+  it('db tables 也核对列集：多列/少列进 warnings（审查 I-3，README 承诺不静默）', async () => {
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('ALTER TABLE "sessions" ADD COLUMN "rogue_col" VARCHAR')
+      await s.query('ALTER TABLE "staff" DROP COLUMN "email"')
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
+
+    const text = (meta().warnings as string[]).join('\n')
+    // 多列与少列各自点名，措辞与 db describe 同源（同一个事实，两处说法一致）
+    expect(text).toMatch(/表 sessions 实际多列 rogue_col/)
+    expect(text).toMatch(/表 staff 实际少列 email/)
+    // 反证：健康表不得被误报（否则「全部表都警告一遍」也能让上面两行绿）
+    expect(text).not.toMatch(/表 daily_overview 实际/)
+    // 列清单仍以声明为权威：多出来的列不进 pii_columns、也不进任何 data 字段
+    const sessions = (data().tables as TableOut[]).find((t) => t.name === 'sessions')!
+    expect(sessions.pii_columns).not.toContain('rogue_col')
+  })
+
   it('未知参数 / --pretty / 值位缺失 → usage 退出码 2；--help → 0', async () => {
     expect(await dbCommand(['tables', '--db', dbPath(), '--bogus'])).toBe(2)
     expect(errorOf().kind).toBe('usage')
