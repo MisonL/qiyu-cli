@@ -68,8 +68,9 @@ describe('TABLES —— 表定义', () => {
   })
 
   it('schema_version.version 是 INTEGER（迁移序号，非 ID 列）', () => {
-    // 逐键断言而非整体 toEqual：E 给 ColumnDef 追加了可选元数据键（grain/unit/note/observed_enum），
+    // 逐键断言而非整体 toEqual：E 给 ColumnDef 追加了可选元数据键（unit/note/observed_enum），
     // 整体相等会把「新增可选元数据」误判成列定义变更；语义（名/型/非空/非敏感）逐项保留。
+    // ⚠️ `grain` 是 **TableDef** 的键（不是 ColumnDef）—— 底下这条只有列定义，不含 grain。
     const c = tableByName('schema_version')!.columns[0]
     expect(c.name).toBe('version')
     expect(c.type).toBe('INTEGER')
@@ -113,6 +114,14 @@ describe('TABLES —— E 元数据扩展', () => {
       .toEqual(['pending', 'complete'])
     expect(tableByName('knowledge_items')!.columns.find((c) => c.name === 'type')!.observed_enum)
       .toEqual([1, 10])
+    // staff.role / staff.status（设计稿 §6.2 实测 330 行）：列是 VARCHAR，故枚举按字符串给。
+    // ⚠️ 除这两处外，无出处的列必须不带 observed_enum（不是按名称泛化）。
+    expect(tableByName('staff')!.columns.find((c) => c.name === 'role')!.observed_enum)
+      .toEqual(['0', '1', '2', '-2'])
+    expect(tableByName('staff')!.columns.find((c) => c.name === 'status')!.observed_enum)
+      .toEqual(['1', '2', '3'])
+    expect(tableByName('staff')!.columns.find((c) => c.name === 'roleId')!.observed_enum)
+      .toBeUndefined()
     expect(tableByName('sessions')!.columns.find((c) => c.name === 'userPhone')!.observed_enum)
       .toBeUndefined()
   })

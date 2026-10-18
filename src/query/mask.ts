@@ -20,7 +20,12 @@ export interface MaskOutcome {
   rows: Record<string, unknown>[]
   /**
    * 本次**实际脱敏**的列名（spec line 217：至少有一行的值在脱敏前后不同），按输出列序。
-   * 全 null / 行内缺键 / 非字符串值（原样返回）的列不出现 —— Agent 据此判断输出是否被改写。
+   * 全 null / 全空串 / 行内缺键 / 非字符串值（maskValue 一律原样返回）的列不出现
+   * —— Agent 据此判断输出是否被改写，所以「命中敏感列但一个值都没改」必须不算。
+   *
+   * ⚠️ 判定用 `!==` 而非 `Object.is`：理论上 NaN 会让「改前 === 改后」成立而被误算成
+   * 未脱敏（NaN !== NaN）。但 DuckDB 的 JSON 输出不表示 NaN（数值要么是可序列化数字、
+   * 要么是 null），该分支不可达 —— 记在这里是为了别把它当成「漏考虑」，不是待办。
    */
   maskedColumns: string[]
   warnings: string[]
@@ -167,7 +172,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       mode.table.columns.filter((c) => c.sensitive).map((c) => c.name))
     const hit = columns.filter((name) => sensitive.has(name))
     // maskedColumns 只收「至少有一行的值在脱敏前后不同」的列（spec line 217：
-    // 实际脱敏，Agent 据此判断输出是否被改写）。全 null / 行内缺键的列不算。
+    // 实际脱敏，Agent 据此判断输出是否被改写）。全 null / 全空串 / 行内缺键的列不算
+    //（空串走 maskValue 的「原样返回」分支，不是被改写成 `<已脱敏>`）。
     const changed = new Set<string>()
     const outRows = rows.map((row) => {
       const out = { ...row }
