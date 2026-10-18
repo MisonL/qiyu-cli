@@ -195,6 +195,10 @@ describe('db tables', () => {
     const sessions = (data().tables as TableOut[]).find((t) => t.name === 'sessions')!
     expect(sessions.time_range).toBeNull()
     expect(sessions.rows).toBe(2)                 // 行数照常（不受缺时间列影响）
+    // 反证：缺列降级必须只影响那一个表 —— 「把所有有 timeColumn 的表都置 null」也能让上一行绿
+    const overview = (data().tables as TableOut[]).find((t) => t.name === 'daily_overview')!
+    expect(overview.time_range).toEqual(
+      { min: '2026-09-15T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00' })
 
     const text = (meta().warnings as string[]).join('\n')
     expect(text).toMatch(/缺少时间列/)
@@ -454,6 +458,10 @@ describe('db describe', () => {
     // 声明元数据照常（含被删的时间列本身）
     expect(d.time_column).toEqual({ name: 'startTime', kind: 'epoch-ms' })
     expect(d.columns.map((c) => c.name)).toContain('startTime')
+    // 反证：其余列没被连坐清空（否则「降级」实际是「整表列集丢失」也会让上面几行绿）
+    const names = d.columns.map((c) => c.name)
+    expect(names).toContain('session_id')
+    expect(names).toContain('userPhone')
 
     const text = (meta().warnings as string[]).join('\n')
     expect(text).toMatch(/少列/)

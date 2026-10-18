@@ -95,6 +95,17 @@ describe('TABLES —— E 元数据扩展', () => {
     expect(tableByName('staff_attendance')!.timeColumn).toEqual({ name: 'hour_ts', kind: 'iso-instant' })
     expect(tableByName('daily_overview')!.timeColumn).toEqual({ name: 'stat_date', kind: 'iso-day' })
   })
+  // ⚠️ 不变量：timeColumn.name 必须是本表 columns 里的一列。
+  // `db describe` / `db tables` 缺时间列时靠「少列」warning 点名（db.ts 的注释依赖这一点）；
+  // 若声明的时间列根本不在 columns 里，列集核对不会报少列 —— 命令会**静默**把
+  // time_range 置 null 而没有任何提示，Agent 会以为「这张表没有时间数据」。
+  it('timeColumn.name 必须出现在本表 columns 中（否则缺列降级会静默）', () => {
+    for (const t of TABLES) {
+      if (t.timeColumn === undefined) continue
+      expect(t.columns.map((c) => c.name), `${t.name}.timeColumn.name=${t.timeColumn.name}`)
+        .toContain(t.timeColumn.name)
+    }
+  })
   it('observed_enum 只出现在有实测出处的列上（不是按名称泛化）', () => {
     expect(tableByName('sessions')!.columns.find((c) => c.name === 'session_type')!.observed_enum)
       .toEqual(['robot', 'internal', 'human'])
