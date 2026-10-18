@@ -264,8 +264,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   这类情形会在 `meta.mask_warnings` 里点名（是警告不是防护），要完整覆盖请用 `--table`。
   两个已知缺口同样进 `meta.mask_warnings`，不会静默：**`--sql` 不按列名脱敏 `payload`**
   （报表 payload 是聚合数字，整值替换会误杀；会话/工单的 payload 只靠值级检测，
-  其中的姓名/地址会原样输出——SQL 里出现 `payload` 或输出含该列即警告，别名与
-  `json_extract` 包装同样覆盖）；**`--table` 通道对 `TABLES` 之外的列不脱敏**
+  其中的姓名/地址会原样输出——SQL 里出现 `payload`、输出含该列、或输出含整行 JSON 值
+  即警告，别名 `payload AS p`、`json_extract(payload,…)`、`row_to_json(t)` 都覆盖）；
+  **`--table` 通道对 `TABLES` 之外的列不脱敏**
   （库中多出来的列可能来自旧版 CLI，只警告不改写）。
   ⚠️ 这些是**警告不是防护**：`--sql` 通道的 payload 缺口只能靠 Agent 读到警告后改用
   `--table` 或 `--no-mask` 显式承担风险来闭合，CLI 无法在保持报表 payload 可用的前提下

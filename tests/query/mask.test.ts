@@ -258,6 +258,37 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
       mode: sqlMode('SELECT session_id FROM sessions'),
     })
     expect(noPayloadCol.warnings).toEqual([])
+
+    // 定点复审记录的第三类形态：整行序列化——SQL 无 payload 记号、输出列名是函数表达式，
+    // 但值就是整行 JSON（姓名/地址原样）。判据补「原始行里存在 JSON 对象/数组值」。
+    for (const sql of [
+      'SELECT row_to_json(t) AS r FROM sessions t',
+      'SELECT to_json(t) AS r FROM sessions t',
+    ]) {
+      const whole = maskQueryRows({
+        rows: [{ r: '{"userName":"张三","userAddress":"北京市朝阳区"}' }],
+        columns: ['r'], mode: sqlMode(sql),
+      })
+      expect(whole.warnings, sql).toHaveLength(1)
+      expect(whole.warnings[0], sql).toMatch(/整行 JSON/)
+    }
+    // 反证 1：报表表的 JSON payload 不是 PII 载体 → 不警告
+    const reportBlob = maskQueryRows({
+      rows: [{ r: '{"total":42}' }], columns: ['r'],
+      mode: sqlMode('SELECT row_to_json(t) AS r FROM daily_overview t'),
+    })
+    expect(reportBlob.warnings).toEqual([])
+    // 反证 2：聚合数字列（非 JSON）不误报
+    const agg = maskQueryRows({
+      rows: [{ c: 3 }], columns: ['c'], mode: sqlMode('SELECT COUNT(*) AS c FROM sessions'),
+    })
+    expect(agg.warnings).toEqual([])
+    // 反证 3：同样的整行 JSON 但表与 payload 无关（staff 无敏感 payload）→ 不警告
+    const staffBlob = maskQueryRows({
+      rows: [{ r: '{"username":"x"}' }], columns: ['r'],
+      mode: sqlMode('SELECT row_to_json(t) AS r FROM staff t'),
+    })
+    expect(staffBlob.warnings).toEqual([])
   })
 
   it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5、词边界、精确大小写）', () => {

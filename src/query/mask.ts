@@ -246,18 +246,32 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 的输出列名都不叫 payload，PII 照样整段漏出。所以判据是「输出列名含 payload
   // **或** SQL 文本出现 payload 标识符（词边界）」。报表表不在此列（payload 未标
   // sensitive），故 `SELECT payload FROM daily_overview` 不会吃警告。
+  // ⚠️ 还有第三类形态（复审定点验证记录）：整行序列化 `SELECT row_to_json(t) FROM sessions t`
+  // ——SQL 里既无 payload 记号、输出列名也是函数表达式，但**值**就是整行 JSON。
+  // 判据补「脱敏**前**的原始行里存在 JSON 对象/数组字面量值」（脱敏会把命中的整段换成
+  // 标记、不再可解析，故必须看入参 rows）。聚合数字列（COUNT 等）不会命中。
   // ⚠️ 这是启发式（与既有缺口警告同源）：字符串字面量里出现 payload 也会误报——方向安全
   //（多警告），且真正解析 SQL 标识符超出本纯函数的职责。
   const payloadPiiTables = mode.tables
     .filter((t) => t.columns.some((c) => c.name === 'payload' && c.sensitive))
     .map((t) => t.name)
     .filter((name) => new RegExp(`\\b${name}\\b`, 'i').test(mode.sql))
+  const hasJsonBlob = rows.some((row) => columns.some((name) => {
+    const v = row[name]
+    if (typeof v !== 'string') return false
+    const t = v.trim()
+    if (!t.startsWith('{') && !t.startsWith('[')) return false
+    try {
+      const parsed: unknown = JSON.parse(t)
+      return typeof parsed === 'object' && parsed !== null
+    } catch { return false }
+  }))
   const payloadReferenced = columns.includes('payload') || /\bpayload\b/i.test(mode.sql)
-  if (payloadReferenced && payloadPiiTables.length > 0) {
+  if ((payloadReferenced || hasJsonBlob) && payloadPiiTables.length > 0) {
     warnings.push(
-      `SQL 引用了 payload（含 PII 的表 ${payloadPiiTables.join('、')}）：`
+      `引用了 payload 或整行 JSON（含 PII 的表 ${payloadPiiTables.join('、')}）：`
       + '本通道只对 payload 做值级检测（手机号/邮箱/IPv4），其中的姓名/地址等无格式 PII 可能未脱敏'
-      + '（别名、JSON 提取、拼接都绕得过列名级）。要整值替换请用 `qiyu query --table <表>`')
+      + '（别名、JSON 提取、整行序列化都绕得过列名级）。要整值替换请用 `qiyu query --table <表>`')
   }
 
   for (const name of sensitiveNames) {
