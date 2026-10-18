@@ -327,10 +327,29 @@ describe('stats fields', () => {
     }
     expect(err.length).toBeGreaterThan(0)   // usageFail 双通道
 
+    // hint 只有在「该表真有 PII payload」时才成立：sessions 确实如此
+    expect(String(errorOf().hint)).toMatch(/PII/)
+
     // 完全未知的表名同样 usage + 清单
     out = ''; err = ''
     expect(await statsCommand(['fields', 'sessons'])).toBe(2)
     expect(errorOf().kind).toBe('usage')
+  })
+
+  // 手工验收（2026-10-18）发现的契约诚实性缺陷：hint 曾固定写「会话/工单的 payload 是
+  // PII 副本」—— 对 `staff`（维度表，没有 payload 列）是假话，对拼错的表名毫无信息量。
+  it('非报表表的 hint 按成因给：维度表不说 PII、拼错的表名给候选', async () => {
+    // 维度表 staff：没有 payload 列 → 不得声称「payload 是 PII 副本」
+    expect(await statsCommand(['fields', 'staff'])).toBe(2)
+    let hint = String(errorOf().hint)
+    expect(hint).not.toMatch(/PII/)
+    expect(hint).toMatch(/没有 payload 列|不是整体收敛进 payload/)
+
+    // 拼错的报表表名 → 候选（不裸给 25 张表清单）
+    out = ''; err = ''
+    expect(await statsCommand(['fields', 'daily_overveiw'])).toBe(2)
+    hint = String(errorOf().hint)
+    expect(hint).toContain('daily_overview')
   })
 
   it('sentinel 恒在，meaning 说明 -1 是「无数据」', async () => {
