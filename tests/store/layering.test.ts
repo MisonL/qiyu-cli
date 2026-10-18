@@ -28,10 +28,36 @@ describe('分层约束（架构不变量）', () => {
       }
     }
   })
+  // core 是 query 与 sync 的共同底座（`core/time.ts` 就是为了让两边共用而沉淀的）——
+  // 它一旦反向依赖 sync/，那条沉淀就白做了，且 query 会间接拉进写侧引擎。
+  it('core/ 不得 import sync/', () => {
+    for (const f of walk(join(src, 'core'))) {
+      for (const m of readFileSync(f, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)) {
+        expect(m[1], `${f} → ${m[1]}`).not.toMatch(/\/sync\/|\.\.\/sync/)
+      }
+    }
+  })
   it('sync/ 不得 import commands/（引擎与任务不知道命令层，spec §十一.15）', () => {
     for (const f of walk(join(src, 'sync'))) {
       for (const m of readFileSync(f, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)) {
         expect(m[1], `${f} → ${m[1]}`).not.toMatch(/\/commands\/|\.\.\/commands/)
+      }
+    }
+  })
+  // E 的红线（spec §5.1 / 裁决 R2）：查询层是**被命令层调用**的库，不是命令层的一部分。
+  // 反向依赖会让 `query/` 里的纯函数（mask / errors / table-query）间接拉进命令层与同步引擎，
+  // 单测被迫加载整个 CLI；`sync/` 更是写侧引擎，只读层依赖它意味着沙箱的只读性无法静态论证。
+  it('query/ 不得 import sync/ 与 commands/', () => {
+    for (const f of walk(join(src, 'query'))) {
+      for (const m of readFileSync(f, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)) {
+        expect(m[1], `${f} → ${m[1]}`).not.toMatch(/\/sync\/|\.\.\/sync|\/commands\/|\.\.\/commands/)
+      }
+    }
+  })
+  it('store/ 不得 import query/', () => {
+    for (const f of walk(join(src, 'store'))) {
+      for (const m of readFileSync(f, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)) {
+        expect(m[1], `${f} → ${m[1]}`).not.toMatch(/\/query\/|\.\.\/query/)
       }
     }
   })
