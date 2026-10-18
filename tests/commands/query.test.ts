@@ -152,6 +152,9 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(w).toHaveLength(1)
     expect(w[0]).toMatch(/不是全部/)
     expect(w[0]).toMatch(/db describe/)
+    // ⚠️ 替代路径必须在该通道真的可行：--since/--until/--group-by 与 --sql 同用会被拒
+    expect(w[0]).toMatch(/在 SQL 里加 WHERE/)
+    expect(w[0]).not.toMatch(/--since/)
 
     expect(await q('--sql', 'SELECT session_id FROM sessions ORDER BY session_id', '--limit', '3')).toBe(0)
     expect(rowsOf()).toHaveLength(3)
@@ -577,8 +580,10 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(meta().data_coverage).toEqual({
       min: '2026-10-14T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00',
     })
-    // 与 --sql 通道同源的截断警告（两个通道共用 truncationWarning）
-    expect((meta().warnings as string[])[0]).toMatch(/不是全部/)
+    // 与 --sql 通道分开的截断警告：--table 通道的替代路径是时间/分组过滤
+    const tw = (meta().warnings as string[]).find((x) => /不是全部/.test(x)) ?? ''
+    expect(tw).toMatch(/--since\/--until\/--group-by/)
+    expect(tw).not.toMatch(/在 SQL 里加 WHERE/)   // 这条通道没有 SQL 可改
   })
 
   it('只有 --until → 下界取该表 MIN；空表 → resolved_range null + 两条 warning', async () => {

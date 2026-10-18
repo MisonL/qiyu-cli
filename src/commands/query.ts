@@ -79,18 +79,23 @@ const ZERO_ROW_HINT =
   '这不代表没有数据：同步可能未覆盖该区间——用 `qiyu sync status` 查看覆盖范围，或放宽过滤条件'
 
 /**
- * 截断警告（两个通道同源）。
+ * 截断警告（两个通道**文案必须分开**）。
  *
  * ⚠️ 措辞必须同时点破两件事（设计稿 §9.2「0 行是比报错危险得多的失败模式」的同源推理）：
  * ① 返回的行数不是全部；② **被切掉的那部分里可能正好有缺失数据的窗口**——Agent 看到
  * `truncated:true` 时注意力天然落在「已返回的这些行」上，于是「同步缺口」这类只有看过
- * 全量才能发现的问题被静默跳过。所以警告里要给出替代路径（`db describe` 看行数/时间范围、
- * 或加过滤条件收窄），而不只是说「结果被截断了」。
+ * 全量才能发现的问题被静默跳过。所以警告里要给出替代路径，而不只是说「结果被截断了」。
+ *
+ * ⚠️ 替代路径**必须在该通道真的可行**（复审 Minor-2）：`--since/--until/--group-by` 与
+ * `--sql` 同用会被拒（`--sql` 只接受 SQL 文本），建议 Agent 加它们等于给一条走不通的路。
+ * `--sql` 通道只能让它改 SQL 里的 WHERE。
  */
-function truncationWarning(returned: number, limit: number): string {
-  return `结果被 --limit ${limit} 截断，本次只返回 ${returned} 行（不是全部）；`
+function truncationWarning(returned: number, limit: number, channel: 'sql' | 'table'): string {
+  const head = `结果被 --limit ${limit} 截断，本次只返回 ${returned} 行（不是全部）；`
     + '聚合与「是否存在数据缺口」的判断都不应基于这批不完整的结果——'
-    + '请用 `qiyu db describe <表>` 看总行数与时间范围，或加过滤条件（--since/--until/--group-by）收窄'
+  return head + (channel === 'table'
+    ? '请用 `qiyu db describe <表>` 看总行数与时间范围，或加过滤条件（--since/--until/--group-by）收窄'
+    : '请在 SQL 里加 WHERE 条件收窄，或用 `qiyu db describe <表>` 看总行数与时间范围')
 }
 
 interface QueryFlags {
@@ -302,7 +307,7 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
   }
 
   // 截断不得静默（同上）：`--limit` 生效时 Agent 读到的不是全量。
-  if (result.truncated) warnings.push(truncationWarning(rows.length, input.limit))
+  if (result.truncated) warnings.push(truncationWarning(rows.length, input.limit, 'table'))
 
   // --no-mask 的风险警告属于「脱敏整体关闭」，进 meta.warnings；mask_warnings 只装
   // 静态缺口警告（没脱敏就没有「脱敏不完整」可言）。spec §7.2。
@@ -462,7 +467,7 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
       warnings.push(`查询返回 0 行，且 SQL 引用了业务时间列。${ZERO_ROW_HINT}`)
     }
     // 截断不得静默：Agent 会把「只看到前 N 行」当成事实（spec §十）。
-    if (result.truncated) warnings.push(truncationWarning(masked.rows.length, limit))
+    if (result.truncated) warnings.push(truncationWarning(masked.rows.length, limit, 'sql'))
 
     // --no-mask 的风险警告属于「脱敏整体关闭」，进 meta.warnings；mask_warnings 只装
     // 静态缺口警告（没脱敏就没有「脱敏不完整」可言）。spec §7.2。

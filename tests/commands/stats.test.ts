@@ -338,12 +338,29 @@ describe('stats fields', () => {
 
   // 手工验收（2026-10-18）发现的契约诚实性缺陷：hint 曾固定写「会话/工单的 payload 是
   // PII 副本」—— 对 `staff`（维度表，没有 payload 列）是假话，对拼错的表名毫无信息量。
-  it('非报表表的 hint 按成因给：维度表不说 PII、拼错的表名给候选', async () => {
+  // 复审 Minor-1：三分后仍有分支内部文案不齐 —— `knowledge_*` 三表**有**非敏感 payload 列，
+  // 却落进「没有 payload 列」那支，同样是假话。
+  it('非报表表的 hint 按成因给：维度表不说 PII、知识库不说「没有 payload 列」、拼错给候选', async () => {
     // 维度表 staff：没有 payload 列 → 不得声称「payload 是 PII 副本」
     expect(await statsCommand(['fields', 'staff'])).toBe(2)
     let hint = String(errorOf().hint)
     expect(hint).not.toMatch(/PII/)
-    expect(hint).toMatch(/没有 payload 列|不是整体收敛进 payload/)
+    expect(hint).toMatch(/没有 payload 列/)
+
+    // 知识库表：**有** payload 列（非敏感）→ 不得说「没有 payload 列」，且要指向 db describe
+    for (const t of ['knowledge_items', 'knowledge_points', 'knowledge_categories']) {
+      out = ''; err = ''
+      expect(await statsCommand(['fields', t]), t).toBe(2)
+      const h = String(errorOf().hint)
+      expect(h, t).not.toMatch(/没有 payload 列/)
+      expect(h, t).not.toMatch(/PII/)
+      expect(h, t).toMatch(/db describe/)
+    }
+
+    // 有敏感 payload 的表：理由仍是 PII
+    out = ''; err = ''
+    expect(await statsCommand(['fields', 'tickets'])).toBe(2)
+    expect(String(errorOf().hint)).toMatch(/PII/)
 
     // 拼错的报表表名 → 候选（不裸给 25 张表清单）
     out = ''; err = ''

@@ -170,18 +170,25 @@ async function statsFields(argv: string[]): Promise<number> {
   const table = sanitizeControlChars(flags.rest[0])
   // spec §9.1：闭集校验先于一切 I/O —— 非报表表不进库、不开连接。
   if (!REPORT_TABLES.includes(table)) {
-    // ⚠️ hint 必须按**这句话是否成立**来给（2026-10-18 手工验收发现）：
+    // ⚠️ hint 必须按**这句话是否成立**来给（2026-10-18 手工验收发现，复审 Minor-1 补齐）：
     // 固定写「会话/工单的 payload 是 PII 副本」对 `staff`/`tags` 这类维度表是假话
-    //（它们没有 payload 列），对表名拼错更是毫无信息量。三种情形分开说。
+    //（它们没有 payload 列），对表名拼错更是毫无信息量。按「有无 payload 列 + 是否敏感」三分：
+    //   · 表名未知 → 候选；
+    //   · 有敏感 payload（sessions/tickets/ticket_logs）→ PII 理由；
+    //   · 有**非敏感** payload（knowledge_* 三表）→ 不能说「没有 payload 列」——那与 schema 相反；
+    //   · 无 payload 列（staff/tags/sync_state 等维度/元数据表）→ 收敛说明。
     const known = TABLES.find((t) => t.name === table)
     const candidates = known === undefined ? suggestNames(table, TABLES.map((t) => t.name)) : []
+    const payloadCol = known?.columns.find((c) => c.name === 'payload')
     const hint = known === undefined
       ? (candidates.length > 0
         ? `候选：${candidates.join('、')}（stats fields 只接受报表域表；用 \`qiyu db tables\` 查看全部表）`
         : '用 `qiyu db tables` 查看全部表；stats fields 只接受报表域表')
-      : known.columns.some((c) => c.name === 'payload' && c.sensitive)
+      : payloadCol !== undefined && payloadCol.sensitive
         ? '该表的 payload 是整行 PII 副本：统计它没有价值且会扩大暴露面'
-        : '该表的业务字段不是整体收敛进 payload 的（没有 payload 列），字段自描述对它没有意义'
+        : payloadCol !== undefined
+          ? '该表的业务字段收敛在 payload 里但不属于报表域；stats fields 只做报表指标，字段清单请用 `qiyu db describe ' + table + '`'
+          : '该表的业务字段不是整体收敛进 payload 的（没有 payload 列），字段自描述对它没有意义'
     return usageFail(
       `stats fields 只接受报表域表，收到：${table}\n可用表：${REPORT_TABLES.join('、')}`,
       hint)
