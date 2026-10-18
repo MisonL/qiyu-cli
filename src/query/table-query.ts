@@ -153,8 +153,12 @@ function buildTimeFilter(input: TableQueryInput): TimeFilter {
     // 只给了 --until：下界取该表时间列 MIN（命令层已查，契约 B）。
     const mn = input.tableMin
     if (mn === undefined || mn === null) {
+      // ⚠️ 措辞不得断言「表为空」（审查 Minor 3）：`MIN(TRY_CAST(...))` 为 NULL 有两种成因
+      // ——表真的没有行，或该列全为 NULL/非数字（epoch-ms 列里脏值会被 TRY_CAST 折成 NULL）。
+      // 说成「表为空」在第二种情形下是假话，Agent 会据此判断「同步没跑」。
       warnings.push(
-        `表 ${table.name} 的时间列 ${tc.name} 无值（表为空），无法解析缺省下界；本次查询仅限制上界`)
+        `表 ${table.name} 的时间列 ${tc.name} 无可用值（表为空，或该列全为 NULL/非数字），`
+        + '无法解析缺省下界；本次查询仅限制上界')
     } else lower = mn
   }
   // --until 缺省但有 --since → 上界 = 当前时刻（契约 B）。
@@ -166,17 +170,29 @@ function buildTimeFilter(input: TableQueryInput): TimeFilter {
   if (lower !== undefined && upper !== undefined) {
     const lo = effectiveBound(tc.kind, lower)
     const hi = effectiveBound(tc.kind, upper)
-    // 契约 I：start >= end → usage。iso-day 取整后可能出现（同一天的 since/until 会落到
-    // 同一个日零点），所以检查放在**取整之后**。
+    // 只有 `lo > hi` 才是用法错误（真·倒置区间）。
+    // ⚠️ `lo === hi` **必须放行**：iso-day 列存的就是日零点，`>= X AND <= X` 是合法的
+    // 单日查询（「就看 9/15 这一天」「看今天」都落在这里）。早先写成 `>=` 会把这两种
+    // 最自然的问法判成「区间无效」，而 `--since 9/14`（不给 until）却能返回 9/14 + 9/15
+    // 两行——同一个意图两种结局，Agent 只能改用 --sql。
+    // iso-instant/epoch-ms 的单点区间同样放行：结果为 0 行 + 既有 0 行警告，比用法错误更符合事实。
     // ⚠️ 只校验用户给出的 since：`--since` 缺省时下界来自表 MIN，「表里最早的数据晚于
     // --until」是数据事实（0 行 + 0 行警告），不是用法错误 —— 不能把它变成退出码 2。
-    if (since !== undefined && lo >= hi) {
+    if (since !== undefined && lo > hi) {
       throw new TableQueryUsageError(
-        `区间无效：生效下界 ${shanghaiIso(lo)} 不早于生效上界 ${shanghaiIso(hi)}` +
+        `区间无效：生效下界 ${shanghaiIso(lo)} 晚于生效上界 ${shanghaiIso(hi)}` +
         (tc.kind === 'iso-day' ? '（日期型时间列两端都取上海日零点）' : '') +
         '；请调整 --since / --until')
     }
     resolvedRange = [lo, hi]
+    // 下界来自表 MIN 时可能出现 lo > hi（「表里最早的数据晚于 --until」）：这不是用法
+    // 错误（用户只给了一个端点），但 resolved_range 会回显一个倒置二元组 —— 不说明成因的话
+    // Agent 得自己推断为什么 0 行。spec §十「0 行 ≠ 没有数据」的同类：把成因写在明处。
+    if (since === undefined && lo > hi) {
+      warnings.push(
+        `缺省下界（该表最早数据 ${shanghaiIso(lo)}）晚于上界 ${shanghaiIso(hi)}，本次查询必然 0 行；`
+        + '请放宽 --until 或改用 --sql')
+    }
   }
 
   const expr = timeExprOf(tc)

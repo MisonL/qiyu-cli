@@ -93,6 +93,10 @@ describe('buildTableQuery · 缺省端与 resolved_range（契约 B/C）', () =>
     expect(plan.resolvedRange).toBeNull()
     expect(plan.warnings).toHaveLength(1)
     expect(plan.warnings[0]).toMatch(/无法解析缺省下界/)
+    // ⚠️ 不得断言「表为空」（审查 Minor 3）：MIN 为 NULL 也可能是时间列全为 NULL/非数字
+    //（epoch-ms 列的脏值被 TRY_CAST 折成 NULL），那时表并不空。两种成因都要覆盖到文案里。
+    expect(plan.warnings[0]).toMatch(/表为空|NULL\/非数字/)
+    expect(plan.warnings[0]).toMatch(/NULL\/非数字/)
   })
 
   it('两端都缺省 → 不加时间谓词，resolved_range 为 null', () => {
@@ -102,30 +106,59 @@ describe('buildTableQuery · 缺省端与 resolved_range（契约 B/C）', () =>
     expect(plan.resolvedRange).toBeNull()
   })
 
-  it('区间无效：生效下界不早于生效上界 → 抛 usage（iso-day 取整后可能出现）', () => {
-    // 原始 since > until
+  it('区间倒置（下界晚于上界）→ 抛 usage', () => {
     expect(() => buildTableQuery({
       table: t('sessions'),
       since: Date.parse('2026-10-20T00:00:00Z'),
       until: Date.parse('2026-10-01T00:00:00Z'),
       now: NOW,
     })).toThrow(/区间无效/)
+  })
 
-    // iso-day 取整后两端落到同一天：契约 I 明定 start >= end → usage
-    expect(() => buildTableQuery({
+  // ⚠️ 同一天是**合法的单日区间**，不是用法错误（审查 Important #2）：
+  // iso-day 列存的就是日零点，`>= X AND <= X` 正好选中那一天。
+  // 早先按 `lo >= hi` 拒绝，会让「就看 9/15 这一天」「看今天」两种最自然的问法都变成 exit 2，
+  // 而 `--since 9/14`（不给 until）却能返回 9/14 + 9/15 两行 —— 同一个意图两种结局。
+  it('iso-day 两端落在同一天 → 合法单日区间（两个参数都是该日零点）', () => {
+    const plan = buildTableQuery({
       table: t('daily_overview'),
       since: Date.parse('2026-09-15T12:00:00+08:00'),
       until: Date.parse('2026-09-15T13:00:00+08:00'),
       now: NOW,
-    })).toThrow(/区间无效/)
+    })
+    const dayIso = '2026-09-14T16:00:00.000Z'   // 上海 9/15 零点
+    expect(plan.params).toEqual([dayIso, dayIso])
+    expect(plan.sql).toContain('"stat_date" >= ?')
+    expect(plan.sql).toContain('"stat_date" <= ?')
+    expect(plan.resolvedRange).toEqual([
+      Date.parse('2026-09-15T00:00:00+08:00'), Date.parse('2026-09-15T00:00:00+08:00')])
   })
 
-  it('只给 --until 且表下界晚于 until → 不是用法错误（「数据都在区间之后」是 0 行事实）', () => {
+  it('iso-instant / epoch-ms 的单点区间同样放行（0 行是事实，不是用法错误）', () => {
+    const at = Date.parse('2026-09-15T02:00:00Z')
+    const plan = buildTableQuery({ table: t('staff_attendance'), since: at, until: at, now: NOW })
+    expect(plan.params).toEqual(['2026-09-15T02:00:00.000Z', '2026-09-15T02:00:00.000Z'])
+  })
+
+  it('只给 --until 且表下界晚于 until → 不是用法错误，但 warning 点名「必然 0 行」', () => {
     const min = Date.parse('2026-10-01T00:00:00Z')
     const until = Date.parse('2026-01-01T00:00:00Z')
     const plan = buildTableQuery({ table: t('sessions'), until, tableMin: min, now: NOW })
     expect(plan.params).toEqual([min, until])
-    expect(plan.resolvedRange).toEqual([min, until])   // 如实回显，不粉饰成 null
+    // 如实回显倒置区间（不粉饰成 null，否则 Agent 不知道发生了什么）
+    expect(plan.resolvedRange).toEqual([min, until])
+    // ⚠️ 但必须说明成因：resolved_range 是个倒置二元组，不解释的话 Agent 得自己推断
+    expect(plan.warnings.some((w) => /必然 0 行/.test(w))).toBe(true)
+  })
+
+  // 反证：下界来自 MIN 且**有效**（早于 until）时不得出现这条 warning
+  // —— 否则「只给 --until」这条路径会永远带一条与事实不符的警告。
+  it('只给 --until 且表下界早于 until → 无「必然 0 行」警告', () => {
+    const plan = buildTableQuery({
+      table: t('sessions'), until: Date.parse('2026-10-05T00:00:00Z'),
+      tableMin: Date.parse('2026-10-01T00:00:00Z'), now: NOW,
+    })
+    expect(plan.warnings).toEqual([])
   })
 
   it('effectiveBound：iso-day 取上海日零点，其余原值', () => {

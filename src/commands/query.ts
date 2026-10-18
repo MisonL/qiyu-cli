@@ -156,9 +156,17 @@ function parseTimeoutMs(raw: string | undefined): number {
 }
 
 /**
- * 时间参数归一（`src/commands/sync-run.ts` 同款）：`Nd`/`yesterday` 返回完整区间
+ * 时间参数归一（形态沿 `src/commands/sync-run.ts`）：`Nd`/`yesterday` 返回完整区间
  * （`--since` 取 .start、`--until` 取 .end）；`YYYY-MM-DD`/ISO 返回时刻。
  * 无法解析 → 抛错（命令层转 usage），不静默当成「无过滤」。
+ *
+ * ⚠️ `--until` 取区间形态时**必须减 1ms**，与 sync-run.ts 的 `.end` 不同：
+ * `parseTimeArg` 返回的是**半开窗口** `[start, end)`（`yesterday` = `[昨天0点, 今天0点)`）。
+ * sync-run 拿 `.end` 当窗口右端（半开，正确）；而查询的谓词是**闭区间** `<=`，
+ * 直接把 `.end` 当上界会多含一天：iso-day 列取整后上界落在「今天 0 点」，正好等于
+ * 今天那行的 stat_date —— 用户说「只要昨天」却拿到昨天 + 今天，退出码 0、无 warning。
+ * 减 1ms 后 iso-day 取整得昨天 0 点（正确）、iso-instant/epoch-ms 得 `…23:59:59.999`
+ * （正确）。**这不是笔误，改回 `.end` 会把静默多算一天重新引入。**
  */
 function resolveTimeFlag(
   raw: string | undefined, label: '--since' | '--until', clock: () => number,
@@ -168,7 +176,8 @@ function resolveTimeFlag(
   if (v === null) {
     throw new Error(`${label} 无法解析：${raw}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601（按 Asia/Shanghai）`)
   }
-  return typeof v === 'object' ? (label === '--since' ? v.start : v.end) : v
+  if (typeof v !== 'object') return v
+  return label === '--since' ? v.start : v.end - 1
 }
 
 /**
@@ -270,6 +279,11 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
   // 0 行 ≠ 没有数据（spec §十 / 红线 3）：给了时间过滤而 0 行时附可操作提示。
   if (result.rows.length === 0 && (input.since !== undefined || input.until !== undefined)) {
     warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until))
+  } else if (result.rows.length === 0 && warnings.length === 0) {
+    // 没给时间过滤也 0 行：spec §十 把「空表」列为 warnings 的触发条件。
+    // 这里必须能区分「表空」与「查询没命中」—— `--table` 通道没有 WHERE 子句（除了时间过滤），
+    // 所以 0 行且无时间过滤**只可能**是表里没有行。文案与 `stats fields` 的空表警告同源。
+    warnings.push('该表无数据；先运行 `qiyu sync run`')
   }
 
   // --no-mask 的风险警告属于「脱敏整体关闭」，进 meta.warnings；mask_warnings 只装

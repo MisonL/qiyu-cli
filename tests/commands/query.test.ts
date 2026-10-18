@@ -451,6 +451,47 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(meta().mask_warnings).toEqual([])
   })
 
+  it('iso-day 单日区间：--since 与 --until 落在同一天 → 合法，只返回那一天（不是用法错误）', async () => {
+    await seed()
+    expect(await qAt('--table', 'daily_overview',
+      '--since', '2026-10-14T08:00:00+08:00', '--until', '2026-10-14T20:00:00+08:00')).toBe(0)
+
+    expect(rowsOf()).toHaveLength(1)
+    expect(rowsOf()[0].stat_date).toBe('2026-10-13T16:00:00.000Z')   // 上海 10/14 零点
+    expect(meta().resolved_range).toEqual([
+      '2026-10-14T00:00:00+08:00', '2026-10-14T00:00:00+08:00'])
+  })
+
+  // ⚠️ `parseTimeArg` 的区间形态（yesterday / Nd）是**半开** `[start, end)`，
+  // 而查询谓词是闭区间 `<=`。直接把 `.end` 当上界会多算一天：iso-day 取整后上界落在
+  // 「今天 0 点」，正好等于今天那行的 stat_date —— 用户说「只要昨天」却拿到昨天+今天，
+  // 退出码 0、无 warning（审查 Important #1）。真实库实测复现过。
+  it('--until 取区间形态（yesterday）不得多算一天：闭区间上界按 end−1ms 取整', async () => {
+    await seed()
+    // 补一行「今天」（上海 10/15）的数据；夹具原有的行在上海 10/14
+    await seedMore('daily_overview', [
+      { stat_date: '2026-10-14T16:00:00.000Z', payload: '{"a":9}', synchronized_at: null },
+    ])
+    expect(await qAt('--table', 'daily_overview', '--until', 'yesterday')).toBe(0)
+
+    // 只要昨天（10/14）：今天（10/15）那行不得出现
+    expect(rowsOf()).toHaveLength(1)
+    expect(rowsOf()[0].stat_date).toBe('2026-10-13T16:00:00.000Z')
+    expect(meta().resolved_range).toEqual([
+      '2026-10-14T00:00:00+08:00', '2026-10-14T00:00:00+08:00'])
+  })
+
+  it('0 行 + 无时间过滤（表空）→ warning 说明表空（spec §十「空表」触发条件）', async () => {
+    await seed()   // robot_summary 无数据
+    expect(await qAt('--table', 'robot_summary')).toBe(0)
+
+    expect(rowsOf()).toHaveLength(0)
+    const warnings = meta().warnings as string[]
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatch(/该表无数据/)
+    expect(warnings[0]).toMatch(/sync run/)
+  })
+
   it('iso-day：--since 9/15 12:00 向下取整后仍包含 stat_date=9/15 零点的行（spec §四 的核心语义）', async () => {
     await seed()
     // 夹具行的 stat_date = 2026-10-13T16:00:00.000Z = 上海 10/14 00:00
