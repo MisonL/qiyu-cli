@@ -1,4 +1,5 @@
-// tests/commands/query.test.ts —— E-T8：`query --sql` 命令面（spec §五/§七/§十/§十一）。
+// tests/commands/query.test.ts —— E-T8/T9：`query --sql` 与 `query --table` 命令面
+// （spec §五/§六/§七/§十/§十一）。
 // 夹具沿 tests/commands/db.test.ts：mkdtemp + stubEnv('HOME') + 真 DuckDB 临时库 +
 // spy stdout/stderr 双通道。
 // ⚠️ fixtures 全合成：13800001111 是明显的测试号码，不使用任何真实企业数据。
@@ -43,6 +44,15 @@ async function q(...args: string[]): Promise<number> {
   return queryCommand([...args, '--db', dbPath()])
 }
 
+/** 固定时钟：上海 2026-10-15 12:00（--since Nd 的 end 与缺省上界都取它，测试不读系统时钟）。 */
+const NOW = Date.parse('2026-10-15T04:00:00Z')
+
+/** 同 q()，但注入固定时钟（--table 的时间缺省端依赖它，不注入就会 flaky）。 */
+async function qAt(...args: string[]): Promise<number> {
+  out = ''; err = ''
+  return queryCommand([...args, '--db', dbPath()], { now: () => NOW })
+}
+
 /** 会话行（payload 为合成 JSON，userPhone 是明显的测试号码）。 */
 const sessionRow = (id: string): Record<string, unknown> => ({
   session_id: id, payload: JSON.stringify({ id }), staffId: '1000001',
@@ -66,6 +76,27 @@ async function seed(): Promise<void> {
     await s.close()
   }
 }
+
+/** 在已 seed 的库上追加合成行（upsert 要求每行提供该表完整列集）。 */
+async function seedMore(table: string, rows: Record<string, unknown>[]): Promise<void> {
+  const s: Store = await createDuckDbStore(
+    { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+  try {
+    await s.upsert(table, rows)
+  } finally {
+    await s.close()
+  }
+}
+
+/** 考勤行（iso-instant 时间列 hour_ts）：值全为合成。 */
+const attendanceRow = (hourTs: string): Record<string, unknown> => ({
+  staff_id: '1000001', hour_ts: hourTs, stat_date: '2026-09-14T16:00:00.000Z',
+  payload: '{"a":1}', synchronized_at: '2026-10-15T00:00:00.000Z',
+})
+
+/** 日报行（iso-day 时间列 stat_date）：stat_date 是上海日零点的 ISO。 */
+const overviewRow = (statDate: string): Record<string, unknown> =>
+  ({ stat_date: statDate, payload: '{"a":1}', synchronized_at: null })
 
 /**
  * 外部证据：库文件此刻能以 READ_WRITE 打开 —— 说明命令结束后没有只读会话把锁滞留在进程里。
@@ -181,7 +212,7 @@ describe('query --sql · 成功路径（spec §十）', () => {
 })
 
 describe('query --sql · 参数与错误分派（spec §十一）', () => {
-  it('--sql 与 --table 互斥；都缺 → usage；--table 单独给 → 尚未实现（Task 9 替换）', async () => {
+  it('--sql 与 --table 互斥；都缺 → usage', async () => {
     await seed()
 
     expect(await q('--sql', 'SELECT 1', '--table', 'sessions')).toBe(2)
@@ -191,10 +222,6 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(await q()).toBe(2)
     expect(errorOf().kind).toBe('usage')
     expect(err).toMatch(/--sql/)
-
-    expect(await q('--table', 'sessions')).toBe(2)
-    expect(errorOf().kind).toBe('usage')
-    expect(err).toMatch(/尚未实现/)
   })
 
   it('未知表 → usage + query_error + 候选 sessions（不裸透 DuckDB 英文原文）', async () => {
@@ -267,6 +294,11 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(await queryCommand(['--help'])).toBe(0)
     expect(out).toMatch(/query --sql/)
     expect(out).toMatch(/query --table/)
+    // Task 9：--table 已实现，USAGE 不得再承诺「尚未实现」；时间/分组参数要在用法里
+    expect(out).not.toMatch(/尚未实现/)
+    expect(out).toMatch(/--since/)
+    expect(out).toMatch(/--until/)
+    expect(out).toMatch(/--group-by/)
     expect(err).toBe('')
 
     // --help 不吞额外参数
@@ -369,5 +401,240 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     const e = errorOf()
     expect(e.kind).toBe('store_not_initialized')
     expect(String(e.hint)).toMatch(/store init|--db/)
+  })
+})
+
+describe('query --table · 成功路径（spec §六/§十）', () => {
+  it('精确脱敏：sensitive 列全脱敏、session_type 原样；meta 仍是九键（形状钉死）', async () => {
+    await seed()
+    expect(await qAt('--table', 'sessions')).toBe(0)
+    expect(err).toBe('')
+
+    expect(rowsOf()).toHaveLength(3)
+    const row = rowsOf()[0]
+    expect(row.userPhone).toBe('138****1111')   // §7.1 手机号规则：前 3 后 4
+    expect(row.userName).toBe('<已脱敏>')        // 姓名无格式 → 整值替换
+    expect(row.payload).toBe('<已脱敏>')         // payload 是 PII 完整副本 → 整值替换
+    expect(row.session_type).toBe('human')      // 非敏感列不得误伤
+    expect(row.userEmail).toBeNull()            // null 不变成字符串
+    expect(out).not.toContain('13800001111')
+
+    const m = meta()
+    expect(m.rows).toBe(3)
+    expect(m.truncated).toBe(false)
+    expect(m.limit_applied).toBe(1000)
+    expect(m.masked).toBe(true)
+    // 实际被改写的列，按输出列序
+    expect(m.masked_columns).toEqual(['payload', 'userPhone', 'userName'])
+    expect(m.mask_warnings).toEqual([])
+    expect(m.warnings).toEqual([])
+    // 没给 --since/--until → 不回显区间；有 timeColumn → 覆盖恒计算
+    expect(m.resolved_range).toBeNull()
+    expect(m.data_coverage).toEqual({
+      min: '2026-10-14T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00',
+    })
+    expect(Object.keys(m).sort()).toEqual([
+      'data_coverage', 'limit_applied', 'mask_warnings', 'masked', 'masked_columns',
+      'resolved_range', 'rows', 'truncated', 'warnings',
+    ])
+  })
+
+  it('--no-mask：输出原值 + meta.warnings 带 PII 警告，masked_columns 为空', async () => {
+    await seed()
+    expect(await qAt('--table', 'sessions', '--no-mask')).toBe(0)
+
+    expect(rowsOf()[0].userPhone).toBe('13800001111')
+    expect(rowsOf()[0].userName).toBe('测试用户')
+    expect(meta().masked).toBe(false)
+    expect(meta().masked_columns).toEqual([])
+    expect(meta().warnings).toContain(NO_MASK_WARNING)
+    expect(meta().mask_warnings).toEqual([])
+  })
+
+  it('iso-day：--since 9/15 12:00 向下取整后仍包含 stat_date=9/15 零点的行（spec §四 的核心语义）', async () => {
+    await seed()
+    // 夹具行的 stat_date = 2026-10-13T16:00:00.000Z = 上海 10/14 00:00
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-14T12:00:00+08:00')).toBe(0)
+
+    expect(rowsOf()).toHaveLength(1)
+    expect(rowsOf()[0].stat_date).toBe('2026-10-13T16:00:00.000Z')
+    // resolved_range 回显**实际生效**的区间：两端都是上海日零点（含 --until 所在日全天）
+    expect(meta().resolved_range).toEqual([
+      '2026-10-14T00:00:00+08:00', '2026-10-15T00:00:00+08:00',
+    ])
+    expect(meta().data_coverage).toEqual({
+      min: '2026-10-14T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00',
+    })
+  })
+
+  it('iso-instant：staff_attendance 按 hour_ts 字符串比较（不取整）', async () => {
+    await seed()
+    await seedMore('staff_attendance', [
+      attendanceRow('2026-09-15T02:00:00.000Z'),
+      attendanceRow('2026-09-15T05:00:00.000Z'),
+    ])
+    expect(await qAt('--table', 'staff_attendance',
+      '--since', '2026-09-15T01:00:00Z', '--until', '2026-09-15T03:00:00Z')).toBe(0)
+
+    expect(rowsOf().map((r) => r.hour_ts)).toEqual(['2026-09-15T02:00:00.000Z'])
+    expect(meta().resolved_range).toEqual([
+      '2026-09-15T09:00:00+08:00', '2026-09-15T11:00:00+08:00',
+    ])
+  })
+
+  it('epoch-ms：TRY_CAST 排除非数字 startTime；data_coverage 只覆盖过滤范围', async () => {
+    await seed()
+    await seedMore('sessions', [
+      { ...sessionRow('s4'), startTime: String(Date.parse('2026-09-01T00:00:00Z')) },
+      { ...sessionRow('s5'), startTime: 'not-a-number' },   // 非数字行不参与时间比较
+    ])
+    expect(await qAt('--table', 'sessions',
+      '--since', '2026-08-31', '--until', '2026-09-03')).toBe(0)
+
+    expect(rowsOf().map((r) => r.session_id)).toEqual(['s4'])
+    // 全表覆盖会是 [9/1 08:00, 10/14 00:00]；过滤后只剩 s4 一段
+    expect(meta().data_coverage).toEqual({
+      min: '2026-09-01T08:00:00+08:00', max: '2026-09-01T08:00:00+08:00',
+    })
+  })
+
+  it('--group-by：count 是 number（BIGINT 字符串必须 Number 收敛）+ 分组确定性排序', async () => {
+    await seed()
+    expect(await qAt('--table', 'sessions', '--since', '30d', '--group-by', 'session_type')).toBe(0)
+
+    expect(rowsOf()).toEqual([{ session_type: 'human', count: 3 }])
+    expect(typeof rowsOf()[0].count).toBe('number')
+    expect(meta().masked_columns).toEqual([])   // 分组列已排除敏感列
+    expect(meta().resolved_range).toEqual([
+      '2026-09-15T12:00:00+08:00', '2026-10-15T12:00:00+08:00',
+    ])
+  })
+
+  it('确定性排序：同一 startTime 的行按主键 ASC，跑两次顺序一致', async () => {
+    await seed()
+    expect(await qAt('--table', 'sessions')).toBe(0)
+    const first = rowsOf().map((r) => r.session_id)
+    expect(first).toEqual(['s1', 's2', 's3'])
+
+    expect(await qAt('--table', 'sessions')).toBe(0)
+    expect(rowsOf().map((r) => r.session_id)).toEqual(first)
+  })
+
+  it('截断：--limit 2 → truncated true；data_coverage 仍覆盖全表（独立查询，不受 limit 影响）', async () => {
+    await seed()
+    expect(await qAt('--table', 'sessions', '--limit', '2')).toBe(0)
+
+    expect(rowsOf()).toHaveLength(2)
+    expect(meta().rows).toBe(2)
+    expect(meta().truncated).toBe(true)
+    expect(meta().data_coverage).toEqual({
+      min: '2026-10-14T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00',
+    })
+  })
+
+  it('只有 --until → 下界取该表 MIN；空表 → resolved_range null + 两条 warning', async () => {
+    await seed()
+    await seedMore('sessions', [
+      { ...sessionRow('s4'), startTime: String(Date.parse('2026-10-01T00:00:00Z')) },
+    ])
+    expect(await qAt('--table', 'sessions', '--until', '2026-10-05')).toBe(0)
+
+    expect(rowsOf().map((r) => r.session_id)).toEqual(['s4'])
+    expect(meta().resolved_range).toEqual([
+      '2026-10-01T08:00:00+08:00', '2026-10-05T00:00:00+08:00',
+    ])
+
+    // 空表（无任何行）→ 无法解析缺省下界
+    expect(await qAt('--table', 'robot_summary', '--until', '2026-10-05')).toBe(0)
+    expect(rowsOf()).toHaveLength(0)
+    expect(meta().resolved_range).toBeNull()
+    expect(meta().data_coverage).toBeNull()
+    const warnings = meta().warnings as string[]
+    expect(warnings.some((w) => /无法解析缺省下界/.test(w))).toBe(true)
+    expect(warnings.some((w) => /0 行/.test(w))).toBe(true)
+  })
+
+  it('0 行 + 时间过滤 → warning 说明实际区间（与 --sql 通道同源文案）', async () => {
+    await seed()
+    expect(await qAt('--table', 'daily_overview',
+      '--since', '2026-10-01', '--until', '2026-10-05')).toBe(0)
+
+    const warnings = meta().warnings as string[]
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('2026-10-01T00:00:00+08:00')
+    expect(warnings[0]).toContain('2026-10-05T00:00:00+08:00')
+    expect(warnings[0]).toContain('这不代表没有数据')
+    expect(warnings[0]).toContain('qiyu sync status')
+  })
+})
+
+describe('query --table · 参数与错误分派（spec §六/§十一）', () => {
+  it('未知表 → usage + 候选 sessions', async () => {
+    await seed()
+    expect(await qAt('--table', 'sessons')).toBe(2)
+
+    expect(errorOf().kind).toBe('usage')
+    expect(err).toMatch(/未知表：sessons/)
+    expect(String(errorOf().hint)).toContain('sessions')
+  })
+
+  it('无 timeColumn 的表给 --since/--until → usage + 有 timeColumn 的表清单', async () => {
+    await seed()
+    expect(await qAt('--table', 'staff', '--since', '2026-09-01')).toBe(2)
+
+    expect(errorOf().kind).toBe('usage')
+    expect(err).toMatch(/没有时间列/)
+    // hint 列出**有**时间列的表，而不是全表清单
+    const hint = String(errorOf().hint)
+    expect(hint).toContain('daily_overview')
+    expect(hint).toContain('sessions')
+    expect(hint).not.toMatch(/支持时间过滤的表：.*staff[^_]/)
+  })
+
+  it('--group-by 未知列 / 敏感列 / 重复列 → usage', async () => {
+    await seed()
+
+    expect(await qAt('--table', 'sessions', '--group-by', 'session_typ')).toBe(2)
+    expect(errorOf().kind).toBe('usage')
+    expect(err).toMatch(/未知列.*session_typ/)
+    expect(err).toContain('session_type')   // 该表列候选
+
+    for (const col of ['userPhone', 'payload']) {
+      expect(await qAt('--table', 'sessions', '--group-by', col), col).toBe(2)
+      expect(err, col).toContain(`不接受敏感列 ${col}`)
+      expect(err, col).toContain('失真')
+      expect(err, col).toContain('--sql')
+    }
+
+    expect(await qAt('--table', 'sessions',
+      '--group-by', 'session_type', '--group-by', 'session_type')).toBe(2)
+    expect(err).toMatch(/重复/)
+  })
+
+  it('区间无效（start >= end）→ usage', async () => {
+    await seed()
+    expect(await qAt('--table', 'sessions',
+      '--since', '2026-10-20', '--until', '2026-10-01')).toBe(2)
+
+    expect(errorOf().kind).toBe('usage')
+    expect(err).toMatch(/区间无效/)
+  })
+
+  it('--sql 与 --since/--until/--group-by 同用 → usage（只适用于 --table）', async () => {
+    await seed()
+
+    for (const extra of [['--since', '30d'], ['--until', '2026-10-01'], ['--group-by', 'x']]) {
+      expect(await qAt('--sql', 'SELECT 1', ...extra), extra.join(' ')).toBe(2)
+      expect(errorOf().kind).toBe('usage')
+      expect(err).toMatch(/只适用于 --table/)
+    }
+  })
+
+  it('--since/--until 无法解析 → usage', async () => {
+    await seed()
+    expect(await qAt('--table', 'sessions', '--since', '不是时间')).toBe(2)
+    expect(err).toMatch(/--since 无法解析/)
+    expect(await qAt('--table', 'sessions', '--until', '不是时间')).toBe(2)
+    expect(err).toMatch(/--until 无法解析/)
   })
 })

@@ -1,4 +1,4 @@
-// src/commands/query.ts —— E-T8：`query --sql`（spec §五 / §七 / §十 / §十一）。
+// src/commands/query.ts —— E-T8/T9：`query --sql`（spec §五）与 `query --table`（spec §六）。
 //
 // 形态沿 store.ts / db.ts：parseFlags（值位守卫）→ usageFail/fail 双通道 →
 // 查询层统一错误出口 thrownToQueryExit。
@@ -8,15 +8,23 @@
 //     DuckDB 驱动（驱动包名字面量禁止出现在 src/commands/，layering 红线）；
 //   · 默认脱敏，原始值必须显式 `--no-mask`（spec §七）。脱敏的唯一出口是
 //     `query/mask.ts`，本文件不自己改值；
-//   · 0 行 ≠ 没有数据（spec §十）：SQL 含时间列而结果 0 行 → 必须附可操作警告。
+//   · 0 行 ≠ 没有数据（spec §十）：SQL 含时间列、或 --table 给了时间过滤而结果 0 行
+//     → 必须附可操作警告。
 //
-// `--table` 由 Task 9 在同一文件追加；本任务只保留互斥检查与占位分支。
+// `--table` 的 SQL 构造在 `query/table-query.ts`（纯函数，单测不加载 CLI/引擎）：
+// 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import { resolveStoreConfig } from '../store/config.js'
 import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
-import { thrownToQueryExit } from '../query/errors.js'
+import { suggestNames, thrownToQueryExit } from '../query/errors.js'
 import { maskQueryRows } from '../query/mask.js'
-import { TABLES } from '../store/schema.js'
+import { parseTimeArg, shanghaiIso, msToShanghaiIso } from '../core/time.js'
+import { TABLES, tableByName } from '../store/schema.js'
+import type { TableDef, TimeColumnKind } from '../store/schema.js'
+import {
+  buildCoverageQuery, buildMinQuery, buildTableQuery, effectiveBound, validateGroupBy,
+} from '../query/table-query.js'
+import type { BuiltTableQuery } from '../query/table-query.js'
 import { statGuard } from './db.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
 
@@ -24,14 +32,17 @@ const USAGE = `用法：qiyu query <查询方式> [参数]
 
 查询方式（二选一）：
   query --sql <SQL>        任意只读 SQL（三层只读沙箱 + 默认脱敏 + 行数上限 + 超时）
-  query --table <表>       受约束查询通道（尚未实现）
+  query --table <表>       受约束查询通道（TABLES 闭集校验 + 时间过滤 + 分组计数 + 默认脱敏）
 
 参数：
-  --limit <n>             最多返回行数，1–10000 的整数（默认 1000）
-  --timeout <秒>          超时秒数，非负数，0 = 无超时（默认 30）
-  --no-mask               关闭默认脱敏，输出原始 PII（不要写入日志或对外报表）
+  --since <时间>           起始时间（仅 --table）：Nd / yesterday / YYYY-MM-DD / ISO 8601，按 Asia/Shanghai 解析
+  --until <时间>           结束时间（仅 --table）：同上；日期型时间列含 --until 所在自然日全天
+  --group-by <列>          按列分组计数（仅 --table，可重复给多列；不接受敏感列）
+  --limit <n>              最多返回行数，1–10000 的整数（默认 1000）
+  --timeout <秒>           超时秒数，非负数，0 = 无超时（默认 30）
+  --no-mask                关闭默认脱敏，输出原始 PII（不要写入日志或对外报表）
   --db <path> / --profile <name> / --backend <name>
-                          存储定位（与 store / sync 命令同族）
+                           存储定位（与 store / sync 命令同族）
 
 只接受单条 SELECT / DESCRIBE / SHOW / EXPLAIN；写操作、多语句、文件与网络访问一律被沙箱拦截。
 `
@@ -39,7 +50,10 @@ const USAGE = `用法：qiyu query <查询方式> [参数]
 const KNOWN = new Set(['--help', '-h', '--pretty'])
 
 /** 值位参数（缺值或值以 `--` 开头 → 报缺值，防止把下一个 flag 当取值）。 */
-const VALUE_FLAGS = new Set(['--sql', '--table', '--limit', '--timeout', '--db', '--profile', '--backend'])
+const VALUE_FLAGS = new Set([
+  '--sql', '--table', '--since', '--until', '--group-by',
+  '--limit', '--timeout', '--db', '--profile', '--backend',
+])
 
 /**
  * 全部已知 flag token（含布尔 flag 与 help/pretty）。
@@ -60,9 +74,16 @@ const TIMEOUT_MAX_MS = 2_147_483_647
  */
 const ZERO_ROW_TIME_RE = /\b(stat_date|work_date|hour_ts|startTime|endTime)\b/
 
+/** 0 行警告的后半句（两个通道同源）；前半句各自说明触发条件与实际区间。 */
+const ZERO_ROW_HINT =
+  '这不代表没有数据：同步可能未覆盖该区间——用 `qiyu sync status` 查看覆盖范围，或放宽过滤条件'
+
 interface QueryFlags {
   sql?: string
   table?: string
+  since?: string
+  until?: string
+  groupBy: string[]
   limit?: string
   timeout?: string
   noMask: boolean
@@ -72,7 +93,7 @@ interface QueryFlags {
 }
 
 function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
-  const out: QueryFlags & { rest: string[] } = { noMask: false, rest: [] }
+  const out: QueryFlags & { rest: string[] } = { noMask: false, groupBy: [], rest: [] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (VALUE_FLAGS.has(a)) {
@@ -80,13 +101,16 @@ function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
       // 值位守卫（沿 store.ts / db.ts）：值位缺失，或取值**恰好是已知 flag** → 报缺值，
       // 否则 `query --sql --limit 2` 会把 --limit 当成 SQL 文本。
       // ⚠️ `--sql` 只拒绝「恰好是已知 flag」的值：SQL 以 `--` 开头是合法行注释
-      // （`--sql '-- 注释\nSELECT 1'` 必须能跑）。路径/名字/数字的合法取值不会以 `--`
+      // （`--sql '-- 注释\nSELECT 1'` 必须能跑）。路径/名字/数字/时间的合法取值不会以 `--`
       // 开头，所以其余值位参数仍按前缀拒绝。
       if (v === undefined || (a === '--sql' ? FLAG_TOKENS.has(v) : v.startsWith('--'))) {
         throw new Error(`${a} 缺少取值`)
       }
       if (a === '--sql') out.sql = v
       else if (a === '--table') out.table = v
+      else if (a === '--since') out.since = v
+      else if (a === '--until') out.until = v
+      else if (a === '--group-by') out.groupBy.push(v)   // 可重复（spec §六）
       else if (a === '--limit') out.limit = v
       else if (a === '--timeout') out.timeout = v
       else if (a === '--db') out.db = v
@@ -131,7 +155,153 @@ function parseTimeoutMs(raw: string | undefined): number {
   return n > 0 && ms === 0 ? 1 : ms
 }
 
-export async function queryCommand(argv: string[]): Promise<number> {
+/**
+ * 时间参数归一（`src/commands/sync-run.ts` 同款）：`Nd`/`yesterday` 返回完整区间
+ * （`--since` 取 .start、`--until` 取 .end）；`YYYY-MM-DD`/ISO 返回时刻。
+ * 无法解析 → 抛错（命令层转 usage），不静默当成「无过滤」。
+ */
+function resolveTimeFlag(
+  raw: string | undefined, label: '--since' | '--until', clock: () => number,
+): number | undefined {
+  if (raw === undefined) return undefined
+  const v = parseTimeArg(raw, clock, label)
+  if (v === null) {
+    throw new Error(`${label} 无法解析：${raw}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601（按 Asia/Shanghai）`)
+  }
+  return typeof v === 'object' ? (label === '--since' ? v.start : v.end) : v
+}
+
+/**
+ * 查表 MIN 的返回值 → epoch 毫秒（契约 B）。
+ * epoch-ms 列经 MIN(TRY_CAST) 出来是 BIGINT（JSON 安全值是字符串）；iso 列是 ISO 字符串。
+ * 无值/不可解析 → null（不编造一个边界）。
+ */
+function toEpochMs(v: unknown, kind: TimeColumnKind): number | null {
+  if (v === null || v === undefined || v === '') return null
+  const n = kind === 'epoch-ms' ? Number(v) : Date.parse(String(v))
+  return Number.isFinite(n) ? n : null
+}
+
+/** 0 行警告（spec §十）：说明**实际生效**的区间，没有完整区间时如实说明。 */
+function zeroRowWarning(
+  range: [number, number] | null, tc: TableDef['timeColumn'], until?: number,
+): string {
+  if (range !== null) {
+    return `查询在区间 [${shanghaiIso(range[0])}, ${shanghaiIso(range[1])}] 返回 0 行。${ZERO_ROW_HINT}`
+  }
+  if (tc !== undefined && until !== undefined) {
+    return `查询在上限 ${shanghaiIso(effectiveBound(tc.kind, until))}（下界未能解析）返回 0 行。${ZERO_ROW_HINT}`
+  }
+  return `查询在给定时间条件下返回 0 行。${ZERO_ROW_HINT}`
+}
+
+interface TableRunInput {
+  table: TableDef
+  since?: number
+  until?: number
+  groupBy: string[]
+  limit: number
+  timeoutMs: number
+  noMask: boolean
+  now: number
+}
+
+/**
+ * `--table` 的执行路径（spec §六）：解析缺省下界 → 主查询 → 覆盖统计 → 脱敏 → 信封。
+ * 所有 SQL 由 `query/table-query.ts` 的纯函数构造（表/列已过闭集）。
+ */
+async function runTableQuery(session: SandboxSession, input: TableRunInput): Promise<number> {
+  const { table } = input
+  const tc = table.timeColumn
+  const warnings: string[] = []
+
+  // 只给 --until：先查该表时间列下界（契约 B）。空表 → 不解析，交给纯函数出 warning。
+  // 超时预算与主查询同一口径（--timeout 0 = 不限时）。
+  let tableMin: number | null | undefined
+  if (tc !== undefined && input.since === undefined && input.until !== undefined) {
+    const minRow = (await session.run(buildMinQuery(table).sql, { timeoutMs: input.timeoutMs }))
+      .rows[0] ?? {}
+    tableMin = toEpochMs(minRow.mn, tc.kind)
+  }
+
+  let plan: BuiltTableQuery
+  try {
+    plan = buildTableQuery({
+      table, since: input.since, until: input.until, tableMin,
+      groupBy: input.groupBy, now: input.now,
+    })
+  } catch (e) {
+    return usageFail(sanitizeControlChars((e as Error).message))
+  }
+  warnings.push(...plan.warnings)
+
+  const result = await session.run(plan.sql, {
+    params: plan.params, limit: input.limit, timeoutMs: input.timeoutMs,
+  })
+
+  // data_coverage（契约 D）：表有 timeColumn 时**恒计算**，独立查询、不受 limit 截断影响；
+  // 过滤范围与主查询同一谓词（不是全表 MIN/MAX）。
+  let dataCoverage: { min: string; max: string } | null = null
+  if (tc !== undefined) {
+    const cov = buildCoverageQuery({
+      table, since: input.since, until: input.until, tableMin, now: input.now,
+    })
+    const row = (await session.run(cov.sql, { params: cov.params, timeoutMs: input.timeoutMs }))
+      .rows[0] ?? {}
+    if (row.mn !== null && row.mn !== undefined && row.mx !== null && row.mx !== undefined) {
+      dataCoverage = {
+        min: msToShanghaiIso(row.mn as string | number),
+        max: msToShanghaiIso(row.mx as string | number),
+      }
+    }
+  }
+
+  // 脱敏唯一出口（spec §7.2）；--table 通道按列精确命中（mode.kind='table'）。
+  const masked = maskQueryRows({
+    rows: result.rows, columns: result.columns,
+    mode: { kind: 'table', table }, noMask: input.noMask,
+  })
+  // ⚠️ `COUNT(*)` 经 getRowObjectsJson 是**字符串**（BIGINT）—— 输出必须是 number，
+  // 否则 Agent 拿 `"count": "3"` 做算术会静默出错（与 db describe 的 Number() 同款）。
+  const rows = input.groupBy.length > 0
+    ? masked.rows.map((r) => ({ ...r, count: Number(r.count) }))
+    : masked.rows
+
+  // 0 行 ≠ 没有数据（spec §十 / 红线 3）：给了时间过滤而 0 行时附可操作提示。
+  if (result.rows.length === 0 && (input.since !== undefined || input.until !== undefined)) {
+    warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until))
+  }
+
+  // --no-mask 的风险警告属于「脱敏整体关闭」，进 meta.warnings；mask_warnings 只装
+  // 静态缺口警告（没脱敏就没有「脱敏不完整」可言）。spec §7.2。
+  const maskWarnings = input.noMask ? [] : masked.warnings
+  if (input.noMask) warnings.push(...masked.warnings)
+
+  return ok(
+    { columns: result.columns, rows },
+    {
+      rows: rows.length,
+      truncated: result.truncated,
+      limit_applied: input.limit,
+      masked: !input.noMask,
+      masked_columns: masked.maskedColumns,
+      mask_warnings: maskWarnings,
+      warnings,
+      // 回显实际生效区间（不是用户原始输入）：iso-day 两端都是上海日零点（契约 C）。
+      resolved_range: plan.resolvedRange === null
+        ? null
+        : [shanghaiIso(plan.resolvedRange[0]), shanghaiIso(plan.resolvedRange[1])],
+      data_coverage: dataCoverage,
+    },
+  )
+}
+
+export interface QueryDeps {
+  /** 时钟注入点（缺省 Date.now）：--since/--until 的相对时间与缺省上界都取它。 */
+  now?: () => number
+}
+
+export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promise<number> {
   // 次序沿 store.ts / db.ts：--help 分流 → --pretty 显式拒绝 → parseFlags → 未知参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     // --help 不吞额外参数；--pretty 豁免（同族惯例）。
@@ -153,9 +323,44 @@ export async function queryCommand(argv: string[]): Promise<number> {
   if (sql !== undefined && table !== undefined) {
     return usageFail('--sql 与 --table 互斥，只能给一个')
   }
-  // Task 9 在同一文件实现 --table；在此之前给明确的「尚未实现」，不伪装成未知参数。
-  if (table !== undefined) return usageFail('query --table 尚未实现')
-  if (sql === undefined) return usageFail('缺少查询方式：请给 --sql <SQL> 或 --table <表>')
+  // 时间/分组参数只属于 --table：与 --sql 同用时不能静默忽略（用户会以为过滤生效了）。
+  if (sql !== undefined
+    && (flags.since !== undefined || flags.until !== undefined || flags.groupBy.length > 0)) {
+    return usageFail(
+      '--since / --until / --group-by 只适用于 --table，不能与 --sql 同用；' +
+      '--sql 请把时间条件直接写进 SQL')
+  }
+  if (sql === undefined && table === undefined) {
+    return usageFail('缺少查询方式：请给 --sql <SQL> 或 --table <表>')
+  }
+
+  // 时钟只取一次：同一条命令里 Nd 的 end、缺省上界、区间校验必须站在同一时刻。
+  const nowMs = (deps.now ?? (() => Date.now()))()
+
+  // —— --table：闭集校验先于一切 I/O（拼错表/列名不必先打开库，db.ts 同款次序）——
+  let tableDef: TableDef | undefined
+  let sinceMs: number | undefined
+  let untilMs: number | undefined
+  if (table !== undefined) {
+    const name = sanitizeControlChars(table)
+    tableDef = tableByName(name)
+    if (tableDef === undefined) {
+      const candidates = suggestNames(name, TABLES.map((t) => t.name))
+      return usageFail(`未知表：${name}`,
+        candidates.length > 0 ? `候选：${candidates.join('、')}` : '用 `qiyu db tables` 查看可用表')
+    }
+    try {
+      validateGroupBy(tableDef, flags.groupBy)
+      sinceMs = resolveTimeFlag(flags.since, '--since', () => nowMs)
+      untilMs = resolveTimeFlag(flags.until, '--until', () => nowMs)
+    } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+    if (tableDef.timeColumn === undefined && (sinceMs !== undefined || untilMs !== undefined)) {
+      const usable = TABLES.filter((t) => t.timeColumn !== undefined).map((t) => t.name)
+      return usageFail(
+        `表 ${tableDef.name} 没有时间列，不支持 --since/--until`,
+        `支持时间过滤的表：${usable.join('、')}`)
+    }
+  }
 
   let limit: number
   let timeoutMs: number
@@ -203,19 +408,26 @@ export async function queryCommand(argv: string[]): Promise<number> {
       })
     }
 
-    const result = await session.run(sql, { limit, timeoutMs })
+    if (tableDef !== undefined) {
+      return await runTableQuery(session, {
+        table: tableDef, since: sinceMs, until: untilMs, groupBy: flags.groupBy,
+        limit, timeoutMs, noMask: flags.noMask, now: nowMs,
+      })
+    }
+
+    // —— --sql 通道（上方「至少给一个」闸门 + 已返回的 --table 分支保证 sql 存在）——
+    const sqlText = sql as string
+    const result = await session.run(sqlText, { limit, timeoutMs })
     // 脱敏唯一出口（spec §7.2）：列名级 + 值级兜底 + 缺口警告都在 mask.ts 内。
     const masked = maskQueryRows({
       rows: result.rows, columns: result.columns,
-      mode: { kind: 'sql', sql, tables: TABLES }, noMask: flags.noMask,
+      mode: { kind: 'sql', sql: sqlText, tables: TABLES }, noMask: flags.noMask,
     })
 
     // 0 行 ≠ 没有数据（spec §十 / 红线 3）：时间过滤查询 0 行时附可操作提示。
     const warnings: string[] = []
-    if (result.rows.length === 0 && ZERO_ROW_TIME_RE.test(sql)) {
-      warnings.push(
-        '查询返回 0 行，且 SQL 引用了业务时间列。这不代表没有数据：' +
-        '同步可能未覆盖该区间——用 `qiyu sync status` 查看覆盖范围，或放宽过滤条件')
+    if (result.rows.length === 0 && ZERO_ROW_TIME_RE.test(sqlText)) {
+      warnings.push(`查询返回 0 行，且 SQL 引用了业务时间列。${ZERO_ROW_HINT}`)
     }
 
     // --no-mask 的风险警告属于「脱敏整体关闭」，进 meta.warnings；mask_warnings 只装
