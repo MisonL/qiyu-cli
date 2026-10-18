@@ -23,6 +23,7 @@ import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef } from '../store/schema.js'
+import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail, sanitizeControlChars } from '../output.js'
 
@@ -123,6 +124,61 @@ async function timeRangeOf(
   }
 }
 
+/**
+ * 打开「已通过前置检查」的沙箱会话（db tables / db describe 共用样板）：
+ * resolveStoreConfig → statGuard → openSandbox → `schema_version` 探测。
+ *
+ * 返回 `{ exit }` 表示前置检查已产出退出码（调用方直接返回它，不做任何清理）；
+ * 返回 `{ session }` 时**所有权归调用方**，必须 `finally session.close()`。
+ * ⚠️ `schema_version` 探测的失败/缺表分支在这里就把会话关掉——调用方拿不到
+ * session，不能指望它的 finally。
+ */
+async function openGuardedSession(
+  flags: StoreFlags,
+): Promise<{ session: SandboxSession } | { exit: number }> {
+  let config: StoreConfig
+  try {
+    config = resolveStoreConfig({
+      flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
+      env: {
+        QIYU_DB_PATH: process.env.QIYU_DB_PATH,
+        QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
+        QIYU_PROFILE: process.env.QIYU_PROFILE,
+      },
+    }).config
+  } catch (e) { return { exit: usageFail(sanitizeControlChars((e as Error).message)) } }
+
+  const guarded = statGuard(config.path)
+  if (guarded !== null) return { exit: guarded }
+
+  let session: SandboxSession
+  try {
+    session = await openSandbox(config)
+  } catch (e) { return { exit: thrownToQueryExit(e, TABLES) } }
+
+  try {
+    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」；
+    // hint 沿 sync.ts openRo 形态：同时指「换 --db 路径」与「qiyu store init」）。
+    // 口径与实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
+    const sv = await session.run(
+      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
+    if (sv.rows.length === 0) {
+      await session.close()
+      return {
+        exit: fail({
+          code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
+          message: `数据库结构不完整（缺表）：${config.path}`,
+          hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
+        }),
+      }
+    }
+  } catch (e) {
+    await session.close()
+    return { exit: thrownToQueryExit(e, TABLES) }
+  }
+  return { session }
+}
+
 async function dbTables(argv: string[]): Promise<number> {
   // 子命令级次序沿 store.ts：--help 分流 → --pretty 显式拒绝 → parseFlags → 未知参数。
   if (argv.includes('--help') || argv.includes('-h')) {
@@ -137,40 +193,11 @@ async function dbTables(argv: string[]): Promise<number> {
   try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
   if (flags.rest.length > 0) return usageFail(`未知参数：${flags.rest.join(' ')}`)
 
-  let config
-  try {
-    config = resolveStoreConfig({
-      flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
-      env: {
-        QIYU_DB_PATH: process.env.QIYU_DB_PATH,
-        QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
-        QIYU_PROFILE: process.env.QIYU_PROFILE,
-      },
-    }).config
-  } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
-
-  const guarded = statGuard(config.path)
-  if (guarded !== null) return guarded
-
-  let session: SandboxSession
-  try {
-    session = await openSandbox(config)
-  } catch (e) { return thrownToQueryExit(e, TABLES) }
+  const opened = await openGuardedSession(flags)
+  if ('exit' in opened) return opened.exit
+  const session = opened.session
 
   try {
-    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」；
-    // hint 沿 sync.ts openRo 形态：同时指「换 --db 路径」与「qiyu store init」）。
-    // 口径与下方实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
-    const sv = await session.run(
-      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
-    if (sv.rows.length === 0) {
-      return fail({
-        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
-      })
-    }
-
     // 实际表集 → 与声明比对（spec §8.1「声明与实况的差异不得静默」）。
     const actual = await session.run(
       "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
@@ -194,6 +221,20 @@ async function dbTables(argv: string[]): Promise<number> {
         + '这些表没有元数据声明（可能来自旧版 CLI 或其他工具），不出现在 tables 中')
     }
 
+    // 实际列集一次查全库（25 次往返 → 1 次）：时间列被删的表不能让 timeRangeOf 的
+    // `MIN("c")` 在 prepare 期抛 Binder Error 把整命令打成退出码 2（Task 7 审查
+    // Important #1）——缺列降级为 time_range null + warning。
+    const colRows = await session.run(
+      "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='main'")
+    const columnsOf = new Map<string, Set<string>>()
+    for (const row of colRows.rows) {
+      const tableName = String(row.table_name)
+      const columnName = String(row.column_name)
+      const set = columnsOf.get(tableName)
+      if (set === undefined) columnsOf.set(tableName, new Set([columnName]))
+      else set.add(columnName)
+    }
+
     // 逐表：行数 + 时间范围；清单与顺序以 TABLES 为权威（裁决 R4：缺表的表整条跳过）。
     const tables: Array<{
       name: string
@@ -207,11 +248,20 @@ async function dbTables(argv: string[]): Promise<number> {
       const r = await session.run(`SELECT COUNT(*) AS n FROM "${t.name}"`)
       // ⚠️ COUNT 是 BIGINT，经 getRowObjectsJson() 是**字符串** —— 必须 Number() 收敛。
       const rows = Number((r.rows[0] ?? {}).n)
+      let timeRange: { min: string; max: string } | null = null
+      const tc = t.timeColumn
+      if (tc !== undefined) {
+        if (columnsOf.get(t.name)?.has(tc.name) ?? false) {
+          timeRange = await timeRangeOf(session, t)
+        } else {
+          warnings.push(`表 ${t.name} 缺少时间列 ${tc.name}（可能来自旧版 CLI 或库损坏），time_range 置 null`)
+        }
+      }
       tables.push({
         name: t.name,
         rows,
         grain: t.grain,
-        time_range: await timeRangeOf(session, t),
+        time_range: timeRange,
         pii_columns: piiColumnsOf(t),
       })
     }
@@ -271,38 +321,11 @@ async function dbDescribe(argv: string[]): Promise<number> {
       candidates.length > 0 ? `候选：${candidates.join('、')}` : '用 `qiyu db tables` 查看可用表')
   }
 
-  let config
-  try {
-    config = resolveStoreConfig({
-      flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
-      env: {
-        QIYU_DB_PATH: process.env.QIYU_DB_PATH,
-        QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
-        QIYU_PROFILE: process.env.QIYU_PROFILE,
-      },
-    }).config
-  } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
-
-  const guarded = statGuard(config.path)
-  if (guarded !== null) return guarded
-
-  let session: SandboxSession
-  try {
-    session = await openSandbox(config)
-  } catch (e) { return thrownToQueryExit(e, TABLES) }
+  const opened = await openGuardedSession(flags)
+  if ('exit' in opened) return opened.exit
+  const session = opened.session
 
   try {
-    // 库结构校验与 db tables 同款（spec §十一）：缺 schema_version = 不是本 CLI 的库。
-    const sv = await session.run(
-      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
-    if (sv.rows.length === 0) {
-      return fail({
-        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
-      })
-    }
-
     // 表名来自 `TABLES` 闭集（代码内常量），拼进字面量安全；用户输入只用于上面的闭集查找。
     const present = (await session.run(
       `SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='${table.name}'`))
@@ -320,9 +343,11 @@ async function dbDescribe(argv: string[]): Promise<number> {
       const r = await session.run(`SELECT COUNT(*) AS n FROM "${table.name}"`)
       // ⚠️ COUNT 是 BIGINT，经 getRowObjectsJson() 是**字符串** —— 必须 Number() 收敛。
       rowCount = Number((r.rows[0] ?? {}).n)
-      timeRange = await timeRangeOf(session, table)
 
       // 实际列集核对（spec §8.2「声明与实况的差异不得静默」）。
+      // ⚠️ 必须**先于** timeRangeOf：声明的时间列若已被删，`MIN("c")` 会在 prepare 期
+      // 抛 Binder Error 把整命令打成退出码 2，row_count/columns/pii_columns 全丢——
+      // 而「时间列被删」只是「列集不一致」的子集，应降级为 warning + time_range null。
       const actual = (await session.run(
         `SELECT column_name FROM information_schema.columns WHERE table_schema='main' AND table_name='${table.name}'`))
         .rows.map((row) => String(row.column_name))
@@ -330,6 +355,13 @@ async function dbDescribe(argv: string[]): Promise<number> {
       const declaredSet = new Set(table.columns.map((c) => c.name))
       const missing = table.columns.map((c) => c.name).filter((n) => !actualSet.has(n))
       const extra = actual.filter((n) => !declaredSet.has(n)).sort()
+
+      const tc = table.timeColumn
+      if (tc !== undefined && actualSet.has(tc.name)) {
+        timeRange = await timeRangeOf(session, table)
+      }
+      // tc 缺失时 timeRange 保持 null；下面的「少列」warning 已点名该时间列。
+
       if (missing.length > 0 || extra.length > 0) {
         const parts: string[] = []
         if (extra.length > 0) parts.push(`多列 ${extra.join('、')}`)

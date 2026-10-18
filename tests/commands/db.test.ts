@@ -181,6 +181,26 @@ describe('db tables', () => {
     expect(text).not.toMatch(/需重建库或重新同步/)   // 重新同步单独无法重建被删表
   })
 
+  it('声明的时间列被删 → db tables 仍成功，该表 time_range 为 null + warning（不硬失败）', async () => {
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('ALTER TABLE "sessions" DROP COLUMN "startTime"')
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
+
+    const sessions = (data().tables as TableOut[]).find((t) => t.name === 'sessions')!
+    expect(sessions.time_range).toBeNull()
+    expect(sessions.rows).toBe(2)                 // 行数照常（不受缺时间列影响）
+
+    const text = (meta().warnings as string[]).join('\n')
+    expect(text).toMatch(/缺少时间列/)
+    expect(text).toMatch(/startTime/)
+  })
+
   it('未知参数 / --pretty / 值位缺失 → usage 退出码 2；--help → 0', async () => {
     expect(await dbCommand(['tables', '--db', dbPath(), '--bogus'])).toBe(2)
     expect(errorOf().kind).toBe('usage')
@@ -413,5 +433,91 @@ describe('db describe', () => {
     expect(text).toMatch(/不存在/)
     expect(text).toMatch(/声明元数据/)
     expect(meta().notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
+  })
+
+  it('声明的时间列被删 → 退出码 0、time_range null、row_count 照常、warnings 点名该列', async () => {
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('ALTER TABLE "sessions" DROP COLUMN "startTime"')
+    } finally {
+      await s.close()
+    }
+    // 时间列是「列集不一致」的子集：不得让 MIN("startTime") 的 Binder Error 把整命令打成 2
+    expect(await dbCommand(['describe', 'sessions', '--db', dbPath()])).toBe(0)
+
+    const d = data() as DescribeOut
+    expect(d.time_range).toBeNull()
+    expect(typeof d.row_count).toBe('number')
+    expect(d.row_count).toBe(2)
+    // 声明元数据照常（含被删的时间列本身）
+    expect(d.time_column).toEqual({ name: 'startTime', kind: 'epoch-ms' })
+    expect(d.columns.map((c) => c.name)).toContain('startTime')
+
+    const text = (meta().warnings as string[]).join('\n')
+    expect(text).toMatch(/少列/)
+    expect(text).toMatch(/startTime/)
+  })
+
+  it('time_range 覆盖 iso-day 与 iso-instant 两种 kind', async () => {
+    await seed()
+    // iso-day（daily_overview.stat_date）
+    expect(await dbCommand(['describe', 'daily_overview', '--db', dbPath()])).toBe(0)
+    let d = data() as DescribeOut
+    expect(d.time_column).toEqual({ name: 'stat_date', kind: 'iso-day' })
+    expect(d.time_range).toEqual(
+      { min: '2026-09-15T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00' })
+
+    // iso-instant（staff_attendance.hour_ts）
+    out = ''
+    expect(await dbCommand(['describe', 'staff_attendance', '--db', dbPath()])).toBe(0)
+    d = data() as DescribeOut
+    expect(d.time_column).toEqual({ name: 'hour_ts', kind: 'iso-instant' })
+    expect(d.time_range).toEqual(
+      { min: '2026-09-15T09:00:00+08:00', max: '2026-09-16T09:00:00+08:00' })
+  })
+
+  it('库不存在 / 空库 / 他人库 → store_not_initialized，hint 指 store init 或换 --db', async () => {
+    expect(await dbCommand(['describe', 'sessions', '--db', join(dir, 'missing.db')])).toBe(1)
+    let e = errorOf()
+    expect(e.kind).toBe('store_not_initialized')
+    expect(e.hint).toMatch(/store init/)
+
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: {
+        create: (p: string, o?: unknown) => Promise<{
+          connect: () => Promise<{ run: (sql: string) => Promise<unknown>; closeSync: () => void }>
+          closeSync: () => void
+        }>
+      }
+    }
+    // 空库（合法 DuckDB、零表）
+    const empty = join(dir, 'empty.db')
+    ;(await mod.DuckDBInstance.create(empty)).closeSync()
+    out = ''
+    expect(await dbCommand(['describe', 'sessions', '--db', empty])).toBe(1)
+    e = errorOf()
+    expect(e.kind).toBe('store_not_initialized')
+    expect(e.hint).toMatch(/store init/)
+
+    // 他人库（有表、无 schema_version）
+    const alien = join(dir, 'alien.db')
+    const inst = await mod.DuckDBInstance.create(alien)
+    const conn = await inst.connect()
+    await conn.run('CREATE TABLE alien (a INTEGER)')
+    conn.closeSync()   // ⚠️ connection 与 instance 都要关，否则锁随进程存活
+    inst.closeSync()
+    out = ''
+    expect(await dbCommand(['describe', 'sessions', '--db', alien])).toBe(1)
+    e = errorOf()
+    expect(e.kind).toBe('store_not_initialized')
+    expect(e.hint).toMatch(/换 --db 路径/)
+  })
+
+  it('--help 不接受额外参数（describe --help --bogus → usage 2）', async () => {
+    expect(await dbCommand(['describe', '--help', '--bogus'])).toBe(2)
+    expect(err).toMatch(/未知参数/)
+    expect(errorOf().kind).toBe('usage')
   })
 })
