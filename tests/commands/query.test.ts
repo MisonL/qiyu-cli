@@ -147,10 +147,16 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(meta().rows).toBe(2)
     expect(meta().truncated).toBe(true)
     expect(meta().limit_applied).toBe(2)
+    // 截断不得静默：warning 要同时说清「不是全量」与「别拿这批结果判缺口」，并给替代路径
+    const w = meta().warnings as string[]
+    expect(w).toHaveLength(1)
+    expect(w[0]).toMatch(/不是全部/)
+    expect(w[0]).toMatch(/db describe/)
 
     expect(await q('--sql', 'SELECT session_id FROM sessions ORDER BY session_id', '--limit', '3')).toBe(0)
     expect(rowsOf()).toHaveLength(3)
     expect(meta().truncated).toBe(false)     // 恰好 limit 行 ≠ 截断
+    expect((meta().warnings as string[])).toEqual([])   // 未截断 → 无该警告
 
     // -1 是 spec §5.3 明列的「负数」分支：取值不以 -- 开头，能到数值校验，必须被拒
     for (const bad of ['0', '10001', '1.5', 'abc', '-1']) {
@@ -571,6 +577,8 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(meta().data_coverage).toEqual({
       min: '2026-10-14T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00',
     })
+    // 与 --sql 通道同源的截断警告（两个通道共用 truncationWarning）
+    expect((meta().warnings as string[])[0]).toMatch(/不是全部/)
   })
 
   it('只有 --until → 下界取该表 MIN；空表 → resolved_range null + 两条 warning', async () => {
