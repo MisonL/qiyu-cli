@@ -239,6 +239,33 @@ describe('stats fields', () => {
     expect(data().unknown_fields).toEqual(['a b'])
   })
 
+  // 键名是**不受信输入**（payload 原样落库）。JSON 路径必须按路径语法转义，
+  // 否则两种失败形态（2026-10-18 实测）：
+  //   · `a"b` / 尾随 `\` → `JSON path error`，一个畸形键名让整条命令失败；
+  //   · `a\\b`（连续反斜杠）→ 路径静默返回 NULL，非空值被计成 nulls（静默错数）。
+  it('键名含双引号 / 反斜杠：路径转义后仍能取值，不得整命令失败或静默计入 nulls', async () => {
+    const s = await fresh()
+    try {
+      // 键：a"b（含双引号）、a\\b（JSON 转义后是单个反斜杠）、ab\（尾随反斜杠）、plain
+      await s.upsert('daily_overview', [{
+        stat_date: '2026-10-01T16:00:00.000Z',
+        payload: '{"a\\"b":42,"a\\\\b":43,"ab\\\\":44,"plain":45}', synchronized_at: null,
+      }])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+
+    const observed = data().observed as Observed[]
+    const byField = new Map(observed.map((o) => [o.field, o]))
+    // 四个键都必须取到值：nulls=0 是关键断言 —— 转义写错时这里会变成 nulls=1 + min/max=null
+    for (const [field, v] of [['a"b', 42], ['a\\b', 43], ['ab\\', 44], ['plain', 45]] as const) {
+      const o = byField.get(field)
+      expect(o, `缺字段 ${field}`).toBeDefined()
+      expect(o).toEqual({ field, rows_present: 1, minus_one: 0, nulls: 0, min: v, max: v })
+    }
+  })
+
   it('空表 → observed=[]、unknown_fields=[] + warning；目录声明仍如实给出', async () => {
     const s = await fresh()   // 只建库，不灌任何报表数据
     await s.close()

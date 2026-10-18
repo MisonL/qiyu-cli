@@ -78,17 +78,28 @@ function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
  *   · `min`/`max`：**排除 -1** 后的数值极值；非数值字段为 null（不报错）。
  *
  * ⚠️ 表名来自 REPORT_TABLES 闭集，是代码内常量，不承载外部输入。
- * ⚠️ JSON 路径用 `$."k"` 加引号形态：字段名含特殊字符（空格等）时仍成立（探针 6/17）。
+ * ⚠️ JSON 路径必须先**按 JSON 路径语法转义**再拼：键名来自库里的 payload（不受信）。
+ * 实测（2026-10-18，DuckDB 1.5.6-r.1）三种形态：
+ *   · `a"b` / 尾随 `\` → `JSON path error`，**整条命令失败**（一个畸形键名杀掉全部统计）；
+ *   · `a\\b`（键内含连续反斜杠）→ 路径静默返回 NULL，非空值被计成 nulls ——
+ *     **静默错数**，比报错更糟。
+ * 故先 `replace(k,'\\','\\\\')` 再 `replace(k,'"','\\"')`（顺序不可反：先转义引号会把
+ * 新引入的反斜杠再翻倍）。转义后的路径在探针里对 7 种键名（含空格/点/方括号/引号/反斜杠）
+ * 全部取到值，未转义的对照组复现了上述两类缺陷。
  */
 function observeSql(table: string): string {
   return `WITH kv AS (
   SELECT j.k AS k, t.payload AS payload
   FROM "${table}" t, unnest(json_keys(t.payload)) AS j(k)
+), ext AS (
+  SELECT k, payload,
+         '$."' || replace(replace(k, '\\', '\\\\'), '"', '\\"') || '"' AS path
+  FROM kv
 ), vals AS (
   SELECT k, payload,
-         json_extract(payload, '$."' || k || '"') AS raw,
-         TRY_CAST(json_extract_string(payload, '$."' || k || '"') AS DOUBLE) AS num
-  FROM kv
+         json_extract(payload, path) AS raw,
+         TRY_CAST(json_extract_string(payload, path) AS DOUBLE) AS num
+  FROM ext
 )
 SELECT k AS field, COUNT(*) AS rows_present,
        SUM(CASE WHEN num = -1 THEN 1 ELSE 0 END) AS minus_one,
