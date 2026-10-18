@@ -40,7 +40,9 @@ git clone https://github.com/MisonL/qiyu-cli.git
 cd qiyu-cli && npm install && npm run build
 ```
 
-> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
+> 核心命令（`auth`、`api`）零运行时依赖。`store` / `db` / `query` / `stats` 命令需要
+> `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。
+> 该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
 
 ## 配置凭证
 
@@ -216,20 +218,29 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 ### 查询命令的输出
 
 五个查询命令都走同一个信封 `{ok,data,meta}`，`meta` 恒含 `warnings`（可为空数组）——
-**0 行不等于没有数据**：带时间过滤而结果 0 行时，`warnings` 会说明「同步可能未覆盖该区间」，
-而不是让你据此得出「那段时间真的没数据」。
+**0 行不等于没有数据**：**带时间过滤**而结果 0 行时，`warnings` 会说明「同步可能未覆盖该区间」，
+而不是让你据此得出「那段时间真的没数据」。触发条件是**逐个判定的**：`--table` 通道给了
+`--since`/`--until` 即触发；`--sql` 通道仅当 SQL 文本引用了业务时间列名
+（`stat_date` / `work_date` / `hour_ts` / `startTime` / `endTime`）才触发，
+普通 `WHERE` 条件过滤出的 0 行不附带这条警告。
 
-`query --sql` 与 `query --table` 的 `meta` 恒含：
+`query --sql` 与 `query --table` 的 `data` 形态是 `{columns, rows}`（`rows` 为对象数组）；
+`meta` 恒含：
 `rows`（截断后的实际行数）/ `truncated`（是否被 `--limit` 截断）/ `limit_applied`（生效上限）/
 `masked`（本次是否脱敏）/ `masked_columns`（**实际被改写**的列名，全 null 的列不算）/
 `mask_warnings`（脱敏缺口警告）/ `resolved_range` / `data_coverage` / `warnings`。
 
+- `--table` 通道的输出顺序是**确定的**：无 `--group-by` 时按时间列降序、再按主键升序
+  （`--limit` 截到的因此是**最新**的那些行）；有 `--group-by` 时按 `count` 降序、分组列升序。
 - `resolved_range`：`--table` 给了 `--since`/`--until` 时回显**实际生效**的区间
   （`+08:00` ISO 二元组），不是原始输入——`iso-day` 表会向下取整到上海自然日，
   所以要按它判断覆盖了哪几天。`--sql` 通道恒为 `null`（任意 SQL 无法通用判定）。
 - `data_coverage`：该表时间列在**过滤范围内**的 MIN/MAX（`+08:00` ISO）；`--sql` 通道恒为 `null`。
+  它有三种 `null` 成因，用 `resolved_range` 与 `warnings` 区分：`--sql` 通道 / 该表无时间列 /
+  有过滤范围但范围内一行都没有。
 - `db tables` / `db describe` 的 `meta.notice` 恒在（本库含客户 PII 的提示）；
-  声明与实况不一致（缺表/缺列/多列）逐条进 `meta.warnings`，不静默。
+  声明与实况不一致（缺表/缺列/多列）逐条进 `meta.warnings`，不静默——`db tables` 做表级
+  与列集核对，`db describe` 给出该表的逐列差异细节。
 
 `stats fields <报表>` 的输出把**声明**与**观测**分开：`declared`（每条带 `source`：
 `design-doc` 实测 / `name-suffix` 命名推断）、`observed`（`rows_present` / `minus_one` /
@@ -250,14 +261,19 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   脱敏的边界如实写在明处：`--table` 通道是**精确**的（列名来自 `TABLES` 元数据）；
   `--sql` 通道是「列名级 + 值级兜底」，**别名绕过时姓名/地址无法值级检测仍会漏**——
   这类情形会在 `meta.mask_warnings` 里点名（是警告不是防护），要完整覆盖请用 `--table`。
-- **只读沙箱三层缺一不可**：`query --sql` 只接受单条 SELECT/EXPLAIN，
-  每连接 `enable_external_access=false` + `lock_configuration=true`，
+  两个已知缺口同样进 `meta.mask_warnings`，不会静默：**`--sql` 不按列名脱敏 `payload`**
+  （报表 payload 是聚合数字，整值替换会误杀；会话/工单的 payload 只靠值级检测，
+  其中的姓名/地址会原样输出）；**`--table` 通道对 `TABLES` 之外的列不脱敏**
+  （库中多出来的列可能来自旧版 CLI，只警告不改写）。
+- **只读沙箱三层缺一不可**：`query --sql` 只接受单条只读语句（SELECT / DESCRIBE / SHOW / EXPLAIN），
+  每实例首次连接时 `enable_external_access=false` + `lock_configuration=true`，
   实例 `access_mode=READ_ONLY`。文件读写、网络、`ATTACH`、`COPY TO`、多语句全部被拦；
   `EXPLAIN ANALYZE` 也拒（它会真正执行内层语句）。
 
 ## 当前状态
 
-本仓库实现了设计稿中的**前两个子项目**：认证与通用 API 通道、API 参数校验（`api schema`/body 分级校验）。
+本仓库已交付设计稿中的**前五个子项目**：认证与通用 API 通道、API 参数校验
+（`api schema`/body 分级校验）、存储层、同步引擎、查询接口与只读沙箱。
 
 **已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
 限频感知（`retry_after`）、本地数据仓库——`store init` / `store status`（存储层已交付，

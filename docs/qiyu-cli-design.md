@@ -965,7 +965,7 @@ qiyu sync uninstall
 qiyu db tables                    # 本地表清单 + 粒度 + 行数 + 数据时间范围
 qiyu db describe <table>          # 列名、类型、单位、枚举值、是否可空
 qiyu query --sql "SELECT ..."     # 只读
-qiyu query --table sessions --since 30d --group-by category
+qiyu query --table sessions --since 30d --group-by session_type
 qiyu stats fields <report>        # 指标自描述（单位/取值范围/higher_is_better）
 ```
 

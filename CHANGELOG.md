@@ -17,9 +17,11 @@
   - `db tables`（25 表清单 + 粒度 + 行数 + 数据时间范围 + PII 列）、`db describe <表>`
     （列/类型/可空/敏感标记/观测枚举/时间列/单位）；声明与实况不一致逐条进 `meta.warnings`
   - `query --sql` —— 任意只读 SQL，**三层只读沙箱缺一不可**：语句白名单
-    （单条 + `prepare().statementType` ∈ {SELECT, EXPLAIN}）、每连接
-    `SET enable_external_access=false` + `SET lock_configuration=true`、实例 `access_mode=READ_ONLY`；
-    另有行数上限（默认 1000）、`--timeout`（`conn.interrupt`）与 `LIMIT` 准确截断
+    （单条 + `prepare().statementType` ∈ {SELECT, DESCRIBE, SHOW, EXPLAIN}）、每实例首次连接
+    `SET enable_external_access=false` + `SET lock_configuration=true`（含 `memory_limit` 加固
+    与自检）、实例 `access_mode=READ_ONLY`；
+    另有行数上限（默认 1000）、`--timeout`（`conn.interrupt`）与按 reader 多读一行的准确截断
+    （不做 SQL `LIMIT` 包装——那需要剥尾分号/尾注释，`SELECT 1; -- x` 会炸）
   - `query --table` —— 受约束通道：`--since`/`--until` 按时间列三形态（`iso-day` 向下取整到
     上海自然日 / `iso-instant` 字符串比较 / `epoch-ms` `TRY_CAST`）生成谓词，
     `--group-by` 列闭集校验（敏感列拒绝）、`resolved_range`/`data_coverage` 回显
@@ -28,7 +30,8 @@
     「无数据」而非负数比率，`unknown_fields` 如实列出判不出单位的字段
 - 查询默认脱敏：`query` 两条通道默认按 `TABLES.sensitive` 脱敏（手机号/邮箱/IPv4 按形态打码，
   其余整值 `<已脱敏>`），`--no-mask` 才输出原始值（并追加 PII 风险警告）；`meta.masked_columns`
-  只记**实际被改写**的列，`--sql` 通道的别名绕过缺口进 `meta.mask_warnings`
+  只记**实际被改写**的列，`--sql` 通道的别名绕过缺口与 payload 缺口（`payload` 不做列名级，
+  姓名/地址等无格式 PII 会原样输出）都进 `meta.mask_warnings`
 - 新增错误 kind：`query_timeout`（`--timeout` 触发 `conn.interrupt`，退出码 1）
 - 查询无 schema 迁移：`TABLES` 的元数据扩展（`grain`/`timeColumn`/`observed_enum`/`unit`/`note`）
   是纯 TypeScript 侧声明，不进 DDL、不新增迁移条目，旧库无需任何操作即可查询
