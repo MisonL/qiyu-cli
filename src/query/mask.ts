@@ -240,15 +240,24 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 是噪音，会让 Agent 学会忽略 mask_warnings。
   // ⚠️ 不对 payload 脱敏本身（报表 payload 是聚合数字，整值替换会误杀）——只声明缺口。
   // （noMask 已在函数入口提前返回；payload 不在 sensitiveNames，故无需再查 nameHit。）
+  //
+  // ⚠️ 只看「输出列名里有 payload」会漏掉别名与函数包装（复审 I-1 残留）：
+  // `SELECT payload AS p FROM sessions`、`json_extract(payload,'$.userName') AS n`
+  // 的输出列名都不叫 payload，PII 照样整段漏出。所以判据是「输出列名含 payload
+  // **或** SQL 文本出现 payload 标识符（词边界）」。报表表不在此列（payload 未标
+  // sensitive），故 `SELECT payload FROM daily_overview` 不会吃警告。
+  // ⚠️ 这是启发式（与既有缺口警告同源）：字符串字面量里出现 payload 也会误报——方向安全
+  //（多警告），且真正解析 SQL 标识符超出本纯函数的职责。
   const payloadPiiTables = mode.tables
     .filter((t) => t.columns.some((c) => c.name === 'payload' && c.sensitive))
     .map((t) => t.name)
     .filter((name) => new RegExp(`\\b${name}\\b`, 'i').test(mode.sql))
-  if (columns.includes('payload') && payloadPiiTables.length > 0) {
+  const payloadReferenced = columns.includes('payload') || /\bpayload\b/i.test(mode.sql)
+  if (payloadReferenced && payloadPiiTables.length > 0) {
     warnings.push(
-      `输出含 payload 列（SQL 引用了含 PII 的表 ${payloadPiiTables.join('、')}）：`
-      + '本通道只对 payload 做值级检测（手机号/邮箱/IPv4），其中的姓名/地址等无格式 PII 可能未脱敏。'
-      + '要整值替换请用 `qiyu query --table <表>`')
+      `SQL 引用了 payload（含 PII 的表 ${payloadPiiTables.join('、')}）：`
+      + '本通道只对 payload 做值级检测（手机号/邮箱/IPv4），其中的姓名/地址等无格式 PII 可能未脱敏'
+      + '（别名、JSON 提取、拼接都绕得过列名级）。要整值替换请用 `qiyu query --table <表>`')
   }
 
   for (const name of sensitiveNames) {

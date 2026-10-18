@@ -221,8 +221,8 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 **0 行不等于没有数据**：**带时间过滤**而结果 0 行时，`warnings` 会说明「同步可能未覆盖该区间」，
 而不是让你据此得出「那段时间真的没数据」。触发条件是**逐个判定的**：`--table` 通道给了
 `--since`/`--until` 即触发；`--sql` 通道仅当 SQL 文本引用了业务时间列名
-（`stat_date` / `work_date` / `hour_ts` / `startTime` / `endTime`）才触发，
-普通 `WHERE` 条件过滤出的 0 行不附带这条警告。
+（`stat_date` / `work_date` / `hour_ts` / `startTime` / `endTime`）才触发——它与子句位置无关，
+`WHERE stat_date > '…'` 也算；用**其它**列（如 `createtime`）的 `WHERE` 过滤出的 0 行不附带此警告。
 
 `query --sql` 与 `query --table` 的 `data` 形态是 `{columns, rows}`（`rows` 为对象数组）；
 `meta` 恒含：
@@ -230,8 +230,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 `masked`（本次是否脱敏）/ `masked_columns`（**实际被改写**的列名，全 null 的列不算）/
 `mask_warnings`（脱敏缺口警告）/ `resolved_range` / `data_coverage` / `warnings`。
 
-- `--table` 通道的输出顺序是**确定的**：无 `--group-by` 时按时间列降序、再按主键升序
-  （`--limit` 截到的因此是**最新**的那些行）；有 `--group-by` 时按 `count` 降序、分组列升序。
+- `--table` 通道的输出顺序是**确定的**：无 `--group-by` 时，**有时间列的表**按时间列降序、
+  再按主键升序（`--limit` 截到的因此是**最新**的那些行）；**无时间列的表**只能按主键升序。
+  有 `--group-by` 时按 `count` 降序、分组列升序。
 - `resolved_range`：`--table` 给了 `--since`/`--until` 时回显**实际生效**的区间
   （`+08:00` ISO 二元组），不是原始输入——`iso-day` 表会向下取整到上海自然日，
   所以要按它判断覆盖了哪几天。`--sql` 通道恒为 `null`（任意 SQL 无法通用判定）。
@@ -263,9 +264,14 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   这类情形会在 `meta.mask_warnings` 里点名（是警告不是防护），要完整覆盖请用 `--table`。
   两个已知缺口同样进 `meta.mask_warnings`，不会静默：**`--sql` 不按列名脱敏 `payload`**
   （报表 payload 是聚合数字，整值替换会误杀；会话/工单的 payload 只靠值级检测，
-  其中的姓名/地址会原样输出）；**`--table` 通道对 `TABLES` 之外的列不脱敏**
+  其中的姓名/地址会原样输出——SQL 里出现 `payload` 或输出含该列即警告，别名与
+  `json_extract` 包装同样覆盖）；**`--table` 通道对 `TABLES` 之外的列不脱敏**
   （库中多出来的列可能来自旧版 CLI，只警告不改写）。
-- **只读沙箱三层缺一不可**：`query --sql` 只接受单条只读语句（SELECT / DESCRIBE / SHOW / EXPLAIN），
+  ⚠️ 这些是**警告不是防护**：`--sql` 通道的 payload 缺口只能靠 Agent 读到警告后改用
+  `--table` 或 `--no-mask` 显式承担风险来闭合，CLI 无法在保持报表 payload 可用的前提下
+  替你做整值替换。
+- **只读沙箱三层缺一不可**：`query --sql` 只接受单条只读语句（`SELECT` / `DESCRIBE` / `SHOW` / `EXPLAIN`——
+  后两者实测归入 `statementType` 的 SELECT/EXPLAIN 类型值），
   每实例首次连接时 `enable_external_access=false` + `lock_configuration=true`，
   实例 `access_mode=READ_ONLY`。文件读写、网络、`ATTACH`、`COPY TO`、多语句全部被拦；
   `EXPLAIN ANALYZE` 也拒（它会真正执行内层语句）。

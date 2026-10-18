@@ -17,7 +17,8 @@
   - `db tables`（25 表清单 + 粒度 + 行数 + 数据时间范围 + PII 列）、`db describe <表>`
     （列/类型/可空/敏感标记/观测枚举/时间列/单位）；声明与实况不一致逐条进 `meta.warnings`
   - `query --sql` —— 任意只读 SQL，**三层只读沙箱缺一不可**：语句白名单
-    （单条 + `prepare().statementType` ∈ {SELECT, DESCRIBE, SHOW, EXPLAIN}）、每实例首次连接
+    （单条 + `prepare().statementType` ∈ {SELECT, EXPLAIN}；`DESCRIBE`/`SHOW` 实测归入
+    这两类的类型值故一并放行）、每实例首次连接
     `SET enable_external_access=false` + `SET lock_configuration=true`（含 `memory_limit` 加固
     与自检）、实例 `access_mode=READ_ONLY`；
     另有行数上限（默认 1000）、`--timeout`（`conn.interrupt`）与按 reader 多读一行的准确截断

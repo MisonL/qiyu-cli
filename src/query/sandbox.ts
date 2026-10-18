@@ -70,7 +70,8 @@ const SELF_CHECK_SQL =
 
 /**
  * DuckDB 的 memory_limit 回显 → 字节数（实测格式 `953.6 MiB` / `51.1 GiB` / `1.0 GiB`）。
- * 无法解析（未来改格式、或未设时回显非字符串）→ 返回 0，让自检拒绝服务而不是放过。
+ * **无法解析 → 返回 0**，调用方必须把 0 当成失败（fail-closed）——否则未来 DuckDB 改
+ * 回显格式时自检会静默放行一个没加固的会话（复审发现的 fail-open）。
  * 支持 B/KiB/MiB/GiB/TiB（spaced 或紧贴写法都认）。
  */
 export function memoryLimitBytes(display: unknown): number {
@@ -392,10 +393,13 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
     const r = await conn.runAndReadAll(SELF_CHECK_SQL)
     const row = r.getRowObjectsJson()[0] ?? {}
     // memory_limit 的回显是格式化字符串（实测 `SET memory_limit='1GB'` → "953.6 MiB"，
-    // 未加固时是机器内存的 80%，本机 51.1 GiB），无法回读原值 —— 按**上限**断言（≤ 2 GiB）：
-    // 加固的意义是「封顶」，删掉加固行后默认值必然远超它，自检因此拒绝服务；
-    // 而不是让大排序在不受控的内存下跑（探针 8：128MB 会 OOM，1GB 足够本库任何表）。
-    if (row.ea !== false || row.lc !== true || memoryLimitBytes(row.ml) > 2 * 1024 ** 3) {
+    // 未加固时是机器内存的 80%，本机 51.1 GiB），无法回读原值 —— 按**上限**断言：
+    // 加固的意义是「封顶」（1GB → 953.6 MiB），上限取 1 GiB 既容得下加固值、
+    // 又挡得住未加固的默认值（内存 ≥1.25 GiB 的机器默认值即 >1 GiB；更小的机器上
+    // 默认值本就接近加固值，漏判无害）。解析失败返回 0 必须算失败（fail-closed，
+    // 复审 I-5 残留）：否则 DuckDB 改回显格式时静默放行一个没封顶的会话。
+    const mlBytes = memoryLimitBytes(row.ml)
+    if (row.ea !== false || row.lc !== true || mlBytes === 0 || mlBytes > 1024 ** 3) {
       throw sandboxError(
         'internal',
         `只读沙箱自检失败：enable_external_access=${String(row.ea)}，`

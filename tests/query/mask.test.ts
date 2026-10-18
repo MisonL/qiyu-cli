@@ -216,10 +216,31 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     // 输出——而 `masked_columns` 非空（手机号命中），Agent 看到 masked:true 会以为已脱敏。
     // 会话/工单的 payload 标了 sensitive → 警告；报表 payload 未标 → 不警告（避免噪音）。
     expect(session.warnings).toHaveLength(1)
-    expect(session.warnings[0]).toMatch(/payload 列/)
+    expect(session.warnings[0]).toMatch(/引用了 payload/)
     expect(session.warnings[0]).toMatch(/姓名\/地址/)
     expect(session.warnings[0]).toContain('sessions')
     expect(report.warnings).toEqual([])   // daily_overview 的 payload 不是 PII 载体
+
+    // 复审 I-1 残留：别名与 JSON 提取的输出列名都不叫 payload，PII 照样整段漏出 ——
+    // 判据必须是「输出列含 payload 或 SQL 文本出现 payload」，只看输出列名会全漏。
+    // （`json_extract` 那条还会同时命中 userName 的缺口警告 → 2 条，故只断言「包含」。）
+    for (const sql of [
+      'SELECT payload AS p FROM sessions',
+      "SELECT json_extract(payload, '$.userName') AS n FROM sessions",
+      "SELECT concat(payload, '') AS c FROM sessions",
+      'select PAYLOAD from sessions',              // 大小写
+    ]) {
+      const aliased = maskQueryRows({
+        rows: [{ p: '{"userName":"张三"}' }], columns: ['p'], mode: sqlMode(sql),
+      })
+      expect(aliased.warnings.join('\n'), sql).toMatch(/引用了 payload/)
+    }
+    // SELECT * 输出 payload 列但 SQL 文本里没有 payload 字样 → 仍要警告（靠输出列名那半支）
+    const star = maskQueryRows({
+      rows: [{ session_id: 's-1', payload: '{"userName":"张三"}' }],
+      columns: ['session_id', 'payload'], mode: sqlMode('SELECT * FROM sessions'),
+    })
+    expect(star.warnings).toHaveLength(1)
 
     // 无格式载荷（无手机号/邮箱/IP）：payload 原样输出、maskedColumns 为空 ——
     // 这正是最危险的形态（Agent 看到 masked_columns 空但 masked:true），警告必须仍在。

@@ -358,10 +358,11 @@ describe('加固自检与顺序', () => {
         "current_setting('memory_limit') AS ml")
       expect(r.rows[0]).toMatchObject({ ea: false, lc: true, tz: 'Asia/Shanghai' })
       // 审查 I-5：memory_limit 是 spec §5.2 声明的加固项，但此前无任何测试观测 ——
-      // 删掉 HARDENING_SQL 里那行仍全绿。加固是**封顶**，故断言上限（≤ 2 GiB）：
+      // 删掉 HARDENING_SQL 里那行仍全绿。加固是**封顶**，故断言上限（≤ 1 GiB）：
       // 未加固时回显是机器内存的 80%（本机 51.1 GiB），删行后这条必红。
-      expect(memoryLimitBytes(r.rows[0].ml)).toBeLessThanOrEqual(2 * 1024 ** 3)
+      // 复审残留：解析失败返回 0 必须算失败（fail-closed），故同时断言 > 0。
       expect(memoryLimitBytes(r.rows[0].ml)).toBeGreaterThan(0)
+      expect(memoryLimitBytes(r.rows[0].ml)).toBeLessThanOrEqual(1024 ** 3)
     })
   })
 
@@ -707,6 +708,39 @@ describe('openSandbox 的错误路径', () => {
     } finally {
       await s.close()
     }
+  })
+
+  it('加固自检 fail-closed：memory_limit 回显无法解析 / 超过上限 → 拒绝服务（复审 I-5 残留）', async () => {
+    // 解析失败（未来 DuckDB 改格式）或未加固（回显机器内存 80%）都必须拒服务，
+    // 而不是静默放行一个没封顶的会话。fake importer 让自检回显难以解析的值。
+    const makeMod = (ml: string) => ({
+      DuckDBInstance: {
+        create: async () => ({
+          connect: async () => ({
+            run: async () => ({}),
+            runAndReadAll: async () => ({
+              getRowObjectsJson: () => [{ ea: false, lc: true, ml }],
+              columnNames: () => ['x'],
+            }),
+            interrupt: () => {},
+            closeSync: () => {},
+          }),
+          closeSync: () => {},
+        }),
+      },
+      StatementType: {},
+    })
+    for (const ml of ['unlimited', '51.1 GiB', '']) {
+      const importer = async (): Promise<unknown> => makeMod(ml)
+      const e = await expectReject(openSandbox(cfgFor('/nonexistent/q.db'), { importer }), {
+        kind: 'internal', match: /只读沙箱自检失败/,
+      })
+      expect(e.message, ml).toContain('memory_limit=')
+    }
+    // 正例：加固值（953.6 MiB）通过 —— 上面的拒绝不是「一律拒」的退化行为
+    const importer = async (): Promise<unknown> => makeMod('953.6 MiB')
+    const s = await openSandbox(cfgFor('/nonexistent/q.db'), { importer })
+    await s.close()
   })
 
   it('库不存在 → store_not_initialized（不裸崩，hint 指 store init）', async () => {
