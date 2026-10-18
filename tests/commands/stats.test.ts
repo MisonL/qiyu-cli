@@ -186,9 +186,57 @@ describe('stats fields', () => {
     expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
 
     expect((data().observed as Observed[]).length).toBe(1000)
-    const warnings = meta().warnings as string[]
-    expect(warnings.join('\n')).toMatch(/1000/)
-    expect(warnings.join('\n')).toMatch(/不完整/)
+    const text = (meta().warnings as string[]).join('\n')
+    expect(text).toMatch(/1000/)      // N 取自实际返回行数
+    expect(text).toMatch(/不完整/)
+    // 文案只说观测侧（declared 还含目录声明，可能多于 N）
+    expect(text).toMatch(/observed\/unknown_fields/)
+    expect(text).not.toMatch(/declared/)
+  })
+
+  it('数组 / 标量 payload 的 json_keys 为空 → 该行不贡献字段（不报错、不编造下标键）', async () => {
+    const s = await fresh()
+    try {
+      // 探针实测：json_keys('[10,20]') 返回 []（不是 "0"/"1" 下标键）——
+      // 数组与标量 payload 等价于「无可观测字段」，不应让整条命令失败。
+      await s.upsert('daily_overview', [
+        { stat_date: '2026-10-01T16:00:00.000Z', payload: '[10,20]', synchronized_at: null },
+        { stat_date: '2026-10-02T16:00:00.000Z', payload: '"abc"', synchronized_at: null },
+        { stat_date: '2026-10-03T16:00:00.000Z', payload: '{"sessions":7}', synchronized_at: null },
+      ])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+
+    // 只有对象 payload 那行贡献字段；数组/标量行不产生 "0"/"1" 之类的键
+    expect(data().observed).toEqual([
+      { field: 'sessions', rows_present: 1, minus_one: 0, nulls: 0, min: 7, max: 7 },
+    ])
+    expect(meta().warnings).toEqual([])   // 有可观测字段 → 不是空结果
+  })
+
+  it('含空格的键名：JSON 路径 $."a b" 可取（不误判为 unknown 之外的失败）', async () => {
+    const s = await fresh()
+    try {
+      await s.upsert('daily_overview', [{
+        stat_date: '2026-10-01T16:00:00.000Z',
+        payload: '{"a b":5,"reply Ratio":0.25}', synchronized_at: null,
+      }])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+
+    const observed = data().observed as Observed[]
+    // 空格键名与普通键名同等对待：ORDER BY field 下按字典序
+    expect(observed).toEqual([
+      { field: 'a b', rows_present: 1, minus_one: 0, nulls: 0, min: 5, max: 5 },
+      { field: 'reply Ratio', rows_present: 1, minus_one: 0, nulls: 0, min: 0.25, max: 0.25 },
+    ])
+    const declared = data().declared as Record<string, Declared>
+    expect(declared['a b'].unit).toBe('unknown')
+    expect(data().unknown_fields).toEqual(['a b'])
   })
 
   it('空表 → observed=[]、unknown_fields=[] + warning；目录声明仍如实给出', async () => {
@@ -316,5 +364,26 @@ describe('stats fields', () => {
     expect(await statsCommand(['fields', 'daily_overview', '--db', empty])).toBe(1)
     expect(errorOf().kind).toBe('store_not_initialized')
     expect(String(errorOf().hint)).toMatch(/store init/)
+  })
+
+  it('迁移已完成而表被删 → hint 不承诺 store init 能重建（与 db.ts 同口径）', async () => {
+    // base commit ee6f73d 的结论：init 只重放 version > MAX(version) 的迁移，
+    // 已迁移库上 DROP 掉的表不会被重建 —— hint 若只说「先运行 store init」，
+    // Agent 会跑到 ok 再撞同一错误。必须按成因拆开，并给出真正的修复路径。
+    const s = await fresh()
+    try {
+      await s.query('DROP TABLE "daily_overview"')
+    } finally {
+      await s.close()
+    }
+
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(1)
+    const e = errorOf()
+    expect(e.kind).toBe('store_not_initialized')
+    expect(String(e.code)).toBe('store_not_initialized')
+    const hint = String(e.hint)
+    expect(hint).toMatch(/store init/)     // 保留指针（迁移未跑完时它确实能补建）
+    expect(hint).toMatch(/不会重建/)        // 但不得暗示它对已迁移库也有效
+    expect(hint).toMatch(/重建库/)          // 真正的修复路径
   })
 })

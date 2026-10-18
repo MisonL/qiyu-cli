@@ -45,6 +45,10 @@ const SENTINEL = {
 
 interface StoreFlags { db?: string; profile?: string; backend?: string }
 
+// ⚠️ 与 db.ts / query.ts 的 parseFlags 同款，**有意各自一份**：命令间不互相 import 的
+// 红线已为 statGuard 放宽为单点复用（它有三处调用方、语义完整）；parseFlags 只是十几行
+// 的 flag 循环，再抽一个共享模块会把「哪些 flag 是值位」的局部知识挪到远处，
+// 收益不抵耦合（YAGNI）。
 function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
   const out: StoreFlags & { rest: string[] } = { rest: [] }
   for (let i = 0; i < argv.length; i++) {
@@ -182,9 +186,10 @@ async function statsFields(argv: string[]): Promise<number> {
 
   try {
     // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）：
-    // ① 无 schema_version = 不是本 CLI 创建的库；② 有库但缺目标表 = 建库不完整。
+    // ① 无 schema_version = 不是本 CLI 创建的库；② 有库但缺目标表 = 建库不完整/表被删。
+    // 口径与 db.ts 及下方目标表查询一致：限定 table_schema='main'（别库同名表不算数）。
     const sv = await session.run(
-      "SELECT 1 FROM information_schema.tables WHERE table_name='schema_version'")
+      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
     if (sv.rows.length === 0) {
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
@@ -195,10 +200,15 @@ async function statsFields(argv: string[]): Promise<number> {
     const target = await session.run(
       `SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='${table}'`)
     if (target.rows.length === 0) {
+      // ⚠️ 不得承诺 store init 一定能修（审查 Important #1，与 db.ts:184-189 同款）：
+      // init 只重放 `version > MAX(version)` 的迁移，已迁移到最新版后被 DROP 的表
+      // **不会**被重建（迁移已跳过，返回 ok 而表仍缺）——那是「成功但无效」的修复。
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库中缺表：${table}（${config.path}）`,
-        hint: '建库可能不完整或库损坏，请先运行：qiyu store init',
+        hint: '若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
+          + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
+          + '——需重建库（删除库文件后重新 qiyu store init 并重新同步）',
       })
     }
 
@@ -242,12 +252,13 @@ async function statsFields(argv: string[]): Promise<number> {
           + '字段自描述需要 payload 内的 JSON 键；请确认同步写入的是报表原始 JSON')
       }
     }
-    // 观测 SQL 一行 = 一个字段；沙箱默认行数上限 1000，超限会被截断。
+    // 观测 SQL 一行 = 一个字段；沙箱默认行数上限（1000）超限即截断。
     // 报表 payload 实测几十个键，正常不会触发 —— 但截断不得静默（Agent 会把
-    // 「只看到 1000 个字段」当成事实）。
+    // 「只看到 N 个字段」当成事实）。⚠️ 文案不写死上限值：N 取自实际返回行数
+    // （上限是沙箱的默认值，不是本命令的契约）；declared 还含目录声明、可能多于 N。
     if (result.truncated) {
-      warnings.push('字段数超过单次上限（1000），observed/declared/unknown_fields 只含前 1000 个字段；'
-        + '该表的字段集可能不完整')
+      warnings.push(`观测字段数超过单次行数上限，observed/unknown_fields 只含按字段名排序的前 `
+        + `${result.rows.length} 个字段；该表的字段集可能不完整`)
     }
 
     return ok(
