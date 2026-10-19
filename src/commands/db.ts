@@ -119,12 +119,24 @@ function piiColumnsOf(t: TableDef): string[] {
  *   · iso-instant：`new Date(ms).toISOString()` → `YYYY-MM-DDTHH:MM:SS.mmmZ`。
  * 兼容旧值：允许省略毫秒（`.000` 之外的零毫秒形态在库里也存在）。
  */
-function shapeSqlOf(kind: TimeColumnKind, col: string): string | null {
-  if (kind === 'epoch-ms') return null
+function shapeSqlOf(kind: TimeColumnKind, col: string): string[] {
+  // ⚠️ epoch-ms 也必须有判据（正确性审查 F5）：`TRY_CAST(... AS BIGINT) IS NULL` 只挡
+  // 非数字，`-1`（七鱼「无值」哨兵）、秒级/微秒级误写全部「合法」——会让 time_range
+  // 声称数据从 1970 年开始。写路径对秒级时间戳已有同口径（`n <= 1e11` 丢弃）。
+  if (kind === 'epoch-ms') {
+    const n = `TRY_CAST(${col} AS BIGINT)`
+    return [`${n} > 100000000000`, `${n} <= 8640000000000000`]
+  }
   const shape = kind === 'iso-day'
     ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
-    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2}(\\.[0-9]+)?)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
-  return `regexp_matches(${col}, '${shape}')`
+    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
+  // ⚠️ 形态正则之外还要 `TRY_CAST` 可解析（正确性审查 F3）：`'2026-10-14T02:00Z'`
+  // 能过宽松正则，但 `TRY_CAST(... AS TIMESTAMPTZ)` 是 NULL —— 只按正则判会让它
+  // 在 `arg_min` 里被静默踢出 time_range，既不在极值里、也不计入脏值。
+  return [
+    `regexp_matches(${col}, '${shape}')`,
+    `TRY_CAST(${col} AS TIMESTAMPTZ) IS NOT NULL`,
+  ]
 }
 
 /**
@@ -149,20 +161,16 @@ async function timeRangeOf(
   // ⚠️ 用 `regexp_matches`，**不要**用 `~` 运算符：实测（DuckDB 1.5.6-r.1）`~` 对
   // `'2026-10-13T…' ~ '^2026'` 也返回 false —— 它不是正则匹配，会把所有行都滤掉。
   const shape = shapeSqlOf(tc.kind, col)
-  // ⚠️ iso-instant 必须按**解析后的时刻**取极值，不能按原始字符串（CodeRabbit 终审 minor）：
-  // 形态判据接受 `+08:00` / `+0800` 等偏移写法，而 VARCHAR 字典序只在「全部同一 UTC Z
-  // 形态」时才与时间序一致 —— 实测 `'2026-09-16T09:00:00+08:00'`（01:00Z）在字典序上
-  // 大于 `'2026-09-16T05:00:00Z'`（05:00Z），但时刻更早，`time_range.max` 会报错的那一端。
-  // `arg_min/arg_max(col, 时刻)` 按时刻排序、返回原始字符串（`msToShanghaiIso` 能解析
-  // 带偏移的形态，实测四种写法都对）。iso-day 全是同一个 `…T16:00:00.000Z` 形态，
-  // 字典序即时间序，保持 MIN/MAX（避免把日期列塞进 TIMESTAMPTZ 引入时区解释）。
+  // ⚠️ **三种形态一律按解析后的时刻取极值**（正确性审查 F1/F2）：iso-day 的无毫秒形态
+  // `…T16:00:00Z` 在字典序上大于同刻的 `…T16:00:00.000Z`，iso-instant 的 `+08:00` 写法
+  // 与 `Z` 写法字典序与时间序相反 —— `MIN/MAX(原始串)` 都会取错那一端。
+  // `arg_min/arg_max(col, 时刻)` 按时刻排序、**返回原始字符串**（`msToShanghaiIso` 能
+  // 解析全部写法）。epoch-ms 用 BIGINT 极值。
   const agg = tc.kind === 'epoch-ms'
     ? `MIN(TRY_CAST(${col} AS BIGINT)) AS mn, MAX(TRY_CAST(${col} AS BIGINT)) AS mx`
-    : tc.kind === 'iso-day'
-      ? `MIN(${col}) AS mn, MAX(${col}) AS mx`
-      : `arg_min(${col}, TRY_CAST(${col} AS TIMESTAMPTZ)) AS mn, `
-        + `arg_max(${col}, TRY_CAST(${col} AS TIMESTAMPTZ)) AS mx`
-  const where = shape === null ? '' : ` WHERE ${shape}`
+    : `arg_min(${col}, TRY_CAST(${col} AS TIMESTAMPTZ)) AS mn, `
+      + `arg_max(${col}, TRY_CAST(${col} AS TIMESTAMPTZ)) AS mx`
+  const where = ` WHERE ${shape.join(' AND ')}`
   const r = await session.run(`SELECT ${agg} FROM "${t.name}"${where}`)
   const row = r.rows[0] ?? {}
   if (row.mn === null || row.mn === undefined || row.mx === null || row.mx === undefined) return null
@@ -184,9 +192,11 @@ async function dirtyTimeValues(
   if (tc === undefined) return 0
   const col = `"${tc.name}"`
   const shape = shapeSqlOf(tc.kind, col)
-  const bad = shape === null
-    ? `TRY_CAST(${col} AS BIGINT) IS NULL`
-    : `NOT ${shape}`
+  // 脏值 = 非空且不满足全部形态条件。
+  // ⚠️ 必须 COALESCE（CodeRabbit 复审 minor，实测）：epoch-ms 的非数字值让 `TRY_CAST`
+  // 为 NULL，`NOT (NULL AND NULL)` 仍是 NULL → WHERE 把该行静默丢掉，脏值计数为 0、
+  // 警告也不出现。COALESCE(…, false) 把「无法判定」归为「不符合」。
+  const bad = `NOT COALESCE((${shape.join(' AND ')}), false)`
   const r = await session.run(
     `SELECT COUNT(*) AS n FROM "${t.name}" WHERE ${col} IS NOT NULL AND ${bad}`)
   return Number((r.rows[0] ?? {}).n)

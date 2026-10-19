@@ -182,6 +182,25 @@ function typeName(t: number): string {
 }
 
 /**
+ * 列名去重（与 @duckdb/node-api 的 `deduplicatedColumnNames()` 规则一致，但用 Map）：
+ * 重复名第 2 次起加 `:N` 后缀（`x`、`x:1`、`x:2`）。
+ *
+ * 为什么不直接调驱动的同名方法：它用普通对象当计数器，`__proto__` 这类名字会命中原型链
+ * （`columnNameCount['__proto__']` 是 `Object.prototype`，不是 undefined），导致重复列
+ * 不加后缀 —— 实测 `SELECT a AS "__proto__", a AS "__proto__"` 返回两个 `"__proto__"`，
+ * 而行对象只有 `{}`（键互相覆盖）。Map 没有这个洞。
+ */
+function deduplicateNames(names: string[]): string[] {
+  const seen = new Map<string, number>()
+  return names.map((name) => {
+    const count = (seen.get(name) ?? 0) + 1
+    seen.set(name, count)
+    return count > 1 ? `${name}:${count - 1}` : name
+  })
+}
+
+
+/**
  * 剥掉 SQL 里的注释与字符串/标识符字面量，只留下「可能承载关键字」的骨架。
  *
  * 为什么要剥（而不是直接对原文查 ANALYZE）：
@@ -565,7 +584,19 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
       // 时 `Object.keys` 少了它，显式请求的列连同值凭空消失、退出码 0、零警告。
       // 取真实列名后逐行核对自有键：缺键说明该列的值经此驱动 API 无法表示，**必须
       // fail-closed**（静默丢一列比报错更糟：Agent 会把「没有这一列」当成事实）。
-      const columns = reader.columnNames()
+      // ⚠️ 行的键是**去重后**的列名（重名列变成 `x`、`x:1`、`x:2`），与 `columnNames()`
+      // （保留重复、未去重）不是同一个序列（安全审查 Critical，2026-10-20 实测）：
+      //   `SELECT userPhone, userPhone FROM sessions`
+      //   → columnNames() = ["userPhone","userPhone"]，行 = {"userPhone":…, "userPhone:1":…}
+      // 若把未去重的 columnNames() 交给脱敏层，`userPhone:1` 从未被遍历 → 自连接
+      // `SELECT * FROM sessions a JOIN sessions b` 时第二张表的 PII 原样输出，且
+      // meta.masked 仍为 true、零警告。
+      //
+      // ⚠️ **不能直接用驱动的 `deduplicatedColumnNames()`**：它用普通对象当计数器
+      //（`columnNameCount[name]`），名为 `__proto__` 的列会命中原型链而永不加 `:N` 后缀
+      // ——实测 `SELECT a AS "__proto__", a AS "__proto__"` 返回 ["__proto__","__proto__"]
+      // 而行是 `{}`（两个同名键互相覆盖）。这里用 Map 自算，规则与驱动一致。
+      const columns = deduplicateNames(reader.columnNames())
       for (const row of rows) {
         for (const name of columns) {
           if (Object.hasOwn(row, name)) continue

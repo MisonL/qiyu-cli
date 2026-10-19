@@ -63,4 +63,27 @@ describe('core/time —— 上海时间（E 与 D 同源）', () => {
     expect(msToShanghaiIso(T)).toBe('2026-09-15T12:00:00+08:00')
     expect(msToShanghaiIso('2026-09-14T16:00:00.000Z')).toBe('2026-09-15T00:00:00+08:00')
   })
+
+  it('日期分支按上海零点解析，且断言具体值而非仅类型（测试审查 F8）', () => {
+    expect(parseTimeArg('2026-09-15', () => T, '--since')).toBe(Date.UTC(2026, 8, 14, 16))
+    expect(parseTimeArg('2024-02-29', () => T, '--since')).toBe(Date.UTC(2024, 1, 28, 16))
+  })
+
+  it('带时刻的 ISO 也回验日历日，不静默进位（正确性审查 F7）', () => {
+    // Date.parse 会把 2/30 进位成 3/2、4/31 进位成 5/1 —— 与纯日期分支同一类缺陷。
+    for (const bad of [
+      '2026-02-30T00:00:00', '2026-04-31T00:00:00',
+      '2026-02-30T00:00:00Z', '2026-02-30T00:00:00+08:00',
+    ]) {
+      expect(parseTimeArg(bad, () => T, '--since'), bad).toBeNull()
+    }
+  })
+
+  it('超出 Date 表示范围的值不抛 RangeError，原样回显（正确性审查 F4）', () => {
+    // 库里一条微秒级脏值（1792467000000000000）曾让 db tables 整条命令 internal 失败。
+    expect(msToShanghaiIso('1792467000000000000')).toBe('1792467000000000000')
+    expect(msToShanghaiIso(8.7e15)).toBe('8700000000000000')
+    // 超大相对时长同样回 usage，而不是崩到 internal
+    expect(parseTimeArg('999999999d', () => T, '--since')).toBeNull()
+  })
 })

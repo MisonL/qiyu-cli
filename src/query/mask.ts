@@ -169,9 +169,28 @@ function sqlSensitiveNames(tables: TableDef[]): string[] {
 export function maskQueryRows(input: MaskInput): MaskOutcome {
   const { rows, columns, mode, noMask } = input
 
-  // --no-mask：脱敏整体关闭，缺口警告也随之失去意义（没有「脱敏不完整」，只有「没脱敏」），
-  // 只保留一条 PII 风险警告（spec §7.2）。
-  if (noMask) return { rows, maskedColumns: [], warnings: [NO_MASK_WARNING] }
+  // --no-mask：脱敏整体关闭，缺口警告随之失去意义（没有「脱敏不完整」，只有「没脱敏」）。
+  // ⚠️ 但**形态类**警告与脱敏开关无关，必须保留（契约审查 C-06）：
+  // `--table --no-mask` 时 `TABLES` 之外的列仍未被脱敏、仍应点名——README 明说
+  // 「表定义之外的列不做脱敏但会警告」，这条是数据完整性提示，不是「脱敏不完整」提示。
+  if (noMask) {
+    if (mode.kind === 'table') {
+      const declared = new Set(mode.table.columns.map((c) => c.name))
+      const undeclared = columns.filter((n) => n !== 'count' && !declared.has(n))
+      return {
+        rows,
+        maskedColumns: [],
+        warnings: [
+          NO_MASK_WARNING,
+          ...(undeclared.length > 0
+            ? [`输出含表定义之外的列 ${undeclared.join('、')}（可能来自旧版 CLI 或库损坏）：`
+              + '这些列不在 `TABLES` 元数据中，本次也未做脱敏（--no-mask）']
+            : []),
+        ],
+      }
+    }
+    return { rows, maskedColumns: [], warnings: [NO_MASK_WARNING] }
+  }
 
   if (mode.kind === 'table') {
     // --table 通道：精确。只认 TableDef 的 sensitive 标记；不在 TableDef.columns 的
@@ -200,7 +219,12 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
         // 行里缺这个键就不凭空造一个（输出列与行键正常一致，防御性跳过）
         if (!(name in out)) continue
         const before = out[name]
-        out[name] = maskValue(before, ruleForColumn(name))
+        // ⚠️ 非字符串值整值替换（安全审查 Minor，2026-10-20）：与 --sql 通道的 S1 规则一致。
+        // 类型漂移（外部工具把 userPhone 改成 BIGINT/JSON）时 maskValue 对非字符串原样返回，
+        // 数字形态的手机号会整值漏出且 masked_columns 为空。
+        out[name] = before !== null && before !== undefined && typeof before !== 'string'
+          ? FULL
+          : maskValue(before, ruleForColumn(name))
         if (out[name] !== before) changed.add(name)
       }
       return out
@@ -228,6 +252,9 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     columns.map(baseName).filter((n) => sensitiveNames.includes(n)))
   // 实际改写追踪（两条分支共用）：maskedColumns 只收「至少有一行的值在脱敏前后不同」的列。
   const changed = new Set<string>()
+  // 整行/STRUCT/LIST 命中的列：那是「整值替换」而不是「按值形态误判业务数字」，
+  // 不进下面的误伤提示（场景审查 7.2 只针对字符串形态命中）。
+  const structuralMasked = new Set<string>()
   const outRows = rows.map((row) => {
     const out = { ...row }
     for (const name of columns) {
@@ -248,6 +275,9 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
           : maskValue(before, ruleForColumn(baseName(name)))
       } else {
         out[name] = maskCellByValue(before)
+        if (out[name] !== before && (Array.isArray(before) || (before !== null && typeof before === 'object'))) {
+          structuralMasked.add(name)
+        }
       }
       if (out[name] !== before) changed.add(name)
     }
@@ -303,6 +333,21 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     } catch { return false }
   }))
   const payloadReferenced = columns.includes('payload') || /\bpayload\b/i.test(mode.sql)
+  // ⚠️ 第四类绕过（安全审查 Major，2026-10-20 实测）：`query()` 表函数把内层 SQL 当作
+  // **字符串**执行，外层文本与输出列名都看不到内层标识符——
+  //   `SELECT * FROM query('SELECT userName AS n, userAddress AS a FROM sessions')`
+  // 实测输出列 `n`/`a`，SQL 文本不含 userName/userAddress/payload → 三条启发式全落空，
+  // 姓名/地址静默原样输出且 `mask_warnings: []`。这类「SQL 嵌套执行」的构造无法可靠
+  // 分析，只能声明缺口（不拒绝：query() 本身在沙箱内、仍是只读 SELECT）。
+  // 判据取 `query(` / `query_table(` 词边界；`COLUMNS(...) AS` 也降级为同一警告。
+  const nestedSql = /\bquery_table\s*\(|\bquery\s*\(/i.test(mode.sql)
+    || /\bCOLUMNS\s*\(/i.test(mode.sql)
+  if (nestedSql) {
+    warnings.push(
+      'SQL 使用了 query()/query_table()/COLUMNS() 这类**在其内部再执行 SQL 或批量重命名**的构造：'
+      + '内层引用的敏感列无法被列名级识别，姓名/地址等无格式 PII 可能未经脱敏。'
+      + '需要可靠脱敏请把内层查询单独执行，或改用 `qiyu query --table <表>`')
+  }
   if ((payloadReferenced || hasJsonBlob) && payloadPiiTables.length > 0) {
     warnings.push(
       `引用了 payload 或整行 JSON（含 PII 的表 ${payloadPiiTables.join('、')}）：`
@@ -325,6 +370,37 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     warnings.push(
       `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，` +
       '建议用 `qiyu query --table` 或保持列名原样')
+  }
+
+  // 分组 / 去重会把不同原值压成同一个脱敏值（场景审查 7.3，2026-10-20 实测）：
+  // `SELECT userPhone, COUNT(*) … GROUP BY userPhone` 对 3 个不同手机号输出 3 行同一个
+  // `138****1111`、每行 count=1 —— Agent 会读成「只有 1 个手机号」或「数据坏了」，而
+  // 输出里没有任何提示。`--table --group-by` 直接拒绝敏感列正是为了这个，`--sql` 只能声明。
+  const grouped = /\bGROUP\s+BY\b|\bDISTINCT\b/i.test(mode.sql)
+  if (grouped && matchedSensitive.size > 0) {
+    warnings.push(
+      `SQL 对脱敏列做了 GROUP BY / DISTINCT（${[...matchedSensitive].join('、')}）：`
+      + '不同原值会映射成同一个脱敏值，分组结果与计数可能失真。'
+      + '需要准确分组请用 `--no-mask`（并自行承担 PII 风险），或改用不敏感列分组')
+  }
+
+  // 值级兜底命中了**非敏感列**（场景审查 7.2）：11 位、以 1 开头的订单号/聚合值会被
+  // 当成手机号打码，而 `--table` 通道对同一列返回原值。规则本身不能放宽（放宽就漏 PII），
+  // 但必须告诉 Agent「这一列不是声明上的 PII，是形态命中，值可能被误改」。
+  //
+  // ⚠️ 只在 SQL **完全没有引用任何敏感列**时提示：`SELECT userPhone AS p` 的 p 也是
+  // 「非敏感列名」，但它显然来自敏感列，上面已有缺口警告，再报一条就是噪音。
+  // payload 同理（它有自己的缺口警告，且刻意不在 sensitiveNames 里）。
+  const referencesSensitive = sensitiveNames.some((n) => new RegExp(`\\b${n}\\b`, 'i').test(mode.sql))
+  const falsePositive = referencesSensitive
+    ? []
+    : [...changed].filter((n) =>
+      n !== 'payload' && !structuralMasked.has(n) && !sensitiveNames.includes(baseName(n)))
+  if (falsePositive.length > 0) {
+    warnings.push(
+      `列 ${falsePositive.join('、')} 不在敏感列清单里，是按**值形态**（手机号/邮箱/IPv4）`
+      + '命中的脱敏：若它其实是订单号、聚合值等业务数字，输出值已被改写。'
+      + '这类列可用 `qiyu query --table` 取得原始值（该通道按列声明脱敏）')
   }
 
   const maskedColumns = columns.filter((n) => changed.has(n))

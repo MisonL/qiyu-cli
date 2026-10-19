@@ -27,7 +27,7 @@ import { readWatermark } from '../sync/state.js'
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
-import { ok, fail, usageFail } from '../output.js'
+import { ok, fail, usageFail, describeArgs } from '../output.js'
 import { thrownToExit } from './store.js'
 import type { Store } from '../store/types.js'
 
@@ -157,16 +157,31 @@ function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: strin
   }
 }
 
-/** sync run 侧的 store_not_initialized 出口：hint 指 `qiyu store init`（spec §三/§九）。 */
+/**
+ * sync run 侧的存储失败出口。
+ *
+ * ⚠️ **保留底层错误的 hint**（架构审查 F1）：`store_not_initialized` 有四种成因，只有
+ * 「库不存在」能靠 `qiyu store init` 解决；「路径不是 DuckDB 文件」「他人库」「依赖未安装」
+ * 跑 store init 会**再次失败**（`duckdb.ts:216-222` 会拒绝他人库，`depError` 的 hint 指向
+ * npm install）。早先无条件改成「请先运行 store init」，把 Agent 送进
+ * `sync run → store init → sync run` 死循环，且与 `store status`/`db tables` 对同一失败
+ * 给出的 hint 互相矛盾。现在只在**没有**底层 hint 时补缺省建议。
+ */
 function storeInitFail(e: unknown): number {
-  const err = e as { kind?: string; message?: string; retryable?: boolean }
+  const err = e as { kind?: string; message?: string; retryable?: boolean; hint?: string }
   const msg = err.message ?? String(e)
   if (err.kind === 'store_not_initialized' || /not a valid DuckDB database/i.test(msg)) {
+    // 成因优先于缺省建议：底层 hint（依赖缺失 / 他人库 / 权限）原样保留；
+    // 「路径存在但不是 DuckDB 文件」由 DuckDB 原文判定（store.ts 同款文案）。
+    const hint = err.hint
+      ?? (/not a valid DuckDB database/i.test(msg)
+        ? '该路径已存在且不是 DuckDB 数据库，请换 --db 路径'
+        : '数据库尚未初始化。请先运行：qiyu store init')
     return fail({
       code: 'store_not_initialized', kind: 'store_not_initialized',
       retryable: false,
       message: msg,
-      hint: '数据库尚未初始化。请先运行：qiyu store init',
+      hint,
     })
   }
   return thrownToExit(e)
@@ -177,6 +192,23 @@ export async function runSyncRun(argv: string[]): Promise<number> {
   const clock = (): number => Date.now()
   // —— flag 解析（store.ts 同族：值位守卫，--开头算缺值）——
   const KNOWN = new Set(['--full', '--quiet', '--pretty', '--help', '-h'])
+
+  // ⚠️ `--help` 必须先分流、且不吞额外参数（架构审查 F2）：全仓不变量是「help 永远成功、
+  // 但不能把写错的参数静默吃掉」。早先这一分支写在解析循环里，于是
+  // `sync run --help --bogus` 退出码 0（--bogus 被吞）、`--pretty --help` 却退出码 2
+  // （先撞上 --pretty 检查）—— 同一组 token 因书写顺序得到两种结果。
+  if (argv.includes('--help') || argv.includes('-h')) {
+    const extra = argv.filter((a) => !KNOWN.has(a))
+    if (extra.length > 0) {
+      // ⚠️ 不要写「未知参数」：`--since`/`--db` 是**已知**参数，只是不能与 --help 同用。
+      // 与 query.ts 的 help 分流同款措辞（CodeRabbit 复审 minor）。
+      return usageFail(`--help 不接受额外参数：${describeArgs(extra)}`)
+    }
+    process.stdout.write(SYNC_RUN_USAGE)
+    return 0
+  }
+  if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+
   const flags: Record<string, string> = {}
   const taskIds: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -189,14 +221,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       flags[a] = v
       i++
     } else if (KNOWN.has(a)) {
-      if (a === '--pretty') return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
-      if (a === '--help' || a === '-h') {
-        process.stdout.write(SYNC_RUN_USAGE)
-        return 0
-      }
       flags[a] = a
     } else if (a.startsWith('-')) {
-      return usageFail(`未知参数：${a}。可用：--full --since --until --quiet --db --profile --backend`)
+      return usageFail(`未知参数：${describeArgs([a])}。可用：--full --since --until --quiet --db --profile --backend`)
     } else {
       taskIds.push(a)
     }

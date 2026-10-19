@@ -487,4 +487,40 @@ describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码
     expect(err).toContain('表 sessons 不存在')
     expect(err).not.toContain('<已脱敏>')
   })
+
+  it('值回显不止单引号句式：双引号 / strptime / Malformed JSON 的 payload 都必须脱敏（安全审查 Major）', () => {
+    // 2026-10-20 实测（DuckDB 1.5.6-r.1）：
+    //   CAST(userPhone AS DECIMAL) → Could not convert string "13800138000" to DECIMAL(5,2)
+    //   strptime(userPhone,'%Y')   → Could not parse string "13800138000" according to …
+    //   json_extract(payload,'$.x')→ Malformed JSON … Input: "{"userName":"张三","x":"
+    // 只挡单引号句式会漏掉全部三种；payload 是 PII 的完整副本，泄漏面更大。
+    const cases: Array<[string, string]> = [
+      ['Conversion Error: Could not convert string "13800138000" to DECIMAL(5,2) '
+        + 'when casting from source column userPhone', '13800138000'],
+      ['Invalid Input Error: Could not parse string "13800138000" according to format '
+        + 'specifier "%Y"', '13800138000'],
+      ['Invalid Input Error: Malformed JSON at byte 25 of input: unexpected end of data. '
+        + 'Input: "{"userName":"张三","x":"', '张三'],
+      ['Conversion Error: Casting value "13800138000" to type INT32 failed: '
+        + 'value is out of range!', '13800138000'],
+      // ⚠️ 值内部含未转义的引号（payload 是 JSON）：DuckDB 原样回显，不转义内层引号。
+      // 按「引号到下一个引号」匹配只会吃掉 `"{"`，剩余 userName/张三 全部泄漏。
+      ['Conversion Error: Could not convert string "{"userName":"张三","x":1}" '
+        + 'to DECIMAL(5,2) when casting from source column payload', '张三'],
+      // strptime 还会在下一行把原值再打印一遍，后面跟 `^` 指示符
+      ['Invalid Input Error: Could not parse string "{"userName":"张三"}" according to '
+        + 'format specifier "%Y"\n{"userName":"张三"}\n^\nError: Expected a number', '张三'],
+      // ⚠️ 插入符带前导空白（DuckDB 按出错列位置缩进）时同样必须脱敏
+      ['Invalid Input Error: Could not parse string "13800138000" according to '
+        + 'format specifier "%Y"\n13800138000\n   ^\nError: Expected a number', '13800138000'],
+    ]
+    for (const [message, secret] of cases) {
+      out = ''; err = ''
+      expect(thrownToQueryExit(new Error(message), TABLES)).toBe(1)
+      const msg = String(JSON.parse(out).error.message)
+      expect(msg, message).not.toContain(secret)
+      expect(msg, message).toContain('<已脱敏>')
+      expect(err, message).toBe('')
+    }
+  })
 })

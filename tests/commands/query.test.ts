@@ -14,7 +14,9 @@ import type { Store } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/db.test.ts 同款放宽）；
 // 超时用例要等 conn.interrupt 生效（实测约 300ms），一并放宽。
-vi.setConfig({ testTimeout: 15_000 })
+// DuckDB 冷启动在慢机上实测可达 10s+（首条用例尤其明显），15s 会偶发假失败；
+// 与 tests/store/duckdb.test.ts 同款放宽到 30s。真正的挂起由单条用例自己的超时兜底。
+vi.setConfig({ testTimeout: 30_000 })
 
 let dir = ''
 let out = ''
@@ -99,14 +101,22 @@ const overviewRow = (statDate: string): Record<string, unknown> =>
   ({ stat_date: statDate, payload: '{"a":1}', synchronized_at: null })
 
 /**
- * 外部证据：库文件此刻能以 READ_WRITE 打开 —— 说明命令结束后没有只读会话把锁滞留在进程里。
- * 沿 tests/query/sandbox.test.ts「close() 真正释放文件锁」的形态（只关 instance 不关 conn
- * 时锁会随进程存活）；若上一轮会话没关，这里会因冲突锁直接抛错。
+ * 外部证据：库文件此刻能被**另一个进程**以 READ_WRITE 打开。
+ *
+ * ⚠️ 必须用子进程（测试审查 F1）：DuckDB 的文件锁是**进程级**的 —— 同一进程里只读
+ * 实例/连接仍然开着时，`DuckDBInstance.create(path, {READ_WRITE})` 照样成功。早先的
+ * 同进程版本是空证：把 `finally { await session.close() }` 整段删掉，query.test 仍然全绿。
+ * 子进程持有锁时，本进程的 RW 打开才会报 `Conflicting lock is held`。
  */
 async function expectLockReleased(): Promise<void> {
-  const { DuckDBInstance } = await import('@duckdb/node-api')
-  const inst = await DuckDBInstance.create(dbPath(), { access_mode: 'READ_WRITE' })
-  inst.closeSync()
+  const { execFileSync } = await import('node:child_process')
+  execFileSync(process.execPath, [
+    '--input-type=module',
+    '-e',
+    `import { DuckDBInstance } from '@duckdb/node-api';
+     const i = await DuckDBInstance.create(${JSON.stringify(dbPath())}, { access_mode: 'READ_WRITE' });
+     i.closeSync();`,
+  ], { cwd: process.cwd(), stdio: 'pipe', timeout: 30_000 })
 }
 
 describe('query --sql · 成功路径（spec §十）', () => {
@@ -204,6 +214,22 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(gaps[0]).toContain('脱敏可能不完整')
   })
 
+  it('重名输出列（自连接 / 重复列）的第二列也必须脱敏，不得以 :N 键原样漏出（安全 Critical）', async () => {
+    await seed()
+    // 驱动把重复列名去重成 `userPhone:1`，而列名 API 返回未去重的序列。若命令层
+    // 用未去重的列名，脱敏只遍历 userPhone 两次、`:1` 键从未被访问 —— 实测
+    // `SELECT userPhone, userPhone FROM sessions` 会输出第二个原始号码。
+    expect(await q('--sql',
+      'SELECT userPhone, userPhone FROM sessions ORDER BY session_id LIMIT 1')).toBe(0)
+    const cols = data().columns as string[]
+    expect(cols).toEqual(['userPhone', 'userPhone:1'])
+    const row = rowsOf()[0]
+    expect(row.userPhone).toBe('138****1111')
+    expect(row['userPhone:1']).toBe('138****1111')   // 关键断言：第二列也被改写
+    expect(JSON.stringify(row)).not.toContain('13800001111')
+    expect(meta().masked_columns).toEqual(['userPhone', 'userPhone:1'])
+  })
+
   it('0 行 + SQL 含时间列 → meta.warnings 一条可操作文案；空结果集仍有真实列名', async () => {
     await seed()
     expect(await q('--sql', 'SELECT stat_date FROM daily_overview WHERE 1=0')).toBe(0)
@@ -217,6 +243,11 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toContain('这不代表没有数据')
     expect(warnings[0]).toContain('qiyu sync status')
+
+    // ⚠️ 大小写不敏感（契约审查 C-02）：`SELECT * FROM sessions WHERE STARTTIME > …`
+    // 是合法 SQL，敏感匹配会让这条警告静默失效。
+    expect(await q('--sql', 'SELECT session_id FROM sessions WHERE UPPER(STARTTIME) > \'9\'')).toBe(0)
+    expect((meta().warnings as string[]).some((x) => /这不代表没有数据/.test(x))).toBe(true)
   })
 
   it('iso-day 列 + 日期形态字面量 → meta.warnings 警告少一天（场景 F3）', async () => {
@@ -231,6 +262,12 @@ describe('query --sql · 成功路径（spec §十）', () => {
     // 纯日期字面量同样触发
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
+    expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(true)
+
+    // ⚠️ 空格分隔形态同样触发（场景审查 4）：`'2026-10-13 00:00:00'` 与 `T` 形态等价，
+    // 旧正则只认 `T` → 这种写法静默少算一天、零 warning。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13 00:00:00'")).toBe(0)
     expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(true)
 
     // 反证 1：UTC `…Z` 形态（正确写法）不警告
@@ -329,7 +366,8 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(rowsOf()).toHaveLength(1)
     // SUM(BIGINT) 是 HUGEINT，经 getRowObjectsJson 是**字符串**（spec §5.3）：原样断言，不转 Number
     expect(String(rowsOf()[0].s)).toBe('1999999999000000000')
-  })
+    // ⚠️ 本用例含一条确定性 >1s 的查询 + 两次子进程锁验证，15s 全局超时在慢 CI 上不够。
+  }, 40_000)
 
   it('命令形态：--help 不吞额外参数 / --pretty 显式拒绝 / 未知参数 / 值位守卫', async () => {
     // --help → stdout 用法、退出码 0，两条通道都在
@@ -694,6 +732,41 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect((meta().warnings as string[]).some((x) => /自然日/.test(x))).toBe(false)
   })
 
+  it('今天有行时不得掩盖昨天的真缺口（正确性审查 F6）', async () => {
+    await seed()
+    // NOW = 上海 10/15 12:00。铺 10/11..10/14 只缺 10/12，再加**今天 10/15** 一行。
+    // `--since 10/11` 应覆盖 10/11..10/14（不含今天），实际 3 天 → 必须警告。
+    // 旧实现的 coveredDays 含今天那行 = 4，恰好补满缺口 → 零警告（实测）。
+    await seedMore('daily_overview', [
+      { stat_date: '2026-10-10T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },   // 10/11
+      { stat_date: '2026-10-12T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },   // 10/13
+      { stat_date: '2026-10-13T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },   // 10/14
+      { stat_date: '2026-10-14T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },   // 10/15（今天）
+    ])
+    // seed 自带 10/14 那行会与上面 10/14 冲突？—— overviewRow 主键是 stat_date，
+    // seed 的是 2026-10-13T16:00:00.000Z，上面重复了同一值，upsert 幂等。
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-11')).toBe(0)
+    const w = meta().warnings as string[]
+    expect(w.some((x) => /应有 4 个自然日.*实际只有 3 个/.test(x))).toBe(true)
+  })
+
+  it('库漂移（声明有而实际无的列）→ 警告点名缺列，不静默少列（场景审查 9）', async () => {
+    await seed()
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('ALTER TABLE "sessions" ADD COLUMN "extra_col" VARCHAR')
+      await s.query('ALTER TABLE "sessions" DROP COLUMN "userAddress"')
+    } finally { await s.close() }
+
+    expect(await qAt('--table', 'sessions')).toBe(0)
+    const w = meta().warnings as string[]
+    expect(w.some((x) => /库中缺列 userAddress/.test(x))).toBe(true)
+    expect(w.some((x) => /db describe sessions/.test(x))).toBe(true)
+    // 反向：多出来的列由脱敏层的 drift 警告覆盖（两条警告互不替代）
+    expect((meta().mask_warnings as string[]).some((x) => /extra_col/.test(x))).toBe(true)
+  })
+
   it('库漂移（声明表整个被删）→ store_not_initialized 退出码 1，不再伪装成拼写错误（场景 F1）', async () => {
     await seed()
     // 声明有、库里无：TABLES 认得 staff_quality，information_schema 没有。
@@ -817,13 +890,46 @@ describe('query --table · 参数与错误分派（spec §六/§十一）', () =
     for (const col of ['userPhone', 'payload']) {
       expect(await qAt('--table', 'sessions', '--group-by', col), col).toBe(2)
       expect(err, col).toContain(`不接受敏感列 ${col}`)
-      expect(err, col).toContain('失真')
+      expect(err, col).toContain('分组结果无法区分')
       expect(err, col).toContain('--sql')
     }
 
     expect(await qAt('--table', 'sessions',
       '--group-by', 'session_type', '--group-by', 'session_type')).toBe(2)
     expect(err).toMatch(/重复/)
+  })
+
+  it('iso-day 无毫秒形态（…T16:00:00Z）仍能被区间命中（正确性审查 F1）', async () => {
+    await seed()
+    // seed 已有 10/14 的 `….000Z`；再补同一自然日的无毫秒写法。字典序上
+    // `…16:00:00Z` > `…16:00:00.000Z`，字符串 `<=` 比较会把无毫秒那行漏掉。
+    await seedMore('daily_overview', [overviewRow('2026-10-13T16:00:00Z')])
+    expect(await qAt('--table', 'daily_overview',
+      '--since', '2026-10-14', '--until', '2026-10-14')).toBe(0)
+    expect(rowsOf().map((r) => r.stat_date).sort())
+      .toEqual(['2026-10-13T16:00:00.000Z', '2026-10-13T16:00:00Z'])
+    expect(meta().warnings).toEqual([])   // 有数据 → 不得出现「0 行」警告
+  })
+
+  it('iso-instant 混合偏移（+08:00 与 Z）按时刻过滤、排序与取极值（正确性审查 F2）', async () => {
+    await seed()
+    // 09:00+08:00 = 01:00Z（更早）；05:00Z = 05:00Z（更晚）。字典序与时间序相反。
+    await seedMore('staff_attendance', [
+      attendanceRow('2026-09-20T09:00:00+08:00'),
+      attendanceRow('2026-09-20T05:00:00Z'),
+    ])
+    // 区间 [00:00Z, 02:00Z] 只含 01:00Z 那行
+    expect(await qAt('--table', 'staff_attendance',
+      '--since', '2026-09-20T00:00:00Z', '--until', '2026-09-20T02:00:00Z')).toBe(0)
+    expect(rowsOf().map((r) => r.hour_ts)).toEqual(['2026-09-20T09:00:00+08:00'])
+
+    // 排序与覆盖统计同样按时刻：最新的（05:00Z）在前，min/max 不能取反
+    expect(await qAt('--table', 'staff_attendance')).toBe(0)
+    expect(rowsOf().map((r) => r.hour_ts))
+      .toEqual(['2026-09-20T05:00:00Z', '2026-09-20T09:00:00+08:00'])
+    const cov = meta().data_coverage as { min: string; max: string }
+    expect(cov.min).toBe('2026-09-20T09:00:00+08:00')
+    expect(cov.max).toBe('2026-09-20T13:00:00+08:00')   // 05:00Z = 13:00+08:00
   })
 
   it('取值位为空串时消息必须可见（edge F7）：空表名/空 group-by/空 --since/--limit', async () => {

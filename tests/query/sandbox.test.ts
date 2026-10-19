@@ -553,6 +553,20 @@ describe('白名单与截断', () => {
     })
   })
 
+  it('重名输出列：columns 必须是驱动去重后的键（x / x:1），否则脱敏遍历不到第二列（安全 Critical）', async () => {
+    const { path } = await mkDb()
+    await withSandbox(path, async (s) => {
+      // 实测（DuckDB 1.5.6-r.1 + @duckdb/node-api）：
+      //   columnNames()             = ["a","a"]
+      //   deduplicatedColumnNames() = ["a","a:1"]
+      //   getRowObjectsJson() 的行键 = {"a":…, "a:1":…}
+      // 返回未去重的序列会让调用方（脱敏层）只遍历 a 两次，a:1 永远不被访问。
+      const r = await s.run('SELECT a, a FROM t ORDER BY a LIMIT 1')
+      expect(r.columns).toEqual(['a', 'a:1'])
+      expect(Object.keys(r.rows[0]!).sort()).toEqual(['a', 'a:1'])
+    })
+  })
+
   it('timeoutMs 负数 → usage（0 = 无超时）', async () => {
     const { path } = await mkDb()
     await withSandbox(path, async (s) => {
@@ -634,26 +648,26 @@ describe('openSandbox 的错误路径', () => {
     await expectReject(s.run('SELECT 1'), { kind: 'usage' })
   })
 
-  it('close() 真正释放文件锁：随后以 READ_WRITE 打开同一文件成功', async () => {
-    // 只关 instance 不关 conn 时锁会随进程滞留（store/duckdb.ts:305 的教训）——
-    // 用「rw 能否打开」作外部证据，比断言 closeSync 被调用更接近事实。
+  it('close() 真正释放文件锁：子进程能以 READ_WRITE 打开同一文件', async () => {
+    // ⚠️ 必须用子进程（测试审查 F1）：DuckDB 的锁是**进程级**的，同一进程里只读会话
+    // 仍然开着时 RW create 照样成功 —— 旧版本的同进程断言是空证（把 closeRaw 改成空函数
+    // 后 sandbox 仍 40/41 绿）。子进程打开时父进程若仍持锁会报 Conflicting lock。
     const { path } = await mkDb()
     const s = await openSandbox(cfgFor(path))
     await s.close()
-    const { DuckDBInstance } = await import('@duckdb/node-api')
-    const inst = await DuckDBInstance.create(path, { access_mode: 'READ_WRITE' })
-    try {
-      const conn = await inst.connect()
-      try {
-        await conn.run("INSERT INTO t VALUES (4, 'w')")
-        const r = await conn.runAndReadAll('SELECT COUNT(*) AS n FROM t')
-        expect(Number(r.getRowObjectsJson()[0].n)).toBe(4)
-      } finally {
-        conn.closeSync()
-      }
-    } finally {
-      inst.closeSync()
-    }
+    const { execFileSync } = await import('node:child_process')
+    const stdout = execFileSync(process.execPath, [
+      '--input-type=module',
+      '-e',
+      `import { DuckDBInstance } from '@duckdb/node-api';
+       const i = await DuckDBInstance.create(${JSON.stringify(path)}, { access_mode: 'READ_WRITE' });
+       const c = await i.connect();
+       await c.run("INSERT INTO t VALUES (4, 'w')");
+       const r = await c.runAndReadAll('SELECT COUNT(*) AS n FROM t');
+       console.log(r.getRowObjectsJson()[0].n);
+       c.closeSync(); i.closeSync();`,
+    ], { cwd: process.cwd(), stdio: 'pipe', timeout: 30_000 })
+    expect(Number(String(stdout).trim())).toBe(4)
   })
 
   it('prepare 期错误挂上 cause（原生原文），供 Task 5 补算表/列候选', async () => {

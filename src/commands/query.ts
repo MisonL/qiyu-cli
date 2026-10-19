@@ -70,7 +70,9 @@ const TIMEOUT_MAX_MS = 2_147_483_647
  * 0 行警告的触发正则（spec §十）：SQL 文本命中任一业务时间列名即认为这是一次
  * 时间过滤查询 —— 0 行更可能是同步未覆盖该区间，而不是「那段时间真没有数据」。
  */
-const ZERO_ROW_TIME_RE = /\b(stat_date|work_date|hour_ts|startTime|endTime)\b/
+// ⚠️ 大小写不敏感（契约审查 C-02）：DuckDB 标识符不分大小写，`WHERE STARTTIME …`
+// 是合法 SQL；敏感匹配会让 0 行警告静默失效（正是「0 行 ≠ 没有数据」要防的场景）。
+const ZERO_ROW_TIME_RE = /\b(stat_date|work_date|hour_ts|startTime|endTime)\b/i
 
 /** 0 行警告的后半句（两个通道同源）；前半句各自说明触发条件与实际区间。 */
 const ZERO_ROW_HINT =
@@ -90,8 +92,11 @@ const ZERO_ROW_HINT =
  * `…T00:00:00+08:00`）——即 CLI 自己教出去、却在 `--sql` 里比较错的那种写法。
  * 方向安全（多警告）：误报只多一句话；UTC `…Z` 形态与 `--table` 通道不受影响。
  */
-const ISO_DAY_COL_RE = /\b(stat_date|work_date)\b/
-const DAY_LITERAL_RE = /'\d{4}-\d{2}-\d{2}(T00:00:00(\.0+)?(\+08:00)?)?'/
+// ⚠️ 大小写不敏感，理由同上（`STAT_DATE >= '2026-10-13'` 同样会少一天）。
+const ISO_DAY_COL_RE = /\b(stat_date|work_date)\b/i
+// ⚠️ 必须同时接受 `T` 与**空格**分隔（场景审查 4）：SQL 里 `'2026-10-12 00:00:00'` 是
+// 与 `'…T00:00:00'` 等价的合法写法，旧正则只认 `T` → 空格形态静默少算一天、零 warning。
+const DAY_LITERAL_RE = /'\d{4}-\d{2}-\d{2}([T ]00:00:00(\.0+)?(\+08:00)?)?'/
 const ISO_DAY_LITERAL_HINT =
   '该列列内是 UTC `…Z` 形态的字符串（上海日零点 = 前一日 16:00Z），按字典序比较，' +
   '日期字面量会**少算或漏掉当天**。要在 --sql 里过滤请写 UTC 形态（如 \'2026-10-12T16:00:00.000Z\'），' +
@@ -319,6 +324,18 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     rows: result.rows, columns: result.columns,
     mode: { kind: 'table', table }, noMask: input.noMask,
   })
+
+  // 库漂移「声明有而实际无」（场景审查 9）：`SELECT *` 只返回库里真实存在的列，
+  // 被删掉的列（旧版 CLI/外部工具改过库）会**静默消失**，而 `db tables`/`db describe`
+  // 对同一状态会警告。这里补一条，与 `--table` 通道的「表定义之外的列」警告对称。
+  // group-by 只返回分组列，缺列是预期行为，不检查。
+  const missingCols = input.groupBy.length > 0
+    ? []
+    : table.columns.map((c) => c.name).filter((n) => !result.columns.includes(n))
+  if (missingCols.length > 0) {
+    warnings.push(`库中缺列 ${missingCols.join('、')}（表 ${table.name} 的定义里有、实际没有）：`
+      + '可能来自旧版 CLI 或库损坏；`qiyu db describe ' + table.name + '` 可核对声明与实况的差异')
+  }
   // ⚠️ `COUNT(*)` 经 getRowObjectsJson 是**字符串**（BIGINT）—— 输出必须是 number，
   // 否则 Agent 拿 `"count": "3"` 做算术会静默出错（与 db describe 的 Number() 同款）。
   const rows = input.groupBy.length > 0
@@ -349,10 +366,22 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     const hi = input.until === undefined
       ? Math.min(plan.resolvedRange[1], shanghaiYesterdayStart(input.now))
       : plan.resolvedRange[1]
+    // ⚠️ 缺口计数必须与 `expectedDays` 用**同一个上界**（正确性审查 F6）：
+    // `coveredDays` 来自实际查询区间，缺省上界含今天；而 expectedDays 已排除今天。
+    // 今天只要有一行，就会把昨天的真缺口补满 → 零警告（实测：10/13–10/18 + 今天、
+    // 缺 10/19，`--since 7d` 输出 warnings: []）。这里按夹紧后的 hi 再算一次。
+    let daysInWindow = coveredDays
+    if (hi < plan.resolvedRange[1]) {
+      const clamped = buildCoverageQuery({ ...input, until: hi })
+      const row = (await session.run(clamped.sql, {
+        params: clamped.params, timeoutMs: input.timeoutMs,
+      })).rows[0] ?? {}
+      daysInWindow = row.days === null || row.days === undefined ? coveredDays : Number(row.days)
+    }
     const expectedDays = Math.max(0, Math.round((hi - plan.resolvedRange[0]) / 86_400_000) + 1)
-    if (coveredDays < expectedDays) {
+    if (daysInWindow < expectedDays) {
       const scope = input.until === undefined ? '（不含今天：当天数据次日才同步）' : ''
-      warnings.push(`区间内应有 ${expectedDays} 个自然日${scope}，实际只有 ${coveredDays} 个有数据`
+      warnings.push(`区间内应有 ${expectedDays} 个自然日${scope}，实际只有 ${daysInWindow} 个有数据`
         + '（窗口内部存在缺口）；用 `qiyu sync status` 查看缺口详情，或放宽过滤条件')
     }
   }

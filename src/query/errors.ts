@@ -353,16 +353,37 @@ export function emitQueryFailure(f: QueryFailure, noMask = false): number {
   // `SELECT CAST(userPhone AS INT) FROM sessions` →
   // `Conversion Error: Could not convert string '13800138000' to INT32 …`
   // —— 那是查询结果行之外的一条独立泄漏通道（脱敏只作用于 rows，错误消息不经过它）。
-  // 只针对这个固定句式替换：usage 错误里的引号标识符（表名/列名）必须保持可读。
+  //
+  // ⚠️ **不止单引号一种句式**（安全审查 Major，2026-10-20 用随包 `libduckdb.dylib` 的
+  // 格式串 + 实跑核对）：同一个值会以不同包装回显，只挡一种就漏其余——
+  //   · `Could not convert string '…' to INT32`        （单引号，INT/BIGINT）
+  //   · `Could not convert string "…" to DECIMAL(5,2)` （双引号，实测）
+  //   · `Could not parse string "…" according to format specifier "%Y"`（strptime，实测）
+  //   · `Casting value "…" to type … failed: value is out of range!`
+  //   · `Malformed JSON … Input: "<payload 原文片段>"`（payload 是 PII 完整副本，实测）
+  //   · `Failed to cast value: …` / `Failed to cast value to decimal: …`
+  // 只替换**值**的位置，保留错误类别与列名等可读信息（usage 错误里的引号标识符不受影响）。
+  // ⚠️ **值内部可能含未转义的引号**（CodeRabbit 复审 Major，2026-10-20 实测）：
+  // payload 是 JSON，DuckDB 回显时**不转义**内层引号——
+  //   `Could not convert string "{"userName":"张三","x":1}" to DECIMAL(5,2)`
+  // 若按「引号到下一个引号」匹配，只会吃掉 `"{"`，剩余 `userName":"张三"...` 原样留在
+  // 消息里（strptime 更会在下一行再回显一遍原值）。故必须**锚定固定后缀**、贪婪匹配：
+  //   · `… string <quote>…<quote> to …` / `… according to …`
+  //   · `Casting value "…" to type …`
+  const redactValueEcho = (s: string): string => s
+    .replace(/(Could not (?:convert|parse) string )(['"])[\s\S]*\2(?=\s+(?:to|according)\b)/gi,
+      "$1'<已脱敏>'")
+    .replace(/(Casting value )"[\s\S]*"(?=\s+to type\b)/gi, "$1'<已脱敏>'")
+    // `Input: "…"` 之后整段都是原始输入（可能跨行）—— 到消息结尾全裁掉。
+    .replace(/(Malformed JSON[\s\S]*?\bInput: )"[\s\S]*$/i, "$1'<已脱敏>'")
+    .replace(/(Failed to cast value(?: to (?:decimal|numerical))?: )[\s\S]*$/i, "$1'<已脱敏>'")
+    // strptime 的第二处回显：`… according to format specifier "%Y"\n<原值>\n<缩进>^`
+    // —— 头部已脱敏，但下一行会把原值再打印一遍（实测，payload 场景同样中招）。
+    // ⚠️ 插入符可能带**前导空白**（DuckDB 按出错列位置缩进），lookahead 必须容忍。
+    .replace(/(according to format specifier "[^"]*"\n)[\s\S]*?\n(?=[ \t]*\^)/i, '$1<已脱敏>\n')
   const clean = (s: string): string => {
     const withoutSql = stripSqlEcho(s)
-    const redacted = noMask
-      ? withoutSql
-      : withoutSql.replace(
-        /(Could not convert string )'(?:[^']|'')*'(?= to\b)/gi,
-        "$1'<已脱敏>'",
-      )
-    return sanitizeMessage(redacted)
+    return sanitizeMessage(noMask ? withoutSql : redactValueEcho(withoutSql))
   }
   const message = clean(f.message)
   const hint = f.hint === undefined ? undefined : clean(f.hint)
