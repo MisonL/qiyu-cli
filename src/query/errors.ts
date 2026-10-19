@@ -377,9 +377,10 @@ export function emitQueryFailure(f: QueryFailure, noMask = false): number {
     // `Input: "…"` 之后整段都是原始输入（可能跨行）—— 到消息结尾全裁掉。
     .replace(/(Malformed JSON[\s\S]*?\bInput: )"[\s\S]*$/i, "$1'<已脱敏>'")
     .replace(/(Failed to cast value(?: to (?:decimal|numerical))?: )[\s\S]*$/i, "$1'<已脱敏>'")
-    // strptime 的第二处回显：`… according to format specifier "%Y"\n<原值>\n^`
+    // strptime 的第二处回显：`… according to format specifier "%Y"\n<原值>\n<缩进>^`
     // —— 头部已脱敏，但下一行会把原值再打印一遍（实测，payload 场景同样中招）。
-    .replace(/(according to format specifier "[^"]*"\n)[\s\S]*?\n(?=\^)/i, '$1<已脱敏>\n')
+    // ⚠️ 插入符可能带**前导空白**（DuckDB 按出错列位置缩进），lookahead 必须容忍。
+    .replace(/(according to format specifier "[^"]*"\n)[\s\S]*?\n(?=[ \t]*\^)/i, '$1<已脱敏>\n')
   const clean = (s: string): string => {
     const withoutSql = stripSqlEcho(s)
     return sanitizeMessage(noMask ? withoutSql : redactValueEcho(withoutSql))

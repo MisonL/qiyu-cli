@@ -16,7 +16,9 @@ import { __setSleep as setKnowledgeSleep } from '../../src/sync/tasks/knowledge.
 import type { Store } from '../../src/store/types.js'
 
 // L1 对冲：真库冷启动偶发 >5s（同 tests/store/duckdb.test.ts / tasks-dim.test.ts）。
-vi.setConfig({ testTimeout: 15_000 })
+// ⚠️ 30s：本文件含多条真实网络桩 + 真库的端到端用例，机器有并发负载时 15s 仍会假失败
+//（2026-10-20 实测：单独跑 67/67 绿，全量并发时两条 15s 超时）。
+vi.setConfig({ testTimeout: 30_000 })
 
 let out = ''
 let err = ''

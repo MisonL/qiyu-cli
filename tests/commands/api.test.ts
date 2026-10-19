@@ -571,10 +571,12 @@ describe('api list', () => {
   it('run(["api", "list"]) 会走到 apiCommand —— 挂载没漏', async () => {
     // 同任务 10：漏登记 COMMANDS 表会让 CLI 静默返回"未知子命令"，
     // 而 apiCommand 自己的测试全绿。
+    // ⚠️ 动态 import 整个 cli 图（含 store/query 的命令注册），冷启动 transform 实测可超 5s
+    //（本机 8.6s），默认 5s 超时会偶发假失败。
     const { run } = await import('../../src/cli.js')
     expect(await run(['api', 'list'])).toBe(0)
     expect(JSON.parse(out).data.length).toBeGreaterThan(0)
-  })
+  }, 30_000)
 
   it('help 文本里不得出现 Markdown 标记 —— 它走 stdout，是纯文本不是渲染后的文档', async () => {
     // ⚠️ 这条守的是"帮助文本是给终端看的"这个前提（2026-10-06 补）。

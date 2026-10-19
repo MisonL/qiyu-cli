@@ -510,6 +510,9 @@ describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码
       // strptime 还会在下一行把原值再打印一遍，后面跟 `^` 指示符
       ['Invalid Input Error: Could not parse string "{"userName":"张三"}" according to '
         + 'format specifier "%Y"\n{"userName":"张三"}\n^\nError: Expected a number', '张三'],
+      // ⚠️ 插入符带前导空白（DuckDB 按出错列位置缩进）时同样必须脱敏
+      ['Invalid Input Error: Could not parse string "13800138000" according to '
+        + 'format specifier "%Y"\n13800138000\n   ^\nError: Expected a number', '13800138000'],
     ]
     for (const [message, secret] of cases) {
       out = ''; err = ''
