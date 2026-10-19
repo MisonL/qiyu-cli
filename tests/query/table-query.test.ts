@@ -255,7 +255,7 @@ describe('buildCoverageQuery / buildMinQuery（契约 B/D）', () => {
 
     expect(cov.sql).toBe(
       'SELECT MIN(TRY_CAST("startTime" AS BIGINT)) AS mn, ' +
-      'MAX(TRY_CAST("startTime" AS BIGINT)) AS mx FROM "sessions"' +
+      'MAX(TRY_CAST("startTime" AS BIGINT)) AS mx, NULL AS days FROM "sessions"' +
       ' WHERE TRY_CAST("startTime" AS BIGINT) >= ? AND TRY_CAST("startTime" AS BIGINT) <= ?')
     expect(cov.params).toEqual(plan.params)
   })
@@ -263,7 +263,8 @@ describe('buildCoverageQuery / buildMinQuery（契约 B/D）', () => {
   it('无谓词时覆盖 = 全表 MIN/MAX', () => {
     const cov = buildCoverageQuery({ table: t('daily_overview'), now: NOW })
     expect(cov.sql).toBe(
-      'SELECT MIN("stat_date") AS mn, MAX("stat_date") AS mx FROM "daily_overview"')
+      'SELECT MIN("stat_date") AS mn, MAX("stat_date") AS mx, ' +
+      'COUNT(DISTINCT "stat_date") AS days FROM "daily_overview"')
     expect(cov.params).toEqual([])
   })
 

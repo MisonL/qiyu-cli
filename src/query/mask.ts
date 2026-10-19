@@ -127,6 +127,14 @@ function hasPiiLeaf(value: unknown): boolean {
  * 返回原值表示「未改写」，调用方据此决定是否计入 maskedColumns。
  */
 function maskCellByValue(v: unknown): unknown {
+  // ⚠️ 非字符串的 JSON 形态（DuckDB 的 STRUCT/LIST/MAP → JS 对象/数组）必须**整值替换**
+  // （security S1，Critical）：`SELECT t FROM sessions t` / `SELECT [t]` / `SELECT {'a':t}`
+  // 的值就是整行，里面是全量 PII；而它既不是字符串（旧的 JSON 字符串分支够不着），
+  // 也没有列名可归属（列名级够不着）。这类形态只可能来自整行序列化 / struct_pack /
+  // list 聚合，没有「聚合数字」这种合法误杀场景（报表 payload 是 VARCHAR 字符串，走下面
+  // 的字符串分支）。漏 PII 的代价远高于误杀一个 struct，故一律整值替换。
+  if (Array.isArray(v)) return FULL
+  if (v !== null && typeof v === 'object') return FULL
   if (typeof v !== 'string' || v === '') return v
   const t = v.trim()
   if (t.startsWith('{') || t.startsWith('[')) {
@@ -204,7 +212,16 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 精确大小写匹配：输出列名 = 表定义大小写（探针 12），故 `staff.username`（全小写）
   // 不会命中 `sessions.userName`（驼峰）——这是「精确」而非「忽略大小写」的理由。
   const sensitiveNames = sqlSensitiveNames(mode.tables)
-  const nameHit = new Set(columns.filter((name) => sensitiveNames.includes(name)))
+  // ⚠️ DuckDB 把重名输出列去重成 `userName:1`、`userName:2`（security S2，Critical：
+  // 自连接 `SELECT a.userName, b.userName FROM sessions a JOIN sessions b …` 即可触发）。
+  // 精确匹配会放过改名后的第 2 列 → 原始 PII 静默漏出（列名级与值级两条防线都够不着，
+  // 因为姓名/地址无法值级检测）。故匹配用「去掉 `:数字` 后缀的基名」。
+  const baseName = (n: string): string => n.replace(/:\d+$/, '')
+  const nameHit = new Set(
+    columns.filter((name) => sensitiveNames.includes(baseName(name))))
+  // 供缺口警告用：哪些敏感列名**真的**匹配到了输出列（含 `:N` 改名后的）。
+  const matchedSensitive = new Set(
+    columns.map(baseName).filter((n) => sensitiveNames.includes(n)))
   // 实际改写追踪（两条分支共用）：maskedColumns 只收「至少有一行的值在脱敏前后不同」的列。
   const changed = new Set<string>()
   const outRows = rows.map((row) => {
@@ -213,7 +230,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       if (!(name in out)) continue
       const before = out[name]
       if (nameHit.has(name)) {
-        out[name] = maskValue(before, ruleForColumn(name))
+        out[name] = maskValue(before, ruleForColumn(baseName(name)))
       } else {
         out[name] = maskCellByValue(before)
       }
@@ -258,6 +275,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     .filter((name) => new RegExp(`\\b${name}\\b`, 'i').test(mode.sql))
   const hasJsonBlob = rows.some((row) => columns.some((name) => {
     const v = row[name]
+    // security S1：STRUCT/LIST 是 JS 对象/数组，不是字符串 —— 也必须算「整行 JSON」，
+    // 否则 `SELECT t FROM sessions t` 脱敏后仍按「值已改写」放行、不再发缺口警告。
+    if (Array.isArray(v)) return true
+    if (v !== null && typeof v === 'object') return true
     if (typeof v !== 'string') return false
     const t = v.trim()
     if (!t.startsWith('{') && !t.startsWith('[')) return false
@@ -276,7 +297,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
 
   for (const name of sensitiveNames) {
     if (warnings.length >= WARNING_LIMIT) break
-    if (nameHit.has(name)) continue
+    if (matchedSensitive.has(name)) continue
     // `\b` 两侧都要求非标识符字符：userPhoneBook 这类更长标识符不会误报 userPhone。
     if (!new RegExp(`\\b${name}\\b`).test(mode.sql)) continue
     warnings.push(

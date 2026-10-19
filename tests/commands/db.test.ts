@@ -205,6 +205,62 @@ describe('db tables', () => {
     expect(text).toMatch(/startTime/)
   })
 
+  it('时间列的脏值不进 time_range，且逐表给 warning（正确性 P1）', async () => {
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      // 字典序上 `n` > `2`，脏值会赢下 MAX —— 旧实现把 time_range.max 变成 'not-a-date'。
+      await s.query("INSERT INTO \"daily_overview\" VALUES ('not-a-date', '{}', NULL)")
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
+
+    const overview = (data().tables as TableOut[]).find((t) => t.name === 'daily_overview')!
+    expect(overview.rows).toBe(3)                  // 脏行照样计数（它是真实存在的行）
+    expect(overview.time_range).toEqual(           // 极值仍是合法 ISO
+      { min: '2026-09-15T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00' })
+
+    const text = (meta().warnings as string[]).join('\n')
+    expect(text).toMatch(/时间列 stat_date 有 1 个值不符合约定形态/)
+    expect(text).not.toMatch(/not-a-date/)
+
+    // 反证：干净库（无脏值）不得出现该警告 —— 否则这条警告会被 Agent 学会忽略
+    const clean = mkdtempSync(join(tmpdir(), 'qiyu-db-clean-'))
+    try {
+      const dir2 = { path: join(clean, 'q.db') }
+      const s2 = await createDuckDbStore(
+        { backend: 'duckdb', path: dir2.path, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+      try {
+        await s2.init()
+        await s2.upsert('daily_overview', [
+          { stat_date: '2026-10-13T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null }])
+      } finally { await s2.close() }
+      out = ''; err = ''
+      expect(await dbCommand(['tables', '--db', dir2.path])).toBe(0)
+      expect((meta().warnings as string[]).join('\n')).not.toMatch(/不符合约定形态/)
+    } finally { rmSync(clean, { recursive: true, force: true }) }
+  })
+
+  it('db describe 的时间范围同样排除脏值并逐列警告（正确性 P1）', async () => {
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query("INSERT INTO \"staff_attendance\" VALUES ('1000002', 'not-a-date', '2026-09-15T16:00:00.000Z', '{}', NULL)")
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['describe', 'staff_attendance', '--db', dbPath()])).toBe(0)
+
+    const d = data()
+    expect(d.row_count).toBe(3)
+    expect(d.time_range).toEqual(
+      { min: '2026-09-15T09:00:00+08:00', max: '2026-09-16T09:00:00+08:00' })
+    expect((meta().warnings as string[]).join('\n')).toMatch(/时间列 hour_ts 有 1 个值不符合约定形态/)
+  })
+
   it('db tables 也核对列集：多列/少列进 warnings（审查 I-3，README 承诺不静默）', async () => {
     await seed()
     const s = await createDuckDbStore(

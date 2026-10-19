@@ -1,7 +1,7 @@
 // src/commands/store.ts
 import { statSync, lstatSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { resolveStoreConfig } from '../store/config.js'
+import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { ok, fail, usageFail, sanitizeControlChars } from '../output.js'
 
@@ -19,6 +19,10 @@ const USAGE = `用法：qiyu store <子命令> [参数]
 
 const KNOWN = new Set(['--help', '-h', '--pretty'])
 
+/**
+ * `--db/--profile/--backend` 的值位解析。⚠️ 与 db.ts / stats.ts 的同名函数**逐字相同**
+ * （query.ts 的是第四份、语义有意不同）—— 改动必须三处同步（架构审查 M-2）。
+ */
 function parseFlags(argv: string[]): { db?: string; profile?: string; backend?: string; rest: string[] } {
   const out: { db?: string; profile?: string; backend?: string; rest: string[] } = { rest: [] }
   for (let i = 0; i < argv.length; i++) {
@@ -102,7 +106,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
   let resolved
   try {
     resolved = resolveStoreConfig({ flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
-      env: { QIYU_DB_PATH: process.env.QIYU_DB_PATH, QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND, QIYU_PROFILE: process.env.QIYU_PROFILE } })
+      env: currentStoreEnv() })
   } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
 
   const { config, configPath, configExists } = resolved

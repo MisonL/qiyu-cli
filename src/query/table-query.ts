@@ -19,6 +19,7 @@
 // 实际从 9/15 00:00 起算；`--until 9/20` 实际覆盖到 9/20 全天）。契约 C。
 import { shanghaiDayIso, shanghaiDayStart, shanghaiIso } from '../core/time.js'
 import { suggestNames } from './errors.js'
+import { describeArgs } from '../output.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
 
 /** 时间列定义（`TableDef.timeColumn` 的非空形态）。 */
@@ -109,7 +110,8 @@ export function validateGroupBy(table: TableDef, groupBy: readonly string[]): st
       const hint = candidates.length > 0
         ? `候选：${candidates.join('、')}`
         : `该表列：${names.join('、')}`
-      throw new TableQueryUsageError(`--group-by 未知列：${name}（表 ${table.name} 无此列）；${hint}`)
+      throw new TableQueryUsageError(
+        `--group-by 未知列：${describeArgs([name])}（表 ${table.name} 无此列）；${hint}`)
     }
     if (sensitive.has(name)) {
       throw new TableQueryUsageError(
@@ -249,6 +251,11 @@ export function buildTableQuery(input: TableQueryInput): BuiltTableQuery {
 /**
  * `data_coverage` 的查询（契约 D）：与主查询**同一个谓词**（不是全表 MIN/MAX），
  * 独立执行因而不受 `--limit` 截断影响。值原样返回，格式化由命令层统一走 `msToShanghaiIso`。
+ *
+ * 第二个输出列 `days` 是**区间内的不同自然日数**（端到端场景 F4）：MIN/MAX 结构上
+ * 表达不了内部空洞 —— 7 天窗口里缺一天时 rows 可能恰好是 7、看什么都没问题。
+ * iso-day 列的行粒度就是一天，直接 `COUNT(DISTINCT)` 即自然日数；iso-instant/epoch-ms
+ * 的表不是日粒度（hour_ts 是小时），拿它比日历日没有意义，故为 NULL 由调用方跳过。
  */
 export function buildCoverageQuery(input: TableQueryInput): { sql: string; params: unknown[] } {
   const { table } = input
@@ -259,8 +266,9 @@ export function buildCoverageQuery(input: TableQueryInput): { sql: string; param
   const filter = buildTimeFilter(input)
   const expr = timeExprOf(tc)
   const where = filter.clauses.length > 0 ? ` WHERE ${filter.clauses.join(' AND ')}` : ''
+  const days = tc.kind === 'iso-day' ? `, COUNT(DISTINCT ${expr}) AS days` : ', NULL AS days'
   return {
-    sql: `SELECT MIN(${expr}) AS mn, MAX(${expr}) AS mx FROM ${quote(table.name)}${where}`,
+    sql: `SELECT MIN(${expr}) AS mn, MAX(${expr}) AS mx${days} FROM ${quote(table.name)}${where}`,
     params: filter.params,
   }
 }

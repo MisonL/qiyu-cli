@@ -464,7 +464,10 @@ describe('白名单与截断', () => {
         ["SET TimeZone='UTC'", /SET/],                               // 20
         ['INSTALL httpfs', /INSTALL/],                               // 21
         [`ATTACH '${join(dir, 'a.db')}' AS a`, /ATTACH/],            // 25
-        ['DELETE FROM t', /类型 5/],                                 // 映射表外的类型 → 「类型 N」
+        ['DELETE FROM t', /DELETE/],                                 // 5（类型名，不再是裸数字）
+        ['UPDATE t SET a = 1', /UPDATE/],                            // 3
+        ['DROP TABLE t', /DROP/],                                    // 15
+        ['ALTER TABLE t ADD COLUMN c INTEGER', /ALTER/],             // 9
       ]
       for (const [sql, re] of blocked) {
         await expectReject(s.run(sql), { kind: 'usage', code: 'sandbox_blocked', match: re })
@@ -556,6 +559,54 @@ describe('白名单与截断', () => {
       await expectReject(s.run('SELECT 1', { timeoutMs: -1 }), { kind: 'usage' })
       expect((await s.run('SELECT 1 AS x', { timeoutMs: 0 })).rows).toEqual([{ x: 1 }])
     })
+  })
+
+  it('列名 __proto__ 被驱动映射成原型属性时 fail-closed，不静默丢列（edge F3）', async () => {
+    // 实测：`SELECT "__proto__", b FROM …` 时 getRowObjectsJson 产出的行对象只有 b，
+    // 旧实现用 `Object.keys(rows[0])` 取列名 → 显式请求的 __proto__ 连值带名消失、
+    // 退出码 0 且零警告。现在列名取 columnNames()，缺自有键即 fail-closed。
+    const fakeMod = {
+      DuckDBInstance: {
+        create: async () => ({
+          connect: async () => ({
+            run: async () => ({}),
+            runAndReadAll: async () => ({
+              getRowObjectsJson: () => [{ ea: false, lc: true, ml: '953.6 MiB' }],
+              columnNames: () => [] as string[],
+            }),
+            extractStatements: async () => ({
+              count: 1,
+              prepare: async () => ({
+                statementType: 1,
+                parameterCount: 0,
+                bind: () => {},
+                runAndReadUntil: async () => ({
+                  // 行对象**缺** __proto__ 自有键（原型赋值），但真实列名里有它
+                  getRowObjectsJson: () => [{ b: 1 }],
+                  columnNames: () => ['__proto__', 'b'],
+                }),
+                destroySync: () => {},
+              }),
+            }),
+            interrupt: () => {},
+            closeSync: () => {},
+          }),
+          closeSync: () => {},
+        }),
+      },
+      StatementType: {},
+    }
+    const importer = async (): Promise<unknown> => fakeMod
+    const s = await openSandbox(cfgFor('/nonexistent/q.db'), { importer })
+    try {
+      const e = await expectReject(s.run('SELECT "__proto__", b FROM t'), {
+        kind: 'internal', code: 'internal', match: /__proto__/,
+      })
+      expect(e.hint).toMatch(/别名/)
+      expect(e.message).toMatch(/无法安全表示/)
+    } finally {
+      await s.close()
+    }
   })
 
   it('超时：大范围查询 + timeoutMs=50 → query_timeout；中断后连接仍可用、可正常关闭', async () => {

@@ -34,8 +34,10 @@ describe('原生报错 → 中文 + 候选（spec §十一）', () => {
     expect(f).toMatchObject({
       kind: 'usage', code: 'query_error', retryable: false, message: '列 paylod 不存在',
     })
-    // suggestNames 先给 payload（来自 TABLES），原生候选 session_id 追加在后
-    expect(f.hint).toBe('候选：payload、session_id')
+    // suggestNames 先给 payload（来自 TABLES），原生候选 session_id 追加在后。
+    // 正确性 P2 起，原生候选须过相关性闸门（suggestNames 同阈值）：session_id 与 paylod
+    // 前缀/编辑距离都不沾边 → 不再收进候选；payload 相关、保留。
+    expect(f.hint).toBe('候选：payload')
   })
 
   it('Permission Error … disabled by configuration → sandbox_blocked', () => {
@@ -47,6 +49,24 @@ describe('原生报错 → 中文 + 候选（spec §十一）', () => {
       kind: 'usage', code: 'sandbox_blocked', retryable: false,
       message: '该语句尝试访问文件或网络，已被只读沙箱拦截',
     })
+  })
+
+  it('原生候选与本输入无关时不再展示（正确性 P2：robot_summary → staff_group_members）', () => {
+    // DuckDB 的 binder 候选可能与自己毫无关系（实测删掉 robot_summary 后给 staff_group_members）
+    // —— 直接展示会把 Agent 推向另一张表。判据与其他候选同一阈值：前缀或编辑距离 ≤2。
+    const e = new Error(
+      'Catalog Error: Table with name robot_summary does not exist!\n' +
+      'Candidate bindings: "staff_group_members"',
+    )
+    const f = classifyDuckDbError(e, TABLES)
+    expect(f.message).toBe('表 robot_summary 不存在')
+    expect(f.hint).toBe('用 `qiyu db tables` 查看可用表')
+
+    // 反证：原生候选**确实相关**时保留（sessons → sessions 距离 1）
+    const relevant = new Error(
+      'Catalog Error: Table with name sessons does not exist!\nDid you mean "sessions"?',
+    )
+    expect(classifyDuckDbError(relevant, TABLES).hint).toBe('候选：sessions')
   })
 
   it('裸 Permission Error（OS 权限问题）不得误报 sandbox_blocked', () => {
@@ -136,7 +156,7 @@ describe('原生报错 → 中文 + 候选（spec §十一）', () => {
     const e = new Error(
       'Catalog Error: Table with name sessons does not exist!\nDid you mean "pg_constraint"?',
     )
-    expect(classifyDuckDbError(e, TABLES).hint).toBe('候选：sessions、pg_constraint')
+    expect(classifyDuckDbError(e, TABLES).hint).toBe('候选：sessions')
   })
 
   it('候选超过 5 个 → 展示前 5 个 + 「等」', () => {
@@ -230,6 +250,13 @@ describe('suggestNames：前缀优先，其次编辑距离 ≤ 2', () => {
     expect(suggestNames('a', ['ab', 'ac', 'ad', 'ae', 'af', 'ag'], 3)).toEqual(['ab', 'ac', 'ad'])
   })
 
+  it('仅大小写不同 → 把定义大小的名字作为候选（edge F6）', () => {
+    // 此前 `lower === needle` 一律 continue，把「只差大小写」的正确答案排除了 ——
+    // Agent 拿 `SESSIONS` 查不到候选，而 DuckDB 标识符大小写不敏感（--sql 通道同写法能跑）。
+    expect(suggestNames('SESSIONS', ['sessions', 'tickets'])).toEqual(['sessions'])
+    expect(suggestNames('sessions', ['SESSIONS'])).toEqual(['SESSIONS'])
+  })
+
   it('空输入 / max<=0 / 空名字池 → 空数组', () => {
     expect(suggestNames('', ['sessions'])).toEqual([])
     expect(suggestNames('sessons', ['sessions'], 0)).toEqual([])
@@ -313,7 +340,8 @@ describe('sandbox 包装错误：cause 带原生表/列错误时补算中文消�
     expect(f.kind).toBe('usage')
     expect(f.code).toBe('query_error')
     expect(f.message).toBe('列 paylod 不存在')
-    expect(f.hint).toBe('候选：payload、session_id')
+    // 原生候选 session_id 与 paylod 不相关（P2 闸门）→ 只剩 TABLES 侧的相关候选
+    expect(f.hint).toBe('候选：payload')
   })
 
   it('cause 是无关错误（如 INTERRUPT）→ message 保持 sandbox 原文不变', () => {
@@ -403,5 +431,32 @@ describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码
     })
     expect(j.error.message.startsWith('查询内存不足')).toBe(true)
     expect(err).toBe('')
+  })
+
+  it('DuckDB 原文回显 SQL 时，stderr/stdout 都裁掉 LINE n 之后的 SQL（security S3）', () => {
+    // Parser/Binder 错误会把出错行的 SQL 全文附在 LINE n: 之后 —— 那段可能含调用方
+    // 写进 SQL 的 PII（如手机号）。原样透传等于把原始值写进 stderr。
+    const e = new Error(
+      'Parser Error: syntax error at or near "="\n\n' +
+      'LINE 1: SELECT 1 FROM (SELECT userPhone FROM sessions) WHERE x = \n' +
+      '                                                              ^',
+    )
+    expect(thrownToQueryExit(e, TABLES)).toBe(2)
+    const j = JSON.parse(out)
+    expect(String(j.error.message)).not.toContain('userPhone')
+    expect(String(j.error.message)).toContain('LINE 1: （SQL 原文已省略）')
+    expect(err).not.toContain('userPhone')
+    expect(err).toContain('LINE 1: （SQL 原文已省略）')
+    // 类别与可操作性保住：仍是 SQL 语法错误 + 中文包装
+    expect(String(j.error.message)).toMatch(/SQL 语法错误/)
+  })
+
+  it('message 里的终端控制字符在出口被净化（security S4，DuckDB 原文路径）', () => {
+    const e = Object.assign(new Error('该语句尝试访问文件或网络\u001b]0;OWNED\u0007，已被只读沙箱拦截'), {
+      kind: 'usage', code: 'sandbox_blocked',
+    })
+    expect(thrownToQueryExit(e, TABLES)).toBe(2)
+    expect(err).not.toContain('\u001b')
+    expect(String(JSON.parse(out).error.message)).not.toContain('\u001b')
   })
 })

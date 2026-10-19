@@ -16,7 +16,7 @@
 //   ⑥ 中断裁决：不装 signal handler —— 事务边界是安全点，进程被 kill 时 DuckDB 回滚、
 //      水位不推，下次 run 从水位续跑（红线 3 钉死用例覆盖）。
 import { openStore } from '../store/index.js'
-import { resolveStoreConfig } from '../store/config.js'
+import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { resolveCredentials } from '../core/credentials.js'
 import { RateGate } from '../sync/rate-gate.js'
 import { runTask, runRotated } from '../sync/engine.js'
@@ -234,7 +234,7 @@ export async function runSyncRun(argv: string[]): Promise<number> {
   try {
     resolved = resolveStoreConfig({
       flags: { db: flags['--db'], profile: flags['--profile'], backend: flags['--backend'] },
-      env: { QIYU_DB_PATH: process.env.QIYU_DB_PATH, QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND, QIYU_PROFILE: process.env.QIYU_PROFILE },
+      env: currentStoreEnv(),
     })
   } catch (e) { return usageFail((e as Error).message) }
   let store: Store | undefined

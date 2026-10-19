@@ -291,6 +291,86 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     expect(staffBlob.warnings).toEqual([])
   })
 
+  it('security S1：STRUCT/LIST/MAP 整值替换（非字符串 JSON 形态的列名级/值级都够不着）', () => {
+    // DuckDB 的 `SELECT t FROM sessions t` 返回 STRUCT → JS 对象；`SELECT [t]` 返回
+    // LIST → JS 数组。这类值既不是字符串（旧的 JSON 字符串分支够不着）、也没有列名
+    // 可归属（列名级够不着），结果漏出全量 PII 且零警告（Critical）。
+    const struct = maskQueryRows({
+      rows: [{ t: { userPhone: '13800138000', userName: '张三', session_id: 's1' } }],
+      columns: ['t'], mode: sqlMode('SELECT t FROM sessions t'),
+    })
+    expect(struct.rows[0].t).toBe(FULL)
+    expect(struct.maskedColumns).toContain('t')
+
+    const list = maskQueryRows({
+      rows: [{ t: [{ userPhone: '13800138000', userName: '张三' }] }],
+      columns: ['t'], mode: sqlMode('SELECT [t] AS t FROM sessions t'),
+    })
+    expect(list.rows[0].t).toBe(FULL)
+
+    const map = maskQueryRows({
+      rows: [{ m: { a: { userPhone: '13800138000' } } }],
+      columns: ['m'], mode: sqlMode("SELECT {'a': t} AS m FROM sessions t"),
+    })
+    expect(map.rows[0].m).toBe(FULL)
+
+    // 还有 payload 缺口警告一并起（sessions 的表名在 SQL 里 → payloadPiiTables 非空；
+    // hasJsonBlob 因对象/数组为 true → 穿透）。
+    expect(struct.warnings.length).toBeGreaterThanOrEqual(1)
+    expect(struct.warnings[0]).toMatch(/payload 或整行 JSON/)
+
+    // 反证：聚合对象的反证——不含 PII 表名的查询不触发 payload 警告。
+    // ⚠️ 聚合 struct 本身仍被整值替换（slight over-masking），但这是代价最小的安全选择。
+    const agg = maskQueryRows({
+      rows: [{ s: { min: 42, max: 99 } }], columns: ['s'],
+      mode: sqlMode("SELECT {'min': MIN(x), 'max': MAX(x)} AS s FROM daily_overview"),
+    })
+    expect(agg.rows[0].s).toBe(FULL)
+    expect(agg.warnings).toEqual([])  // daily_overview 不在 payloadPiiTables
+  })
+
+  it('security S2：DuckDB 去重列名 userPhone:1/userPhone:2 必须脱敏', () => {
+    // 自连接 `SELECT a.userName, b.userName FROM sessions a JOIN sessions b ON …`
+    // → DuckDB 把输出列去重成 userName 与 userName:1（冒号 + 数字）。
+    // 精确匹配放过 userName:1 → 姓名/地址原样漏出且零警告（Critical）。
+    const selfJoin = maskQueryRows({
+      rows: [{ userName: '张三', 'userName:1': '李四' }],
+      columns: ['userName', 'userName:1'],
+      mode: sqlMode(
+        'SELECT a.userName, b.userName FROM sessions a JOIN sessions b ON a.session_id < b.session_id'),
+    })
+    expect(selfJoin.rows[0].userName).toBe(FULL)
+    expect(selfJoin.rows[0]['userName:1']).toBe(FULL)
+    expect(selfJoin.maskedColumns).toContain('userName')
+    expect(selfJoin.maskedColumns).toContain('userName:1')
+
+    // phone 列同样覆盖（有格式 → 按 phone 规则而不是整值）
+    const phoneJoin = maskQueryRows({
+      rows: [{ userPhone: '13800138000', 'userPhone:1': '13900139000' }],
+      columns: ['userPhone', 'userPhone:1'],
+      mode: sqlMode(
+        'SELECT a.userPhone, b.userPhone FROM sessions a JOIN sessions b ON a.session_id < b.session_id'),
+    })
+    expect(phoneJoin.rows[0].userPhone).toBe('138****8000')
+    expect(phoneJoin.rows[0]['userPhone:1']).toBe('139****9000')
+    expect(phoneJoin.maskedColumns).toContain('userPhone')
+    expect(phoneJoin.maskedColumns).toContain('userPhone:1')
+
+    // 三列同名 userPhone, userPhone, userPhone → :1 与 :2 都要脱敏
+    const triple = maskQueryRows({
+      rows: [{ userPhone: '13800138000', 'userPhone:1': '13900139000', 'userPhone:2': '13700137000' }],
+      columns: ['userPhone', 'userPhone:1', 'userPhone:2'],
+      mode: sqlMode('SELECT userPhone, userPhone, userPhone FROM sessions'),
+    })
+    expect(triple.rows[0].userPhone).toBe('138****8000')
+    expect(triple.rows[0]['userPhone:1']).toBe('139****9000')
+    expect(triple.rows[0]['userPhone:2']).toBe('137****7000')
+
+    // 缺口警告不能因 :N 改名而误报（matchedSensitive 用 baseName）
+    expect(selfJoin.warnings).toEqual([])
+    expect(phoneJoin.warnings).toEqual([])
+  })
+
   it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5、词边界、精确大小写）', () => {
     const one = maskQueryRows({
       rows: [{ p: '13800138000' }], columns: ['p'],

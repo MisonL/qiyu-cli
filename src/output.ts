@@ -79,7 +79,9 @@ export function describeArgs(args: readonly string[]): string {
 }
 
 /** 把不受信文本（调用方 body 的字段名等）中的终端控制字符抹成占位，防止 stderr 注入 ANSI/OSC 序列。 */
-export { sanitizeControlChars } from './core/sanitize.js'
+export { sanitizeControlChars, sanitizeMessage, stripSqlEcho } from './core/sanitize.js'
+// usageFail 的出口净化要用（re-export 不建立本地绑定）。
+import { sanitizeMessage } from './core/sanitize.js'
 
 export function ok(data: unknown, meta?: unknown): number {
   // ⚠️ `data` 必须**始终存在**，即便值是 undefined 也写成 null。
@@ -168,11 +170,16 @@ export function fail(error: ErrorInput): number {
  * 这样两类读者都照顾到：人看 stderr，Agent 按契约读 stdout 的 JSON。
  */
 export function usageFail(message: string, hint?: string): number {
-  process.stderr.write(message.endsWith('\n') ? message : message + '\n')
+  // ⚠️ stderr 是不受信文本进终端的主通道（security S4）：未知参数、未知表名、DuckDB 原文
+  // 都拼进 message，未经净化就能注入 ANSI/OSC 序列。净化必须在**出口**做一次，
+  // 而不是靠每个调用点自觉补 —— 实测 `db describe` / `query --table` 的未知表路径补了、
+  // 而同文件的 `未知参数` / `--help` 多余参数路径没补，两种行为并存正是缺口的来源。
+  const safe = sanitizeMessage(message)
+  process.stderr.write(safe.endsWith('\n') ? safe : safe + '\n')
   return fail({
     code: 'usage', kind: 'usage', retryable: false,
     // message 去尾换行 —— stdout 的 JSON 里不该带控制字符；stderr 的文本保留换行便于阅读。
-    message: message.replace(/\n+$/, ''),
-    hint,
+    message: safe.replace(/\n+$/, ''),
+    ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
   })
 }

@@ -35,7 +35,7 @@ export interface TableDef {
  * 时间列编码文案（设计稿 §四）：kind 决定存储形态，也决定 E 的比较方式——
  * iso-day 必须先把 --since 向下取整到上海自然日，直接比较会漏掉当天全天的行。
  */
-const UNIT_ISO_DAY = '上海自然日 00:00 的 ISO 8601'
+const UNIT_ISO_DAY = '上海自然日 00:00 的 ISO 8601（列内实为 UTC `…Z` 形态）'
 const UNIT_ISO_INSTANT = 'ISO 8601 UTC'
 const UNIT_EPOCH_MS = 'epoch 毫秒数字字符串'
 /** 业务字段整体收敛列（报表/工单/会话/知识库同一取舍）：值为整行 JSON 字符串。 */

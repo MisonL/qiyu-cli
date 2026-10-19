@@ -216,6 +216,51 @@ describe('stats fields', () => {
     expect(meta().warnings).toEqual([])   // 有可观测字段 → 不是空结果
   })
 
+  it('混入一行非法 JSON payload → 不整命令失败，坏行进 warning 点名（edge F2）', async () => {
+    const s = await fresh()
+    try {
+      // 生产写路径用 JSON.stringify，坏值只可能来自旧版 CLI / 外部工具 / 库损坏。
+      // 旧行为：json_keys 抛 Malformed JSON → 整条命令退出码 1，8 行合法数据全丢。
+      await s.upsert('daily_overview', [
+        { stat_date: '2026-10-01T16:00:00.000Z', payload: '{"sessions":7}', synchronized_at: null },
+        { stat_date: '2026-10-02T16:00:00.000Z', payload: '{"sessions":9}', synchronized_at: null },
+        { stat_date: '2026-10-03T16:00:00.000Z', payload: 'not json at all', synchronized_at: null },
+        { stat_date: '2026-10-04T16:00:00.000Z', payload: '', synchronized_at: null },
+      ])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+
+    // 合法行照常统计
+    expect(data().observed).toEqual([
+      { field: 'sessions', rows_present: 2, minus_one: 0, nulls: 0, min: 7, max: 9 },
+    ])
+    const w = meta().warnings as string[]
+    expect(w.some((x) => /2 行 payload 不是合法 JSON/.test(x))).toBe(true)
+    // 坏 JSON 与空 payload 都算坏行（'' 不是合法 JSON）；警告语不得说成「无数据」
+    expect(w.some((x) => /该表无数据/.test(x))).toBe(false)
+  })
+
+  it('payload 含空字符串键 "" → 不整命令失败，空键进 warning（edge F1）', async () => {
+    const s = await fresh()
+    try {
+      // 旧行为：拼出 JSON 路径 $."" → JSON path error → 整条命令失败。
+      await s.upsert('daily_overview', [
+        { stat_date: '2026-10-01T16:00:00.000Z', payload: '{"":6,"sessions":7}', synchronized_at: null },
+      ])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+
+    expect(data().observed).toEqual([
+      { field: 'sessions', rows_present: 1, minus_one: 0, nulls: 0, min: 7, max: 7 },
+    ])
+    const w = meta().warnings as string[]
+    expect(w.some((x) => /空字符串键/.test(x))).toBe(true)
+  })
+
   it('含空格的键名：JSON 路径 $."a b" 可取（不误判为 unknown 之外的失败）', async () => {
     const s = await fresh()
     try {

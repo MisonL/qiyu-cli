@@ -17,7 +17,7 @@
 //
 // ⚠️ 分层约束（spec §5.1）：不 import `sync/`、`commands/`。`output.ts` 是 CLI 输出层
 // （信封与退出码），不是命令层，可以 import。
-import { fail } from '../output.js'
+import { fail, sanitizeMessage, stripSqlEcho } from '../output.js'
 import type { TableDef } from '../store/schema.js'
 
 export interface QueryFailure {
@@ -93,9 +93,16 @@ export function suggestNames(input: string, names: readonly string[], max = CAND
   const seen = new Set<string>()
   for (const name of names) {
     const lower = name.toLowerCase()
-    if (lower === needle || seen.has(lower)) continue // 与输入同名 / 名字池里重复（列名跨表重名）
+    if (seen.has(lower)) continue // 名字池里重复（列名跨表重名）
     seen.add(lower)
     const distance = levenshtein(needle, lower)
+    // 仅大小写不同的精确同名（edge F6）：`SESSIONS` → `sessions`。此前 `lower === needle`
+    // 直接 continue 把「只差大小写」的正确答案排除了，Agent 反而拿不到候选；而 DuckDB
+    // 标识符大小写不敏感（同一写法在 --sql 通道能跑通），必须把该名字本身作为候选。
+    if (lower === needle) {
+      if (name !== input) scored.push({ name, rank: -1, distance: 0 })
+      continue
+    }
     const isPrefix = lower.startsWith(needle) || needle.startsWith(lower)
     if (isPrefix) scored.push({ name, rank: 0, distance })
     else if (distance <= MAX_DISTANCE) scored.push({ name, rank: 1, distance })
@@ -121,6 +128,11 @@ function nativeCandidates(msg: string): string[] {
 /**
  * 候选合并：`suggestNames` 的结果在前（来自 TABLES，是用户真正可能想要的），
  * 原生候选只补位 —— 原生候选可能是系统表（`pg_constraint`），不能无条件排第一。
+ *
+ * ⚠️ 原生候选必须**再过一次相关性闸门**（正确性 P2）：DuckDB 的 binder 会给出与自己
+ * 无关的候选（实测删掉 `robot_summary` 后 → `候选：staff_group_members`），照单全收会
+ * 把 Agent 推向另一张表、且与 `TABLES` 无关。`suggestNames` 用的同一阈值（前缀或距离 ≤2）
+ * 在这里同样适用 —— 不硬凑（spec §十一）。过滤后为空则退回「用 db tables 查看」。
  */
 function mergeCandidates(primary: string[], native: string[]): string[] {
   const out: string[] = []
@@ -161,7 +173,10 @@ function tableNotFound(name: string, msg: string, tables: readonly TableDef[]): 
   const candidates = mergeCandidates(
     // 多要一个：只有知道「还有第 6 个」才能决定 hint 末尾加不加「等」。
     suggestNames(name, tables.map((t) => t.name), CANDIDATE_LIMIT + 1),
-    nativeCandidates(msg),
+    // 原生候选（正确性 P2）同样过相关性闸门：DuckDB 的 `Candidate bindings/tables`
+    // 可能给出与本输入毫无关系的名字（实测 `robot_summary` → `staff_group_members`），
+    // 直接当「候选」展示会把 Agent 推向另一张表。只保留通过 `suggestNames` 阈值的那部分。
+    suggestNames(name, nativeCandidates(msg), CANDIDATE_LIMIT + 1),
   )
   return {
     message: `表 ${name} 不存在`,
@@ -174,7 +189,8 @@ function columnNotFound(name: string, msg: string, tables: readonly TableDef[]):
   const allColumns = [...new Set(tables.flatMap((t) => t.columns.map((c) => c.name)))]
   const candidates = mergeCandidates(
     suggestNames(name, allColumns, CANDIDATE_LIMIT + 1),
-    nativeCandidates(msg),
+    // 同 tableNotFound：原生候选须过相关性闸门（正确性 P2）。
+    suggestNames(name, nativeCandidates(msg), CANDIDATE_LIMIT + 1),
   )
   return {
     message: `列 ${name} 不存在`,
@@ -317,13 +333,59 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
  * `query_timeout` 不设特殊分支）。若将来 `output.usageFail` 支持自定义 code，可改回复用它。
  */
 export function thrownToQueryExit(e: unknown, tables: readonly TableDef[]): number {
-  const f = classifyDuckDbError(e, tables)
+  return emitQueryFailure(classifyDuckDbError(e, tables))
+}
+
+/**
+ * 已分类失败的唯一出口（`thrownToQueryExit` 与 `--table` 漂移识别共用）。
+ * usage 双通道：stderr 纯文本 + stdout JSON（见上一段的说明）。
+ */
+export function emitQueryFailure(f: QueryFailure): number {
+  // security S3/S4：DuckDB 原文与调用方输入都可能带终端控制字符，且 Parser/Binder 错误
+  // 会回显整行 SQL（其中可能含调用方写进 SQL 的 PII）。在**唯一出口**统一净化 + 裁掉
+  // SQL 回显 —— 逐调用点补会漏（security 实测同文件内两种行为并存）。
+  const message = sanitizeMessage(stripSqlEcho(f.message))
+  const hint = f.hint === undefined ? undefined : sanitizeMessage(stripSqlEcho(f.hint))
   if (f.kind === 'usage') {
-    process.stderr.write(f.message.endsWith('\n') ? f.message : f.message + '\n')
+    process.stderr.write(message.endsWith('\n') ? message : message + '\n')
   }
   return fail({
     code: f.code, kind: f.kind, retryable: f.retryable,
-    message: f.message.replace(/\n+$/, ''),
-    ...(f.hint !== undefined ? { hint: f.hint } : {}),
+    message: message.replace(/\n+$/, ''),
+    ...(hint !== undefined ? { hint } : {}),
   })
+}
+
+/**
+ * `--table` 通道的**库漂移**识别（PR 前契约审查 Minor）。
+ *
+ * 该通道的 SQL 由代码按 `TABLES` 生成，用户没写列名/表名 —— 撞上库漂移（列被删、表被删）
+ * 时，`classifyDuckDbError` 的「SQL 无法执行，请检查表名、列名与 SQL 语法」与候选清单
+ * 会把 Agent 指向**它无法修改的东西**（它没写 SQL），而唯一有效动作是核对漂移
+ *（`db describe` 对同一状态会给出「实际多列/少列」的警告）。
+ *
+ * 判据收紧到「缺失名确实属于该表的声明」才认作漂移 —— 否则可能把真实的代码 bug
+ *（生成的 SQL 里写错了列名）掩盖成环境问题。不属于时返回 null，交回原生分派。
+ */
+export function driftFailureFor(table: TableDef, e: unknown): QueryFailure | null {
+  const msg = errorText(e)
+  const byTable = TABLE_NAME_RE.exec(msg) ?? TABLE_REF_RE.exec(msg)
+  if (byTable !== null && byTable[1] === table.name) {
+    return {
+      code: 'query_error', kind: 'usage', retryable: false,
+      message: `表 ${table.name} 在库中不存在——与 TABLES 声明漂移（表被删或建库不完整）`,
+      hint: `这不是你的查询写错了：本命令的 SQL 由 CLI 生成。用 \`qiyu db describe ${table.name}\` 核对，`
+        + '并考虑重新同步或重建库（`qiyu store init` 只补未执行的迁移，不重建已删的表）',
+    }
+  }
+  const byColumn = COLUMN_NAMED_RE.exec(msg) ?? COLUMN_NAME_RE.exec(msg)
+  if (byColumn !== null && table.columns.some((c) => c.name === byColumn[1])) {
+    return {
+      code: 'query_error', kind: 'usage', retryable: false,
+      message: `列 ${byColumn[1]} 在库中不存在（表 ${table.name}）——库与 TABLES 声明漂移`,
+      hint: `这不是你的查询写错了：本命令的 SQL 由 CLI 生成，列名来自 TABLES 声明。`
+        + `用 \`qiyu db describe ${table.name}\` 查看实际列集与漂移警告`,
+    }
+  }
+  return null
 }

@@ -131,8 +131,8 @@ qiyu stats fields <报表>              指标自描述（声明 + 本地观测�
 **请按 `kind` 分支，不要按 `code`。** `code` 只是个标签：它可能是服务端的数字码
 （如 `14009`），也可能是本 CLI 合成的词（`usage` / `network` / `internal` /
 `auth_missing` / `confirm_required` / `store_locked` / `store_not_initialized` /
-`local_rate_limit` / `unknown`）。合成词在官方
-错误码表里查不到。
+`local_rate_limit` / `query_error` / `sandbox_blocked` / `query_timeout` / `unknown`）。
+合成词在官方错误码表里查不到；完整清单见 `qiyu --help`。
 
 ### 退出码
 
@@ -239,15 +239,29 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 - `data_coverage`：该表时间列在**过滤范围内**的 MIN/MAX（`+08:00` ISO）；`--sql` 通道恒为 `null`。
   它有三种 `null` 成因，用 `resolved_range` 与 `warnings` 区分：`--sql` 通道 / 该表无时间列 /
   有过滤范围但范围内一行都没有。
+- **`--sql` 通道的数值是 JSON 安全形态的字符串**：`COUNT(*)` / `SUM` / `BIGINT` / `HUGEINT` /
+  `DECIMAL` 一律输出字符串（如 `"n":"12"`、`"d":"1.50"`），这是驱动为避免精度丢失的取舍。
+  做算术或比较前先转数字（`Number(x)`）；`--table --group-by` 的 `count`、`db describe` 的
+  `row_count`、`stats fields` 的 `observed` 则都是数字——两种口径不同，别混用。
+- **`iso-day` 列在库内是 UTC `…Z` 形态**（上海日零点 = 前一日 16:00Z），而所有元数据出口
+  （`db tables.time_range`、`db describe` 的 `unit`、`resolved_range`、`data_coverage`）呈现
+  的是 `+08:00` 形态。`--table` 通道已处理取整语义；**`--sql` 里直接按字符串比较时要用 UTC 形态**，
+  否则会少算一天（如 `WHERE stat_date >= '2026-10-12T16:00:00.000Z'`）。检测到
+  「iso-day 列 + 日期形态字面量」时 `meta.warnings` 会明确提示。
 - `db tables` / `db describe` 的 `meta.notice` 恒在（本库含客户 PII 的提示）；
-  声明与实况不一致（缺表/缺列/多列）逐条进 `meta.warnings`，不静默——`db tables` 做表级
-  与列集核对，`db describe` 给出该表的逐列差异细节。
+  声明与实况不一致（缺表/缺列/多列/时间列脏值）逐条进 `meta.warnings`，不静默——`db tables` 做表级
+  与列集核对，`db describe` 给出该表的逐列差异细节。时间列里不符合约定形态的值**不进**
+  `time_range`（否则 `not-a-date` 会在字典序上赢下 MAX），并由 warning 点名数量。
 
 `stats fields <报表>` 的输出把**声明**与**观测**分开：`declared`（每条带 `source`：
 `design-doc` 实测 / `name-suffix` 命名推断）、`observed`（`rows_present` / `minus_one` /
 `nulls` / `min` / `max`）、`unknown_fields`（判不出单位的字段）、`sentinel`
 （`-1` = 该窗口或筛选条件没有匹配到数据，**不是负数比率**）。`-1` 是厂商未文档化的哨兵值，
 `observed.minus_one` 与 `rows_present` 相等时说明该字段本次全是哨兵。
+⚠️ 这是**聚合观测，不是逐行取值**：`rows_present` 为 1 时 `min` 与 `max` 都等于那一行的原值
+（例：薪资明细表只有一行时，极值就是该行金额）。需要逐行数据请用 `query --sql` 并自行承担
+脱敏边界；payload 不是合法 JSON 的行、以及含空字符串键 `""` 的行也不计入统计，
+两者都会在 `meta.warnings` 里点名数量。
 
 ## 安全
 

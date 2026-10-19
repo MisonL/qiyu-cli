@@ -10,15 +10,12 @@
 //     每条带 source；`observed` 是本地 payload 的数据分布，不是语义；
 //   · `-1` 是「该窗口没有匹配到数据」的哨兵（设计稿实测，厂商未文档化）——
 //     sentinel 恒在，且 min/max 一律排除 -1（否则 Agent 会报出 -100%）。
-import { resolveStoreConfig } from '../store/config.js'
-import { openSandbox } from '../query/sandbox.js'
-import type { SandboxSession } from '../query/sandbox.js'
 import { thrownToQueryExit, suggestNames } from '../query/errors.js'
 import { METRIC_CATALOG, REPORT_TABLES, declareMetric } from '../query/metric-catalog.js'
 import type { MetricDecl } from '../query/metric-catalog.js'
 import { TABLES } from '../store/schema.js'
-import { statGuard } from './db.js'
-import { ok, fail, usageFail, sanitizeControlChars } from '../output.js'
+import { openGuardedSession } from './db.js'
+import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
 
 const USAGE = `用法：qiyu stats <子命令> [参数]
 
@@ -45,10 +42,9 @@ const SENTINEL = {
 
 interface StoreFlags { db?: string; profile?: string; backend?: string }
 
-// ⚠️ 与 db.ts / query.ts 的 parseFlags 同款，**有意各自一份**：命令间不互相 import 的
-// 红线已为 statGuard 放宽为单点复用（它有三处调用方、语义完整）；parseFlags 只是十几行
-// 的 flag 循环，再抽一个共享模块会把「哪些 flag 是值位」的局部知识挪到远处，
-// 收益不抵耦合（YAGNI）。
+// ⚠️ 与 db.ts / store.ts 的 parseFlags **逐字相同**（query.ts 的是第四份、语义有意不同），
+// 另两处各有同款注释互指（架构审查 M-2）。改动必须三处同步，否则新增共享定位 flag 时
+// 某条命令会静默把它当位置参数。
 function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
   const out: StoreFlags & { rest: string[] } = { rest: [] }
   for (let i = 0; i < argv.length; i++) {
@@ -90,23 +86,42 @@ function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
 function observeSql(table: string): string {
   return `WITH kv AS (
   SELECT j.k AS k, t.payload AS payload
-  FROM "${table}" t, unnest(json_keys(t.payload)) AS j(k)
+  FROM "${table}" t, unnest(TRY(json_keys(t.payload))) AS j(k)
+  WHERE j.k <> ''
 ), ext AS (
   SELECT k, payload,
          '$."' || replace(replace(k, '\\', '\\\\'), '"', '\\"') || '"' AS path
   FROM kv
 ), vals AS (
   SELECT k, payload,
-         json_extract(payload, path) AS raw,
-         TRY_CAST(json_extract_string(payload, path) AS DOUBLE) AS num
+         TRY(json_extract(payload, path)) AS raw,
+         TRY_CAST(TRY(json_extract_string(payload, path)) AS DOUBLE) AS num
   FROM ext
 )
 SELECT k AS field, COUNT(*) AS rows_present,
        SUM(CASE WHEN num = -1 THEN 1 ELSE 0 END) AS minus_one,
-       SUM(CASE WHEN raw IS NULL OR json_type(raw) = 'NULL' THEN 1 ELSE 0 END) AS nulls,
+       SUM(CASE WHEN raw IS NULL OR TRY(json_type(raw)) = 'NULL' THEN 1 ELSE 0 END) AS nulls,
        MIN(CASE WHEN num <> -1 THEN num END) AS min,
        MAX(CASE WHEN num <> -1 THEN num END) AS max
 FROM vals GROUP BY k ORDER BY k`
+}
+
+/**
+ * 库形态计数（edge cases F1/F2）：一行 payload 不是合法 JSON、或含空键 `""` ——
+ * 前者让 `json_keys` 抛 `Malformed JSON`，**一行坏数据会杀掉整条命令**（连不依赖数据的
+ * `declared` 都拿不到）；后者拼出 `$.""` 路径、抛 `JSON path error`，同样整命令失败。
+ * 观测 SQL 已用 `TRY`/过滤兜住这两类，本查询负责点名成因并进 `meta.warnings`
+ * （「有坏行」与「表为空」是不同的事实，不能混成一句）。
+ */
+function shapeSql(table: string): string {
+  return `SELECT
+    COUNT(*) AS total,
+    COUNT(*) FILTER (
+      WHERE payload IS NOT NULL AND TRY(json_valid(payload)) IS NOT TRUE) AS bad_json,
+    COUNT(*) FILTER (
+      WHERE TRY(json_valid(payload)) IS TRUE AND
+        EXISTS (SELECT 1 FROM unnest(TRY(json_keys(payload))) AS j(k) WHERE j.k = '')) AS empty_key
+  FROM "${table}"`
 }
 
 /** COUNT/SUM 经 getRowObjectsJson() 是**字符串**（BIGINT/DECIMAL 的 JSON 形态）→ Number() 收敛。 */
@@ -190,43 +205,20 @@ async function statsFields(argv: string[]): Promise<number> {
           ? '该表的业务字段收敛在 payload 里但不属于报表域；stats fields 只做报表指标，字段清单请用 `qiyu db describe ' + table + '`'
           : '该表的业务字段不是整体收敛进 payload 的（没有 payload 列），字段自描述对它没有意义'
     return usageFail(
-      `stats fields 只接受报表域表，收到：${table}\n可用表：${REPORT_TABLES.join('、')}`,
+      `stats fields 只接受报表域表，收到：${describeArgs([table])}\n可用表：${REPORT_TABLES.join('、')}`,
       hint)
   }
 
-  let config
-  try {
-    config = resolveStoreConfig({
-      flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
-      env: {
-        QIYU_DB_PATH: process.env.QIYU_DB_PATH,
-        QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
-        QIYU_PROFILE: process.env.QIYU_PROFILE,
-      },
-    }).config
-  } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
-
-  const guarded = statGuard(config.path)
-  if (guarded !== null) return guarded
-
-  let session: SandboxSession
-  try {
-    session = await openSandbox(config)
-  } catch (e) { return thrownToQueryExit(e, TABLES) }
+  const opened = await openGuardedSession({
+    db: flags.db, profile: flags.profile, backend: flags.backend,
+  })
+  if ('exit' in opened) return opened.exit
+  const session = opened.session
 
   try {
-    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）：
-    // ① 无 schema_version = 不是本 CLI 创建的库；② 有库但缺目标表 = 建库不完整/表被删。
-    // 口径与 db.ts 及下方目标表查询一致：限定 table_schema='main'（别库同名表不算数）。
-    const sv = await session.run(
-      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
-    if (sv.rows.length === 0) {
-      return fail({
-        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
-      })
-    }
+    // 目标表存在性校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）：
+    // schema_version 的库结构校验在 openGuardedSession 里已做（E 族共用，口径见 db.ts 的
+    // 注释）——这里只补本命令特有的「目标表缺」分支，并给出对 stats 有意义的 hint。
     const target = await session.run(
       `SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='${table}'`)
     if (target.rows.length === 0) {
@@ -235,7 +227,7 @@ async function statsFields(argv: string[]): Promise<number> {
       // **不会**被重建（迁移已跳过，返回 ok 而表仍缺）——那是「成功但无效」的修复。
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库中缺表：${table}（${config.path}）`,
+        message: `数据库中缺表：${table}（${opened.dbPath}）`,
         hint: '若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
           + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
           + '——需重建库（删除库文件后重新 qiyu store init 并重新同步）',
@@ -243,6 +235,7 @@ async function statsFields(argv: string[]): Promise<number> {
     }
 
     const result = await session.run(observeSql(table))
+    const shape = (await session.run(shapeSql(table))).rows[0] ?? {}
     const observed: Observed[] = result.rows.map((r) => ({
       field: String(r.field),
       rows_present: countOf(r.rows_present),
@@ -273,8 +266,21 @@ async function statsFields(argv: string[]): Promise<number> {
     // 空结果有两种成因，警告必须分开说（「没有行」与「有行但 payload 没有可观测键」
     // 是不同的事实，前者指向同步、后者指向 payload 落库形态）。
     const warnings: string[] = []
+    // 坏行先点名（edge cases F1/F2）：它们不进 observed，但**必须**说明成因 ——
+    // 否则 Agent 会把「统计里少了几行」当成「那些字段就是没数据」。
+    const badJson = countOf(shape.bad_json)
+    if (badJson > 0) {
+      warnings.push(`该表有 ${badJson} 行 payload 不是合法 JSON，未计入统计`
+        + '（正常同步写入的是 JSON 字符串；这些行可能来自旧版 CLI、外部工具或库损坏）。'
+        + '用 `qiyu query --sql` 单独查看它们以确认成因')
+    }
+    const emptyKey = countOf(shape.empty_key)
+    if (emptyKey > 0) {
+      warnings.push(`该表有 ${emptyKey} 行 payload 含空字符串键 ""，该键未计入统计`
+        + '（JSON 路径无法表达空键名）；其余字段照常统计')
+    }
     if (observed.length === 0) {
-      const n = Number((await session.run(`SELECT COUNT(*) AS n FROM "${table}"`)).rows[0]?.n)
+      const n = Number(shape.total)
       if (n === 0) {
         warnings.push('该表无数据；先运行 `qiyu sync run`')
       } else {

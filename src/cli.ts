@@ -48,7 +48,7 @@ const USAGE = `用法：qiyu <子命令> [参数]
   db tables                列出库中全部表：行数、粒度、时间范围、PII 列
   db describe <表>         查看单表列定义（列名、类型、可空、敏感标记、时间列）
   query --sql <SQL>        任意只读 SQL（三层只读沙箱 + 默认脱敏 + 行数上限 + 超时）
-  query --table <表> --since <时间> [--group-by <列>]
+  query --table <表> [--since <时间>] [--until <时间>] [--group-by <列>]
                            受约束查询通道（列白名单、时间列语义化、精确脱敏）
   stats fields <报表表>     指标声明（带出处）+ 本地观测分布 + -1 哨兵
 

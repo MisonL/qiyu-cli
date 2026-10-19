@@ -94,8 +94,27 @@ export function parseTimeArg(arg: string, clock: () => number,
     return { start: todayStart - DAY_MS, end: todayStart }
   }
   const date = /^(\d{4})-(\d{2})-(\d{2})$/.exec(arg)
-  if (date) return shanghaiMidnightUtc(Number(date[1]), Number(date[2]), Number(date[3]))
-  const full = Date.parse(arg)
+  if (date) {
+    const y = Number(date[1])
+    const m = Number(date[2])
+    const d = Number(date[3])
+    // ⚠️ 回验（正确性 P1 / edge F4）：`Date.UTC` 会把越界的月/日**静默进位**
+    // （2026-02-30 → 2026-03-02、2026-13-45 → 2027-02-14），也会把 0–99 年映射到
+    // 1900+（0000-01-01 → 1900-01-01）。旧实现直接返回进位结果、退出码 0 且无警告：
+    // Agent 拿到一条与输入对不上的区间，甚至把「输入了不存在的日期」误读成「同步缺口」。
+    // 回验不一致即视为无法解析（红线 3「未知 ≠ 猜」），由调用方走 usage。
+    const ms = shanghaiMidnightUtc(y, m, d)
+    const back = new Date(ms + SHANGHAI_OFFSET_MS)
+    if (back.getUTCFullYear() !== y || back.getUTCMonth() + 1 !== m || back.getUTCDate() !== d) {
+      return null
+    }
+    return ms
+  }
+  // ⚠️ 无时区后缀的 ISO 必须显式按 Asia/Shanghai 解释（edge F5）：`Date.parse` 对
+  // 无偏移量的 ISO 使用**进程时区**，在 CI（常为 UTC）上同一输入会偏 8 小时，
+  // 而本 CLI 的全部时间语义是 Asia/Shanghai（spec §三），且偏了没有任何警告。
+  const tzless = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(arg)
+  const full = Date.parse(tzless ? `${arg.replace(' ', 'T')}+08:00` : arg)
   if (!Number.isNaN(full)) return full
   return null   // 解析失败 → 调用方 usage
 }

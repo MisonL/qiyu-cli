@@ -27,7 +27,7 @@ import { dirname } from 'node:path'
 import { SYNC_TASKS, taskById, UNSUPPORTED_DATASETS } from '../sync/registry.js'
 import { listGaps, listWatermarks } from '../sync/state.js'
 import type { SyncTask } from '../sync/types.js'
-import { resolveStoreConfig } from '../store/config.js'
+import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
 import { resolveCredentials } from '../core/credentials.js'
@@ -119,11 +119,7 @@ interface StoreFlags { db?: string; profile?: string; backend?: string }
 function resolveConfig(flags: StoreFlags): { path: string; backend: string; config: Parameters<typeof openStore>[0] } {
   const resolved = resolveStoreConfig({
     flags,
-    env: {
-      QIYU_DB_PATH: process.env.QIYU_DB_PATH,
-      QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
-      QIYU_PROFILE: process.env.QIYU_PROFILE,
-    },
+    env: currentStoreEnv(),
   })
   return { path: resolved.config.path, backend: resolved.config.backend, config: resolved.config }
 }

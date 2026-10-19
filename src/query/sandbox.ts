@@ -14,12 +14,11 @@
 // JSON」的契约。所以必须在 layer1 直接拒绝（见 hasAnalyzeToken）。
 //
 // ⚠️ 分层约束（spec §5.1）：本文件不 import `sync/`、`commands/`、`store/duckdb.ts` 的
-// Store 实现。唯一从 duckdb.ts 借的是纯函数 `isModuleNotFound`（无状态、不触碰 Store），
-// 复用它是为了两条依赖缺失路径的 hint 逐字一致。
+// Store 实现。依赖缺失的识别函数 `isModuleNotFound` 定义在 `store/retry.ts`（架构审查
+// M-4 后下沉，让 query/ 的依赖面与 spec 白名单逐字一致），两条路径的 hint 逐字一致由它保证。
 //
 // ⚠️ 依赖加载：`@duckdb/node-api` 只经 dynamic import（与 store/duckdb.ts 同款惰性边界）。
-import { isLockError, retryWithBackoff } from '../store/retry.js'
-import { isModuleNotFound } from '../store/duckdb.js'
+import { isLockError, retryWithBackoff, isModuleNotFound } from '../store/retry.js'
 import type { ErrorKind } from '../core/errors.js'
 import type { StoreConfig } from '../store/types.js'
 
@@ -84,9 +83,12 @@ export function memoryLimitBytes(display: unknown): number {
 }
 
 // statementType 数值 → 类型名（spec §5.3 映射表；实测值见任务 brief）。
+// ⚠️ 补全 3/5/9/15（edge F6）：此前 DELETE/UPDATE/DROP/ALTER 被拒时报「类型 5」这类裸数字，
+// Agent 既查不到含义也无法据此改查询；spec §十一要求点明类型名。
 const TYPE_NAMES: Record<number, string> = {
-  2: 'INSERT', 7: 'CREATE', 11: 'COPY', 16: 'EXPORT', 17: 'PRAGMA',
-  19: 'CALL', 20: 'SET', 21: 'INSTALL', 25: 'ATTACH',
+  2: 'INSERT', 3: 'UPDATE', 5: 'DELETE', 7: 'CREATE', 9: 'ALTER', 11: 'COPY',
+  15: 'DROP', 16: 'EXPORT', 17: 'PRAGMA', 19: 'CALL', 20: 'SET', 21: 'INSTALL',
+  25: 'ATTACH',
 }
 
 // —— DuckDB 原语的最小结构化类型（本文件不静态 import @duckdb/node-api）——
@@ -557,8 +559,23 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
       const all = reader.getRowObjectsJson()
       const truncated = all.length > limit
       const rows = truncated ? all.slice(0, limit) : all
-      // 空结果集也要给真实列名（不能留空数组）—— columnNames() 在空集上仍返回真实列名。
-      const columns = rows.length > 0 ? Object.keys(rows[0]) : reader.columnNames()
+      // ⚠️ 列名一律取 `columnNames()`，**不要**用 `Object.keys(rows[0])`（edge F3）：
+      // 驱动的 `getRowObjectsJson()` 以属性赋值构行，名为 `__proto__` 的列会变成**原型
+      // 赋值而不是自有键** —— 实测 `SELECT session_id, "__proto__", normal_extra FROM …`
+      // 时 `Object.keys` 少了它，显式请求的列连同值凭空消失、退出码 0、零警告。
+      // 取真实列名后逐行核对自有键：缺键说明该列的值经此驱动 API 无法表示，**必须
+      // fail-closed**（静默丢一列比报错更糟：Agent 会把「没有这一列」当成事实）。
+      const columns = reader.columnNames()
+      for (const row of rows) {
+        for (const name of columns) {
+          if (Object.hasOwn(row, name)) continue
+          throw sandboxError('internal', `查询结果含无法安全表示的列名 ${name}`
+            + '（驱动把该名字映射成了对象原型属性，取不到值）', {
+            code: 'internal',
+            hint: `请给该列起别名后重试，例如 SELECT "${name}" AS proto_col …`,
+          })
+        }
+      }
       return { columns, rows, truncated }
     } finally {
       try { p.destroySync?.() } catch { /* 释放期错误不掩盖查询结果/原异常 */ }

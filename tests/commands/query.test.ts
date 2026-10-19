@@ -218,6 +218,31 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(warnings[0]).toContain('这不代表没有数据')
     expect(warnings[0]).toContain('qiyu sync status')
   })
+
+  it('iso-day 列 + 日期形态字面量 → meta.warnings 警告少一天（场景 F3）', async () => {
+    await seed()
+    // CLI 自己把 stat_date 说成 +08:00 形态（db tables / db describe），Agent 照抄会写
+    // 出下面这句——列是 VARCHAR、按字典序比较，整整少一天，退出码 0 且原本无任何提示。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T00:00:00+08:00'")).toBe(0)
+    const w = meta().warnings as string[]
+    expect(w.some((x) => /UTC `…Z` 形态|少算或漏掉当天/.test(x))).toBe(true)
+
+    // 纯日期字面量同样触发
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
+    expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(true)
+
+    // 反证 1：UTC `…Z` 形态（正确写法）不警告
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00.000Z'")).toBe(0)
+    expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(false)
+
+    // 反证 2：无关表的日期字面量（没有 iso-day 列名）不警告
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM sessions WHERE session_id >= '2026-10-13'")).toBe(0)
+    expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(false)
+  })
 })
 
 describe('query --sql · 参数与错误分派（spec §十一）', () => {
@@ -595,6 +620,99 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(tw).not.toMatch(/在 SQL 里加 WHERE/)   // 这条通道没有 SQL 可改
   })
 
+  it('截断警告不得建议该表装不下的过滤条件：无时间列的表不提 --since/--until', async () => {
+    // PR 前契约审查 Important：25 张表里有 10 张没有 timeColumn，对它们建议 --since/--until
+    // 等于给一条同一命令会以退出码 2 拒绝的路（实测 `--table tickets --since 1d` → usage）。
+    // tickets 无 timeColumn，插 3 行造出截断。
+    await seed()
+    await seedMore('tickets', [
+      { ticket_id: 't1', payload: '{}', crmUserName: null, crmUserPhone: null, crmUserEmail: null, userMobile: null, synchronized_at: null },
+      { ticket_id: 't2', payload: '{}', crmUserName: null, crmUserPhone: null, crmUserEmail: null, userMobile: null, synchronized_at: null },
+      { ticket_id: 't3', payload: '{}', crmUserName: null, crmUserPhone: null, crmUserEmail: null, userMobile: null, synchronized_at: null },
+    ])
+    expect(await qAt('--table', 'tickets', '--limit', '2')).toBe(0)
+    expect(meta().truncated).toBe(true)
+
+    const tw = (meta().warnings as string[]).find((x) => /不是全部/.test(x)) ?? ''
+    expect(tw).toMatch(/--group-by/)            // 任何表都支持
+    expect(tw).not.toMatch(/加过滤条件/)          // 不得把 --since/--until 当可行路径推荐
+    expect(tw).toMatch(/不接受 --since\/--until/)  // 而是主动说明该表装不下它们
+    // 反证：有 timeColumn 的表仍照旧给出时间过滤建议（两种文案确实分叉，不是一刀切删掉）
+    expect(await qAt('--table', 'sessions', '--limit', '2')).toBe(0)
+    const sw = (meta().warnings as string[]).find((x) => /不是全部/.test(x)) ?? ''
+    expect(sw).toMatch(/--since\/--until\/--group-by/)
+  })
+
+  it('库漂移（声明列被删）→ hint 指向 db describe，不说「检查 SQL 语法」（PR 前契约审查 Minor）', async () => {
+    await seed()
+    // 模拟漂移：把 sessions 的时间列删掉——`--table` 的 SQL 由代码按 TABLES 生成，
+    // 于是 binder 报「列 startTime 不存在」，但用户没写过 SQL，改 SQL 不是有效动作。
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try { await s.query('ALTER TABLE "sessions" DROP COLUMN "startTime"') } finally { await s.close() }
+
+    expect(await qAt('--table', 'sessions')).toBe(2)
+    const e = errorOf()
+    expect(e.kind).toBe('usage')
+    expect(String(e.hint)).toContain('qiyu db describe sessions')
+    expect(String(e.hint)).toMatch(/不是你的查询写错了/)
+    expect(String(e.hint)).not.toMatch(/检查表名、列名与 SQL 语法/)
+    // ⚠️ 只对 --table 通道生效：--sql 通道用户确实写了 SQL，原样分派（候选清单）
+    expect(await q('--sql', 'SELECT "startTime" FROM sessions')).toBe(2)
+    expect(String(errorOf().hint)).not.toMatch(/不是你的查询写错了/)
+  })
+
+  it('iso-day 窗口内部空洞 → warning 点名「应有 N 个自然日，实际 M 个」（场景 F4）', async () => {
+    await seed()
+    // 库里 daily_overview 只有 10/14 一天（seed）；再补 10/12、10/13 —— 10/11~10/15
+    // 的 5 天窗口缺 10/11：MIN/MAX 的 data_coverage 看不见，rows 恰好是 3。
+    await seedMore('daily_overview', [
+      { stat_date: '2026-10-11T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },
+      { stat_date: '2026-10-12T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },
+    ])
+    // 上海 10/12 0 点 ~ 10/16 0 点（NOW = 上海 10/15 12:00）→ 窗口 10/12..10/15 共 4 天，
+    // 库里有 10/12、10/13、10/14 三天 → 缺 10/15。
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-12')).toBe(0)
+    const w = meta().warnings as string[]
+    expect(w.some((x) => /应有 4 个自然日，实际只有 3 个/.test(x))).toBe(true)
+
+    // 反证 1：完整窗口不警告（补上缺的上海 10/15 那天 = UTC 10/14T16:00Z）
+    await seedMore('daily_overview', [
+      { stat_date: '2026-10-14T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },
+    ])
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-12')).toBe(0)
+    expect((meta().warnings as string[]).some((x) => /自然日/.test(x))).toBe(false)
+
+    // 反证 2：非 iso-day 表（sessions，epoch-ms）不算自然日、不触发
+    expect(await qAt('--table', 'sessions', '--since', '2026-10-01')).toBe(0)
+    expect((meta().warnings as string[]).some((x) => /自然日/.test(x))).toBe(false)
+  })
+
+  it('库漂移（声明表整个被删）→ store_not_initialized 退出码 1，不再伪装成拼写错误（场景 F1）', async () => {
+    await seed()
+    // 声明有、库里无：TABLES 认得 staff_quality，information_schema 没有。
+    // 旧行为：走到 SQL 执行 → Catalog Error → 「表 staff_quality 不存在 + 候选：staff」
+    // + 退出码 2 —— 把库损坏说成拼写错误，且把 Agent 推向另一张表。
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try { await s.query('DROP TABLE "staff_quality"') } finally { await s.close() }
+
+    expect(await qAt('--table', 'staff_quality')).toBe(1)
+    const e = errorOf()
+    expect(e.kind).toBe('store_not_initialized')
+    expect(String(e.message)).toContain('数据库中缺表：staff_quality')
+    expect(String(e.message)).toMatch(/CLI 的表定义中存在/)
+    expect(String(e.hint)).toMatch(/qiyu store init/)
+    expect(String(e.hint)).toMatch(/qiyu db tables/)
+    expect(String(e.hint)).not.toMatch(/候选：/)
+    // 不再出现误导性的「不存在 + 候选」形态
+    expect(String(e.message)).not.toMatch(/不存在.*候选/)
+
+    // --sql 通道同一张表：用户自己写的 SQL，仍走 Catalog Error 翻译（不抢分派）
+    expect(await q('--sql', 'SELECT COUNT(*) FROM staff_quality')).toBe(2)
+    expect(errorOf().kind).toBe('usage')
+  })
+
   it('只有 --until → 下界取该表 MIN；空表 → resolved_range null + 两条 warning', async () => {
     await seed()
     await seedMore('sessions', [
@@ -675,6 +793,23 @@ describe('query --table · 参数与错误分派（spec §六/§十一）', () =
     expect(await qAt('--table', 'sessions',
       '--group-by', 'session_type', '--group-by', 'session_type')).toBe(2)
     expect(err).toMatch(/重复/)
+  })
+
+  it('取值位为空串时消息必须可见（edge F7）：空表名/空 group-by/空 --since/--limit', async () => {
+    await seed()
+    // 旧实现渲染成「未知表：」「未知列：」「无法解析：。」—— 冒号后空白，
+    // Agent 无从知道该改哪个参数（describeArgs 的约定没覆盖取值位）。
+    expect(await qAt('--table', '')).toBe(2)
+    expect(err).toContain("未知表：''")
+
+    expect(await qAt('--table', 'sessions', '--group-by', '')).toBe(2)
+    expect(err).toMatch(/未知列：''/)
+
+    expect(await qAt('--table', 'sessions', '--since', '')).toBe(2)
+    expect(err).toMatch(/--since 无法解析：''/)
+
+    expect(await qAt('--table', 'sessions', '--limit', '')).toBe(2)
+    expect(err).toMatch(/收到：''/)
   })
 
   it('区间无效（start >= end）→ usage', async () => {

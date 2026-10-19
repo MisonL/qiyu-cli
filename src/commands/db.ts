@@ -17,7 +17,7 @@
 //     元数据**（`row_count`/`time_range` 为 null + warning，裁决 R5）——Agent 需要知道
 //     该表应该有什么列，才能判断是没同步还是没建库。
 import { statSync } from 'node:fs'
-import { resolveStoreConfig } from '../store/config.js'
+import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit } from '../query/errors.js'
@@ -25,7 +25,7 @@ import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef } from '../store/schema.js'
 import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso } from '../core/time.js'
-import { ok, fail, usageFail, sanitizeControlChars } from '../output.js'
+import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
 
 const USAGE = `用法：qiyu db <子命令> [参数]
 
@@ -43,8 +43,15 @@ const KNOWN = new Set(['--help', '-h', '--pretty'])
 /** PII 提示（设计稿 §6.5 要求 `db tables` / `db describe` 必须携带）。 */
 const PII_NOTICE = '本数据库包含客户 PII；不要将其写入日志或对外报表'
 
-interface StoreFlags { db?: string; profile?: string; backend?: string }
+export interface StoreFlags { db?: string; profile?: string; backend?: string }
 
+/**
+ * `--db/--profile/--backend` 的值位解析（架构审查 M-2 的互指锚点）。
+ * ⚠️ 与 store.ts / stats.ts 的同名函数**逐字相同**（query.ts 的是第四份、语义有意不同
+ * ——`FLAG_TOKENS` 值位守卫）。改动这里必须同步那两处，或干脆收成共享模块：
+ * 新增共享定位 flag（如 `--config`）时漏改任何一份，那条命令会静默把它当位置参数。
+ * 各有命令级测试钉「--db 缺少取值」的形态，漂移会红。
+ */
 function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
   const out: StoreFlags & { rest: string[] } = { rest: [] }
   for (let i = 0; i < argv.length; i++) {
@@ -103,19 +110,36 @@ function piiColumnsOf(t: TableDef): string[] {
 
 /**
  * 单表时间范围（spec §8.1 / §四）。
- * iso-day / iso-instant：列本身就是 ISO 字符串 → 直接 MIN/MAX；
+ * iso-day / iso-instant：列是 ISO 字符串 → 先按约定形态过滤（见下）再 MIN/MAX；
  * epoch-ms：列是数字字符串 → 先 TRY_CAST 成 BIGINT 再取极值（非数字值不炸、按 NULL 跳过）。
  * 空表（或全 NULL）→ null；非空则两端都过 `msToShanghaiIso`（裁决 R1）。
+ *
+ * ⚠️ ISO 形态过滤（正确性 P1）：脏值（`not-a-date`）会在 VARCHAR 上**赢下** MIN/MAX
+ * （字典序上 `n` > `2`），而 `msToShanghaiIso` 对解析不了的值原样回显 —— 于是
+ * `time_range.max` 输出一个根本不是时间的字符串。契约要求它是上海 ISO，所以先按
+ * 约定形态筛（iso-day = 上海日零点 `…T16:00:00.000Z` 形态的日期前缀 `YYYY-MM-DD`；
+ * iso-instant = 带 Z/偏移的 ISO 8601），脏值不进极值；数量由 `dirtyCount` 单独查，
+ * 由调用方进 warnings（不得静默 —— 库漂移/坏数据是 README 承诺要报警的状态）。
  */
 async function timeRangeOf(
   session: SandboxSession, t: TableDef,
 ): Promise<{ min: string; max: string } | null> {
   const tc = t.timeColumn
   if (tc === undefined) return null
+  const col = `"${tc.name}"`
+  // 形态判据只用于 MIN/MAX 的候选集，不改变列本身的语义（值仍是原样输出的）。
+  // ⚠️ 用 `regexp_matches`，**不要**用 `~` 运算符：实测（DuckDB 1.5.6-r.1）`~` 对
+  // `'2026-10-13T…' ~ '^2026'` 也返回 false —— 它不是正则匹配，会把所有行都滤掉。
+  const shape = tc.kind === 'epoch-ms'
+    ? null
+    : tc.kind === 'iso-day'
+      ? `regexp_matches(${col}, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')`
+      : `regexp_matches(${col}, '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}')`
   const agg = tc.kind === 'epoch-ms'
-    ? `MIN(TRY_CAST("${tc.name}" AS BIGINT)) AS mn, MAX(TRY_CAST("${tc.name}" AS BIGINT)) AS mx`
-    : `MIN("${tc.name}") AS mn, MAX("${tc.name}") AS mx`
-  const r = await session.run(`SELECT ${agg} FROM "${t.name}"`)
+    ? `MIN(TRY_CAST(${col} AS BIGINT)) AS mn, MAX(TRY_CAST(${col} AS BIGINT)) AS mx`
+    : `MIN(${col}) AS mn, MAX(${col}) AS mx`
+  const where = shape === null ? '' : ` WHERE ${shape}`
+  const r = await session.run(`SELECT ${agg} FROM "${t.name}"${where}`)
   const row = r.rows[0] ?? {}
   if (row.mn === null || row.mn === undefined || row.mx === null || row.mx === undefined) return null
   return {
@@ -125,26 +149,54 @@ async function timeRangeOf(
 }
 
 /**
- * 打开「已通过前置检查」的沙箱会话（db tables / db describe 共用样板）：
+ * 时间列里不符合约定形态的非空值计数（正确性 P1）。
+ * epoch-ms 用 `TRY_CAST` 判（非数字即脏）；iso 两形态用与 `timeRangeOf` 同一正则。
+ * 0 = 干净，不产生任何警告。
+ */
+async function dirtyTimeValues(
+  session: SandboxSession, t: TableDef,
+): Promise<number> {
+  const tc = t.timeColumn
+  if (tc === undefined) return 0
+  const col = `"${tc.name}"`
+  const bad = tc.kind === 'epoch-ms'
+    ? `TRY_CAST(${col} AS BIGINT) IS NULL`
+    : tc.kind === 'iso-day'
+      ? `NOT regexp_matches(${col}, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')`
+      : `NOT regexp_matches(${col}, '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}')`
+  const r = await session.run(
+    `SELECT COUNT(*) AS n FROM "${t.name}" WHERE ${col} IS NOT NULL AND ${bad}`)
+  return Number((r.rows[0] ?? {}).n)
+}
+
+/** 脏时间值的公共警告文案（tables 与 describe 同一句话）。 */
+function dirtyTimeWarning(table: string, column: string, n: number): string {
+  return `表 ${table} 的时间列 ${column} 有 ${n} 个值不符合约定形态（已从 time_range 中排除）`
+    + '——可能来自旧版 CLI、外部工具或库损坏；用 `qiyu query --sql` 单独查看它们以确认成因'
+}
+
+/**
+ * 打开「已通过前置检查」的只读沙箱会话（**E 族三个命令共用**）：
  * resolveStoreConfig → statGuard → openSandbox → `schema_version` 探测。
  *
  * 返回 `{ exit }` 表示前置检查已产出退出码（调用方直接返回它，不做任何清理）；
  * 返回 `{ session }` 时**所有权归调用方**，必须 `finally session.close()`。
  * ⚠️ `schema_version` 探测的失败/缺表分支在这里就把会话关掉——调用方拿不到
  * session，不能指望它的 finally。
+ *
+ * ⚠️ 落点就在本文件、由 db 导出给 query/stats（与 `statGuard` 同一放宽口径）：
+ * 这三条命令的「库结构校验」必须逐字一致——探测口径（`table_schema='main'`）、
+ * 文案与 hint 任何一处漂移都会让 Agent 在不同命令上得到互相矛盾的解释。
+ * 此前 query/stats 各自内联了一份拷贝，已合并到此处（架构审查 Important #2）。
  */
-async function openGuardedSession(
+export async function openGuardedSession(
   flags: StoreFlags,
-): Promise<{ session: SandboxSession } | { exit: number }> {
+): Promise<{ session: SandboxSession; dbPath: string } | { exit: number }> {
   let config: StoreConfig
   try {
     config = resolveStoreConfig({
       flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
-      env: {
-        QIYU_DB_PATH: process.env.QIYU_DB_PATH,
-        QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
-        QIYU_PROFILE: process.env.QIYU_PROFILE,
-      },
+      env: currentStoreEnv(),
     }).config
   } catch (e) { return { exit: usageFail(sanitizeControlChars((e as Error).message)) } }
 
@@ -176,7 +228,7 @@ async function openGuardedSession(
     await session.close()
     return { exit: thrownToQueryExit(e, TABLES) }
   }
-  return { session }
+  return { session, dbPath: config.path }
 }
 
 async function dbTables(argv: string[]): Promise<number> {
@@ -268,6 +320,8 @@ async function dbTables(argv: string[]): Promise<number> {
       if (tc !== undefined) {
         if (actualCols.has(tc.name)) {
           timeRange = await timeRangeOf(session, t)
+          const dirty = await dirtyTimeValues(session, t)
+          if (dirty > 0) warnings.push(dirtyTimeWarning(t.name, tc.name, dirty))
         } else {
           warnings.push(`表 ${t.name} 缺少时间列 ${tc.name}（可能来自旧版 CLI 或库损坏），time_range 置 null`)
         }
@@ -332,7 +386,7 @@ async function dbDescribe(argv: string[]): Promise<number> {
   const table = tableByName(name)
   if (table === undefined) {
     const candidates = suggestNames(name, TABLES.map((t) => t.name))
-    return usageFail(`未知表：${name}`,
+    return usageFail(`未知表：${describeArgs([name])}`,
       candidates.length > 0 ? `候选：${candidates.join('、')}` : '用 `qiyu db tables` 查看可用表')
   }
 
@@ -374,6 +428,8 @@ async function dbDescribe(argv: string[]): Promise<number> {
       const tc = table.timeColumn
       if (tc !== undefined && actualSet.has(tc.name)) {
         timeRange = await timeRangeOf(session, table)
+        const dirty = await dirtyTimeValues(session, table)
+        if (dirty > 0) warnings.push(dirtyTimeWarning(table.name, tc.name, dirty))
       }
       // tc 缺失时 timeRange 保持 null；下面的「少列」warning 已点名该时间列。
 

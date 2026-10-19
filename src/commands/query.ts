@@ -13,10 +13,8 @@
 //
 // `--table` 的 SQL 构造在 `query/table-query.ts`（纯函数，单测不加载 CLI/引擎）：
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
-import { resolveStoreConfig } from '../store/config.js'
-import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
-import { suggestNames, thrownToQueryExit } from '../query/errors.js'
+import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure } from '../query/errors.js'
 import { maskQueryRows } from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
@@ -25,7 +23,7 @@ import {
   buildCoverageQuery, buildMinQuery, buildTableQuery, effectiveBound, validateGroupBy,
 } from '../query/table-query.js'
 import type { BuiltTableQuery } from '../query/table-query.js'
-import { statGuard } from './db.js'
+import { openGuardedSession } from './db.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
 
 const USAGE = `用法：qiyu query <查询方式> [参数]
@@ -79,6 +77,27 @@ const ZERO_ROW_HINT =
   '这不代表没有数据：同步可能未覆盖该区间——用 `qiyu sync status` 查看覆盖范围，或放宽过滤条件'
 
 /**
+ * iso-day 字面量比较警告（端到端场景 F3，`--sql` 通道）。
+ *
+ * `stat_date`/`work_date` 这类 iso-day 列**列内实为 UTC `…Z` 形态**（`2026-10-12T16:00:00.000Z`
+ * = 上海 10/13 00:00），而 CLI 的元数据出口（`db tables.time_range`、`db describe.unit`、
+ * `resolved_range`）一律呈现 +08:00 形态 —— Agent 会照着自己读到的形态写
+ * `WHERE stat_date >= '2026-10-13T00:00:00+08:00'`，而列是 VARCHAR、按**字典序**比较：
+ * `'2026-10-12T16:00:00.000Z' >= '2026-10-13T00:00:00+08:00'` 为 false，整整少一天，
+ * 退出码 0、四道自证机制一道都不响。
+ *
+ * 判据 = SQL 文本同时含 iso-day 列名与「日期形态字面量」（纯 `YYYY-MM-DD` 或缺时刻的
+ * `…T00:00:00+08:00`）——即 CLI 自己教出去、却在 `--sql` 里比较错的那种写法。
+ * 方向安全（多警告）：误报只多一句话；UTC `…Z` 形态与 `--table` 通道不受影响。
+ */
+const ISO_DAY_COL_RE = /\b(stat_date|work_date)\b/
+const DAY_LITERAL_RE = /'\d{4}-\d{2}-\d{2}(T00:00:00(\.0+)?(\+08:00)?)?'/
+const ISO_DAY_LITERAL_HINT =
+  '该列列内是 UTC `…Z` 形态的字符串（上海日零点 = 前一日 16:00Z），按字典序比较，' +
+  '日期字面量会**少算或漏掉当天**。要在 --sql 里过滤请写 UTC 形态（如 \'2026-10-12T16:00:00.000Z\'），' +
+  '或改用 `qiyu query --table <表> --since/--until`（该通道已处理取整语义）'
+
+/**
  * 截断警告（两个通道**文案必须分开**）。
  *
  * ⚠️ 措辞必须同时点破两件事（设计稿 §9.2「0 行是比报错危险得多的失败模式」的同源推理）：
@@ -86,16 +105,23 @@ const ZERO_ROW_HINT =
  * `truncated:true` 时注意力天然落在「已返回的这些行」上，于是「同步缺口」这类只有看过
  * 全量才能发现的问题被静默跳过。所以警告里要给出替代路径，而不只是说「结果被截断了」。
  *
- * ⚠️ 替代路径**必须在该通道真的可行**（复审 Minor-2）：`--since/--until/--group-by` 与
- * `--sql` 同用会被拒（`--sql` 只接受 SQL 文本），建议 Agent 加它们等于给一条走不通的路。
- * `--sql` 通道只能让它改 SQL 里的 WHERE。
+ * ⚠️ 替代路径**必须在该通道、该表上真的可行**（复审 Minor-2 → PR 前审查 Important）：
+ *   · `--sql` 通道：`--since/--until/--group-by` 与 `--sql` 同用会被拒，只能让它改 SQL 的 WHERE；
+ *   · `--table` 通道：`--since/--until` 对**无时间列的表**会被拒（25 张表里有 10 张没有
+ *     `timeColumn`）——对这些表只能建议 `--group-by`（任何表都支持）与 `db describe`。
  */
-function truncationWarning(returned: number, limit: number, channel: 'sql' | 'table'): string {
+function truncationWarning(
+  returned: number, limit: number, channel: 'sql' | 'table', hasTimeColumn = true,
+): string {
   const head = `结果被 --limit ${limit} 截断，本次只返回 ${returned} 行（不是全部）；`
     + '聚合与「是否存在数据缺口」的判断都不应基于这批不完整的结果——'
-  return head + (channel === 'table'
+  if (channel === 'sql') {
+    return head + '请在 SQL 里加 WHERE 条件收窄，或用 `qiyu db describe <表>` 看总行数与时间范围'
+  }
+  return head + (hasTimeColumn
     ? '请用 `qiyu db describe <表>` 看总行数与时间范围，或加过滤条件（--since/--until/--group-by）收窄'
-    : '请在 SQL 里加 WHERE 条件收窄，或用 `qiyu db describe <表>` 看总行数与时间范围')
+    : '请用 `qiyu db describe <表>` 看总行数，或用 `--group-by <列>` 聚合成计数收窄'
+      + '（该表没有时间列，不接受 --since/--until）')
 }
 
 interface QueryFlags {
@@ -149,7 +175,7 @@ function parseLimit(raw: string | undefined): number {
   if (raw === undefined) return 1000
   const n = Number(raw)
   if (raw.trim() === '' || !Number.isInteger(n) || n < 1 || n > 10000) {
-    throw new Error(`--limit 必须是 1–10000 的整数，收到：${raw}`)
+    throw new Error(`--limit 必须是 1–10000 的整数，收到：${describeArgs([raw])}`)
   }
   return n
 }
@@ -164,12 +190,12 @@ function parseTimeoutMs(raw: string | undefined): number {
   if (raw === undefined) return 30_000
   const n = Number(raw)
   if (raw.trim() === '' || !Number.isFinite(n) || n < 0) {
-    throw new Error(`--timeout 必须是非负数（秒，0 = 无超时），收到：${raw}`)
+    throw new Error(`--timeout 必须是非负数（秒，0 = 无超时），收到：${describeArgs([raw])}`)
   }
   const ms = Math.round(n * 1000)
   if (ms > TIMEOUT_MAX_MS) {
     throw new Error(
-      `--timeout 过大（上限 ${TIMEOUT_MAX_MS / 1000} 秒），收到：${raw}；` +
+      `--timeout 过大（上限 ${TIMEOUT_MAX_MS / 1000} 秒），收到：${describeArgs([raw])}；` +
       '再大会溢出 Node 定时器、变成立即超时。若想不限时请用 --timeout 0')
   }
   return n > 0 && ms === 0 ? 1 : ms
@@ -194,7 +220,7 @@ function resolveTimeFlag(
   if (raw === undefined) return undefined
   const v = parseTimeArg(raw, clock, label)
   if (v === null) {
-    throw new Error(`${label} 无法解析：${raw}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601（按 Asia/Shanghai）`)
+    throw new Error(`${label} 无法解析：${describeArgs([raw])}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601（按 Asia/Shanghai）`)
   }
   if (typeof v !== 'object') return v
   return label === '--since' ? v.start : v.end - 1
@@ -271,6 +297,8 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
   // data_coverage（契约 D）：表有 timeColumn 时**恒计算**，独立查询、不受 limit 截断影响；
   // 过滤范围与主查询同一谓词（不是全表 MIN/MAX）。
   let dataCoverage: { min: string; max: string } | null = null
+  // 区间内实际覆盖的自然日数（仅 iso-day 表有值）——用于发现窗口内部的空洞（场景 F4）。
+  let coveredDays: number | null = null
   if (tc !== undefined) {
     const cov = buildCoverageQuery({
       table, since: input.since, until: input.until, tableMin, now: input.now,
@@ -283,6 +311,7 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
         max: msToShanghaiIso(row.mx as string | number),
       }
     }
+    if (row.days !== null && row.days !== undefined) coveredDays = Number(row.days)
   }
 
   // 脱敏唯一出口（spec §7.2）；--table 通道按列精确命中（mode.kind='table'）。
@@ -306,8 +335,23 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     warnings.push('该表无数据；先运行 `qiyu sync run`')
   }
 
+  // 窗口内部空洞（端到端场景 F4）：iso-day 表 + 完整区间时，比较「区间应覆盖的自然日数」
+  // 与「实际有行的自然日数」。MIN/MAX 的 data_coverage 结构上看不见内部缺口 ——
+  // 7 天窗口缺一天时 rows 可能恰好是 7，Agent 会把 7 天汇总当成「上周」。
+  // 只在有行时提示：0 行已有更准确的成因警告（同步未覆盖 / 区间为空）。
+  if (coveredDays !== null && plan.resolvedRange !== null && result.rows.length > 0) {
+    const expectedDays = Math.round((plan.resolvedRange[1] - plan.resolvedRange[0]) / 86_400_000) + 1
+    if (coveredDays < expectedDays) {
+      warnings.push(`区间内应有 ${expectedDays} 个自然日，实际只有 ${coveredDays} 个有数据`
+        + '（窗口内部存在缺口）；用 `qiyu sync status` 查看缺口详情，或放宽过滤条件')
+    }
+  }
+
   // 截断不得静默（同上）：`--limit` 生效时 Agent 读到的不是全量。
-  if (result.truncated) warnings.push(truncationWarning(rows.length, input.limit, 'table'))
+  // 无时间列的表不能建议 --since/--until（那是条走不通的路），故传入 tc 是否存在。
+  if (result.truncated) {
+    warnings.push(truncationWarning(rows.length, input.limit, 'table', tc !== undefined))
+  }
 
   // --no-mask 的风险警告属于「脱敏整体关闭」，进 meta.warnings；mask_warnings 只装
   // 静态缺口警告（没脱敏就没有「脱敏不完整」可言）。spec §7.2。
@@ -383,7 +427,7 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     tableDef = tableByName(name)
     if (tableDef === undefined) {
       const candidates = suggestNames(name, TABLES.map((t) => t.name))
-      return usageFail(`未知表：${name}`,
+      return usageFail(`未知表：${describeArgs([name])}`,
         candidates.length > 0 ? `候选：${candidates.join('、')}` : '用 `qiyu db tables` 查看可用表')
     }
     try {
@@ -406,43 +450,39 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     timeoutMs = parseTimeoutMs(flags.timeout)
   } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
 
-  let config
-  try {
-    config = resolveStoreConfig({
-      flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
-      env: {
-        QIYU_DB_PATH: process.env.QIYU_DB_PATH,
-        QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
-        QIYU_PROFILE: process.env.QIYU_PROFILE,
-      },
-    }).config
-  } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
-
-  // 库前置检查（ENOENT / 非普通文件 / 权限三分 → 退出码 1，hint 指 store init）。
-  const guarded = statGuard(config.path)
-  if (guarded !== null) return guarded
-
-  let session: SandboxSession
-  try {
-    session = await openSandbox(config)
-  } catch (e) { return thrownToQueryExit(e, TABLES) }
+  // 配置解析 → 库前置检查 → 打开沙箱 → schema_version 探测：E 族三个命令共用同一条
+  // 路径（db.ts 的 openGuardedSession）。合并的理由见那里的注释：探测口径与文案
+  // 一旦三处各写一份，Agent 会在不同命令上得到互相矛盾的解释（架构审查 Important #2）。
+  const opened = await openGuardedSession({
+    db: flags.db, profile: flags.profile, backend: flags.backend,
+  })
+  if ('exit' in opened) return opened.exit
+  const session = opened.session
 
   try {
-    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
-    // ⚠️ 必须有：合法 DuckDB 但**没有 schema_version** 的库（空库 / 别的工具建的库 /
-    // 迁移没跑完）在沙箱里照样能执行 SQL，于是 `SELECT 1` 会「成功」—— 而 `masked:true`
-    // 的语义建立在本 CLI 的 PII 列集上，对不认识的 schema 这个声明没有依据；
-    // `SELECT * FROM sessions` 更会得到「表不存在，候选：sessions」，把 Agent 引去改 SQL，
-    // 而正确处置是 `qiyu store init`。探测口径与 commands/db.ts 同款（限定 main schema，
-    // 避免同名表在别的 schema 里被误认）。
-    const sv = await session.run(
-      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
-    if (sv.rows.length === 0) {
-      return fail({
-        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
-      })
+    // 库结构校验（缺 schema_version → store_not_initialized）在 openGuardedSession 里
+    // 已做（E 族共用，口径见 db.ts 的注释）——这里不重复探测。
+    //
+    // ⚠️ 本命令特有的第二条：**目标表**在库中是否存在（端到端场景 F1）。
+    // `TABLES` 声明了它、`information_schema` 里没有 = 建库不完整或表被删，是环境问题
+    // 而非拼写错误。此前它会一路走到 SQL 执行、由 Catalog Error 翻译成「表 X 不存在 +
+    // 候选：<前缀相似的另一张表>」并返回退出码 2 —— Agent 会把库损坏读成自己写错，
+    // 并照候选去查一张口径完全不同的表。口径与 `stats fields` 一致（同一条 message 形态），
+    // hint 补上「声明有而库中无」的两种成因（不得承诺 store init 一定能修）。
+    if (tableDef !== undefined) {
+      const exists = await session.run(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='" +
+        tableDef.name + "'")
+      if (exists.rows.length === 0) {
+        return fail({
+          code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
+          message: `数据库中缺表：${tableDef.name}（本表在 CLI 的表定义中存在，库里没有）`,
+          hint: '若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
+            + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
+            + '——需重建库（删除库文件后重新 qiyu store init 并重新同步）。'
+            + '用 `qiyu db tables` 查看库中实际有数据的表',
+        })
+      }
     }
 
     if (tableDef !== undefined) {
@@ -465,6 +505,11 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     const warnings: string[] = []
     if (result.rows.length === 0 && ZERO_ROW_TIME_RE.test(sqlText)) {
       warnings.push(`查询返回 0 行，且 SQL 引用了业务时间列。${ZERO_ROW_HINT}`)
+    }
+    // iso-day 列 + 日期形态字面量 → 按字符串比较会少一天（场景 F3）。与 0 行无关：
+    // 非 0 行也可能已经悄悄少了一整天，这正是它危险的地方。
+    if (ISO_DAY_COL_RE.test(sqlText) && DAY_LITERAL_RE.test(sqlText)) {
+      warnings.push(ISO_DAY_LITERAL_HINT)
     }
     // 截断不得静默：Agent 会把「只看到前 N 行」当成事实（spec §十）。
     if (result.truncated) warnings.push(truncationWarning(masked.rows.length, limit, 'sql'))
@@ -490,6 +535,12 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
       },
     )
   } catch (e) {
+    // --table 通道的 SQL 是代码生成的：撞上库漂移时把原因说对（PR 前契约审查 Minor），
+    // 否则 Agent 会按「请检查 SQL 语法」去改它没写过的东西。
+    if (tableDef !== undefined) {
+      const drift = driftFailureFor(tableDef, e)
+      if (drift !== null) return emitQueryFailure(drift)
+    }
     return thrownToQueryExit(e, TABLES)
   } finally {
     await session.close()

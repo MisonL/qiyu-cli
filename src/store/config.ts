@@ -46,6 +46,22 @@ function assertPositiveInt(v: unknown, key: string, max?: number): number {
 }
 
 /**
+ * 当前进程的三元环境变量（架构审查 M-3）。
+ *
+ * 此前 6 个调用点各自手写 `{ QIYU_DB_PATH: process.env.QIYU_DB_PATH, … }` ——
+ * `resolveStoreConfig` 对缺省 env 是**静默忽略**（`opts.env ?? {}`），所以加第 4 个
+ * 环境变量时漏改任何一处，那条命令就会静默用默认库、与同族命令分叉。
+ * 调用方应传 `env: currentStoreEnv()`；需要注入的测试自己传对象。
+ */
+export function currentStoreEnv(): StoreEnv {
+  return {
+    QIYU_DB_PATH: process.env.QIYU_DB_PATH,
+    QIYU_STORE_BACKEND: process.env.QIYU_STORE_BACKEND,
+    QIYU_PROFILE: process.env.QIYU_PROFILE,
+  }
+}
+
+/**
  * 解析 store 配置：命令行 > 环境变量 > 配置文件 > 内置默认（spec §3.2）。
  * ⚠️ 只读不写；配置文件由用户手工维护（`auth login` 归 G1，spec §3.5）。
  */
