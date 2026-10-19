@@ -12,8 +12,13 @@
 // D-T11 追加：src/sync/tasks/knowledge.ts 常量 SELECT 1 处
 //（knowledge.categories 的驱动序 SELECT DISTINCT robot_id），不在上述 9 处内。
 import { MIGRATIONS, tableByName, type TableDef } from './schema.js'
-import { retryWithBackoff, isLockError } from './retry.js'
+import { retryWithBackoff, isLockError, isModuleNotFound } from './retry.js'
 import type { QueryResult, Store, StoreConfig, StoreMode, WriteTx } from './types.js'
+
+// `isModuleNotFound` 的定义已下沉到 retry.ts（架构审查 M-4）：spec §5.1 白名单允许
+// query/ import `store/retry` 但不允许 `store/duckdb`。这里保留 re-export，既有
+// 导入点（tests/store/errors.test.ts）不破。
+export { isModuleNotFound }
 
 /** 可注入的导入边界 —— 单测 mock 它模拟依赖缺失（spec §5.1）。 */
 export type DuckDbImporter = () => Promise<unknown>
@@ -23,14 +28,6 @@ export interface DuckDbDeps {
   importer?: DuckDbImporter
   sleep?: (ms: number) => Promise<void>
   now?: () => number
-}
-
-/** 识别 ERR_MODULE_NOT_FOUND 并取出缺失的 specifier（spec §5.1 的二分规则）。 */
-export function isModuleNotFound(e: unknown): { missing: string } | null {
-  const err = e as { code?: string; message?: string }
-  if (err?.code !== 'ERR_MODULE_NOT_FOUND') return null
-  const m = /Cannot find (?:package|module) '([^']+)'/.exec(err.message ?? '')
-  return { missing: m?.[1] ?? '' }
 }
 
 /** 依赖缺失 → store_not_initialized（按缺失 specifier 前缀二分 hint，spec §5.1）。 */

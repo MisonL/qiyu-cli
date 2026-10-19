@@ -8,6 +8,14 @@ export function isLockError(e: unknown): boolean {
   return msg.includes('Conflicting lock')
 }
 
+/** 识别 ERR_MODULE_NOT_FOUND 并取出缺失的 specifier（spec §5.1 的二分规则）。 */
+export function isModuleNotFound(e: unknown): { missing: string } | null {
+  const err = e as { code?: string; message?: string }
+  if (err?.code !== 'ERR_MODULE_NOT_FOUND') return null
+  const m = /Cannot find (?:package|module) '([^']+)'/.exec(err.message ?? '')
+  return { missing: m?.[1] ?? '' }
+}
+
 export interface RetryOpts<T> {
   tryOpen: () => Promise<T>
   isRetryable: (e: unknown) => boolean

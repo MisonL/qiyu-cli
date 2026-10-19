@@ -7,7 +7,7 @@ JSON、用退出码表达该做什么、错误按语义分类、危险操作有�
 七鱼 API 的 26 种响应信封、3 种分页和一堆静默失败，就能正确调用。
 
 > **本仓库仍在早期**：已实现「认证 + 通用 API 通道」＋ API 参数校验（`api schema`/body 分级校验）＋ 存储基础（见[当前状态](#当前状态)）。
-> 本地数据仓库的**同步**（`qiyu sync`）已交付，见[当前状态](#当前状态)；**查询**（`qiyu query`）尚未实现。
+> 本地数据仓库的**同步**（`qiyu sync`）与**查询**（`qiyu db` / `qiyu query` / `qiyu stats`）均已交付，见[当前状态](#当前状态)。
 
 ## 为什么需要它
 
@@ -40,7 +40,9 @@ git clone https://github.com/MisonL/qiyu-cli.git
 cd qiyu-cli && npm install && npm run build
 ```
 
-> 核心命令（`auth`、`api`）零运行时依赖。`store` 命令需要 `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
+> 核心命令（`auth`、`api`）零运行时依赖。`store` / `db` / `query` / `stats` 命令需要
+> `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。
+> 该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
 
 ## 配置凭证
 
@@ -99,6 +101,12 @@ qiyu sync verify [任务...]           核对本地与远端一致性（drift �
 qiyu sync install --schedule CRON [--yes]
                                      安装系统调度条目（默认 dry-run）
 qiyu sync uninstall [--yes]          移除系统调度条目（默认 dry-run）
+qiyu db tables                       本地表清单 + 粒度 + 行数 + 数据时间范围 + PII 列
+qiyu db describe <表>                列名/类型/可空/敏感标记/观测枚举/时间列/单位
+qiyu query --sql <SQL>               任意只读 SQL（三层沙箱 + 默认脱敏 + 行数上限 + 超时）
+qiyu query --table <表> [--since T] [--until T] [--group-by <列>]
+                                     受约束查询通道（列白名单、时间列语义化、精确脱敏）
+qiyu stats fields <报表>              指标自描述（声明 + 本地观测分布 + -1 哨兵）
 ```
 
 ## 输出契约
@@ -123,8 +131,8 @@ qiyu sync uninstall [--yes]          移除系统调度条目（默认 dry-run�
 **请按 `kind` 分支，不要按 `code`。** `code` 只是个标签：它可能是服务端的数字码
 （如 `14009`），也可能是本 CLI 合成的词（`usage` / `network` / `internal` /
 `auth_missing` / `confirm_required` / `store_locked` / `store_not_initialized` /
-`local_rate_limit` / `unknown`）。合成词在官方
-错误码表里查不到。
+`local_rate_limit` / `query_error` / `sandbox_blocked` / `query_timeout` / `unknown`）。
+合成词在官方错误码表里查不到；完整清单见 `qiyu --help`。
 
 ### 退出码
 
@@ -207,6 +215,54 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 `QIYU_APP_KEY`/`QIYU_APP_SECRET`，请确认其对该调度上下文可用——调度条目**不写入任何
 凭证**（秘密进 plist/unit 文件是安全红线）。
 
+### 查询命令的输出
+
+五个查询命令都走同一个信封 `{ok,data,meta}`，`meta` 恒含 `warnings`（可为空数组）——
+**0 行不等于没有数据**：**带时间过滤**而结果 0 行时，`warnings` 会说明「同步可能未覆盖该区间」，
+而不是让你据此得出「那段时间真的没数据」。触发条件是**逐个判定的**：`--table` 通道给了
+`--since`/`--until` 即触发；`--sql` 通道仅当 SQL 文本引用了业务时间列名
+（`stat_date` / `work_date` / `hour_ts` / `startTime` / `endTime`）才触发——它与子句位置无关，
+`WHERE stat_date > '…'` 也算；用**其它**列（如 `createtime`）的 `WHERE` 过滤出的 0 行不附带此警告。
+
+`query --sql` 与 `query --table` 的 `data` 形态是 `{columns, rows}`（`rows` 为对象数组）；
+`meta` 恒含：
+`rows`（截断后的实际行数）/ `truncated`（是否被 `--limit` 截断）/ `limit_applied`（生效上限）/
+`masked`（本次是否脱敏）/ `masked_columns`（**实际被改写**的列名，全 null 的列不算）/
+`mask_warnings`（脱敏缺口警告）/ `resolved_range` / `data_coverage` / `warnings`。
+
+- `--table` 通道的输出顺序是**确定的**：无 `--group-by` 时，**有时间列的表**按时间列降序、
+  再按主键升序（`--limit` 截到的因此是**最新**的那些行）；**无时间列的表**只能按主键升序。
+  有 `--group-by` 时按 `count` 降序、分组列升序。
+- `resolved_range`：`--table` 给了 `--since`/`--until` 时回显**实际生效**的区间
+  （`+08:00` ISO 二元组），不是原始输入——`iso-day` 表会向下取整到上海自然日，
+  所以要按它判断覆盖了哪几天。`--sql` 通道恒为 `null`（任意 SQL 无法通用判定）。
+- `data_coverage`：该表时间列在**过滤范围内**的 MIN/MAX（`+08:00` ISO）；`--sql` 通道恒为 `null`。
+  它有三种 `null` 成因，用 `resolved_range` 与 `warnings` 区分：`--sql` 通道 / 该表无时间列 /
+  有过滤范围但范围内一行都没有。
+- **`--sql` 通道的数值是 JSON 安全形态的字符串**：`COUNT(*)` / `SUM` / `BIGINT` / `HUGEINT` /
+  `DECIMAL` 一律输出字符串（如 `"n":"12"`、`"d":"1.50"`），这是驱动为避免精度丢失的取舍。
+  做算术或比较前先转数字（`Number(x)`）；`--table --group-by` 的 `count`、`db describe` 的
+  `row_count`、`stats fields` 的 `observed` 则都是数字——两种口径不同，别混用。
+- **`iso-day` 列在库内是 UTC `…Z` 形态**（上海日零点 = 前一日 16:00Z），而所有元数据出口
+  （`db tables.time_range`、`db describe` 的 `unit`、`resolved_range`、`data_coverage`）呈现
+  的是 `+08:00` 形态。`--table` 通道已处理取整语义；**`--sql` 里直接按字符串比较时要用 UTC 形态**，
+  否则会少算一天（如 `WHERE stat_date >= '2026-10-12T16:00:00.000Z'`）。检测到
+  「iso-day 列 + 日期形态字面量」时 `meta.warnings` 会明确提示。
+- `db tables` / `db describe` 的 `meta.notice` 恒在（本库含客户 PII 的提示）；
+  声明与实况不一致（缺表/缺列/多列/时间列脏值）逐条进 `meta.warnings`，不静默——`db tables` 做表级
+  与列集核对，`db describe` 给出该表的逐列差异细节。时间列里不符合约定形态的值**不进**
+  `time_range`（否则 `not-a-date` 会在字典序上赢下 MAX），并由 warning 点名数量。
+
+`stats fields <报表>` 的输出把**声明**与**观测**分开：`declared`（每条带 `source`：
+`design-doc` 实测 / `name-suffix` 命名推断）、`observed`（`rows_present` / `minus_one` /
+`nulls` / `min` / `max`）、`unknown_fields`（判不出单位的字段）、`sentinel`
+（`-1` = 该窗口或筛选条件没有匹配到数据，**不是负数比率**）。`-1` 是厂商未文档化的哨兵值，
+`observed.minus_one` 与 `rows_present` 相等时说明该字段本次全是哨兵。
+⚠️ 这是**聚合观测，不是逐行取值**：`rows_present` 为 1 时 `min` 与 `max` 都等于那一行的原值
+（例：薪资明细表只有一行时，极值就是该行金额）。需要逐行数据请用 `query --sql` 并自行承担
+脱敏边界；payload 不是合法 JSON 的行、以及含空字符串键 `""` 的行也不计入统计，
+两者都会在 `meta.warnings` 里点名数量。
+
 ## 安全
 
 - **危险操作硬门禁**：标记为 `dangerous` 的接口在缺少 `--yes` 时，**绝不发出任何请求**：body 合法则返回退出码 4，body 缺必填/非对象则**先**报参数错误（退出码 2），并给出 `confirm_required` / `confirm_arg` / `risk` / `target` 四个字段。
@@ -215,10 +271,30 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   都会被抹成 `<已隐藏>`。`auth whoami` 连末尾四位都不回显。
 - **服务端内部信息过滤**：服务端偶发的错误消息里会泄漏 Java 包名/类名与请求 id，
   透出前一律替换为占位符。
+- **查询默认脱敏**：`query` 两条通道都默认脱敏（`sensitive: true` 的列），
+  要原始值必须显式 `--no-mask`（此时 `meta.warnings` 追加 PII 风险提示）。
+  脱敏的边界如实写在明处：`--table` 通道是**精确**的（列名来自 `TABLES` 元数据）；
+  `--sql` 通道是「列名级 + 值级兜底」，**别名绕过时姓名/地址无法值级检测仍会漏**——
+  这类情形会在 `meta.mask_warnings` 里点名（是警告不是防护），要完整覆盖请用 `--table`。
+  两个已知缺口同样进 `meta.mask_warnings`，不会静默：**`--sql` 不按列名脱敏 `payload`**
+  （报表 payload 是聚合数字，整值替换会误杀；会话/工单的 payload 只靠值级检测，
+  其中的姓名/地址会原样输出——SQL 里出现 `payload`、输出含该列、或输出含整行 JSON 值
+  即警告，别名 `payload AS p`、`json_extract(payload,…)`、`row_to_json(t)` 都覆盖）；
+  **`--table` 通道对 `TABLES` 之外的列不脱敏**
+  （库中多出来的列可能来自旧版 CLI，只警告不改写）。
+  ⚠️ 这些是**警告不是防护**：`--sql` 通道的 payload 缺口只能靠 Agent 读到警告后改用
+  `--table` 或 `--no-mask` 显式承担风险来闭合，CLI 无法在保持报表 payload 可用的前提下
+  替你做整值替换。
+- **只读沙箱三层缺一不可**：`query --sql` 只接受单条只读语句（`SELECT` / `DESCRIBE` / `SHOW` / `EXPLAIN`——
+  后两者实测归入 `statementType` 的 SELECT/EXPLAIN 类型值），
+  每实例首次连接时 `enable_external_access=false` + `lock_configuration=true`，
+  实例 `access_mode=READ_ONLY`。文件读写、网络、`ATTACH`、`COPY TO`、多语句全部被拦；
+  `EXPLAIN ANALYZE` 也拒（它会真正执行内层语句）。
 
 ## 当前状态
 
-本仓库实现了设计稿中的**前两个子项目**：认证与通用 API 通道、API 参数校验（`api schema`/body 分级校验）。
+本仓库已交付设计稿中的**前五个子项目**：认证与通用 API 通道、API 参数校验
+（`api schema`/body 分级校验）、存储层、同步引擎、查询接口与只读沙箱。
 
 **已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
 限频感知（`retry_after`）、本地数据仓库——`store init` / `store status`（存储层已交付，
@@ -228,6 +304,8 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 跨平台调度安装；会话导出走 create→poll→download→unzip→parse 流水线）。
 `sync install` 的安装前置是**至少成功同步过一次**（sync_state 有 `range_status=complete`
 或 `last_synced_at` 非空的行——全败的 run 只留 pending，不算跑通）。
+查询与只读沙箱——`db tables` / `db describe` / `query --sql` / `query --table` / `stats fields`
+（三层只读沙箱、默认脱敏、时间列三形态语义化、`-1` 哨兵呈现、声明与观测分离）。
 
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
@@ -240,7 +318,7 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 
 - `auth login`（配置文件写入）——目前只支持环境变量；
 - `--pretty`（人类可读输出）——目前只输出紧凑 JSON；
-- 本地数据仓库的**查询**（`qiyu query`）——存储与同步（`store init/status`、`sync` 六个子命令）已可用，见「当前状态」；
+- `F` 子项目的 Skill 化（Agent 操作协议、`skill check`）——查询命令本身已可用，见「当前状态」；
 
 `api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
@@ -275,8 +353,9 @@ src/
   output.ts             输出契约（ok / fail / usageFail，退出码）
   store/                存储抽象（src/store/：Store 接口、DuckDB 后端、schema 与迁移）
   sync/                 同步引擎（src/sync/：引擎、状态、限频门、窗口切分、任务注册表与 21 个任务）
+  query/                查询层（src/query/：三层只读沙箱、脱敏、错误分派、表查询构造、指标目录）
   schedule/             跨平台调度安装（launchd / systemd / schtasks）
-  commands/             子命令（auth / api / store / sync）
+  commands/             子命令（auth / api / store / sync / db / query / stats）
   core/
     sign.ts             七鱼签名（checksum = SHA1(appSecret + md5(body) + time)）
     http.ts             请求构建、重试、限频

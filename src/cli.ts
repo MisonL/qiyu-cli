@@ -6,12 +6,18 @@ import { fail, usageFail, describeArgs } from './output.js'
 import { apiCommand } from './commands/api.js'
 import { storeCommand } from './commands/store.js'
 import { syncCommand } from './commands/sync.js'
+import { dbCommand } from './commands/db.js'
+import { queryCommand } from './commands/query.js'
+import { statsCommand } from './commands/stats.js'
 
 const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   auth: authCommand,
   api: apiCommand,
   store: storeCommand,
   sync: syncCommand,
+  db: dbCommand,
+  query: queryCommand,
+  stats: statsCommand,
 }
 
 /**
@@ -39,12 +45,25 @@ const USAGE = `用法：qiyu <子命令> [参数]
                            安装系统定时调度（macOS=launchd / linux=systemd user /
                            win32=schtasks。默认 dry-run；--yes 才写入）
   sync uninstall [--yes]   移除系统调度条目（默认 dry-run，--yes 才删除）
+  db tables                列出库中全部表：行数、粒度、时间范围、PII 列
+  db describe <表>         查看单表列定义（列名、类型、可空、敏感标记、时间列）
+  query --sql <SQL>        任意只读 SQL（三层只读沙箱 + 默认脱敏 + 行数上限 + 超时）
+  query --table <表> [--since <时间>] [--until <时间>] [--group-by <列>]
+                           受约束查询通道（列白名单、时间列语义化、精确脱敏）
+  stats fields <报表表>     指标声明（带出处）+ 本地观测分布 + -1 哨兵
+
+查询族参数：
+  query --limit <n> / --timeout <秒> / --no-mask
+                           行数上限 / 超时 / 关闭默认脱敏（细节见 qiyu query --help）
+  --db <path> / --profile <name> / --backend <name>
+                           db / query / stats 共用的存储定位（与 store / sync 同族）
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
      数字码（如 14009），也可能是本 CLI 合成的词（usage / network / internal /
      auth_missing / confirm_required / store_locked / store_not_initialized /
-     local_rate_limit / unknown）。合成词查不到官方错误码表。
+     local_rate_limit / query_error / sandbox_blocked / query_timeout / unknown）。
+     合成词查不到官方错误码表。
 
 退出码：0 成功 · 1 业务错误 · 2 用法错误 · 3 网络错误 · 4 需要 --yes
 `

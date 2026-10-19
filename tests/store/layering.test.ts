@@ -12,26 +12,65 @@ const walk = (dir: string): string[] =>
   })
 
 describe('分层约束（架构不变量）', () => {
+  // ⚠️ 只扫静态 `from '…'` 会漏掉两类等价写法（架构审查 M-1）：动态
+  // `await import('../sync/engine.js')`（仓库里已有这种惯用法：sandbox.ts:49、
+  // sync-run.ts:125）与裸副作用 `import '../commands/db.js'`。两者都能静默穿透红线。
+  // 本函数把三种形态一并取出，供各条规则共用。
+  const importSpecifiers = (f: string): string[] => {
+    const text = readFileSync(f, 'utf8')
+    return [
+      ...text.matchAll(/from\s+['"]([^'"]+)['"]/g),
+      ...text.matchAll(/import\s*\(\s*['"]([^'"]+)['"]\s*\)/g),
+      ...text.matchAll(/^\s*import\s+['"]([^'"]+)['"]/gm),
+    ].map((m) => m[1])
+  }
+
   it('store/ 不得 import sync/', () => {
     const root = join(src, 'store')
     if (!existsSync(root)) return
     for (const f of walk(root)) {
-      for (const m of readFileSync(f, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)) {
-        expect(m[1], `${f} → ${m[1]}`).not.toMatch(/\/sync\/|\.\.\/sync/)
+      for (const m of importSpecifiers(f)) {
+        expect(m, `${f} → ${m}`).not.toMatch(/\/sync\/|\.\.\/sync/)
       }
     }
   })
   it('core/ 不得 import store/', () => {
     for (const f of walk(join(src, 'core'))) {
-      for (const m of readFileSync(f, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)) {
-        expect(m[1], `${f} → ${m[1]}`).not.toMatch(/\/store\/|\.\.\/store/)
+      for (const m of importSpecifiers(f)) {
+        expect(m, `${f} → ${m}`).not.toMatch(/\/store\/|\.\.\/store/)
+      }
+    }
+  })
+  // core 是 query 与 sync 的共同底座（`core/time.ts` 就是为了让两边共用而沉淀的）——
+  // 它一旦反向依赖 sync/，那条沉淀就白做了，且 query 会间接拉进写侧引擎。
+  it('core/ 不得 import sync/', () => {
+    for (const f of walk(join(src, 'core'))) {
+      for (const m of importSpecifiers(f)) {
+        expect(m, `${f} → ${m}`).not.toMatch(/\/sync\/|\.\.\/sync/)
       }
     }
   })
   it('sync/ 不得 import commands/（引擎与任务不知道命令层，spec §十一.15）', () => {
     for (const f of walk(join(src, 'sync'))) {
-      for (const m of readFileSync(f, 'utf8').matchAll(/from\s+['"]([^'"]+)['"]/g)) {
-        expect(m[1], `${f} → ${m[1]}`).not.toMatch(/\/commands\/|\.\.\/commands/)
+      for (const m of importSpecifiers(f)) {
+        expect(m, `${f} → ${m}`).not.toMatch(/\/commands\/|\.\.\/commands/)
+      }
+    }
+  })
+  // E 的红线（spec §5.1 / 裁决 R2）：查询层是**被命令层调用**的库，不是命令层的一部分。
+  // 反向依赖会让 `query/` 里的纯函数（mask / errors / table-query）间接拉进命令层与同步引擎，
+  // 单测被迫加载整个 CLI；`sync/` 更是写侧引擎，只读层依赖它意味着沙箱的只读性无法静态论证。
+  it('query/ 不得 import sync/ 与 commands/', () => {
+    for (const f of walk(join(src, 'query'))) {
+      for (const m of importSpecifiers(f)) {
+        expect(m, `${f} → ${m}`).not.toMatch(/\/sync\/|\.\.\/sync|\/commands\/|\.\.\/commands/)
+      }
+    }
+  })
+  it('store/ 不得 import query/', () => {
+    for (const f of walk(join(src, 'store'))) {
+      for (const m of importSpecifiers(f)) {
+        expect(m, `${f} → ${m}`).not.toMatch(/\/query\/|\.\.\/query/)
       }
     }
   })

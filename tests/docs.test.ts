@@ -79,8 +79,12 @@ describe('readme.test.ts —— C1 追加断言（防文档说假话）', () => 
     const notYet = /尚未实现[\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
     expect(notYet).not.toMatch(/store init/)
   })
-  it('readme.test.ts 原有「前两个子项目」断言仍绿（第 11 处不动裁决的正向锚，I 组 L8）', () => {
-    expect(read('README.md')).toMatch(/前两个子项目/)
+  it('「子项目计数」随交付推进：E 交付后为「前五个」，且不再残留「前两个」', () => {
+    // 该锚最初（C1 组）钉的是「前两个子项目」不动裁决；E 交付后那句话成了不实声明
+    // （同节紧接列出 store/sync/query），审查 Minor 15 改为随事实推进的正锚。
+    const md = read('README.md')
+    expect(md).toMatch(/前五个子项目/)
+    expect(md).not.toMatch(/前两个子项目/)
   })
 })
 
@@ -126,12 +130,14 @@ describe('D 同步引擎交付联动 —— 不得说假话（D-T15）', () => {
     expect(md).toMatch(/sync verify/)
     expect(md).toMatch(/src\/sync\//)
   })
-  it('README 横幅与「尚未实现」清单：同步已交付、查询仍未实现', () => {
+  it('README 横幅与「尚未实现」清单：同步与查询均已交付', () => {
     const md = read('README.md')
     expect(md).toMatch(/同步.*已交付|已交付.*同步/)
+    expect(md).toMatch(/查询.*已交付|已交付.*查询/)
     const notYet = /\*\*尚未实现\*\*（调用时[\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
     expect(notYet).not.toMatch(/sync run/)
-    expect(notYet).toMatch(/query/)
+    // E 交付后查询命令不得再出现在「尚未实现」清单里（只允许 F 的 Skill 待做）
+    expect(notYet).not.toMatch(/qiyu query|`db tables`|`stats fields`/)
   })
   it('README 依赖分述：sync 零常规运行时依赖（fflate 只在 devDependencies，仅测试夹具用）', () => {
     const md = read('README.md')
@@ -156,17 +162,17 @@ describe('D 同步引擎交付联动 —— 不得说假话（D-T15）', () => {
     const dLine = s.split('\n').find((l) => /sync tasks/.test(l) && /#/.test(l)) ?? ''
     expect(dLine).toMatch(/列出可用任务（含每任务敏感列出口）/)
   })
-  it('路线图 §四.D 标注已交付且 E 未关闭（整节不得假勾）', () => {
+  it('路线图 §四.D 标注已交付（D 节不得假勾）', () => {
     const s = read('docs/superpowers/specs/2026-10-09-后续交付路线图-design.md')
     expect(s).toMatch(/### D\. 同步引擎（`sync\/`）—— ✅ 已交付/)
-    expect(s).not.toMatch(/### E\..*已交付/)
   })
-  it('路线图 §六.3：D 已交付 + §六.4：E 已解锁', () => {
+  it('路线图 §六.3：D 已交付 + §六.4：E 已交付', () => {
     const s = read('docs/superpowers/specs/2026-10-09-后续交付路线图-design.md')
     const l3 = s.split('\n').find((l) => /D 已交付（2026-10-15/.test(l)) ?? ''
     expect(l3).toMatch(/D 已交付/)
-    const l4 = s.split('\n').find((l) => /已解锁（C1、D 均已交付）/.test(l)) ?? ''
-    expect(l4).toMatch(/已解锁/)
+    // E 交付后该行由「已解锁」改写为「已交付」——断言跟着事实走，不锁旧措辞
+    const l4 = s.split('\n').find((l) => /^\d+\.\s.*E 已交付（2026-10-17/.test(l)) ?? ''
+    expect(l4).toMatch(/均已解锁/)
   })
   it('设计稿状态行含 D 交付标注', () => {
     expect(read('docs/qiyu-cli-design.md')).toMatch(/状态：实施中.*D 同步引擎.*已交付/)
@@ -421,5 +427,63 @@ describe('CI 工作流 —— 承诺的检查必须真的接在 npm 脚本上', 
     const md = read('CHANGELOG.md')
     const unreleased = /## \[未发布\][\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
     expect(unreleased).toMatch(/CI（`\.github\/workflows\/ci\.yml`）/)
+  })
+})
+
+describe('E 查询与沙箱交付联动 —— 不得说假话（E-T12）', () => {
+  it('cli.ts 顶层 USAGE 列全五个查询命令', () => {
+    const s = read('src/cli.ts')
+    for (const cmd of ['db tables', 'db describe', 'query --sql', 'query --table', 'stats fields']) {
+      expect(s, `USAGE 缺 ${cmd}`).toMatch(new RegExp(cmd.replace(/ /g, '\\s+')))
+    }
+  })
+  it('README 含五个查询命令、查询层目录与默认脱敏边界', () => {
+    const md = read('README.md')
+    for (const cmd of ['db tables', 'db describe', 'query --sql', 'query --table', 'stats fields']) {
+      expect(md, `README 缺 ${cmd}`).toMatch(new RegExp(cmd.replace(/ /g, '\\s+')))
+    }
+    expect(md).toMatch(/src\/query\//)
+    expect(md).toMatch(/默认脱敏/)
+    // 脱敏边界必须写明：--sql 的别名绕过会漏，不是「安全无死角」的承诺
+    expect(md).toMatch(/别名|值级兜底/)
+  })
+  it('README 查询段含 meta 键与「0 行 ≠ 没有数据」', () => {
+    const md = read('README.md')
+    for (const k of ['resolved_range', 'data_coverage', 'masked_columns', 'mask_warnings', 'truncated']) {
+      expect(md, `README 缺 ${k}`).toMatch(new RegExp(k))
+    }
+    expect(md).toMatch(/0 行不等于没有数据|0 行.{0,10}不等于.{0,10}没有数据/)
+  })
+  it('CHANGELOG [未发布] 段内含查询命令、三层沙箱与 query_timeout（反引号命令形态）', () => {
+    const md = read('CHANGELOG.md')
+    const unreleased = /## \[未发布\][\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
+    expect(unreleased).toMatch(/`db tables`/)
+    expect(unreleased).toMatch(/`query --sql`/)
+    expect(unreleased).toMatch(/`query --table`/)
+    // 命令后带形态说明（如 `stats fields <报表>`）——锚开引号后的命令名即可
+    expect(unreleased).toMatch(/`stats fields/)
+    expect(unreleased).toMatch(/query_timeout/)
+    expect(unreleased).toMatch(/三层只读沙箱/)
+  })
+  it('路线图 §四.E 标注已交付、§六.4 记 E 交付且下一步是 F', () => {
+    const s = read('docs/superpowers/specs/2026-10-09-后续交付路线图-design.md')
+    expect(s).toMatch(/### E\. 查询接口与沙箱（`query\/`）—— ✅ 已交付/)
+    const l4 = s.split('\n').find((l) => /E 已交付（2026-10-17/.test(l)) ?? ''
+    expect(l4).toMatch(/E 已交付/)
+    const next = s.split('\n').find((l) => /下一步（2026-10-17 更新）/.test(l)) ?? ''
+    expect(next).toMatch(/F Skill/)
+  })
+  it('设计稿状态行与 §8 含 E 阶段标注，并点名实现期两处修正', () => {
+    const s = read('docs/qiyu-cli-design.md')
+    expect(s).toMatch(/状态：实施中.*E 查询与沙箱已交付/)
+    expect(s).toMatch(/E 阶段：✅ 已交付/)
+    // 阶段标注必须点名两处实现期修正（否则读者会以为设计稿 = 最终实现）
+    expect(s).toMatch(/EXPLAIN ANALYZE/)
+    expect(s).toMatch(/块注释可嵌套/)
+  })
+  it('分层规则已扩展：query 不 import sync/commands，store 不 import query', () => {
+    const s = read('tests/store/layering.test.ts')
+    expect(s).toMatch(/query\/ 不得 import sync\/ 与 commands\//)
+    expect(s).toMatch(/store\/ 不得 import query\//)
   })
 })

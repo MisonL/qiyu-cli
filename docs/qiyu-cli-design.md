@@ -1,7 +1,7 @@
 # qiyu-cli 设计文档
 
 日期：2026-09-30（Version 2）
-状态：实施中——A/B/C1/D 已交付（D 同步引擎已交付 2026-10-15，见 `src/sync/`）；E 查询与沙箱、F Skill 未实现
+状态：实施中——A/B/C1/D 已交付（D 同步引擎已交付 2026-10-15，见 `src/sync/`；E 查询与沙箱已交付 2026-10-17，见 `src/query/`）；F Skill 未实现
 修订说明：Version 1 的核心论据是错的（见 §13）；Version 2 予以更正，并纳入会话明细同步
 
 > **关于本文档中的实测数据**：本文档中出现的所有 ID（robotId、staffId、groupId、categoryId、会话 ID 等）、人名与业务内容，**均为合成的占位值**，不指向任何真实企业。标注为「实测」的结论（字段行为、分页语义、限频、错误码、统计口径、比例、行数）来自对某个真实七鱼企业账号的**只读**探测，并已做匿名化处理；**其结构性结论可直接复用于任何七鱼企业，但具体数量级会随企业规模而变化**。
@@ -954,11 +954,18 @@ qiyu sync uninstall
 
 ## 8. 查询接口与沙箱
 
+> **E 阶段：✅ 已交付（2026-10-17）** —— 落点在 `src/query/`（三层只读沙箱、默认脱敏、错误分派、
+> 表查询构造、指标目录）与 `src/commands/{db,query,stats}.ts`。本节的三层沙箱、脱敏默认开启、
+> `-1` 哨兵呈现均按下述设计实现；实现期的两处修正记录在
+> `docs/superpowers/specs/2026-10-17-查询接口与沙箱-design.md`：①`EXPLAIN ANALYZE` 会真正执行
+> 内层语句，沙箱额外拒绝带 ANALYZE 的 EXPLAIN；②DuckDB 行注释在 `\r` 也终止、块注释可嵌套，
+> 词法剥离必须按深度而非首个 `*/`。
+
 ```bash
 qiyu db tables                    # 本地表清单 + 粒度 + 行数 + 数据时间范围
 qiyu db describe <table>          # 列名、类型、单位、枚举值、是否可空
 qiyu query --sql "SELECT ..."     # 只读
-qiyu query --table sessions --since 30d --group-by category
+qiyu query --table sessions --since 30d --group-by session_type
 qiyu stats fields <report>        # 指标自描述（单位/取值范围/higher_is_better）
 ```
 

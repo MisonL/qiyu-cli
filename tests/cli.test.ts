@@ -257,6 +257,55 @@ describe('入口退出行为（架构不变量）', () => {
   })
 })
 
+describe('查询族子命令注册（db / query / stats）', () => {
+  it('顶层 USAGE 列出 db / query / stats 五个子命令', async () => {
+    // ⚠️ 这五条是 spec §三「命令面」的逐条承诺。少列一条 = Agent 读 --help
+    // 看不到那条能力；多列一条 = 指向不存在的能力（同 `auth login` 那条禁令）。
+    // 断言到「子命令 + 方式」粒度，而不是只断言出现了 db / query / stats 三个词 ——
+    // 后者在只挂一个空壳子命令时也会绿。
+    expect(await run(['--help'])).toBe(0)
+    for (const line of ['db tables', 'db describe', 'query --sql', 'query --table', 'stats fields']) {
+      expect(out, `顶层 USAGE 必须列出 ${line}`).toContain(line)
+    }
+    expect(err).toBe('')
+  })
+
+  it('qiyu db / query / stats --help → 退出码 0 且输出各自用法', async () => {
+    // ⚠️ 只断言「顶层列了」不够：COMMANDS 没挂上时，`qiyu db --help` 会落到
+    // 「未知子命令」分支（退出码 2）—— 帮助请求变成错误，对 Agent 是坏交互。
+    const cases: Array<[string, RegExp, string]> = [
+      ['db', /db tables/, 'db 用法'],
+      ['query', /query --sql/, 'query 用法'],
+      ['stats', /stats fields/, 'stats 用法'],
+    ]
+    for (const [sub, re, label] of cases) {
+      out = ''; err = ''
+      expect(await run([sub, '--help']), `${label} 必须是退出码 0`).toBe(0)
+      expect(out, `${label} 必须走 stdout`).toMatch(re)
+      expect(err, `${label} 不是错误，不该写 stderr`).toBe('')
+    }
+  })
+
+  it('未知子命令仍报「未知子命令」并列出新增命令', async () => {
+    expect(await run(['nope'])).toBe(2)
+    expect(err).toContain('未知子命令：nope')
+    // 「可用子命令：」这一行必须真的能引导 Agent —— 它列的就是 COMMANDS 的键，
+    // 所以新注册的三个命令必须出现在同一行里。
+    const line = err.split('\n').find((l) => l.includes('可用子命令：')) ?? ''
+    for (const name of ['db', 'query', 'stats']) {
+      expect(line, `「可用子命令：」行必须含 ${name}`).toContain(name)
+    }
+  })
+
+  it('qiyu --help --bogus → 退出码 2（既有行为不得回归）', async () => {
+    // ⚠️ 2026-10-08 修过的行为：`--help` 不吞额外参数。本任务动了 USAGE 与
+    // COMMANDS，不能顺手把这条分派层规则碰坏。
+    expect(await run(['--help', '--bogus'])).toBe(2)
+    expect(err).toContain('未知参数：--bogus')
+    expect(JSON.parse(out).error.message).toContain('--help 不接受额外参数')
+  })
+})
+
 describe('store 子命令注册', () => {
   it('store 进 COMMANDS 且 dispatch 可达（store --help → 0）', async () => {
     const { run } = await import('../src/cli.js')

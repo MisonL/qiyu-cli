@@ -15,6 +15,24 @@ describe('sanitizeControlChars —— 不受信文本不得注入终端控制序
   it('替换 C0/C1 控制字符但保留 Tab', () => {
     expect(sanitizeControlChars('a\u001b]0;pwned\u0007\t\nb')).toBe('a·]0;pwned·\t·b')
   })
+
+  it('usageFail 在出口净化 message 与 hint（security S4：不是靠每个调用点自觉）', () => {
+    // 实测缺口：`query --table "nosuch\033]0;OWNED\007"` 走了净化、而同一文件的
+    // `未知参数：…` / `--help` 多余参数路径没走 —— 逐调用点补会漏。
+    out = ''; err = ''
+    usageFail('未知参数：--bogus\u001b[2J', '提示：\u001b]0;OWNED\u0007')
+    expect(err).not.toContain('\u001b')
+    expect(err).toContain('未知参数：--bogus·[2J')
+    const parsed = JSON.parse(out)
+    expect(parsed.error.message).not.toContain('\u001b')
+    expect(parsed.error.hint).not.toContain('\u001b')
+
+    // 多行 message 的换行结构必须保住（净化是逐行做的，不是整串抹掉 \n）
+    out = ''; err = ''
+    usageFail('第一行\n第二行')
+    expect(err).toBe('第一行\n第二行\n')
+    expect(JSON.parse(out).error.message).toBe('第一行\n第二行')
+  })
 })
 
 describe('成功输出', () => {

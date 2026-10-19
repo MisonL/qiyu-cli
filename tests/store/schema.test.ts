@@ -68,7 +68,66 @@ describe('TABLES —— 表定义', () => {
   })
 
   it('schema_version.version 是 INTEGER（迁移序号，非 ID 列）', () => {
-    expect(tableByName('schema_version')!.columns[0]).toEqual({ name: 'version', type: 'INTEGER', nullable: false, sensitive: false })
+    // 逐键断言而非整体 toEqual：E 给 ColumnDef 追加了可选元数据键（unit/note/observed_enum），
+    // 整体相等会把「新增可选元数据」误判成列定义变更；语义（名/型/非空/非敏感）逐项保留。
+    // ⚠️ `grain` 是 **TableDef** 的键（不是 ColumnDef）—— 底下这条只有列定义，不含 grain。
+    const c = tableByName('schema_version')!.columns[0]
+    expect(c.name).toBe('version')
+    expect(c.type).toBe('INTEGER')
+    expect(c.nullable).toBe(false)
+    expect(c.sensitive).toBe(false)
+  })
+})
+
+// —— E 前置：元数据扩展（设计稿 §四）—— 以下断言只读 TS 侧元数据，不碰 DDL/迁移。
+describe('TABLES —— E 元数据扩展', () => {
+  it('每张表都有 grain 声明（E 的 db tables 出口）', () => {
+    for (const t of TABLES) expect(t.grain, t.name).toBeTruthy()
+  })
+  it('timeColumn 只出现在有业务时间列的表上，且 kind 合法', () => {
+    const withTime = TABLES.filter((t) => t.timeColumn).map((t) => t.name).sort()
+    expect(withTime).toEqual(['daily_overview', 'order_performance', 'robot_summary', 'sessions',
+      'staff_attendance', 'staff_quality', 'staff_salary_detail', 'staff_satisfaction',
+      'staff_workload', 'transfer_human'])
+    for (const t of TABLES) {
+      if (t.timeColumn) expect(['iso-day', 'iso-instant', 'epoch-ms']).toContain(t.timeColumn.kind)
+    }
+    expect(tableByName('sessions')!.timeColumn).toEqual({ name: 'startTime', kind: 'epoch-ms' })
+    expect(tableByName('staff_attendance')!.timeColumn).toEqual({ name: 'hour_ts', kind: 'iso-instant' })
+    expect(tableByName('daily_overview')!.timeColumn).toEqual({ name: 'stat_date', kind: 'iso-day' })
+  })
+  // ⚠️ 不变量：timeColumn.name 必须是本表 columns 里的一列。
+  // `db describe` / `db tables` 缺时间列时靠「少列」warning 点名（db.ts 的注释依赖这一点）；
+  // 若声明的时间列根本不在 columns 里，列集核对不会报少列 —— 命令会**静默**把
+  // time_range 置 null 而没有任何提示，Agent 会以为「这张表没有时间数据」。
+  it('timeColumn.name 必须出现在本表 columns 中（否则缺列降级会静默）', () => {
+    for (const t of TABLES) {
+      if (t.timeColumn === undefined) continue
+      expect(t.columns.map((c) => c.name), `${t.name}.timeColumn.name=${t.timeColumn.name}`)
+        .toContain(t.timeColumn.name)
+    }
+  })
+  it('observed_enum 只出现在有实测出处的列上（不是按名称泛化）', () => {
+    expect(tableByName('sessions')!.columns.find((c) => c.name === 'session_type')!.observed_enum)
+      .toEqual(['robot', 'internal', 'human'])
+    expect(tableByName('sync_state')!.columns.find((c) => c.name === 'range_status')!.observed_enum)
+      .toEqual(['pending', 'complete'])
+    expect(tableByName('knowledge_items')!.columns.find((c) => c.name === 'type')!.observed_enum)
+      .toEqual([1, 10])
+    // staff.role / staff.status（设计稿 §6.2 实测 330 行）：列是 VARCHAR，故枚举按字符串给。
+    // ⚠️ 除这两处外，无出处的列必须不带 observed_enum（不是按名称泛化）。
+    expect(tableByName('staff')!.columns.find((c) => c.name === 'role')!.observed_enum)
+      .toEqual(['0', '1', '2', '-2'])
+    expect(tableByName('staff')!.columns.find((c) => c.name === 'status')!.observed_enum)
+      .toEqual(['1', '2', '3'])
+    expect(tableByName('staff')!.columns.find((c) => c.name === 'roleId')!.observed_enum)
+      .toBeUndefined()
+    expect(tableByName('sessions')!.columns.find((c) => c.name === 'userPhone')!.observed_enum)
+      .toBeUndefined()
+  })
+  it('扩展字段不进 DDL（ddlFor 只读 name/type/nullable）', () => {
+    const sql = ddlFor(tableByName('sessions')!)
+    expect(sql).not.toMatch(/grain|observed_enum|note|unit|timeColumn/)
   })
 })
 

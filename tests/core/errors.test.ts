@@ -1,6 +1,15 @@
 // tests/core/errors.test.ts
-import { describe, it, expect } from 'vitest'
-import { classify, redactInternal } from '../../src/core/errors.js'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { classify, redactInternal, type ErrorKind } from '../../src/core/errors.js'
+import { fail } from '../../src/output.js'
+
+// ErrorKind 闭集用例要观察 fail() 的 stdout 信封（与 tests/output.test.ts 同款 spy）。
+let out = ''
+beforeEach(() => {
+  out = ''
+  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
+})
+afterEach(() => { vi.restoreAllMocks() })
 
 describe('错误分类', () => {
   it('14001 鉴权错误不可重试', () => {
@@ -445,5 +454,21 @@ describe('内部信息脱敏', () => {
     const elapsed = Date.now() - t0
     // 上界给得宽松（真实 77ms，阈值 3 秒）—— 只为抓"指数级"回归，不追求精确计时。
     expect(elapsed, `超长 token 脱敏耗时 ${elapsed}ms，疑似正则回溯爆炸`).toBeLessThan(3000)
+  })
+})
+
+describe('ErrorKind 闭集（E 组扩展）', () => {
+  it("'query_timeout' 是合法 kind（只读查询超时，退出码 1）", () => {
+    // 编译期检查：这行赋不进 ErrorKind 就说明联合类型没扩展（E spec §十一）。
+    // ⚠️ 它靠 `npm run typecheck`（tsc -p tsconfig.test.json，include 含 tests/）兜底，
+    // CI 在 `npm test` 之前执行；vitest 只转译不做类型检查（CodeRabbit 终审 minor 的
+    // 前提已核实成立：删掉联合成员后 typecheck 在本文件报 TS2322）。
+    const k: ErrorKind = 'query_timeout'
+    // 运行时事实（不是自比较）：该 kind 真的走 exitCodeFor 的 business 分支 → 退出码 1，
+    // 且信封里保留 code/kind。联合成员加了却漏配分派时这里会红。
+    expect(fail({ code: k, kind: k, retryable: false, message: '超时' })).toBe(1)
+    expect(JSON.parse(out)).toMatchObject({
+      ok: false, error: { code: 'query_timeout', kind: 'query_timeout', retryable: false },
+    })
   })
 })
