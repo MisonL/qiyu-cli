@@ -67,43 +67,40 @@ function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
  * 观测 SQL（spec §9.2 原型 SQL，探针 17 实测通过）。
  *
  * 逐字段统计（不是逐行取值）：
- *   · `rows_present`：payload 中出现该键的行数（缺键不进 json_keys；payload 为 SQL NULL /
- *     `{}` 的行不贡献任何字段行）；
+ *   · `rows_present`：payload 中出现该键的行数（缺键不出现；payload 为 SQL NULL /
+ *     `{}`/数组/标量的行不贡献任何字段行）；
  *   · `minus_one`：数值恰为 -1 的行数（哨兵）；
- *   · `nulls`：JSON null 的行数（`json_type(raw)='NULL'`）；
+ *   · `nulls`：JSON null 的行数（`json_each` 的 `type = 'NULL'`）；
  *   · `min`/`max`：**排除 -1** 后的数值极值；非数值字段为 null（不报错）。
  *
  * ⚠️ 表名来自 REPORT_TABLES 闭集，是代码内常量，不承载外部输入。
- * ⚠️ JSON 路径必须先**按 JSON 路径语法转义**再拼：键名来自库里的 payload（不受信）。
- * 实测（2026-10-18，DuckDB 1.5.6-r.1）三种形态：
+ *
+ * ⚠️ 用 `json_each` 展开、**不拼 JSON 路径**（CodeRabbit nitpick，2026-10-19 探针复核）：
+ * 早先的写法是 `json_keys` 逐键取，键名来自库里的 payload（不受信），必须按 JSON 路径
+ * 语法转义后再 `json_extract`。实测（2026-10-18，DuckDB 1.5.6-r.1）转义写错就有两种病：
  *   · `a"b` / 尾随 `\` → `JSON path error`，**整条命令失败**（一个畸形键名杀掉全部统计）；
  *   · `a\\b`（键内含连续反斜杠）→ 路径静默返回 NULL，非空值被计成 nulls ——
  *     **静默错数**，比报错更糟。
- * 故先 `replace(k,'\\','\\\\')` 再 `replace(k,'"','\\"')`（顺序不可反：先转义引号会把
- * 新引入的反斜杠再翻倍）。转义后的路径在探针里对 7 种键名（含空格/点/方括号/引号/反斜杠）
- * 全部取到值，未转义的对照组复现了上述两类缺陷。
+ * `json_each` 直接给出 `key`/`value`/`type`，键名不进路径语法，整类缺陷消失；
+ * 顺带每行只展开一次（旧写法对每个键重复解析 payload）。
+ * ⚠️ 实测对照（2026-10-19，含 `b"c`、`x\y`、空键、JSON null、-1、非法 JSON、数组、标量）：
+ * 新旧两版输出**逐字相同**，仅 `TRY(json_type(payload)) = 'OBJECT'` 把非对象行挡在外面。
+ * `min/max` 走 `e.value ->> '$'`（JSON 值转文本再转 DOUBLE），非数值自然为 NULL。
  */
 function observeSql(table: string): string {
   return `WITH kv AS (
-  SELECT j.k AS k, t.payload AS payload
-  FROM "${table}" t, unnest(TRY(json_keys(t.payload))) AS j(k)
-  WHERE j.k <> ''
-), ext AS (
-  SELECT k, payload,
-         '$."' || replace(replace(k, '\\', '\\\\'), '"', '\\"') || '"' AS path
-  FROM kv
-), vals AS (
-  SELECT k, payload,
-         TRY(json_extract(payload, path)) AS raw,
-         TRY_CAST(TRY(json_extract_string(payload, path)) AS DOUBLE) AS num
-  FROM ext
+  SELECT e.key AS k, e.value AS raw, e.type AS jt,
+         TRY_CAST(e.value ->> '$' AS DOUBLE) AS num
+  FROM (SELECT payload FROM "${table}" WHERE TRY(json_type(payload)) = 'OBJECT') t,
+       json_each(t.payload) AS e
+  WHERE e.key <> ''
 )
 SELECT k AS field, COUNT(*) AS rows_present,
        SUM(CASE WHEN num = -1 THEN 1 ELSE 0 END) AS minus_one,
-       SUM(CASE WHEN raw IS NULL OR TRY(json_type(raw)) = 'NULL' THEN 1 ELSE 0 END) AS nulls,
+       SUM(CASE WHEN jt = 'NULL' THEN 1 ELSE 0 END) AS nulls,
        MIN(CASE WHEN num <> -1 THEN num END) AS min,
        MAX(CASE WHEN num <> -1 THEN num END) AS max
-FROM vals GROUP BY k ORDER BY k`
+FROM kv GROUP BY k ORDER BY k`
 }
 
 /**
