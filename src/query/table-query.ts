@@ -77,6 +77,27 @@ function timeExprOf(tc: TimeColumn): string {
 }
 
 /**
+ * ISO 列的**形态谓词**（CodeRabbit 终审 minor）：脏值（`not-a-date`、空串、纯日期）
+ * 不得进入 MIN/MAX —— 它们在 VARCHAR 字典序上可能赢下 MAX（`n` > `2`、`≤ \s`），
+ * 于是 `data_coverage.max` 输出一个根本不是时间的字符串，或空串把 `--until` 的
+ * 缺省下界判成「无可用值」。
+ *
+ * ⚠️ 口径必须与 `commands/db.ts` 的 `shapeSqlOf` **逐字一致**（同一条 README 承诺：
+ * 「脏值不进 time_range」）。两处分叉的话，同一条脏库会在 `db tables` 被排除、
+ * 在 `query --table` 被当成覆盖范围 —— 同一状态两种说法。
+ * ⚠️ 主查询的时间谓词不需要它：脏值本来就过不了 `<= ISO 上界`；只有**不带谓词**的
+ * MIN/MAX（`data_coverage`、`buildMinQuery`）需要。
+ */
+function shapeClause(tc: TimeColumn): string[] {
+  if (tc.kind === 'epoch-ms') return []
+  const shape = tc.kind === 'iso-day'
+    ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
+    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2}(\\.[0-9]+)?)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
+  // ⚠️ `regexp_matches`，不要用 `~`（实测 DuckDB 1.5.6-r.1 的 `~` 不是正则匹配）。
+  return [`regexp_matches(${quote(tc.name)}, '${shape}')`]
+}
+
+/**
  * 生效边界（`resolved_range` 的回显值）：iso-day 取上海日零点，其余原值（契约 A/C）。
  * 导出供命令层在「0 行警告」里说明实际生效的上界。
  */
@@ -265,7 +286,9 @@ export function buildCoverageQuery(input: TableQueryInput): { sql: string; param
   }
   const filter = buildTimeFilter(input)
   const expr = timeExprOf(tc)
-  const where = filter.clauses.length > 0 ? ` WHERE ${filter.clauses.join(' AND ')}` : ''
+  // 形态谓词与时间谓词同一 WHERE（CodeRabbit 终审 minor）：脏值不进覆盖范围。
+  const clauses = [...shapeClause(tc), ...filter.clauses]
+  const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : ''
   const days = tc.kind === 'iso-day' ? `, COUNT(DISTINCT ${expr}) AS days` : ', NULL AS days'
   return {
     sql: `SELECT MIN(${expr}) AS mn, MAX(${expr}) AS mx${days} FROM ${quote(table.name)}${where}`,
@@ -273,11 +296,15 @@ export function buildCoverageQuery(input: TableQueryInput): { sql: string; param
   }
 }
 
-/** 表时间列的下界查询（只给 `--until` 时解析缺省下界，契约 B）。不带任何谓词。 */
+/** 表时间列的下界查询（只给 `--until` 时解析缺省下界，契约 B）。只带形态谓词。 */
 export function buildMinQuery(table: TableDef): { sql: string } {
   const tc = table.timeColumn
   if (tc === undefined) {
     throw new TableQueryUsageError(`表 ${table.name} 没有时间列，无法查询下界`)
   }
-  return { sql: `SELECT MIN(${timeExprOf(tc)}) AS mn FROM ${quote(table.name)}` }
+  // ⚠️ 必须过滤形态（CodeRabbit 终审 minor）：空串在字典序上小于一切 ISO，
+  // `MIN` 会返回它 → 命令层判成「该列无可用值」而丢掉缺省下界，尽管表里有合法行。
+  const shape = shapeClause(tc)
+  const where = shape.length > 0 ? ` WHERE ${shape.join(' AND ')}` : ''
+  return { sql: `SELECT MIN(${timeExprOf(tc)}) AS mn FROM ${quote(table.name)}${where}` }
 }

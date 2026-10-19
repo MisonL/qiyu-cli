@@ -38,6 +38,27 @@ describe('core/time —— 上海时间（E 与 D 同源）', () => {
     expect(parseTimeArg('2026-09-15T12:00', () => T, '--since')).toBe(Date.UTC(2026, 8, 15, 4))
     expect(parseTimeArg('2026-09-15T12:00:00Z', () => T, '--since')).toBe(Date.UTC(2026, 8, 15, 12))
   })
+
+  it('非 ISO 形态一律拒绝，不落到 Date.parse 的遗留解析器（CodeRabbit 终审 minor）', () => {
+    // V8 的 Date.parse 接受 `2026/09/15`、`Sep 15 2026` 这类非 ISO 写法，并按**进程时区**
+    // 解释 —— 与 F5 同一个缺陷的另一扇门（TZ=UTC 的 CI 上偏 8 小时），而且退出码 0
+    // 无警告。契约只承诺 ISO 8601，其余必须 usage 拒绝。
+    for (const bad of [
+      '2026/09/15', '2026/09/15 12:00', 'Sep 15 2026', '15 Sep 2026',
+      '2026-09-15T12', '2026-9-15', 'September 15, 2026', '20260915',
+    ]) {
+      expect(parseTimeArg(bad, () => T, '--since'), bad).toBeNull()
+    }
+    // 契约内的形态仍然全部接受
+    for (const ok of [
+      '2026-09-15', '2026-09-15T12:00', '2026-09-15T12:00:00',
+      '2026-09-15T12:00:00Z', '2026-09-15T12:00:00+08:00', '2026-09-15T12:00:00+0800',
+      '2026-09-15 12:00:00Z',
+    ]) {
+      expect(typeof parseTimeArg(ok, () => T, '--since'), ok).toBe('number')
+    }
+  })
+
   it('msToShanghaiIso 输出 +08:00', () => {
     expect(msToShanghaiIso(T)).toBe('2026-09-15T12:00:00+08:00')
     expect(msToShanghaiIso('2026-09-14T16:00:00.000Z')).toBe('2026-09-15T00:00:00+08:00')

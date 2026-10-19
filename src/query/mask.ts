@@ -217,6 +217,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 精确匹配会放过改名后的第 2 列 → 原始 PII 静默漏出（列名级与值级两条防线都够不着，
   // 因为姓名/地址无法值级检测）。故匹配用「去掉 `:数字` 后缀的基名」。
   const baseName = (n: string): string => n.replace(/:\d+$/, '')
+  // ⚠️ 大小写敏感（与下方 SQL 文本匹配的规则**不同**，两边各有理由）：
+  // 输出列名 = 表定义大小写（DuckDB 保留声明大小写，实测探针 12），所以列名级用精确比较
+  // 就是对的；反而是 SQL 文本的匹配必须宽松（用户写 `username` 也与 `userName` 同列）。
+  // 若把这里也放宽，`staff.username`（非敏感列）的输出列会被当成 sensitive 整列改写。
   const nameHit = new Set(
     columns.filter((name) => sensitiveNames.includes(baseName(name))))
   // 供缺口警告用：哪些敏感列名**真的**匹配到了输出列（含 `:N` 改名后的）。
@@ -233,8 +237,13 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
         // ⚠️ 列名命中不等于值可安全转换（CodeRabbit 终审 major）：`SELECT t AS userName
         // FROM sessions t` 把整行 STRUCT 别名成敏感列名 → 走 nameHit 分支 → `maskValue`
         // 对非字符串原样返回 → 全量 PII 漏出，且 matchedSensitive 含该名使缺口警告也不触发。
-        // 与 maskCellByValue 的 S1 规则同一处理：对象/数组整值替换。
-        out[name] = before !== null && typeof before === 'object'
+        // 与 maskCellByValue 的 S1 规则同一处理：**任何非字符串值整值替换**。
+        // ⚠️ 覆盖面必须是「所有非字符串」而不只是对象/数组（CodeRabbit 复审）：
+        // `SELECT userPhone::DOUBLE AS userPhone FROM sessions` 返回数字 13800138000，
+        // maskValue 同样原样返回 —— 数字形态的手机号一样是 PII。schema 里 PII 列都是
+        // VARCHAR，故真实列不会走到这里；能走到的是**用户显式 cast 成非字符串**，
+        // 那种情形宁可整值替换（误杀无害，漏出有害）。
+        out[name] = before !== null && before !== undefined && typeof before !== 'string'
           ? FULL
           : maskValue(before, ruleForColumn(baseName(name)))
       } else {
@@ -305,7 +314,14 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     if (warnings.length >= WARNING_LIMIT) break
     if (matchedSensitive.has(name)) continue
     // `\b` 两侧都要求非标识符字符：userPhoneBook 这类更长标识符不会误报 userPhone。
-    if (!new RegExp(`\\b${name}\\b`).test(mode.sql)) continue
+    //
+    // ⚠️ **必须大小写不敏感**（CodeRabbit 终审 major，spec §十五.4「误报方向必须是
+    // 多警告而非少警告」）：DuckDB 标识符不分大小写 —— 实测 `SELECT username FROM
+    // sessions` 输出列名是 `userName`（值已列名级脱敏），但 `SELECT username AS n` 输出
+    // 列名是 `n`，列名级够不着、值级无法检测姓名 → 大小写敏感时**零警告静默漏出**。
+    // 代价是 `SELECT username FROM staff`（staff.username 不是敏感列）会多一条误报 ——
+    // spec 明确要求这个方向。
+    if (!new RegExp(`\\b${name}\\b`, 'i').test(mode.sql)) continue
     warnings.push(
       `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，` +
       '建议用 `qiyu query --table` 或保持列名原样')

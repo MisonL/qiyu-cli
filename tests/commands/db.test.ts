@@ -586,6 +586,34 @@ describe('db describe', () => {
       { min: '2026-09-15T09:00:00+08:00', max: '2026-09-16T09:00:00+08:00' })
   })
 
+  it('iso-instant 按解析时刻取极值，不按字典序（CodeRabbit 终审 minor）', async () => {
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      // 混排偏移形态：'09:00:00+08:00' 是 01:00Z（更早），'05:00:00Z' 是 05:00Z（更晚）。
+      // 字典序上 '…T09…' > '…T05…'，所以按原始字符串取 MAX 会报出更早的那一刻。
+      await s.upsert('staff_attendance', [
+        { staff_id: '1000002', hour_ts: '2026-09-20T09:00:00+08:00',
+          stat_date: '2026-09-19T16:00:00.000Z', payload: '{}', synchronized_at: null },
+        { staff_id: '1000003', hour_ts: '2026-09-20T05:00:00Z',
+          stat_date: '2026-09-19T16:00:00.000Z', payload: '{}', synchronized_at: null },
+      ])
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['describe', 'staff_attendance', '--db', dbPath()])).toBe(0)
+    const d = data() as DescribeOut
+    const range = d.time_range!
+    // max 取 05:00Z（= 13:00+08:00，更晚的那个时刻），而不是字典序更大的
+    // 09:00:00+08:00（= 01:00Z，更早）—— 旧实现按原始字符串取 MAX 会报错这一端。
+    expect(range.max).toBe('2026-09-20T13:00:00+08:00')
+    // min 仍是 seed 里最早那行（09-15 09:00+08:00），说明新形态没有误改下限
+    expect(range.min).toBe('2026-09-15T09:00:00+08:00')
+    // 两种形态都合法，不算脏值
+    expect((meta().warnings as string[]).join('\n')).not.toMatch(/不符合约定形态/)
+  })
+
   it('库不存在 / 空库 / 他人库 → store_not_initialized，hint 指 store init 或换 --db', async () => {
     expect(await dbCommand(['describe', 'sessions', '--db', join(dir, 'missing.db')])).toBe(1)
     let e = errorOf()

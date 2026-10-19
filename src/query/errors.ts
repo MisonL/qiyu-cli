@@ -332,20 +332,40 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
  * 对 kind='usage' 同样返回退出码 2。其余 kind 直接 `fail({...})`（退出码 1；
  * `query_timeout` 不设特殊分支）。若将来 `output.usageFail` 支持自定义 code，可改回复用它。
  */
-export function thrownToQueryExit(e: unknown, tables: readonly TableDef[]): number {
-  return emitQueryFailure(classifyDuckDbError(e, tables))
+export function thrownToQueryExit(
+  e: unknown, tables: readonly TableDef[], noMask = false,
+): number {
+  return emitQueryFailure(classifyDuckDbError(e, tables), noMask)
 }
 
 /**
  * 已分类失败的唯一出口（`thrownToQueryExit` 与 `--table` 漂移识别共用）。
  * usage 双通道：stderr 纯文本 + stdout JSON（见上一段的说明）。
+ *
+ * `noMask` 只影响**转换错误回显里的值**（见下）；默认（false）脱敏。
  */
-export function emitQueryFailure(f: QueryFailure): number {
+export function emitQueryFailure(f: QueryFailure, noMask = false): number {
   // security S3/S4：DuckDB 原文与调用方输入都可能带终端控制字符，且 Parser/Binder 错误
   // 会回显整行 SQL（其中可能含调用方写进 SQL 的 PII）。在**唯一出口**统一净化 + 裁掉
   // SQL 回显 —— 逐调用点补会漏（security 实测同文件内两种行为并存）。
-  const message = sanitizeMessage(stripSqlEcho(f.message))
-  const hint = f.hint === undefined ? undefined : sanitizeMessage(stripSqlEcho(f.hint))
+  //
+  // ⚠️ 转换错误还会回显**表里的真实值**（CodeRabbit 终审 major）：实测
+  // `SELECT CAST(userPhone AS INT) FROM sessions` →
+  // `Conversion Error: Could not convert string '13800138000' to INT32 …`
+  // —— 那是查询结果行之外的一条独立泄漏通道（脱敏只作用于 rows，错误消息不经过它）。
+  // 只针对这个固定句式替换：usage 错误里的引号标识符（表名/列名）必须保持可读。
+  const clean = (s: string): string => {
+    const withoutSql = stripSqlEcho(s)
+    const redacted = noMask
+      ? withoutSql
+      : withoutSql.replace(
+        /(Could not convert string )'(?:[^']|'')*'(?= to\b)/gi,
+        "$1'<已脱敏>'",
+      )
+    return sanitizeMessage(redacted)
+  }
+  const message = clean(f.message)
+  const hint = f.hint === undefined ? undefined : clean(f.hint)
   if (f.kind === 'usage') {
     process.stderr.write(message.endsWith('\n') ? message : message + '\n')
   }

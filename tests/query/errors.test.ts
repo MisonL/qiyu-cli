@@ -459,4 +459,32 @@ describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码
     expect(err).not.toContain('\u001b')
     expect(String(JSON.parse(out).error.message)).not.toContain('\u001b')
   })
+
+  it('转换错误回显的表内值默认脱敏，--no-mask 才原样输出（CodeRabbit 终审 major）', () => {
+    // 实测（DuckDB 1.5.6-r.1）：`SELECT CAST(userPhone AS INT) FROM sessions` →
+    // `Conversion Error: Could not convert string '13800138000' to INT32 …`
+    // —— 表里的真实值，不走结果行脱敏。这是行之外的一条独立泄漏通道。
+    const e = new Error(
+      "Conversion Error: Could not convert string '13800138000' to INT32 "
+      + 'when casting from source column userPhone',
+    )
+    expect(thrownToQueryExit(e, TABLES)).toBe(1)
+    const j = JSON.parse(out)
+    expect(String(j.error.message)).not.toContain('13800138000')
+    expect(String(j.error.message)).toContain("'<已脱敏>'")
+    expect(err).toBe('')   // internal 路径不写 stderr
+
+    // --no-mask：显式承担风险，原样输出
+    out = ''; err = ''
+    expect(thrownToQueryExit(e, TABLES, true)).toBe(1)
+    expect(String(JSON.parse(out).error.message)).toContain('13800138000')
+
+    // 反证：usage 错误里的引号标识符（表名/列名）必须保持可读，不能被这条规则误伤
+    out = ''; err = ''
+    expect(thrownToQueryExit(
+      new Error('Catalog Error: Table with name sessons does not exist!'), TABLES,
+    )).toBe(2)
+    expect(err).toContain('表 sessons 不存在')
+    expect(err).not.toContain('<已脱敏>')
+  })
 })

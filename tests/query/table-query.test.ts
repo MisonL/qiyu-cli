@@ -260,19 +260,26 @@ describe('buildCoverageQuery / buildMinQuery（契约 B/D）', () => {
     expect(cov.params).toEqual(plan.params)
   })
 
-  it('无谓词时覆盖 = 全表 MIN/MAX', () => {
+  it('无谓词时覆盖 = 全表 MIN/MAX；ISO 列带形态谓词（脏值不进覆盖）', () => {
     const cov = buildCoverageQuery({ table: t('daily_overview'), now: NOW })
+    // 形态谓词与 commands/db.ts 的 shapeSqlOf 逐字一致（CodeRabbit 终审 minor）。
     expect(cov.sql).toBe(
       'SELECT MIN("stat_date") AS mn, MAX("stat_date") AS mx, ' +
-      'COUNT(DISTINCT "stat_date") AS days FROM "daily_overview"')
+      'COUNT(DISTINCT "stat_date") AS days FROM "daily_overview"' +
+      ` WHERE regexp_matches("stat_date", '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$')`)
     expect(cov.params).toEqual([])
+    // epoch-ms 列没有形态谓词（TRY_CAST 已把非数字折成 NULL）
+    const epoch = buildCoverageQuery({ table: t('sessions'), now: NOW })
+    expect(epoch.sql).not.toMatch(/regexp_matches/)
   })
 
-  it('MIN 查询（只给 --until 时解析缺省下界）：不带 WHERE，epoch-ms 加 TRY_CAST', () => {
+  it('MIN 查询（只给 --until 时解析缺省下界）：epoch-ms 加 TRY_CAST；ISO 列带形态谓词', () => {
     expect(buildMinQuery(t('sessions')).sql)
       .toBe('SELECT MIN(TRY_CAST("startTime" AS BIGINT)) AS mn FROM "sessions"')
+    // 空串在字典序上小于一切 ISO —— 不带形态谓词时 MIN 会返回它，
+    // 命令层据此判「该列无可用值」而丢掉缺省下界（CodeRabbit 终审 minor）。
     expect(buildMinQuery(t('daily_overview')).sql)
-      .toBe('SELECT MIN("stat_date") AS mn FROM "daily_overview"')
+      .toMatch(/^SELECT MIN\("stat_date"\) AS mn FROM "daily_overview" WHERE regexp_matches\("stat_date", '\^\[0-9\]\{4\}/)
   })
 
   it('无 timeColumn 的表不能构造时间查询（纯函数层直接拒绝，不生成半截 SQL）', () => {

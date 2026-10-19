@@ -547,11 +547,13 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
   } catch (e) {
     // --table 通道的 SQL 是代码生成的：撞上库漂移时把原因说对（PR 前契约审查 Minor），
     // 否则 Agent 会按「请检查 SQL 语法」去改它没写过的东西。
+    // `flags.noMask` 一路传到出口：转换错误会回显表里的真实值（CodeRabbit 终审 major），
+    // 只有显式 --no-mask 才允许原样输出。
     if (tableDef !== undefined) {
       const drift = driftFailureFor(tableDef, e)
-      if (drift !== null) return emitQueryFailure(drift)
+      if (drift !== null) return emitQueryFailure(drift, flags.noMask)
     }
-    return thrownToQueryExit(e, TABLES)
+    return thrownToQueryExit(e, TABLES, flags.noMask)
   } finally {
     await session.close()
   }

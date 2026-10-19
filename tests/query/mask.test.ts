@@ -403,7 +403,32 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     expect(phoneJoin.warnings).toEqual([])
   })
 
-  it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5、词边界、精确大小写）', () => {
+  it('敏感列被 cast 成非字符串时整值替换（CodeRabbit 复审）', () => {
+    // `SELECT userPhone::DOUBLE AS userPhone` 返回数字 13800138000 —— 列名命中敏感名，
+    // 但 maskValue 对非字符串原样返回 → 数字形态的手机号照样漏出（PII 不因类型而消失）。
+    for (const [sql, value] of [
+      ['SELECT userPhone::DOUBLE AS userPhone FROM sessions', 13800138000],
+      ['SELECT CAST(userPhone AS BIGINT) AS userPhone FROM sessions', 13800138000],
+      ['SELECT true AS userPhone FROM sessions', true],
+    ] as const) {
+      const out = maskQueryRows({
+        rows: [{ userPhone: value }], columns: ['userPhone'], mode: sqlMode(sql),
+      })
+      expect(out.rows[0].userPhone, sql).toBe(FULL)
+      expect(out.maskedColumns, sql).toContain('userPhone')
+    }
+
+    // 反证：null / undefined / 空串照旧原样（不是 PII，也不该被替换成标记）
+    const nullish = maskQueryRows({
+      rows: [{ userPhone: null }, { userPhone: '' }], columns: ['userPhone'],
+      mode: sqlMode('SELECT userPhone FROM sessions'),
+    })
+    expect(nullish.rows[0].userPhone).toBeNull()
+    expect(nullish.rows[1].userPhone).toBe('')
+    expect(nullish.maskedColumns).toEqual([])
+  })
+
+  it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5、词边界、SQL 侧大小写不敏感）', () => {
     const one = maskQueryRows({
       rows: [{ p: '13800138000' }], columns: ['p'],
       mode: sqlMode('SELECT userPhone AS p FROM sessions'),
@@ -436,14 +461,26 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     })
     expect(longer.warnings).toEqual([])
 
-    // 精确大小写（探针 12：输出列名 = 表定义大小写）：staff.username ≠ sessions.userName
+    // 大小写不敏感（CodeRabbit 终审 major）：DuckDB 标识符不分大小写 ——
+    // `SELECT username AS n FROM sessions` 读的就是 sessions.userName，而输出列名是 n，
+    // 列名级够不着、值级检测不出姓名 → 大小写敏感时**零警告静默漏出**。
+    // 代价是 staff.username（非敏感列）也吃一条警告 —— spec §十五.4 明确要求
+    // 「误报方向必须多警告而非少警告」，这个方向是对的。
+    const lowerAlias = maskQueryRows({
+      rows: [{ n: '张三' }], columns: ['n'],
+      mode: sqlMode('SELECT username AS n FROM sessions'),
+    })
+    expect(lowerAlias.warnings.join('\n')).toContain('userName')
+
+    // 值本身仍不被改写（列名级只认输出列名，staff.username 不是敏感列）；重声明的方向是
+    // 「多一条警告」，不是「整列误杀」。
     const staff = maskQueryRows({
       rows: [{ username: 'agent01' }], columns: ['username'],
       mode: sqlMode('SELECT username FROM staff'),
     })
     expect(staff.rows[0].username).toBe('agent01')
     expect(staff.maskedColumns).toEqual([])
-    expect(staff.warnings).toEqual([])
+    expect(staff.warnings.join('\n')).toContain('userName')   // 误报方向安全
   })
 })
 

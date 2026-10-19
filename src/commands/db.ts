@@ -149,9 +149,19 @@ async function timeRangeOf(
   // ⚠️ 用 `regexp_matches`，**不要**用 `~` 运算符：实测（DuckDB 1.5.6-r.1）`~` 对
   // `'2026-10-13T…' ~ '^2026'` 也返回 false —— 它不是正则匹配，会把所有行都滤掉。
   const shape = shapeSqlOf(tc.kind, col)
+  // ⚠️ iso-instant 必须按**解析后的时刻**取极值，不能按原始字符串（CodeRabbit 终审 minor）：
+  // 形态判据接受 `+08:00` / `+0800` 等偏移写法，而 VARCHAR 字典序只在「全部同一 UTC Z
+  // 形态」时才与时间序一致 —— 实测 `'2026-09-16T09:00:00+08:00'`（01:00Z）在字典序上
+  // 大于 `'2026-09-16T05:00:00Z'`（05:00Z），但时刻更早，`time_range.max` 会报错的那一端。
+  // `arg_min/arg_max(col, 时刻)` 按时刻排序、返回原始字符串（`msToShanghaiIso` 能解析
+  // 带偏移的形态，实测四种写法都对）。iso-day 全是同一个 `…T16:00:00.000Z` 形态，
+  // 字典序即时间序，保持 MIN/MAX（避免把日期列塞进 TIMESTAMPTZ 引入时区解释）。
   const agg = tc.kind === 'epoch-ms'
     ? `MIN(TRY_CAST(${col} AS BIGINT)) AS mn, MAX(TRY_CAST(${col} AS BIGINT)) AS mx`
-    : `MIN(${col}) AS mn, MAX(${col}) AS mx`
+    : tc.kind === 'iso-day'
+      ? `MIN(${col}) AS mn, MAX(${col}) AS mx`
+      : `arg_min(${col}, TRY_CAST(${col} AS TIMESTAMPTZ)) AS mn, `
+        + `arg_max(${col}, TRY_CAST(${col} AS TIMESTAMPTZ)) AS mx`
   const where = shape === null ? '' : ` WHERE ${shape}`
   const r = await session.run(`SELECT ${agg} FROM "${t.name}"${where}`)
   const row = r.rows[0] ?? {}

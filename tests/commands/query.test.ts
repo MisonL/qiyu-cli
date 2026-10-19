@@ -741,6 +741,31 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(warnings.some((w) => /0 行/.test(w))).toBe(true)
   })
 
+  it('空串/脏值不进 data_coverage 与缺省下界（CodeRabbit 终审 minor）', async () => {
+    await seed()
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      // 空串在字典序上小于一切 ISO：`MIN` 会返回它 → 命令层判「该列无可用值」而丢掉
+      // 缺省下界，尽管表里有合法行（这正是只有 --until 的路径）。
+      await s.query("INSERT INTO \"daily_overview\" VALUES ('', '{}', NULL)")
+      // 'not-a-date' 在字典序上大于 '2…'：`MAX` 会返回它 → data_coverage.max 输出非时间。
+      await s.query("INSERT INTO \"daily_overview\" VALUES ('not-a-date', '{}', NULL)")
+    } finally { await s.close() }
+
+    expect(await qAt('--table', 'daily_overview', '--until', '2026-10-20')).toBe(0)
+    // 缺省下界仍解析出合法值（空串被形态谓词排除）
+    expect(meta().resolved_range).toEqual([
+      '2026-10-14T00:00:00+08:00', '2026-10-20T00:00:00+08:00',
+    ])
+    // 覆盖范围只由合法行决定（'not-a-date' 被排除）
+    expect(meta().data_coverage).toEqual({
+      min: '2026-10-14T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00',
+    })
+    // 两条脏行不产生「无法解析缺省下界」的误判
+    expect((meta().warnings as string[]).some((w) => /无可用值/.test(w))).toBe(false)
+  })
+
   it('0 行 + 时间过滤 → warning 说明实际区间（与 --sql 通道同源文案）', async () => {
     await seed()
     expect(await qAt('--table', 'daily_overview',

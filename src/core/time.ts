@@ -113,8 +113,14 @@ export function parseTimeArg(arg: string, clock: () => number,
   // ⚠️ 无时区后缀的 ISO 必须显式按 Asia/Shanghai 解释（edge F5）：`Date.parse` 对
   // 无偏移量的 ISO 使用**进程时区**，在 CI（常为 UTC）上同一输入会偏 8 小时，
   // 而本 CLI 的全部时间语义是 Asia/Shanghai（spec §三），且偏了没有任何警告。
+  //
+  // ⚠️ 且只接受**两种 ISO 形态**（CodeRabbit 终审 minor）：`Date.parse` 的遗留解析器
+  // 还接受 `2026/09/15`、`Sep 15 2026` 这类非 ISO 写法，并按进程时区解释 ——
+  // 同一个 F5 缺陷的另一扇门。契约（README / --help）只承诺 ISO 8601，故其余一律拒绝。
   const tzless = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(arg)
-  const full = Date.parse(tzless ? `${arg.replace(' ', 'T')}+08:00` : arg)
+  const zoned = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i.test(arg)
+  if (!tzless && !zoned) return null
+  const full = Date.parse(tzless ? `${arg.replace(' ', 'T')}+08:00` : arg.replace(' ', 'T'))
   if (!Number.isNaN(full)) return full
   return null   // 解析失败 → 调用方 usage
 }
