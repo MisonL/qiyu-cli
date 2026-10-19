@@ -192,8 +192,11 @@ async function dirtyTimeValues(
   if (tc === undefined) return 0
   const col = `"${tc.name}"`
   const shape = shapeSqlOf(tc.kind, col)
-  // 脏值 = 非空且不满足全部形态条件（`NOT (a AND b)` 覆盖任一条件失败）。
-  const bad = `NOT (${shape.join(' AND ')})`
+  // 脏值 = 非空且不满足全部形态条件。
+  // ⚠️ 必须 COALESCE（CodeRabbit 复审 minor，实测）：epoch-ms 的非数字值让 `TRY_CAST`
+  // 为 NULL，`NOT (NULL AND NULL)` 仍是 NULL → WHERE 把该行静默丢掉，脏值计数为 0、
+  // 警告也不出现。COALESCE(…, false) 把「无法判定」归为「不符合」。
+  const bad = `NOT COALESCE((${shape.join(' AND ')}), false)`
   const r = await session.run(
     `SELECT COUNT(*) AS n FROM "${t.name}" WHERE ${col} IS NOT NULL AND ${bad}`)
   return Number((r.rows[0] ?? {}).n)

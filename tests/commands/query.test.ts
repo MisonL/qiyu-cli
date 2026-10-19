@@ -14,7 +14,9 @@ import type { Store } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/db.test.ts 同款放宽）；
 // 超时用例要等 conn.interrupt 生效（实测约 300ms），一并放宽。
-vi.setConfig({ testTimeout: 15_000 })
+// DuckDB 冷启动在慢机上实测可达 10s+（首条用例尤其明显），15s 会偶发假失败；
+// 与 tests/store/duckdb.test.ts 同款放宽到 30s。真正的挂起由单条用例自己的超时兜底。
+vi.setConfig({ testTimeout: 30_000 })
 
 let dir = ''
 let out = ''
@@ -364,7 +366,8 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(rowsOf()).toHaveLength(1)
     // SUM(BIGINT) 是 HUGEINT，经 getRowObjectsJson 是**字符串**（spec §5.3）：原样断言，不转 Number
     expect(String(rowsOf()[0].s)).toBe('1999999999000000000')
-  })
+    // ⚠️ 本用例含一条确定性 >1s 的查询 + 两次子进程锁验证，15s 全局超时在慢 CI 上不够。
+  }, 40_000)
 
   it('命令形态：--help 不吞额外参数 / --pretty 显式拒绝 / 未知参数 / 值位守卫', async () => {
     // --help → stdout 用法、退出码 0，两条通道都在

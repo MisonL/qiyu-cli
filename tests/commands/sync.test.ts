@@ -99,6 +99,13 @@ describe('sync 用法', () => {
     expect(await syncCommand(['run', '--help', '--bogus'])).toBe(2)
     expect(err).toContain('--bogus')
     expect(err).toContain('--help 不接受额外参数')
+    // ⚠️ 不得把已知 flag 说成「未知」（CodeRabbit 复审）：`--since` 是合法参数，
+    // 只是不能与 --help 同用。
+    out = ''; err = ''
+    expect(await syncCommand(['run', '--help', '--since', '7d'])).toBe(2)
+    expect(err).toContain('--help 不接受额外参数')
+    expect(err).not.toContain('未知参数')
+    expect(err).not.toContain('可用：--full')
 
     out = ''; err = ''
     expect(await syncCommand(['run', '--pretty', '--help'])).toBe(0)

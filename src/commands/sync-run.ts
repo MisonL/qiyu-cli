@@ -200,9 +200,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
   if (argv.includes('--help') || argv.includes('-h')) {
     const extra = argv.filter((a) => !KNOWN.has(a))
     if (extra.length > 0) {
-      return usageFail(
-        `未知参数：${describeArgs(extra)}。--help 不接受额外参数`
-        + '（可用：--full --since --until --quiet --db --profile --backend）')
+      // ⚠️ 不要写「未知参数」：`--since`/`--db` 是**已知**参数，只是不能与 --help 同用。
+      // 与 query.ts 的 help 分流同款措辞（CodeRabbit 复审 minor）。
+      return usageFail(`--help 不接受额外参数：${describeArgs(extra)}`)
     }
     process.stdout.write(SYNC_RUN_USAGE)
     return 0

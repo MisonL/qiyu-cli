@@ -264,6 +264,24 @@ describe('db tables', () => {
       .toMatch(/时间列 stat_date 有 2 个值不符合约定形态/)
   })
 
+  it('epoch-ms 列的非数字值是脏值，必须计数并警告（CodeRabbit 复审：SQL 三值逻辑回归）', async () => {
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      // ⚠️ 非数字值让 TRY_CAST 为 NULL，`NOT (NULL AND NULL)` 仍是 NULL，
+      // WHERE 会把该行静默丢掉 → 脏值计数为 0、警告不出现、time_range 却仍正常。
+      // 必须 COALESCE(…, false)。同时验证 -1 哨兵（数值但不在合理区间）也算脏。
+      await s.query("INSERT INTO \"sessions\" (\"session_id\", \"startTime\") VALUES ('bad', 'not-a-number')")
+      await s.query("INSERT INTO \"sessions\" (\"session_id\", \"startTime\") VALUES ('sentinel', '-1')")
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['describe', 'sessions', '--db', dbPath()])).toBe(0)
+    expect((meta().warnings as string[]).join('\n'))
+      .toMatch(/时间列 startTime 有 2 个值不符合约定形态/)
+  })
+
   it('db describe 的时间范围同样排除脏值并逐列警告（正确性 P1）', async () => {
     await seed()
     const s = await createDuckDbStore(

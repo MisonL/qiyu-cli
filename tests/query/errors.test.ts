@@ -503,6 +503,13 @@ describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码
         + 'Input: "{"userName":"张三","x":"', '张三'],
       ['Conversion Error: Casting value "13800138000" to type INT32 failed: '
         + 'value is out of range!', '13800138000'],
+      // ⚠️ 值内部含未转义的引号（payload 是 JSON）：DuckDB 原样回显，不转义内层引号。
+      // 按「引号到下一个引号」匹配只会吃掉 `"{"`，剩余 userName/张三 全部泄漏。
+      ['Conversion Error: Could not convert string "{"userName":"张三","x":1}" '
+        + 'to DECIMAL(5,2) when casting from source column payload', '张三'],
+      // strptime 还会在下一行把原值再打印一遍，后面跟 `^` 指示符
+      ['Invalid Input Error: Could not parse string "{"userName":"张三"}" according to '
+        + 'format specifier "%Y"\n{"userName":"张三"}\n^\nError: Expected a number', '张三'],
     ]
     for (const [message, secret] of cases) {
       out = ''; err = ''

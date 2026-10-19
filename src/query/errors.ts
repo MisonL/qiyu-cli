@@ -363,13 +363,23 @@ export function emitQueryFailure(f: QueryFailure, noMask = false): number {
   //   · `Malformed JSON … Input: "<payload 原文片段>"`（payload 是 PII 完整副本，实测）
   //   · `Failed to cast value: …` / `Failed to cast value to decimal: …`
   // 只替换**值**的位置，保留错误类别与列名等可读信息（usage 错误里的引号标识符不受影响）。
+  // ⚠️ **值内部可能含未转义的引号**（CodeRabbit 复审 Major，2026-10-20 实测）：
+  // payload 是 JSON，DuckDB 回显时**不转义**内层引号——
+  //   `Could not convert string "{"userName":"张三","x":1}" to DECIMAL(5,2)`
+  // 若按「引号到下一个引号」匹配，只会吃掉 `"{"`，剩余 `userName":"张三"...` 原样留在
+  // 消息里（strptime 更会在下一行再回显一遍原值）。故必须**锚定固定后缀**、贪婪匹配：
+  //   · `… string <quote>…<quote> to …` / `… according to …`
+  //   · `Casting value "…" to type …`
   const redactValueEcho = (s: string): string => s
-    .replace(/(Could not (?:convert|parse) string )(?:'(?:[^']|'')*'|"(?:[^"]|"")*")/gi,
+    .replace(/(Could not (?:convert|parse) string )(['"])[\s\S]*\2(?=\s+(?:to|according)\b)/gi,
       "$1'<已脱敏>'")
-    .replace(/(Casting value )"(?:[^"]|"")*"/gi, "$1'<已脱敏>'")
+    .replace(/(Casting value )"[\s\S]*"(?=\s+to type\b)/gi, "$1'<已脱敏>'")
     // `Input: "…"` 之后整段都是原始输入（可能跨行）—— 到消息结尾全裁掉。
     .replace(/(Malformed JSON[\s\S]*?\bInput: )"[\s\S]*$/i, "$1'<已脱敏>'")
     .replace(/(Failed to cast value(?: to (?:decimal|numerical))?: )[\s\S]*$/i, "$1'<已脱敏>'")
+    // strptime 的第二处回显：`… according to format specifier "%Y"\n<原值>\n^`
+    // —— 头部已脱敏，但下一行会把原值再打印一遍（实测，payload 场景同样中招）。
+    .replace(/(according to format specifier "[^"]*"\n)[\s\S]*?\n(?=\^)/i, '$1<已脱敏>\n')
   const clean = (s: string): string => {
     const withoutSql = stripSqlEcho(s)
     return sanitizeMessage(noMask ? withoutSql : redactValueEcho(withoutSql))
