@@ -9,6 +9,7 @@ import { loadValidationOverrides } from '../core/registry/validation-overrides.j
 import { loadParams } from '../core/registry/params.js'
 import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/validate.js'
 import { ok, fail, usageFail, describeArgs, EXIT } from '../output.js'
+import { sanitizeMessage } from '../core/sanitize.js'
 
 const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 
@@ -622,7 +623,11 @@ function mapThrownToExit(e: unknown): number {
     })
   }
   // 用法错误双通道：fail() 出 stdout JSON，同时手工补 stderr 一条（与 usageFail 的可见性一致）
-  const message = e instanceof Error ? e.message : String(e)
+  // ⚠️ 必须在出口净化（架构审查 F3）：`api call <ESC 序列>` 曾把原始 ANSI/OSC 写进 stderr，
+  // 而 db/query 走 `usageFail` 的同款输入会变成 `·`。与 output.ts 的「净化在出口做一次」
+  // 是同一约定 —— 这是第三个手写出口，同样不能漏。
+  const raw = e instanceof Error ? e.message : String(e)
+  const message = sanitizeMessage(raw)
   process.stderr.write(message.endsWith('\n') ? message : message + '\n')
   return fail({ code: 'usage', kind: 'usage', retryable: false, message: message.replace(/\n+$/, ''), hint: err.hint })
 }

@@ -67,6 +67,14 @@ describe('分层约束（架构不变量）', () => {
       }
     }
   })
+  // spec design.md:100 明列：query/ 不得依赖 `store/duckdb.ts` 的 Store 实现（测试审查 F10）。
+  it('query/ 不得 import store/duckdb（驱动实现）', () => {
+    for (const f of walk(join(src, 'query'))) {
+      for (const m of importSpecifiers(f)) {
+        expect(m, `${f} → ${m}`).not.toMatch(/store\/duckdb/)
+      }
+    }
+  })
   it('store/ 不得 import query/', () => {
     for (const f of walk(join(src, 'store'))) {
       for (const m of importSpecifiers(f)) {
@@ -81,7 +89,11 @@ describe('分层约束（架构不变量）', () => {
     for (const f of ['auth.ts', 'api.ts'].map((n) => join(src, 'commands', n))) {
       const text = readFileSync(f, 'utf8')
       expect(text, `${f} 含 @duckdb 字面量`).not.toMatch(/@duckdb/)
-      expect(text, `${f} import store`).not.toMatch(/from\s+['"][^'"]*\/store\//)
+      // ⚠️ 必须同时覆盖三种写法（测试审查 F8）：静态 `from '…'`、动态 `import('…')`、
+      // 裸副作用 `import '…'`。只匹配 `from` 时，加一行 `await import('../store/index.js')`
+      // 就能静默穿透「auth/api 零加载」红线。
+      expect(text, `${f} import store`).not.toMatch(
+        /(?:from\s*|import\s*\(\s*|import\s+)['"][^'"]*\/store\//)
     }
   })
 })

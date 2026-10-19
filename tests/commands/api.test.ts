@@ -508,6 +508,18 @@ describe('api list', () => {
     expect(err, 'call 的空白接口 id（走 byId 的手写渲染副本）').toContain("未知接口：' '")
   })
 
+  it('终端控制字符在 stderr 出口被净化，不得注入 ANSI/OSC（架构审查 F3）', async () => {
+    // 实测：`api call $'\x1b]0;pwned\x07'` 曾把原始 ESC/BEL 写进 stderr，
+    // 而 `db tables` 同样的输入经 usageFail 会变成 `·`。mapThrownToExit 是第三个
+    // 手写用法出口，同样必须在出口净化。
+    const evil = '\u001b]0;pwned\u0007'
+    expect(await apiCommand(['call', evil])).toBe(2)
+    expect(err).not.toContain('\u001b')
+    expect(err).not.toContain('\u0007')
+    expect(err).toContain('·')
+    expect(JSON.parse(out).error.message).not.toContain('\u001b')
+  })
+
   it('`api list -h` 走 help（stdout + 退出码 0），不报"未知参数"', async () => {
     // ⚠️ 全局约束把 `--help`/`-h` 定为「stdout 只输出 JSON」的**唯一例外**：
     // 出人类可读用法、退出码 0。顶层 `apiCommand`、`callOne`、任务 10 的

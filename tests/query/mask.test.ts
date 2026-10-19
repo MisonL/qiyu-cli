@@ -507,3 +507,60 @@ describe('--no-mask', () => {
     expect(sqlOut.warnings).toEqual([NO_MASK_WARNING])
   })
 })
+
+describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景审查 7.2/7.3）', () => {
+  it('GROUP BY 敏感列 → 警告「不同原值会映射成同一个脱敏值」（否则 Agent 会把 3 个号码读成 1 个）', () => {
+    const out = maskQueryRows({
+      rows: [
+        { userPhone: '13800001111', n: 1 },
+        { userPhone: '13899991111', n: 1 },
+        { userPhone: '13812341111', n: 1 },
+      ],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone, COUNT(*) AS n FROM sessions GROUP BY userPhone',
+        tables: TABLES,
+      },
+    })
+    // 三条不同号码被压成同一个占位符 —— 这是规则本身，无法避免，必须警告
+    expect(new Set(out.rows.map((r) => r.userPhone)).size).toBe(1)
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    expect(out.warnings.join('\n')).toContain('分组结果与计数可能失真')
+  })
+
+  it('值级兜底命中非敏感列 → 警告「可能是业务数字被误改」（11 位订单号）', () => {
+    const out = maskQueryRows({
+      rows: [{ order_id: '13800138000' }],
+      columns: ['order_id'],
+      mode: { kind: 'sql', sql: 'SELECT order_id FROM order_performance', tables: TABLES },
+    })
+    expect(out.rows[0].order_id).toBe('138****8000')   // 规则不放宽（放宽就漏 PII）
+    expect(out.warnings.join('\n')).toContain('不在敏感列清单里')
+    expect(out.warnings.join('\n')).toContain('业务数字')
+  })
+
+  it('反证：SQL 引用敏感列时不再报「非敏感列误伤」（别名场景已有缺口警告）', () => {
+    const out = maskQueryRows({
+      rows: [{ p: '13800138000' }],
+      columns: ['p'],
+      mode: { kind: 'sql', sql: 'SELECT userPhone AS p FROM sessions', tables: TABLES },
+    })
+    expect(out.warnings.join('\n')).toContain('脱敏可能不完整')
+    expect(out.warnings.join('\n')).not.toContain('不在敏感列清单里')
+  })
+
+  it('--no-mask 时漂移列的警告仍保留（形态问题与脱敏开关无关，契约审查 C-06）', () => {
+    const sessions = tableByName('sessions')!
+    const out = maskQueryRows({
+      rows: [{ session_id: 's1', extra_col: 'x' }],
+      columns: ['session_id', 'extra_col'],
+      mode: { kind: 'table', table: sessions },
+      noMask: true,
+    })
+    expect(out.rows[0].extra_col).toBe('x')          // 确实没脱敏
+    expect(out.warnings[0]).toBe(NO_MASK_WARNING)
+    expect(out.warnings.join('\n')).toContain('extra_col')
+    expect(out.warnings.join('\n')).toContain('表定义之外的列')
+  })
+})

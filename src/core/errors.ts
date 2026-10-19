@@ -26,6 +26,12 @@ export type ErrorKind =
   // 查询层（E）：只读查询超时（conn.interrupt 生效）—— 退出码 1；
   // `output.ts` 的 `exitCodeFor` 不设分支，落 default（EXIT.BUSINESS）
   | 'query_timeout'
+  // 同步层（D）：sync status/verify 尚无成功 run 的证据 —— 退出码 1。
+  // 此前只在 `sync.ts` 里以字符串字面量出现、不在本联合里，按 kind 分支的 Agent
+  // 会收到一个未在任何类型/文档中出现的值（契约审查 C-03）。
+  | 'sync_not_run'
+  // ⚠️ `sandbox_blocked` / `query_error` 是 **code** 不是 kind：查询层的这两类失败
+  // 都归 `kind: 'usage'`（退出码 2），见 `src/query/errors.ts` 的分类表。
 
 export interface QiyuError {
   code: string

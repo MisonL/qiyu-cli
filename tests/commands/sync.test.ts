@@ -91,6 +91,28 @@ describe('sync 用法', () => {
     expect(JSON.parse(out).error.message).toMatch(/未知子命令/)
   })
 
+  it('sync run 的 --help 不吞额外参数，且与 --pretty 的书写顺序无关（架构审查 F2）', async () => {
+    // 全仓不变量：--help 永远成功、但不得把写错的参数静默吃掉。
+    // 早先这一分支写在解析循环里：`--help --bogus` 退出码 0（--bogus 被吞）、
+    // `--pretty --help` 却退出码 2 —— 同一组 token 因顺序得到两种结果。
+    out = ''; err = ''
+    expect(await syncCommand(['run', '--help', '--bogus'])).toBe(2)
+    expect(err).toContain('--bogus')
+    expect(err).toContain('--help 不接受额外参数')
+
+    out = ''; err = ''
+    expect(await syncCommand(['run', '--pretty', '--help'])).toBe(0)
+    expect(out).toMatch(/用法：qiyu sync run/)
+
+    out = ''; err = ''
+    expect(await syncCommand(['run', '--help', '--pretty'])).toBe(0)
+    expect(out).toMatch(/用法：qiyu sync run/)
+
+    // 纯 help 仍然成功
+    out = ''; err = ''
+    expect(await syncCommand(['run', '--help'])).toBe(0)
+  })
+
   it('无子命令输出用法、退出码 0（store.ts 同族惯例：无参数是请求帮助不是错误）', async () => {
     expect(await syncCommand([])).toBe(0)
     expect(out).toMatch(/用法：qiyu sync/)
@@ -370,7 +392,7 @@ describe('sync run —— 区间参数（--full/--since/--until）', () => {
 })
 
 describe('sync run —— store 与凭证前置检查', () => {
-  it('store 不可用（路径是普通文件）→ 1 + store_not_initialized + hint 指 qiyu store init', async () => {
+  it('store 不可用（路径是普通文件）→ 1 + store_not_initialized，hint 保留底层成因（架构审查 F1）', async () => {
     // DuckDB 对不存在的路径会直接建库（init 幂等），sync run 不会报「未初始化」；
     // 「无法打开」的真实形态是路径存在但不是 DuckDB 文件（store.test.ts 同款注入）。
     const p = join(dir, 'notdb.bin')
@@ -379,7 +401,11 @@ describe('sync run —— store 与凭证前置检查', () => {
     expect(code).toBe(1)
     const e = JSON.parse(out).error
     expect(e.kind).toBe('store_not_initialized')
-    expect(e.hint).toMatch(/store init/)
+    // ⚠️ 不得把 hint 一律改成「请先运行 store init」（架构审查 F1）：这条路对
+    // 「路径不是 DuckDB 文件」必然再次失败，Agent 会进 store init → sync run 死循环。
+    // 底层 hint（换 --db 路径）必须原样保留。
+    expect(e.hint).toMatch(/换 --db 路径|不是 DuckDB/)
+    expect(e.hint).not.toMatch(/请先运行/)
   })
 
   it('缺凭证 → 1 + auth_missing（环境问题不是用法错误，api.ts 同族）', async () => {

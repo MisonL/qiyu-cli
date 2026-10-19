@@ -30,7 +30,10 @@ describe('buildTableQuery · 时间列三形态（契约 A）', () => {
       '2026-09-14T16:00:00.000Z',   // 上海 9/15 00:00
       '2026-09-19T16:00:00.000Z',   // 上海 9/20 00:00 —— stat_date 存日零点，故含 9/20 全天
     ])
-    expect(plan.sql).toContain('WHERE "stat_date" >= ? AND "stat_date" <= ?')
+    // ⚠️ 按**时刻**比较（正确性审查 F1）：iso-day 列里 `…T16:00:00Z`（无毫秒）在字典序上
+    // 大于同刻的 `…T16:00:00.000Z`，字符串比较会把当天漏掉。
+    expect(plan.sql).toContain('TRY_CAST("stat_date" AS TIMESTAMPTZ) >= TRY_CAST(? AS TIMESTAMPTZ)')
+    expect(plan.sql).toContain('TRY_CAST("stat_date" AS TIMESTAMPTZ) <= TRY_CAST(? AS TIMESTAMPTZ)')
     // resolved_range 回显**实际生效**的区间（契约 C）：两端都是日零点
     expect(plan.resolvedRange).toEqual([
       Date.parse('2026-09-15T00:00:00+08:00'),
@@ -38,7 +41,7 @@ describe('buildTableQuery · 时间列三形态（契约 A）', () => {
     ])
   })
 
-  it('iso-instant：两端都用 toISOString，直接字符串比较（不加 TRY_CAST）', () => {
+  it('iso-instant：两端都用 toISOString，按解析后的时刻比较（正确性审查 F2）', () => {
     const plan = buildTableQuery({
       table: t('staff_attendance'),
       since: Date.parse('2026-09-15T01:00:00Z'),
@@ -46,8 +49,9 @@ describe('buildTableQuery · 时间列三形态（契约 A）', () => {
       now: NOW,
     })
     expect(plan.params).toEqual(['2026-09-15T01:00:00.000Z', '2026-09-15T05:30:00.000Z'])
-    expect(plan.sql).toContain('"hour_ts" >= ? AND "hour_ts" <= ?')
-    expect(plan.sql).not.toContain('TRY_CAST')
+    // 混合偏移写法（+08:00 / Z）的字典序与时间序相反 —— 必须 cast 成 TIMESTAMPTZ 比较。
+    expect(plan.sql).toContain('TRY_CAST("hour_ts" AS TIMESTAMPTZ) >= TRY_CAST(? AS TIMESTAMPTZ)')
+    expect(plan.sql).toContain('TRY_CAST("hour_ts" AS TIMESTAMPTZ) <= TRY_CAST(? AS TIMESTAMPTZ)')
     expect(plan.resolvedRange).toEqual([
       Date.parse('2026-09-15T01:00:00Z'), Date.parse('2026-09-15T05:30:00Z'),
     ])
@@ -87,8 +91,8 @@ describe('buildTableQuery · 缺省端与 resolved_range（契约 B/C）', () =>
     // iso-day：上界取 until 所在上海日的日零点
     const until = Date.parse('2026-10-10T00:00:00+08:00')
     const plan = buildTableQuery({ table: t('robot_summary'), until, tableMin: null, now: NOW })
-    expect(plan.sql).not.toContain('>=')
-    expect(plan.sql).toContain('"stat_date" <= ?')
+    expect(plan.sql).not.toContain('TRY_CAST("stat_date" AS TIMESTAMPTZ) >=')
+    expect(plan.sql).toContain('TRY_CAST("stat_date" AS TIMESTAMPTZ) <= TRY_CAST(? AS TIMESTAMPTZ)')
     expect(plan.params).toEqual(['2026-10-09T16:00:00.000Z'])
     expect(plan.resolvedRange).toBeNull()
     expect(plan.warnings).toHaveLength(1)
@@ -128,8 +132,8 @@ describe('buildTableQuery · 缺省端与 resolved_range（契约 B/C）', () =>
     })
     const dayIso = '2026-09-14T16:00:00.000Z'   // 上海 9/15 零点
     expect(plan.params).toEqual([dayIso, dayIso])
-    expect(plan.sql).toContain('"stat_date" >= ?')
-    expect(plan.sql).toContain('"stat_date" <= ?')
+    expect(plan.sql).toContain('TRY_CAST("stat_date" AS TIMESTAMPTZ) >= TRY_CAST(? AS TIMESTAMPTZ)')
+    expect(plan.sql).toContain('TRY_CAST("stat_date" AS TIMESTAMPTZ) <= TRY_CAST(? AS TIMESTAMPTZ)')
     expect(plan.resolvedRange).toEqual([
       Date.parse('2026-09-15T00:00:00+08:00'), Date.parse('2026-09-15T00:00:00+08:00')])
   })
@@ -194,7 +198,9 @@ describe('buildTableQuery · --group-by（契约 E/F）', () => {
     })
     expect(plan.sql).toBe(
       'SELECT "session_type", COUNT(*) AS count FROM "sessions"' +
-      ' WHERE TRY_CAST("startTime" AS BIGINT) >= ? AND TRY_CAST("startTime" AS BIGINT) <= ?' +
+      ' WHERE TRY_CAST("startTime" AS BIGINT) > 100000000000' +
+      ' AND TRY_CAST("startTime" AS BIGINT) <= 8640000000000000' +
+      ' AND TRY_CAST("startTime" AS BIGINT) >= ? AND TRY_CAST("startTime" AS BIGINT) <= ?' +
       ' GROUP BY "session_type" ORDER BY count DESC, "session_type"')
     expect(plan.params).toEqual([since, NOW])
   })
@@ -207,12 +213,16 @@ describe('buildTableQuery · --group-by（契约 E/F）', () => {
       .toThrow(/session_type/)
   })
 
-  it('敏感列（userPhone / payload）→ 抛 usage，文案说明脱敏失真', () => {
+  it('敏感列（userPhone / payload）→ 抛 usage，文案说明分组不可区分', () => {
     for (const col of ['userPhone', 'payload']) {
       expect(() => buildTableQuery({ table: t('sessions'), groupBy: [col], now: NOW }), col)
         .toThrow(new RegExp(`不接受敏感列 ${col}`))
+      // 计数本身是准的（每组一个 count），失真的是「分组代表哪些原值」。
       expect(() => buildTableQuery({ table: t('sessions'), groupBy: [col], now: NOW }), col)
-        .toThrow(/分组与计数都会失真/)
+        .toThrow(/分组结果无法区分/)
+      // 可执行的替代路径必须给对：--sql 单独用仍会被列名级脱敏，必须配 --no-mask。
+      expect(() => buildTableQuery({ table: t('sessions'), groupBy: [col], now: NOW }), col)
+        .toThrow(/--no-mask/)
     }
   })
 
@@ -236,13 +246,15 @@ describe('buildTableQuery · 确定性排序（契约 E）', () => {
 
   it('时间列本身就是主键时只保留一次（daily_overview: stat_date）', () => {
     const plan = buildTableQuery({ table: t('daily_overview'), now: NOW })
-    expect(plan.sql).toBe('SELECT * FROM "daily_overview" ORDER BY "stat_date" DESC')
+    // 排序也按时刻（正确性审查 F1）：无毫秒形态 `…Z` 与 `….000Z` 的字典序与时间序相反。
+    expect(plan.sql).toBe(
+      'SELECT * FROM "daily_overview" ORDER BY TRY_CAST("stat_date" AS TIMESTAMPTZ) DESC')
   })
 
   it('复合主键：时间列不重复出现在 tiebreaker 里', () => {
     const plan = buildTableQuery({ table: t('staff_attendance'), now: NOW })
     expect(plan.sql).toBe(
-      'SELECT * FROM "staff_attendance" ORDER BY "hour_ts" DESC, "staff_id" ASC')
+      'SELECT * FROM "staff_attendance" ORDER BY TRY_CAST("hour_ts" AS TIMESTAMPTZ) DESC, "staff_id" ASC')
   })
 })
 
@@ -256,30 +268,39 @@ describe('buildCoverageQuery / buildMinQuery（契约 B/D）', () => {
     expect(cov.sql).toBe(
       'SELECT MIN(TRY_CAST("startTime" AS BIGINT)) AS mn, ' +
       'MAX(TRY_CAST("startTime" AS BIGINT)) AS mx, NULL AS days FROM "sessions"' +
-      ' WHERE TRY_CAST("startTime" AS BIGINT) >= ? AND TRY_CAST("startTime" AS BIGINT) <= ?')
+      ' WHERE TRY_CAST("startTime" AS BIGINT) > 100000000000' +
+      ' AND TRY_CAST("startTime" AS BIGINT) <= 8640000000000000' +
+      ' AND TRY_CAST("startTime" AS BIGINT) >= ? AND TRY_CAST("startTime" AS BIGINT) <= ?')
     expect(cov.params).toEqual(plan.params)
   })
 
-  it('无谓词时覆盖 = 全表 MIN/MAX；ISO 列带形态谓词（脏值不进覆盖）', () => {
+  it('无谓词时覆盖 = 全表极值；ISO 列带形态谓词（脏值不进覆盖）', () => {
     const cov = buildCoverageQuery({ table: t('daily_overview'), now: NOW })
-    // 形态谓词与 commands/db.ts 的 shapeSqlOf 逐字一致（CodeRabbit 终审 minor）。
+    // 形态谓词与 commands/db.ts 的 shapeSqlOf 逐字一致；极值按时刻取（正确性审查 F1/F3/F6）。
     expect(cov.sql).toBe(
-      'SELECT MIN("stat_date") AS mn, MAX("stat_date") AS mx, ' +
-      'COUNT(DISTINCT "stat_date") AS days FROM "daily_overview"' +
-      ` WHERE regexp_matches("stat_date", '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$')`)
+      'SELECT arg_min("stat_date", TRY_CAST("stat_date" AS TIMESTAMPTZ)) AS mn, ' +
+      'arg_max("stat_date", TRY_CAST("stat_date" AS TIMESTAMPTZ)) AS mx, ' +
+      `COUNT(DISTINCT timezone('Asia/Shanghai', TRY_CAST("stat_date" AS TIMESTAMPTZ))::DATE) AS days ` +
+      'FROM "daily_overview"' +
+      ` WHERE regexp_matches("stat_date", '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$')` +
+      ' AND TRY_CAST("stat_date" AS TIMESTAMPTZ) IS NOT NULL')
     expect(cov.params).toEqual([])
-    // epoch-ms 列没有形态谓词（TRY_CAST 已把非数字折成 NULL）
+    // epoch-ms 列的判据是数值区间（正确性审查 F5）：-1 哨兵/秒级/微秒级误写不算时间。
     const epoch = buildCoverageQuery({ table: t('sessions'), now: NOW })
     expect(epoch.sql).not.toMatch(/regexp_matches/)
+    expect(epoch.sql).toContain('TRY_CAST("startTime" AS BIGINT) > 100000000000')
   })
 
   it('MIN 查询（只给 --until 时解析缺省下界）：epoch-ms 加 TRY_CAST；ISO 列带形态谓词', () => {
     expect(buildMinQuery(t('sessions')).sql)
-      .toBe('SELECT MIN(TRY_CAST("startTime" AS BIGINT)) AS mn FROM "sessions"')
+      .toBe('SELECT MIN(TRY_CAST("startTime" AS BIGINT)) AS mn FROM "sessions"'
+        + ' WHERE TRY_CAST("startTime" AS BIGINT) > 100000000000'
+        + ' AND TRY_CAST("startTime" AS BIGINT) <= 8640000000000000')
     // 空串在字典序上小于一切 ISO —— 不带形态谓词时 MIN 会返回它，
     // 命令层据此判「该列无可用值」而丢掉缺省下界（CodeRabbit 终审 minor）。
+    // 极值按时刻取（正确性审查 F2）。
     expect(buildMinQuery(t('daily_overview')).sql)
-      .toMatch(/^SELECT MIN\("stat_date"\) AS mn FROM "daily_overview" WHERE regexp_matches\("stat_date", '\^\[0-9\]\{4\}/)
+      .toMatch(/^SELECT arg_min\("stat_date", TRY_CAST\("stat_date" AS TIMESTAMPTZ\)\) AS mn FROM "daily_overview" WHERE regexp_matches\("stat_date", '\^\[0-9\]\{4\}/)
   })
 
   it('无 timeColumn 的表不能构造时间查询（纯函数层直接拒绝，不生成半截 SQL）', () => {

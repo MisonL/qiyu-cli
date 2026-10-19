@@ -10,6 +10,12 @@
 export const SHANGHAI_OFFSET_MS = 8 * 3_600_000
 /** 一天的毫秒数。 */
 export const DAY_MS = 86_400_000
+/**
+ * ECMAScript Date 可表示的最大绝对毫秒（±8.64e15，约 ±27.5 万年）。
+ * 超出后 `toISOString()` 抛 `RangeError: Invalid time value` —— 一条微秒级脏值
+ * （`1792467000000000000`）就能让 `db tables` 整条命令 internal 失败（正确性审查 F4）。
+ */
+export const MAX_DATE_MS = 8.64e15
 
 /** 毫秒 → 所属上海自然日 00:00 的 epoch 毫秒。 */
 export function shanghaiDayStart(ms: number): number {
@@ -37,6 +43,10 @@ const SHANGHAI_DAY = new Intl.DateTimeFormat('en-CA', {
 
 /** 毫秒 → 上海时区的 ISO 回显（resolved_range/watermark 的输出形态，spec §九.3）。 */
 export function shanghaiIso(ms: number): string {
+  // ⚠️ 越界值原样回显（正确性审查 F4）：`toISOString()` 对 |ms| > 8.64e15 抛 RangeError，
+  // 而调用点可能拿到库里的脏值（微秒误写）或用户给的超大 `--since 999999999d`。
+  // 抛异常会让整条命令 internal 失败；回显原始数字至少保住「可解释」。
+  if (!Number.isFinite(ms) || Math.abs(ms) > MAX_DATE_MS) return String(ms)
   const shifted = new Date(ms + SHANGHAI_OFFSET_MS)
   // 整秒时省略毫秒段（spec 示例形态 "2026-09-14T00:00:00+08:00"）；带毫秒保留
   const iso = shifted.toISOString()
@@ -57,7 +67,9 @@ export function shanghaiIso(ms: number): string {
 export function msToShanghaiIso(v: string | number): string {
   const numeric = typeof v === 'number' ? v : Number(v)
   const n = Number.isFinite(numeric) ? numeric : Date.parse(String(v))
-  return Number.isFinite(n) && String(v).trim() !== '' ? shanghaiIso(n) : String(v)
+  // 越界值不抛 RangeError（正确性审查 F4）：库里一条微秒级脏值不应炸掉整条 db tables。
+  if (!Number.isFinite(n) || Math.abs(n) > MAX_DATE_MS) return String(v)
+  return String(v).trim() !== '' ? shanghaiIso(n) : String(v)
 }
 
 /** 上海自然日 00:00 → epoch 毫秒（YYYY-MM-DD）。 */
@@ -84,7 +96,12 @@ export function parseTimeArg(arg: string, clock: () => number,
   const dur = /^(\d+)d$/.exec(arg)
   if (dur) {
     const end = clock()
-    return { start: end - Number(dur[1]) * DAY_MS, end }
+    // ⚠️ 带相对时长的 `--since` 也要挡住溢出（正确性审查 F4）：
+    // `999999999d` 的 `end − N×DAY_MS` 远出 Date 范围，后续 `shanghaiIso` 会抛 RangeError。
+    // 与 ISO 分支同一上界，回到「未知 ≠ 猜」（usage）而不是崩到 internal。
+    const start = end - Number(dur[1]) * DAY_MS
+    if (!Number.isFinite(start) || Math.abs(start) > MAX_DATE_MS) return null
+    return { start, end }
   }
   if (arg === 'yesterday') {
     // 上海昨天 00:00 ~ 今天 00:00 的单日窗
@@ -120,7 +137,18 @@ export function parseTimeArg(arg: string, clock: () => number,
   const tzless = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(arg)
   const zoned = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i.test(arg)
   if (!tzless && !zoned) return null
+  // ⚠️ 带时刻的 ISO 同样要回验日历日（正确性审查 F7）：`Date.parse('2026-02-30T00:00:00')`
+  // 静默进位成 3/2，退出码 0 —— 与纯日期分支已修的那类缺陷是同一扇门的另一半。
+  // 回验的是**日期字段**（年/月/日）；时刻字段（24:00、60 秒）由下面的 Number 范围校验兜。
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})/.exec(arg)
+  if (ymd) {
+    const y = Number(ymd[1]); const m = Number(ymd[2]); const d = Number(ymd[3])
+    const probe = new Date(Date.UTC(y, m - 1, d))
+    if (probe.getUTCFullYear() !== y || probe.getUTCMonth() + 1 !== m || probe.getUTCDate() !== d) {
+      return null
+    }
+  }
   const full = Date.parse(tzless ? `${arg.replace(' ', 'T')}+08:00` : arg.replace(' ', 'T'))
-  if (!Number.isNaN(full)) return full
-  return null   // 解析失败 → 调用方 usage
+  if (Number.isNaN(full) || Math.abs(full) > MAX_DATE_MS) return null
+  return full   // 解析失败 → 调用方 usage
 }

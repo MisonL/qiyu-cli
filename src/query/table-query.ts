@@ -71,30 +71,74 @@ function quote(name: string): string {
   return `"${name}"`
 }
 
-/** 时间列的比较表达式：epoch-ms 必须先 TRY_CAST，字符串比较毫秒数会按字典序得出错误结果。 */
+/**
+ * 时间列的比较表达式。
+ *
+ * ⚠️ **一律按解析后的时刻比较，不按原始字符串**（正确性审查 F1/F2/F3，2026-10-20 实测）：
+ *   · iso-day 无毫秒形态 `'…T16:00:00Z'` 在字典序上**大于** `'…T16:00:00.000Z'`，
+ *     `<= 上界` 会把它漏掉 → `db describe` 说有数据、`query` 说 0 行；
+ *   · iso-instant 的 `+08:00` 写法与 `Z` 写法字典序与时间序相反 → 错排/错纳/错漏；
+ *   · epoch-ms 必须先 TRY_CAST，字符串比较毫秒数会按字典序得出错误结果。
+ * `TRY_CAST(... AS TIMESTAMPTZ)` 对非时间值返回 NULL（被谓词排除），与形态谓词同向。
+ */
 function timeExprOf(tc: TimeColumn): string {
-  return tc.kind === 'epoch-ms' ? `TRY_CAST(${quote(tc.name)} AS BIGINT)` : quote(tc.name)
+  return tc.kind === 'epoch-ms'
+    ? `TRY_CAST(${quote(tc.name)} AS BIGINT)`
+    : `TRY_CAST(${quote(tc.name)} AS TIMESTAMPTZ)`
 }
 
 /**
- * ISO 列的**形态谓词**（CodeRabbit 终审 minor）：脏值（`not-a-date`、空串、纯日期）
- * 不得进入 MIN/MAX —— 它们在 VARCHAR 字典序上可能赢下 MAX（`n` > `2`、`≤ \s`），
- * 于是 `data_coverage.max` 输出一个根本不是时间的字符串，或空串把 `--until` 的
- * 缺省下界判成「无可用值」。
+ * 极值聚合：**按时刻排序、返回原始字符串**（与 `commands/db.ts` 的 `timeRangeOf` 同口径）。
+ *
+ * 不能直接 `MIN(col)` —— 那按字典序选，遇到混合偏移/无毫秒形态会取错（见 `timeExprOf`）。
+ * 也不能直接 `MIN(TRY_CAST(... AS TIMESTAMPTZ))` —— 那会把返回值变成 TIMESTAMPTZ 文本
+ * （`2026-10-14 00:00:00+08`），改变 `data_coverage` 的输出形态。
+ * `arg_min(col, 时刻键)` 两者兼得：按时刻排序、返回列内原值。
+ * 键为 NULL 的行（非时间值）不参与，与形态谓词同向。
+ */
+function aggExprOf(tc: TimeColumn): { mn: string; mx: string } {
+  if (tc.kind === 'epoch-ms') {
+    return {
+      mn: `MIN(TRY_CAST(${quote(tc.name)} AS BIGINT))`,
+      mx: `MAX(TRY_CAST(${quote(tc.name)} AS BIGINT))`,
+    }
+  }
+  const col = quote(tc.name)
+  const key = `TRY_CAST(${col} AS TIMESTAMPTZ)`
+  return { mn: `arg_min(${col}, ${key})`, mx: `arg_max(${col}, ${key})` }
+}
+
+/**
+ * 时间列的**可用值谓词**（脏值不进 MIN/MAX、不进覆盖统计、不进主查询的时间过滤）。
+ *
+ * 判据 = 「形态正则命中」**且**「能解析成时刻/整数」：
+ *   · iso-day / iso-instant：`regexp_matches(...)` + `TRY_CAST(... AS TIMESTAMPTZ) IS NOT NULL`
+ *     —— 实测 `'2026-10-14T02:00Z'`（无秒）通过正则但 `TRY_CAST` 为 NULL，只按正则判会
+ *     让它在 `arg_min` 里被静默踢出 time_range（正确性审查 F3）；
+ *   · epoch-ms：`TRY_CAST(... AS BIGINT)` 落在合理区间 `(1e11, 8.64e15]`
+ *     —— `-1` 是七鱼「无值」哨兵、秒级/微秒级是单位误写，都不该被当成 1970/万年后的时刻
+ *     （正确性审查 F5）。写路径对秒级时间戳已有同口径丢弃（`reports.ts` 的 `n <= 1e11`）。
  *
  * ⚠️ 口径必须与 `commands/db.ts` 的 `shapeSqlOf` **逐字一致**（同一条 README 承诺：
  * 「脏值不进 time_range」）。两处分叉的话，同一条脏库会在 `db tables` 被排除、
  * 在 `query --table` 被当成覆盖范围 —— 同一状态两种说法。
- * ⚠️ 主查询的时间谓词不需要它：脏值本来就过不了 `<= ISO 上界`；只有**不带谓词**的
- * MIN/MAX（`data_coverage`、`buildMinQuery`）需要。
+ * ⚠️ 主查询的时间谓词也需要它（正确性审查 F8）：否则 `'2026-10-15garbage'` 会出现在
+ * rows / group-by 计数里，而 `data_coverage` 把它排除，同一响应内自相矛盾。
  */
 function shapeClause(tc: TimeColumn): string[] {
-  if (tc.kind === 'epoch-ms') return []
+  if (tc.kind === 'epoch-ms') {
+    const n = `TRY_CAST(${quote(tc.name)} AS BIGINT)`
+    return [`${n} > 100000000000`, `${n} <= 8640000000000000`]
+  }
   const shape = tc.kind === 'iso-day'
     ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
-    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2}(\\.[0-9]+)?)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
+    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
   // ⚠️ `regexp_matches`，不要用 `~`（实测 DuckDB 1.5.6-r.1 的 `~` 不是正则匹配）。
-  return [`regexp_matches(${quote(tc.name)}, '${shape}')`]
+  // 秒必须存在（`:[0-9]{2}` 不再是可选项）：`T02:00Z` 能过宽松正则却 cast 不了。
+  return [
+    `regexp_matches(${quote(tc.name)}, '${shape}')`,
+    `TRY_CAST(${quote(tc.name)} AS TIMESTAMPTZ) IS NOT NULL`,
+  ]
 }
 
 /**
@@ -103,6 +147,11 @@ function shapeClause(tc: TimeColumn): string[] {
  */
 export function effectiveBound(kind: TimeColumnKind, ms: number): number {
   return kind === 'iso-day' ? shanghaiDayStart(ms) : ms
+}
+
+/** 时间谓词的参数占位符：ISO 列必须显式 cast，否则 VARCHAR 与 TIMESTAMPTZ 的比较会退化。 */
+function boundPlaceholder(kind: TimeColumnKind): string {
+  return kind === 'epoch-ms' ? '?' : 'TRY_CAST(? AS TIMESTAMPTZ)'
 }
 
 /** 时间谓词的参数值（契约 A）：iso-day → 上海日零点 ISO；iso-instant → ISO；epoch-ms → number。 */
@@ -136,8 +185,9 @@ export function validateGroupBy(table: TableDef, groupBy: readonly string[]): st
     }
     if (sensitive.has(name)) {
       throw new TableQueryUsageError(
-        `--group-by 不接受敏感列 ${name}：脱敏会把不同取值归并成同一个分组键，` +
-        '分组与计数都会失真；请改用 --sql 并显式承担风险')
+        `--group-by 不接受敏感列 ${name}：脱敏会把不同取值归并成同一个分组键，`
+        + '分组结果无法区分（计数本身准确，但每个分组代表哪些原值不可知）。'
+        + '确需按原值分组请改用 `qiyu query --sql --no-mask`（显式承担 PII 风险）')
     }
     if (seen.has(name)) {
       throw new TableQueryUsageError(`--group-by 列重复：${name}（同一列只能给一次，不做静默去重）`)
@@ -219,12 +269,15 @@ function buildTimeFilter(input: TableQueryInput): TimeFilter {
   }
 
   const expr = timeExprOf(tc)
+  // 形态+可解析谓词与时间谓词同一 WHERE（正确性审查 F8）：否则脏值会出现在 rows 里，
+  // 而 data_coverage 把它们排除 —— 同一响应的两个字段互相矛盾。
+  if (lower !== undefined || upper !== undefined) clauses.push(...shapeClause(tc))
   if (lower !== undefined) {
-    clauses.push(`${expr} >= ?`)
+    clauses.push(`${expr} >= ${boundPlaceholder(tc.kind)}`)
     params.push(boundParam(tc.kind, lower))
   }
   if (upper !== undefined) {
-    clauses.push(`${expr} <= ?`)
+    clauses.push(`${expr} <= ${boundPlaceholder(tc.kind)}`)
     params.push(boundParam(tc.kind, upper))
   }
   return { clauses, params, resolvedRange, warnings }
@@ -285,13 +338,19 @@ export function buildCoverageQuery(input: TableQueryInput): { sql: string; param
     throw new TableQueryUsageError(`表 ${table.name} 没有时间列，无法计算 data_coverage`)
   }
   const filter = buildTimeFilter(input)
-  const expr = timeExprOf(tc)
-  // 形态谓词与时间谓词同一 WHERE（CodeRabbit 终审 minor）：脏值不进覆盖范围。
-  const clauses = [...shapeClause(tc), ...filter.clauses]
+  // 形态谓词与时间谓词同一 WHERE：buildTimeFilter 在有任一端时已并入 shapeClause；
+  // 两端都缺省时（全表覆盖统计）才需要在这里单独补上，避免重复拼接。
+  const clauses = filter.clauses.length > 0 ? [...filter.clauses] : [...shapeClause(tc)]
   const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : ''
-  const days = tc.kind === 'iso-day' ? `, COUNT(DISTINCT ${expr}) AS days` : ', NULL AS days'
+  const agg = aggExprOf(tc)
+  // ⚠️ 自然日数必须按**自然日**去重，不能 COUNT(DISTINCT 原字符串)（正确性审查 F6）：
+  // 同一上海日可能有两种写法（`…16:00:00.000Z` 与 `…16:00:00Z`），按字符串数会把
+  // 一天算成两天，恰好补齐内部缺口、让真缺口零警告。
+  const days = tc.kind === 'iso-day'
+    ? `, COUNT(DISTINCT timezone('Asia/Shanghai', ${timeExprOf(tc)})::DATE) AS days`
+    : ', NULL AS days'
   return {
-    sql: `SELECT MIN(${expr}) AS mn, MAX(${expr}) AS mx${days} FROM ${quote(table.name)}${where}`,
+    sql: `SELECT ${agg.mn} AS mn, ${agg.mx} AS mx${days} FROM ${quote(table.name)}${where}`,
     params: filter.params,
   }
 }
@@ -304,7 +363,9 @@ export function buildMinQuery(table: TableDef): { sql: string } {
   }
   // ⚠️ 必须过滤形态（CodeRabbit 终审 minor）：空串在字典序上小于一切 ISO，
   // `MIN` 会返回它 → 命令层判成「该列无可用值」而丢掉缺省下界，尽管表里有合法行。
+  // ⚠️ 极值必须按**时刻**取（正确性审查 F2）：`MIN(原始字符串)` 在混合偏移写法下会
+  // 选到字典序最小、而不是时刻最早的那一行。`aggExprOf` 用 arg_min 返回原始串。
   const shape = shapeClause(tc)
   const where = shape.length > 0 ? ` WHERE ${shape.join(' AND ')}` : ''
-  return { sql: `SELECT MIN(${timeExprOf(tc)}) AS mn FROM ${quote(table.name)}${where}` }
+  return { sql: `SELECT ${aggExprOf(tc).mn} AS mn FROM ${quote(table.name)}${where}` }
 }
