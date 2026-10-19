@@ -243,6 +243,27 @@ describe('db tables', () => {
     } finally { rmSync(clean, { recursive: true, force: true }) }
   })
 
+  it('形态判据两端锚定：尾部垃圾与纯日期也算脏值，不进 time_range（CodeRabbit 终审 minor）', async () => {
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      // '2026-10-12garbage' 在字典序上 `g` > `T`，只锚开头的旧判据会放它进 MAX；
+      // 纯日期 '2026-10-13' 会被 msToShanghaiIso 按 UTC 解析、输出偏 8 小时。
+      await s.query("INSERT INTO \"daily_overview\" VALUES ('2026-10-12garbage', '{}', NULL)")
+      await s.query("INSERT INTO \"daily_overview\" VALUES ('2026-10-13', '{}', NULL)")
+    } finally {
+      await s.close()
+    }
+    expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
+
+    const overview = (data().tables as TableOut[]).find((t) => t.name === 'daily_overview')!
+    expect(overview.time_range).toEqual(
+      { min: '2026-09-15T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00' })
+    expect((meta().warnings as string[]).join('\n'))
+      .toMatch(/时间列 stat_date 有 2 个值不符合约定形态/)
+  })
+
   it('db describe 的时间范围同样排除脏值并逐列警告（正确性 P1）', async () => {
     await seed()
     const s = await createDuckDbStore(

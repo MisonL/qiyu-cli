@@ -664,24 +664,30 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
 
   it('iso-day 窗口内部空洞 → warning 点名「应有 N 个自然日，实际 M 个」（场景 F4）', async () => {
     await seed()
-    // 库里 daily_overview 只有 10/14 一天（seed）；再补 10/12、10/13 —— 10/11~10/15
-    // 的 5 天窗口缺 10/11：MIN/MAX 的 data_coverage 看不见，rows 恰好是 3。
+    // 库里 daily_overview 有 10/13（seed）+ 10/11、10/12；NOW = 上海 10/15 12:00。
     await seedMore('daily_overview', [
+      { stat_date: '2026-10-10T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },
       { stat_date: '2026-10-11T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },
+    ])
+    // 只给 --since 10/11 → 上界缺省 = now → 取整到 10/15 0 点；但**今天（10/15）要排除**
+    // （日报任务的日对齐切片跳过当天残段窗，今天那行次日才有，CodeRabbit 终审 minor）。
+    // 应覆盖 10/11..10/14 四天，实际有 10/11、10/12、10/13 三天 → 缺 10/14。
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-11')).toBe(0)
+    const w = meta().warnings as string[]
+    expect(w.some((x) => /应有 4 个自然日（不含今天：当天数据次日才同步），实际只有 3 个/.test(x))).toBe(true)
+
+    // 反证 0：**当天缺口本身不算缺口**——补上缺的上海 10/13（UTC 10/12T16:00Z）后
+    // （今天 10/15 仍没有行）不再警告
+    await seedMore('daily_overview', [
       { stat_date: '2026-10-12T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },
     ])
-    // 上海 10/12 0 点 ~ 10/16 0 点（NOW = 上海 10/15 12:00）→ 窗口 10/12..10/15 共 4 天，
-    // 库里有 10/12、10/13、10/14 三天 → 缺 10/15。
-    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-12')).toBe(0)
-    const w = meta().warnings as string[]
-    expect(w.some((x) => /应有 4 个自然日，实际只有 3 个/.test(x))).toBe(true)
-
-    // 反证 1：完整窗口不警告（补上缺的上海 10/15 那天 = UTC 10/14T16:00Z）
-    await seedMore('daily_overview', [
-      { stat_date: '2026-10-14T16:00:00.000Z', payload: '{"a":1}', synchronized_at: null },
-    ])
-    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-12')).toBe(0)
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-11')).toBe(0)
     expect((meta().warnings as string[]).some((x) => /自然日/.test(x))).toBe(false)
+
+    // 反证 1：显式 --until 覆盖今天时按用户说的算（今天没有行 = 真缺口）
+    expect(await qAt('--table', 'daily_overview',
+      '--since', '2026-10-11', '--until', '2026-10-16')).toBe(0)
+    expect((meta().warnings as string[]).some((x) => /应有 6 个自然日，实际只有 4 个/.test(x))).toBe(true)
 
     // 反证 2：非 iso-day 表（sessions，epoch-ms）不算自然日、不触发
     expect(await qAt('--table', 'sessions', '--since', '2026-10-01')).toBe(0)

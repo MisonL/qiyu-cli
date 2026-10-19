@@ -22,7 +22,7 @@ import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
-import type { ColumnDef, TableDef } from '../store/schema.js'
+import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
 import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
@@ -109,6 +109,25 @@ function piiColumnsOf(t: TableDef): string[] {
 }
 
 /**
+ * 时间列的**约定形态**（可注入 SQL 片段，`timeRangeOf` 与 `dirtyTimeValues` 共用同一份
+ * ——两处口径一旦分叉，就会出现「算极值时排除、计数时不排除」这种自相矛盾的状态）。
+ *
+ * 两端都锚定（CodeRabbit 终审 minor）：只锚开头会放过 `'2026-10-12garbage'`（它字典序上
+ * `g` > `T`，反而赢下 MAX）与只有日期的 `'2026-10-13'`（`msToShanghaiIso` 按 UTC 解析，
+ * 输出偏 8 小时）。形态与写路径逐字对应：
+ *   · iso-day：`shanghaiDayIso` → `YYYY-MM-DDT16:00:00.000Z`（上海日零点的 UTC 形态）；
+ *   · iso-instant：`new Date(ms).toISOString()` → `YYYY-MM-DDTHH:MM:SS.mmmZ`。
+ * 兼容旧值：允许省略毫秒（`.000` 之外的零毫秒形态在库里也存在）。
+ */
+function shapeSqlOf(kind: TimeColumnKind, col: string): string | null {
+  if (kind === 'epoch-ms') return null
+  const shape = kind === 'iso-day'
+    ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
+    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2}(\\.[0-9]+)?)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
+  return `regexp_matches(${col}, '${shape}')`
+}
+
+/**
  * 单表时间范围（spec §8.1 / §四）。
  * iso-day / iso-instant：列是 ISO 字符串 → 先按约定形态过滤（见下）再 MIN/MAX；
  * epoch-ms：列是数字字符串 → 先 TRY_CAST 成 BIGINT 再取极值（非数字值不炸、按 NULL 跳过）。
@@ -117,8 +136,7 @@ function piiColumnsOf(t: TableDef): string[] {
  * ⚠️ ISO 形态过滤（正确性 P1）：脏值（`not-a-date`）会在 VARCHAR 上**赢下** MIN/MAX
  * （字典序上 `n` > `2`），而 `msToShanghaiIso` 对解析不了的值原样回显 —— 于是
  * `time_range.max` 输出一个根本不是时间的字符串。契约要求它是上海 ISO，所以先按
- * 约定形态筛（iso-day = 上海日零点 `…T16:00:00.000Z` 形态的日期前缀 `YYYY-MM-DD`；
- * iso-instant = 带 Z/偏移的 ISO 8601），脏值不进极值；数量由 `dirtyCount` 单独查，
+ * 约定形态筛（见 `shapeSqlOf`），脏值不进极值；数量由 `dirtyTimeValues` 单独查，
  * 由调用方进 warnings（不得静默 —— 库漂移/坏数据是 README 承诺要报警的状态）。
  */
 async function timeRangeOf(
@@ -130,11 +148,7 @@ async function timeRangeOf(
   // 形态判据只用于 MIN/MAX 的候选集，不改变列本身的语义（值仍是原样输出的）。
   // ⚠️ 用 `regexp_matches`，**不要**用 `~` 运算符：实测（DuckDB 1.5.6-r.1）`~` 对
   // `'2026-10-13T…' ~ '^2026'` 也返回 false —— 它不是正则匹配，会把所有行都滤掉。
-  const shape = tc.kind === 'epoch-ms'
-    ? null
-    : tc.kind === 'iso-day'
-      ? `regexp_matches(${col}, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')`
-      : `regexp_matches(${col}, '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}')`
+  const shape = shapeSqlOf(tc.kind, col)
   const agg = tc.kind === 'epoch-ms'
     ? `MIN(TRY_CAST(${col} AS BIGINT)) AS mn, MAX(TRY_CAST(${col} AS BIGINT)) AS mx`
     : `MIN(${col}) AS mn, MAX(${col}) AS mx`
@@ -150,7 +164,7 @@ async function timeRangeOf(
 
 /**
  * 时间列里不符合约定形态的非空值计数（正确性 P1）。
- * epoch-ms 用 `TRY_CAST` 判（非数字即脏）；iso 两形态用与 `timeRangeOf` 同一正则。
+ * epoch-ms 用 `TRY_CAST` 判（非数字即脏）；iso 两形态用与 `timeRangeOf` 同一份形态。
  * 0 = 干净，不产生任何警告。
  */
 async function dirtyTimeValues(
@@ -159,11 +173,10 @@ async function dirtyTimeValues(
   const tc = t.timeColumn
   if (tc === undefined) return 0
   const col = `"${tc.name}"`
-  const bad = tc.kind === 'epoch-ms'
+  const shape = shapeSqlOf(tc.kind, col)
+  const bad = shape === null
     ? `TRY_CAST(${col} AS BIGINT) IS NULL`
-    : tc.kind === 'iso-day'
-      ? `NOT regexp_matches(${col}, '^[0-9]{4}-[0-9]{2}-[0-9]{2}')`
-      : `NOT regexp_matches(${col}, '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}')`
+    : `NOT ${shape}`
   const r = await session.run(
     `SELECT COUNT(*) AS n FROM "${t.name}" WHERE ${col} IS NOT NULL AND ${bad}`)
   return Number((r.rows[0] ?? {}).n)

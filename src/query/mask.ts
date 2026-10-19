@@ -230,7 +230,13 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       if (!(name in out)) continue
       const before = out[name]
       if (nameHit.has(name)) {
-        out[name] = maskValue(before, ruleForColumn(baseName(name)))
+        // ⚠️ 列名命中不等于值可安全转换（CodeRabbit 终审 major）：`SELECT t AS userName
+        // FROM sessions t` 把整行 STRUCT 别名成敏感列名 → 走 nameHit 分支 → `maskValue`
+        // 对非字符串原样返回 → 全量 PII 漏出，且 matchedSensitive 含该名使缺口警告也不触发。
+        // 与 maskCellByValue 的 S1 规则同一处理：对象/数组整值替换。
+        out[name] = before !== null && typeof before === 'object'
+          ? FULL
+          : maskValue(before, ruleForColumn(baseName(name)))
       } else {
         out[name] = maskCellByValue(before)
       }

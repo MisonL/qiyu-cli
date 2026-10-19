@@ -329,6 +329,38 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     expect(agg.warnings).toEqual([])  // daily_overview 不在 payloadPiiTables
   })
 
+  it('STRUCT/LIST 被别名成敏感列名时同样整值替换（CodeRabbit 终审 major）', () => {
+    // 实测（DuckDB 1.5.6-r.1）：`SELECT t AS userName FROM sessions t` 返回
+    // `{userName: {…整行…}}`（JS 对象），`SELECT [t] AS userName` 返回数组。
+    // 旧实现走 nameHit 分支 → maskValue 对非字符串原样返回 → 全量 PII 漏出；
+    // 而 matchedSensitive 含 userName → 缺口警告也不触发（静默）。
+    for (const [sql, value] of [
+      ['SELECT t AS userName FROM sessions t', { userPhone: '13800138000', userName: '张三' }],
+      ['SELECT [t] AS userName FROM sessions t', [{ userPhone: '13800138000', userName: '张三' }]],
+      ["SELECT {'a': t} AS userPhone FROM sessions t", { a: { userPhone: '13800138000' } }],
+    ] as const) {
+      const out = maskQueryRows({
+        rows: [{ userName: value }], columns: ['userName'],
+        mode: sqlMode(sql),
+      })
+      expect(out.rows[0].userName, sql).toBe(FULL)
+      expect(out.maskedColumns, sql).toContain('userName')
+      expect(JSON.stringify(out.rows[0]), sql).not.toContain('13800138000')
+    }
+
+    // 反证：标量值仍走原规则（不被一刀切成 FULL）
+    const scalar = maskQueryRows({
+      rows: [{ userName: '张三' }], columns: ['userName'],
+      mode: sqlMode('SELECT userName FROM sessions'),
+    })
+    expect(scalar.rows[0].userName).toBe(FULL)   // full 规则本来就是整值替换
+    const phone = maskQueryRows({
+      rows: [{ userPhone: '13800138000' }], columns: ['userPhone'],
+      mode: sqlMode('SELECT userPhone FROM sessions'),
+    })
+    expect(phone.rows[0].userPhone).toBe('138****8000')  // phone 规则按位保留
+  })
+
   it('security S2：DuckDB 去重列名 userPhone:1/userPhone:2 必须脱敏', () => {
     // 自连接 `SELECT a.userName, b.userName FROM sessions a JOIN sessions b ON …`
     // → DuckDB 把输出列去重成 userName 与 userName:1（冒号 + 数字）。

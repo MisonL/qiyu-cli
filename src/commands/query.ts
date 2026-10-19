@@ -16,7 +16,7 @@
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure } from '../query/errors.js'
 import { maskQueryRows } from '../query/mask.js'
-import { parseTimeArg, shanghaiIso, msToShanghaiIso } from '../core/time.js'
+import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
 import {
@@ -339,10 +339,20 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
   // 与「实际有行的自然日数」。MIN/MAX 的 data_coverage 结构上看不见内部缺口 ——
   // 7 天窗口缺一天时 rows 可能恰好是 7，Agent 会把 7 天汇总当成「上周」。
   // 只在有行时提示：0 行已有更准确的成因警告（同步未覆盖 / 区间为空）。
+  //
+  // ⚠️ 上界缺省（只给 --since）时**必须排除今天**（CodeRabbit 终审 minor）：日报任务的
+  // 日对齐切片会跳过当天那个不满一天的残段窗（`isResidualWindow`），所以今天那行要
+  // 次日 run 才出现。而缺省上界 = now 再向下取整到今天 0 点，不排除的话
+  // `--since 7d` 恒得到「应有 8 天、实际 7 天」——一条几乎每次都误报的警告，
+  // 只会教会 Agent 忽略 warnings。显式给了 --until 就按用户说的算，不做这种调整。
   if (coveredDays !== null && plan.resolvedRange !== null && result.rows.length > 0) {
-    const expectedDays = Math.round((plan.resolvedRange[1] - plan.resolvedRange[0]) / 86_400_000) + 1
+    const hi = input.until === undefined
+      ? Math.min(plan.resolvedRange[1], shanghaiYesterdayStart(input.now))
+      : plan.resolvedRange[1]
+    const expectedDays = Math.max(0, Math.round((hi - plan.resolvedRange[0]) / 86_400_000) + 1)
     if (coveredDays < expectedDays) {
-      warnings.push(`区间内应有 ${expectedDays} 个自然日，实际只有 ${coveredDays} 个有数据`
+      const scope = input.until === undefined ? '（不含今天：当天数据次日才同步）' : ''
+      warnings.push(`区间内应有 ${expectedDays} 个自然日${scope}，实际只有 ${coveredDays} 个有数据`
         + '（窗口内部存在缺口）；用 `qiyu sync status` 查看缺口详情，或放宽过滤条件')
     }
   }
