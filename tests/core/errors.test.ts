@@ -1,6 +1,6 @@
 // tests/core/errors.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { classify, redactInternal, type ErrorKind } from '../../src/core/errors.js'
+import { classify, redactInternal, ERROR_KINDS, type ErrorKind } from '../../src/core/errors.js'
 import { fail } from '../../src/output.js'
 
 // ErrorKind 闭集用例要观察 fail() 的 stdout 信封（与 tests/output.test.ts 同款 spy）。
@@ -470,5 +470,50 @@ describe('ErrorKind 闭集（E 组扩展）', () => {
     expect(JSON.parse(out)).toMatchObject({
       ok: false, error: { code: 'query_timeout', kind: 'query_timeout', retryable: false },
     })
+  })
+})
+
+describe('ERROR_KINDS 运行时常量', () => {
+  // 全量清单（20 个，当前版本真正会产出的 kind）—— F 子项目 Task 4。
+  // 顺序与 `errors.ts` 的 `ERROR_KINDS` 声明顺序一致，便于逐行对照；
+  // 断言用 toContain，不依赖顺序本身（skill check 也只做"存在性"校验）。
+  const ALL: readonly string[] = [
+    'auth', 'auth_missing', 'bad_time', 'param', 'rate_limit', 'module_offline',
+    'window_too_large', 'window_misaligned', 'not_in_queue', 'pending',
+    'route_not_found', 'internal', 'network', 'usage', 'unknown',
+    'needs_confirmation', 'store_locked', 'store_not_initialized',
+    'query_timeout', 'sync_not_run',
+  ]
+
+  it('包含当前版本全部会产出的 kind', () => {
+    for (const k of ALL) {
+      expect(ERROR_KINDS, `ERROR_KINDS 少了 ${k}`).toContain(k)
+    }
+  })
+
+  // ⚠️ `ambiguous` 是路线图 **G2（§9.4 名称解析）** 才交付的 kind，当前版本不存在。
+  // `skill check` 拿 ERROR_KINDS 当权威源，所以这里必须反向钉住：
+  // 一旦有人把它加进来，这条会红 —— 而那意味着 skill 正文允许引用一个
+  // 运行时产不出来的 kind，正是本常量要防的事（设计稿 §11.4）。
+  it('不包含尚未实现的 ambiguous（G2 才交付）', () => {
+    expect(ERROR_KINDS).not.toContain('ambiguous')
+  })
+
+  it('无重复', () => {
+    expect(new Set(ERROR_KINDS).size).toBe(ERROR_KINDS.length)
+  })
+
+  // 双向闭集：既不能多（多出来的值运行时产不出来，Agent 会为一个不存在的
+  // kind 写处理分支），也不能少（skill check 会误判正文里真实的 kind 为违规）。
+  it('不多不少 —— 与上面那份清单互为闭集', () => {
+    expect([...ERROR_KINDS].sort()).toEqual([...ALL].sort())
+  })
+
+  it('派生出的 ErrorKind 覆盖常量里的每个成员（编译期 + 运行时双向对齐）', () => {
+    // `satisfies` 让 tsc 核对"常量数组的每个元素都真的是 ErrorKind"；
+    // 若有人给常量加了值却没进联合（或反之），这里报错。
+    // 反向（联合有、常量没有）由 `npm run typecheck` 在 `kind: '...'` 字面量处抓住。
+    const ks: readonly ErrorKind[] = ERROR_KINDS satisfies readonly ErrorKind[]
+    expect(ks).toHaveLength(ALL.length)
   })
 })

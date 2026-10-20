@@ -1,37 +1,49 @@
 // src/core/errors.ts
 
-export type ErrorKind =
-  | 'auth'              // 凭证**无效**（14001/14002/14008/14515）—— 发出去被服务端拒了
-  | 'auth_missing'      // 凭证**根本没配置**（本地就拦下，从未发出请求）—— 设计稿 §9.5
-  | 'bad_time'          // 时间戳超期：core 先自动重签重试；仍失败说明本机时钟真的偏了
-  | 'param'             // 参数错误，重试无用
-  | 'rate_limit'        // 限流，延迟重试
-  | 'module_offline'    // 模块未开通，永久失败
-  | 'window_too_large'  // 时间跨度超限，调用方需自行切片后重试
-  | 'window_misaligned' // 时间边界没对齐自然日 —— 切片修不好，必须对齐 endTime
-  | 'not_in_queue'      // 业务态，不是故障
-  | 'pending'           // 异步任务未完成（如会话导出轮询），可重试
-  | 'route_not_found'   // 服务端没有这条路由 —— 注册表的路径写错了，重试无用
-  | 'internal'          // 服务端内部错误，退避重试
-  | 'network'           // 网络层故障
-  | 'usage'             // 调用方式有误（未知接口 id、--body 不合法），对应退出码 2
-  | 'unknown'
+/**
+ * 全部错误 kind 的**单一事实源**（F 子项目 Task 4）。
+ *
+ * 类型与运行时共用这一份：`ErrorKind` 由它派生，`skill check` 也拿它校验
+ * skill 正文里的 `kind: x` 引用是否真实存在（设计稿 §11.4）。
+ * 加/删成员只改这里 —— 漏抄会让一批 `kind: '...'` 字面量在 `npm run typecheck`
+ * 报错，这正是我们要的保护。
+ */
+export const ERROR_KINDS = [
+  'auth',                  // 凭证**无效**（14001/14002/14008/14515）—— 发出去被服务端拒了
+  'auth_missing',          // 凭证**根本没配置**（本地就拦下，从未发出请求）—— 设计稿 §9.5
+  'bad_time',              // 时间戳超期：core 先自动重签重试；仍失败说明本机时钟真的偏了
+  'param',                 // 参数错误，重试无用
+  'rate_limit',            // 限流，延迟重试
+  'module_offline',        // 模块未开通，永久失败
+  'window_too_large',      // 时间跨度超限，调用方需自行切片后重试
+  'window_misaligned',     // 时间边界没对齐自然日 —— 切片修不好，必须对齐 endTime
+  'not_in_queue',          // 业务态，不是故障
+  'pending',               // 异步任务未完成（如会话导出轮询），可重试
+  'route_not_found',       // 服务端没有这条路由 —— 注册表的路径写错了，重试无用
+  'internal',              // 服务端内部错误，退避重试
+  'network',               // 网络层故障
+  'usage',                 // 调用方式有误（未知接口 id、--body 不合法），对应退出码 2
+  'unknown',
   // `--yes` 门禁拒绝时的 kind —— `api.ts` 的 `fail()` 产出它，
   // 对应 `code: 'confirm_required'`（危险接口未加 --yes），退出码 4
-  | 'needs_confirmation'
+  'needs_confirmation',
   // 存储层（C1）：数据库被写进程持锁（读者退避超限 / 写者立即）—— 退出码 1，可重试
-  | 'store_locked'
+  'store_locked',
   // 存储层（C1）：库不存在 / 缺表 / 依赖缺失 / 非 DuckDB 文件 / 他人库 —— 退出码 1
-  | 'store_not_initialized'
+  'store_not_initialized',
   // 查询层（E）：只读查询超时（conn.interrupt 生效）—— 退出码 1；
   // `output.ts` 的 `exitCodeFor` 不设分支，落 default（EXIT.BUSINESS）
-  | 'query_timeout'
+  'query_timeout',
   // 同步层（D）：sync status/verify 尚无成功 run 的证据 —— 退出码 1。
   // 此前只在 `sync.ts` 里以字符串字面量出现、不在本联合里，按 kind 分支的 Agent
   // 会收到一个未在任何类型/文档中出现的值（契约审查 C-03）。
-  | 'sync_not_run'
-  // ⚠️ `sandbox_blocked` / `query_error` 是 **code** 不是 kind：查询层的这两类失败
-  // 都归 `kind: 'usage'`（退出码 2），见 `src/query/errors.ts` 的分类表。
+  'sync_not_run',
+] as const
+
+export type ErrorKind = typeof ERROR_KINDS[number]
+
+// ⚠️ `sandbox_blocked` / `query_error` 是 **code** 不是 kind：查询层的这两类失败
+// 都归 `kind: 'usage'`（退出码 2），见 `src/query/errors.ts` 的分类表。
 
 export interface QiyuError {
   code: string
