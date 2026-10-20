@@ -1,7 +1,7 @@
 // src/commands/db.ts —— E 组查询命令骨架；Task 6：`db tables`（spec §8.1），
 // Task 7：`db describe`（spec §8.2）。
 //
-// 形态沿 store.ts / sync.ts：parseFlags（值位守卫）→ usageFail/fail 双通道 →
+// 形态沿 store.ts / sync.ts：parseStoreFlags（值位守卫）→ usageFail/fail 双通道 →
 // 查询层统一错误出口 thrownToQueryExit。
 //
 // 三条硬约束：
@@ -26,6 +26,8 @@ import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
 import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
+import { parseStoreFlags } from './store-flags.js'
+import type { StoreFlags } from './store-flags.js'
 
 const USAGE = `用法：qiyu db <子命令> [参数]
 
@@ -42,33 +44,6 @@ const KNOWN = new Set(['--help', '-h', '--pretty'])
 
 /** PII 提示（设计稿 §6.5 要求 `db tables` / `db describe` 必须携带）。 */
 const PII_NOTICE = '本数据库包含客户 PII；不要将其写入日志或对外报表'
-
-export interface StoreFlags { db?: string; profile?: string; backend?: string }
-
-/**
- * `--db/--profile/--backend` 的值位解析（架构审查 M-2 的互指锚点）。
- * ⚠️ 与 store.ts / stats.ts 的同名函数**逐字相同**（query.ts 的是第四份、语义有意不同
- * ——`FLAG_TOKENS` 值位守卫）。改动这里必须同步那两处，或干脆收成共享模块：
- * 新增共享定位 flag（如 `--config`）时漏改任何一份，那条命令会静默把它当位置参数。
- * 各有命令级测试钉「--db 缺少取值」的形态，漂移会红。
- */
-function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
-  const out: StoreFlags & { rest: string[] } = { rest: [] }
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]
-    if (a === '--db' || a === '--profile' || a === '--backend') {
-      const v = argv[i + 1]
-      // 值位守卫（沿 store.ts）：值位缺失或以 -- 开头 → 报缺值，
-      // 否则 `db tables --db --profile x` 会把 --profile 当路径。
-      if (v === undefined || v.startsWith('--')) throw new Error(`${a} 缺少取值`)
-      if (a === '--db') out.db = v
-      else if (a === '--profile') out.profile = v
-      else out.backend = v
-      i++
-    } else out.rest.push(a)
-  }
-  return out
-}
 
 /**
  * 只读命令的库前置检查（ENOENT / 非普通文件 / 权限三分 → 退出码，否则 null）。
@@ -265,7 +240,7 @@ export async function openGuardedSession(
 }
 
 async function dbTables(argv: string[]): Promise<number> {
-  // 子命令级次序沿 store.ts：--help 分流 → --pretty 显式拒绝 → parseFlags → 未知参数。
+  // 子命令级次序沿 store.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 未知参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const rawRest = argv.filter((a) => !KNOWN.has(a))
     if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
@@ -274,8 +249,8 @@ async function dbTables(argv: string[]): Promise<number> {
   }
   if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
 
-  let flags: ReturnType<typeof parseFlags>
-  try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+  let flags: ReturnType<typeof parseStoreFlags>
+  try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
   if (flags.rest.length > 0) return usageFail(`未知参数：${flags.rest.join(' ')}`)
 
   const opened = await openGuardedSession(flags)
@@ -393,7 +368,7 @@ function describeColumn(c: ColumnDef): {
 }
 
 async function dbDescribe(argv: string[]): Promise<number> {
-  // 子命令级次序沿 dbTables：--help 分流 → --pretty 显式拒绝 → parseFlags → 位置参数。
+  // 子命令级次序沿 dbTables：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const rawRest = argv.filter((a) => !KNOWN.has(a))
     if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
@@ -402,8 +377,8 @@ async function dbDescribe(argv: string[]): Promise<number> {
   }
   if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
 
-  let flags: ReturnType<typeof parseFlags>
-  try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+  let flags: ReturnType<typeof parseStoreFlags>
+  try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
 
   // 未知 flag（`--bogus`）会落进 rest —— 先按 `-` 前缀挑出来，避免被当成表名。
   const flagish = flags.rest.filter((a) => a.startsWith('-'))
