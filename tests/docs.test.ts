@@ -406,12 +406,27 @@ describe('CI 工作流 —— 承诺的检查必须真的接在 npm 脚本上', 
     // （注释里说明该约束是允许的；断言只看非注释行）
     const ciCode = ci.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')
     expect(ciCode).not.toMatch(/maxWorkers|fileParallelism|--no-file-parallelism/)
+    // 分片数 CI 必须显式钉成 1：GitHub runner 只有 2 核，分片反而更慢
+    // （每片都要重起 Node + 转换缓存）。这条是**收敛**不是放宽 —— 但它得被钉住，
+    // 否则删掉它就悄悄变慢，而没人会发现 CI 慢了。
+    expect(ciCode).toMatch(/QIYU_TEST_SHARDS:\s*1/)
   })
 
-  it('package.json test 脚本自带单进程限制（CI 复用它的前提）', () => {
+  it('npm test 链上的每一环都自带单进程限制（CI 复用它的前提）', () => {
     const pkg = JSON.parse(read('package.json')) as { scripts: Record<string, string> }
-    expect(pkg.scripts.test).toMatch(/--maxWorkers=1/)
-    expect(pkg.scripts.test).toMatch(/--no-file-parallelism/)
+    // npm test 走固定分片 runner（scripts/test-shards.mjs）。单进程限制因此不在
+    // package.json 那一行字面里，而在 runner 里 —— 断言跟着搬家，但**判据不放宽**：
+    // runner 必须逐字带上 --maxWorkers=1 与 --no-file-parallelism。
+    //
+    // ⚠️ 这条断言护的是 2026-10-05 那次内存耗尽事故：CI 只跑 `npm test`，
+    // 所以并发限制必须烤进这条命令链的任何一环，且不能被环境变量悄悄改掉。
+    expect(pkg.scripts.test).toMatch(/scripts\/test-shards\.mjs/)
+    const runner = read('scripts/test-shards.mjs')
+    expect(runner).toMatch(/--maxWorkers=1/)
+    expect(runner).toMatch(/--no-file-parallelism/)
+    // 分片数必须**固定上限**，不得随 CPU 数放大 —— 「16 核起满 worker」正是事故形态。
+    expect(runner).toMatch(/MAX_SHARDS/)
+    expect(runner).not.toMatch(/cpus\(\)|availableParallelism/)
     expect(pkg.scripts.typecheck).toMatch(/tsc/)
   })
 

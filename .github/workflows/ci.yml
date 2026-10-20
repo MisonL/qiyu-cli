@@ -36,6 +36,10 @@ jobs:
 
       - run: npm run typecheck
 
-      # 单进程限制已在 package.json 的 test 脚本里写死（--maxWorkers=1
-      # --no-file-parallelism），CI 直接复用，不要在这里另传并发参数。
+      # npm test = 固定分片 runner（scripts/test-shards.mjs）。GitHub runner 只有 2 核，
+      # 分片反而更慢（每片都要重新起 Node + 转换缓存），所以 CI 显式要求单片。
+      # 每片内部仍是 --maxWorkers=1 --no-file-parallelism，事故防护（2026-10-05 内存耗尽）
+      # 一条都没松。
       - run: npm test
+        env:
+          QIYU_TEST_SHARDS: 1

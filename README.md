@@ -333,10 +333,17 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 ```bash
 npm install
 npm run typecheck         # 类型检查（含测试）
-npm test                  # 运行测试
+npm test                  # 运行测试（默认 4 分片并行，≈50s）
 
-# ⚠️ 测试必须单进程运行。vitest.config.ts 已写死 maxWorkers: 1 +
-#    fileParallelism: false，但命令行参数会覆盖配置——不要去掉这两个限制。
+# ⚠️ 每个分片内部仍是**单进程单 worker**。vitest.config.ts 写死 maxWorkers: 1 +
+#    fileParallelism: false，分片 runner 也照传这两个参数——不要去掉。
+#    分片数是固定值（默认 4，上限 8），不随 CPU 数放大：2026-10-05 的内存耗尽事故
+#    根因是「无界循环 × 无界增长」，不是并发本身。
+
+QIYU_TEST_SHARDS=1 npm test   # 单片串行（≈110s，排查时序问题或复现 CI 时用）
+npm run test:single           # 等价写法
+QIYU_TEST_SHARDS=8 npm test   # 更多分片（16 核机器上收益递减）
+QIYU_TEST_HEAP_MB=1024 npm test   # 收紧每片 Node 堆上限（默认 2048）
 ```
 
 测试覆盖了响应信封归一化、错误分类、签名、脱敏、限频、注册表校验、CLI 契约等。

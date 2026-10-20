@@ -35,7 +35,8 @@
   "scripts": {
     "build": "tsc && node scripts/copy-params.mjs",
     "prepare": "npm run build",
-    "test": "vitest run --maxWorkers=1 --no-file-parallelism",
+    "test": "node scripts/test-shards.mjs",
+    "test:single": "vitest run --maxWorkers=1 --no-file-parallelism",
     "typecheck": "tsc -p tsconfig.test.json"
   },
   "devDependencies": {
