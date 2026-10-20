@@ -362,6 +362,54 @@ describe('installSkill', () => {
     expect(r.warnings.some((w) => w.includes('references'))).toBe(true)
   })
 
+  it('清理路径同样不得穿透：上一版受管文件在目录符号链接之下，--force 不得删实体外的文件（审查 N1-G1）', async () => {
+    const src = makeSource()
+    // 首次安装：清单 files 记录 references/deep.md。
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    // 用户把 references 换成指向个人笔记目录的链接，个人目录里有同名文件。
+    const personal = join(home, 'personal-notes')
+    mkdirSync(personal)
+    writeFileSync(join(personal, 'deep.md'), '我的个人笔记\n')
+    rmSync(join(entity, 'references'), { recursive: true })
+    symlinkSync(personal, join(entity, 'references'))
+    // 新版包删掉 references/deep.md，并改动 SKILL.md 逼出 updated（否则走 skipped，清理根本不跑）。
+    rmSync(join(src, 'references'), { recursive: true })
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    // 清理确实跑了（清单被换新），但实体之外的个人文件原样、链接原样；拒绝删除要如实警告。
+    expect(r.status).toBe('updated')
+    expect(readFileSync(join(personal, 'deep.md'), 'utf8')).toBe('我的个人笔记\n')
+    expect(lstatSync(join(entity, 'references')).isSymbolicLink()).toBe(true)
+    expect(r.warnings.some((w) => w.includes('references'))).toBe(true)
+  })
+
+  it('清单 files 含 .. 逃逸条目（被篡改）：拒绝按它删除实体外文件（审查 N1-G2）', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    // 手工篡改清单，塞进一条路径逃逸条目（模拟用户编辑或被篡改的清单）。
+    const m = readManifest(entity)
+    writeFileSync(join(entity, MANIFEST), JSON.stringify({ ...m, files: ['../../../escape.md'] }))
+    const victim = join(home, 'escape.md')
+    writeFileSync(victim, '实体外的文件\n')
+    // 改内容逼出 updated，确保清理逻辑真的执行。
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(r.status).toBe('updated')
+    expect(readFileSync(victim, 'utf8')).toBe('实体外的文件\n')
+    // 篡改清单在解析层就被拒（readManifestSafe 返回 null → 不作为清理依据），
+    // 重写后的清单不再含逃逸条目；实体外文件没有任何删除动作。
+    const after = readManifest(entity)
+    expect(after.version).toBe('1.1.0')
+    expect(after.files).not.toContain('../../../escape.md')
+    expect(existsSync(victim)).toBe(true)
+  })
+
   // —— 审查 I1/I3：暂存失败时实体保持原样 ——
   it('覆盖中断（目标子路径被目录占用）：其余文件已换入、清单保持上一版，修复占用后重跑收敛', async () => {
     const src = makeSource()
