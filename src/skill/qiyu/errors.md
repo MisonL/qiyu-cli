@@ -22,7 +22,7 @@
 | `kind: not_in_queue` | 业务状态，不是故障。按业务语义处理，不重试 |
 | `kind: pending` | 异步任务未完成（如会话导出轮询）。这是正常中间态——稍后再次轮询，不要判成失败 |
 | `kind: route_not_found` | 服务端没有这条路由。接口 id 写错，或 CLI 的接口注册表有误；重试无用，报告人类 |
-| `kind: internal` | 服务端内部错误。退避后重试；反复出现就停下报告 |
+| `kind: internal` | 看 `retryable`：true 才退避重试；false 时按 message 的两种已知成因查参数（无效参数、翻页越界），重试无用 |
 | `kind: network` | 网络层故障（退出码 3）。检查网络后退避重试 |
 | `kind: unknown` | 未分类错误。按 message 判断，不要盲目重试 |
 | `kind: needs_confirmation` | 危险操作等待确认（退出码 4）。**停下**，向人类复述该操作及其目标；**绝不自动追加 `--yes`** |

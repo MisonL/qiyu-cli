@@ -16,8 +16,9 @@ qiyu sync status
 ```
 
 它给出每条同步任务的水位、上次成功同步时间、实际覆盖区间、缺口与锁。在看过它之前，
-不要对数据下任何结论。如果它报 `kind: sync_not_run`，说明还没有成功同步过——先跑
-`qiyu sync run`，跑完再看。
+不要对数据下任何结论。**如果所有任务的水位与覆盖区间都是 null**（说明还没有成功同步过），
+先跑 `qiyu sync run`，跑完再看。（安装调度时，`sync install` 的前置探测会以
+`kind: sync_not_run` 报同一事实。）
 
 拿到覆盖范围后，按需自描述：
 
@@ -52,7 +53,7 @@ qiyu sync status
 
 ## 输出与退出码
 
-- stdout 只有一行 JSON：成功为 `{"ok":true,"data":…,"meta":…}`，失败为
+- stdout 只有一行 JSON：成功为 `{"ok":true,"data":…}`（部分命令附带 `"meta":…`），失败为
   `{"ok":false,"error":…}`；日志与进度走 stderr，不要把 stderr 当数据。
 - 出错时按 `error.kind` 分支，不要按 `code`（见 errors.md）。
 - 退出码：`0` 成功 · `1` 业务错误 · `2` 用法错误 · `3` 网络错误 · `4` 需要人工确认。
