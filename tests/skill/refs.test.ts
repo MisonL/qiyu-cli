@@ -157,6 +157,10 @@ describe('护栏：行为决策固化（审查 Minor-3）', () => {
       { path: ['query'], flags: ['--table'], line: 3 },
     ])
   })
+  it('sqlSequences 按行升序：块级兜底混排时不乱序', () => {
+    const r = extractRefs('```sql\nSELECT id\nFROM sessions\n```\ntail `SELECT * FROM x`')
+    expect(r.sqlSequences.map((s) => s.line)).toEqual([2, 5])
+  })
   it('qiyu 单列（无参数）不匹配命令形态', () => {
     expect(extractRefs('`qiyu`').commands).toEqual([])
     expect(extractRefs('`qiyu `').commands).toEqual([])

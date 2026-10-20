@@ -6,7 +6,7 @@
 // 里，是 `skill check`（Task 6）的事。保持这条边界，提取器才能被单独测试，也不会把
 // commands 层拉进 skill 层。
 //
-// 扫描面（collectSegments / collectFenceBlocks 决定「哪些文本算代码」，scan* 决定算什么引用）：
+// 扫描面（collectSurfaces 决定「哪些文本算代码」，scan* 决定算什么引用）：
 //   · 行内代码：散文里的 `` `qiyu sync status` ``，单反引号包裹，一行可多片段，各自计数。
 //   · 围栏代码块：``` 围栏内的行。围栏行**既**按裸文本扫、**也**解析行内反引号 ——
 //     `` `qiyu db tables` `` 和裸 `qiyu db tables` 都是真实引用，漏检（Task 6 看不见）
@@ -284,6 +284,7 @@ function scanSql(content: string, line: number, refs: Refs): void {
 
 /**
  * 从 skill 正文里提取全部引用。返回顺序即出现顺序（按行、行内按片段出现位置）；
+ * 围栏块级 SQL 兜底在最后统一收集，返回前按行稳定排序归位；
  * 同一行同一内容只记一次（围栏面的裸文本与行内片段不双计），不同行不合并、不去重 ——
  * 校验方需要逐处报行号。
  */
@@ -303,6 +304,10 @@ export function extractRefs(text: string): Refs {
     const hit = refs.sqlSequences.some((s) => s.line >= block.firstLine && s.line <= block.lastLine)
     if (!hit) refs.sqlSequences.push({ text: block.text, line: block.selectLine })
   }
+
+  // 块级兜底统一 append 在最后，与逐行条目混排时行号会乱序；稳定排序归位，兑现
+  // 「返回顺序即出现顺序」的承诺（同行的多条保持插入顺序）。
+  refs.sqlSequences.sort((a, b) => a.line - b.line)
 
   return refs
 }
