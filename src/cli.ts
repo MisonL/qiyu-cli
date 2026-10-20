@@ -9,6 +9,10 @@ import { syncCommand } from './commands/sync.js'
 import { dbCommand } from './commands/db.js'
 import { queryCommand } from './commands/query.js'
 import { statsCommand } from './commands/stats.js'
+// `COMMAND_TREE` 的**权威位置**是 `commands/tree.ts`（worktree 裁定，见那里顶部注释）：
+// 它只 import 各命令模块、不含入口逻辑，将来 `src/skill/check.ts` 从**那里**消费。
+// 本文件 re-export 只是兼容入口（计划原文写的是 `cli.ts` 汇总），免得调用方改路径。
+export { COMMAND_TREE } from './commands/tree.js'
 
 const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   auth: authCommand,

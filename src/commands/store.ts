@@ -5,6 +5,27 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { ok, fail, usageFail, sanitizeControlChars } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import type { CommandSpec } from './spec-types.js'
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu store …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ */
+export const STORE_SPECS: CommandSpec[] = [
+  {
+    path: ['store', 'init'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['store', 'status'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+]
 
 const USAGE = `用法：qiyu store <子命令> [参数]
 
@@ -18,7 +39,7 @@ const USAGE = `用法：qiyu store <子命令> [参数]
    也可用 --db / QIYU_DB_PATH 直接指定库路径。
 `
 
-const KNOWN = new Set(['--help', '-h', '--pretty'])
+const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 export function thrownToExit(e: unknown): number {
   const err = e as { kind?: string; message?: string; hint?: string; retryable?: boolean }

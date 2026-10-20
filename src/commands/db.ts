@@ -28,6 +28,28 @@ import { msToShanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
 import type { StoreFlags } from './store-flags.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import type { CommandSpec } from './spec-types.js'
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu db …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * 值位解析走共享的 `parseStoreFlags`（它从 `STORE_FLAGS` 派生接受集），与这里同源。
+ */
+export const DB_SPECS: CommandSpec[] = [
+  {
+    path: ['db', 'tables'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['db', 'describe'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [{ name: '表', domain: 'tables' }],
+    rejected: REJECTED_FLAGS,
+  },
+]
 
 const USAGE = `用法：qiyu db <子命令> [参数]
 
@@ -40,7 +62,7 @@ const USAGE = `用法：qiyu db <子命令> [参数]
 存储定位：--db / --profile / --backend（store 命令同族）。
 `
 
-const KNOWN = new Set(['--help', '-h', '--pretty'])
+const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 /** PII 提示（设计稿 §6.5 要求 `db tables` / `db describe` 必须携带）。 */
 const PII_NOTICE = '本数据库包含客户 PII；不要将其写入日志或对外报表'

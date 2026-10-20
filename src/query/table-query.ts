@@ -27,7 +27,7 @@ type TimeColumn = NonNullable<TableDef['timeColumn']>
 
 /**
  * `--table` 的用法类错误（未知表/列、敏感列、区间无效）。
- * 纯函数只负责抛，命令层统一转 `usageFail`（退出码 2）—— 与 `parseFlags` 的异常形态同款。
+ * 纯函数只负责抛，命令层统一转 `usageFail`（退出码 2）—— 与 `parseStoreFlags` 的异常形态同款。
  */
 export class TableQueryUsageError extends Error {
   constructor(message: string) {

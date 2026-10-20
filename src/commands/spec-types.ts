@@ -16,8 +16,9 @@
 //     spec §11.2 E 也明令不要用。命中 `rejected` 要单独给「已知但未实现」话术，区别于
 //     「该命令不接受此 flag」。
 //
-// 本文件必须保持零依赖（只含类型与常量）：`core/`、`query/`、`sync/` 分层红线之外，
-// 它是 commands 层里最底层的一块，被 7 个命令模块与 `cli.ts` 的 `COMMAND_TREE` 共同消费。
+// 本文件必须保持零依赖（只含类型、常量与几个纯函数）：`core/`、`query/`、`sync/`
+// 分层红线之外，它是 commands 层里最底层的一块，被各命令模块与 `tree.ts` 的
+// `COMMAND_TREE` 共同消费。
 
 /** 位置参数的取值域——`skill check` 据此比对正文里出现的表名 / 报表表 / 任务 id / 接口 id。 */
 export type Domain = 'tables' | 'report-tables' | 'task-ids' | 'endpoint-ids'
@@ -51,6 +52,34 @@ export const GLOBAL_FLAGS: FlagSpec[] = [
   { name: '--pretty', kind: 'bool' },
 ]
 
+/**
+ * `GLOBAL_FLAGS` 的名字集合，供各解析器的 `KNOWN` 使用。
+ *
+ * 派生而不是手写：解析器的「已知 token 集」与 spec 的「完整接受集」必须同源，
+ * 否则加一个全局 flag 时两处会各自漂移（`--pretty` 就是这样同时存在于两者里的）。
+ */
+export const GLOBAL_FLAG_NAMES: readonly string[] = GLOBAL_FLAGS.map((f) => f.name)
+
+/**
+ * 渲染「可用：…」错误文案里的 flag 清单。
+ *
+ * 为什么放在这里：文案里那份清单过去是手写的，与解析器接受的 flag 是**两份**事实源
+ * （`sync run` 的 `可用：--full --since …` 与它的解析条件各写一遍）。现在两边都从
+ * 同一个模块级 `FlagSpec[]` 派生，加 flag 时不会出现「解析器认了、文案没提」。
+ *
+ * `separator` 由调用方给：`api` 族用「、」，`sync run` 的历史文案用空格——**最终字符串
+ * 必须与改造前逐字一致**，多个测试钉着它们（如 `api.test.ts` 的 `可用：--body`）。
+ *
+ * ⚠️ 目前只有 `api list` 与 `sync run` 用它；`api call` / `api schema` 的文案带取值
+ * 占位符或点名的是 `rejected` flag，**保持字面量**（见 `api.ts` 的说明）。
+ */
+export function renderFlagNames(
+  flags: readonly FlagSpec[],
+  opts: { separator?: string } = {},
+): string {
+  return flags.map((f) => f.name).join(opts.separator ?? '、')
+}
+
 /** 显式拒绝的 flag。从 GLOBAL_FLAGS 里手写一份，而不是 filter 派生——`kind` 是 bool，
  *  「是否被拒绝」不是能从 kind 推出来的属性，硬推会把 `--help` 也卷进来。 */
 export const REJECTED_FLAGS: string[] = ['--pretty']
@@ -67,6 +96,16 @@ export const STORE_FLAGS: FlagSpec[] = [
 ]
 
 /**
+ * 从一份 flag 清单里取出**吃值的** flag 名（`kind: 'value'` 或 `'repeatable'`）。
+ *
+ * `query` 的解析器用它派生 `VALUE_FLAGS`：可重复的 `--group-by` 与普通值位一样吃一个
+ * 值，只是可重复，所以两者同属「值位」。解析器不再自己手写一份值位名单。
+ */
+export function valueFlagNames(flags: readonly FlagSpec[]): string[] {
+  return flags.filter((f) => f.kind === 'value' || f.kind === 'repeatable').map((f) => f.name)
+}
+
+/**
  * 按最长前缀匹配命令路径：`['sync','run']` 优先于 `['sync']`。
  *
  * 用**原始 argv** 逐位比较，不预先滤掉 flag：真实分派取 argv[0] 当子命令
@@ -80,6 +119,15 @@ export const STORE_FLAGS: FlagSpec[] = [
  *     `--db` 落在 `sync` 的子命令位，真实分派同样报未知子命令。
  * 路径之后的位置参数不参与比较（`db describe sessions` 的 `sessions`），所以位置参数
  * 恰好等于某个命令名时也不会把路径凑长——tree 里没有那条 spec 就不命中。
+ *
+ * ⚠️ **tree 不变量：不得存在既是叶命令、又是更深 spec 前缀的 path。**
+ * 分组判定 `isGroup` 只看「tree 里有没有更深的 spec」，分不清「更深 spec 挂在哪个
+ * 父层」：若 tree 里同时有 `['sync']` 与 `['sync','run']`，`['sync']` 会被当作分组，
+ * 于是 `sync --db x run` 虽然真实分派取 argv[0]=`sync`、把 `run` 当位置参数跑，
+ * 却被判成不命中——合法 flag 被误拒（Task 1 复审 N-2）。真实分派（`const [sub, ...rest]
+ * = argv`）本就只有「叶命令 / 分组」两种形状，所以这条不变量不损失表达力。
+ * `tests/commands/command-tree.test.ts` 有断言钉住它；`spec-types.test.ts` 的 fixture
+ * 含 `['sync']` 只是为了单独测试 `isGroup` 分支的行为，不是合法的生产 tree。
  */
 export function findSpec(tree: CommandSpec[], argv: string[]): CommandSpec | undefined {
   let best: CommandSpec | undefined

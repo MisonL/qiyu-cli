@@ -17,6 +17,22 @@ import { TABLES } from '../store/schema.js'
 import { openGuardedSession } from './db.js'
 import { parseStoreFlags } from './store-flags.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import type { CommandSpec } from './spec-types.js'
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu stats …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * 位置参数的 `report-tables` 域就是 `REPORT_TABLES` 闭集，校验方据此比对正文里的表名。
+ */
+export const STATS_SPECS: CommandSpec[] = [
+  {
+    path: ['stats', 'fields'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [{ name: '报表表', domain: 'report-tables' }],
+    rejected: REJECTED_FLAGS,
+  },
+]
 
 const USAGE = `用法：qiyu stats <子命令> [参数]
 
@@ -30,7 +46,7 @@ const USAGE = `用法：qiyu stats <子命令> [参数]
 存储定位：--db / --profile / --backend（store 命令同族）。
 `
 
-const KNOWN = new Set(['--help', '-h', '--pretty'])
+const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 /**
  * -1 哨兵（spec §9.2，逐字）。设计稿 §6.2 用 A/B 实测证明：数据充足的 31 天窗口

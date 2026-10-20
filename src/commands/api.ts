@@ -10,6 +10,59 @@ import { loadParams } from '../core/registry/params.js'
 import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/validate.js'
 import { ok, fail, usageFail, describeArgs, EXIT } from '../output.js'
 import { sanitizeMessage } from '../core/sanitize.js'
+import { GLOBAL_FLAGS, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
+import type { CommandSpec, FlagSpec } from './spec-types.js'
+
+/** `api list` 的业务 flag（`flags` 里还要再并上全局 flag）。 */
+const LIST_FLAGS: FlagSpec[] = [{ name: '--all', kind: 'bool' }]
+/** `api call` 的业务 flag；顺序即「可用：」文案的顺序。 */
+const CALL_FLAGS: FlagSpec[] = [
+  { name: '--body', kind: 'value' },
+  { name: '--yes', kind: 'bool' },
+  { name: '--no-validate', kind: 'bool' },
+  { name: '--strict', kind: 'bool' },
+]
+/** `api schema` 没有业务 flag——只有全局 flag（其中 `--pretty` 在 rejected 里）。 */
+const SCHEMA_FLAGS: FlagSpec[] = []
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu api …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ */
+export const API_SPECS: CommandSpec[] = [
+  {
+    path: ['api', 'list'],
+    flags: [...GLOBAL_FLAGS, ...LIST_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['api', 'call'],
+    flags: [...GLOBAL_FLAGS, ...CALL_FLAGS],
+    positionals: [{ name: '接口id', domain: 'endpoint-ids' }],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['api', 'schema'],
+    flags: [...GLOBAL_FLAGS, ...SCHEMA_FLAGS],
+    positionals: [{ name: '接口id', domain: 'endpoint-ids' }],
+    rejected: REJECTED_FLAGS,
+  },
+]
+
+/** 各子命令的 `KNOWN`：解析器接受的 token 集 = spec 的完整接受集，两处同源。 */
+const LIST_KNOWN = new Set([...GLOBAL_FLAGS, ...LIST_FLAGS].map((f) => f.name))
+const CALL_KNOWN = new Set([...GLOBAL_FLAGS, ...CALL_FLAGS].map((f) => f.name))
+const SCHEMA_KNOWN = new Set([...GLOBAL_FLAGS, ...SCHEMA_FLAGS].map((f) => f.name))
+
+/**
+ * 「可用：…」文案里的 flag 清单。`api list` 只有 `--all`，从常量渲染即可。
+ * ⚠️ `api call` / `api schema` 的文案保持**字面量**：`readme.test.ts:58` 按**源文本**
+ * 钉着 `可用：--body <JSON>、--yes、--no-validate、--strict`，改成渲染会让它变红；
+ * 而两处的运行时文案又被 `api.test.ts` 钉着，不能改。事实源仍是上面的 `FlagSpec` 常量
+ * ——`command-tree.test.ts` 有一条断言把文案里点名的 flag 与 spec 的接受集对齐。
+ */
+const LIST_AVAILABLE = renderFlagNames(LIST_FLAGS)
 
 const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 
@@ -112,7 +165,7 @@ function list(argv: string[]): number {
   // 三条合起来 → 检查顺序必须是「未知/位置参数 → help → --pretty」。
   // ⚠️ `callOne` 2026-10-08 起与这里逐字同序（此前它 help 只认**首个** token、
   // `--pretty` 又排在位置参数之前，实测三处不一致 —— 见 `callOne` 内注释）。
-  const KNOWN = new Set(['--all', '--pretty', '--help', '-h'])
+  const KNOWN = LIST_KNOWN
   // ⚠️ 判据是"以 `-` 开头"，不是"以 `--` 开头" —— 否则单横线的 `-x` 既不算
   // 未知参数、也不进位置参数（那条的判据同样收在"不以 `-` 开头"），会被**静默
   // 丢弃**（2026-10-08 反事实实测：单改本判据为 `--`，`api list -x` 返回 0、
@@ -123,14 +176,14 @@ function list(argv: string[]): number {
   // 本条判据与位置参数那条是**一对**，动一个必须同时想另一个。
   const unknown = argv.filter((a) => a.startsWith('-') && !KNOWN.has(a))
   if (unknown.length > 0) {
-    return usageFail(`未知参数：${describeArgs(unknown)}。可用：--all`)
+    return usageFail(`未知参数：${describeArgs(unknown)}。可用：${LIST_AVAILABLE}`)
   }
   // ⚠️ 位置参数也必须报错。`api list` 不接受任何位置参数，而此前它们被**无声丢弃** ——
   // 实测 `api list extra` 返回退出码 0 与全部 9 行（默认过滤后的行数）。这与下面 `call` 的情况同族：
   // 拼错一个 flag 会被拦下（`--al` → 退出码 2），写错一个位置参数却被放过。
   const positional = argv.filter((a) => !a.startsWith('-'))
   if (positional.length > 0) {
-    return usageFail(`未知参数：${describeArgs(positional)}。api list 不接受位置参数，可用：--all`)
+    return usageFail(`未知参数：${describeArgs(positional)}。api list 不接受位置参数，可用：${LIST_AVAILABLE}`)
   }
   // 命令行已证明合法 —— 现在 help 优先于其余（见上方 ②）。
   if (argv.includes('--help') || argv.includes('-h')) {
@@ -272,11 +325,12 @@ function list(argv: string[]): number {
   })
 }
 
-const SCHEMA_KNOWN = new Set(['--pretty', '--help', '-h'])
 const SCHEMA_USAGE = `用法：qiyu api schema <接口id> [--pretty]\n\n  查看某接口的请求参数表（params）与响应形状（response_shape）。\n\n--pretty  尚未实现（无参数替代它）。当前只输出紧凑 JSON。\n`
 
 async function schema(argv: string[]): Promise<number> {
   const unknown = argv.filter((a) => a.startsWith('-') && !SCHEMA_KNOWN.has(a))
+  // ⚠️ 文案逐字保留 `可用：--pretty`：历史输出只列这一项（`--help`/`-h` 是帮助开关，
+  // 不进「可用参数」清单）；`--pretty` 本身在 spec 的 `rejected` 里，不能从 `flags` 派生。
   if (unknown.length > 0) return usageFail(`未知参数：${describeArgs(unknown)}。可用：--pretty`)
   const positional = argv.filter((a) => !a.startsWith('-'))
   const help = argv.includes('--help') || argv.includes('-h')
@@ -440,10 +494,13 @@ async function callOne(argv: string[]): Promise<number> {
   //   `--al` 是**真的拼错**（该报未知参数），`--pretty` 是**真的存在**（该报未实现）——
   //   两者同时出现时，先报哪个都对，但**三个子命令必须选同一个**，否则又是一族
   //   "同族错误两种行为"。选"未知参数优先"与 `list()` 一致。
-  const KNOWN = new Set(['--body', '--yes', '--pretty', '--help', '-h', '--no-validate', '--strict'])
+  const KNOWN = CALL_KNOWN
   const unknown = argv.filter((a, idx) =>
     a.startsWith('-') && !KNOWN.has(a) && !isBodyValue(idx))
   if (unknown.length > 0) {
+    // ⚠️ 这一句保持**字面量**：`readme.test.ts:58` 按源文本逐字钉着它（含 `<JSON>` 占位符，
+    // 渲染无法无参复现）。`command-tree.test.ts` 有一条断言把这里点名的 flag 与
+    // `CALL_FLAGS` 对齐，所以它不会与 spec 漂移。
     return usageFail(`未知参数：${describeArgs(unknown)}。可用：--body <JSON>、--yes、--no-validate、--strict`)
   }
 

@@ -18,6 +18,14 @@ export interface StoreFlags { db?: string; profile?: string; backend?: string }
 /** 值位 flag 名（`--db` 等，带 `--`），顺序沿 `STORE_FLAGS`。 */
 export const STORE_VALUE_FLAG_NAMES: readonly string[] = STORE_FLAGS.map((f) => f.name)
 
+// ⚠️ 模块级断言（Task 2 复审 M1，Task 3 顺带落地）：`parseStoreFlags` 用 `a.slice(2)`
+// 推键名，前提是每个名字都以 `--` 开头。若将来给 `STORE_FLAGS` 加一个短 flag（如 `-x`），
+// `slice(2)` 会把键写成空串并静默落进结果对象（复审实测：`{ rest: [], '': 'v' }`），
+// 既不报错也不被消费。这里 fail fast —— 这是编程错误，不该等到 Agent 拿到空串键才发现。
+if (!STORE_VALUE_FLAG_NAMES.every((n) => n.startsWith('--'))) {
+  throw new Error(`STORE_FLAGS 含非 -- 前缀的名字：${STORE_VALUE_FLAG_NAMES.join('、')}`)
+}
+
 /**
  * 把 `--db/--profile/--backend` 及其值位从 argv 里剥出来，其余 token 原序进 `rest`
  * （由调用方判「未知参数」还是「位置参数」）。

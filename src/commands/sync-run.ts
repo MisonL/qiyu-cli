@@ -30,6 +30,37 @@ import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time
 import { ok, fail, usageFail, describeArgs } from '../output.js'
 import { thrownToExit } from './store.js'
 import type { Store } from '../store/types.js'
+import { GLOBAL_FLAGS, STORE_FLAGS, renderFlagNames, valueFlagNames } from './spec-types.js'
+import type { FlagSpec } from './spec-types.js'
+
+/**
+ * `sync run` 的业务 flag。事实源是这份常量：解析器的值位判定与「可用：…」错误文案
+ * 都从它派生，`sync.ts` 的 `SYNC_SPECS` 也引用它（不另写一份）。
+ *
+ * ⚠️ `--since/--until` 是值位；`--full/--quiet` 是布尔。`--db/--profile/--backend`
+ * 走 `STORE_FLAGS`（与 `parseStoreFlags` 同一份）——`sync run` 自己解析这三个 flag
+ * （不走 `parseStoreFlags`：它要连同 `--since/--until` 一起按值位处理）。
+ *
+ * ⚠️ **数组顺序就是「可用：…」文案的顺序**（历史文案是 `--full --since --until --quiet
+ * --db --profile --backend`，逐字被既有输出依赖）：不要按「先布尔后值位」重排。
+ */
+export const RUN_FLAGS: FlagSpec[] = [
+  { name: '--full', kind: 'bool' },
+  { name: '--since', kind: 'value' },
+  { name: '--until', kind: 'value' },
+  { name: '--quiet', kind: 'bool' },
+  ...STORE_FLAGS,
+]
+
+/** 值位 flag 名（`--since/--until/--db/--profile/--backend`）。 */
+const RUN_VALUE_FLAGS = valueFlagNames(RUN_FLAGS)
+/** 布尔 flag 名（`--full/--quiet`）。 */
+const RUN_BOOL_FLAGS = RUN_FLAGS.filter((f) => f.kind === 'bool').map((f) => f.name)
+/**
+ * 「可用：……」清单。⚠️ **分隔符是空格**（不是「、」）——这行文案逐字被既有输出依赖，
+ * 不得改分隔符。
+ */
+const RUN_AVAILABLE = renderFlagNames(RUN_FLAGS, { separator: ' ' })
 
 // E 起时间助手下沉 core/time（query/ 不得 import sync/，两域同源）；本层保留
 // re-export —— 既有导入点（commands/sync.ts 等）与测试不破。
@@ -191,7 +222,10 @@ function storeInitFail(e: unknown): number {
 export async function runSyncRun(argv: string[]): Promise<number> {
   const clock = (): number => Date.now()
   // —— flag 解析（store.ts 同族：值位守卫，--开头算缺值）——
-  const KNOWN = new Set(['--full', '--quiet', '--pretty', '--help', '-h'])
+  // 已知 token 集（help 分流的豁免名单）= 全局 flag + 本命令的**布尔** flag。
+  // ⚠️ 不含值位：`sync run --help --since 7d` 必须报「--help 不接受额外参数」并把
+  // `--since` 点出来（既有测试钉着这条次序）；值位只在下面的解析循环里消费。
+  const KNOWN = new Set([...GLOBAL_FLAGS.map((f) => f.name), ...RUN_BOOL_FLAGS])
 
   // ⚠️ `--help` 必须先分流、且不吞额外参数（架构审查 F2）：全仓不变量是「help 永远成功、
   // 但不能把写错的参数静默吃掉」。早先这一分支写在解析循环里，于是
@@ -213,17 +247,17 @@ export async function runSyncRun(argv: string[]): Promise<number> {
   const taskIds: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
-    if (a === '--since' || a === '--until' || a === '--db' || a === '--profile' || a === '--backend') {
+    if (RUN_VALUE_FLAGS.includes(a)) {
       const v = argv[i + 1]
       if (v === undefined || v.startsWith('--')) {
         return usageFail(`${a} 缺少取值`)
       }
       flags[a] = v
       i++
-    } else if (KNOWN.has(a)) {
+    } else if (RUN_BOOL_FLAGS.includes(a)) {
       flags[a] = a
     } else if (a.startsWith('-')) {
-      return usageFail(`未知参数：${describeArgs([a])}。可用：--full --since --until --quiet --db --profile --backend`)
+      return usageFail(`未知参数：${describeArgs([a])}。可用：${RUN_AVAILABLE}`)
     } else {
       taskIds.push(a)
     }
