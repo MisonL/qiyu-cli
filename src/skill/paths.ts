@@ -66,6 +66,11 @@ export type LinkState = 'ok' | 'dangling' | 'foreign' | 'missing'
 /**
  * 判定 `linkPath` 相对 `entityDir` 的状态。比较前两边都过 `path.resolve`，
  * 抹平相对/绝对与 `..` 段的写法差异，避免「同一个目录、两种字符串」被判成 foreign。
+ *
+ * 注意：自指或成环的符号链接（realpath 解析超过系统上限）会抛 ELOOP，**不落四态** ——
+ * ELOOP 不在内部吞掉的错误之列（`lstatOrNull` 只吞 ENOENT，`realpathOrNull` 吞
+ * ENOENT/ENOTDIR，其余一律照常抛）。Task 11 的 `skill where`
+ * 若要在这种异常环境下仍然给出可读输出，需要自己在调用处兜住。
  */
 export function linkState(linkPath: string, entityDir: string): LinkState {
   const stat = lstatOrNull(linkPath)
