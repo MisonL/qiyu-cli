@@ -12,8 +12,8 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readlinkSync,
-  symlinkSync, statSync, existsSync, realpathSync,
+  chmodSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, readFileSync,
+  readlinkSync, symlinkSync, statSync, existsSync, realpathSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -114,6 +114,7 @@ describe('installSkill', () => {
     expect(m.version).toBe('1.2.3')
     expect(m.skill_contract_version).toBe(SKILL_CONTRACT_VERSION)
     expect(m.content_hash).toBe(contentHash(src))
+    expect(m.files).toEqual(['SKILL.md', 'protocols.md', 'references/deep.md'])
     expect(Number.isNaN(Date.parse(m.installed_at))).toBe(false)
 
     expect(r.links).toEqual([{ agent: 'claude-code', path: join(agent, 'qiyu'), state: 'ok' }])
@@ -190,7 +191,7 @@ describe('installSkill', () => {
     expect(m.content_hash).toBe(contentHash(src))
   })
 
-  it('--force 覆盖时清掉上一版遗留的文件，并如实警告（不静默删除）', async () => {
+  it('--force 清理上一版受管文件（按清单 files 界定），并如实警告', async () => {
     const src = makeSource()
     await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
     const entity = defaultEntityDir(home)
@@ -201,12 +202,49 @@ describe('installSkill', () => {
 
     expect(r.status).toBe('updated')
     expect(existsSync(join(entity, 'references', 'deep.md'))).toBe(false)
-    expect(r.warnings.some((w) => w.includes('deep.md'))).toBe(true)
+    expect(r.warnings.some((w) => w.includes('references/deep.md'))).toBe(true)
+    expect(r.warnings.some((w) => w.includes('上一版安装、本版不再包含'))).toBe(true)
     // 清理后目标哈希与源一致：下一次安装必须能回到 skipped。
     expect(readManifest(entity).content_hash).toBe(contentHash(src))
     const again = await installSkill({ home, sourceDir: src, version: '1.3.0', force: false })
     expect(again.status).toBe('skipped')
     expect(again.warnings).toEqual([])
+  })
+
+  it('--force 不删用户新增的文件（审查 I2：以清单 files 界定，不删一切包外文件）', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+    const entity = defaultEntityDir(home)
+    // 用户在实体里放了自己的笔记，包内没有。
+    write(entity, 'my-notes.md', '用户自己的笔记\n')
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.3.0', force: true })
+
+    expect(r.status).toBe('updated')
+    expect(readFileSync(join(entity, 'my-notes.md'), 'utf8')).toBe('用户自己的笔记\n')
+    expect(r.warnings.some((w) => w.includes('my-notes.md') && w.includes('保留'))).toBe(true)
+  })
+
+  it('清单没有 files 字段（旧格式）：--force 不删任何包外文件，只警告', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+    const entity = defaultEntityDir(home)
+    // 模拟本任务之前写的清单：没有 files 字段。
+    const m = readManifest(entity)
+    writeFileSync(join(entity, MANIFEST), JSON.stringify({
+      version: m.version, skill_contract_version: m.skill_contract_version,
+      content_hash: m.content_hash, installed_at: m.installed_at,
+    }))
+    write(entity, 'old-leftover.md', '上一版遗留\n')
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.3.0', force: true })
+
+    expect(r.status).toBe('updated')
+    // 无法识别上一版 → 宁可不删。
+    expect(existsSync(join(entity, 'old-leftover.md'))).toBe(true)
+    expect(r.warnings.some((w) => w.includes('old-leftover.md') && w.includes('未删除'))).toBe(true)
   })
 
   it('内容没变但版本变了：只重写清单，正文不动，status=updated', async () => {
@@ -234,6 +272,211 @@ describe('installSkill', () => {
     ).rejects.toThrow(/实体/)
   })
 
+  // —— 审查 C1：用户内容全为符号链接的实体不是空目录 ——
+  it('实体只含符号链接（无 force）：不得被删、不得被判为空目录', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(entity, { recursive: true })
+    const victim = join(home, 'user-notes.md')
+    writeFileSync(victim, '用户笔记\n')
+    symlinkSync(victim, join(entity, 'notes'))
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+
+    expect(r.status).toBe('skipped')
+    expect(r.warnings.some((w) => w.includes('--force'))).toBe(true)
+    // 链接本身原样保留，指向的用户文件也没被动过。
+    expect(readlinkSync(join(entity, 'notes'))).toBe(victim)
+    expect(readFileSync(victim, 'utf8')).toBe('用户笔记\n')
+  })
+
+  it('真空实体（只剩 manifest）：按首次安装换入', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(entity, { recursive: true })
+    write(entity, MANIFEST, JSON.stringify({ version: '0.0.0' }))
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+
+    expect(r.status).toBe('installed')
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# qiyu\n')
+  })
+
+  it('实体含用户子目录（无 force）：不覆盖、子目录原样保留', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    write(entity, 'user-dir/private.md', '私有内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+
+    expect(r.status).toBe('skipped')
+    expect(readFileSync(join(entity, 'user-dir', 'private.md'), 'utf8')).toBe('私有内容\n')
+  })
+
+  // —— 审查 C2：实体里的符号链接不得被写穿（copy 写穿 / rename 替换，两种都拦） ——
+  it('实体 SKILL.md 是指向用户文件的符号链接（无 force）：不得写穿', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(entity, { recursive: true })
+    const victim = join(home, 'my-notes.md')
+    writeFileSync(victim, '珍贵笔记\n')
+    symlinkSync(victim, join(entity, 'SKILL.md'))
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+
+    // 链接未被替换为普通文件，用户文件内容原封不动；按「内容不同」跳过并提示 --force。
+    expect(lstatSync(join(entity, 'SKILL.md')).isSymbolicLink()).toBe(true)
+    expect(readFileSync(victim, 'utf8')).toBe('珍贵笔记\n')
+    expect(r.status).toBe('skipped')
+    expect(r.warnings.some((w) => w.includes('--force'))).toBe(true)
+  })
+
+  it('实体 SKILL.md 是指向用户文件的符号链接（带 force）：同样不得写穿', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(entity, { recursive: true })
+    const victim = join(home, 'my-notes.md')
+    writeFileSync(victim, '珍贵笔记\n')
+    symlinkSync(victim, join(entity, 'SKILL.md'))
+
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: true })
+
+    expect(lstatSync(join(entity, 'SKILL.md')).isSymbolicLink()).toBe(true)
+    expect(readFileSync(victim, 'utf8')).toBe('珍贵笔记\n')
+  })
+
+  it('实体子目录是目录符号链接（force）：不得经它写进实体之外', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(entity, { recursive: true })
+    const outside = join(home, 'outside-dir')
+    mkdirSync(outside)
+    symlinkSync(outside, join(entity, 'references'))
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    // 链接还在（未被 rename 替换），实体之外没有新文件落进来。
+    expect(lstatSync(join(entity, 'references')).isSymbolicLink()).toBe(true)
+    expect(existsSync(join(outside, 'deep.md'))).toBe(false)
+    expect(r.warnings.some((w) => w.includes('references'))).toBe(true)
+  })
+
+  // —— 审查 I1/I3：暂存失败时实体保持原样 ——
+  it('覆盖中断（目标子路径被目录占用）：其余文件已换入、清单保持上一版，修复占用后重跑收敛', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    // 把 SKILL.md 换成目录：rename 换入必然失败（EISDIR），模拟覆盖中断。
+    rmSync(join(entity, 'SKILL.md'))
+    mkdirSync(join(entity, 'SKILL.md'))
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    // 被占用的文件跳过并警告；其余文件原子换入；清单保持上一版（写入不完整不换清单），
+    // 这样下一次安装的漂移探测才能如实报 stale。
+    expect(r.warnings.some((w) => w.includes('SKILL.md'))).toBe(true)
+    expect(r.warnings.some((w) => w.includes('未能完整写入'))).toBe(true)
+    expect(readManifest(entity).version).toBe('1.0.0')
+    expect(readFileSync(join(entity, 'protocols.md'), 'utf8')).toBe('协议正文\n')
+
+    // 无 force 重跑：内容与包内不同 → 如实 skipped + 提示 --force。
+    const skipped = await installSkill({ home, sourceDir: src, version: '1.1.0', force: false })
+    expect(skipped.status).toBe('skipped')
+    expect(skipped.warnings.some((w) => w.includes('--force'))).toBe(true)
+
+    // 用户清掉占用后 force：完整写入、清单换新；再装回到幂等 skipped。
+    rmSync(join(entity, 'SKILL.md'), { recursive: true })
+    const fixed = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+    expect(fixed.warnings).toEqual([])
+    expect(readManifest(entity).version).toBe('1.1.0')
+    expect(readManifest(entity).content_hash).toBe(contentHash(src))
+    expect((await installSkill({ home, sourceDir: src, version: '1.1.0', force: false })).status)
+      .toBe('skipped')
+  })
+
+  it('源目录内容不可读：明确抛错且实体保持原样（审查 I1）', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return // root 下 chmod 不拦读取
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    const manifestBefore = readManifest(entity)
+    // 源里加一个不可读文件：读源阶段就失败，实体还一个字节没动。
+    write(src, 'extra/secret.md', 'x\n')
+    chmodSync(join(src, 'extra', 'secret.md'), 0o000)
+    try {
+      await expect(
+        installSkill({ home, sourceDir: src, version: '1.1.0', force: true }),
+      ).rejects.toThrow(/skill 源目录不可读/)
+    } finally {
+      chmodSync(join(src, 'extra', 'secret.md'), 0o644)
+    }
+
+    // 实体一个字节不变：正文、清单都还是 1.0.0，新目录没落进来。
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# qiyu\n')
+    expect(readManifest(entity)).toEqual(manifestBefore)
+    expect(existsSync(join(entity, 'extra'))).toBe(false)
+  })
+
+  it('暂存阶段失败（实体父目录只读）：抛错且用户内容保持原样（审查 I1，去 rename 换入变异即红）', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return // root 下 chmod 不拦写入
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    // 用户改过正文；再把实体父目录设为只读：暂存目录建不出来 → 暂存阶段失败。
+    write(entity, 'SKILL.md', '# 用户自己改过的内容\n')
+    const skillsRoot = join(home, '.agents', 'skills')
+    chmodSync(skillsRoot, 0o555)
+    try {
+      await expect(
+        installSkill({ home, sourceDir: src, version: '1.1.0', force: true }),
+      ).rejects.toThrow(/暂存目录写入失败/)
+    } finally {
+      chmodSync(skillsRoot, 0o755) // 让 afterEach 能清理
+    }
+
+    // 实体保持原样：用户的正文没有被覆盖，清单还是 1.0.0。
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# 用户自己改过的内容\n')
+    expect(readManifest(entity).version).toBe('1.0.0')
+    // 暂存目录没有残留。
+    expect(readdirSync(skillsRoot).filter((n) => n.includes('.tmp-'))).toEqual([])
+  })
+
+  // —— 审查 I4：实体不可读时 --force 仍能修复 ——
+  it('实体内容不可读（chmod 000）：无 force 跳过并警告，有 force 正常覆盖', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    chmodSync(join(entity, 'SKILL.md'), 0o000)
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    try {
+      const skipped = await installSkill({ home, sourceDir: src, version: '1.1.0', force: false })
+      expect(skipped.status).toBe('skipped')
+      expect(skipped.warnings.some((w) => w.includes('--force'))).toBe(true)
+
+      const forced = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+      expect(forced.status).toBe('updated')
+      expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# 新版包内容\n')
+    } finally {
+      chmodSync(join(entity, 'SKILL.md'), 0o644) // 让 afterEach 能清理
+    }
+  })
+
+  it('清单损坏（JSON 残缺）：正文一致时只重写清单，不视为用户改动（审查 M2）', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+    const entity = defaultEntityDir(home)
+    writeFileSync(join(entity, MANIFEST), '{ 残缺的 JSON')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.3.0', force: false })
+
+    expect(r.status).toBe('updated')
+    expect(readManifest(entity).version).toBe('1.3.0')
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# qiyu\n')
+  })
+
   it('noLink：只放实体，不建任何链接', async () => {
     const src = makeSource()
     mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
@@ -245,19 +488,20 @@ describe('installSkill', () => {
     expect(existsSync(join(defaultEntityDir(home), 'SKILL.md'))).toBe(true)
   })
 
-  it('linkDirs 指向不存在的目录：不建链接、links=[]、不替用户建目录', async () => {
+  it('linkDirs 指向不存在的目录：不建链接、不替用户建目录，links 记 missing（审查 M3）', async () => {
     const src = makeSource()
     const missing = join(home, '.claude', 'skills')
     const r = await installSkill({
       home, sourceDir: src, version: '1.2.3', force: false, linkDirs: [missing],
     })
-    expect(r.links).toEqual([])
+    // 显式点名的目录不存在：Task 11 要逐 agent 展示状态，links 不能缺行。
+    expect(r.links).toEqual([{ agent: missing, path: join(missing, 'qiyu'), state: 'missing' }])
     expect(existsSync(missing)).toBe(false)
     // 显式点名却不存在，要告诉用户；自动探测为空则不告警（没有 agent 是正常状态）。
     expect(r.warnings.some((w) => w.includes(missing))).toBe(true)
   })
 
-  it('linkDirs 指向文件而非目录：警告并跳过，不让安装失败', async () => {
+  it('linkDirs 指向文件而非目录：警告并跳过，links 记 missing，不让安装失败', async () => {
     const src = makeSource()
     const notDir = join(home, 'not-a-dir')
     writeFileSync(notDir, '')
@@ -267,8 +511,23 @@ describe('installSkill', () => {
     })
 
     expect(r.status).toBe('installed')
-    expect(r.links).toEqual([])
+    expect(r.links).toEqual([{ agent: notDir, path: join(notDir, 'qiyu'), state: 'missing' }])
     expect(r.warnings.some((w) => w.includes(notDir))).toBe(true)
+  })
+
+  it('linkDirs 的父路径是文件（ENOTDIR）时收敛进 warnings，不让安装失败（审查 M1）', async () => {
+    const src = makeSource()
+    const blocker = join(home, 'blocker')
+    writeFileSync(blocker, '')
+    const unreachable = join(blocker, 'skills')
+
+    const r = await installSkill({
+      home, sourceDir: src, version: '1.2.3', force: false, linkDirs: [unreachable],
+    })
+
+    expect(r.status).toBe('installed')
+    expect(r.links).toEqual([{ agent: unreachable, path: join(unreachable, 'qiyu'), state: 'missing' }])
+    expect(r.warnings.some((w) => w.includes('检查') && w.includes(unreachable))).toBe(true)
   })
 
   it('已存在的 foreign 目录：不覆盖、state=foreign、用户内容原样保留', async () => {
