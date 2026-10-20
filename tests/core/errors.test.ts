@@ -475,15 +475,16 @@ describe('ErrorKind 闭集（E 组扩展）', () => {
 
 describe('ERROR_KINDS 运行时常量', () => {
   // 全量清单（20 个，当前版本真正会产出的 kind）—— F 子项目 Task 4。
-  // 顺序与 `errors.ts` 的 `ERROR_KINDS` 声明顺序一致，便于逐行对照；
-  // 断言用 toContain，不依赖顺序本身（skill check 也只做"存在性"校验）。
-  const ALL: readonly string[] = [
+  // ⚠️ 必须 `as const`：元素类型要是**字面量联合**，下方
+  // `Exclude<ErrorKind, (typeof ALL)[number]>` 才可能非空（标注成 `readonly string[]`
+  // 会让它恒为 `never`，编译期护栏变成空转）。顺序与 `errors.ts` 的声明顺序一致。
+  const ALL = [
     'auth', 'auth_missing', 'bad_time', 'param', 'rate_limit', 'module_offline',
     'window_too_large', 'window_misaligned', 'not_in_queue', 'pending',
     'route_not_found', 'internal', 'network', 'usage', 'unknown',
     'needs_confirmation', 'store_locked', 'store_not_initialized',
     'query_timeout', 'sync_not_run',
-  ]
+  ] as const
 
   it('包含当前版本全部会产出的 kind', () => {
     for (const k of ALL) {
@@ -503,17 +504,22 @@ describe('ERROR_KINDS 运行时常量', () => {
     expect(new Set(ERROR_KINDS).size).toBe(ERROR_KINDS.length)
   })
 
-  // 双向闭集：既不能多（多出来的值运行时产不出来，Agent 会为一个不存在的
-  // kind 写处理分支），也不能少（skill check 会误判正文里真实的 kind 为违规）。
   it('不多不少 —— 与上面那份清单互为闭集', () => {
     expect([...ERROR_KINDS].sort()).toEqual([...ALL].sort())
   })
 
-  it('派生出的 ErrorKind 覆盖常量里的每个成员（编译期 + 运行时双向对齐）', () => {
-    // `satisfies` 让 tsc 核对"常量数组的每个元素都真的是 ErrorKind"；
-    // 若有人给常量加了值却没进联合（或反之），这里报错。
-    // 反向（联合有、常量没有）由 `npm run typecheck` 在 `kind: '...'` 字面量处抓住。
-    const ks: readonly ErrorKind[] = ERROR_KINDS satisfies readonly ErrorKind[]
-    expect(ks).toHaveLength(ALL.length)
+  // 编译期双向校验（vitest 只转译、不查类型，所以真正的护栏是 `npm run typecheck`）：
+  //   · ALL 多出常量里没有的值 → 下方 `satisfies readonly ErrorKind[]` 报 TS1360；
+  //   · 常量多出 ALL 里没有的值（有人加 kind 却忘了同步这份清单）→ `Unlisted`
+  //     不再是 `never`，`noUnlistedKind: true` 报 TS2322。
+  // ⚠️ 这里**不能**写成 `const ks: readonly ErrorKind[] = ERROR_KINDS` ——
+  // `ErrorKind` 本身就是从 `ERROR_KINDS` 派生的，那种断言永远为真，
+  // 看着像护栏、实际测不到任何漂移（本任务自审时删掉过一次）。
+  it('两份清单在类型层面也互为闭集', () => {
+    const ks = ALL satisfies readonly ErrorKind[]
+    type Unlisted = Exclude<ErrorKind, (typeof ALL)[number]>
+    const noUnlistedKind: [Unlisted] extends [never] ? true : never = true
+    expect(noUnlistedKind).toBe(true)
+    expect(ks.length).toBe(ERROR_KINDS.length)
   })
 })
