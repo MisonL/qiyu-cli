@@ -81,8 +81,10 @@ export function linkState(linkPath: string, entityDir: string): LinkState {
   const resolvedEntity = realpathOrNull(entityDir)
   if (resolvedEntity === null) return 'dangling'
 
-  // realpath 本身已把路径归一化（含大小写，Windows 上返回卷上的真实写法），
-  // 两边再走一次 path.resolve 后严格比较即可。
+  // 两边都过 realpath 后再 path.resolve 严格比较。POSIX 上 realpath 已消除
+  // `..`、重复斜杠与符号链接，严格相等即同一目录（本机已由用例覆盖）。Windows
+  // 上 realpath 预期返回卷上的规范写法，使大小写差异自然消解 —— 这一条是推断，
+  // 未在本机实测（见 spec §跨平台）。
   return path.resolve(resolvedLink) === path.resolve(resolvedEntity) ? 'ok' : 'foreign'
 }
 
