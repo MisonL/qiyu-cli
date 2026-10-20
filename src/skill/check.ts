@@ -49,6 +49,11 @@ export interface CheckContext {
   errorKinds: readonly string[]
 }
 
+/** 转义正则元字符：表名来自 `CheckContext` 注入，按字面匹配而不是正则模式。 */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /**
  * 校验一份 skill 文档正文。
  *
@@ -102,9 +107,11 @@ export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
   // 3：表名。代码面片段由 refs.ts 统一收集（行内代码 + 围栏内容行），这里只做词边界匹配。
   // `(?<![\w-])` / `(?![\w-])`：`tag` 不命中 `tags`、`staff` 不命中 `staff_groups`；
   // 大小写敏感（不加 `i`），避免把 `Staff` 之类的英文单词误判成表名。
+  // 表名先过 escapeRegExp：当前 TABLES 全是 `[a-z_]+` 所以不转义也安全，但 `tableNames`
+  // 是调用方注入的，契约上不能假定它永远只含标识符字符。
   const matchers = ctx.tableNames.map((name) => ({
     name,
-    re: new RegExp(`(?<![\\w-])${name}(?![\\w-])`),
+    re: new RegExp(`(?<![\\w-])${escapeRegExp(name)}(?![\\w-])`),
   }))
   for (const segment of collectSegments(text)) {
     for (const { name, re } of matchers) {
@@ -156,6 +163,11 @@ export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
  *
  * 汇总时把「文件:行」前缀写进 detail（如 `SKILL.md:3 …`）—— `Violation` 没有文件名字段，
  * 多文件汇总时只靠行号无法定位；`line` 仍保留原行号供程序化消费。
+ *
+ * ⚠️ 抛错边界（本函数不吞错，由调用方守卫，`qiyu skill check` 要接）：
+ *   · `dir` 不存在 → `readdirSync` 抛 `ENOENT`；
+ *   · `dir` 下有名为 `*.md` 的子目录 → `readFileSync` 读目录抛 `EISDIR`；
+ *   · 某个文件读不出来（权限等）→ `readFileSync` 的原始错误。
  */
 export function checkSkillDir(dir: string, ctx: CheckContext): CheckResult {
   const violations: Violation[] = []
