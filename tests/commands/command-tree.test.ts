@@ -1,6 +1,13 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { COMMAND_TREE } from '../../src/commands/tree.js'
-import { GLOBAL_FLAGS } from '../../src/commands/spec-types.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES } from '../../src/commands/spec-types.js'
+import { authCommand } from '../../src/commands/auth.js'
+import { apiCommand } from '../../src/commands/api.js'
+import { storeCommand } from '../../src/commands/store.js'
+import { syncCommand } from '../../src/commands/sync.js'
+import { dbCommand } from '../../src/commands/db.js'
+import { queryCommand } from '../../src/commands/query.js'
+import { statsCommand } from '../../src/commands/stats.js'
 import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,6 +19,16 @@ const paths = COMMAND_TREE.map((s) => s.path.join(' ')).sort()
 // 仓库测试统一用 `fileURLToPath(import.meta.url)` 定位源码（ESM 下没有 `__dirname`），
 // brief 里的 `__dirname` 在 vitest ESM 中不可用，这里换成等价写法。
 const srcRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'commands')
+
+// 行为式断言要调用真实处理器并读它们的双通道输出（usageFail 同时写 stderr 与 stdout JSON）。
+let out = ''
+let err = ''
+beforeEach(() => {
+  out = ''; err = ''
+  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
+  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+})
+afterEach(() => { vi.restoreAllMocks() })
 
 describe('COMMAND_TREE', () => {
   it('覆盖全部 16 条叶命令', () => {
@@ -69,25 +86,23 @@ describe('COMMAND_TREE', () => {
       }
     }
   })
-  // 错误文案与解析器同源，但**最终字符串**不得变：多处测试钉着「可用：…」的逐字文案
-  // （`api.test.ts` / `readme.test.ts` 按字面量，`sync run` 的旧文案分隔符是空格不是「、」）。
-  // 这里按**源文本**钉住渲染形态：分隔符写错时，运行时断言未必覆盖到（`sync run` 的
-  // 「可用：」分支此前无任何测试）。
-  it('「可用：」文案与解析器同源 —— sync run 空格分隔，api list 从常量渲染', () => {
-    const runSrc = readFileSync(join(srcRoot, 'sync-run.ts'), 'utf8')
-    expect(runSrc).toMatch(/renderFlagNames\(RUN_FLAGS, \{ separator: ' ' \}\)/)
+  // ⚠️ 「可用：」的运行时形态由**行为式**断言守：`sync run` 的整句由 `sync.test.ts` 的
+  // 「未知 flag 的『可用：』文案（逐字）」逐字钉住；`api call` 的字面量文案由下一条
+  // 断言与 spec 对齐。
+  // 这里早先有一条 `expect(runSrc).toMatch(/renderFlagNames\(RUN_FLAGS, \{ separator: ' ' \}\)/)`
+  // ——它把**实现写法**逐字钉住（照抄实现），却不回答「文案对不对」，且顺序漂移完全不拦，
+  // 复审 I-3 已删，不再恢复。
+  // 复审 I-1：`api call` 的「可用：」文案是字面量（readme.test.ts 按源文本钉着它），
+  // 所以这里必须把**字面量**与 spec 的接受集对齐。⚠️ 正则必须锚到**运行时那一行**
+  // `return usageFail(\`未知参数：${describeArgs(unknown)}。可用：…\`)` —— 早先只写
+  // `/可用：(--body[^\n]*)`/，命中的是 api.ts 顶部**注释**里的同一句话：删掉运行时文案里的
+  // `--no-validate` 时全量 1162 条仍绿，断言等于空转（复审实测）。
+  it('api call 的运行时「可用：」文案点名的 flag 与 spec 接受集完全一致', () => {
     const apiSrc = readFileSync(join(srcRoot, 'api.ts'), 'utf8')
-    // `readme.test.ts` 按源文本钉这一句：它必须保持字面量（含 `<JSON>` 占位符）。
-    expect(apiSrc).toMatch(/可用：--body <JSON>、--yes、--no-validate、--strict/)
-    expect(apiSrc).toMatch(/const LIST_AVAILABLE = renderFlagNames\(LIST_FLAGS\)/)
-  })
-  // 上一条保留了 `api call` 的字面量文案，这里把字面量与 spec 对齐：文案里点名的每个 flag
-  // 都必须是 `api call` 的接受集成员，且名单不能漏（否则「可用：」会承诺一个不存在的 flag、
-  // 或漏掉一个真实存在的）。`<JSON>` 是 `--body` 的取值占位符，剥掉再比。
-  it('api call 字面量文案点名的 flag 与 spec 接受集完全一致', () => {
-    const apiSrc = readFileSync(join(srcRoot, 'api.ts'), 'utf8')
-    const line = apiSrc.match(/可用：(--body[^`\n]*)`/)?.[1] ?? ''
-    const listed = line.split('、').map((s) => s.trim().split(' ')[0])
+    const m = apiSrc.match(/return usageFail\(`未知参数：\$\{describeArgs\(unknown\)\}。可用：(--body[^`\n]*)`\)/)
+    expect(m, 'api.ts 里必须能找到 api call 的运行时「可用：」文案（而不是注释里的同款句子）').not.toBeNull()
+    // 剥掉 `--body` 的取值占位符（`<JSON>`），只留 flag 名。
+    const listed = m![1]!.split('、').map((s) => s.trim().split(' ')[0])
     const call = COMMAND_TREE.find((s) => s.path.join(' ') === 'api call')!
     const accepted = call.flags.map((f) => f.name).filter((n) => !GLOBAL_FLAGS.some((g) => g.name === n))
     expect(listed).toEqual(accepted)
@@ -103,6 +118,60 @@ describe('COMMAND_TREE', () => {
     const business = s.flags.map((f) => f.name).filter((n) => !GLOBAL_FLAGS.some((g) => g.name === n))
     expect(business).toEqual(['--yes'])
   })
+  // 复审 I-2：**行为式**集合断言。源码字面量断言只回答「字面量存在」，拦不住「spec 多写
+  // 一个解析器不接受的 flag」（多写的名字当然也能在源码里找到）。这里直接调用真实处理器，
+  // 分两个探针 —— 为什么必须拆成两个，见下：
+  //
+  //   ① 基线探针：`<命令> <位置参数> --zzz-sentinel`
+  //      断言错误里出现「未知参数：…--zzz-sentinel」——证明这条命令**确实有**未知参数
+  //      检测、且 sentinel 走到了那一层（不是更早的「缺表名/缺接口 id」把它挤掉）。
+  //   ② 排除探针：`<命令> <位置参数> <被测 flag> x --zzz-sentinel`
+  //      断言「未知参数：…」那一段里**不含**被测 flag——证明解析器认它。
+  //      多写一个 flag → 解析器不认识它 → 它必然落进未知参数清单 → 红。
+  //
+  // ⚠️ 为什么不把「含 sentinel」与「不含被测 flag」合成一条：`sync` 的 `parseSubFlags`
+  // 遇到**第一个**未知 token 就抛、只报一个（`api`/`store`/`db`/`query` 是 filter 收集全部）。
+  // 合成一条时，`sync status --all …` 只会报 `未知参数：--all`、sentinel 根本不出现，
+  // 于是失败信息会误导成「没走到未知检测」，而真实结论是「解析器不接受 --all」。
+  //
+  // 位置参数用**真实闭集值**（ticket.search / sessions / daily_overview）：避免在未知参数
+  // 检测之前就因「未知接口/未知表」失败。`x` 占位值只为了让值位 flag 吃掉一个 token。
+  // 所有探针都不会打开库或发网络：未知参数检测在各命令里都排在开库之前（`store` 的
+  // `--db x` 只是被解析、不落盘；`sync install` 的 cron 校验也在未知检测之后）。
+  it('spec 里的每个非全局 flag 都被真实解析器接受（多写一个 → 必红）', async () => {
+    const HANDLERS: Record<string, (argv: string[]) => Promise<number>> = {
+      auth: authCommand, api: apiCommand, store: storeCommand, sync: syncCommand,
+      db: dbCommand, query: queryCommand, stats: statsCommand,
+    }
+    const POSITIONAL: Record<string, string[]> = {
+      'api call': ['ticket.search'],
+      'api schema': ['ticket.search'],
+      'db describe': ['sessions'],
+      'stats fields': ['daily_overview'],
+    }
+    for (const s of COMMAND_TREE) {
+      const key = s.path.join(' ')
+      const handler = HANDLERS[s.path[0]!]!
+      // 处理器收到的 argv 不含顶层命令名（与 cli.ts 的 `COMMANDS[sub](rest)` 一致）。
+      const head = [...s.path.slice(1), ...(POSITIONAL[key] ?? [])]
+
+      // ① 基线探针
+      out = ''; err = ''
+      const baseCode = await handler([...head, SENTINEL])
+      const baseMsg = messageOf()
+      expect(unknownSegment(baseMsg), `${key}：未知参数检测不可达（message=${baseMsg}）`).toContain(SENTINEL)
+      expect(baseCode, `${key} 的基线探针`).toBe(2)
+
+      // ② 排除探针：每个非全局 flag 单独一次
+      for (const flag of s.flags.map((f) => f.name).filter((n) => !GLOBAL_FLAG_NAMES.includes(n))) {
+        out = ''; err = ''
+        await handler([...head, flag, 'x', SENTINEL])
+        const msg = messageOf()
+        expect(unknownSegment(msg).split(/[、\s]+/),
+          `${key} 的 ${flag}：解析器不接受它（message=${msg}）`).not.toContain(flag)
+      }
+    }
+  })
   // Task 1 复审 N-2 钉 tree 不变量：`findSpec` 用「tree 里还有更深 spec」判分组，
   // 若某条 spec 既是叶命令、又是更深的 spec 的前缀（如同时有 `['sync']` 与 `['sync','run']`），
   // 它会把 `sync --db x run`、甚至 `sync run` 之后的 flag 场景误判 —— 真实分派取 argv[0]
@@ -116,3 +185,21 @@ describe('COMMAND_TREE', () => {
     }
   })
 })
+
+const SENTINEL = '--zzz-sentinel'
+/** 从 usageFail 的输出里取 message（JSON 在 stdout，rejection/错误兜底在 stderr）。 */
+function messageOf(): string {
+  if (out.trim() !== '') {
+    try { return (JSON.parse(out) as { error?: { message?: string } }).error?.message ?? '' } catch { /* 下面回落 */ }
+  }
+  return err
+}
+/** 从错误文案里截出「未知参数：…」那一段（到第一个句号为止）。 */
+function unknownSegment(message: string): string {
+  const marker = '未知参数：'
+  const i = message.indexOf(marker)
+  if (i < 0) return ''
+  const rest = message.slice(i + marker.length)
+  const stop = rest.indexOf('。')
+  return stop < 0 ? rest : rest.slice(0, stop)
+}
