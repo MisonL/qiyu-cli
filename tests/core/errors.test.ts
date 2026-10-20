@@ -515,11 +515,24 @@ describe('ERROR_KINDS 运行时常量', () => {
   // ⚠️ 这里**不能**写成 `const ks: readonly ErrorKind[] = ERROR_KINDS` ——
   // `ErrorKind` 本身就是从 `ERROR_KINDS` 派生的，那种断言永远为真，
   // 看着像护栏、实际测不到任何漂移（本任务自审时删掉过一次）。
-  it('两份清单在类型层面也互为闭集', () => {
+  //
+  // ⚠️ 本用例**没有运行时断言**，这是有意的（复审 M-3）：真正的判据全在类型层，
+  // 而 vitest 只转译、不查类型 —— 写成 `expect(noUnlistedKind).toBe(true)` 是恒真的
+  // （类型不过就根本不会运行到这一行），正是本仓库反复要消灭的「声明了但没人读」。
+  // 保留一个 `it` 只在类型出错时给出可读的失败位置（typecheck 会指向这里）。
+  it('两份清单在类型层面也互为闭集（判据在类型层，靠 npm run typecheck）', () => {
     const ks = ALL satisfies readonly ErrorKind[]
     type Unlisted = Exclude<ErrorKind, (typeof ALL)[number]>
     const noUnlistedKind: [Unlisted] extends [never] ? true : never = true
-    expect(noUnlistedKind).toBe(true)
-    expect(ks.length).toBe(ERROR_KINDS.length)
+    // 仅为消除未使用变量告警；不是断言。
+    void ks
+    void noUnlistedKind
+  })
+
+  // 数量在**运行时**也有区分度：上面的 `satisfies` 拦不住「两边同时删掉一个」
+  // （ALL 少一个、ERROR_KINDS 也少一个 → 双向闭集仍成立）。这条补住那个方向。
+  it('成员数量为 20（两边同时少一个时仍能发现）', () => {
+    expect(ERROR_KINDS.length).toBe(20)
+    expect(ALL.length).toBe(20)
   })
 })

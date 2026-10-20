@@ -22,25 +22,34 @@
 import { spawn } from 'node:child_process'
 import { readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { realpathSync } from 'node:fs'
+import { pathToFileURL } from 'node:url'
 
 const DEFAULT_SHARDS = 4
 const MAX_SHARDS = 8
 const DEFAULT_HEAP_MB = 2048
 
-const rawShards = Number(process.env.QIYU_TEST_SHARDS ?? DEFAULT_SHARDS)
-if (!Number.isInteger(rawShards) || rawShards < 1) {
-  console.error(`QIYU_TEST_SHARDS 必须是 ≥1 的整数，收到：${process.env.QIYU_TEST_SHARDS}`)
-  process.exit(2)
-}
-const shards = Math.min(rawShards, MAX_SHARDS)
-if (rawShards > MAX_SHARDS) {
-  console.warn(`⚠️ QIYU_TEST_SHARDS=${rawShards} 超过上限，按 ${MAX_SHARDS} 片执行`)
-}
-
-const heapMb = Number(process.env.QIYU_TEST_HEAP_MB ?? DEFAULT_HEAP_MB)
-if (!Number.isInteger(heapMb) || heapMb < 256) {
-  console.error(`QIYU_TEST_HEAP_MB 必须是 ≥256 的整数，收到：${process.env.QIYU_TEST_HEAP_MB}`)
-  process.exit(2)
+/**
+ * 读分片数与堆上限。**只在真正要跑测试时调用** —— 顶层直接读环境变量会让
+ * 「import 本模块拿 planShards」这个动作连带触发一次全量测试
+ * （2026-10-20 实测踩到：审查者 import 它核对分片构成，结果无意中跑了两次全量）。
+ */
+function readOptions() {
+  const rawShards = Number(process.env.QIYU_TEST_SHARDS ?? DEFAULT_SHARDS)
+  if (!Number.isInteger(rawShards) || rawShards < 1) {
+    console.error(`QIYU_TEST_SHARDS 必须是 ≥1 的整数，收到：${process.env.QIYU_TEST_SHARDS}`)
+    process.exit(2)
+  }
+  const shards = Math.min(rawShards, MAX_SHARDS)
+  if (rawShards > MAX_SHARDS) {
+    console.warn(`⚠️ QIYU_TEST_SHARDS=${rawShards} 超过上限，按 ${MAX_SHARDS} 片执行`)
+  }
+  const heapMb = Number(process.env.QIYU_TEST_HEAP_MB ?? DEFAULT_HEAP_MB)
+  if (!Number.isInteger(heapMb) || heapMb < 256) {
+    console.error(`QIYU_TEST_HEAP_MB 必须是 ≥256 的整数，收到：${process.env.QIYU_TEST_HEAP_MB}`)
+    process.exit(2)
+  }
+  return { shards, heapMb }
 }
 
 const walk = (dir) =>
@@ -63,7 +72,7 @@ export function planShards(files, count) {
 
 const vitestBin = join(process.cwd(), 'node_modules', 'vitest', 'vitest.mjs')
 
-function runShard(files, index) {
+function runShard(files, index, heapMb) {
   return new Promise((resolve) => {
     const started = Date.now()
     const child = spawn(
@@ -82,28 +91,40 @@ function runShard(files, index) {
   })
 }
 
-const allFiles = walk('tests').sort()
-if (allFiles.length === 0) {
-  console.error('未找到任何测试文件（tests/**/*.test.ts）')
-  process.exit(2)
+/** 入口：把全部测试文件分片并并行跑完，返回退出码。 */
+async function main() {
+  const { shards, heapMb } = readOptions()
+
+  const allFiles = walk('tests').sort()
+  if (allFiles.length === 0) {
+    console.error('未找到任何测试文件（tests/**/*.test.ts）')
+    return 2
+  }
+
+  const groups = planShards(allFiles, shards)
+  console.log(`\n分片执行：${groups.length} 片 / ${allFiles.length} 个测试文件 / 每片堆上限 ${heapMb} MB\n`)
+
+  const startedAll = Date.now()
+  const results = await Promise.all(groups.map((files, i) => runShard(files, i + 1, heapMb)))
+  const totalMs = Date.now() - startedAll
+
+  console.log('\n—— 分片结果 ——')
+  for (const r of results.sort((a, b) => a.index - b.index)) {
+    const status = r.code === 0 ? '通过' : `失败（退出码 ${r.code}${r.signal ? `，信号 ${r.signal}` : ''}）`
+    console.log(`  片 ${r.index}: ${r.count} 文件  ${(r.ms / 1000).toFixed(1)}s  ${status}`)
+  }
+  console.log(`  合计墙钟：${(totalMs / 1000).toFixed(1)}s\n`)
+
+  const failed = results.filter((r) => r.code !== 0)
+  if (failed.length > 0) {
+    console.error(`❌ ${failed.length}/${results.length} 片失败`)
+    return 1
+  }
+  return 0
 }
 
-const groups = planShards(allFiles, shards)
-console.log(`\n分片执行：${groups.length} 片 / ${allFiles.length} 个测试文件 / 每片堆上限 ${heapMb} MB\n`)
-
-const startedAll = Date.now()
-const results = await Promise.all(groups.map((files, i) => runShard(files, i + 1)))
-const totalMs = Date.now() - startedAll
-
-console.log('\n—— 分片结果 ——')
-for (const r of results.sort((a, b) => a.index - b.index)) {
-  const status = r.code === 0 ? '通过' : `失败（退出码 ${r.code}${r.signal ? `，信号 ${r.signal}` : ''}）`
-  console.log(`  片 ${r.index}: ${r.count} 文件  ${(r.ms / 1000).toFixed(1)}s  ${status}`)
-}
-console.log(`  合计墙钟：${(totalMs / 1000).toFixed(1)}s\n`)
-
-const failed = results.filter((r) => r.code !== 0)
-if (failed.length > 0) {
-  console.error(`❌ ${failed.length}/${results.length} 片失败`)
-  process.exit(1)
+// ⚠️ **只在被直接执行时才跑**：本模块导出 `planShards` 供核对分片构成用，
+// 若无条件执行，`import` 一下就会连带跑整轮测试（2026-10-20 实际踩到）。
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+  process.exitCode = await main()
 }

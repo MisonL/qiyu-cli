@@ -5,8 +5,14 @@
  *
  * 类型与运行时共用这一份：`ErrorKind` 由它派生，`skill check` 也拿它校验
  * skill 正文里的 `kind: x` 引用是否真实存在（设计稿 §11.4）。
- * 加/删成员只改这里 —— 漏抄会让 `kind: '...'` 字面量在 `npm run typecheck` 报错，
- * 这正是我们要的保护。
+ *
+ * 加/删成员只改这里。漏抄的保护分两档，**不是**一律都由 typecheck 兜住
+ * （复审 M-2 修正了此处早先的过度承诺）：
+ *   · 大多数字面量走 `fail(ErrorInput)`，而 `ErrorInput.kind` 是 `string` ——
+ *     这条路径**不**受 `ErrorKind` 约束，漏抄时 typecheck 不会报错；
+ *   · 受约束的是 `classify()` 的返回值、`sandboxError(kind: ErrorKind)` 这类，
+ *     以及 `tests/core/errors.test.ts` 的 `ALL satisfies readonly ErrorKind[]`。
+ * 所以漏抄的最终防线是**测试 + typecheck 一起**，不是 typecheck 单独一条。
  */
 export const ERROR_KINDS = [
   'auth',                  // 凭证**无效**（14001/14002/14008/14515）—— 发出去被服务端拒了
@@ -40,10 +46,10 @@ export const ERROR_KINDS = [
   'sync_not_run',
 ] as const
 
-export type ErrorKind = typeof ERROR_KINDS[number]
-
 // ⚠️ `sandbox_blocked` / `query_error` 是 **code** 不是 kind：查询层的这两类失败
 // 都归 `kind: 'usage'`（退出码 2），见 `src/query/errors.ts` 的分类表。
+
+export type ErrorKind = typeof ERROR_KINDS[number]
 
 export interface QiyuError {
   code: string
