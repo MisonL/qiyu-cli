@@ -9,9 +9,9 @@
 // 三条建模约束（不满足就退化成第二事实源）：
 //   · `CommandSpec.flags` 必须是该命令的**完整接受集**，不是「额外的」flag。只记差异的话，
 //     skill 里写 `` `qiyu api list --no-validate` ``（真实用法错误）会被判通过。
-//   · `GLOBAL_FLAGS` 同理：各命令的解析器 `KNOWN` 只认 `--help/-h/--pretty`，业务 flag
-//     全在各自的常量里。所以校验时要 `[...spec.flags, ...GLOBAL_FLAGS]` **合并后**再比，
-//     只看 `spec.flags` 会把 `db tables --db` 误判非法。
+//   · 「完整」**包含全局 flag**：各命令组装 spec 时写成 `[...GLOBAL_FLAGS, ...业务 flag]`。
+//     校验方只查这一份，不再另行合并（两处各合一次是漂移的来源）。但必须**先查
+//     `rejected` 再查 `flags`**——`--pretty` 同时在两者里，顺序反了会把它判合法。
 //   · `--pretty` 建模成 `rejected` 而不是合法 flag：每个模块都走 `usageFail` 拒绝它，
 //     spec §11.2 E 也明令不要用。命中 `rejected` 要单独给「已知但未实现」话术，区别于
 //     「该命令不接受此 flag」。
@@ -31,14 +31,20 @@ export interface FlagSpec {
 export interface CommandSpec {
   /** 命令路径，不含程序名：`['db', 'describe']`。 */
   path: string[]
-  /** 完整接受集，不含 `GLOBAL_FLAGS`——校验方负责合并。 */
+  /** 完整接受集，**含 `GLOBAL_FLAGS`**——各命令组装时写成 `[...GLOBAL_FLAGS, ...业务 flag]`。 */
   flags: FlagSpec[]
   positionals: { name: string; domain: Domain }[]
   /** 已知但显式拒绝的 flag（当前只有 `--pretty`）。 */
   rejected: string[]
 }
 
-/** 所有命令都接受的全局 flag（解析器里的 `KNOWN`）。 */
+/**
+ * 所有命令都接受的全局 flag（解析器里的 `KNOWN`）。
+ *
+ * ⚠️ `--pretty` 同时出现在 `REJECTED_FLAGS` 里：校验方必须**先查 `rejected` 再查
+ * `flags`**，否则它会因为「在完整接受集里」被判合法——而每个模块实际都用 `usageFail`
+ * 拒绝它，skill 里照写必然失败。
+ */
 export const GLOBAL_FLAGS: FlagSpec[] = [
   { name: '--help', kind: 'bool' },
   { name: '-h', kind: 'bool' },
@@ -63,23 +69,33 @@ export const STORE_FLAGS: FlagSpec[] = [
 /**
  * 按最长前缀匹配命令路径：`['sync','run']` 优先于 `['sync']`。
  *
- * 做法：从 argv 里摘出**不以 `-` 开头的** token 组成序列，取它的逐个前缀去 tree 里找，
- * 记下 `path.length` 最长的命中。不剪位置参数是安全的——位置参数恰好等于某个命令名
- * （如 `db describe sessions`），`sessions` 本身不在 tree 里，最长命中仍是 `['db','describe']`。
+ * 用**原始 argv** 逐位比较，不预先滤掉 flag：真实分派取 argv[0] 当子命令
+ * （`db.ts` / `sync.ts` 的 `const [sub, ...rest] = argv`），`qiyu db --profile tables`
+ * 会报「未知子命令：--profile」并退出 2。若先滤掉 flag 再匹配，这里会误命中
+ * `['db','tables']`——把一条运行时必然失败的命令判成合法，正是 skill check 要防的假阴性。
  *
- * 命中之后的位置参数**没有语义**（域校验是 `skill check` 自己的事），所以这里不再把
- * 命中之后的部分剪掉。别试图「命令后遇 flag 即停」来替省略号收窄范围：
- * `['sync','run','--full','dim.staff']` 靠省略号能命中，改成遇 flag 即停就会返回
- * `['sync']`——把一条合法命令判成不接受 `--full`，正是 spec D4 要防的那类误判。
+ * 两条约束：
+ *   · 路径位（i < path.length）出现以 `-` 开头的 token 即不命中；
+ *   · 分组命令（tree 里还有更深的 spec）的子命令位不能是 flag：`sync --db x run` 里
+ *     `--db` 落在 `sync` 的子命令位，真实分派同样报未知子命令。
+ * 路径之后的位置参数不参与比较（`db describe sessions` 的 `sessions`），所以位置参数
+ * 恰好等于某个命令名时也不会把路径凑长——tree 里没有那条 spec 就不命中。
  */
 export function findSpec(tree: CommandSpec[], argv: string[]): CommandSpec | undefined {
-  const tokens = argv.filter((a) => !a.startsWith('-'))
   let best: CommandSpec | undefined
   for (const spec of tree) {
-    if (spec.path.length > tokens.length) continue
-    if (spec.path.every((seg, i) => tokens[i] === seg) && (!best || spec.path.length > best.path.length)) {
-      best = spec
+    if (spec.path.length > argv.length) continue
+    let matched = true
+    for (let i = 0; i < spec.path.length; i++) {
+      const token = argv[i]!
+      if (token.startsWith('-') || token !== spec.path[i]) { matched = false; break }
     }
+    if (!matched) continue
+    const isGroup = tree.some(
+      (other) => other.path.length > spec.path.length && spec.path.every((seg, i) => other.path[i] === seg),
+    )
+    if (isGroup && argv[spec.path.length]?.startsWith('-')) continue
+    if (!best || spec.path.length > best.path.length) best = spec
   }
   return best
 }
