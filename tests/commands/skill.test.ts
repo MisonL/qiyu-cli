@@ -329,6 +329,25 @@ describe('skill install --dry-run 与真实安装同判据（审查 I1）', () =
     expect(real.warnings).toContain('已存在')
   })
 
+  it('H. 坏 agent（~/.claude 是文件）下 auto 模式：dry-run 与真实安装同样不建链接', async () => {
+    // 复审新 Minor：fix 曾让 planLinks 的自动路径改用逐 agent 退化（为 M4 修的），
+    // 而真实安装的自动路径是「枚举整体失败 → 本次不建链接」。dry-run 因此会预告
+    // 一批真实安装不会发生的链接。这条钉住两边走同一条退化（逐 agent 只用于显式 --link）。
+    writeFileSync(join(home, '.claude'), '不是目录\n')
+    mkdirSync(join(home, '.codex', 'skills'), { recursive: true })
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity, '--dry-run'])).toBe(0)
+    expect(data().links).toEqual([])
+    expect(metaWarnings()).toContain('本次不建链接')
+    expect(existsSync(join(home, '.codex', 'skills', 'qiyu')), 'dry-run 不得建链').toBe(false)
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    expect(data().links).toEqual([])
+    expect(metaWarnings()).toContain('本次不建链接')
+    expect(existsSync(join(home, '.codex', 'skills', 'qiyu')), '真实安装同样不建').toBe(false)
+    expect(existsSync(join(entity, 'SKILL.md')), '实体照常安装').toBe(true)
+  })
+
   it('dry-run 能预见的失败与真实安装同样报错（实体路径被文件占用）', async () => {
     writeFileSync(entity, '')
     out = ''; err = ''

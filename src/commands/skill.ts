@@ -309,7 +309,8 @@ function planOutcome(plan: InstallPlan): {
 /**
  * dry-run 的链接计划：只读探测，绝不建链、绝不建目录。
  * `explicitTargets` 非 undefined 时只规划用户点名的 agent（与 installSkill 的
- * `linkDirs` 语义一致）；否则用 `probeAgentDirs` 自动探测（与 where 共用退化逻辑）。
+ * `linkDirs` 语义一致）；自动模式则与 installSkill 的 linkAgents **同一条退化**：
+ * 枚举整体失败时不规划任何链接（逐 agent 退化只用于显式 --link，审查 M4）。
  */
 function planLinks(
   home: string,
@@ -323,12 +324,14 @@ function planLinks(
   if (explicitTargets !== undefined) {
     targets = explicitTargets
   } else {
-    const probed = probeAgentDirs(home)
-    warnings.push(...probed.warnings)
-    for (const [name, error] of probed.broken) {
-      warnings.push(`${name} 的 skills 目录无法检查（${error}），跳过建链`)
+    // ⚠️ 自动模式必须与 installSkill 的 linkAgents 自动路径**同一条退化**（复审
+    // Minor）：`~/.claude` 是文件时枚举整体抛 ENOTDIR，真实安装「本次不建链接」。
+    // 若这里改用逐 agent 退化，dry-run 会预告一批真实安装不会发生的链接。
+    try {
+      targets = agentSkillDirs(home).map((a) => ({ name: a.name, dir: a.dir }))
+    } catch (e) {
+      return { links: [], warnings: [`探测 agent skills 目录失败（${errMsg(e)}），本次不建链接`] }
     }
-    targets = probed.dirs
   }
   const links: PlannedLink[] = []
   for (const t of targets) {
