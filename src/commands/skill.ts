@@ -26,7 +26,7 @@
 
 import { lstatSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve as resolvePath } from 'node:path'
 import { describeArgs, fail, ok, setSkillWarning, usageFail } from '../output.js'
 import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from '../core/edition.js'
 import { ERROR_KINDS } from '../core/errors.js'
@@ -40,7 +40,7 @@ import { contentHash, installSkill, planInstall, type InstallPlan } from '../ski
 import { resolveSkillSourceDir } from '../skill/detect.js'
 import {
   AGENT_SKILL_SUBDIRS, agentSkillDirs, agentSkillSubdir, defaultEntityDir, LINK_NAME, linkState,
-  type AgentDir, type LinkState,
+  readEnvByNormalizedKey, type AgentDir, type LinkState,
 } from '../skill/paths.js'
 
 /**
@@ -164,13 +164,24 @@ function parseOrFail(argv: string[], spec: FlagSpec, sub: string): Parsed | numb
 
 // —— 路径与错误工具 ——
 
-type EntitySource = '--dir' | 'QIYU_SKILL_DIR' | 'default'
+type EntitySource = '--dir' | 'QIYU_SKILL_DIR' | 'npm_config_qiyu_skill_dir' | 'default'
 
-/** 实体定位：`--dir` > `QIYU_SKILL_DIR`（空白视为未设）> 默认位置。 */
+/**
+ * 实体定位：`--dir` > `QIYU_SKILL_DIR` > `npm_config_qiyu_skill_dir` > 默认位置。
+ *
+ * 第三条是 postinstall 的安装通道（spec C5：`npm i -g` 时唯一跨版本可用的自定义位置）。
+ * 不认它的话，用 postinstall 装到自定义目录的用户跑 `skill where` / `check --installed`
+ * 会对着默认路径报「未安装」，和漂移探测（detect.resolveEntityDir，同一套读取）口径不一致
+ * （终审 I2 的连带面）。空白视为未设，与另外两条同口径。
+ */
 function resolveEntity(flagDir: string | undefined): { dir: string; source: EntitySource } {
   if (flagDir !== undefined) return { dir: flagDir, source: '--dir' }
   const env = process.env.QIYU_SKILL_DIR?.trim()
   if (env !== undefined && env !== '') return { dir: env, source: 'QIYU_SKILL_DIR' }
+  const fromNpm = readEnvByNormalizedKey(process.env, 'npm_config_qiyu_skill_dir')
+  if (fromNpm !== undefined) {
+    return { dir: resolvePath(fromNpm), source: 'npm_config_qiyu_skill_dir' }
+  }
   return { dir: defaultEntityDir(homedir()), source: 'default' }
 }
 

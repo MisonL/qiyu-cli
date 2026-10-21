@@ -34,7 +34,14 @@ export interface CommandSpec {
   path: string[]
   /** 完整接受集，**含 `GLOBAL_FLAGS`**——各命令组装时写成 `[...GLOBAL_FLAGS, ...业务 flag]`。 */
   flags: FlagSpec[]
-  positionals: { name: string; domain: Domain }[]
+  /**
+   * 位置参数槽位。`repeatable` 表示「可给任意多个」（如 `sync run [任务...]`）：
+   * 校验方在槽位数用尽后把余下的字面取值继续按**最后一个**槽位的域比，而不是判「超量」。
+   *
+   * ⚠️ 没有这个标记时，「个数超过 spec 声明」会被判成违规——对 `sync run a b` 这种
+   * **合法调用**是误报（把正确内容判成错误），比漏报更糟。
+   */
+  positionals: { name: string; domain: Domain; repeatable?: boolean }[]
   /** 已知但显式拒绝的 flag（当前只有 `--pretty`）。 */
   rejected: string[]
 }

@@ -122,6 +122,20 @@ describe('checkSkillDoc', () => {
     })
     expect(extraOnZero.violations[0]!.detail).toContain('只接受 0 个位置参数')
   })
+  it('最后一个槽位 repeatable 时，超出的取值按它的域继续比（终审 fix 自查）', () => {
+    // `sync run [任务...]` 接受任意多个真实任务 id——把两个合法 id 判成「超量」
+    // 是对正确内容的误报，比漏报更糟。`db describe`（单槽位不 repeatable）
+    // 的第二个参数仍然要报「只接受 1 个」。
+    const twoTasks = checkSkillDoc('`qiyu sync run dim.staff dim.staff_groups`', ctx)
+    expect(twoTasks.violations.filter((v) => v.rule === 'unknown_positional')).toEqual([])
+    const twoTables = checkSkillDoc('`qiyu db describe sessions daily_overview`', ctx)
+    const over = twoTables.violations.find((v) => v.rule === 'unknown_positional')
+    expect(over, JSON.stringify(twoTables.violations)).toBeDefined()
+    expect(over!.detail).toContain('只接受 1 个位置参数')
+    // 变长槽位里的非法值仍要报：变长 ≠ 放弃校验。
+    const badSecond = checkSkillDoc('`qiyu sync run dim.staff totally-bogus-task`', ctx)
+    expect(badSecond.violations.filter((v) => v.rule === 'unknown_positional')).toHaveLength(1)
+  })
   it('终审报告的四行复现现在全部报 unknown_positional', () => {
     // 这四行在真实 CLI 里分别退出 2（未知接口 / 未知任务 / 未知表 / 只接受报表域表）；
     // 合并成一份文档时 `unknown_positional` 必须恰好四条（排序后行号 1..4）。

@@ -77,19 +77,19 @@ export const SYNC_SPECS: CommandSpec[] = [
   {
     path: ['sync', 'run'],
     flags: [...GLOBAL_FLAGS, ...RUN_FLAGS],
-    positionals: [{ name: '任务', domain: 'task-ids' }],
+    positionals: [{ name: '任务', domain: 'task-ids', repeatable: true }],
     rejected: REJECTED_FLAGS,
   },
   {
     path: ['sync', 'status'],
     flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
-    positionals: [{ name: '任务', domain: 'task-ids' }],
+    positionals: [{ name: '任务', domain: 'task-ids', repeatable: true }],
     rejected: REJECTED_FLAGS,
   },
   {
     path: ['sync', 'verify'],
     flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
-    positionals: [{ name: '任务', domain: 'task-ids' }],
+    positionals: [{ name: '任务', domain: 'task-ids', repeatable: true }],
     rejected: REJECTED_FLAGS,
   },
   {

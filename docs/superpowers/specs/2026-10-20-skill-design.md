@@ -165,11 +165,15 @@ export interface FlagSpec {
 export interface CommandSpec {
   path: string[]                       // ['db', 'describe']
   flags: FlagSpec[]
-  positionals: { name: string; domain: Domain }[]
+  positionals: { name: string; domain: Domain; repeatable?: boolean }[]
   rejected: string[]                   // 已知但显式拒绝（当前只有 --pretty）
 }
 type Domain = 'tables' | 'report-tables' | 'task-ids' | 'endpoint-ids'
 ```
+
+`repeatable` 是实施期补充（终审 I1 修复）：`sync run/status/verify` 的用法是 `[任务...]`，
+一个槽位收任意多个合法任务 id。没有它，「个数超过声明」会把 `qiyu sync run a b` 这种
+**合法调用**判成违规——误报正确内容比漏报更糟。
 
 `cli.ts` 汇总成 `export const COMMAND_TREE: CommandSpec[]`。
 

@@ -117,10 +117,17 @@ export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
     }
     // 位置参数：`path` 与 `positionals` 是同一串字面 token，切掉命令词后余下的即取值。
     // `refs.ts` 已排除占位符（`<表>` 不是字面值）与 flag 取值（`--table sessions`）。
+    // 槽位数用尽时按**最后一个**槽位处理：repeatable（`sync run [任务...]`）就把余下
+    // 取值继续按它的域比；不 repeatable（`db describe <表>` 只收一个）才判「超量」。
+    // ⚠️ 对合法的变长调用（`qiyu sync run a b`，两个都是真实任务 id）判超量是误报——
+    // 把正确内容判成错误比漏报更糟（终审 fix 自查）。
     const values = cmd.positionals.slice(spec.path.length)
     for (let i = 0; i < values.length; i++) {
       const value = values[i]!
       const slot = spec.positionals[i]
+        ?? (spec.positionals.length > 0 && spec.positionals[spec.positionals.length - 1]!.repeatable
+          ? spec.positionals[spec.positionals.length - 1]!
+          : undefined)
       if (slot === undefined) {
         violations.push({
           line: cmd.line,

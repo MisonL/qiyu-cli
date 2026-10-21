@@ -420,6 +420,25 @@ describe('skill where', () => {
     expect(data().entity).toMatchObject({ path: envDir, source: 'QIYU_SKILL_DIR', state: 'missing' })
   })
 
+  it('npm_config_qiyu_skill_dir（postinstall 的安装通道）也认，且 QIYU_SKILL_DIR 优先（终审 I2 连带）', async () => {
+    // postinstall 只可能写 npm_config_*（spec C5：命令行 flag 在 npm 12 已死，环境变量是
+    // 唯一跨版本通路）。命令层的 --dir / where / check --installed 若不认它，用那条通路
+    // 装到自定义目录的用户就会对着默认路径报「未安装」——与漂移探测（detect 侧已修）
+    // 口径分叉，同一份实体两套结论。
+    vi.stubEnv('npm_config_qiyu_skill_dir', join(home, 'npm-entity'))
+    expect(await skillCommand(['where'])).toBe(0)
+    expect(data().entity).toMatchObject({
+      path: join(home, 'npm-entity'), source: 'npm_config_qiyu_skill_dir',
+    })
+    // 两级优先：显式 QIYU_SKILL_DIR 压过 npm_config_*。
+    vi.stubEnv('QIYU_SKILL_DIR', join(home, 'explicit-entity'))
+    out = ''
+    expect(await skillCommand(['where'])).toBe(0)
+    expect(data().entity).toMatchObject({
+      path: join(home, 'explicit-entity'), source: 'QIYU_SKILL_DIR',
+    })
+  })
+
   it('是纯只读命令：探测后链接与实体原样保留', async () => {
     mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
