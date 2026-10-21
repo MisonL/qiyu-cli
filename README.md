@@ -333,10 +333,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 
 ## 当前状态
 
-本仓库已交付设计稿中的**前五个子项目**：认证与通用 API 通道、API 参数校验
-（`api schema`/body 分级校验）、存储层、同步引擎、查询接口与只读沙箱。
-此外 **F 子项目（Skill 化）也已交付**：见下方「装完之后：安装 skill」与
-`qiyu skill install` / `qiyu skill check` / `qiyu skill where`。
+本仓库已交付设计稿中的**前六个子项目**：认证与通用 API 通道、API 参数校验
+（`api schema`/body 分级校验）、存储层、同步引擎、查询接口与只读沙箱、Skill 化
+（`qiyu skill install` / `skill check` / `skill where`，见上方「装完之后：安装 skill」）。
 
 **已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
 限频感知（`retry_after`）、本地数据仓库——`store init` / `store status`（存储层已交付，

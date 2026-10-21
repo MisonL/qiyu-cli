@@ -79,12 +79,13 @@ describe('readme.test.ts —— C1 追加断言（防文档说假话）', () => 
     const notYet = /尚未实现[\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
     expect(notYet).not.toMatch(/store init/)
   })
-  it('「子项目计数」随交付推进：E 交付后为「前五个」，且不再残留「前两个」', () => {
-    // 该锚最初（C1 组）钉的是「前两个子项目」不动裁决；E 交付后那句话成了不实声明
-    // （同节紧接列出 store/sync/query），审查 Minor 15 改为随事实推进的正锚。
+  it('「子项目计数」随交付推进：F 交付后为「前六个」，且不再残留旧计数', () => {
+    // 该锚最初（C1 组）钉的是「前两个子项目」不动裁决；E 交付后改成「前五个」，
+    // F 交付后再改成「前六个」——同一审查结论：交付推进时这句话必须同步，
+    // 否则它就成了被测试钉死的不实声明。
     const md = read('README.md')
-    expect(md).toMatch(/前五个子项目/)
-    expect(md).not.toMatch(/前两个子项目/)
+    expect(md).toMatch(/前六个子项目/)
+    expect(md).not.toMatch(/前五个子项目/)
   })
 })
 
