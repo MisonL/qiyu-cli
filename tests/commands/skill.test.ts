@@ -10,7 +10,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
   symlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -150,7 +150,7 @@ describe('skill install', () => {
     expect(await skillCommand(['install', '--dir', entity, '--dry-run'])).toBe(0)
     expect(existsSync(entity)).toBe(false)
     expect(existsSync(join(home, '.claude', 'skills', 'qiyu'))).toBe(false)
-    expect(data()).toMatchObject({ dry_run: true, action: 'install', entity_state: 'absent' })
+    expect(data()).toMatchObject({ dry_run: true, action: 'install', planned_status: 'installed' })
     const links = data().links as Array<Record<string, unknown>>
     expect(links).toEqual([
       { agent: 'claude-code', path: join(home, '.claude', 'skills', 'qiyu'), state: 'missing', action: 'create' },
@@ -195,6 +195,148 @@ describe('skill install', () => {
     out = ''
     ok({ ok: true })
     expect(JSON.parse(out).meta).toBeUndefined()
+  })
+
+  it('--link codex 在无关 agent 坏掉（~/.claude 是文件）时照常安装并链 codex（审查 M4）', async () => {
+    // 自动模式在同一环境下是 exit 0（claude 记警告、codex 照常链）；
+    // 显式点名 codex 不该因为无关的 claude 整体失败。
+    writeFileSync(join(home, '.claude'), '不是目录\n')
+    mkdirSync(join(home, '.codex', 'skills'), { recursive: true })
+    expect(await skillCommand(['install', '--dir', entity, '--link', 'codex'])).toBe(0)
+    expect(data().status).toBe('installed')
+    // 点名映射在 ENOTDIR 下仍要给出可读的 agent 名（而不是目录路径）
+    expect(data().links).toEqual([
+      { agent: 'codex', path: join(home, '.codex', 'skills', 'qiyu'), state: 'ok' },
+    ])
+    expect(lstatSync(join(home, '.codex', 'skills', 'qiyu')).isSymbolicLink()).toBe(true)
+    expect(existsSync(join(entity, 'SKILL.md'))).toBe(true)
+  })
+
+  it('--link claude-code 恰好点到坏掉的那个 agent：警告并跳过，其余照常（不创建目录）', async () => {
+    writeFileSync(join(home, '.claude'), '不是目录\n')
+    expect(await skillCommand(['install', '--dir', entity, '--link', 'claude-code'])).toBe(0)
+    expect(metaWarnings()).toContain('claude-code')
+    expect(metaWarnings()).toContain('ENOTDIR')
+    expect(data().links).toEqual([])
+  })
+})
+
+// —— I1 回归：dry-run 的计划必须与真实 install 的判定一致（四种边界态） ——
+//
+// 审查实测过四种分叉：A 用户改正文、B 空实体、C 清单被删、D 用户新增文件。
+// 修法是从 install.ts 抽出 `planInstall` 供两边共用；这组用例是防漂移的硬要求——
+// 同一状态下先 dry-run 断言 action/planned_status，再真实安装断言 status，
+// 两者必须一一对应。
+describe('skill install --dry-run 与真实安装同判据（审查 I1）', () => {
+  /** 先安装一份，供各场景在此基础上制造状态。 */
+  async function installed(): Promise<void> {
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+  }
+  /** dry-run 的 (action, planned_status, warnings)。 */
+  async function dryRun(): Promise<{ action: unknown; planned: unknown; warnings: string }> {
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link', '--dry-run'])).toBe(0)
+    return { action: data().action, planned: data().planned_status, warnings: metaWarnings() }
+  }
+  /** 真实安装的 (status, warnings)。 */
+  async function realInstall(extra: string[] = []): Promise<{ status: unknown; warnings: string }> {
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link', ...extra])).toBe(0)
+    return { status: data().status, warnings: metaWarnings() }
+  }
+
+  it('A. 用户改过正文：dry-run 说 skip + --force 警告，真实安装也是 skipped + 同样警告', async () => {
+    await installed()
+    writeFileSync(join(entity, 'SKILL.md'), '# 用户改过的正文\n')
+    const dry = await dryRun()
+    expect(dry).toMatchObject({ action: 'skip', planned: 'skipped' })
+    expect(dry.warnings).toContain('--force')
+    // dry-run 不写盘：用户改动原样
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# 用户改过的正文\n')
+    const real = await realInstall()
+    expect(real.status).toBe(dry.planned)
+    expect(real.warnings).toContain('--force')
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# 用户改过的正文\n')
+  })
+
+  it('B. 空实体目录：dry-run 说 install，真实安装 status=installed', async () => {
+    mkdirSync(entity, { recursive: true })
+    const dry = await dryRun()
+    expect(dry).toMatchObject({ action: 'install', planned: 'installed' })
+    expect(existsSync(join(entity, 'SKILL.md'))).toBe(false)
+    const real = await realInstall()
+    expect(real.status).toBe(dry.planned)
+    expect(existsSync(join(entity, 'SKILL.md'))).toBe(true)
+  })
+
+  it('C. 清单被删、正文一致：dry-run 说 update，真实安装 status=updated（且只重写清单）', async () => {
+    await installed()
+    rmSync(join(entity, MANIFEST))
+    const before = readFileSync(join(entity, 'SKILL.md'), 'utf8')
+    const dry = await dryRun()
+    expect(dry).toMatchObject({ action: 'update', planned: 'updated' })
+    expect(dry.warnings).toBe('')
+    // dry-run 不得把清单补回来
+    expect(existsSync(join(entity, MANIFEST))).toBe(false)
+    const real = await realInstall()
+    expect(real.status).toBe(dry.planned)
+    expect(existsSync(join(entity, MANIFEST))).toBe(true)
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe(before)
+  })
+
+  it('D. 正文一致、用户新增一个文件：dry-run 说 skip + --force 警告，真实安装 skipped + 同样警告', async () => {
+    await installed()
+    writeFileSync(join(entity, 'my-notes.md'), '用户自己的笔记\n')
+    const dry = await dryRun()
+    expect(dry).toMatchObject({ action: 'skip', planned: 'skipped' })
+    expect(dry.warnings).toContain('--force')
+    const real = await realInstall()
+    expect(real.status).toBe(dry.planned)
+    expect(real.warnings).toContain('--force')
+    expect(readFileSync(join(entity, 'my-notes.md'), 'utf8')).toBe('用户自己的笔记\n')
+  })
+
+  it('E. 真空实体（只剩清单）：dry-run 说 install，真实安装 installed', async () => {
+    mkdirSync(entity, { recursive: true })
+    writeFileSync(join(entity, MANIFEST), JSON.stringify({ version: '0.0.0' }))
+    const dry = await dryRun()
+    expect(dry).toMatchObject({ action: 'install', planned: 'installed' })
+    const real = await realInstall()
+    expect(real.status).toBe(dry.planned)
+  })
+
+  it('F. 用户改正文 + --force：dry-run 说 update，真实安装 updated 且覆盖', async () => {
+    await installed()
+    writeFileSync(join(entity, 'SKILL.md'), '# 用户改过的正文\n')
+    out = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link', '--dry-run', '--force'])).toBe(0)
+    expect(data()).toMatchObject({ action: 'update', planned_status: 'updated' })
+    // dry-run 不写盘
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# 用户改过的正文\n')
+    const real = await realInstall(['--force'])
+    expect(real.status).toBe('updated')
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toContain('name: qiyu')
+  })
+
+  it('G. 内容一致且清单最新：dry-run 说 skip、无警告，真实安装 skipped + 「已存在」提示', async () => {
+    await installed()
+    const dry = await dryRun()
+    expect(dry).toMatchObject({ action: 'skip', planned: 'skipped' })
+    expect(dry.warnings).toBe('')
+    const real = await realInstall()
+    expect(real.status).toBe(dry.planned)
+    // 命令层对幂等命中补的「已存在」是安装后的说明，不是计划的一部分
+    expect(real.warnings).toContain('已存在')
+  })
+
+  it('dry-run 能预见的失败与真实安装同样报错（实体路径被文件占用）', async () => {
+    writeFileSync(entity, '')
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity, '--dry-run'])).toBe(1)
+    expect((envelope().error as Record<string, unknown>).message).toContain('无法计算安装计划')
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity])).toBe(1)
+    expect((envelope().error as Record<string, unknown>).message).toContain('skill 安装失败')
   })
 })
 
@@ -261,6 +403,32 @@ describe('skill where', () => {
     expect(lstatSync(linkPath).isSymbolicLink()).toBe(true)
     expect(existsSync(join(entity, 'SKILL.md'))).toBe(true)
   })
+
+  it('报告 foreign 与 dangling 两种状态（M7 判别力补强）', async () => {
+    mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
+    mkdirSync(join(home, '.codex', 'skills'), { recursive: true })
+    // foreign：链接路径被一个真实目录占用
+    mkdirSync(join(home, '.claude', 'skills', 'qiyu'))
+    // dangling：链接存在，但目标不存在（实体目录本身存在，否则会先短路成 dangling）
+    mkdirSync(entity, { recursive: true })
+    symlinkSync(join(home, 'nowhere'), join(home, '.codex', 'skills', 'qiyu'))
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(linkOf('claude-code')).toMatchObject({ state: 'foreign' })
+    expect(linkOf('codex')).toMatchObject({ state: 'dangling' })
+  })
+
+  it('实体不可检查（EACCES）→ exists:null、state:unknown，不谎报「不存在」（审查 M6）', async () => {
+    const locked = join(home, 'locked')
+    mkdirSync(join(locked, 'entity'), { recursive: true })
+    chmodSync(locked, 0o000)
+    try {
+      expect(await skillCommand(['where', '--dir', join(locked, 'entity')])).toBe(0)
+      expect(data().entity).toMatchObject({ exists: null, state: 'unknown' })
+      expect(metaWarnings()).toContain('EACCES')
+    } finally {
+      chmodSync(locked, 0o755)
+    }
+  })
 })
 
 describe('skill check', () => {
@@ -296,6 +464,35 @@ describe('skill check', () => {
     expect(err).toContain('互斥')
   })
 
+  it('默认（包内）模式下单独给 --dir → 2，不静默忽略（审查 M1）', async () => {
+    expect(await skillCommand(['check', '--dir', entity])).toBe(2)
+    expect(err).toContain('--installed')
+    expect(err).toContain('--compare')
+  })
+
+  it('--installed 空目录 → 1，按未安装处理（审查 M2）', async () => {
+    mkdirSync(entity, { recursive: true })
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(1)
+    const e = envelope().error as Record<string, unknown>
+    expect(String(e.message)).toContain('未安装')
+    expect(String(e.message)).toContain('SKILL.md')
+  })
+
+  it('--installed 目录只有无关 .md、没有 SKILL.md → 1（零 md 不等于可用安装）', async () => {
+    mkdirSync(entity, { recursive: true })
+    writeFileSync(join(entity, 'notes.md'), '# 随手记\n')
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(1)
+    expect(String((envelope().error as Record<string, unknown>).message)).toContain('SKILL.md')
+  })
+
+  it('--compare 空目录 → 1，present=false 且差异提到 SKILL.md（审查 M2）', async () => {
+    mkdirSync(entity, { recursive: true })
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+    const d = data()
+    expect((d.installed as Record<string, unknown>)).toMatchObject({ present: false })
+    expect((d.differences as string[]).join('\n')).toContain('SKILL.md')
+  })
+
   it('--compare 两份都比：一致时 differences 为空、退出码 0', async () => {
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
     out = ''; err = ''
@@ -323,5 +520,22 @@ describe('skill check', () => {
     const d = data()
     expect((d.installed as Record<string, unknown>)).toMatchObject({ present: false })
     expect((d.differences as string[]).join('\n')).toContain('不存在')
+  })
+
+  it('--compare 内容哈希失败 → 退出 1（无法完成比较 ≠ 一致，审查 M3）', async () => {
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    // 非 .md 文件不参与 checkSkillDir，但参与 contentHash——把它变成不可读，
+    // 就能构造「两份都能校验、但内容哈希比较失败」的状态。
+    const bad = join(entity, 'notes.txt')
+    writeFileSync(bad, '私有内容\n')
+    chmodSync(bad, 0o000)
+    try {
+      out = ''; err = ''
+      expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+      const d = data()
+      expect((d.differences as string[]).join('\n')).toContain('内容哈希比较失败')
+    } finally {
+      chmodSync(bad, 0o644)
+    }
   })
 })

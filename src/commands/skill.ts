@@ -33,8 +33,8 @@ import { ERROR_KINDS } from '../core/errors.js'
 import { TABLES } from '../store/schema.js'
 import { COMMAND_TREE } from './tree.js'
 import { checkSkillDir, type CheckContext, type CheckResult } from '../skill/check.js'
-import { contentHash, installSkill } from '../skill/install.js'
-import { detectSkillState, resolveSkillSourceDir } from '../skill/detect.js'
+import { contentHash, installSkill, planInstall, type InstallPlan } from '../skill/install.js'
+import { resolveSkillSourceDir } from '../skill/detect.js'
 import {
   agentSkillDirs, defaultEntityDir, linkState, type AgentDir, type LinkState,
 } from '../skill/paths.js'
@@ -70,7 +70,8 @@ const SKILL_USAGE = `用法：qiyu skill <子命令> [参数]
   skill check   [--installed | --compare] [--dir <path>]
                            校验 skill 正文引用与 CLI 契约是否一致（有违规退出码 1）
   skill where   [--dir <path>]
-                           报告实体目录与各 agent 链接状态（只读，不修复）
+                           报告实体目录与各 agent 链接状态（只读，不修复；
+                           无法判定时 state=unknown、exists=null——不是「不存在」）
 
 实体目录定位：--dir > QIYU_SKILL_DIR > ~/.agents/skills/qiyu
 --link 取值：claude-code、codex（可重复）。点名的 agent 目录不存在时不创建目录，只警告。
@@ -192,6 +193,47 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+interface AgentProbe {
+  /** 已确认存在的 agent skills 目录。 */
+  dirs: { name: AgentDir['name']; dir: string }[]
+  /** 探测失败的 agent：name → 底层错误文案（ENOTDIR/EACCES 等）。 */
+  broken: Map<AgentDir['name'], string>
+  warnings: string[]
+}
+
+/**
+ * 探测 agent skills 目录（`install --link` 与 `where` 共用，审查 M4）。
+ *
+ * 正常路径用 `agentSkillDirs(home)`（只返回已存在的目录）。它**整体抛出**
+ * （`~/.claude` 是文件 → ENOTDIR；Task 7 实测）时退化为逐个已知 agent 探测：
+ * 坏的那个进 `broken`，好的照常返回——否则「点名 codex、但无关的 claude 坏了」
+ * 会让整条安装失败，而自动模式在同一环境下是成功的。
+ */
+function probeAgentDirs(home: string): AgentProbe {
+  try {
+    return {
+      dirs: agentSkillDirs(home).map((a) => ({ name: a.name, dir: a.dir })),
+      broken: new Map(),
+      warnings: [],
+    }
+  } catch (e) {
+    const warnings = [`枚举 agent skills 目录失败（${errMsg(e)}），改为逐个 agent 探测`]
+    const dirs: { name: AgentDir['name']; dir: string }[] = []
+    const broken = new Map<AgentDir['name'], string>()
+    for (const name of KNOWN_AGENTS) {
+      const dir = join(home, AGENT_SUBDIRS[name])
+      try {
+        lstatSync(dir)
+        dirs.push({ name, dir })
+      } catch (err) {
+        if (isErrno(err, 'ENOENT')) continue
+        broken.set(name, errMsg(err))
+      }
+    }
+    return { dirs, broken, warnings }
+  }
+}
+
 /** 包内 skill 源目录缺失时的统一错误（安装包不完整，属于 CLI 自身缺陷）。 */
 function sourceMissing(): number {
   return fail({
@@ -209,10 +251,10 @@ function sourceMissing(): number {
  * `qiyu store init`（那是数据库，不是 skill）。message 与 hint 已把动作说死，
  * `unknown` 在 errors.md 里的语义是「按 message 判断」——这里 message 足够明确。
  */
-function notInstalled(entityDir: string): number {
+function notInstalled(entityDir: string, detail?: string): number {
   return fail({
     code: 'skill_not_installed', kind: 'unknown', retryable: false,
-    message: `skill 未安装到 ${entityDir}`,
+    message: `skill 未安装到 ${entityDir}${detail !== undefined ? `（${detail}）` : ''}`,
     hint: '先运行：qiyu skill install（可用 --dir 指定实体目录）',
   })
 }
@@ -247,10 +289,27 @@ function linkAction(state: LinkState | 'unknown'): PlannedLink['action'] {
   }
 }
 
+/** 安装计划 → dry-run 的 action/planned_status（与真实 install 的 status 一一对应）。 */
+function planOutcome(plan: InstallPlan): {
+  action: 'install' | 'update' | 'skip'
+  status: 'installed' | 'updated' | 'skipped'
+} {
+  switch (plan.action) {
+    case 'write':
+      return plan.status === 'installed'
+        ? { action: 'install', status: 'installed' }
+        : { action: 'update', status: 'updated' }
+    case 'rewrite-manifest':
+      return { action: 'update', status: 'updated' }
+    case 'none':
+      return { action: 'skip', status: 'skipped' }
+  }
+}
+
 /**
  * dry-run 的链接计划：只读探测，绝不建链、绝不建目录。
  * `explicitTargets` 非 undefined 时只规划用户点名的 agent（与 installSkill 的
- * `linkDirs` 语义一致）；否则自动探测全部已存在的 agent 目录。
+ * `linkDirs` 语义一致）；否则用 `probeAgentDirs` 自动探测（与 where 共用退化逻辑）。
  */
 function planLinks(
   home: string,
@@ -259,21 +318,19 @@ function planLinks(
   noLink: boolean,
 ): { links: PlannedLink[]; warnings: string[] } {
   if (noLink) return { links: [], warnings: [] }
+  const warnings: string[] = []
   let targets: { name: string; dir: string }[]
   if (explicitTargets !== undefined) {
     targets = explicitTargets
   } else {
-    try {
-      targets = agentSkillDirs(home).map((a) => ({ name: a.name, dir: a.dir }))
-    } catch (e) {
-      return {
-        links: [],
-        warnings: [`探测 agent skills 目录失败（${errMsg(e)}），本次不建链接`],
-      }
+    const probed = probeAgentDirs(home)
+    warnings.push(...probed.warnings)
+    for (const [name, error] of probed.broken) {
+      warnings.push(`${name} 的 skills 目录无法检查（${error}），跳过建链`)
     }
+    targets = probed.dirs
   }
   const links: PlannedLink[] = []
-  const warnings: string[] = []
   for (const t of targets) {
     const linkPath = join(t.dir, LINK_NAME)
     try {
@@ -310,6 +367,8 @@ async function skillInstall(argv: string[]): Promise<number> {
   if (unknownAgents.length > 0) {
     return usageFail(`未知 agent：${describeArgs(unknownAgents)}。可用 agent：${KNOWN_AGENTS.join('、')}`)
   }
+  // 校验过后才收窄成联合类型（校验前是用户输入，不能直接断言）。
+  const agentNames = linkNames as AgentDir['name'][]
 
   const home = homedir()
   const { dir: entityDir, source } = resolveEntity(parsed.values.get('--dir'))
@@ -320,43 +379,51 @@ async function skillInstall(argv: string[]): Promise<number> {
 
   // 边界 2（brief）：用户显式点名的 agent 目录不存在 → 不创建目录（spec D1），
   // 该 agent 进 warnings，其余照常安装。显式点名意味着**只**链这些 agent。
-  let explicitTargets: { name: string; dir: string }[] | undefined
-  if (!noLink && linkNames.length > 0) {
+  //
+  // 探测失败按 agent 粒度收敛（审查 M4）：`agentSkillDirs` 因无关 agent（如
+  // `~/.claude` 是文件 → ENOTDIR）整体抛出时，退化为逐个已知 agent 探测——
+  // 点名 codex 就照常链 codex，坏的 claude 只进 warnings，不拖垮整条安装。
+  let explicitTargets: { name: AgentDir['name']; dir: string }[] | undefined
+  if (!noLink && agentNames.length > 0) {
     explicitTargets = []
-    let detected: AgentDir[]
-    try {
-      detected = agentSkillDirs(home)
-    } catch (e) {
-      return fail({
-        code: 'skill_agent_dirs_failed', kind: 'unknown', retryable: false,
-        message: `无法探测 agent skills 目录：${errMsg(e)}`,
-        hint: '请检查 ~/.claude、~/.codex 是否为目录后重试（不替用户创建或修复这些目录）',
-      })
-    }
-    for (const name of linkNames) {
-      const hit = detected.find((a) => a.name === name)
-      if (hit === undefined) {
-        warnings.push(`${name} 的 skills 目录不存在，跳过（不替用户创建目录）`)
+    const probed = probeAgentDirs(home)
+    warnings.push(...probed.warnings)
+    for (const name of agentNames) {
+      const hit = probed.dirs.find((a) => a.name === name)
+      if (hit !== undefined) {
+        explicitTargets.push(hit)
         continue
       }
-      explicitTargets.push({ name: hit.name, dir: hit.dir })
+      const broken = probed.broken.get(name)
+      if (broken !== undefined) {
+        warnings.push(`${name} 的 skills 目录无法检查（${broken}），跳过`)
+      } else {
+        warnings.push(`${name} 的 skills 目录不存在，跳过（不替用户创建目录）`)
+      }
     }
   }
   // 边界 3（brief）：未给 --link 且未给 --no-link → 交给 installSkill 自己探测。
   const linkDirs = explicitTargets?.map((t) => t.dir)
 
   if (dryRun) {
-    const state = detectSkillState(entityDir, sourceDir, PACKAGE_VERSION)
-    let action: 'install' | 'update' | 'skip' | 'unknown'
-    if (state.kind === 'absent') action = 'install'
-    else if (state.kind === 'current') action = 'skip'
-    else if (state.kind === 'stale') action = force ? 'update' : 'skip'
-    else action = 'unknown'
-    if (state.kind === 'stale' && !force) {
-      warnings.push(`实体目录内容与包内不同（可能被手工修改），未覆盖；确认后可用 --force 覆盖：${entityDir}`)
-    } else if (state.kind === 'unknown') {
-      warnings.push(`无法判定实体目录状态（可能被文件占用或不可读）：${entityDir}`)
+    // ⚠️ 计划必须与真实安装**共用同一判定**（审查 I1）：`planInstall` 是 installSkill
+    // 内部使用的同一个只读判定函数（比实体内容哈希 / 真空 / 清单落后），不是
+    // detectSkillState 的「包是否变过」。四种边界态（用户改正文、空实体、清单被删、
+    // 用户新增文件）都有「dry-run action == 真实 install status」的对照用例。
+    let plan: InstallPlan
+    try {
+      plan = planInstall({ entityDir, sourceDir, version: PACKAGE_VERSION, force })
+    } catch (e) {
+      // 计划能预见到的失败（源不可用 / 实体被文件占用）与真实安装同样报错，
+      // 不谎报一个会成功的计划。
+      return fail({
+        code: 'skill_install_failed', kind: 'unknown', retryable: false,
+        message: `无法计算安装计划：${errMsg(e)}`,
+        hint: '请检查 --dir 目标路径与包内 skill 源目录的可读性；若 --dir 指向的是文件，请改成目录路径',
+      })
     }
+    const outcome = planOutcome(plan)
+    warnings.push(...plan.warnings)
     const planned = planLinks(home, entityDir, explicitTargets, noLink)
     warnings.push(...planned.warnings)
     return ok(
@@ -366,8 +433,8 @@ async function skillInstall(argv: string[]): Promise<number> {
         entity_source: source,
         source_dir: sourceDir,
         version: PACKAGE_VERSION,
-        entity_state: state.kind,
-        action,
+        action: outcome.action,
+        planned_status: outcome.status,
         force,
         no_link: noLink,
         links: planned.links,
@@ -406,6 +473,17 @@ async function skillInstall(argv: string[]): Promise<number> {
     allWarnings.push(`skill 已存在且内容一致，未做任何改动：${result.entityDir}`)
   }
 
+  // ⚠️ installSkill 的显式 linkDirs 分支用 `agentSkillDirs(home)` 反查 agent 名；
+  // 该调用失败（如无关的 `~/.claude` 是文件 → ENOTDIR）时它静默退回「目录路径当
+  // agent 标识」。命令层手里有明确的点名映射，这里按链接路径回填可读的 agent 名
+  // （审查 M4：点名 codex 时输出也必须写 codex，而不是一串路径）。
+  const links = explicitTargets === undefined
+    ? result.links
+    : result.links.map((link) => {
+        const hit = explicitTargets.find((t) => join(t.dir, LINK_NAME) === link.path)
+        return hit === undefined ? link : { ...link, agent: hit.name }
+      })
+
   return ok(
     {
       dry_run: false,
@@ -414,7 +492,7 @@ async function skillInstall(argv: string[]): Promise<number> {
       source_dir: sourceDir,
       version: PACKAGE_VERSION,
       status: result.status,
-      links: result.links,
+      links,
     },
     allWarnings.length > 0 ? { warnings: allWarnings } : undefined,
   )
@@ -477,6 +555,21 @@ function probeDir(dir: string): DirProbe {
   }
 }
 
+/**
+ * 目录里是否有 `SKILL.md`（审查 M2）：「已安装」的最低判据。
+ *
+ * 只凭「目录存在」会把空目录（或只有几个无关 `.md` 的目录）判成「已安装且通过」，
+ * 与「目录不存在 → 未安装」自相矛盾。`SKILL.md` 是 skill 的入口正文，它不在就不是
+ * 一份可用的安装。
+ */
+function hasSkillDoc(dir: string): boolean {
+  try {
+    return statSync(join(dir, 'SKILL.md')).isFile()
+  } catch {
+    return false
+  }
+}
+
 async function skillCheck(argv: string[]): Promise<number> {
   const parsed = parseOrFail(
     argv,
@@ -490,7 +583,13 @@ async function skillCheck(argv: string[]): Promise<number> {
   if (wantInstalled && wantCompare) {
     return usageFail('--installed 与 --compare 互斥：一次只能选一种校验基准')
   }
-  const { dir: entityDir, source } = resolveEntity(parsed.values.get('--dir'))
+  const flagDir = parsed.values.get('--dir')
+  // 审查 M1：默认基准是**包内那份**，`--dir` 改不了它——静默忽略与仓库
+  // 「不静默吞参数」的口径不一致。`--dir` 只对已安装侧（--installed/--compare）有意义。
+  if (!wantInstalled && !wantCompare && flagDir !== undefined) {
+    return usageFail('--dir 只配合 --installed / --compare 使用：默认校验包内那份，不能用 --dir 改')
+  }
+  const { dir: entityDir, source } = resolveEntity(flagDir)
 
   // —— 默认：包内那份（CI 可跑） ——
   if (!wantInstalled && !wantCompare) {
@@ -513,6 +612,8 @@ async function skillCheck(argv: string[]): Promise<number> {
         hint: '用 --dir 指向 skill 实体目录（默认 ~/.agents/skills/qiyu）',
       })
     }
+    // 审查 M2：空目录 / 零 SKILL.md 不是「已安装且通过」。
+    if (!hasSkillDoc(entityDir)) return notInstalled(entityDir, '目录里没有 SKILL.md')
     const outcome = runCheck(entityDir)
     if ('error' in outcome) return checkFailed(entityDir, outcome.error)
     return reportSingle('installed', entityDir, outcome.result)
@@ -539,6 +640,12 @@ async function skillCheck(argv: string[]): Promise<number> {
     differences.push(`已安装路径不可用：${entityDir}（${why}）`)
     installedData.error = why
     installedFailed = true
+  } else if (!hasSkillDoc(entityDir)) {
+    // 审查 M2：`present` 与 `--installed` 的「已安装」判据必须一致——没有 SKILL.md
+    // 的目录不算一份可用的安装，不能判成 present=true + 零违规。
+    differences.push(`已安装目录缺少 SKILL.md：${entityDir}`)
+    installedData.error = '缺少 SKILL.md'
+    installedFailed = true
   } else {
     const outcome = runCheck(entityDir)
     if ('error' in outcome) {
@@ -557,7 +664,9 @@ async function skillCheck(argv: string[]): Promise<number> {
           differences.push('包内与已安装的正文内容不同（content_hash 不一致）')
         }
       } catch (e) {
+        // 审查 M3：无法完成内容比较 = 无法完成比较，退出码必须为 1。
         differences.push(`内容哈希比较失败：${errMsg(e)}`)
+        installedFailed = true
       }
       if (installedViolations !== pkgOutcome.result.violations.length) {
         differences.push(
@@ -601,41 +710,26 @@ interface LinkReport {
 }
 
 /**
- * 逐 agent 探测链接状态。正常路径用 `agentSkillDirs(home)`（只返回已存在的目录）；
- * 它整体抛出（ENOTDIR）时退化为逐个已知 agent 探测——坏的那个记 unknown，
- * 好的照常报告，兑现 brief「其余照常报告」。
- *
- * 每个 agent 的 `linkState` 各自 try/catch：自指/成环链接抛 ELOOP，
- * 一个坏链接不能让整条排查命令崩掉（brief 硬要求）。
+ * 逐 agent 探测链接状态。目录枚举走 `probeAgentDirs`（与 install 共用同一套
+ * ENOTDIR 退化逻辑，审查 M4）；每个 agent 的 `linkState` 各自 try/catch：
+ * 自指/成环链接抛 ELOOP，一个坏链接不能让整条排查命令崩掉（brief 硬要求）。
  */
 function probeAgentLinks(
   home: string,
   entityDir: string,
 ): { links: LinkReport[]; warnings: string[] } {
   const links: LinkReport[] = []
-  const warnings: string[] = []
-  let targets: { name: string; dir: string }[]
+  const probed = probeAgentDirs(home)
+  const warnings = [...probed.warnings]
 
-  try {
-    targets = agentSkillDirs(home).map((a) => ({ name: a.name, dir: a.dir }))
-  } catch (e) {
-    warnings.push(`枚举 agent skills 目录失败（${errMsg(e)}），改为逐个 agent 探测`)
-    targets = []
-    for (const name of KNOWN_AGENTS) {
-      const dir = join(home, AGENT_SUBDIRS[name])
-      try {
-        lstatSync(dir)
-        targets.push({ name, dir })
-      } catch (err) {
-        if (isErrno(err, 'ENOENT')) continue
-        // 目录本身不可检查（如父级是文件 → ENOTDIR）：如实记 unknown，继续下一个。
-        links.push({ agent: name, path: join(dir, LINK_NAME), state: 'unknown', error: errMsg(err) })
-        warnings.push(`${name} 的 skills 目录无法检查（${errMsg(err)}）：${dir}`)
-      }
-    }
+  // 探测失败的 agent：目录本身不可检查（如父级是文件 → ENOTDIR），如实记 unknown，
+  // 继续报告其余 agent。
+  for (const [name, error] of probed.broken) {
+    links.push({ agent: name, path: join(home, AGENT_SUBDIRS[name], LINK_NAME), state: 'unknown', error })
+    warnings.push(`${name} 的 skills 目录无法检查（${error}）：${join(home, AGENT_SUBDIRS[name])}`)
   }
 
-  for (const t of targets) {
+  for (const t of probed.dirs) {
     const linkPath = join(t.dir, LINK_NAME)
     try {
       links.push({ agent: t.name, path: linkPath, state: linkState(linkPath, entityDir) })
@@ -663,8 +757,10 @@ async function skillWhere(argv: string[]): Promise<number> {
     if (isErrno(e, 'ENOENT')) {
       entity = { path: entityDir, source, exists: false, state: 'missing' }
     } else {
+      // 审查 M6：ELOOP/EACCES 下我们**不知道**路径是否存在——`exists: false` 可能
+      // 是一句假话。用 null 表示「无法判定」，与 state:'unknown' 配套；见 SKILL_USAGE。
       warnings.push(`实体路径无法检查（${errMsg(e)}）：${entityDir}`)
-      entity = { path: entityDir, source, exists: false, state: 'unknown', error: errMsg(e) }
+      entity = { path: entityDir, source, exists: null, state: 'unknown', error: errMsg(e) }
     }
   }
 

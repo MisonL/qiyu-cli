@@ -436,21 +436,29 @@ function cleanupPreviousManaged(
  * 符号链接/目录/设备 → 一律不写，警告并说明原因。`copyFile` 会写穿符号链接、
  * `rename` 会替换链接本身——实体里与包内路径重合的任何非普通文件都按「用户占用」
  * 处理，无论是否有 --force。
+ *
+ * 判定与文案拆成 `writeTargetWarning`：`planInstall` 需要**只读预判**清单是否可写
+ * （dry-run 与真实安装共用同一判据，Task 11 审查 I1），但预判时不能产生警告。
  */
-function isSafeWriteTarget(p: string, what: string, warnings: string[]): boolean {
+function writeTargetWarning(p: string, what: string): string | null {
   let st
   try {
     st = lstatSync(p)
   } catch (err) {
-    if (isErrno(err, 'ENOENT')) return true
-    warnings.push(`检查${what} ${p} 失败（${errMsg(err)}），未写入`)
-    return false
+    if (isErrno(err, 'ENOENT')) return null
+    return `检查${what} ${p} 失败（${errMsg(err)}），未写入`
   }
   if (!st.isFile()) {
-    warnings.push(`${what}已被非普通文件占用（符号链接/目录等），不覆盖、保留用户内容：${p}`)
-    return false
+    return `${what}已被非普通文件占用（符号链接/目录等），不覆盖、保留用户内容：${p}`
   }
-  return true
+  return null
+}
+
+function isSafeWriteTarget(p: string, what: string, warnings: string[]): boolean {
+  const warning = writeTargetWarning(p, what)
+  if (warning === null) return true
+  warnings.push(warning)
+  return false
 }
 
 /**
@@ -533,15 +541,40 @@ function writeInstalled(
 }
 
 /**
- * 安装 skill。流程见文件头决策表。链接阶段的任何异常都进 warnings，不向上抛；
- * 只有「源目录不可用」「实体路径被文件占用」「暂存写入失败」这类无法继续的情况
- * 才抛错（调用方 Task 11 会转成 internal 错误信封）。
+ * 安装判定的**唯一事实源**（Task 11 审查 I1）：`installSkill` 与 `qiyu skill install
+ * --dry-run` 都调它，dry-run 因此不会与真实安装分叉。
+ *
+ * 纯只读：只做 stat/readdir/readFile/lstat，不写盘、不建链。返回值里的
+ * `action` 告诉调用方「接下来该做哪种写操作」：
+ *   · 'write'            —— 调 `writeInstalled`（首次安装 / 真空实体 / --force 覆盖）；
+ *   · 'rewrite-manifest' —— 只重写清单（正文一致、清单落后/损坏）；
+ *   · 'none'             —— 一个字节都不写。
+ * `status` 是安装完成后 `InstallResult.status` 的值（写盘中途失败不改变它——与
+ * 重构前的行为一致）。
+ *
+ * 抛错边界与 `installSkill` 一致：源目录不可用、实体路径被文件占用。调用方
+ * （命令层）把它们转成可读错误；dry-run 也照此报告——计划能预见到失败，就不该
+ * 谎报一个会成功的计划。
  */
-export async function installSkill(opts: InstallOptions): Promise<InstallResult> {
-  const { home, sourceDir, version, force, noLink = false } = opts
-  const entityDir = opts.entityDir ?? defaultEntityDir(home)
+export interface InstallPlan {
+  entityDir: string
+  sourceFiles: string[]
+  sourceHash: string
+  status: InstallResult['status']
+  action: 'write' | 'rewrite-manifest' | 'none'
+  warnings: string[]
+  /** `action === 'write'` 且实体已有上一版清单时，上一版受管文件列表（清理用）。 */
+  prevFiles?: string[]
+}
+
+export function planInstall(opts: {
+  entityDir: string
+  sourceDir: string
+  version: string
+  force: boolean
+}): InstallPlan {
+  const { entityDir, sourceDir, version, force } = opts
   const warnings: string[] = []
-  const links: InstallResult['links'] = []
 
   // —— 源目录校验 ——
   let srcIsDir: boolean
@@ -563,7 +596,8 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
     // 但给出比裸 EACCES 更能定位问题的文案。
     throw new Error(`skill 源目录不可读：${sourceDir}（${errMsg(err)}）`)
   }
-  let status: InstallResult['status']
+
+  const base = { entityDir, sourceFiles, sourceHash }
 
   if (!isDirectory(entityDir)) {
     let exists = true
@@ -574,63 +608,91 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
       else throw err
     }
     if (exists) throw new Error(`实体路径已存在但不是目录：${entityDir}`)
-    writeInstalled(entityDir, sourceDir, sourceFiles, version, sourceHash, warnings)
-    status = 'installed'
-  } else {
-    // —— 分类（审查 I4：分类读取可能因 EACCES 等抛错；失败按「内容不同」处理，
-    // 让 --force 仍然可用、无 force 则跳过 + 警告，不把用户卡死） ——
-    let vacuous = false
-    let targetHash: string | null = null
-    let readError: unknown = null
-    try {
-      vacuous = isVacuous(entityDir)
-      if (!vacuous) targetHash = contentHash(entityDir)
-    } catch (err) {
-      readError = err
-    }
+    return { ...base, status: 'installed', action: 'write', warnings }
+  }
 
-    if (vacuous) {
-      // 真空（审查 C1 判据：除根部清单外无任何条目）——没有用户内容可保护，按首次安装换入。
-      const prev = readManifestSafe(entityDir)
-      writeInstalled(entityDir, sourceDir, sourceFiles, version, sourceHash, warnings, prev?.files)
-      status = 'installed'
-    } else if (targetHash === sourceHash) {
-      const m = readManifestSafe(entityDir)
-      if (
-        m !== null
-        && m.version === version
-        && m.skill_contract_version === SKILL_CONTRACT_VERSION
-        && m.content_hash === sourceHash
-      ) {
-        status = 'skipped' // 幂等：一个字节都不写
-      } else {
-        // 审查 M2：清单损坏/字段缺失/旧格式视为「落后」，不视为用户改动——它不是
-        // 正文，损坏不构成保护对象；正文哈希一致已证明正文未被改动。只重写清单
-        // （否则 Task 10 的漂移探测会永远报 stale）。
-        if (isSafeWriteTarget(path.join(entityDir, MANIFEST), '清单', warnings)) {
-          writeManifest(entityDir, version, sourceHash, sourceFiles)
-          status = 'updated'
-        } else {
-          status = 'skipped' // 清单被占用：正文一致，用户处理占用后重跑即可
-        }
-      }
-    } else if (force) {
-      const prev = readManifestSafe(entityDir)
-      writeInstalled(entityDir, sourceDir, sourceFiles, version, sourceHash, warnings, prev?.files)
-      status = 'updated'
-    } else {
-      const reason = readError !== null
-        ? `读取实体目录内容失败（${errMsg(readError)}）`
-        : '实体目录内容与包内不同（可能被手工修改）'
-      status = 'skipped'
-      warnings.push(`${reason}，未覆盖；确认后可用 --force 覆盖：${entityDir}`)
+  // —— 分类（审查 I4：分类读取可能因 EACCES 等抛错；失败按「内容不同」处理，
+  // 让 --force 仍然可用、无 force 则跳过 + 警告，不把用户卡死） ——
+  let vacuous = false
+  let targetHash: string | null = null
+  let readError: unknown = null
+  try {
+    vacuous = isVacuous(entityDir)
+    if (!vacuous) targetHash = contentHash(entityDir)
+  } catch (err) {
+    readError = err
+  }
+
+  if (vacuous) {
+    // 真空（审查 C1 判据：除根部清单外无任何条目）——没有用户内容可保护，按首次安装换入。
+    const prev = readManifestSafe(entityDir)
+    return {
+      ...base, status: 'installed', action: 'write', warnings,
+      ...(prev?.files !== undefined ? { prevFiles: prev.files } : {}),
     }
   }
 
+  if (targetHash === sourceHash) {
+    const m = readManifestSafe(entityDir)
+    if (
+      m !== null
+      && m.version === version
+      && m.skill_contract_version === SKILL_CONTRACT_VERSION
+      && m.content_hash === sourceHash
+    ) {
+      return { ...base, status: 'skipped', action: 'none', warnings } // 幂等：一个字节都不写
+    }
+    // 审查 M2：清单损坏/字段缺失/旧格式视为「落后」，不视为用户改动——它不是
+    // 正文，损坏不构成保护对象；正文哈希一致已证明正文未被改动。只重写清单
+    // （否则 Task 10 的漂移探测会永远报 stale）。
+    const manifestWarning = writeTargetWarning(path.join(entityDir, MANIFEST), '清单')
+    if (manifestWarning !== null) {
+      // 清单被占用：正文一致，用户处理占用后重跑即可。
+      return { ...base, status: 'skipped', action: 'none', warnings: [manifestWarning] }
+    }
+    return { ...base, status: 'updated', action: 'rewrite-manifest', warnings }
+  }
+
+  if (force) {
+    const prev = readManifestSafe(entityDir)
+    return {
+      ...base, status: 'updated', action: 'write', warnings,
+      ...(prev?.files !== undefined ? { prevFiles: prev.files } : {}),
+    }
+  }
+
+  const reason = readError !== null
+    ? `读取实体目录内容失败（${errMsg(readError)}）`
+    : '实体目录内容与包内不同（可能被手工修改）'
+  warnings.push(`${reason}，未覆盖；确认后可用 --force 覆盖：${entityDir}`)
+  return { ...base, status: 'skipped', action: 'none', warnings }
+}
+
+/**
+ * 安装 skill。流程见文件头决策表。链接阶段的任何异常都进 warnings，不向上抛；
+ * 只有「源目录不可用」「实体路径被文件占用」「暂存写入失败」这类无法继续的情况
+ * 才抛错（调用方 Task 11 会转成 internal 错误信封）。
+ *
+ * 判定本身在 `planInstall`（只读）；本函数只负责按计划执行写操作。
+ */
+export async function installSkill(opts: InstallOptions): Promise<InstallResult> {
+  const { home, sourceDir, version, force, noLink = false } = opts
+  const entityDir = opts.entityDir ?? defaultEntityDir(home)
+
+  const plan = planInstall({ entityDir, sourceDir, version, force })
+  const warnings = [...plan.warnings]
+
+  if (plan.action === 'write') {
+    writeInstalled(entityDir, sourceDir, plan.sourceFiles, version, plan.sourceHash, warnings, plan.prevFiles)
+  } else if (plan.action === 'rewrite-manifest') {
+    writeManifest(entityDir, version, plan.sourceHash, plan.sourceFiles)
+  }
+
   // —— 链接：按四态分派；任何失败都收敛进 warnings ——
+  const links: InstallResult['links'] = []
   if (!noLink) await linkAgents(opts, entityDir, links, warnings)
 
-  return { entityDir, status, links, warnings }
+  return { entityDir, status: plan.status, links, warnings }
 }
 
 /** 对每个 agent 目录按 linkState 四态分派建链，结果与失败原因都写进 links/warnings。 */
