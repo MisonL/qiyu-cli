@@ -115,9 +115,9 @@ export async function runPostinstall(opts: PostinstallOptions): Promise<number> 
     // 相对路径按 `opts.cwd` 解析成绝对路径——installSkill 内部所有路径运算都按绝对路径处理。
     // 绝对路径不受 cwd 影响（`path.resolve` 对绝对输入直接返回，不会拼接基准）。
     const requestedDir = env.get('npm_config_qiyu_skill_dir')?.trim()
-    // ⚠️ 这是 runPostinstall 里**唯一**一次读进程状态（`process.cwd()`），只在调用方
-    // 没注入 `cwd` 时兜底。纯函数原则不破：所有判定输入仍以 opts 为准，生产入口显式
-    // 传 `INIT_CWD ?? process.cwd()`，测试一律注入，因此正常路径上这行不会被走到。
+    // ⚠️ `process.cwd()` 只在调用方没注入 `cwd` 时求值（`??` 短路），但**不是**
+    // 「正常路径走不到」——多数测试用例并不注入 cwd，所以这条兜底在测试里确实会跑。
+    // 它是纯函数里唯一一次读进程状态：生产入口一律显式注入，判定输入仍以 opts 为准。
     const baseCwd = opts.cwd ?? process.cwd()
     const entityDir = requestedDir !== undefined && requestedDir !== ''
       ? path.resolve(baseCwd, requestedDir)
@@ -164,18 +164,47 @@ function isEntry(): boolean {
   }
 }
 
+/**
+ * 入口接线：把「进程状态 → runPostinstall 的输入」这一步单独导出，供测试直接钉住
+ * （复审 N3：此前接线段零覆盖，变异「去掉 `INIT_CWD ??`」可存活）。
+ *
+ * 三个职责：
+ *   1. `cwd` 取 `INIT_CWD ?? process.cwd()`——npm 生命周期脚本的 cwd 是包根
+ *      （`node_modules/qiyu-cli`），`INIT_CWD` 才是用户执行 install 的目录（审查 M2）；
+ *   2. **任何异常都收敛成 0**，包括取 `process.cwd()` 本身抛错（cwd 被删的场景，
+ *      复审 N1 实测过：写在实参位置会在 `.catch()` 之外，退 1、阻断安装）；
+ *   3. 恒返回数字，调用方直接赋给 `process.exitCode`。
+ *
+ * `cwd` 参数仅供测试注入进程 cwd；生产入口不传，走 `process.cwd()`。
+ */
+export async function mainEntry(opts: {
+  env: NodeJS.ProcessEnv
+  home: string
+  /** 仅供测试注入进程 cwd；生产入口不传，走 `process.cwd()`。 */
+  cwd?: string
+  /** 仅供测试覆盖包内源目录；生产入口不传，走 `resolveSkillSourceDir()`。 */
+  sourceDir?: string
+}): Promise<number> {
+  try {
+    // 优先级：`INIT_CWD`（npm 提供的用户目录）> 注入的进程 cwd（测试用）> `process.cwd()`。
+    // `opts.cwd` 代表「进程 cwd 的替身」，语义上低于 env 里的 INIT_CWD —— 顺序写反
+    // 会让用户在 npm 生命周期里设相对路径时落到包根（M2 的原始病症）。
+    const base = opts.env.INIT_CWD ?? opts.cwd ?? process.cwd()
+    return await runPostinstall({
+      env: opts.env,
+      home: opts.home,
+      cwd: base,
+      ...(opts.sourceDir !== undefined ? { sourceDir: opts.sourceDir } : {}),
+    })
+  } catch {
+    // 连「取 cwd 失败」都在这里被兜住 —— postinstall 绝不阻断 npm 安装。
+    return 0
+  }
+}
+
 if (isEntry()) {
   // 连 catch 兜底都返回 0：postinstall 在任何情况下都不得阻断 npm 安装。
   // 用 `process.exitCode` 而不是 `process.exit`（与 cli.ts 同理：设 exitCode 后
   // 让事件循环自然结束，stdout/stderr 先排空再退出）。
-  //
-  // `cwd` 传 `INIT_CWD ?? process.cwd()`：npm 生命周期脚本的 cwd 是包根
-  // （`node_modules/qiyu-cli`），`INIT_CWD` 才是用户执行 install 的目录——用户设
-  // `npm_config_qiyu_skill_dir=./my-skill` 时应当落在用户目录，不是包目录（审查 M2）。
-  // `INIT_CWD` 缺失（非 npm 生命周期的直接执行）时退回进程 cwd 是唯一合理基准。
-  process.exitCode = await runPostinstall({
-    env: process.env,
-    home: homedir(),
-    cwd: process.env.INIT_CWD ?? process.cwd(),
-  }).catch(() => 0)
+  process.exitCode = await mainEntry({ env: process.env, home: homedir() })
 }

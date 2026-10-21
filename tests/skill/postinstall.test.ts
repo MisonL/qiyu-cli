@@ -18,7 +18,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { runPostinstall } from '../../src/postinstall.js'
+import { runPostinstall, mainEntry } from '../../src/postinstall.js'
 import { defaultEntityDir } from '../../src/skill/paths.js'
 
 let home: string
@@ -257,6 +257,73 @@ describe('runPostinstall', () => {
       expect(installed(abs)).toBe(true)
       // 没有被拼进 cwd 之下。
       expect(existsSync(join(elsewhere, 'absolute-entity'))).toBe(false)
+    })
+  })
+
+  // —— 复审 N1/N3：入口接线（mainEntry） ——
+  //
+  // 上面所有用例都直接调 `runPostinstall`，入口段（取 `INIT_CWD ?? process.cwd()`
+  // 并兜住异常）零覆盖——复审实测「入口去掉 `INIT_CWD ??`」与「去掉 catch」两类
+  // 变异在旧测试上存活。这里直接钉 `mainEntry`（入口唯一做的事就是调它）。
+  describe('入口接线 mainEntry（复审 N1/N3）', () => {
+    it('INIT_CWD 优先于进程 cwd 作为相对路径基准（入口真的把它传下去了）', async () => {
+      const sourceDir = makeSource()
+      const userProj = join(home, 'user-proj')
+      mkdirSync(userProj, { recursive: true })
+      const code = await mainEntry({
+        env: {
+          npm_config_global: 'true',
+          npm_command: 'install',
+          npm_config_qiyu_skill_dir: 'rel-dir',
+          INIT_CWD: userProj,
+        },
+        home,
+        sourceDir,
+        // 进程 cwd 故意给一个无关目录：若入口只传 process.cwd()，落点会错。
+        cwd: join(home, 'wrong-base'),
+      })
+      expect(code).toBe(0)
+      expect(installed(join(userProj, 'rel-dir'))).toBe(true)
+    })
+
+    it('INIT_CWD 缺失时退回注入的进程 cwd', async () => {
+      const sourceDir = makeSource()
+      const base = join(home, 'proc-cwd')
+      mkdirSync(base, { recursive: true })
+      const code = await mainEntry({
+        env: {
+          npm_config_global: 'true',
+          npm_command: 'install',
+          npm_config_qiyu_skill_dir: 'rel-dir',
+        },
+        home,
+        sourceDir,
+        cwd: base,
+      })
+      expect(code).toBe(0)
+      expect(installed(join(base, 'rel-dir'))).toBe(true)
+    })
+
+    it('取 cwd 失败也退 0（复审 N1：异常不得漏出入口）', async () => {
+      const sourceDir = makeSource()
+      // 注入一个「取 cwd 就抛」的场景：不给 cwd、也不给 INIT_CWD，并把进程 cwd
+      // 临时删掉——process.cwd() 会抛 ENOENT。用 chdir 到临时目录再删除它来构造。
+      const doomed = join(home, 'doomed')
+      mkdirSync(doomed, { recursive: true })
+      const before = process.cwd()
+      process.chdir(doomed)
+      rmSync(doomed, { recursive: true, force: true })
+      try {
+        const code = await mainEntry({
+          env: { npm_config_global: 'true', npm_command: 'install' },
+          home,
+          sourceDir,
+          // 不传 cwd：逼入口走 process.cwd()，此时它必抛。
+        })
+        expect(code).toBe(0)
+      } finally {
+        process.chdir(before)
+      }
     })
   })
 })
