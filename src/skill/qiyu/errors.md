@@ -29,7 +29,7 @@
 | `kind: store_locked` | 本地库正被写进程持锁（例如同步进行中）。退避后重试；期间可以先用已有数据做分析 |
 | `kind: store_not_initialized` | 本地库不存在或缺表。先跑 `qiyu store init`，再跑 `qiyu sync run` |
 | `kind: query_timeout` | 查询超时。缩小时间窗口、减少分组列或降低 `--limit` 后重试 |
-| `kind: sync_not_run` | 还没有成功同步过。先跑 `qiyu sync run`，跑完再查 |
+| `kind: sync_not_run` | 还没有成功同步过。这个 kind **只由 `sync install` 的前置探测产出**（`sync status` 不产出它，水位全为 null 时按 `SKILL.md` 的开场协议处理）：先跑一次 `qiyu sync run` 让至少一个任务真正同步成功，再装调度 |
 
 ## 退出码 4 的信号
 

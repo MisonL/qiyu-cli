@@ -30,37 +30,25 @@ import { join } from 'node:path'
 import { describeArgs, fail, ok, setSkillWarning, usageFail } from '../output.js'
 import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from '../core/edition.js'
 import { ERROR_KINDS } from '../core/errors.js'
+import { allEndpoints } from '../core/registry/index.js'
 import { TABLES } from '../store/schema.js'
+import { REPORT_TABLES } from '../query/metric-catalog.js'
+import { SYNC_TASKS } from '../sync/registry.js'
 import { COMMAND_TREE } from './tree.js'
 import { checkSkillDir, type CheckContext, type CheckResult } from '../skill/check.js'
 import { contentHash, installSkill, planInstall, type InstallPlan } from '../skill/install.js'
 import { resolveSkillSourceDir } from '../skill/detect.js'
 import {
-  agentSkillDirs, defaultEntityDir, linkState, type AgentDir, type LinkState,
+  AGENT_SKILL_SUBDIRS, agentSkillDirs, agentSkillSubdir, defaultEntityDir, LINK_NAME, linkState,
+  type AgentDir, type LinkState,
 } from '../skill/paths.js'
 
 /**
- * agent skills 目录下的链接名。与 `skill/install.ts` 的 `LINK_NAME` 是同一事实
- * （那里未导出；本任务只允许改三个文件，故在此镜像一份）。skill 身份固定为 `qiyu`。
+ * 已知 agent 名（`--link` 的合法取值）。从 paths.ts 的 `AGENT_SKILL_SUBDIRS` 派生，
+ * 不再本地镜像：`AgentDir['name']` 是类型层的唯一事实源，paths.ts 的
+ * `Record<AgentDir['name'], string>` 保证那里覆盖全部成员（新增 agent 时编译失败）。
  */
-const LINK_NAME = 'qiyu'
-
-/**
- * 已知 agent 的 skills 子目录。正常路径用 `agentSkillDirs(home)`（paths.ts 的事实源）；
- * 只在它整体抛出（ENOTDIR）时作为逐 agent 退化探测用。`Record` 的键是联合类型，
- * 新增/重命名 agent 时这里会编译失败——子目录字符串本身的漂移没有编译期保护，
- * 这是本任务不能改 paths.ts 的已知代价（报告里注明）。
- */
-const AGENT_SUBDIRS: Record<AgentDir['name'], string> = {
-  'claude-code': join('.claude', 'skills'),
-  codex: join('.codex', 'skills'),
-}
-
-/**
- * 已知 agent 名（`--link` 的合法取值）。从 `AGENT_SUBDIRS` 的键派生，不再手写第二份：
- * `AgentDir['name']` 是类型层的唯一事实源，`Record` 保证这里覆盖全部成员。
- */
-const KNOWN_AGENTS = Object.keys(AGENT_SUBDIRS) as AgentDir['name'][]
+const KNOWN_AGENTS = AGENT_SKILL_SUBDIRS.map((a) => a.name)
 
 const SKILL_USAGE = `用法：qiyu skill <子命令> [参数]
 
@@ -68,7 +56,8 @@ const SKILL_USAGE = `用法：qiyu skill <子命令> [参数]
   skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
                            安装 skill 正文到实体目录，并链接到已存在的 agent 目录
   skill check   [--installed | --compare] [--dir <path>]
-                           校验 skill 正文引用与 CLI 契约是否一致（有违规退出码 1）
+                           校验 skill 正文引用与 CLI 契约是否一致（有违规退出码 1；
+                           --compare 下内容不一致、已安装那份不可用同样算失败）
   skill where   [--dir <path>]
                            报告实体目录与各 agent 链接状态（只读，不修复；
                            无法判定时 state=unknown、exists=null——不是「不存在」）
@@ -221,7 +210,7 @@ function probeAgentDirs(home: string): AgentProbe {
     const dirs: { name: AgentDir['name']; dir: string }[] = []
     const broken = new Map<AgentDir['name'], string>()
     for (const name of KNOWN_AGENTS) {
-      const dir = join(home, AGENT_SUBDIRS[name])
+      const dir = join(home, agentSkillSubdir(name))
       try {
         lstatSync(dir)
         dirs.push({ name, dir })
@@ -503,11 +492,27 @@ async function skillInstall(argv: string[]): Promise<number> {
 
 // —— skill check ——
 
-/** 校验上下文：命令树 / 表名 / 错误 kind 全部从各自的权威位置取。 */
+/**
+ * 校验上下文：命令树 / 表名 / 错误 kind / 四个位置参数取值域，全部从各自的权威位置取。
+ *
+ * 取值域闭集在这里组装而不是让 `skill/check.ts` 去 import：`skill/` 若要自己取
+ * `SYNC_TASKS` / `allEndpoints()` / `REPORT_TABLES`，就会把 sync 注册表乃至
+ * `core/registry/specs.json` 拉进它的依赖面（`skill check` 因此连带加载注册表）。
+ * 命令层本来就是组合根，四个闭集在这里并成一份注入。
+ *
+ * `domains` 的键是 `Domain` 联合类型（`Record<Domain, …>`）：`Domain` 加一个成员而
+ * 不在这里补闭集，`tsc` 会直接报缺键——取值域不会悄悄少一份。
+ */
 const CHECK_CONTEXT: CheckContext = {
   tree: COMMAND_TREE,
   tableNames: TABLES.map((t) => t.name),
   errorKinds: ERROR_KINDS,
+  domains: {
+    tables: TABLES.map((t) => t.name),
+    'report-tables': REPORT_TABLES,
+    'task-ids': SYNC_TASKS.map((t) => t.id),
+    'endpoint-ids': allEndpoints().map((e) => e.id),
+  },
 }
 
 type CheckOutcome = { result: CheckResult } | { error: string }
@@ -664,7 +669,12 @@ async function skillCheck(argv: string[]): Promise<number> {
       // 内容哈希与违规数：前者回答「两份正文是否一致」，后者回答「判定结果是否一致」。
       try {
         if (contentHash(pkgDir) !== contentHash(entityDir)) {
+          // 「正文内容不同」计入 bad：`--compare` 的存在意义就是发现「装过旧版、包升级
+          // 改了正文」（spec D2.1 的洞），而它在 CI 里唯一的信号就是退出码。同一
+          // `differences` 数组里的其它成因（目录不存在 / 缺 SKILL.md / 读取失败 / 哈希
+          // 比较失败）一律退 1，唯独内容漂移退 0 = 检测到了却不报（终审 I3）。
           differences.push('包内与已安装的正文内容不同（content_hash 不一致）')
+          installedFailed = true
         }
       } catch (e) {
         // 审查 M3：无法完成内容比较 = 无法完成比较，退出码必须为 1。
@@ -734,12 +744,12 @@ function probeAgentLinks(
   for (const name of KNOWN_AGENTS) {
     const dir = dirOf.get(name)
     if (dir === undefined) {
-      const path = join(home, AGENT_SUBDIRS[name], LINK_NAME)
+      const path = join(home, agentSkillSubdir(name), LINK_NAME)
       const error = probed.broken.get(name)
       if (error !== undefined) {
         // 目录本身不可检查（如父级是文件 → ENOTDIR）：如实记 unknown，不谎报 missing。
         links.push({ agent: name, path, state: 'unknown', error })
-        warnings.push(`${name} 的 skills 目录无法检查（${error}）：${join(home, AGENT_SUBDIRS[name])}`)
+        warnings.push(`${name} 的 skills 目录无法检查（${error}）：${join(home, agentSkillSubdir(name))}`)
       } else {
         links.push({ agent: name, path, state: 'missing' })
       }

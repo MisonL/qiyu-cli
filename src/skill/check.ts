@@ -1,31 +1,33 @@
 // src/skill/check.ts —— `skill check` 的校验逻辑：把 skill 正文里的引用与 CLI 的真实契约
-// （命令树 / 表名 / 错误 kind）比对，产出三档判定（设计稿 D3）：
+// （命令树 / 表名 / 错误 kind / 位置参数取值域）比对，产出三档判定（设计稿 D3）：
 //
-//   · violations：引用不存在的命令 / flag / kind；正文出现表名；出现完整 SQL 序列；
-//     推荐了被显式拒绝的 flag（`--pretty`）。
+//   · violations：引用不存在的命令 / flag / kind / 位置参数取值；正文出现表名；出现
+//     完整 SQL 序列；推荐了被显式拒绝的 flag（`--pretty`）。
 //   · warnings：无法静态判定的引用（含管道 / 省略号等），不阻塞，但要指认位置。
 //   · 两者皆空：通过。
 //
 // 分工边界：`refs.ts` 只负责**提取**（哪些文本算引用），本文件只负责**判定**。表名扫描
 // 复用 `collectSegments` 而不是重写一遍围栏解析 —— 两处扫描面一旦各写一遍必然漂移。
 //
-// 契约事实由调用方通过 `CheckContext` 注入（`COMMAND_TREE` / `TABLES` / `ERROR_KINDS`），
-// 本文件不 import `cli.ts`（会拉进整个 CLI 入口图，层级倒置），只从 commands 层取
-// `findSpec` / `CommandSpec`。分层方向：`skill/` 可以 import `commands/`、`store/`、
-// `core/`，反向禁止。
+// 契约事实由调用方通过 `CheckContext` 注入（`COMMAND_TREE` / `TABLES` / `ERROR_KINDS` /
+// 四个取值域闭集），本文件不 import `cli.ts`（会拉进整个 CLI 入口图，层级倒置），也不
+// import `SYNC_TASKS` / `allEndpoints` / `REPORT_TABLES`（那会把 registry 的 `specs.json`
+// 拉进 skill 层并改变它的依赖面），只从 commands 层取 `findSpec` / `CommandSpec` 与
+// `Domain` 类型。分层方向：`skill/` 可以 import `commands/`、`store/`、`core/`，反向禁止。
 //
 // ⚠️ 校验器**不理解否定语境**：`` `tags` `` 出现在「不是 tags 表」这种句子里同样命中
 // `table_name`。skill 正文任何位置都不能写表名，包括用来举例说明「不要写表名」的地方。
 
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { findSpec, type CommandSpec } from '../commands/spec-types.js'
+import { findSpec, type CommandSpec, type Domain } from '../commands/spec-types.js'
 import { collectSegments, extractRefs } from './refs.js'
 
-/** 违规规则名。前三个是命令契约，后三个是内容红线（设计稿 §11.1）。 */
+/** 违规规则名：命令契约（前三条）、位置参数取值域（unknown_positional）与内容红线（后三条）。 */
 export type ViolationRule =
   | 'unknown_command'
   | 'unknown_flag'
+  | 'unknown_positional'
   | 'rejected_flag'
   | 'table_name'
   | 'sql_sequence'
@@ -47,6 +49,14 @@ export interface CheckContext {
   tree: CommandSpec[]
   tableNames: string[]
   errorKinds: readonly string[]
+  /**
+   * `Domain` → 该域的合法取值闭集。由调用方注入（`commands/skill.ts` 的 `CHECK_CONTEXT`
+   * 从 `TABLES` / `REPORT_TABLES` / `SYNC_TASKS` / `allEndpoints()` 组装）—— `skill/`
+   * 因此不需要 import 那几个 registry 模块，`specs.json` 也不会被拉进本层。
+   *
+   * `Record<Domain, …>` 是刻意的：`Domain` 加一个成员而不在这里补一份闭集，编译期就红。
+   */
+  domains: Record<Domain, readonly string[]>
 }
 
 /** 转义正则元字符：表名来自 `CheckContext` 注入，按字面匹配而不是正则模式。 */
@@ -62,19 +72,22 @@ function escapeRegExp(text: string): string {
  *   2. flag：**先查 `spec.rejected`**，再查 `spec.flags` 的完整接受集。顺序是硬要求 ——
  *      `--pretty` 同时在 `GLOBAL_FLAGS`（因而在每条 spec 的 `flags` 里）与 `REJECTED_FLAGS`
  *      里，反过来先查 `flags` 会把它判成合法，`rejected_flag` 永远报不出来；
- *   3. 表名：只在 `collectSegments` 的代码面片段里扫（与 refs 扫描面一致），词边界、
+ *   3. 位置参数取值域：命令词之后（`spec.path.length` 起）的字面 token 逐个按
+ *      `spec.positionals[i].domain` 查注入的闭集；不在闭集 → `unknown_positional`，
+ *      位置参数个数超过 spec 声明同样违规；
+ *   4. 表名：只在 `collectSegments` 的代码面片段里扫（与 refs 扫描面一致），词边界、
  *      大小写敏感；
- *   4. SQL 序列：`extractRefs` 已按行 / 围栏块识别；
- *   5. `kind: x`：对 `ERROR_KINDS` 比对；
- *   6. 无法静态判定的命令（含选择 / 省略符号）进 warnings，不进 violations。
+ *   5. SQL 序列：`extractRefs` 已按行 / 围栏块识别；
+ *   6. `kind: x`：对 `ERROR_KINDS` 比对；
+ *   7. 无法静态判定的命令（含选择 / 省略符号）进 warnings，不进 violations。
  */
 export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
   const violations: Violation[] = []
   const warnings: { line: number; detail: string }[] = []
   const refs = extractRefs(text)
 
-  // 1 + 2：命令路径与 flag。`extractRefs` 给出的 path 已剔除 flag 与取值，
-  // 可直接喂给 `findSpec`（它按原始 argv 风格 token 逐位比较）。
+  // 1 + 2 + 3：命令路径、flag 与位置参数取值域。`extractRefs` 给出的 path 已剔除 flag
+  // 与取值、也在占位符处封口，可直接喂给 `findSpec`（它按原始 argv 风格 token 逐位比较）。
   for (const cmd of refs.commands) {
     const spec = findSpec(ctx.tree, cmd.path)
     if (!spec) {
@@ -102,9 +115,33 @@ export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
         })
       }
     }
+    // 位置参数：`path` 与 `positionals` 是同一串字面 token，切掉命令词后余下的即取值。
+    // `refs.ts` 已排除占位符（`<表>` 不是字面值）与 flag 取值（`--table sessions`）。
+    const values = cmd.positionals.slice(spec.path.length)
+    for (let i = 0; i < values.length; i++) {
+      const value = values[i]!
+      const slot = spec.positionals[i]
+      if (slot === undefined) {
+        violations.push({
+          line: cmd.line,
+          rule: 'unknown_positional',
+          detail: `qiyu ${spec.path.join(' ')} 只接受 ${spec.positionals.length} 个位置参数，`
+            + `多出的不接受：${value}`,
+        })
+        continue
+      }
+      if (!ctx.domains[slot.domain].includes(value)) {
+        violations.push({
+          line: cmd.line,
+          rule: 'unknown_positional',
+          detail: `qiyu ${spec.path.join(' ')} 的位置参数 ${slot.name} 不接受此值：${value}`
+            + `（不在 ${slot.domain} 闭集里）`,
+        })
+      }
+    }
   }
 
-  // 3：表名。代码面片段由 refs.ts 统一收集（行内代码 + 围栏内容行），这里只做词边界匹配。
+  // 4：表名。代码面片段由 refs.ts 统一收集（行内代码 + 围栏内容行），这里只做词边界匹配。
   // `(?<![\w-])` / `(?![\w-])`：`tag` 不命中 `tags`、`staff` 不命中 `staff_groups`；
   // 大小写敏感（不加 `i`），避免把 `Staff` 之类的英文单词误判成表名。
   // 表名先过 escapeRegExp：当前 TABLES 全是 `[a-z_]+` 所以不转义也安全，但 `tableNames`
@@ -125,7 +162,7 @@ export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
     }
   }
 
-  // 4：SQL 关键字序列（`extractRefs` 已处理 SELECT/FROM 独立词、跨行块级判定）。
+  // 5：SQL 关键字序列（`extractRefs` 已处理 SELECT/FROM 独立词、跨行块级判定）。
   // detail 里把换行压成空格，避免多行块级序列把报告撑散。
   for (const sql of refs.sqlSequences) {
     violations.push({
@@ -135,7 +172,7 @@ export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
     })
   }
 
-  // 5：错误 kind。
+  // 6：错误 kind。
   for (const kind of refs.kinds) {
     if (!ctx.errorKinds.includes(kind.name)) {
       violations.push({
@@ -146,13 +183,13 @@ export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
     }
   }
 
-  // 6：无法静态判定 → warning（设计稿 D3：退出码 0，不阻塞）。
+  // 7：无法静态判定 → warning（设计稿 D3：退出码 0，不阻塞）。
   for (const item of refs.unverifiable) {
     warnings.push({ line: item.line, detail: `无法静态判定（${item.reason}）：${item.text}` })
   }
 
-  // 五类规则各自按出现顺序产出，合并后按行稳定排序（V8 的 sort 是稳定排序），
-  // 同一行的多条保持「命令 → 表名 → SQL → kind」的规则顺序。
+  // 各规则按出现顺序产出，合并后按行稳定排序（V8 的 sort 是稳定排序），
+  // 同一行的多条保持「命令 → flag → 位置参数 → 表名 → SQL → kind」的规则顺序。
   violations.sort((a, b) => a.line - b.line)
   return { violations, warnings }
 }

@@ -49,7 +49,7 @@ cd qiyu-cli && npm install && npm run build
 `qiyu` 附带一份 Agent 操作协议（skill），装到 `~/.agents/skills/qiyu` 并链接进各 Agent 的
 skills 目录（当前支持 Claude Code 的 `~/.claude/skills` 与 Codex 的 `~/.codex/skills`）。
 
-**当前版本，自动安装基本不会发生**，请显式跑一次：
+**当前版本，自动安装基本不会发生**，请直接跑一次：
 
 ```bash
 qiyu skill install        # 安装 / 更新 skill 正文并建链接
@@ -57,22 +57,15 @@ qiyu skill install        # 安装 / 更新 skill 正文并建链接
 
 原因如实说：`package.json` 里虽有 `postinstall`，但它**只在 npm 全局安装、且不是 npx 调用时**
 才尝试安装（判据是 `npm_config_global === 'true'` 且 `npm_command !== 'exec'`）。而
-**npm 12 / pnpm 12 / bun 默认阻断安装脚本**，即使装了也可能根本不执行；npx 场景下它还会
-主动跳过（不往你的 home 写东西）。要用 postinstall 的话需要显式放行：
-
-```bash
-# npm 12
-npm install -g qiyu-cli --allow-scripts=qiyu-cli
-# pnpm 12
-pnpm approve-builds      # 在交互界面里勾选 qiyu-cli
-```
-
-但放行后它也**只做「尽力而为」**：失败一律不阻断安装、只写一行 stderr 提示，而且默认安装
-下 stderr 会被 npm 吞掉（`--foreground-scripts` 才可见）。所以**主路径始终是 `qiyu skill install`**。
+**npm 12 / pnpm 12 / bun 默认阻断安装脚本**；更麻烦的是，以 tarball / `file:` 方式安装时
+npm 无法确认可信版本、也就无法 pin 版本，`--allow-scripts` 同样不生效——脚本**根本没跑**
+（npm 仍退 0，只有一行 warn，极易被当成成功）。npx 场景下它还会主动跳过（不往你的 home 写东西）。
+所以**不要指望 postinstall：直接运行 `qiyu skill install`**。
 
 安装是幂等的：内容一致时不动任何文件（要覆盖你改过的正文得加 `--force`）。其他子命令：
 `qiyu skill where` 报告实体目录与各 Agent 的链接状态（只读，不修复）；`qiyu skill check`
-校验 skill 引用的命令/表/错误 kind 是否仍存在（有违规退出码 1，CI 可跑）。
+校验 skill 引用的命令/表/错误 kind 是否仍存在（有违规退出码 1，CI 可跑；`--compare` 模式下
+两份正文内容不一致、或已安装那份不可用，同样退 1）。
 
 > 兜底提示：若 skill 未安装或已过期，`qiyu` 每次成功输出都会在 `meta.warnings` 里提醒
 > 「未安装 / 已过期」——提示只写进 JSON，不改退出码。
@@ -143,7 +136,8 @@ qiyu stats fields <报表>              指标自描述（声明 + 本地观测�
 qiyu skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
                                      安装 skill 正文并链接进各 Agent 的 skills 目录
 qiyu skill check [--installed | --compare] [--dir <path>]
-                                     校验 skill 引用的命令/表/错误 kind（有违规退出码 1）
+                                     校验 skill 引用的命令/表/错误 kind（有违规退出码 1；
+                                     --compare 下内容不一致也算失败）
 qiyu skill where [--dir <path>]      报告实体目录与各 Agent 链接状态（只读，不修复）
 qiyu --version                       包版本 + skill_contract_version
 ```
@@ -348,8 +342,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 查询与只读沙箱——`db tables` / `db describe` / `query --sql` / `query --table` / `stats fields`
 （三层只读沙箱、默认脱敏、时间列三形态语义化、`-1` 哨兵呈现、声明与观测分离）。
 Skill 化——`skill install`（复制正文 + 建 Agent 链接，幂等，`--dry-run` 只算计划）/
-`skill check`（校验正文引用的命令、表名、错误 `kind` 是否仍存在；`--installed`/`--compare`
-改基准；有违规退出码 1）/ `skill where`（只读报告实体目录与各 Agent 链接四态：
+`skill check`（校验正文引用的命令、表名、错误 `kind` 与位置参数取值是否仍存在；
+`--installed`/`--compare` 改基准；有违规退出码 1，`--compare` 下内容不一致也算失败）/
+`skill where`（只读报告实体目录与各 Agent 链接四态：
 `ok`/`missing`/`dangling`/`foreign`，无法判定时报 `unknown` 而非「不存在」），
 外加 `qiyu --version`（输出包版本与 `skill_contract_version`）。
 

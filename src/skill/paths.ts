@@ -5,10 +5,12 @@
 // `core/`，也不被它们反向 import。消费方是 Task 9（安装，用 `LinkState` 填
 // `InstallResult.links[].state`）与 Task 11（`skill where` 直接展示四态）。
 //
-// **注入 home，不读真实环境**：所有路径函数都收调用方给的 `home`，本文件不读 `~`、
-// 不读 `process.env`，测试因此可以完全跑在临时目录里。唯一的平台依赖是
-// `createSkillLink` 里的 `process.platform`，而平台决策本身已抽成纯函数 `linkPlan`，
-// 测试可以直接注入平台值来钉住行为。
+// **注入 home / 注入 env，不读真实环境**：所有路径函数都收调用方给的 `home`，键名
+// 归一化函数收调用方给的 `env`（`postinstall.ts` 传 `opts.env`、`detect.ts` 传
+// `process.env`），本文件不读 `~`、**不直接**读 `process.env`，测试因此可以完全
+// 跑在临时目录与字面量 env 里。唯一的平台依赖是 `createSkillLink` 里的
+// `process.platform`，而平台决策本身已抽成纯函数 `linkPlan`，测试可以直接注入
+// 平台值来钉住行为。
 //
 // 链接四态（linkState）：
 //   · missing —— 链接路径本身不存在（lstat ENOENT）。
@@ -29,11 +31,46 @@ export interface AgentDir {
   dir: string
 }
 
-/** 已知 agent 及其 skills 目录相对 `home` 的位置，按展示顺序排列。 */
-const AGENT_SKILL_SUBDIRS: { name: AgentDir['name']; subdir: string }[] = [
-  { name: 'claude-code', subdir: path.join('.claude', 'skills') },
-  { name: 'codex', subdir: path.join('.codex', 'skills') },
-]
+/**
+ * agent skills 目录下的链接名。skill 身份固定为 `qiyu`（正文 frontmatter 同名），
+ * 不随实体位置变化。
+ *
+ * 本常量是**路径事实**，所以放在 paths.ts 这个路径事实源里：`install.ts`（安装）
+ * 与 `commands/skill.ts`（`--dry-run`/`where` 的计划与探测）都从这里取，避免两份
+ * 字符串镜像各自漂移（终审 Minor-1）。
+ */
+export const LINK_NAME = 'qiyu'
+
+/**
+ * 已知 agent → 它存放 skills 的目录（相对 `home`）。
+ *
+ * 用 `Record<AgentDir['name'], string>` 而不是数组：新增/重命名 agent 时联合类型
+ * 会让这里编译失败，子目录字符串因此有编译期保护（终审 Minor-2 要求保留）。
+ */
+const AGENT_SKILL_SUBDIR_BY_NAME: Record<AgentDir['name'], string> = {
+  'claude-code': path.join('.claude', 'skills'),
+  codex: path.join('.codex', 'skills'),
+}
+
+/**
+ * 已知 agent 及其 skills 目录相对 `home` 的位置，按展示顺序排列。
+ *
+ * 从上面的 `Record` 派生（而不是另写一份数组），消费方是 `agentSkillDirs()` 与
+ * `commands/skill.ts` 的 ENOTDIR 退化探测——两处看到的是同一份事实。
+ */
+export const AGENT_SKILL_SUBDIRS: readonly { name: AgentDir['name']; subdir: string }[] =
+  (Object.keys(AGENT_SKILL_SUBDIR_BY_NAME) as AgentDir['name'][]).map((name) => ({
+    name,
+    subdir: AGENT_SKILL_SUBDIR_BY_NAME[name]!,
+  }))
+
+/**
+ * 按 agent 名取 skills 子目录（相对 `home`）。消费方是 `commands/skill.ts` 的
+ * ENOTDIR 退化探测与 `skill where` 的 missing 条目——它们手里只有 agent 名。
+ */
+export function agentSkillSubdir(name: AgentDir['name']): string {
+  return AGENT_SKILL_SUBDIR_BY_NAME[name]
+}
 
 /**
  * 返回 `home` 下**已存在**的 agent skills 目录。不存在的 agent 不返回 ——
@@ -140,6 +177,40 @@ export function normalizeNewlines(buf: Buffer): Buffer {
     out[n++] = buf[i]!
   }
   return out.subarray(0, n)
+}
+
+// —— 环境变量（键名归一化） ——
+
+/**
+ * 把 env 的键统一成「小写 + `-` 转 `_`」后建索引（spec D8：Windows 环境变量名
+ * 大小写不敏感；npm 自己会把配置名里的 `-` 归一化成 `_`，于是
+ * `npm_config_qiyu-skill-dir` / `NPM_CONFIG_QIYU_SKILL_DIR` 都命中同一键）。
+ * 只收字符串值——`NodeJS.ProcessEnv` 的值类型允许 undefined，未定义的键视同不存在。
+ *
+ * 导出而不是在 `postinstall.ts` 与 `detect.ts` 各写一份：postinstall 用
+ * `npm_config_qiyu_skill_dir` 决定「装到哪」，漂移探测用它决定「去哪找」——两处
+ * 的归一化规则一旦不同，装上之后的每条命令都会误报「未安装」（终审 I2）。
+ */
+export function envIndex(env: NodeJS.ProcessEnv): Map<string, string> {
+  const index = new Map<string, string>()
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== 'string') continue
+    index.set(normalizeEnvKey(key), value)
+  }
+  return index
+}
+
+/**
+ * 按归一化键读一个环境变量，空串/纯空白视同未设（与既有 `QIYU_SKILL_DIR` 口径一致），
+ * 返回值已 trim。`key` 自身也过同一归一化，调用方写哪种拼法都行。
+ */
+export function readEnvByNormalizedKey(env: NodeJS.ProcessEnv, key: string): string | undefined {
+  const value = envIndex(env).get(normalizeEnvKey(key))?.trim()
+  return value !== undefined && value !== '' ? value : undefined
+}
+
+function normalizeEnvKey(key: string): string {
+  return key.toLowerCase().replace(/-/g, '_')
 }
 
 // —— 内部工具 ——

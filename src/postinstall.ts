@@ -22,7 +22,7 @@
 // 唯一跨版本可用的通路。环境变量名按 spec D8 的约定「统一转小写比对」——Windows
 // 环境变量名大小写不敏感；npm 自己会把配置名里的 `-` 归一化成 `_`，所以读取时
 // 键名统一 `toLowerCase().replace(/-/g, '_')` 后再查，`npm_config_qiyu-skill-dir`
-// 这类变体同样命中。
+// 这类变体同样命中。归一化实现在 `skill/paths.ts` 的 `envIndex`（与漂移探测共用）。
 //
 // 分层：本文件是**顶层入口**（与 cli.ts 同级），import `skill/install.ts`——与
 // `qiyu skill install` 是同一份安装逻辑，不是复制代码。纯函数 `runPostinstall`
@@ -36,6 +36,7 @@ import { pathToFileURL } from 'node:url'
 import { PACKAGE_VERSION } from './core/edition.js'
 import { resolveSkillSourceDir } from './skill/detect.js'
 import { installSkill } from './skill/install.js'
+import { envIndex } from './skill/paths.js'
 
 export interface PostinstallOptions {
   /** 注入的环境变量（生产入口传 `process.env`，测试传字面量）。 */
@@ -64,22 +65,11 @@ function note(message: string): void {
 }
 
 /**
- * 把 env 的键统一成「小写 + `-` 转 `_`」后建索引（spec D8：Windows 大小写不敏感；
- * npm 把配置名里的连字符归一化为下划线）。只收字符串值——NodeJS.ProcessEnv 的
- * 值类型允许 undefined，未定义的键视同不存在。
- */
-function envIndex(env: NodeJS.ProcessEnv): Map<string, string> {
-  const index = new Map<string, string>()
-  for (const [key, value] of Object.entries(env)) {
-    if (typeof value !== 'string') continue
-    index.set(key.toLowerCase().replace(/-/g, '_'), value)
-  }
-  return index
-}
-
-/**
  * postinstall 的全部行为。返回**永远**是 0（唯一的非 0 出口不存在）：调用方
  * （入口守卫）把它赋给 `process.exitCode`，失败只写 stderr。
+ *
+ * 键名归一化（小写 + `-`→`_`）已抽到 `skill/paths.ts` 的 `envIndex`——与
+ * `skill/detect.ts` 的漂移探测共用同一套规则（终审 I2：两处各写一份必然漂移）。
  *
  * 分支：
  *   1. npx（`npm_command === 'exec'`）→ 提示，不写任何文件——**判据优先于全局标记**

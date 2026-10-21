@@ -542,6 +542,21 @@ describe('skill check', () => {
     expect((d.differences as string[]).join('\n')).toContain('内容不同')
   })
 
+  it('--compare 正文内容漂移（追加一句、不改任何引用）→ 退 1，differences 含内容不同（终审 I3）', async () => {
+    // spec D2.1 的洞正是「装过旧版、包升级改了正文」；`--compare` 是它在 CI 里的
+    // 唯一检测器。此前这条退 0（检测到了却不报），与同数组其它成因（不存在 / 缺
+    // SKILL.md / 读取失败 / 哈希失败）的命运不一致。
+    // 变异「内容不同不计入 bad」→ 本用例红（退出码变 0）。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const metrics = join(entity, 'metrics.md')
+    writeFileSync(metrics, `${readFileSync(metrics, 'utf8')}\n<!-- 用户追加的一句 -->\n`)
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+    const d = data()
+    expect((d.installed as Record<string, unknown>)).toMatchObject({ present: true, violations: [] })
+    expect((d.differences as string[]).join('\n')).toContain('内容不同')
+  })
+
   it('--compare 在未安装时报告差异并退出 1（不抛 ENOENT）', async () => {
     expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
     const d = data()

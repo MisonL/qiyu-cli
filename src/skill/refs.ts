@@ -25,17 +25,32 @@
 // 命令切词（scanCommand）的裁定语义：
 //   · 路径 token 在第一个 `<...>` 占位符处封口；占位符是 flag 的取值或位置参数模板，
 //     不是子命令（`qiyu query <表>` 不该产出路径 `['query','<表>']`）。
+//   · 占位符之前出现的**字面** token 同时收进 `path` 与 `positionals`：前者给 `findSpec`
+//     做最长前缀匹配，后者供 `skill check` 在命中 spec 后切出位置参数取值、校验取值域
+//     （终审 I1）。占位符本身不是字面值，两个字段都不收。
 //   · flag 跨占位符继续收（`--since <时间>` 的 `--since` 仍可静态校验），但**在管道 /
 //     省略号处止步** —— 管道右侧是另一条命令，`| head -20` 的 `-20` 不属于 qiyu，
 //     收进来 Task 6 会误报 unknown_flag。占位符之后的管道不判 unverifiable（路径已封口，
 //     规则 3 的不可判定判定仍只看占位符之前）。
-//   · flag 的紧邻字面值不当路径 token（`--table sessions` 的 `sessions` 是取值）；
-//     `--table=<表>` 按 `=` 切出 flag 名 —— Task 6 比对的是 flag 名。
+//   · flag 的紧邻字面值不当路径 token，也不当位置参数（`--table sessions` 的 `sessions`
+//     是取值）；`--table=<表>` 按 `=` 切出 flag 名 —— Task 6 比对的是 flag 名。
 //   · 只有 flag 没路径的 `qiyu --help` 不记成命令引用（见 scanCommand 内注释）。
 
-/** 一条命令引用：`path` 不含程序名（`['sync', 'status']`），`flags` 保持出现顺序。 */
+/**
+ * 一条命令引用。
+ *
+ * `path` 与 `positionals` 都是**占位符之前的字面 token**（同一个顺序，见 scanCommand）：
+ *   · `path`      —— 喂给 `findSpec` 按最长前缀匹配命令路径（多余 token 不参与比较）；
+ *   · `positionals` —— 同一串 token 的显式副本，供 `skill check` 在命中 spec 之后按
+ *     `spec.path.length` 切出**位置参数取值**并校验其取值域（终审 I1）。两者内容相同
+ *     是刻意的：refs 层不认识命令树（零业务依赖），拆不出「命令词 / 位置参数」的分界；
+ *     分界由 check 层用 `spec.path` 的已知长度来切。
+ *   · `<...>` 占位符与 flag 的取值（`--table sessions` 的 `sessions`）**不在**其中——
+ *     占位符不是字面值、flag 取值不是位置参数。
+ */
 export interface CommandRef {
   path: string[]
+  positionals: string[]
   flags: string[]
   line: number
 }
@@ -209,41 +224,48 @@ function normalizeFlag(word: string): string {
 /**
  * 扫描一个片段里的命令引用。
  *
- * 两条边界，都以「占位符之前」为界：
+ * 三条边界，都以「占位符之前」为界：
  *   · 路径 token 只收到第一个 `<...>` 为止。占位符之后是调用方要填的值或模板里的可选
  *     部分，再往里收会把值当子命令（`qiyu query <表>` 不该产出路径 `['query','<表>']`）。
  *   · 选择/省略符号（`|`、`…`、`...`）只在占位符之前判定为 unverifiable；占位符之后
- *     遇到即止步（管道右侧是另一条命令），不再往 flags 里收。
+ *     遇到即止步（管道右侧是另一条命令），不再往 flags / positionals 里收。
+ *   · flag 的紧邻字面值是它的取值（`--table sessions` 的 `sessions`），不是位置参数 ——
+ *     把 flag 取值当位置参数去查域，会让合法命令被判成违规。
  *
  * flag 例外地跨占位符收集：`--since <时间>` 里 `<时间>` 是 `--since` 的取值，后面的
  * `--since` 仍是可静态校验的 flag。brief 测试 2 钉死了这一点
  * （`` `qiyu query --table <表> --since <时间>` `` → flags 含 `--table` 与 `--since`）。
  * 它与规则 2 「之前的部分即命令路径 + flag」的字面说法有出入，取舍理由见报告。
+ *
+ * `path` 与 `positionals` 装的是**同一串字面 token**（内容相同，但各自独立数组，避免
+ * 两个消费方共享可变引用）：refs 层不认识命令树，拆不出「命令词 / 位置参数」的分界；
+ * 等 `findSpec` 在 check 层命中后，按 `spec.path.length` 切掉命令词，余下即位置参数
+ * 取值（终审 I1）。
  */
 function scanCommand(content: string, line: number, refs: Refs): void {
   const m = COMMAND_RE.exec(content)
   if (!m) return
 
   const words = m[1]!.split(/\s+/).filter((w) => w !== '')
-  const path: string[] = []
+  const tokens: string[] = []
   const flags: string[] = []
-  let pathClosed = false
+  let closed = false
   let expectFlagValue = false
 
   for (const word of words) {
     if (PLACEHOLDER_RE.test(word)) {
-      // 占位符是前一个 flag 的取值或独立位置参数：路径在此封口，占位符本身不入列。
-      pathClosed = true
+      // 占位符是前一个 flag 的取值或独立位置参数：命令结构在此封口，占位符本身不入列。
+      closed = true
       expectFlagValue = false
       continue
     }
     if (UNVERIFIABLE_RE.test(word)) {
-      if (!pathClosed) {
+      if (!closed) {
         // 选择/省略符号：整条无法判定，记入 unverifiable 而不是猜一个路径。
         refs.unverifiable.push({ text: content, line, reason: REASON_CHOICE })
         return
       }
-      // 占位符之后：管道右侧是另一条命令，它的 flag 不属于本命令，到此为止。
+      // 占位符之后：管道右侧是另一条命令，它的 flag / 位置参数不属于本命令，到此为止。
       break
     }
     if (word.startsWith('-')) {
@@ -251,22 +273,22 @@ function scanCommand(content: string, line: number, refs: Refs): void {
       expectFlagValue = true
       continue
     }
-    if (expectFlagValue && path.length > 0) {
-      // flag 的紧邻字面值是它的取值，不当路径 token。要求 path 已有 token 是防止
+    if (expectFlagValue && tokens.length > 0) {
+      // flag 的紧邻字面值是它的取值，不当路径 token / 位置参数。要求已有 token 是防止
       // 「全局 flag 在最前」的写法（`qiyu --pretty api list`）把子命令吞成取值。
       expectFlagValue = false
       continue
     }
     expectFlagValue = false
-    if (!pathClosed) path.push(word)
+    if (!closed) tokens.push(word)
   }
 
   // 没有路径 token 的 `qiyu --help` 之类不记成命令引用：`Refs.commands` 的语义是
   // 「正文声称存在这条命令路径」，只有 flag 的调用不构成这种声称（而且 `--help` 是全局
   // flag，各命令都接受，记下来反而会让 check 用空路径去匹配、误报未知命令）。
-  if (path.length === 0) return
+  if (tokens.length === 0) return
 
-  refs.commands.push({ path, flags, line })
+  refs.commands.push({ path: [...tokens], positionals: [...tokens], flags, line })
 }
 
 function scanKind(content: string, line: number, refs: Refs): void {

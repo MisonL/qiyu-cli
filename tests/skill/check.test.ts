@@ -8,8 +8,23 @@ import { checkSkillDoc, checkSkillDir, type CheckContext } from '../../src/skill
 import { COMMAND_TREE } from '../../src/commands/tree.js'
 import { TABLES } from '../../src/store/schema.js'
 import { ERROR_KINDS } from '../../src/core/errors.js'
+import { REPORT_TABLES } from '../../src/query/metric-catalog.js'
+import { SYNC_TASKS } from '../../src/sync/registry.js'
+import { allEndpoints } from '../../src/core/registry/index.js'
 
-const ctx: CheckContext = { tree: COMMAND_TREE, tableNames: TABLES.map((t) => t.name), errorKinds: ERROR_KINDS }
+// 与 `commands/skill.ts` 的 CHECK_CONTEXT 同一份组装方式：四个取值域闭集从各自权威
+// 位置取，`check.ts` 自己不认识它们（终审 I1 的分层要求）。
+const ctx: CheckContext = {
+  tree: COMMAND_TREE,
+  tableNames: TABLES.map((t) => t.name),
+  errorKinds: ERROR_KINDS,
+  domains: {
+    tables: TABLES.map((t) => t.name),
+    'report-tables': REPORT_TABLES,
+    'task-ids': SYNC_TASKS.map((t) => t.id),
+    'endpoint-ids': allEndpoints().map((e) => e.id),
+  },
+}
 
 // 目录返回顺序在真实文件系统上不可控，没法用「反序写文件」验证 checkSkillDir 的排序。
 // 用 vi.mock 把 readdirSync 换成可注入的代理：默认仍走真实实现（其余用例照常读临时目录），
@@ -57,6 +72,70 @@ describe('checkSkillDoc', () => {
     const r = checkSkillDoc('`qiyu sync run | head`', ctx)
     expect(r.violations).toEqual([])
     expect(r.warnings).toHaveLength(1)
+  })
+  it('位置参数取值不在域闭集 → unknown_positional（接口 id）', () => {
+    // 终审 I1 复现行 1：真实 CLI 会以「未知接口」退出 2，check 此前却判通过。
+    const r = checkSkillDoc('`qiyu api call totally.bogus.id`', ctx)
+    expect(r.violations).toHaveLength(1)
+    expect(r.violations[0]).toMatchObject({
+      rule: 'unknown_positional',
+      detail: expect.stringContaining('totally.bogus.id'),
+    })
+    expect(r.violations[0]!.detail).toContain('endpoint-ids 闭集')
+  })
+  it('位置参数取值不在域闭集 → unknown_positional（表名）', () => {
+    // 终审 I1 复现行 3。
+    const r = checkSkillDoc('`qiyu db describe totally_bogus_table`', ctx)
+    expect(r.violations).toHaveLength(1)
+    expect(r.violations[0]).toMatchObject({
+      rule: 'unknown_positional',
+      detail: expect.stringContaining('totally_bogus_table'),
+    })
+  })
+  it('位置参数取值为真实接口 id / 表名时不报 unknown_positional', () => {
+    // 变异「不比对闭集、只判有无位置参数」→ 第一条不会红；变异「闭集取反 / 用错域」→ 两条都红。
+    const id = allEndpoints()[0]!.id
+    expect(checkSkillDoc(`\`qiyu api call ${id}\``, ctx).violations).toEqual([])
+    // 真实表名本身会命中 table_name（数据侧事实不得硬编码），这里只钉住位置参数域不误报。
+    const table = TABLES[0]!.name
+    const r = checkSkillDoc(`\`qiyu db describe ${table}\``, ctx)
+    expect(r.violations.filter((v) => v.rule === 'unknown_positional')).toEqual([])
+  })
+  it('占位符不是字面位置参数：`qiyu db describe <表>` 不产生 unknown_positional', () => {
+    // 变异「把占位符也当位置参数」→ 本用例红（`<表>` 会被判成不在 tables 闭集里）。
+    const r = checkSkillDoc('`qiyu db describe <表>`', ctx)
+    expect(r.violations).toEqual([])
+    expect(r.warnings).toEqual([])
+  })
+  it('flag 取值不是位置参数：`qiyu query --table sessions` 不产生 unknown_positional', () => {
+    // `sessions` 是 --table 的取值而非位置参数（`query` 的 positionals 是空数组）。
+    // 变异「flag 紧邻字面值也进 positionals」→ 本用例红（query 没有位置参数 → 超量违规）。
+    const r = checkSkillDoc('`qiyu query --table sessions`', ctx)
+    expect(r.violations.filter((v) => v.rule === 'unknown_positional')).toEqual([])
+  })
+  it('位置参数个数超过 spec 声明 → unknown_positional', () => {
+    // `api list` 不接受位置参数；`db describe` 只接受一个。
+    const extraOnZero = checkSkillDoc('`qiyu api list bogus`', ctx)
+    expect(extraOnZero.violations[0]).toMatchObject({
+      rule: 'unknown_positional',
+      detail: expect.stringContaining('bogus'),
+    })
+    expect(extraOnZero.violations[0]!.detail).toContain('只接受 0 个位置参数')
+  })
+  it('终审报告的四行复现现在全部报 unknown_positional', () => {
+    // 这四行在真实 CLI 里分别退出 2（未知接口 / 未知任务 / 未知表 / 只接受报表域表）；
+    // 合并成一份文档时 `unknown_positional` 必须恰好四条（排序后行号 1..4）。
+    const doc = [
+      '`qiyu api call totally.bogus.id`',
+      '`qiyu sync run totally-bogus-task`',
+      '`qiyu db describe totally_bogus_table`',
+      '`qiyu stats fields totally_bogus_report`',
+    ].join('\n')
+    const r = checkSkillDoc(doc, ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual([
+      'unknown_positional', 'unknown_positional', 'unknown_positional', 'unknown_positional',
+    ])
+    expect(r.violations.map((v) => v.line)).toEqual([1, 2, 3, 4])
   })
   it('单数 tag 不是表名，不生成 matcher（真正的词边界钉在下方边界用例）', () => {
     // 裁定：原 brief 用例写的是 `tags`（在 TABLES 里，必然命中 table_name），改为单数

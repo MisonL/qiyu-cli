@@ -20,7 +20,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import {
   __resetSkillDetectionForTest, detectSkillState, resolveEntityDir, resolveSkillSourceDir, skillWarning,
 } from '../../src/skill/detect.js'
@@ -202,17 +202,32 @@ describe('detectSkillState —— 按参数元组缓存', () => {
 describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
   const savedEnv = process.env.NODE_ENV
   const savedDir = process.env.QIYU_SKILL_DIR
+  // 终审 I2：`npm_config_qiyu_skill_dir` 是 postinstall 的自定义位置通路，探测必须认识它。
+  // 宿主环境可能真的设了这组变量（CI 上 `npm_config_*` 很常见），所以每个用例前后都要
+  // 清干净——否则「未显式注入 → undefined」那条会被宿主的变量污染成假红。
+  const NPM_KEYS = ['npm_config_qiyu_skill_dir', 'NPM_CONFIG_QIYU_SKILL_DIR', 'npm_config_qiyu-skill-dir']
+  const savedNpm = new Map<string, string | undefined>()
+  beforeEach(() => {
+    for (const k of NPM_KEYS) {
+      savedNpm.set(k, process.env[k])
+      delete process.env[k]
+    }
+  })
   afterEach(() => {
     if (savedEnv === undefined) delete process.env.NODE_ENV
     else process.env.NODE_ENV = savedEnv
     if (savedDir === undefined) delete process.env.QIYU_SKILL_DIR
     else process.env.QIYU_SKILL_DIR = savedDir
+    for (const [k, v] of savedNpm) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
   })
 
   it('NODE_ENV=test 且未设 QIYU_SKILL_DIR → undefined', () => {
     // 理由（brief 要求写进实现注释）：测试绝不读写真实 `~`，且探测结果不得依赖
     // 开发者机器上装没装过 skill —— 否则本机装过的人跑全量会多出 meta.warnings，
-    // 没装过的人不会，同一份代码两种结果。
+    // 没装过的人不会，同一份代码两种结果。未显式注入两个变量之一时，测试门保持原样。
     process.env.NODE_ENV = 'test'
     delete process.env.QIYU_SKILL_DIR
     expect(resolveEntityDir()).toBeUndefined()
@@ -248,6 +263,51 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     process.env.NODE_ENV = 'production'
     delete process.env.QIYU_SKILL_DIR
     expect(resolveEntityDir()).toBe(defaultEntityDir(homedir()))
+  })
+
+  // —— 终审 I2：postinstall 与漂移探测必须走同一条位置通路 ——
+  it('npm_config_qiyu_skill_dir 生效（装到自定义目录后不再误报「未安装」）', () => {
+    // 复现终审 P22：postinstall 用这条通路装到 custom-skill，探测此前只认
+    // QIYU_SKILL_DIR，于是每条命令都提示「未安装到默认路径」并建议再装一份。
+    // 变异「删掉 resolveEntityDir 里的 npm_config 分支」→ 本用例红。
+    process.env.NODE_ENV = 'test'
+    delete process.env.QIYU_SKILL_DIR
+    process.env.npm_config_qiyu_skill_dir = join(home, 'custom-skill')
+    expect(resolveEntityDir()).toBe(join(home, 'custom-skill'))
+  })
+
+  it('全大写键 NPM_CONFIG_QIYU_SKILL_DIR 同样生效（spec D8 键名不敏感）', () => {
+    // 归一化与 postinstall 共用 paths.ts 的 readEnvByNormalizedKey；变异「不做小写归一化」
+    // → 本用例红（Windows 上环境变量名大小写不敏感，探测不能只认小写拼法）。
+    process.env.NODE_ENV = 'test'
+    delete process.env.QIYU_SKILL_DIR
+    process.env.NPM_CONFIG_QIYU_SKILL_DIR = join(home, 'custom-upper')
+    expect(resolveEntityDir()).toBe(join(home, 'custom-upper'))
+  })
+
+  it('QIYU_SKILL_DIR 优先于 npm_config_qiyu_skill_dir', () => {
+    // 显式命令层变量优先于 npm 注入的配置（后者是 postinstall 现场留下的）。
+    process.env.NODE_ENV = 'test'
+    process.env.QIYU_SKILL_DIR = join(home, 'explicit')
+    process.env.npm_config_qiyu_skill_dir = join(home, 'from-npm')
+    expect(resolveEntityDir()).toBe(join(home, 'explicit'))
+  })
+
+  it('npm_config_qiyu_skill_dir 的相对路径按 cwd 解析成绝对路径', () => {
+    // 与 postinstall 同语义（installSkill 内部全部按绝对路径运算）；resolveEntityDir
+    // 只做字符串解析，不碰磁盘——home 下并没有这个目录。
+    process.env.NODE_ENV = 'test'
+    delete process.env.QIYU_SKILL_DIR
+    process.env.npm_config_qiyu_skill_dir = './rel-skill'
+    expect(resolveEntityDir()).toBe(resolve('./rel-skill'))
+    expect(isAbsolute(resolveEntityDir()!)).toBe(true)
+  })
+
+  it('npm_config_qiyu_skill_dir 为空串 / 纯空白视为未设（测试门仍然生效）', () => {
+    process.env.NODE_ENV = 'test'
+    delete process.env.QIYU_SKILL_DIR
+    process.env.npm_config_qiyu_skill_dir = '   '
+    expect(resolveEntityDir()).toBeUndefined()
   })
 })
 

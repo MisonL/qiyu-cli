@@ -37,7 +37,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { contentHash, MANIFEST, type Manifest } from './install.js'
-import { defaultEntityDir } from './paths.js'
+import { defaultEntityDir, readEnvByNormalizedKey } from './paths.js'
 
 /**
  * 安装态四态（brief 接口）：
@@ -204,15 +204,28 @@ export function skillWarning(
 }
 
 /**
- * 实体目录解析：显式 `QIYU_SKILL_DIR` 优先；测试环境（NODE_ENV === 'test'）且未
- * 显式设置时返回 undefined——**测试绝不读写真实 `~`**，且探测结果不得依赖开发者
- * 机器装没装过 skill（否则全量测试的 meta 形态随机器而变，理由见文件头注释）。
- * 纯空白（含空串）环境变量视为未设：空路径不是有意义的实体位置，前后空白也几乎
- * 不可能是路径的一部分（多半是 shell 里无意带入的）。
+ * 实体目录解析。优先顺序：
+ *   1. 显式 `QIYU_SKILL_DIR`（空白视为未设，取 trim 后的值）；
+ *   2. `npm_config_qiyu_skill_dir` —— postinstall 用的**同一条通路**（spec C5：环境
+ *      变量是 npm 12 下唯一跨版本可用的自定义位置入口）。探测必须认识它，否则
+ *      「装到自定义目录」之后每条命令都会误报「未安装」并建议用户再装一份（终审 I2；
+ *      照那句提示做会装出**第二份实体**，比不提示更坏）。相对路径按 cwd 解析成绝对
+ *      路径——与 postinstall 的语义一致（`installSkill` 内部全部按绝对路径运算）；
+ *      本函数只做字符串解析，不碰磁盘。
+ *   3. 测试环境（NODE_ENV === 'test'）且上面两个都没显式设置 → undefined：
+ *      **测试绝不读写真实 `~`**，且探测结果不得依赖开发者机器装没装过 skill
+ *      （否则全量测试的 meta 形态随机器而变，理由见文件头注释）。
+ *   4. 默认位置 `~/.agents/skills/qiyu`。
+ *
+ * 键名归一化（小写 + `-`→`_`）与 postinstall 共用 `paths.ts` 的
+ * `readEnvByNormalizedKey`；`npm_config_qiyu_skill_dir` 与 `NPM_CONFIG_QIYU_SKILL_DIR`
+ * 命中同一键。
  */
 export function resolveEntityDir(): string | undefined {
   const explicit = process.env.QIYU_SKILL_DIR?.trim()
   if (explicit !== undefined && explicit !== '') return explicit
+  const fromNpm = readEnvByNormalizedKey(process.env, 'npm_config_qiyu_skill_dir')
+  if (fromNpm !== undefined) return path.resolve(fromNpm)
   if (process.env.NODE_ENV === 'test') return undefined
   return defaultEntityDir(homedir())
 }

@@ -2,7 +2,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { agentSkillDirs, defaultEntityDir, linkTarget, linkState, linkPlan, createSkillLink, normalizeNewlines } from '../../src/skill/paths.js'
+import {
+  AGENT_SKILL_SUBDIRS, LINK_NAME, agentSkillDirs, agentSkillSubdir, defaultEntityDir,
+  envIndex, linkPlan, linkState, linkTarget, createSkillLink, normalizeNewlines,
+  readEnvByNormalizedKey,
+} from '../../src/skill/paths.js'
 
 let home: string
 // realpathSync 在这里是防御性归一化，不是正确性前提：macOS 的 /var 是指向
@@ -67,5 +71,36 @@ describe('paths', () => {
   })
   it('normalizeNewlines 把 CRLF 折成 LF', () => {
     expect(normalizeNewlines(Buffer.from('a\r\nb\r\n')).toString()).toBe('a\nb\n')
+  })
+  // 终审 Minor-1 / Minor-2 的单一事实源：字符串只有一份，两个消费方都从这里取。
+  it('LINK_NAME 与 AGENT_SKILL_SUBDIRS 是对外导出的事实源', () => {
+    expect(LINK_NAME).toBe('qiyu')
+    expect(AGENT_SKILL_SUBDIRS.map((a) => a.name)).toEqual(['claude-code', 'codex'])
+    expect(agentSkillSubdir('claude-code')).toBe(join('.claude', 'skills'))
+    expect(agentSkillSubdir('codex')).toBe(join('.codex', 'skills'))
+  })
+})
+
+describe('envIndex / readEnvByNormalizedKey（postinstall 与漂移探测共用的唯一归一化）', () => {
+  it('键名归一化：小写 + `-` → `_`', () => {
+    const index = envIndex({ 'npm_config_qiyu-skill-dir': '/x', NPM_COMMAND: 'install' })
+    expect(index.get('npm_config_qiyu_skill_dir')).toBe('/x')
+    expect(index.get('npm_command')).toBe('install')
+  })
+  it('只收字符串值（undefined 视同不存在）', () => {
+    // NodeJS.ProcessEnv 的值类型允许 undefined；envIndex 不把它们写进索引。
+    const index = envIndex({ A: undefined, B: ' ' } as unknown as NodeJS.ProcessEnv)
+    expect(index.has('a')).toBe(false)
+    expect(index.get('b')).toBe(' ')
+  })
+  it('大小写与连字符变体命中同一键', () => {
+    expect(readEnvByNormalizedKey({ NPM_CONFIG_QIYU_SKILL_DIR: '/abs' }, 'npm_config_qiyu_skill_dir'))
+      .toBe('/abs')
+    expect(readEnvByNormalizedKey({ 'npm_config_qiyu-skill-dir': ' /rel ' }, 'npm_config_qiyu_skill_dir'))
+      .toBe('/rel')
+  })
+  it('空串 / 纯空白视为未设（与 QIYU_SKILL_DIR 同口径）', () => {
+    expect(readEnvByNormalizedKey({ npm_config_qiyu_skill_dir: '' }, 'npm_config_qiyu_skill_dir')).toBeUndefined()
+    expect(readEnvByNormalizedKey({ npm_config_qiyu_skill_dir: '   ' }, 'npm_config_qiyu_skill_dir')).toBeUndefined()
   })
 })

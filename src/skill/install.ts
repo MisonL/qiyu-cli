@@ -56,15 +56,13 @@ import {
 import path from 'node:path'
 import { SKILL_CONTRACT_VERSION } from '../core/edition.js'
 import {
-  agentSkillDirs, createSkillLink, defaultEntityDir, linkState, linkTarget, normalizeNewlines,
+  agentSkillDirs, createSkillLink, defaultEntityDir, LINK_NAME, linkState, linkTarget,
+  normalizeNewlines,
   type LinkState,
 } from './paths.js'
 
 /** 安装清单文件名：落在实体目录根部，记录版本与内容哈希（Task 10 的安装态探测读它）。 */
 export const MANIFEST = '.qiyu-skill.json'
-
-/** agent skills 目录下的链接名。skill 身份固定为 `qiyu`（正文 frontmatter 同名），不随实体位置变化。 */
-const LINK_NAME = 'qiyu'
 
 /** 暂存目录前缀：`<entity>.tmp-`（`mkdtempSync` 在其后追加唯一随机后缀）。 */
 const STAGING_SUFFIX = '.tmp-'

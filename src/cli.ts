@@ -71,7 +71,8 @@ const USAGE = `用法：qiyu <子命令> [参数]
   skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
                            安装 skill 正文并链接到已存在的 agent 目录
   skill check [--installed | --compare] [--dir <path>]
-                           校验 skill 正文引用与 CLI 契约（有违规退出码 1）
+                           校验 skill 正文引用与 CLI 契约（有违规退出码 1；
+                           --compare 下内容不一致也算失败）
   skill where [--dir <path>] 报告实体目录与各 agent 链接状态（只读，不修复）
 
 查询族参数：
