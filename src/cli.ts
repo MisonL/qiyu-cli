@@ -13,6 +13,7 @@ import { syncCommand } from './commands/sync.js'
 import { dbCommand } from './commands/db.js'
 import { queryCommand } from './commands/query.js'
 import { statsCommand } from './commands/stats.js'
+import { skillCommand } from './commands/skill.js'
 // `COMMAND_TREE` 的**权威位置**是 `commands/tree.ts`（worktree 裁定，见那里顶部注释）：
 // 它只 import 各命令模块、不含入口逻辑，将来 `src/skill/check.ts` 从**那里**消费。
 // 本文件 re-export 只是兼容入口（计划原文写的是 `cli.ts` 汇总），免得调用方改路径。
@@ -26,6 +27,9 @@ const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   db: dbCommand,
   query: queryCommand,
   stats: statsCommand,
+  // skill 是 F 子项目对用户的正式门面（install/check/where 三子命令）。
+  // `commands/skill.ts` 是全仓唯一允许 import `skill/` 的 commands 文件（分层豁免）。
+  skill: skillCommand,
 }
 
 /**
@@ -59,6 +63,11 @@ const USAGE = `用法：qiyu <子命令> [参数]
   query --table <表> [--since <时间>] [--until <时间>] [--group-by <列>]
                            受约束查询通道（列白名单、时间列语义化、精确脱敏）
   stats fields <报表表>     指标声明（带出处）+ 本地观测分布 + -1 哨兵
+  skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
+                           安装 skill 正文并链接到已存在的 agent 目录
+  skill check [--installed | --compare] [--dir <path>]
+                           校验 skill 正文引用与 CLI 契约（有违规退出码 1）
+  skill where [--dir <path>] 报告实体目录与各 agent 链接状态（只读，不修复）
 
 查询族参数：
   query --limit <n> / --timeout <秒> / --no-mask
