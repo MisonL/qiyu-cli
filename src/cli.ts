@@ -2,8 +2,8 @@
 import { pathToFileURL } from 'node:url'
 import { realpathSync } from 'node:fs'
 import { authCommand } from './commands/auth.js'
-import { fail, usageFail, describeArgs, setSkillWarning } from './output.js'
-import { PACKAGE_VERSION } from './core/edition.js'
+import { fail, usageFail, describeArgs, setSkillWarning, ok } from './output.js'
+import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from './core/edition.js'
 import {
   detectSkillState, resolveEntityDir, resolveSkillSourceDir, skillWarning,
 } from './skill/detect.js'
@@ -38,6 +38,11 @@ const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
  * 不能让它落到「未知子命令」分支（实测那会输出「未知子命令：--help」，退出码 2）。
  */
 const USAGE = `用法：qiyu <子命令> [参数]
+
+全局选项：
+  --help, -h               输出本帮助（唯一以裸文本而非 JSON 输出的情形）
+  --version                输出版本 JSON：包版本与 skill 正文契约版本
+                           （Agent 用它判断已安装的 skill 与 CLI 是否配套）
 
 子命令：
   auth whoami              检查凭证是否已配置
@@ -123,11 +128,30 @@ export async function run(argv: string[]): Promise<number> {
     process.stdout.write(USAGE)
     return 0
   }
+  // ⚠️ `--version`（Task 12，spec D6）：输出**机器可读**的包版本与 skill 正文
+  // 契约版本。为什么需要它：skill 正文是单独安装的副本，可能与本 CLI 不配套；
+  // Agent 靠 `skill_contract_version` 判断手上的正文能不能配这份 CLI
+  // （键名逐字为 `version` 与 `skill_contract_version`，是 Agent 契约的一部分）。
+  // 额外参数纪律与 `--help` **完全一致**（同一份豁免清单：`--help`/`-h`/`--pretty`
+  // 是合法 token，其余含位置参数一律 2）—— 分派层每条伪命令守同一条规则，
+  // 免得再出现「多带一个 flag 把用法错误静默吞成 0」的旧坑。
+  // ⚠️ `--version --help` 给**版本 JSON** 而不是 USAGE：全局约束只给裸文本
+  // `--help` 开了一个口子，不能开第二个。
+  // 输出走 `ok()`（而非自己写 stdout）：skill 安装态提示要能经 `meta.warnings`
+  // 合并进来，且成功信封的形态由 output.ts 一处统一。
+  if (sub === '--version') {
+    const extra = rest.filter((a) => a !== '--help' && a !== '-h' && a !== '--pretty')
+    if (extra.length > 0) {
+      return usageFail(`未知参数：${describeArgs(extra)}。--version 不接受额外参数`)
+    }
+    return ok({ version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION })
+  }
   // ⚠️ 分派层的 `--pretty` 必须与叶子层同答（2026-10-08 统一）。此前它落到
   // 「未知子命令：--pretty」—— 而 `--pretty` 是**承诺过、只是未实现**的合法 flag
   // （与 ㉖ 在叶子层修的是同一句话），把合法 flag 说成"未知子命令"是同一类事实错误；
   // 且 `qiyu --pretty --help` 此前被静默吞成 2（而 `qiyu api list --pretty --help` 是 0）。
-  // 次序与叶子层逐字一致：**未知/位置 → help → `--pretty`**。
+  // 次序：**未知/位置 → help → version → `--pretty`**（叶子命令没有 --version，
+  // 前两步与叶子层逐字一致；version 只在分派层存在）。
   if (sub === '--pretty') {
     const unknown = rest.filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
     const positional = rest.filter((a) => !a.startsWith('-'))

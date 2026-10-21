@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { run } from '../src/cli.js'
+// 版本常量从 `core/edition.ts` 取（唯一定义点）：断言必须对**同一个常量**，
+// 不能在测试里再抄一份字面量 —— 否则构建期覆写（Task 13）改变值时两边一起漂。
+import { PACKAGE_VERSION } from '../src/core/edition.js'
 
 let out = ''
 let err = ''
@@ -336,5 +339,55 @@ describe('store 子命令注册', () => {
     vi.spyOn(process.stdout, 'write').mockImplementation((s) => { o += s; return true })
     await run(['--help'])
     expect(o).toMatch(/\[--backend <name>\]/)
+  })
+})
+
+describe('qiyu --version（Task 12，spec D6）', () => {
+  // 为什么 Agent 需要它：已安装的 skill 正文与 CLI 可能**不配套**（skill 是
+  // 单独安装的副本）。`skill_contract_version` 是正文契约的版本号，Agent 拿它
+  // 与 skill 里声明的期望值比对，才能判断手上的正文能不能配这份 CLI。
+  // 输出走 `ok()` 而非裸文本：全局约束只给 `--help` 开了裸文本的口子。
+  it('--version → 0，stdout 是 { ok:true, data:{ version, skill_contract_version } }', async () => {
+    expect(await run(['--version'])).toBe(0)
+    const parsed = JSON.parse(out)
+    expect(parsed.ok).toBe(true)
+    // 键名逐字钉住（Agent 契约的一部分）：改名等于把能力对 Agent 关掉。
+    expect(parsed.data).toEqual({
+      version: PACKAGE_VERSION,
+      skill_contract_version: 1,
+    })
+    expect(typeof parsed.data.version).toBe('string')
+    expect(parsed.data.skill_contract_version).toBe(1)
+    // 版本查询是成功输出，不该在 stderr 留任何东西。
+    expect(err).toBe('')
+  })
+
+  it('--version 不吞额外参数 —— 未知 flag 必须点名（纪律与 --help 一致）', async () => {
+    expect(await run(['--version', '--bod'])).toBe(2)
+    // stderr 给人读、stdout 给 Agent 读，两个通道都要点名 `--bod`。
+    expect(err).toContain('未知参数：--bod')
+    expect(err).toContain('--version 不接受额外参数')
+    expect(JSON.parse(out).error.message).toContain('--bod')
+  })
+
+  it('--version --help 仍给版本 JSON（不开第二个裸文本输出口）', async () => {
+    // 裁定：`--help`/`-h`/`--pretty` 是 --version 的合法附带 token，但带了
+    // `--help` 也输出**版本 JSON**，而不是 USAGE 裸文本 —— 全局约束只允许
+    // 裸文本 `--help` 这一处例外，`qiyu --version --help` 不是那处例外。
+    expect(await run(['--version', '--help'])).toBe(0)
+    const parsed = JSON.parse(out) // 不抛即「合法 JSON」
+    expect(parsed.ok).toBe(true)
+    expect(parsed.data.skill_contract_version).toBe(1)
+  })
+
+  it('-v 不是 --version 的短别名（保持「未知子命令」退出码 2）', async () => {
+    // brief 明确不引入短别名（避免与未来的 -v 冲突）。这条钉住"将来别顺手加"。
+    expect(await run(['-v'])).toBe(2)
+    expect(err).toContain('未知子命令')
+  })
+
+  it('顶层 USAGE 必须列出 --version —— 帮助里看不到的能力等于不存在', async () => {
+    expect(await run(['--help'])).toBe(0)
+    expect(out).toContain('--version')
   })
 })
