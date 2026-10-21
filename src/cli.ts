@@ -2,7 +2,11 @@
 import { pathToFileURL } from 'node:url'
 import { realpathSync } from 'node:fs'
 import { authCommand } from './commands/auth.js'
-import { fail, usageFail, describeArgs } from './output.js'
+import { fail, usageFail, describeArgs, setSkillWarning } from './output.js'
+import { PACKAGE_VERSION } from './core/edition.js'
+import {
+  detectSkillState, resolveEntityDir, resolveSkillSourceDir, skillWarning,
+} from './skill/detect.js'
 import { apiCommand } from './commands/api.js'
 import { storeCommand } from './commands/store.js'
 import { syncCommand } from './commands/sync.js'
@@ -73,6 +77,25 @@ const USAGE = `用法：qiyu <子命令> [参数]
 `
 
 export async function run(argv: string[]): Promise<number> {
+  // —— skill 安装态探测（Task 10，设计稿 D2.1）：只提示，绝不改退出码、data、文件 ——
+  // 每个命令启动时探测一次：装了但过期 / 未装时往 meta.warnings 注入一句提示；
+  // 探测失败（unknown）静默跳过，不影响命令本身。cli.ts 是唯一允许同时 import
+  // output.js 与 skill/ 的入口层，探测经 setSkillWarning 注入而不是让 output.ts
+  // 反向 import skill/（分层红线，Task 14 钉住）。
+  // NODE_ENV === 'test' 且未显式设 QIYU_SKILL_DIR 时 resolveEntityDir() 返回
+  // undefined：测试绝不读写真实 `~`，探测结果也不得依赖开发者机器装没装过 skill。
+  // 每次 run() 都显式 setSkillWarning(...)（探测不了就是 undefined）——同一进程内
+  // 多次 run 不残留上一条的提示。
+  const skillEntityDir = resolveEntityDir()
+  const skillSourceDir = resolveSkillSourceDir()
+  setSkillWarning(
+    skillEntityDir !== undefined && skillSourceDir !== undefined
+      ? skillWarning(
+          detectSkillState(skillEntityDir, skillSourceDir, PACKAGE_VERSION),
+          { entityDir: skillEntityDir, currentVersion: PACKAGE_VERSION },
+        )
+      : undefined,
+  )
   const [sub, ...rest] = argv
   if (sub === '--help' || sub === '-h') {
     // ⚠️ `--help` 不吞额外参数（2026-10-08 修）—— 与叶子命令同一条次序
