@@ -716,6 +716,11 @@ interface LinkReport {
  * 逐 agent 探测链接状态。目录枚举走 `probeAgentDirs`（与 install 共用同一套
  * ENOTDIR 退化逻辑，审查 M4）；每个 agent 的 `linkState` 各自 try/catch：
  * 自指/成环链接抛 ELOOP，一个坏链接不能让整条排查命令崩掉（brief 硬要求）。
+ *
+ * ⚠️ **按 KNOWN_AGENTS 逐个出条目，包括目录不存在的 agent**（规格 D2 / 验收 1：
+ * 「对每个 agent 报出 ok/dangling/foreign/missing 之一」）。此前只报告探测到的
+ * 目录，未装任何 agent 的机器上 links 是空数组——「没报告」不等于「状态是 missing」，
+ * 排查时看不出到底缺哪个。目录不存在 → state:'missing'（链接路径必然也不存在）。
  */
 function probeAgentLinks(
   home: string,
@@ -724,21 +729,28 @@ function probeAgentLinks(
   const links: LinkReport[] = []
   const probed = probeAgentDirs(home)
   const warnings = [...probed.warnings]
+  const dirOf = new Map(probed.dirs.map((d) => [d.name, d.dir]))
 
-  // 探测失败的 agent：目录本身不可检查（如父级是文件 → ENOTDIR），如实记 unknown，
-  // 继续报告其余 agent。
-  for (const [name, error] of probed.broken) {
-    links.push({ agent: name, path: join(home, AGENT_SUBDIRS[name], LINK_NAME), state: 'unknown', error })
-    warnings.push(`${name} 的 skills 目录无法检查（${error}）：${join(home, AGENT_SUBDIRS[name])}`)
-  }
-
-  for (const t of probed.dirs) {
-    const linkPath = join(t.dir, LINK_NAME)
+  for (const name of KNOWN_AGENTS) {
+    const dir = dirOf.get(name)
+    if (dir === undefined) {
+      const path = join(home, AGENT_SUBDIRS[name], LINK_NAME)
+      const error = probed.broken.get(name)
+      if (error !== undefined) {
+        // 目录本身不可检查（如父级是文件 → ENOTDIR）：如实记 unknown，不谎报 missing。
+        links.push({ agent: name, path, state: 'unknown', error })
+        warnings.push(`${name} 的 skills 目录无法检查（${error}）：${join(home, AGENT_SUBDIRS[name])}`)
+      } else {
+        links.push({ agent: name, path, state: 'missing' })
+      }
+      continue
+    }
+    const linkPath = join(dir, LINK_NAME)
     try {
-      links.push({ agent: t.name, path: linkPath, state: linkState(linkPath, entityDir) })
+      links.push({ agent: name, path: linkPath, state: linkState(linkPath, entityDir) })
     } catch (e) {
-      links.push({ agent: t.name, path: linkPath, state: 'unknown', error: errMsg(e) })
-      warnings.push(`${t.name} 的链接状态无法判定（${errMsg(e)}）：${linkPath}`)
+      links.push({ agent: name, path: linkPath, state: 'unknown', error: errMsg(e) })
+      warnings.push(`${name} 的链接状态无法判定（${errMsg(e)}）：${linkPath}`)
     }
   }
   return { links, warnings }

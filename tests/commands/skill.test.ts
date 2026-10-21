@@ -360,15 +360,21 @@ describe('skill install --dry-run 与真实安装同判据（审查 I1）', () =
 })
 
 describe('skill where', () => {
-  it('未安装 → 0，entity 状态 missing，source 报告定位规则', async () => {
+  it('未安装 → 0，entity 状态 missing，每个 agent 都报四态之一', async () => {
     expect(await skillCommand(['where', '--dir', entity])).toBe(0)
     expect(data().entity).toMatchObject({
       path: entity, source: '--dir', exists: false, state: 'missing',
     })
-    expect(data().links).toEqual([])
+    // 规格 D2 / 验收 1：「对每个 agent 报出 ok/dangling/foreign/missing 之一」。
+    // 一个 agent 目录都没有时也必须逐个报 missing，而不是交一张空表——
+    // 「没报告」不等于「状态是 missing」，排查时看不出到底缺哪个。
+    expect(data().links).toEqual([
+      { agent: 'claude-code', path: join(home, '.claude', 'skills', 'qiyu'), state: 'missing' },
+      { agent: 'codex', path: join(home, '.codex', 'skills', 'qiyu'), state: 'missing' },
+    ])
   })
 
-  it('装过且 ~/.claude/skills 存在 → 0，claude-code 为 ok', async () => {
+  it('装过且 ~/.claude/skills 存在 → 0，claude-code 为 ok、未装的 codex 报 missing', async () => {
     mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
     out = ''; err = ''
@@ -377,6 +383,8 @@ describe('skill where', () => {
     expect(linkOf('claude-code')).toMatchObject({
       path: join(home, '.claude', 'skills', 'qiyu'), state: 'ok',
     })
+    // codex 的目录不存在：仍然出现在报告里（state missing），不是从表里消失。
+    expect(linkOf('codex')).toMatchObject({ state: 'missing' })
   })
 
   it('自指循环链接（ELOOP）不崩：该 agent 记 unknown 并进 warnings，其余照常', async () => {
