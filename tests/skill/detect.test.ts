@@ -15,7 +15,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync,
+  chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -344,10 +344,9 @@ describe('cli.run() 接线 —— 提示真的进 meta.warnings，且每次 run 
     // 内部用的是同一份，因此无论哪种形态都判 current。
     const sourceDir = resolveSkillSourceDir() as string
     const currentEntity = join(home, 'current-entity')
-    mkdirSync(currentEntity, { recursive: true })
-    for (const f of readdirSync(sourceDir)) {
-      copyFileSync(join(sourceDir, f), join(currentEntity, f))
-    }
+    // 递归复制：包内 skill 目录当前是扁平的，但正文结构以后可能加子目录；
+    // 用 cpSync 递归复制，来源目录长什么样都不会因为 EISDIR 假红。
+    cpSync(sourceDir, currentEntity, { recursive: true })
     writeFileSync(join(currentEntity, MANIFEST), JSON.stringify({
       version: PACKAGE_VERSION,
       skill_contract_version: SKILL_CONTRACT_VERSION,

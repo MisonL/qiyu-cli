@@ -6,8 +6,11 @@
 // `meta.warnings` 加**一条**提示：
 //
 //   · absent  → 「skill 未安装到 <实体目录>；运行 `qiyu skill install`」；
-//   · stale   → 「已安装的 skill 与当前 CLI 版本不一致（安装于 <旧版本>，当前
-//               <新版本>）；运行 `qiyu skill install --force` 更新」；
+//   · stale   → 三个成因三支文案（实现见 `skillWarning`）：
+//               版本不同 → 「与当前 CLI 版本不一致（安装于 <旧>，当前 <新>）」；
+//               版本相同仅内容漂移 → 「内容与包内当前版本不一致（版本 <v>）」；
+//               版本未知 → 「无法确认已安装 skill 的版本（安装清单缺失或损坏）」；
+//               均以「运行 `qiyu skill install --force` 更新」收尾；
 //   · current / unknown → 不提示（unknown = 判定不了，宁可闭嘴也不打扰）。
 //
 // **只提示、绝不改退出码、绝不改 data、绝不自动改文件**——自动覆盖用户可能改过的
