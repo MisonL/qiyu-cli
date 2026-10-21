@@ -13,13 +13,19 @@
 // 目录，包内源目录里出现它只会让 `contentHash` 两边口径不一致。源里若被误放入同名
 // 文件，拷贝时显式排除并提示——不能悄悄带进发布产物。
 //
-// **版本注入**（spec D7）：`files: ["dist"]` 发布后包里没有 package.json，运行时读不
-// 到版本，所以 `src/core/edition.ts` 用 `PACKAGE_VERSION = '0.0.0-dev'` 占位，
+// **版本注入**（spec D7）：发布包**顶层**有 package.json（npm 永远带上它），但
+// `files: ["dist"]` 下 `dist/` 内部没有——运行时代码在 `dist/core/`，`../package.json`
+// 解析不到；跨层猜 `../../package.json` 又依赖构建层级、发布前后会分叉。所以
+// `src/core/edition.ts` 用 `PACKAGE_VERSION = '0.0.0-dev'` 占位，
 // 由本脚本在 tsc 之后把 `dist/core/edition.js` 里**那一行**替换成 package.json 的
 // version。只替换 `export const PACKAGE_VERSION = '...'` 这一处——注释里提到占位值
 // 是正常的（edition.ts 的注释就写了它），全局替换会把注释也改掉。替换必须**校验**：
 // 找不到该行（tsc 输出形态变了）或替换后该行仍是占位值，都打印错误并以非 0 退出
 // ——发布产物绝不能静默带着 `0.0.0-dev`。
+//
+// ⚠️ 本脚本失败（任何非 0 退出）时 dist 处于**不可用**的混合态：前面的拷贝步骤已经
+// 落盘，但版本可能仍是占位值。`npm run build` 的 `&&` 链会让构建整体失败，CI 与
+// `prepare` 因此安全；单独运行本脚本时**必须检查退出码**，失败了就重跑完整 build。
 
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'

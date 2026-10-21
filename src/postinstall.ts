@@ -48,6 +48,14 @@ export interface PostinstallOptions {
    * 这类场景时才注入。
    */
   sourceDir?: string
+  /**
+   * 解析 `npm_config_qiyu_skill_dir` **相对路径**时的基准目录（审查 M2）。
+   * 生产入口传 `process.env.INIT_CWD ?? process.cwd()`——npm 生命周期脚本的 cwd 是
+   * **包根**（`node_modules/qiyu-cli`），用户设 `=./my-skill` 会装进包目录；`INIT_CWD`
+   * 才是用户执行 install 时的目录（spec C6：它是 npm/pnpm/yarn/bun 唯一都提供的变量）。
+   * 不注入时在纯函数内部兜底读一次 `process.cwd()`（见下方唯一一处进程状态读取）。
+   */
+  cwd?: string
 }
 
 /** 中文提示统一写 stderr（stdout 不归 postinstall 用，npm 也只看 stderr）。 */
@@ -104,10 +112,15 @@ export async function runPostinstall(opts: PostinstallOptions): Promise<number> 
     }
 
     // 自定义实体位置：空串/纯空白视同未设（与 detect.ts 的 resolveEntityDir 同口径），
-    // 相对路径按 cwd 解析成绝对路径——installSkill 内部所有路径运算都按绝对路径处理。
+    // 相对路径按 `opts.cwd` 解析成绝对路径——installSkill 内部所有路径运算都按绝对路径处理。
+    // 绝对路径不受 cwd 影响（`path.resolve` 对绝对输入直接返回，不会拼接基准）。
     const requestedDir = env.get('npm_config_qiyu_skill_dir')?.trim()
+    // ⚠️ 这是 runPostinstall 里**唯一**一次读进程状态（`process.cwd()`），只在调用方
+    // 没注入 `cwd` 时兜底。纯函数原则不破：所有判定输入仍以 opts 为准，生产入口显式
+    // 传 `INIT_CWD ?? process.cwd()`，测试一律注入，因此正常路径上这行不会被走到。
+    const baseCwd = opts.cwd ?? process.cwd()
     const entityDir = requestedDir !== undefined && requestedDir !== ''
-      ? path.resolve(requestedDir)
+      ? path.resolve(baseCwd, requestedDir)
       : undefined
 
     const result = await installSkill({
@@ -155,5 +168,14 @@ if (isEntry()) {
   // 连 catch 兜底都返回 0：postinstall 在任何情况下都不得阻断 npm 安装。
   // 用 `process.exitCode` 而不是 `process.exit`（与 cli.ts 同理：设 exitCode 后
   // 让事件循环自然结束，stdout/stderr 先排空再退出）。
-  process.exitCode = await runPostinstall({ env: process.env, home: homedir() }).catch(() => 0)
+  //
+  // `cwd` 传 `INIT_CWD ?? process.cwd()`：npm 生命周期脚本的 cwd 是包根
+  // （`node_modules/qiyu-cli`），`INIT_CWD` 才是用户执行 install 的目录——用户设
+  // `npm_config_qiyu_skill_dir=./my-skill` 时应当落在用户目录，不是包目录（审查 M2）。
+  // `INIT_CWD` 缺失（非 npm 生命周期的直接执行）时退回进程 cwd 是唯一合理基准。
+  process.exitCode = await runPostinstall({
+    env: process.env,
+    home: homedir(),
+    cwd: process.env.INIT_CWD ?? process.cwd(),
+  }).catch(() => 0)
 }

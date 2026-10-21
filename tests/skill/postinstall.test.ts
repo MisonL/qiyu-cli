@@ -9,10 +9,13 @@
 // 不参与判定。源目录同样注入：`runPostinstall` 收 `sourceDir` 覆盖，否则走
 // `resolveSkillSourceDir()`（在测试进程里会解析到仓库 src/skill/qiyu）。
 //
-// 用例构成：brief 五条 + 控制者补三条（环境变量通路、幂等、npx 判据优先）。
+// 用例构成：brief 五条 + 控制者补三条（环境变量通路、幂等、npx 判据优先）+ 审查
+// fix round 1 补四条（I1 force:false 数据保护、M2 相对路径基准 cwd、M3 键名大小写）。
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { runPostinstall } from '../../src/postinstall.js'
@@ -169,5 +172,91 @@ describe('runPostinstall', () => {
     expect(code).toBe(0)
     expect(existsSync(join(home, '.agents'))).toBe(false)
     expect(messages.join('')).toContain('通过 npx 执行')
+  })
+
+  it('审查 M3：env 键名全大写（NPM_CONFIG_GLOBAL）同样命中（spec D8 大小写不敏感）', async () => {
+    const sourceDir = makeSource()
+    const code = await runPostinstall({
+      env: { NPM_CONFIG_GLOBAL: 'true', NPM_COMMAND: 'install' },
+      home,
+      sourceDir,
+    })
+    expect(code).toBe(0)
+    expect(installed(defaultEntityDir(home))).toBe(true)
+  })
+
+  it('审查 I1：重跑不覆盖用户手改的正文（force:false 的数据保护承诺）', async () => {
+    const sourceDir = makeSource()
+    const env = { npm_config_global: 'true', npm_command: 'install' }
+    await runPostinstall({ env, home, sourceDir })
+
+    // 手改实体里的正文（用户加了自己的内容）。
+    const entityDir = defaultEntityDir(home)
+    const edited = '# qiyu\n\n用户手改的正文，绝不能被自动路径覆盖\n'
+    writeFileSync(join(entityDir, 'SKILL.md'), edited)
+
+    // 捕捉 stderr：既要证明「未覆盖」被如实说出来，也要确认没有谎报「已覆盖」。
+    const messages: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages.push(String(chunk))
+      return true
+    })
+    let code: number
+    try {
+      code = await runPostinstall({ env, home, sourceDir })
+    } finally {
+      spy.mockRestore()
+    }
+
+    expect(code).toBe(0)
+    // ① 用户改动原样保留（逐字节）。
+    expect(readFileSync(join(entityDir, 'SKILL.md'), 'utf8')).toBe(edited)
+    // ② 警告如实说明未覆盖。
+    expect(messages.join('')).toContain('未覆盖')
+  })
+
+  describe('审查 M2：npm_config_qiyu_skill_dir 的路径解析基准', () => {
+    it('相对路径按注入的 cwd 解析（不是进程 cwd）', async () => {
+      const sourceDir = makeSource()
+      const cwd = join(home, 'user-proj')
+      mkdirSync(cwd, { recursive: true })
+      const code = await runPostinstall({
+        env: {
+          npm_config_global: 'true',
+          npm_command: 'install',
+          npm_config_qiyu_skill_dir: 'rel-dir',
+        },
+        home,
+        sourceDir,
+        cwd,
+      })
+      expect(code).toBe(0)
+      expect(installed(join(cwd, 'rel-dir'))).toBe(true)
+      // 实体只落在注入的 cwd 下：若实现退回 `path.resolve(rel)`（进程 cwd 基准），
+      // 上面那条断言就会落空——不必再断言进程 cwd 里的路径，那会在回归时污染仓库根。
+      expect(installed(defaultEntityDir(home))).toBe(false)
+    })
+
+    it('绝对路径不受 cwd 影响', async () => {
+      const sourceDir = makeSource()
+      const abs = join(home, 'absolute-entity')
+      const elsewhere = join(home, 'elsewhere')
+      mkdirSync(elsewhere, { recursive: true })
+      const code = await runPostinstall({
+        env: {
+          npm_config_global: 'true',
+          npm_command: 'install',
+          npm_config_qiyu_skill_dir: abs,
+        },
+        home,
+        sourceDir,
+        // 故意给一个完全无关的 cwd：绝对路径不应该被它拼接。
+        cwd: elsewhere,
+      })
+      expect(code).toBe(0)
+      expect(installed(abs)).toBe(true)
+      // 没有被拼进 cwd 之下。
+      expect(existsSync(join(elsewhere, 'absolute-entity'))).toBe(false)
+    })
   })
 })
