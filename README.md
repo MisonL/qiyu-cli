@@ -44,6 +44,39 @@ cd qiyu-cli && npm install && npm run build
 > `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。
 > 该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
 
+### 装完之后：安装 skill（推荐）
+
+`qiyu` 附带一份 Agent 操作协议（skill），装到 `~/.agents/skills/qiyu` 并链接进各 Agent 的
+skills 目录（当前支持 Claude Code 的 `~/.claude/skills` 与 Codex 的 `~/.codex/skills`）。
+
+**当前版本，自动安装基本不会发生**，请显式跑一次：
+
+```bash
+qiyu skill install        # 安装 / 更新 skill 正文并建链接
+```
+
+原因如实说：`package.json` 里虽有 `postinstall`，但它**只在 npm 全局安装、且不是 npx 调用时**
+才尝试安装（判据是 `npm_config_global === 'true'` 且 `npm_command !== 'exec'`）。而
+**npm 12 / pnpm 12 / bun 默认阻断安装脚本**，即使装了也可能根本不执行；npx 场景下它还会
+主动跳过（不往你的 home 写东西）。要用 postinstall 的话需要显式放行：
+
+```bash
+# npm 12
+npm install -g qiyu-cli --allow-scripts=qiyu-cli
+# pnpm 12
+pnpm approve-builds      # 在交互界面里勾选 qiyu-cli
+```
+
+但放行后它也**只做「尽力而为」**：失败一律不阻断安装、只写一行 stderr 提示，而且默认安装
+下 stderr 会被 npm 吞掉（`--foreground-scripts` 才可见）。所以**主路径始终是 `qiyu skill install`**。
+
+安装是幂等的：内容一致时不动任何文件（要覆盖你改过的正文得加 `--force`）。其他子命令：
+`qiyu skill where` 报告实体目录与各 Agent 的链接状态（只读，不修复）；`qiyu skill check`
+校验 skill 引用的命令/表/错误 kind 是否仍存在（有违规退出码 1，CI 可跑）。
+
+> 兜底提示：若 skill 未安装或已过期，`qiyu` 每次成功输出都会在 `meta.warnings` 里提醒
+> 「未安装 / 已过期」——提示只写进 JSON，不改退出码。
+
 ## 配置凭证
 
 凭证通过环境变量读取：
@@ -107,6 +140,12 @@ qiyu query --sql <SQL>               任意只读 SQL（三层沙箱 + 默认脱
 qiyu query --table <表> [--since T] [--until T] [--group-by <列>]
                                      受约束查询通道（列白名单、时间列语义化、精确脱敏）
 qiyu stats fields <报表>              指标自描述（声明 + 本地观测分布 + -1 哨兵）
+qiyu skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
+                                     安装 skill 正文并链接进各 Agent 的 skills 目录
+qiyu skill check [--installed | --compare] [--dir <path>]
+                                     校验 skill 引用的命令/表/错误 kind（有违规退出码 1）
+qiyu skill where [--dir <path>]      报告实体目录与各 Agent 链接状态（只读，不修复）
+qiyu --version                       包版本 + skill_contract_version
 ```
 
 ## 输出契约
@@ -296,6 +335,8 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 
 本仓库已交付设计稿中的**前五个子项目**：认证与通用 API 通道、API 参数校验
 （`api schema`/body 分级校验）、存储层、同步引擎、查询接口与只读沙箱。
+此外 **F 子项目（Skill 化）也已交付**：见下方「装完之后：安装 skill」与
+`qiyu skill install` / `qiyu skill check` / `qiyu skill where`。
 
 **已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
 限频感知（`retry_after`）、本地数据仓库——`store init` / `store status`（存储层已交付，
@@ -307,6 +348,11 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 或 `last_synced_at` 非空的行——全败的 run 只留 pending，不算跑通）。
 查询与只读沙箱——`db tables` / `db describe` / `query --sql` / `query --table` / `stats fields`
 （三层只读沙箱、默认脱敏、时间列三形态语义化、`-1` 哨兵呈现、声明与观测分离）。
+Skill 化——`skill install`（复制正文 + 建 Agent 链接，幂等，`--dry-run` 只算计划）/
+`skill check`（校验正文引用的命令、表名、错误 `kind` 是否仍存在；`--installed`/`--compare`
+改基准；有违规退出码 1）/ `skill where`（只读报告实体目录与各 Agent 链接四态：
+`ok`/`missing`/`dangling`/`foreign`，无法判定时报 `unknown` 而非「不存在」），
+外加 `qiyu --version`（输出包版本与 `skill_contract_version`）。
 
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
@@ -319,7 +365,6 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 
 - `auth login`（配置文件写入）——目前只支持环境变量；
 - `--pretty`（人类可读输出）——目前只输出紧凑 JSON；
-- `F` 子项目的 Skill 化（Agent 操作协议、`skill check`）——查询命令本身已可用，见「当前状态」；
 
 `api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
