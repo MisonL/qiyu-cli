@@ -33,8 +33,9 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && node scripts/copy-params.mjs",
+    "build": "tsc && node scripts/copy-assets.mjs",
     "prepare": "npm run build",
+    "postinstall": "node dist/postinstall.js || exit 0",
     "test": "node scripts/test-shards.mjs",
     "test:single": "vitest run --maxWorkers=1 --no-file-parallelism",
     "typecheck": "tsc -p tsconfig.test.json"
