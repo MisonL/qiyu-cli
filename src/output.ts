@@ -129,6 +129,17 @@ export function setSkillWarning(text: string | undefined): void {
  *   · meta 不是对象（字符串/数组/null 等）→ 原样返回，不硬塞提示；
  *   · meta 为 undefined 且有提示 → 新建 `{ warnings: [提示] }`（这是提示唯一
  *     能出现的通道，也是唯一允许新建 meta 的情形）。
+ *
+ * ⚠️ **元素形状跟随既有数组保持同质**（审查 I3，控制器裁定）：不同命令的
+ * `meta.warnings` 形状不同——`api call` 是结构化对象数组
+ * （`{ kind, field?, message }`，见 api.ts），其余命令多为字符串数组。消费者按
+ * 自己的形状读：`api call` 的消费者按 `w.kind` 过滤，若往对象数组里塞一个裸字符串，
+ * `w.kind` 就是 `undefined`，静默丢失（或更糟：字符串被当对象取值）。所以：
+ *   ① 没有 warnings → 新建字符串数组 `[text]`；
+ *   ② 有数组且**首元素是非 null 对象** → 按对象形状 append
+ *      `{ kind: 'skill_drift', message: text }`（与 api.ts 同形）；
+ *   ③ 其余（空数组 / 字符串数组 / 首元素是 null 等）→ append 字符串。
+ * 每个命令的 warnings 数组因此保持自身同质，两类读者都不被破坏。
  */
 function mergeSkillWarning(meta: unknown): unknown {
   if (pendingSkillWarning === undefined) return meta
@@ -138,10 +149,21 @@ function mergeSkillWarning(meta: unknown): unknown {
   if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return meta
 
   const existing = (meta as { warnings?: unknown }).warnings
-  const warnings = Array.isArray(existing)
-    ? [...existing, pendingSkillWarning]
-    : [pendingSkillWarning]
+  let warnings: unknown[]
+  if (!Array.isArray(existing)) {
+    warnings = [pendingSkillWarning]
+  } else if (existing.length > 0 && isPlainObject(existing[0])) {
+    // 既有元素是结构化对象：保持同形，新元素带 kind 便于消费者过滤。
+    warnings = [...existing, { kind: 'skill_drift', message: pendingSkillWarning }]
+  } else {
+    warnings = [...existing, pendingSkillWarning]
+  }
   return { ...(meta as Record<string, unknown>), warnings }
+}
+
+/** 非 null 的普通对象（数组不算——它是容器，不是元素形状）。 */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function exitCodeFor(kind: string): number {

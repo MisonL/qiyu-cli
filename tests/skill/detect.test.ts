@@ -13,8 +13,11 @@
 // 「哈希」指 manifest 里记录的 content_hash 与**包内**（sourceDir）的内容哈希是否
 // 一致 —— 探测只读清单、不读实体正文（spec D2.1 的「零成本」）。
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import {
+  chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -23,6 +26,8 @@ import {
 } from '../../src/skill/detect.js'
 import { contentHash, MANIFEST } from '../../src/skill/install.js'
 import { defaultEntityDir } from '../../src/skill/paths.js'
+import { setSkillWarning } from '../../src/output.js'
+import { run } from '../../src/cli.js'
 import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from '../../src/core/edition.js'
 
 let home: string
@@ -225,6 +230,20 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     expect(resolveEntityDir()).toBeUndefined()
   })
 
+  it('QIYU_SKILL_DIR 为纯空白同样视为未设（审查 M1）', () => {
+    // `QIYU_SKILL_DIR="   "`（shell 里无意带入的空白）此前被当成合法路径，
+    // 探测会 stat 一个叫「   」的目录并给出「skill 未安装到    」的文案。
+    process.env.NODE_ENV = 'test'
+    process.env.QIYU_SKILL_DIR = '   '
+    expect(resolveEntityDir()).toBeUndefined()
+  })
+
+  it('路径前后有空白时按 trim 后的值使用', () => {
+    process.env.NODE_ENV = 'test'
+    process.env.QIYU_SKILL_DIR = '  /tmp/some-entity  '
+    expect(resolveEntityDir()).toBe('/tmp/some-entity')
+  })
+
   it('非测试环境返回默认实体位置（纯字符串计算，不碰磁盘）', () => {
     process.env.NODE_ENV = 'production'
     delete process.env.QIYU_SKILL_DIR
@@ -255,17 +274,32 @@ describe('skillWarning —— 只在需要时给出一条可执行的提示', ()
     expect(msg).toContain('qiyu skill install')
   })
 
-  it('stale：带上已安装版本、当前版本与 --force 更新命令', () => {
+  it('stale（版本不同）：带上已安装版本、当前版本与 --force 更新命令', () => {
     const msg = skillWarning({ kind: 'stale', installedVersion: '0.9.0' }, { currentVersion: '1.0.0' })
     expect(msg).toBeDefined()
     expect(msg).toContain('0.9.0')
     expect(msg).toContain('1.0.0')
     expect(msg).toContain('--force')
+    expect(msg).toContain('与当前 CLI 版本不一致')
   })
 
-  it('stale 且安装版本未知：不编造版本号，仍给出 --force', () => {
-    const msg = skillWarning({ kind: 'stale', installedVersion: 'unknown' })
+  it('stale（版本相同、仅内容漂移）：不得说「版本不一致」（审查 I2 的自相矛盾）', () => {
+    // 版本号相同而正文哈希漂移（包更新过、版本没变）时，旧文案输出
+    // 「版本不一致（安装于 0.0.0-dev，当前 0.0.0-dev）」——同一句话自我矛盾。
+    // 这条钉住「内容漂移」专用措辞。
+    const msg = skillWarning({ kind: 'stale', installedVersion: '1.0.0' }, { currentVersion: '1.0.0' })
     expect(msg).toBeDefined()
+    expect(msg).toContain('内容与包内当前版本不一致')
+    expect(msg).toContain('1.0.0')
+    expect(msg).toContain('--force')
+    expect(msg).not.toContain('与当前 CLI 版本不一致')
+  })
+
+  it('stale 且安装版本未知：不编造版本号，用「无法确认版本」措辞（审查 I2）', () => {
+    const msg = skillWarning({ kind: 'stale', installedVersion: 'unknown' }, { currentVersion: '1.0.0' })
+    expect(msg).toBeDefined()
+    expect(msg).toContain('无法确认已安装 skill 的版本')
+    expect(msg).toContain('安装清单缺失或损坏')
     expect(msg).not.toContain('安装于 unknown')
     expect(msg).toContain('--force')
   })
@@ -273,5 +307,70 @@ describe('skillWarning —— 只在需要时给出一条可执行的提示', ()
   it('current / unknown：不提示', () => {
     expect(skillWarning({ kind: 'current' })).toBeUndefined()
     expect(skillWarning({ kind: 'unknown' })).toBeUndefined()
+  })
+})
+
+describe('cli.run() 接线 —— 提示真的进 meta.warnings，且每次 run 显式清除（审查 I1）', () => {
+  // 这两条是 cli.ts 接线的唯一端到端覆盖：`run()` 里的
+  // `setSkillWarning(dir && src ? skillWarning(detectSkillState(...)) : undefined)`
+  // 若被整段删掉、或退化成「只在有提示时才 set」（不清除残留），下面的用例变红。
+  let out: string
+
+  beforeEach(() => {
+    out = ''
+    vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
+  })
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+    setSkillWarning(undefined)
+  })
+
+  it('装了不存在的位置：api list 退出码 0，meta.warnings 含「未安装」提示', async () => {
+    vi.stubEnv('NODE_ENV', 'test')
+    vi.stubEnv('QIYU_SKILL_DIR', join(home, 'absent-entity'))
+    expect(await run(['api', 'list'])).toBe(0)
+    const parsed = JSON.parse(out)
+    expect(parsed.ok).toBe(true)
+    expect(parsed.meta.warnings).toHaveLength(1)
+    expect(parsed.meta.warnings[0]).toContain('未安装')
+    expect(parsed.meta.warnings[0]).toContain(join(home, 'absent-entity'))
+  })
+
+  it('残留清除：第一次 absent 产生提示，第二次换成 current 实体后不得残留上一条', async () => {
+    // 构造一个「已安装且与包内一致」的实体：正文从包内源目录原样复制，
+    // 清单写当前版本 + 源目录哈希。源目录取 resolveSkillSourceDir() 的解析结果
+    // （源码态是 src/skill/qiyu，发布/构建态是 dist/skill/qiyu），哈希与 run()
+    // 内部用的是同一份，因此无论哪种形态都判 current。
+    const sourceDir = resolveSkillSourceDir() as string
+    const currentEntity = join(home, 'current-entity')
+    mkdirSync(currentEntity, { recursive: true })
+    for (const f of readdirSync(sourceDir)) {
+      copyFileSync(join(sourceDir, f), join(currentEntity, f))
+    }
+    writeFileSync(join(currentEntity, MANIFEST), JSON.stringify({
+      version: PACKAGE_VERSION,
+      skill_contract_version: SKILL_CONTRACT_VERSION,
+      content_hash: contentHash(sourceDir),
+      installed_at: new Date().toISOString(),
+    }))
+
+    vi.stubEnv('NODE_ENV', 'test')
+
+    // 第一次：absent → 产生「未安装」提示（若接线缺失，这条先红）。
+    vi.stubEnv('QIYU_SKILL_DIR', join(home, 'absent-entity'))
+    out = ''
+    expect(await run(['api', 'list'])).toBe(0)
+    expect(JSON.parse(out).meta.warnings[0]).toContain('未安装')
+
+    // 第二次：换成 current 实体 → 探测结果无提示。若 cli.ts 只在「有提示」时才
+    // setSkillWarning（不清除），上一条提示会残留在本次 meta 里 → 这条红。
+    vi.stubEnv('QIYU_SKILL_DIR', currentEntity)
+    out = ''
+    expect(await run(['api', 'list'])).toBe(0)
+    const parsed = JSON.parse(out)
+    expect(parsed.ok).toBe(true)
+    expect(parsed.meta, 'current 态不得出现 warnings 键').not.toHaveProperty('warnings')
+    expect(out).not.toContain('未安装')
   })
 })

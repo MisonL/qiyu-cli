@@ -52,6 +52,9 @@ export type SkillState =
   | { kind: 'current' }
   | { kind: 'unknown' }
 
+// ⚠️ 进程内一次判定：命中后**不随文件系统变化**（装完 skill 再调同参仍返回旧结论，
+// 这正是「一个进程只探测一次」的语义）。`__resetSkillDetectionForTest()` 仅测试用，
+// 生产路径不存在清除动作——CLI 每个命令都是新进程，缓存天然只活一次命令。
 const cache = new Map<string, SkillState>()
 
 /**
@@ -181,12 +184,18 @@ export function skillWarning(
     return `skill 未安装${where}；运行 \`qiyu skill install\` 安装`
   }
   if (state.kind === 'stale') {
+    // 三种 stale 来源，文案必须各自准确——不能把「内容漂移」说成「版本不一致」：
+    //   · 清单缺失/损坏 → 连安装版本都不可知；
+    //   · 版本相同、仅内容哈希漂移 → 版本号相同，说「版本不一致」自相矛盾；
+    //   · 版本不同 → 说清「安装于 X，当前 Y」。
+    if (state.installedVersion === 'unknown') {
+      return '无法确认已安装 skill 的版本（安装清单缺失或损坏）；运行 `qiyu skill install --force` 更新'
+    }
+    if (ctx?.currentVersion !== undefined && state.installedVersion === ctx.currentVersion) {
+      return `已安装的 skill 内容与包内当前版本不一致（版本 ${state.installedVersion}）；运行 \`qiyu skill install --force\` 更新`
+    }
     const current = ctx?.currentVersion !== undefined ? `，当前 ${ctx.currentVersion}` : ''
-    // installedVersion='unknown'：清单缺失/损坏时不编造版本号，只说「已安装的」。
-    const installed = state.installedVersion === 'unknown'
-      ? '安装清单缺失或损坏，无法判断安装版本'
-      : `安装于 ${state.installedVersion}`
-    return `已安装的 skill 与当前 CLI 版本不一致（${installed}${current}）；运行 \`qiyu skill install --force\` 更新`
+    return `已安装的 skill 与当前 CLI 版本不一致（安装于 ${state.installedVersion}${current}）；运行 \`qiyu skill install --force\` 更新`
   }
   return undefined
 }
@@ -195,10 +204,11 @@ export function skillWarning(
  * 实体目录解析：显式 `QIYU_SKILL_DIR` 优先；测试环境（NODE_ENV === 'test'）且未
  * 显式设置时返回 undefined——**测试绝不读写真实 `~`**，且探测结果不得依赖开发者
  * 机器装没装过 skill（否则全量测试的 meta 形态随机器而变，理由见文件头注释）。
- * 空串环境变量视为未设：空路径不是有意义的实体位置。
+ * 纯空白（含空串）环境变量视为未设：空路径不是有意义的实体位置，前后空白也几乎
+ * 不可能是路径的一部分（多半是 shell 里无意带入的）。
  */
 export function resolveEntityDir(): string | undefined {
-  const explicit = process.env.QIYU_SKILL_DIR
+  const explicit = process.env.QIYU_SKILL_DIR?.trim()
   if (explicit !== undefined && explicit !== '') return explicit
   if (process.env.NODE_ENV === 'test') return undefined
   return defaultEntityDir(homedir())
