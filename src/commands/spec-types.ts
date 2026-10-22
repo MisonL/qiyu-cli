@@ -39,19 +39,48 @@ export interface FlagSpec {
   kind: 'value' | 'bool' | 'repeatable'
 }
 
+/**
+ * 一个位置参数槽位。
+ *
+ * `repeatable` 表示「可给任意多个」（如 `sync run [任务...]`）：校验方在槽位数用尽后把
+ * 余下的字面取值继续按**最后一个**槽位的域比，而不是判「超量」。
+ *
+ * ⚠️ 没有 `repeatable` 时，「个数超过 spec 声明」会被判成违规——对 `sync run a b` 这种
+ * **合法调用**是误报（把正确内容判成错误），比漏报更糟。
+ */
+export interface PositionalSpec {
+  name: string
+  domain: Domain
+  repeatable?: boolean
+  /**
+   * 位置纪律：这个槽位**必须紧跟在命令词之后**，flag 写在它前面时真实 CLI 退 2。
+   *
+   * 语义来自解析器形态，不是偏好：`api call` 的 `callOne` 是 `const [id] = argv` ——
+   * 它把 `argv[0]` 直接当接口 id，`qiyu api call --yes ticket.search` 报
+   * 「接口 id 必须是第一个参数」并退出 2。其余带位置参数的命令（`api schema` /
+   * `sync run|status|verify` / `db describe` / `stats fields`）都是**先剥 flag 再取位置**
+   * （`parseStoreFlags` / `parseSubFlags` / 显式 `filter`），flag 与位置参数可交错 ——
+   * 给它们标 `first` 会让 `skill check` 把 `qiyu sync run --full dim.staff` 这种合法写法
+   * 误报成 `flag_before_positional`。
+   *
+   * ⚠️ 只在 `positionals[0]` 上有意义：`first` 描述的是「第一个位置参数槽位」，第二个
+   * 槽位没有「紧跟命令词」这回事。校验方只读 `spec.positionals[0]?.first`。
+   *
+   * ⚠️ 这是**唯一**表达该约束的地方：`skill/check.ts` 不再维护命令路径清单（那是
+   * `CommandSpec` 之前的第二事实源）。`tests/commands/command-tree.test.ts` 有一条
+   * 反向对齐用例：用行为探针算出「解析器真把 argv[0] 当位置参数」的命令集合，断言它
+   * 与「标了 `first` 的 spec」完全一致 —— 漏标会被抓，误标同样会被抓。
+   */
+  first?: boolean
+}
+
 export interface CommandSpec {
   /** 命令路径，不含程序名：`['db', 'describe']`。 */
   path: string[]
   /** 完整接受集，**含 `GLOBAL_FLAGS`**——各命令组装时写成 `[...GLOBAL_FLAGS, ...业务 flag]`。 */
   flags: FlagSpec[]
-  /**
-   * 位置参数槽位。`repeatable` 表示「可给任意多个」（如 `sync run [任务...]`）：
-   * 校验方在槽位数用尽后把余下的字面取值继续按**最后一个**槽位的域比，而不是判「超量」。
-   *
-   * ⚠️ 没有这个标记时，「个数超过 spec 声明」会被判成违规——对 `sync run a b` 这种
-   * **合法调用**是误报（把正确内容判成错误），比漏报更糟。
-   */
-  positionals: { name: string; domain: Domain; repeatable?: boolean }[]
+  /** 位置参数槽位，语义见 `PositionalSpec`（含 `repeatable` / `first` 两条纪律）。 */
+  positionals: PositionalSpec[]
   /** 已知但显式拒绝的 flag（当前只有 `--pretty`）。 */
   rejected: string[]
 }

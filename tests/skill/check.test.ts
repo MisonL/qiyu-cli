@@ -352,6 +352,11 @@ describe('审查 A3：flag 的位置（写在子命令位 / 第一个位置参�
     expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_subcommand'])
   })
   it('`api call --yes ticket.search` → flag_before_positional（接口 id 必须是第一个参数）', () => {
+    // G9：判据走 spec 的 `PositionalSpec.first`（`api call` 的接口 id 槽位），不再是
+    // check.ts 里的命令路径清单。变异「把 api call spec 的 first 删掉」→ 本用例红。
+    // ⚠️ 单例豁免：`--help` 是唯一不按此判的 flag —— 缺 id 是硬错误、help 修不了它
+    // （`api.ts` 的 `callOne` 对 `--help`/`-h` 显式豁免，`api call --pretty --help` 报
+    // 「接口 id 必须是第一个参数」而不是给帮助）。`--yes` 无此豁免，所以本用例有效。
     const r = checkSkillDoc('`qiyu api call --yes ticket.search`', ctx)
     expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_positional'])
     expect(r.violations[0]!.detail).toContain('--yes')
@@ -360,8 +365,52 @@ describe('审查 A3：flag 的位置（写在子命令位 / 第一个位置参�
     const r = checkSkillDoc('`qiyu api call --body <JSON> ticket.search`', ctx)
     expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_positional'])
   })
+  it('`api call --no-validate ticket.search` / `--strict ticket.search` → 同样走 spec 标记报出', () => {
+    // 值位（`--body`）与布尔（`--yes`）已各有一条，这里补齐另外两个布尔 flag：判据是
+    // 「槽位有标记且 flag 落在槽位」，与 flag 的 kind 无关。
+    for (const flag of ['--no-validate', '--strict']) {
+      const r = checkSkillDoc(`\`qiyu api call ${flag} ticket.search\``, ctx)
+      expect(r.violations.map((v) => v.rule), flag).toEqual(['flag_before_positional'])
+      expect(r.violations[0]!.detail, flag).toContain(flag)
+    }
+  })
   it('正例：`api call ticket.search --yes` 零违规', () => {
     expect(checkSkillDoc('`qiyu api call ticket.search --yes`', ctx).violations).toEqual([])
+  })
+  // —— spec 缺失标记的**反向**证明（G9 新增）——
+  //
+  // 上面几条只证明「标了 first → 会报」。若 check.ts 改回读硬编码清单、或读错字段，
+  // 只要 `api call` 仍被特判它们照样绿。这里把 `first` 标记从注入的 tree 里**删掉**，
+  // 断言 `flag_before_positional` **不再出现** —— 证明这条违规的唯一来源确实是 spec 字段。
+  // 变异「check.ts 恢复 FIRST_POSITIONAL_STRICT / 读别的字段」→ 本用例红。
+  it('spec 没有 first 标记时不再报 flag_before_positional（违规来源只有 spec）', () => {
+    const noFirst: CheckContext = {
+      ...ctx,
+      tree: ctx.tree.map((s) => s.path.join(' ') === 'api call'
+        ? { ...s, positionals: s.positionals.map(({ first: _first, ...rest }) => rest) }
+        : s),
+    }
+    const r = checkSkillDoc('`qiyu api call --yes ticket.search`', noFirst)
+    expect(r.violations.map((v) => v.rule)).not.toContain('flag_before_positional')
+    // 位置参数取值域那层不受影响：`ticket.search` 本身合法，所以整条零违规。
+    expect(r.violations).toEqual([])
+    // 同一份输入在带标记的 tree 上仍报（对照组，证明上面不是空转）。
+    expect(checkSkillDoc('`qiyu api call --yes ticket.search`', ctx).violations.map((v) => v.rule))
+      .toEqual(['flag_before_positional'])
+  })
+  it('误标：给 `sync run` 的位置参数加 first → 合法写法被误报（反向对齐用例要抓的形态）', () => {
+    // `sync run` 的解析器先剥 flag（`parseSubFlags`），`--full dim.staff` 是合法写法。
+    // 这里演示「spec 误标」的后果：check 会跟着误报 —— 所以
+    // `tests/commands/command-tree.test.ts` 的反向对齐用例必须把误标判红。
+    const wrong: CheckContext = {
+      ...ctx,
+      tree: ctx.tree.map((s) => s.path.join(' ') === 'sync run'
+        ? { ...s, positionals: [{ ...s.positionals[0]!, first: true }] }
+        : s),
+    }
+    expect(checkSkillDoc('`qiyu sync run --full dim.staff`', wrong).violations.map((v) => v.rule))
+      .toEqual(['flag_before_positional'])
+    expect(checkSkillDoc('`qiyu sync run --full dim.staff`', ctx).violations).toEqual([])
   })
   it('正例：其余命令 flag 与位置参数可交错（`sync run --full dim.staff`）', () => {
     expect(checkSkillDoc('`qiyu sync run --full dim.staff`', ctx).violations).toEqual([])

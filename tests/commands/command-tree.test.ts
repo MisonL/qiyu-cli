@@ -190,6 +190,92 @@ describe('COMMAND_TREE', () => {
       rmSync(FAKE_HOME, { recursive: true, force: true })
     }
   })
+  // —— G9：`first` 标记（位置纪律）与解析器行为的**反向**对齐 ——
+  //
+  // 背景：`skill check` 曾用硬编码清单 `FIRST_POSITIONAL_STRICT = ['api call']` 表达
+  // 「flag 不能写在第一个位置参数之前」，那是 `CommandSpec` 之外的第二事实源。现在唯一
+  // 声明处是 spec 的 `PositionalSpec.first`，本用例负责证明**声明与解析器一致**：
+  //   · 漏标（解析器把 argv[0] 当位置参数、spec 没标）→ `skill check` 漏报 → 红；
+  //   · 误标（解析器先剥 flag、spec 标了）→ `skill check` 把合法写法误报 → 红。
+  //
+  // 判据是**行为探针**（两种 token 顺序的对比），不是读源码、也不是「有没有报错」——
+  // 所有命令对**未知 flag** 都会报错，单看 A 的 message 区分不出 flag 位置。
+  // 对每条带位置参数的 spec 跑两次真实处理器，用**同一个** sentinel 当 flag：
+  //   A = `<命令> --zzz-sentinel zzz-probe-value`（flag 在位置参数**前**）
+  //   B = `<命令> zzz-probe-value --zzz-sentinel`（flag 在位置参数**后**）
+  //
+  //   · **先剥 flag** 的解析器（`api schema` 的 filter、`parseSubFlags`、
+  //     `parseStoreFlags`、`sync run` 的解析循环）：两种顺序被**同一个**「未知参数」
+  //     分支拒绝，错误 message 逐字相同 → 位置不影响判定 = 非严格。
+  //   · **把 argv[0] 当位置参数**的解析器（`callOne` 的 `const [id] = argv`）：
+  //     A 里 `--zzz-sentinel` 落进 id 槽位，走的是「接口 id 必须是第一个参数」分支；
+  //     B 走的是「未知参数」分支 → 两条 message **不同** = 严格。
+  //
+  // 这个判据有一个前提（本用例用 SAMPLE 里的真实闭集值保证）：在 B 里，位置参数取到
+  // 真实值后不会先生成**另一条**错误 message。`db describe` / `stats fields` /
+  // `sync status|verify` 的闭集与任务校验在重复值上不产出新 message；若将来某命令的
+  // 校验改成「域外的值报错、域内的值往下走」，这里仍能区分（域内值不产生新错误）。
+  //
+  // ⚠️ 探针值用**真实闭集值**（`ticket.search` / `sessions` / `daily_overview` /
+  // `dim.staff`），否则 B 的域校验会先失败、与 A 的 message 混同。
+  // ⚠️ 探针不碰网络也不开库：`api call` 的 id 位置检查在 `byId` 之前；`db describe` /
+  // `stats fields` 的闭集校验先于 I/O；`sync status|verify` 的 `selectTasks` 在开库之前。
+  it('spec 的 first 标记与解析器行为完全一致（漏标/误标都红）', async () => {
+    const HANDLERS: Record<string, (argv: string[]) => Promise<number>> = {
+      api: apiCommand, sync: syncCommand, db: dbCommand, stats: statsCommand,
+    }
+    // 每条**带位置参数**的 spec → 该槽位的第一个合法取值（探针用）。
+    const SAMPLE: Record<string, string> = {
+      'api call': 'ticket.search',
+      'api schema': 'ticket.search',
+      'sync run': 'dim.staff',
+      'sync status': 'dim.staff',
+      'sync verify': 'dim.staff',
+      'db describe': 'sessions',
+      'stats fields': 'daily_overview',
+    }
+    const withPositionals = COMMAND_TREE.filter((s) => s.positionals.length > 0)
+    // 守卫：SAMPLE 必须覆盖每一条带位置参数的 spec（新增带位置参数的命令却忘了给探针值时，
+    // 本用例要红而不是静默跳过 —— 否则新命令的 first 标记无人验证）。
+    expect(withPositionals.map((s) => s.path.join(' ')).sort()).toEqual(Object.keys(SAMPLE).sort())
+
+    const flagFirstBehavesStrict: string[] = []
+    for (const s of withPositionals) {
+      const key = s.path.join(' ')
+      const handler = HANDLERS[s.path[0]!]!
+      // 处理器收到的 argv 不含顶层命令名（与 cli.ts 的 `COMMANDS[sub](rest)` 一致）。
+      const run = async (argv: string[]): Promise<string> => {
+        out = ''; err = ''
+        const code = await handler([...s.path.slice(1), ...argv])
+        expect(code, `${key} 的探针不该成功退出：${argv.join(' ')}`).toBe(2)
+        return messageOf()
+      }
+      // A：flag 在位置参数之前；B：flag 在位置参数之后。两个探针都不该退出 0
+      // （sentinel 是未知 flag，任何命令都拒绝它）。
+      const before = await run([SENTINEL, SAMPLE[key]!])
+      const after = await run([SAMPLE[key]!, SENTINEL])
+      // 两种顺序给出**不同**的错误 = 位置改变了 flag 的含义 = 解析器把前一个 token
+      // 当位置参数槽位（严格）。相同 = flag 被先剥掉、位置无关（宽容）。
+      if (before !== after) flagFirstBehavesStrict.push(key)
+    }
+    // 反向对齐：解析器严格取 argv[0] 的命令集合 == spec 标了 first 的命令集合。
+    // 变异「删掉 api call 的 first」→ 左多右少 → 红；「给 sync run 加 first」→ 右多左少 → 红。
+    const markedFirst = COMMAND_TREE.filter((s) => s.positionals[0]?.first === true)
+      .map((s) => s.path.join(' ')).sort()
+    expect(flagFirstBehavesStrict.sort()).toEqual(markedFirst)
+  })
+  // 复审 I-2 的形态在这里延续：上面那条只证明「标了 first 的命令解析器确实严格」，
+  // 但**没标**的命令若解析器其实严格（漏标），左侧集合会比右侧多一个 —— 已由同一断言覆盖。
+  // 这条补充「first 只许出现在 positionals[0]」的结构约束：第二个槽位上的 first 无人读，
+  // 写上去等于假声明（`skill check` 只读 `positionals[0]?.first`）。
+  it('first 标记只允许出现在第一个位置参数槽位上（写在后面等于假声明）', () => {
+    for (const s of COMMAND_TREE) {
+      for (const [i, p] of s.positionals.entries()) {
+        if (i === 0) continue
+        expect(p.first, `${s.path.join(' ')} 的第 ${i + 1} 个位置参数不该有 first`).toBeUndefined()
+      }
+    }
+  })
   // —— G3 审查 C1：skill 三条的 spec 与解析器逐 flag 对齐 ——
   //
   // 上面两条通用断言（字面量 + 行为探针）已经覆盖「spec 里的 flag 解析器都认」；
