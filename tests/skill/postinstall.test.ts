@@ -215,6 +215,54 @@ describe('runPostinstall', () => {
     expect(messages.join('')).toContain('未覆盖')
   })
 
+  // —— 审查 B3 / #58：postinstall 的输出也要带上「零链接」提示 ——
+  it('审查 B3：装了 Agent 但没有 skills 子目录 → postinstall 输出提示建链方法', async () => {
+    const sourceDir = makeSource()
+    mkdirSync(join(home, '.claude'), { recursive: true }) // 装了 Agent，没建过 skills
+    const messages: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages.push(String(chunk))
+      return true
+    })
+    let code: number
+    try {
+      code = await runPostinstall({
+        env: { npm_config_global: 'true', npm_command: 'install' },
+        home,
+        sourceDir,
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(code).toBe(0)
+    const out = messages.join('')
+    expect(out).toContain('skills 子目录')
+    expect(out).toContain('skill 不会被任何 Agent 加载')
+    // 不替用户创建目录（spec D1）。
+    expect(existsSync(join(home, '.claude', 'skills'))).toBe(false)
+  })
+
+  it('审查 #58：完全没有 Agent 时 postinstall 也说明「不会被加载」', async () => {
+    const sourceDir = makeSource()
+    const messages: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages.push(String(chunk))
+      return true
+    })
+    let code: number
+    try {
+      code = await runPostinstall({
+        env: { npm_config_global: 'true', npm_command: 'install' },
+        home,
+        sourceDir,
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(code).toBe(0)
+    expect(messages.join('')).toContain('skill 不会被任何 Agent 加载')
+  })
+
   describe('审查 M2：npm_config_qiyu_skill_dir 的路径解析基准', () => {
     it('相对路径按注入的 cwd 解析（不是进程 cwd）', async () => {
       const sourceDir = makeSource()

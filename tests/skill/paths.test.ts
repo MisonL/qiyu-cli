@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs'
+import {
+  mkdtempSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync, readdirSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  AGENT_SKILL_SUBDIRS, LINK_NAME, agentSkillDirs, agentSkillSubdir, defaultEntityDir,
-  envIndex, linkPlan, linkState, linkTarget, createSkillLink, normalizeNewlines,
+  AGENT_SKILL_SUBDIRS, LINK_NAME, agentSkillDirs, agentSkillSubdir, agentsMissingSkillDir,
+  defaultEntityDir, envIndex, linkPlan, linkState, linkTarget, createSkillLink, normalizeNewlines,
   readEnvByNormalizedKey,
 } from '../../src/skill/paths.js'
 
@@ -78,6 +80,102 @@ describe('paths', () => {
     expect(AGENT_SKILL_SUBDIRS.map((a) => a.name)).toEqual(['claude-code', 'codex'])
     expect(agentSkillSubdir('claude-code')).toBe(join('.claude', 'skills'))
     expect(agentSkillSubdir('codex')).toBe(join('.codex', 'skills'))
+  })
+})
+
+// —— 审查 B1：agent 目录本身是符号链接 ——
+describe('B1：linkTarget 按真实落点计算', () => {
+  it('agentDir 是符号链接且深度不同：相对目标按真实落点算，建出可解析的链接', async () => {
+    // 字面路径 3 层（home/.claude/skills），真实落点 2 层（home/dotfiles/x）。
+    const dotfiles = join(home, 'dotfiles', 'x')
+    mkdirSync(dotfiles, { recursive: true })
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    const agentLiteral = join(home, '.claude', 'skills')
+    symlinkSync(dotfiles, agentLiteral)
+    const entity = defaultEntityDir(home)
+    mkdirSync(entity, { recursive: true })
+
+    const target = linkTarget(agentLiteral, entity)
+    // 修复前按字面路径算：'../../.agents/skills/qiyu'；真实落点只需 '../.agents/skills/qiyu'。
+    expect(target).toBe(linkTarget(dotfiles, entity))
+    await createSkillLink(join(dotfiles, 'qiyu'), target)
+    expect(linkState(join(agentLiteral, 'qiyu'), entity)).toBe('ok')
+    expect(realpathSync(join(dotfiles, 'qiyu'))).toBe(realpathSync(entity))
+  })
+
+  it('agentDir 不存在时退回原值（不抛）', () => {
+    const missing = join(home, 'nope', 'skills')
+    expect(linkTarget(missing, join(home, 'entity'))).toBe(join('..', '..', 'entity'))
+  })
+})
+
+// —— 审查 #2 / #36：四态判定的比较口径 ——
+describe('linkState 的比较口径（审查 #2 / #36）', () => {
+  it('实体缺失、链接指向别处的真实存在目录 → foreign（不是 dangling）', () => {
+    const elsewhere = join(home, 'elsewhere')
+    mkdirSync(elsewhere)
+    const link = join(home, 'link')
+    symlinkSync(elsewhere, link)
+    expect(linkState(link, join(home, 'not-there'))).toBe('foreign')
+  })
+
+  it('实体缺失、链接目标也解析不到 → dangling', () => {
+    const link = join(home, 'link')
+    symlinkSync(join(home, 'gone'), link)
+    expect(linkState(link, join(home, 'not-there'))).toBe('dangling')
+  })
+
+  it('同一目录仅大小写不同 → ok（按 inode 判定，不按字符串）', () => {
+    // macOS 默认 APFS 大小写不敏感：`entity` 与 `Entity` 是同一目录，但 realpathSync
+    // 不归一化大小写（只把传入的拼写原样带出来）。只有按 dev+ino 比较才判得对
+    // （字符串比较会判 foreign）。
+    const entity = join(home, 'Entity')
+    mkdirSync(entity)
+    const link = join(home, 'link')
+    symlinkSync(entity, link)
+    // 自检本机文件系统是否大小写不敏感：另一种拼写能否 stat 到（**不能**用
+    // realpathSync 比字符串来判——它本来就不归一化大小写，那样判永远为 false）。
+    let caseInsensitiveFs: boolean
+    try {
+      statSync(join(home, 'ENTITY'))
+      caseInsensitiveFs = true
+    } catch {
+      caseInsensitiveFs = false
+    }
+    if (!caseInsensitiveFs) return // 大小写敏感卷（Linux 等）：不存在「同一目录两种写法」
+    expect(statSync(link).ino).toBe(statSync(join(home, 'entity')).ino) // 前提自检
+    expect(linkState(link, join(home, 'entity'))).toBe('ok')
+  })
+
+  it('不同目录 → foreign（inode 不同）', () => {
+    const entity = join(home, 'a')
+    const other = join(home, 'b')
+    mkdirSync(entity)
+    mkdirSync(other)
+    const link = join(home, 'link')
+    symlinkSync(other, link)
+    expect(linkState(link, entity)).toBe('foreign')
+  })
+})
+
+// —— 审查 B3：区分「装了 Agent 但缺 skills」与「没装 Agent」 ——
+describe('agentsMissingSkillDir（B3）', () => {
+  it('装了 ~/.claude 但缺 skills 子目录 → 报出缺失的目录', () => {
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    expect(agentsMissingSkillDir(home)).toEqual([
+      { name: 'claude-code', dir: join(home, '.claude', 'skills') },
+    ])
+  })
+  it('skills 子目录已存在、或根本没装 Agent → 都不报', () => {
+    expect(agentsMissingSkillDir(home)).toEqual([])
+    mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
+    expect(agentsMissingSkillDir(home)).toEqual([])
+  })
+  it('根是文件（ENOTDIR）→ 不当作「装了 Agent」', () => {
+    writeFileSync(join(home, '.codex'), '不是目录\n')
+    expect(agentsMissingSkillDir(home)).toEqual([])
+    // 不创建任何目录。
+    expect(readdirSync(home).sort()).toEqual(['.codex'])
   })
 })
 

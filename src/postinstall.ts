@@ -122,8 +122,14 @@ export async function runPostinstall(opts: PostinstallOptions): Promise<number> 
       ...(entityDir !== undefined ? { entityDir } : {}),
     })
 
-    note(`skill ${result.status === 'skipped' ? '已是最新，跳过' : `已安装（${result.status}）`}：${result.entityDir}`)
+    // 措辞按**实际**结果（审查 B2）：计划要写、实际零写入时 status 是 skipped，
+    // 说「已是最新，跳过」是谎报——此时正文其实没跟上包内版本。
+    const label = result.status === 'skipped'
+      ? (result.plannedStatus === 'skipped' ? '已是最新，跳过' : '未完成更新（详见下方提示）')
+      : `已安装（${result.status}）`
+    note(`skill ${label}：${result.entityDir}`)
     if (result.warnings.length > 0) {
+      // 零链接（审查 B3 / #58）等提示同样要出现在 npm 自动安装路径上。
       note(`安装提示：${result.warnings.join('；')}`)
     }
     return 0
