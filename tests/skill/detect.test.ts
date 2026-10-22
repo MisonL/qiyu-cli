@@ -355,13 +355,17 @@ describe('skillWarning —— 只在需要时给出一条可执行的提示', ()
     expect(msg).not.toContain('与当前 CLI 版本不一致')
   })
 
-  it('stale 且安装版本未知：不编造版本号，用「无法确认版本」措辞（审查 I2）', () => {
+  it('stale 且安装版本未知：不编造版本号，用「无法确认版本」措辞，且不推 --force（brief D7）', () => {
     const msg = skillWarning({ kind: 'stale', installedVersion: 'unknown' }, { currentVersion: '1.0.0' })
     expect(msg).toBeDefined()
     expect(msg).toContain('无法确认已安装 skill 的版本')
     expect(msg).toContain('安装清单缺失或损坏')
     expect(msg).not.toContain('安装于 unknown')
-    expect(msg).toContain('--force')
+    // 清单缺失/损坏、正文与包内一致 → planInstall 返回 rewrite-manifest：
+    // 不带 --force 的 `qiyu skill install` 只补写清单、不动正文字节。
+    // 推 --force 会让用户误以为要覆盖正文（另两支才需要，见上面两条用例）。
+    expect(msg).toContain('`qiyu skill install`')
+    expect(msg).not.toContain('--force')
   })
 
   it('current / unknown：不提示', () => {

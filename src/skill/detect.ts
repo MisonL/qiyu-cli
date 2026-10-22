@@ -10,7 +10,9 @@
 //               版本不同 → 「与当前 CLI 版本不一致（安装于 <旧>，当前 <新>）」；
 //               版本相同仅内容漂移 → 「内容与包内当前版本不一致（版本 <v>）」；
 //               版本未知 → 「无法确认已安装 skill 的版本（安装清单缺失或损坏）」；
-//               均以「运行 `qiyu skill install --force` 更新」收尾；
+//               前两支以「运行 `qiyu skill install --force` 更新」收尾——内容与包内
+//               不同，不带 `--force` 只会跳过；第三支推**不带 `--force`** 的
+//               `qiyu skill install`（正文与包内一致时它只补写清单）；
 //   · current / unknown → 不提示（unknown = 判定不了，宁可闭嘴也不打扰）。
 //
 // **只提示、绝不改退出码、绝不改 data、绝不自动改文件**——自动覆盖用户可能改过的
@@ -192,7 +194,10 @@ export function skillWarning(
     //   · 版本相同、仅内容哈希漂移 → 版本号相同，说「版本不一致」自相矛盾；
     //   · 版本不同 → 说清「安装于 X，当前 Y」。
     if (state.installedVersion === 'unknown') {
-      return '无法确认已安装 skill 的版本（安装清单缺失或损坏）；运行 `qiyu skill install --force` 更新'
+      // 清单缺失/损坏但正文与包内一致 → `planInstall` 返回 rewrite-manifest：不带
+      // `--force` 的 `qiyu skill install` 就只补写清单、一个正文字节不动（brief D7）。
+      // 推 `--force` 会让用户以为要覆盖正文——那是另一支（内容漂移/版本不一致）才需要。
+      return '无法确认已安装 skill 的版本（安装清单缺失或损坏）；运行 `qiyu skill install` 更新'
     }
     if (ctx?.currentVersion !== undefined && state.installedVersion === ctx.currentVersion) {
       return `已安装的 skill 内容与包内当前版本不一致（版本 ${state.installedVersion}）；运行 \`qiyu skill install --force\` 更新`
