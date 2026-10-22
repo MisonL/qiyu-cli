@@ -17,7 +17,7 @@
 // ⚠️ `resolved_range` 回显的是**实际生效**的区间（不是用户原始输入）：iso-day 两端都是
 // 上海日零点。这是刻意的 —— Agent 要据此知道过滤实际覆盖了哪个自然日（`--since 9/15 12:00`
 // 实际从 9/15 00:00 起算；`--until 9/20` 实际覆盖到 9/20 全天）。契约 C。
-import { shanghaiDayIso, shanghaiDayStart, shanghaiIso } from '../core/time.js'
+import { shanghaiDayIso, shanghaiDayStart, shanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
 import { suggestNames } from './errors.js'
 import { describeArgs } from '../output.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
@@ -128,7 +128,9 @@ function aggExprOf(tc: TimeColumn): { mn: string; mx: string } {
 function shapeClause(tc: TimeColumn): string[] {
   if (tc.kind === 'epoch-ms') {
     const n = `TRY_CAST(${quote(tc.name)} AS BIGINT)`
-    return [`${n} > 100000000000`, `${n} <= 8640000000000000`]
+    // ⚠️ gap 2：上界与 `msToShanghaiIso` 的守卫同源（`MAX_SHANGHAI_SAFE_MS`）。
+    // 旧值 `8640000000000000` 把「回显时抛 RangeError」的值放进候选集。
+    return [`${n} > 100000000000`, `${n} <= ${MAX_SHANGHAI_SAFE_MS}`]
   }
   const shape = tc.kind === 'iso-day'
     ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'

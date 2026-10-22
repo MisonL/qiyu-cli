@@ -16,8 +16,34 @@ export const DAY_MS = 86_400_000
  * （`1792467000000000000`）就能让 `db tables` 整条命令 internal 失败（正确性审查 F4）。
  */
 export const MAX_DATE_MS = 8.64e15
+/**
+ * 能安全渲染成 `+08:00` ISO 的最大绝对毫秒（= `MAX_DATE_MS − 8h`，F 维度审查 gap 2）。
+ *
+ * ⚠️ 为什么不是 `MAX_DATE_MS`：`shanghaiIso` 先把 `ms` 加上上海偏移再 `toISOString()`，
+ * 于是 `(MAX_DATE_MS − 8h, MAX_DATE_MS]` 这段**守卫放行、实际抛** `RangeError`——
+ * 一条脏值就把整条命令打成 internal（与 F4 同一失败模式，只是精确落在边界上）。
+ * 判据必须落在**偏移之后**的量上：`|ms| <= MAX_SHANGHAI_SAFE_MS` 才是「能回显」。
+ *
+ * 三处共用同一常量（不各写一个字面量）：
+ *   · `shanghaiIso` / `msToShanghaiIso` 的越界守卫；
+ *   · `commands/db.ts` 的 `shapeSqlOf` 与 `query/table-query.ts` 的 `shapeClause`
+ *     生成的 epoch-ms 形状谓词上界 —— 「形状合格」必须与「能回显」是同一集合，
+ *     否则 SQL 会把恰好会抛的值放进候选集（gap 2 的放大器）。
+ *
+ * 负侧按同一阈值对称收紧（`Math.abs`）：`(-MAX_DATE_MS, -(MAX_DATE_MS−8h)]` 这段
+ * 偏移后其实仍可表示，但那是公元 −271821 年附近、且 epoch-ms 形状谓词的下界
+ * （`> 1e11`）已排除全部负值 —— 回显原值不丢任何真实信息，换单一阈值更好核。
+ */
+export const MAX_SHANGHAI_SAFE_MS = MAX_DATE_MS - SHANGHAI_OFFSET_MS
 
-/** 毫秒 → 所属上海自然日 00:00 的 epoch 毫秒。 */
+/**
+ * 毫秒 → 所属上海自然日 00:00 的 epoch 毫秒。
+ * ⚠️ 纯算术、不抛；但 `ms` 落在负侧极端带
+ * （`[-MAX_DATE_MS, -MAX_DATE_MS + (DAY_MS − 8h))`，约 16 小时宽）时，向下取整会把
+ * 结果推到 `Date` 可表示范围之外（实测 `shanghaiDayStart(-8.64e15) === -8640000028800000`，
+ * 而 `new Date(-8640000028800000).toISOString()` 抛 `RangeError`）。
+ * 需要 ISO 形态的调用方必须走 `shanghaiDayIso`（它在造型前挡住越界）。
+ */
 export function shanghaiDayStart(ms: number): number {
   return Math.floor((ms + SHANGHAI_OFFSET_MS) / DAY_MS) * DAY_MS - SHANGHAI_OFFSET_MS
 }
@@ -34,7 +60,12 @@ export function shanghaiYesterdayStart(nowMs: number): number {
 
 /** 天对齐值 → ISO 字符串（与 deleteRangeInsert 的范围值同形——报表日期列的唯一形态）。 */
 export function shanghaiDayIso(ms: number): string {
-  return new Date(shanghaiDayStart(ms)).toISOString()
+  const dayStart = shanghaiDayStart(ms)
+  // ⚠️ gap 2 的负侧：`shanghaiDayStart` 的向下取整会把极端负值推到 `Date` 范围外
+  // （见该函数的注释），`toISOString()` 随即抛 `RangeError` —— 一条脏值炸整条命令。
+  // 越界按本模块既有约定**原样回显**（保住可解释），绝不抛。
+  if (!Number.isFinite(dayStart) || Math.abs(dayStart) > MAX_DATE_MS) return String(ms)
+  return new Date(dayStart).toISOString()
 }
 
 const SHANGHAI_DAY = new Intl.DateTimeFormat('en-CA', {
@@ -46,7 +77,11 @@ export function shanghaiIso(ms: number): string {
   // ⚠️ 越界值原样回显（正确性审查 F4）：`toISOString()` 对 |ms| > 8.64e15 抛 RangeError，
   // 而调用点可能拿到库里的脏值（微秒误写）或用户给的超大 `--since 999999999d`。
   // 抛异常会让整条命令 internal 失败；回显原始数字至少保住「可解释」。
-  if (!Number.isFinite(ms) || Math.abs(ms) > MAX_DATE_MS) return String(ms)
+  //
+  // ⚠️ gap 2：判据必须落在**偏移之后**的量上。本函数先把 `ms` 加上上海偏移（+8h）
+  // 再 `toISOString()`，所以 `|ms| <= MAX_DATE_MS` 仍不够 —— `(MAX_DATE_MS−8h, MAX_DATE_MS]`
+  // 这段守卫放行、实际抛 RangeError。故用 `MAX_SHANGHAI_SAFE_MS`（= MAX_DATE_MS − 8h）。
+  if (!Number.isFinite(ms) || Math.abs(ms) > MAX_SHANGHAI_SAFE_MS) return String(ms)
   const shifted = new Date(ms + SHANGHAI_OFFSET_MS)
   // 整秒时省略毫秒段（spec 示例形态 "2026-09-14T00:00:00+08:00"）；带毫秒保留
   const iso = shifted.toISOString()
@@ -68,7 +103,9 @@ export function msToShanghaiIso(v: string | number): string {
   const numeric = typeof v === 'number' ? v : Number(v)
   const n = Number.isFinite(numeric) ? numeric : Date.parse(String(v))
   // 越界值不抛 RangeError（正确性审查 F4）：库里一条微秒级脏值不应炸掉整条 db tables。
-  if (!Number.isFinite(n) || Math.abs(n) > MAX_DATE_MS) return String(v)
+  // ⚠️ gap 2：上界与 `shanghaiIso` 同源（`MAX_SHANGHAI_SAFE_MS`）——两者都要保证
+  // 「偏移之后仍可表示」，差一个 8h 就会让脏值在下游抛 RangeError。
+  if (!Number.isFinite(n) || Math.abs(n) > MAX_SHANGHAI_SAFE_MS) return String(v)
   return String(v).trim() !== '' ? shanghaiIso(n) : String(v)
 }
 
@@ -99,8 +136,11 @@ export function parseTimeArg(arg: string, clock: () => number,
     // ⚠️ 带相对时长的 `--since` 也要挡住溢出（正确性审查 F4）：
     // `999999999d` 的 `end − N×DAY_MS` 远出 Date 范围，后续 `shanghaiIso` 会抛 RangeError。
     // 与 ISO 分支同一上界，回到「未知 ≠ 猜」（usage）而不是崩到 internal。
+    // ⚠️ gap 2：上界是 `MAX_SHANGHAI_SAFE_MS`（偏移后的量），与 `shanghaiIso` 同源——
+    // 本函数接受的范围必须恰好是「能回显成 +08:00 ISO」的范围，否则 resolved_range
+    // 会退化成裸数字。
     const start = end - Number(dur[1]) * DAY_MS
-    if (!Number.isFinite(start) || Math.abs(start) > MAX_DATE_MS) return null
+    if (!Number.isFinite(start) || Math.abs(start) > MAX_SHANGHAI_SAFE_MS) return null
     return { start, end }
   }
   if (arg === 'yesterday') {
@@ -149,6 +189,8 @@ export function parseTimeArg(arg: string, clock: () => number,
     }
   }
   const full = Date.parse(tzless ? `${arg.replace(' ', 'T')}+08:00` : arg.replace(' ', 'T'))
-  if (Number.isNaN(full) || Math.abs(full) > MAX_DATE_MS) return null
+  // ⚠️ gap 2：上界与 `shanghaiIso` 同源（偏移后的量）—— 本函数接受的值必须
+  // 恰好是「能回显成 +08:00 ISO」的值，否则 resolved_range 会退化成裸数字。
+  if (Number.isNaN(full) || Math.abs(full) > MAX_SHANGHAI_SAFE_MS) return null
   return full   // 解析失败 → 调用方 usage
 }
