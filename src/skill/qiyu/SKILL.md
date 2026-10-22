@@ -30,6 +30,25 @@ qiyu sync status
 - 凭证是否已配置：`qiyu auth whoami`
 - 库状态与各表行数：`qiyu store status`
 
+## 这份协议自己的安装与配套
+
+本 skill 是随 CLI 分发的正文，装到本机后可能与包内那份不一致。以下三件事都靠 CLI 回答，
+不要凭记忆判断。
+
+- **`meta.warnings` 里的 skill 提示**：任何一条成功输出都可能带一句「skill 未安装」或
+  「skill 已过期」。它只提示、不改退出码、不改 `data`，也**没有自动改过任何文件**。
+  含义是本机装的正文与这份 CLI 不配套；更新方式是 `qiyu skill install`——它会写到本机
+  的 skill 实体目录与各 Agent 的 skills 目录。**只在人类允许写 home 时执行**，不要自作主张
+  改动用户目录；不允许时把这条提示原样转述给人类。
+- **`qiyu --version`**：输出包版本（`data.version`）与 `data.skill_contract_version`。
+  `skill_contract_version` 就是正文与 CLI 的配套约定号——用它判断手上的正文能否配这份
+  CLI，而不是拿包版本号去比。
+- **`qiyu skill check`**：正文自身的防漂移校验（命令、表名、错误 `kind`、位置参数取值是否
+  仍存在于当前 CLI）。默认校验包内那份；`--installed` 校验已安装的那份，`--compare` 比对
+  两份并报告差异。有违规时退出码 1。
+- **不要手工编辑已安装的正文**：下次 `qiyu skill install` 会以包内那份为准。要改就改
+  包内（发行包里的）那份，并重新安装。
+
 ## 通道路由决策树
 
 先判断任务特征，再选通道——不要一律走 API，也不要一律查本地。

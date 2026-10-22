@@ -19,7 +19,7 @@ F 交付三样东西：
 
 ### C1. `~/.agents/skills` 不是 Claude Code 的用户级 skill 目录
 
-Claude Code 只扫 `~/.claude/skills/`。本机能用 `~/.agents/skills` 里的 skill，靠的是 `~/.claude/skills/` 下 **32 个相对符号链接**（`../.agents/skills/<name>`）。
+Claude Code 只扫 `~/.claude/skills/`。本机能用 `~/.agents/skills` 里的 skill，靠的是 `~/.claude/skills/` 下 **32 个相对符号链接**（相对路径指向实体，具体形态见 D1 的实测）。
 
 → **只往 `~/.agents/skills/qiyu/` 复制文件，Claude 根本不会加载它。**
 
