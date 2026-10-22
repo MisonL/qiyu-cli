@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { runPostinstall, mainEntry } from '../../src/postinstall.js'
 import { defaultEntityDir } from '../../src/skill/paths.js'
+import { npmRelativeBase, resolveEntityDirSources } from '../../src/skill/detect.js'
 
 let home: string
 
@@ -305,6 +306,47 @@ describe('runPostinstall', () => {
       expect(installed(abs)).toBe(true)
       // 没有被拼进 cwd 之下。
       expect(existsSync(join(elsewhere, 'absolute-entity'))).toBe(false)
+    })
+  })
+
+  // —— G3 审查 C3：postinstall 与探测 / 命令层按**同一条基准**解析相对路径 ——
+  describe('G3 审查 C3：与探测层同一条解析（装的位置 = 认的位置）', () => {
+    it('相对 npm_config 在 postinstall 与探测层解析出同一个绝对路径', async () => {
+      // 复现审查 [17]：postinstall 按 INIT_CWD 装到 install-cwd/my-skill，而探测按包根
+      // cwd 算出 pkgroot/my-skill——「装好了却每条命令都说没装」。变异「两处各写一份基准」
+      // → 本用例红。
+      const sourceDir = makeSource()
+      const installCwd = join(home, 'install-cwd')
+      mkdirSync(installCwd, { recursive: true })
+      const pkgRoot = join(home, 'pkgroot')
+      mkdirSync(pkgRoot, { recursive: true })
+      const env = {
+        npm_config_global: 'true',
+        npm_command: 'install',
+        npm_config_qiyu_skill_dir: './my-skill',
+        INIT_CWD: installCwd,
+      }
+      // `mainEntry` 的 `cwd` 代表进程 cwd（npm 生命周期里是包根）。
+      expect(await mainEntry({ env, home, sourceDir, cwd: pkgRoot })).toBe(0)
+      expect(installed(join(installCwd, 'my-skill'))).toBe(true)
+      // 探测层（生产语义，同一份 env）认的必须是**同一个**目录。
+      const probe = resolveEntityDirSources({ env: { ...env, VITEST: undefined }, baseDir: npmRelativeBase(env, () => pkgRoot) })
+      expect(probe).toMatchObject({ decided: true, dir: join(installCwd, 'my-skill') })
+    })
+
+    it('postinstall 不吃测试门：npm test（VITEST/NODE_ENV=test）下仍然执行安装', async () => {
+      // postinstall 的 env 由 npm 给，npx/全局判据已经挡过测试借用场景；若它也吃测试门，
+      // 本仓库测试永远覆盖不到安装分支。变异「testGate 缺省（true）」→ 本用例红
+      //（entityDir 变成 undefined，装到默认位置而不是 npm_config 指定的位置）。
+      const sourceDir = makeSource()
+      const target = join(home, 'npm-under-test')
+      const code = await runPostinstall({
+        env: { npm_config_global: 'true', npm_command: 'install', npm_config_qiyu_skill_dir: target, NODE_ENV: 'test', VITEST: 'true' },
+        home,
+        sourceDir,
+      })
+      expect(code).toBe(0)
+      expect(installed(target)).toBe(true)
     })
   })
 

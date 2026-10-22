@@ -7,7 +7,12 @@
 //
 // 排序不是契约（`path` 自描述），消费者自行按需索引。但**不得**在这里合并/改写任何
 // spec：它是各模块声明的并集，唯一性由 `tests/commands/command-tree.test.ts` 钉住
-// （16 条叶命令 + tree 不变量）。
+// （19 条叶命令 + tree 不变量）。
+//
+// skill 三条（`skill install/check/where`）的 spec 在 `skill-specs.ts` 这个**叶子模块**里，
+// 而不是 `commands/skill.ts`：G3 审查 C1。本文件 import 各命令模块，若再 import
+// `commands/skill.ts` 就是循环（skill.ts → tree.ts → skill.ts）。skill 的 flag 集与它的
+// 解析器同源于 `skill-specs.ts`，`skill.ts` 与本文件各自从那里取一份。
 import { AUTH_SPECS } from './auth.js'
 import { API_SPECS } from './api.js'
 import { STORE_SPECS } from './store.js'
@@ -15,8 +20,10 @@ import { SYNC_SPECS } from './sync.js'
 import { DB_SPECS } from './db.js'
 import { QUERY_SPECS } from './query.js'
 import { STATS_SPECS } from './stats.js'
+import { SKILL_SPECS } from './skill-specs.js'
 import type { CommandSpec } from './spec-types.js'
 
 export const COMMAND_TREE: CommandSpec[] = [
   ...AUTH_SPECS, ...API_SPECS, ...STORE_SPECS, ...SYNC_SPECS, ...DB_SPECS, ...QUERY_SPECS, ...STATS_SPECS,
+  ...SKILL_SPECS,
 ]

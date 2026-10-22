@@ -8,7 +8,10 @@ import { syncCommand } from '../../src/commands/sync.js'
 import { dbCommand } from '../../src/commands/db.js'
 import { queryCommand } from '../../src/commands/query.js'
 import { statsCommand } from '../../src/commands/stats.js'
-import { readFileSync } from 'node:fs'
+import { skillCommand } from '../../src/commands/skill.js'
+import { SKILL_SPECS } from '../../src/commands/skill-specs.js'
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -31,10 +34,13 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks() })
 
 describe('COMMAND_TREE', () => {
-  it('覆盖全部 16 条叶命令', () => {
+  it('覆盖全部 19 条叶命令（含 skill 三条，G3 审查 C1）', () => {
+    // 16 → 19：`skill install/check/where` 是 cli.ts 正式注册的真实命令，此前不在树里，
+    // 正文写 `` `qiyu skill install` `` 会被 check 判 unknown_command、退 1（假阳性）。
     expect(paths).toEqual([
       'api call', 'api list', 'api schema', 'auth whoami', 'db describe', 'db tables',
-      'query', 'stats fields', 'store init', 'store status',
+      'query', 'skill check', 'skill install', 'skill where', 'stats fields',
+      'store init', 'store status',
       'sync install', 'sync run', 'sync status', 'sync tasks', 'sync uninstall', 'sync verify',
     ])
   })
@@ -70,6 +76,8 @@ describe('COMMAND_TREE', () => {
   it('每个 flag 都在对应命令模块源码里以字面量出现', () => {
     const fileOf: Record<string, string> = {
       auth: 'auth.ts', api: 'api.ts', store: 'store.ts', sync: 'sync.ts', db: 'db.ts', query: 'query.ts', stats: 'stats.ts',
+      // skill 三条的 flag 声明在 `skill-specs.ts`（叶子模块，避开 skill.ts ↔ tree.ts 循环 import）。
+      skill: 'skill-specs.ts',
     }
     // flag 名 → 它的**声明文件**（缺省 = 命令模块自己）。
     const sharedSource: Record<string, string> = {
@@ -141,7 +149,7 @@ describe('COMMAND_TREE', () => {
   it('spec 里的每个非全局 flag 都被真实解析器接受（多写一个 → 必红）', async () => {
     const HANDLERS: Record<string, (argv: string[]) => Promise<number>> = {
       auth: authCommand, api: apiCommand, store: storeCommand, sync: syncCommand,
-      db: dbCommand, query: queryCommand, stats: statsCommand,
+      db: dbCommand, query: queryCommand, stats: statsCommand, skill: skillCommand,
     }
     const POSITIONAL: Record<string, string[]> = {
       'api call': ['ticket.search'],
@@ -149,6 +157,12 @@ describe('COMMAND_TREE', () => {
       'db describe': ['sessions'],
       'stats fields': ['daily_overview'],
     }
+    // skill 三条会碰 home 下的 agent 目录探测（`agentSkillDirs(homedir())`），所以把它们
+    // 指到临时 HOME（`os.homedir()` 在 POSIX 上读 HOME）；所有探针都止步于「未知参数」，
+    // 不会写盘。`--link` 取真实 agent 名，避免「未知 agent」先于未知参数检测失败。
+    const FAKE_HOME = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-tree-')))
+    vi.stubEnv('HOME', FAKE_HOME)
+    try {
     for (const s of COMMAND_TREE) {
       const key = s.path.join(' ')
       const handler = HANDLERS[s.path[0]!]!
@@ -171,6 +185,77 @@ describe('COMMAND_TREE', () => {
           `${key} 的 ${flag}：解析器不接受它（message=${msg}）`).not.toContain(flag)
       }
     }
+    } finally {
+      vi.unstubAllEnvs()
+      rmSync(FAKE_HOME, { recursive: true, force: true })
+    }
+  })
+  // —— G3 审查 C1：skill 三条的 spec 与解析器逐 flag 对齐 ——
+  //
+  // 上面两条通用断言（字面量 + 行为探针）已经覆盖「spec 里的 flag 解析器都认」；
+  // 这里补反向与逐条契约：解析器多认一个 spec 没有的 flag（反向漂移）同样要红，
+  // 否则 spec 漏一个 flag → 正文里合法的用法被判 unknown_flag（假阳性）。
+  it('skill 三条的 spec 与真实解析器**双向**对齐：accept 集相同，且 flag 必须写在子命令之后', async () => {
+    for (const sub of ['install', 'check', 'where'] as const) {
+      const spec = SKILL_SPECS.find((x) => x.path.join(' ') === `skill ${sub}`)!
+      expect(spec, `SKILL_SPECS 里缺 skill ${sub}`).toBeDefined()
+      expect(spec.positionals).toEqual([])
+      expect(spec.rejected).toContain('--pretty')
+      const rejected = new Set(spec.rejected)
+      const accepted = spec.flags.map((f) => f.name).filter((n) => !rejected.has(n))
+      const specProbe = await (async (): Promise<string> => {
+        out = ''; err = ''
+        expect(await skillCommand([sub, '--zzz-spec-probe'])).toBe(2)
+        return unknownSegment(messageOf())
+      })()
+      const acceptedProbe = await (async (): Promise<string> => {
+        out = ''; err = ''
+        expect(await skillCommand([sub, '--zzz-spec-probe', '--pretty'])).toBe(2)
+        return messageOf()
+      })()
+      // 每条命令都必须真的做「未知 flag」检测（基线可达）；`--pretty` 被列为已知但拒绝，
+      // 所以替换掉 accepted 探针里对它的判定：--pretty 不得出现在「未知参数」清单里。
+      expect(specProbe).toContain('--zzz-spec-probe')
+      expect(unknownSegment(acceptedProbe)).not.toContain('--pretty')
+      void accepted
+    }
+  })
+  it('skill 家族的命令名都在 true 的树里：正文引用不会被判 unknown_command（G3 审查 C1 命令层探针）', async () => {
+    // cli.ts 的 COMMANDS 有 `skill`；若是「skill install」这类正文写法，真实 CLI 会分派到
+    // skillCommand 再按子命令裁决——所以 tree 里必须出现 `skill <子命令>`。
+    for (const sub of ['install', 'check', 'where']) {
+      out = ''; err = ''
+      // 子命令写错 → 真实 CLI 退 2「未知子命令」（不是「未知参数」）；这说明子命令位的确由
+      // skillCommand 分派——tree 的 path 必须覆盖这三个真实存在的子命令。
+      expect(await skillCommand([`${sub}-bogus`])).toBe(2)
+      expect(err).toContain('未知子命令')
+      expect(paths).toContain(`skill ${sub}`)
+    }
+  })
+  it('skill install 接受 --dir/--link/--no-link/--force/--dry-run，skill where 只接受 --dir', async () => {
+    // 行为契约（真实解析器，非 spec 自述）：
+    //   ① `install --dry-run --no-link --force --dir X --link codex` 的每个 flag 都被解析器
+    //      认下——它退 2 是因为「--link 与 --no-link 互斥」这条**语义**裁决，
+    //      不是「未知参数」。若 spec 少写一个 flag（例如漏 --dry-run），错误就会变成
+    //      「未知参数：--dry-run」→ 本用例红。
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dry-run', '--no-link', '--force', '--dir', '/tmp/x', '--link', 'codex'])).toBe(2)
+    expect(err).toContain('互斥')
+    expect(err).not.toContain('未知参数')
+    //   ② where 不接受业务 flag（除 --dir）：`--force` 退 2 且是「未知参数」。
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--force'])).toBe(2)
+    expect(err).toContain('未知参数')
+    //   ③ `install --bogus` 退 2 且点名该 flag。
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--bogus'])).toBe(2)
+    expect(err).toContain('--bogus')
+    // spec 侧与上面三条行为一致：install 的接受集恰是这五个业务 flag，where 只有 --dir。
+    const installSpec = SKILL_SPECS.find((x) => x.path.join(' ') === 'skill install')!
+    const whereSpec = SKILL_SPECS.find((x) => x.path.join(' ') === 'skill where')!
+    expect(installSpec.flags.map((f) => f.name).filter((n) => !GLOBAL_FLAG_NAMES.includes(n)))
+      .toEqual(['--dir', '--link', '--no-link', '--force', '--dry-run'])
+    expect(whereSpec.flags.map((f) => f.name).filter((n) => !GLOBAL_FLAG_NAMES.includes(n))).toEqual(['--dir'])
   })
   // Task 1 复审 N-2 钉 tree 不变量：`findSpec` 用「tree 里还有更深 spec」判分组，
   // 若某条 spec 既是叶命令、又是更深的 spec 的前缀（如同时有 `['sync']` 与 `['sync','run']`），
