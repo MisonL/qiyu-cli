@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   chmodSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, readFileSync,
-  readlinkSync, symlinkSync, statSync, existsSync, realpathSync,
+  readlinkSync, symlinkSync, statSync, existsSync, realpathSync, utimesSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -134,8 +134,22 @@ vi.mock('node:fs', async (importOriginal) => {
     }) as typeof actual.readdirSync,
     renameSync: (from: string, to: string) => {
       const kind = fsRenameFault.current()
+      // ENOTEMPTY 故障（gap 8）：只拦**整目录换入**（源是暂存目录本身、目标是实体），
+      // 模拟「另一进程在这两步之间把实体建出来了」。逐文件换入不拦。
+      // ⚠️ 这个分支必须排在下面的通用分支**之前**：通用分支对任何非 null 的 kind 都抛
+      // （且会把 ENOTEMPTY 渲染成 EACCES），先命中就永远到不了这里。
+      if (kind === 'ENOTEMPTY' && from.includes('.tmp-') && !to.includes('.tmp-') && !to.endsWith('.md') && !to.endsWith(MANIFEST)) {
+        // ⚠️ 真实竞态里，错误发生时**实体已经在**（另一个进程刚写完）。只抛错不建实体
+        // 会把场景变成「实体不存在」，重判定会给出 installed —— 与真实竞态不同。
+        // 所以这里先把「另一进程的成果」落到磁盘，再抛错。
+        actual.mkdirSync(to, { recursive: true })
+        actual.writeFileSync(actual.realpathSync(to) + '/SKILL.md', '---\nname: qiyu\n---\n# qiyu\n')
+        const e = new Error('ENOTEMPTY: directory not empty, rename') as NodeJS.ErrnoException
+        e.code = 'ENOTEMPTY'
+        throw e
+      }
       // 只拦「换入」的那一步（源在暂存目录里），不拦首次安装的整目录 rename。
-      if (kind !== null && from.includes('.tmp-')) {
+      if (kind !== null && kind !== 'ENOTEMPTY' && from.includes('.tmp-')) {
         const e = new Error(`${kind === 'EXDEV' ? 'EXDEV: cross-device link not permitted' : 'EACCES: permission denied'}`) as NodeJS.ErrnoException
         e.code = kind
         throw e
@@ -1033,18 +1047,35 @@ describe('#3：重建悬空链接时的如实报告', () => {
 
 // —— 审查 #4：SIGKILL 残留的暂存目录 ——
 describe('#4：崩溃残留的暂存目录清理', () => {
-  it('安装开始时清掉同前缀的旧暂存目录', async () => {
+  it('安装开始时清掉同前缀的**过期**旧暂存目录（年轻的不动，见 gap 8）', async () => {
     const src = makeSource()
     const entity = defaultEntityDir(home)
-    // 模拟 SIGKILL 留下的残留：<实体名>.tmp-XXXXXX。
+    // 模拟 SIGKILL 留下的残留：<实体名>.tmp-XXXXXX，且已经放了很久。
     const stale = `${entity}.tmp-AbCdEf`
     mkdirSync(stale, { recursive: true })
     writeFileSync(join(stale, 'SKILL.md'), '半截正文\n')
+    // ⚠️ 必须把 mtime 拨老：清理按年龄判（gap 8 —— 年轻的可能是另一个并发安装正在写的，
+    // 无差别删会把它打成 ENOENT / 「暂存内容与源不一致」）。
+    const longAgo = new Date(Date.now() - 60 * 60_000)
+    utimesSync(stale, longAgo, longAgo)
 
     const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
 
     expect(existsSync(stale)).toBe(false)
     expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(true)
+  })
+
+  it('年轻的同前缀暂存目录不清理（可能是另一个并发安装正在写）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    const young = `${entity}.tmp-Young1`
+    mkdirSync(young, { recursive: true })
+    writeFileSync(join(young, 'SKILL.md'), '正在写\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    expect(existsSync(young), '年轻暂存目录被误删 —— 并发安装会撞 ENOENT').toBe(true)
+    expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(false)
   })
 
   it('不碰名字不像暂存目录的兄弟目录', async () => {
@@ -1227,6 +1258,72 @@ describe('#40：withFileTypes 给出空壳 Dirent 时的类型归类', () => {
     } finally {
       fsReaddirFault.set(false)
     }
+  })
+})
+
+// —— G8（gap 8）：并发 install 的两类故障 ——
+//
+// 实测（6 进程 × 3 轮，修前 13/18 次失败）有两**类**互不相干的失败，修法也不同：
+//   ① ENOTEMPTY：两个进程都判「实体不存在」，一个先建出来，另一个 rename 撞非空目录。
+//   ② 自伤：B 的崩溃残留清理把 **A 正在写的**暂存目录当成「上次中断的残留」删掉，
+//      于是 A 的 copyTree 撞 ENOENT、或哈希校验报「暂存内容与源不一致」。
+// 两条用例分别钉住，且都做变异验证（去掉对应修复 → 红）。
+describe('并发安装（gap 8）', () => {
+  it('① 首次换入撞 ENOTEMPTY（另一进程先建出实体）→ 不报失败，按实体实际状态收敛', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+
+    // 模拟真实竞态：本进程判「实体不存在」→ 另一进程在这瞬间把实体建好并写完 →
+    // 本进程的整目录 rename 撞 ENOTEMPTY。用 mock 在**抛错的同时**把实体建出来，
+    // 精确复现「错误发生时实体已在」这一状态（否则重判定只会看到空目录，与真实竞态不同）。
+    fsRenameFault.set('ENOTEMPTY')
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+      // 关键断言：不把并发当成失败。重判定后实体内容与包内一致 → skipped。
+      expect(r.status).toBe('skipped')
+      expect(r.warnings.some((w) => w.includes('并发'))).toBe(true)
+      // 绝不能出现「安装失败」这类让 Agent 去重装的措辞。
+      expect(r.warnings.some((w) => w.includes('安装失败'))).toBe(false)
+    } finally {
+      fsRenameFault.set(null)
+    }
+
+    // 无论 mock 期间实体建没建出来，实体都必须是**可诊断、可收敛**的：
+    // 不加 --force 时如实报告内容不同（不谎报成功），加 --force 后内容与包内一致。
+    // （上面 mock 的「另一进程」只写了 SKILL.md 且没有清单，是模拟它的不完整成果。）
+    const blocked = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    expect(blocked.status).toBe('skipped')
+    expect(blocked.warnings.some((w) => w.includes('--force'))).toBe(true)
+
+    const forced = await installSkill({ home, sourceDir: src, version: '1.0.0', force: true, noLink: true })
+    expect(forced.status).toBe('updated')
+    expect(contentHash(entity)).toBe(contentHash(src))
+  })
+
+  it('② 崩溃残留清理不得删掉「正被并发安装使用」的暂存目录（按年龄判）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+
+    // 造一个「刚刚创建、还年轻」的暂存目录：代表另一个正在跑的 install。
+    const young = join(dirname(entity), `${entity.split('/').pop()}.tmp-ABC123`)
+    mkdirSync(young)
+    write(young, 'SKILL.md', '# 另一个进程正在写\n')
+
+    // 造一个「很久以前」的残留目录：mtime 拨回 1 小时前。
+    const old = join(dirname(entity), `${entity.split('/').pop()}.tmp-OLD999`)
+    mkdirSync(old)
+    write(old, 'SKILL.md', '# 上次崩溃的残留\n')
+    const longAgo = new Date(Date.now() - 60 * 60_000)
+    utimesSync(old, longAgo, longAgo)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+
+    // 年轻的没被删（它可能正被另一个进程写）。
+    expect(existsSync(young), '年轻暂存目录被误删 —— 会把并发安装的 copyTree 打成 ENOENT').toBe(true)
+    // 老的被清掉了，且如实告知。
+    expect(existsSync(old), '过期残留目录没被清理').toBe(false)
+    expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(true)
   })
 })
 

@@ -498,7 +498,8 @@ async function skillInstall(argv: string[]): Promise<number> {
     return fail({
       code: 'skill_install_failed', kind: 'unknown', retryable: false,
       message: `skill 安装失败：${errMsg(e)}`,
-      hint: '请检查 --dir 目标路径与 agent skills 目录的权限；若 --dir 指向的是文件，请改成目录路径',
+      hint: '请检查 --dir 目标路径与 agent skills 目录的权限；若 --dir 指向的是文件，请改成目录路径；'
+        + '若错误码是 ENOTEMPTY/EEXIST，说明有另一个 qiyu skill install 正在并发安装，稍后重试即可',
     })
   }
 

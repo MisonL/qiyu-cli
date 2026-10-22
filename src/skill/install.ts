@@ -703,8 +703,17 @@ function writeInstalled(
     }
     if (!entityExists) {
       mkdirSync(path.dirname(entityDir), { recursive: true })
-      renameSync(staging, entityDir)
-      return { complete: true, written: sourceFiles.length, total: sourceFiles.length, manifestKept: false }
+      try {
+        renameSync(staging, entityDir)
+        return { complete: true, written: sourceFiles.length, total: sourceFiles.length, manifestKept: false }
+      } catch (err) {
+        // 并发（gap 8）：另一进程在「判实体不存在」与「rename 换入」之间把实体目录
+        // 建了出来（且非空），rename 不能覆盖非空目录 → ENOTEMPTY。这不是失败——
+        // 实体现在可能已经是对的；由调用方按**实际状态**决算（`concurrent: true`）。
+        if (!isErrno(err, 'ENOTEMPTY') && !isErrno(err, 'EEXIST')) throw err
+        warnings.push('检测到另一个 qiyu skill install 正在并发安装（首次换入撞 ENOTEMPTY），按实体实际状态收敛')
+        return { complete: false, written: 0, total: sourceFiles.length, manifestKept: false, concurrent: true }
+      }
     }
     const swap = swapIn(staging, entityDir, sourceFiles, warnings)
     // 清理只在「确实写进了东西」时跑：一个文件都没写进去（例如整盘只读、每次
@@ -743,6 +752,12 @@ interface WriteOutcome {
   total: number
   /** 写不全时旧清单是否还在（措辞用）。 */
   manifestKept: boolean
+  /**
+   * 首次换入撞上并发（ENOTEMPTY/EEXIST）：实体是**另一个进程**建的。
+   * 本进程一个字节都没写，但实体状态由那次安装决定 —— 调用方必须重新判定，
+   * 而不是把「零写入」当成失败报给用户（gap 8）。
+   */
+  concurrent?: boolean
 }
 
 /**
@@ -772,11 +787,27 @@ function stagingBaseDir(entityDir: string): string {
  * 清理 SIGKILL 残留的暂存目录（审查 Minor #4）：只删 `stagingBase` 下名字形如
  * `<entityBase>.tmp-XXXXXX` 的**目录**。删不掉只警告，不让安装失败。
  *
- * 安全性：`mkdtempSync` 生成的目录名带随机后缀、只由本工具创建；用户若恰好手工建了
- * 一个同形状的目录，最坏结果是被当成残留清掉——但这个概率极低，而残留正文会随源
- * 大小无限增长、还可能被按目录扫描的 skill 工具当成第二个同名 skill。
+ * ⚠️ **不能无差别删**（2026-10-22 并发实测）：两个 install 同时跑时，B 会把 A 正在写的
+ * 暂存目录当成「上次中断的残留」删掉，于是 A 的 `copyTree` 撞 `ENOENT`、或哈希校验报
+ * 「暂存内容与源不一致」——6 个并发进程 3 轮跑出 13 次失败，其中一半是这种**自伤**
+ * （变异验证：禁用本函数后 `copyfile ENOENT` 与「暂存内容与源不一致」全部消失，只剩
+ * 真正的 ENOTEMPTY 竞态）。
+ *
+ * 判据改为**按年龄**：只有最后修改时间早于 `STALE_STAGING_MIN_AGE_MS` 的才算残留。
+ * 活着的并发安装会持续往里写文件，mtime 始终是新的，因此不会被误删；而 SIGKILL 留下的
+ * 那份不会再被任何进程触碰，过了阈值就必然可清。
+ *
+ * 为什么不用 pid 文件 / 锁：需要额外写一个「谁在用」的契约，而进程崩溃时那个文件本身
+ * 也可能残留，判定问题只是被挪了一层。年龄阈值是同一个判断的最简形式。
  */
-function cleanupStaleStaging(stagingBase: string, entityBase: string, warnings: string[]): void {
+const STALE_STAGING_MIN_AGE_MS = 10 * 60_000
+
+function cleanupStaleStaging(
+  stagingBase: string,
+  entityBase: string,
+  warnings: string[],
+  now: number = Date.now(),
+): void {
   let entries
   try {
     entries = readdirSync(stagingBase, { withFileTypes: true })
@@ -787,7 +818,10 @@ function cleanupStaleStaging(stagingBase: string, entityBase: string, warnings: 
     if (!isStagingName(ent.name, entityBase)) continue
     const abs = path.join(stagingBase, ent.name)
     try {
-      if (!lstatSync(abs).isDirectory()) continue
+      const st = lstatSync(abs)
+      if (!st.isDirectory()) continue
+      // 年轻 = 可能有别的 install 正在写它。留到下次再清（`--force` 也救不了误删）。
+      if (now - st.mtimeMs < STALE_STAGING_MIN_AGE_MS) continue
       rmSync(abs, { recursive: true, force: true })
       warnings.push(`清理了上次安装中断时残留的暂存目录：${abs}`)
     } catch (err) {
@@ -984,7 +1018,17 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
       entityDir, sourceDir, plan.sourceFiles, version, plan.sourceHash, warnings,
       { files: plan.prevFiles, hashes: plan.prevFileHashes },
     )
-    if (!outcome.complete && outcome.written === 0) {
+    if (outcome.concurrent === true) {
+      // 并发（gap 8）：另一个进程先建出了实体，本进程零写入但**不是失败**——
+      // 实体内容由那次安装决定，必须重新判定后如实报告，否则 Agent 会以为要重装。
+      const replan = planInstall({ entityDir, sourceDir, version, force })
+      status = replan.status
+      warnings.push(
+        replan.status === 'skipped'
+          ? `另一个并发安装已完成，实体内容与包内一致：${entityDir}`
+          : `另一个并发安装已完成，但实体内容与包内仍不同（${replan.warnings[0] ?? '计划要求 --force'}）；如需以本包为准请重跑并加 --force`,
+      )
+    } else if (!outcome.complete && outcome.written === 0) {
       // 零写入：status 必须反映事实。`installed` 也一样退——实体可能只是个空壳。
       status = 'skipped'
       warnings.push(
