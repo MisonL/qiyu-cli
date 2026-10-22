@@ -10,15 +10,17 @@
 //   ③ manifest 不参与内容哈希；
 //   ④ 重复安装幂等（第二次 status='skipped'、无 EEXIST 警告、正文 mtime 不变）。
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   chmodSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, readFileSync,
   readlinkSync, symlinkSync, statSync, existsSync, realpathSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { contentHash, installSkill, MANIFEST, type Manifest } from '../../src/skill/install.js'
-import { defaultEntityDir } from '../../src/skill/paths.js'
+import {
+  contentHash, installSkill, MANIFEST, planInstall, type Manifest,
+} from '../../src/skill/install.js'
+import { defaultEntityDir, linkState, linkTarget } from '../../src/skill/paths.js'
 import { SKILL_CONTRACT_VERSION } from '../../src/core/edition.js'
 
 let home: string
@@ -49,6 +51,107 @@ function makeSource(): string {
 /** 读安装清单。 */
 function readManifest(entityDir: string): Manifest {
   return JSON.parse(readFileSync(join(entityDir, MANIFEST), 'utf8')) as Manifest
+}
+
+/**
+ * `node:fs.renameSync` 的故障注入开关（默认 null = 走真实实现）。
+ *
+ * 为什么在文件顶层 `vi.mock` 而不是用例内 `vi.spyOn`：
+ *   · `vi.spyOn(fs, 'renameSync')` 对内置模块直接抛 `Cannot redefine property`
+ *     （`node:fs` 的导出不可重定义）；
+ *   · 用例内 `vi.doMock` + `vi.resetModules` 能生效，但它会换掉本文件其余用例正在
+ *     用的 `install.js` 模块实例（实测：同文件后面的用例全走 mock 形态、互相污染）。
+ * 顶层 mock 只替换 `renameSync` 一个函数，其余函数原样转出，所有用例共用一份模块；
+ * 需要故障的用例设开关、`finally` 里清空。
+ */
+const fsRenameFault = vi.hoisted(() => {
+  const state: { kind: string | null } = { kind: null }
+  return {
+    set(kind: string | null): void { state.kind = kind },
+    current(): string | null { return state.kind },
+  }
+})
+
+/**
+ * `symlink` 的故障注入开关（默认 false = 真实建链）：为 true 时「建出的链接」内容被
+ * 换成一条解析不到的目标——用来验证**事后复核**（审查 B1 的第二道保险）真的在岗：
+ * 建链调用成功、但 agent 解析不到实体，这时不得报 state='ok'。
+ */
+const fsSymlinkFault = vi.hoisted(() => {
+  const state = { active: false }
+  return {
+    set(active: boolean): void { state.active = active },
+    get(): boolean { return state.active },
+  }
+})
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return {
+    ...actual,
+    symlink: (target: string, linkPath: string, type?: string) =>
+      actual.symlink(fsSymlinkFault.get() ? join('nowhere-at-all') : target, linkPath, type as never),
+  }
+})
+
+/**
+ * `readdirSync({ withFileTypes: true })` 的故障注入开关（默认 false）：为 true 时把
+ * 每个条目换成「空壳 Dirent」——`isFile`/`isDirectory`/`isSymbolicLink` 全部返回
+ * false，模拟 d_type=`DT_UNKNOWN` 的文件系统（审查 #40）。只影响带 `withFileTypes`
+ * 的调用，其余调用原样转出。
+ */
+const fsReaddirFault = vi.hoisted(() => {
+  const state = { active: false }
+  return {
+    set(active: boolean): void { state.active = active },
+    get(): boolean { return state.active },
+  }
+})
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return {
+    ...actual,
+    readdirSync: ((p: Parameters<typeof actual.readdirSync>[0], opts?: unknown) => {
+      const real = (actual.readdirSync as (a: unknown, b?: unknown) => unknown)(p, opts)
+      const withTypes = typeof opts === 'object' && opts !== null
+        && (opts as { withFileTypes?: boolean }).withFileTypes === true
+      if (!fsReaddirFault.get() || !withTypes || !Array.isArray(real)) return real
+      // 空壳：三个类型判定全 false（Node 在 DT_UNKNOWN 上给的就是这种形态）。
+      return real.map((ent: unknown) => {
+        const e = ent as { name: string }
+        return {
+          name: e.name,
+          isFile: () => false,
+          isDirectory: () => false,
+          isSymbolicLink: () => false,
+          isBlockDevice: () => false,
+          isCharacterDevice: () => false,
+          isFIFO: () => false,
+          isSocket: () => false,
+        }
+      })
+    }) as typeof actual.readdirSync,
+    renameSync: (from: string, to: string) => {
+      const kind = fsRenameFault.current()
+      // 只拦「换入」的那一步（源在暂存目录里），不拦首次安装的整目录 rename。
+      if (kind !== null && from.includes('.tmp-')) {
+        const e = new Error(`${kind === 'EXDEV' ? 'EXDEV: cross-device link not permitted' : 'EACCES: permission denied'}`) as NodeJS.ErrnoException
+        e.code = kind
+        throw e
+      }
+      return actual.renameSync(from, to)
+    },
+  }
+})
+
+/**
+ * 「零链接」提示（审查 B3 / #58）的条数。临时 home 默认没有 agent 目录，所以几乎
+ * 每条用例都会带上这一条；断言「没有别的警告」时把它滤掉，而不是逐条复读文案。
+ */
+const NO_LINK_HINT = '未发现任何 Agent skills 目录'
+function noLinkWarnCount(warnings: string[]): number {
+  return warnings.filter((w) => w.includes(NO_LINK_HINT)).length
 }
 
 describe('contentHash', () => {
@@ -208,7 +311,9 @@ describe('installSkill', () => {
     expect(readManifest(entity).content_hash).toBe(contentHash(src))
     const again = await installSkill({ home, sourceDir: src, version: '1.3.0', force: false })
     expect(again.status).toBe('skipped')
-    expect(again.warnings).toEqual([])
+    // 这个 home 里没有 agent 目录：幂等跳过之外只剩审查 B3 的那条「零链接」提示。
+    expect(noLinkWarnCount(again.warnings)).toBe(1)
+    expect(again.warnings.filter((w) => !w.includes('未发现任何 Agent skills 目录'))).toEqual([])
   })
 
   it('--force 不删用户新增的文件（审查 I2：以清单 files 界定，不删一切包外文件）', async () => {
@@ -437,7 +542,7 @@ describe('installSkill', () => {
     // 用户清掉占用后 force：完整写入、清单换新；再装回到幂等 skipped。
     rmSync(join(entity, 'SKILL.md'), { recursive: true })
     const fixed = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
-    expect(fixed.warnings).toEqual([])
+    expect(fixed.warnings.filter((w) => !w.includes(NO_LINK_HINT))).toEqual([])
     expect(readManifest(entity).version).toBe('1.1.0')
     expect(readManifest(entity).content_hash).toBe(contentHash(src))
     expect((await installSkill({ home, sourceDir: src, version: '1.1.0', force: false })).status)
@@ -605,17 +710,20 @@ describe('installSkill', () => {
     expect(readlinkSync(join(agent, 'qiyu'))).toBe(elsewhere)
   })
 
-  it('dangling 链接：先删后建，重建为指向实体、state=ok', async () => {
+  it('dangling 链接（用户自建、目标暂时不存在）：重建为指向实体、state=ok，并如实警告原链接内容（审查 #3）', async () => {
     const src = makeSource()
     const agent = join(home, '.claude', 'skills')
     mkdirSync(agent, { recursive: true })
-    // 指向一个不存在的目标 → dangling。
+    // 指向一个不存在的目标 → dangling。这是用户自己建的链接（可能只是目标暂时没挂上）。
     symlinkSync(join(home, 'gone'), join(agent, 'qiyu'))
 
     const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
 
     expect(r.links).toEqual([{ agent: 'claude-code', path: join(agent, 'qiyu'), state: 'ok' }])
-    expect(r.warnings).toEqual([])
+    // 删掉的是一条用户数据（链接本身）：必须把原链接内容说出来，不能悄悄替换。
+    expect(r.warnings).toHaveLength(1)
+    expect(r.warnings[0]).toContain('重建')
+    expect(r.warnings[0]).toContain(join(home, 'gone'))
     expect(readlinkSync(join(agent, 'qiyu'))).toBe(join('..', '..', '.agents', 'skills', 'qiyu'))
   })
 
@@ -675,3 +783,450 @@ describe('installSkill', () => {
     expect(readlinkSync(join(home, '.claude', 'skills', 'qiyu'))).toBe(join('..', '..', 'custom', 'qiyu'))
   })
 })
+
+// —— 审查 B1：agent skills 目录本身是符号链接（stow/dotfiles 布局）——
+describe('B1：agent skills 目录是符号链接时的建链', () => {
+  it('链接建在真实落点里、指向实体、state=ok（链接内容按真实落点的前缀算）', async () => {
+    const src = makeSource()
+    // dotfiles 布局：~/.claude/skills 本身是一个符号链接，真实落点在别处。
+    // ⚠️ 真实落点的层级数必须与字面路径（`.claude/skills`，home 下 2 级）**不同**
+    // （这里 home/dotfiles/claude-skills 也是 2 级）：同一深度下两种算法算出的相对
+    // 路径恰好相同，用例就分不出实现了（实测过这条用例第一版正是如此，变异存活）。
+    // 3 级深 → 字面算法差一级 `..`，链接必然解析不到。
+    const dotfiles = join(home, 'dotfiles', 'nested', 'claude-skills')
+    mkdirSync(dotfiles, { recursive: true })
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    symlinkSync(dotfiles, join(home, '.claude', 'skills'))
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    // 链接建在真实落点下（不是字面路径下）。
+    const linkPath = join(dotfiles, 'qiyu')
+    expect(lstatSync(linkPath).isSymbolicLink()).toBe(true)
+    // 链接内容必须按**真实落点**的前缀算：相对 linkTarget(真实落点, 实体)。
+    expect(readlinkSync(linkPath)).toBe(linkTarget(dotfiles, defaultEntityDir(home)))
+    // 关键：它必须真的解析到实体目录（修复前指向不存在的路径、linkState 却报 ok）。
+    expect(realpathSync(linkPath)).toBe(realpathSync(defaultEntityDir(home)))
+    // links[].path 沿用 agent 目录的**字面**路径（与 `agentSkillDirs` / where 的
+    // 报告口径一致）：字面路径顺着符号链接正好落到真实落点里的链接，state 如实为 ok。
+    expect(r.links).toEqual([{
+      agent: 'claude-code', path: join(home, '.claude', 'skills', 'qiyu'), state: 'ok',
+    }])
+    expect(linkState(r.links[0]!.path, defaultEntityDir(home))).toBe('ok')
+    expect(r.warnings.filter((w) => !w.includes(NO_LINK_HINT))).toEqual([])
+  })
+
+  it('实体目录在 home 之外（另一棵树上）时同样能建出可解析的链接', async () => {
+    const src = makeSource()
+    const dotfiles = join(home, 'dotfiles', 'nested', 'claude-skills')
+    mkdirSync(dotfiles, { recursive: true })
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    symlinkSync(dotfiles, join(home, '.claude', 'skills'))
+    // 实体放在 home 之外（前缀深度与 agent 目录不同——修复前会算错相对路径）。
+    const entity = join(tmpdir(), `qiyu-entity-outside-${process.pid}`)
+    rmSync(entity, { recursive: true, force: true })
+
+    try {
+      const r = await installSkill({
+        home, sourceDir: src, version: '1.2.3', force: false, entityDir: entity,
+      })
+      const linkPath = join(dotfiles, 'qiyu')
+      expect(realpathSync(linkPath)).toBe(realpathSync(entity))
+      expect(r.links[0]?.state).toBe('ok')
+    } finally {
+      rmSync(entity, { recursive: true, force: true })
+    }
+  })
+
+  it('建链成功但复核不通过时不得报 ok（如实记 dangling + 警告）', async () => {
+    const src = makeSource()
+    const agent = join(home, '.claude', 'skills')
+    mkdirSync(agent, { recursive: true })
+
+    // 故障注入：symlink 实际建出的是一条解析不到目标的链接（模拟「建链调用成功、
+    // 但 agent 加载不到」的形态——B1 的第二道保险要拦的就是这个）。
+    fsSymlinkFault.set(true)
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+      // 不得谎报 ok。
+      expect(r.links[0]?.state).not.toBe('ok')
+      expect(r.links[0]?.state).toBe('dangling')
+      expect(r.warnings.some((w) => w.includes('复核'))).toBe(true)
+    } finally {
+      fsSymlinkFault.set(false)
+    }
+  })
+})
+
+// —— 审查 B2：实体目录跨文件系统 ——
+describe('B2：实体目录跨设备时的写盘', () => {
+  it('暂存目录落在实体的真实落点旁（与实体同设备），写盘不再 EXDEV', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return // root 下 chmod 不拦写入
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    // 让实体目录是一个指向别处的符号链接（网盘/大盘的形态）。
+    const real = join(home, 'bigdisk', 'qiyu')
+    mkdirSync(join(home, '.agents', 'skills'), { recursive: true })
+    mkdirSync(real, { recursive: true })
+    symlinkSync(real, entity)
+
+    // 把「实体目录的字面父目录」锁成只读：暂存位若按字面路径建（修复前），这里
+    // 直接 EACCES；修复后暂存落在实体的**真实落点**旁（bigdisk/），不受影响。
+    // 这条断言不依赖「真的有两个设备」——它钉的是「暂存位建在哪」这个事实。
+    const literalParent = join(home, '.agents', 'skills')
+    chmodSync(literalParent, 0o555)
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+      // 正文真的写进了实体的真实落点。
+      expect(readFileSync(join(real, 'SKILL.md'), 'utf8')).toBe('# qiyu\n')
+      expect(r.status).toBe('installed')
+      // 没有 EXDEV 降级（说明暂存与实体同设备，rename 直接成功）。
+      expect(r.warnings.some((w) => w.includes('EXDEV'))).toBe(false)
+      // 字面父目录里没有留下任何暂存目录（暂存位不在这里）。
+      expect(readdirSync(literalParent).filter((n) => n.includes('.tmp-'))).toEqual([])
+    } finally {
+      chmodSync(literalParent, 0o755)
+    }
+  })
+
+  it('rename 抛 EXDEV 时降级为「复制 → 删源」，内容仍写进去并如实警告', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    // 直接构造「实体已存在」的形态（不调用安装）：--force 的换入路径才走逐文件 rename。
+    write(entity, 'SKILL.md', '# 旧版\n')
+    write(entity, 'protocols.md', '旧协议\n')
+    write(entity, 'references/deep.md', '旧引用\n')
+    write(entity, MANIFEST, JSON.stringify({
+      version: '0.9.0', skill_contract_version: SKILL_CONTRACT_VERSION,
+      content_hash: 'stale', installed_at: new Date().toISOString(),
+      files: ['SKILL.md', 'protocols.md', 'references/deep.md'],
+    }))
+
+    // 模拟跨设备：让 rename 对「换入暂存文件」的那次调用抛 EXDEV。
+    // ⚠️ `vi.spyOn` 对 `node:fs` 这种不可重定义的内置命名空间无效（`Cannot redefine
+    // property`），只能整体 mock。`vi.doMock` + `vi.resetModules` 会换掉本文件其余
+    // 用例用的模块实例（实测污染），所以本用例改用本文件顶层已经 `vi.mock` 好的
+    // 那份模块（见文件末尾的 mock 声明），用开关控制桩是否生效。
+    fsRenameFault.set('EXDEV')
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+      // 内容真的换进去了（降级路径有效）。
+      expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# qiyu\n')
+      expect(r.status).toBe('updated')
+      // 降级不是原子的，必须说出来。
+      expect(r.warnings.some((w) => w.includes('EXDEV'))).toBe(true)
+    } finally {
+      fsRenameFault.set(null)
+    }
+  })
+
+  it('一个文件都没写成功时 status 不得报 updated（审查 #54/B2）', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return // root 下 chmod 不拦写入
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    const before = contentHash(entity)
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    // 实体目录与它的子目录都只读 → 换入的 rename 全部 EACCES（审查 #54 的复现形态）。
+    // 两个层级都锁：子目录仍是 755 时 `references/deep.md` 能换入，就不是「零写入」。
+    chmodSync(join(entity, 'references'), 0o555)
+    chmodSync(entity, 0o555)
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+      // 实体零变化：status 必须如实反映（skipped，不是 updated）。
+      expect(r.status).toBe('skipped')
+      expect(r.plannedStatus).toBe('updated')
+      expect(r.warnings.some((w) => w.includes('一个文件都没有写进去'))).toBe(true)
+      // 清单保持上一版、正文一个字节没变（注：只读锁要在 finally 里解除）。
+      expect(readManifest(entity).version).toBe('1.0.0')
+      expect(contentHash(entity)).toBe(before)
+      expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe('# qiyu\n')
+    } finally {
+      chmodSync(entity, 0o755)
+      chmodSync(join(entity, 'references'), 0o755)
+    }
+  })
+})
+
+// —— 审查 B3：装了 Agent 但没有 skills 子目录 ——
+describe('B3：零链接时的如实提示', () => {
+  it('装了 Agent 根目录但缺 skills 子目录：提示建链方法，不替用户创建目录', async () => {
+    const src = makeSource()
+    mkdirSync(join(home, '.claude'), { recursive: true }) // 装了 Agent，但没建过 skills
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    expect(r.links).toEqual([])
+    expect(r.warnings.some((w) => w.includes('skills 子目录'))).toBe(true)
+    expect(r.warnings.some((w) => w.includes(join(home, '.claude', 'skills')))).toBe(true)
+    // 不替用户创建目录（spec D1）。
+    expect(existsSync(join(home, '.claude', 'skills'))).toBe(false)
+    // 实体照常装好。
+    expect(readFileSync(join(defaultEntityDir(home), 'SKILL.md'), 'utf8')).toBe('# qiyu\n')
+  })
+
+  it('完全没有 Agent：也提示「skill 不会被任何 Agent 加载」', async () => {
+    const src = makeSource()
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    expect(r.links).toEqual([])
+    expect(noLinkWarnCount(r.warnings)).toBe(1)
+    expect(r.warnings[0]).toContain('skill 不会被任何 Agent 加载')
+  })
+
+  it('--no-link 时不提零链接（用户明确不要链接）', async () => {
+    const src = makeSource()
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false, noLink: true })
+    expect(noLinkWarnCount(r.warnings)).toBe(0)
+  })
+})
+
+// —— 审查 #2：实体缺失时「指向别处」的链接是 foreign，不是 dangling ——
+describe('#2：linkState 在实体缺失时的四态', () => {
+  it('链接指向别处且目标存在、实体不存在 → foreign（不是 dangling）', async () => {
+    const agent = join(home, '.claude', 'skills')
+    mkdirSync(agent, { recursive: true })
+    const elsewhere = join(home, 'elsewhere')
+    mkdirSync(elsewhere)
+    symlinkSync(elsewhere, join(agent, 'qiyu'))
+    const entity = join(home, '.agents', 'skills', 'qiyu') // 不存在
+
+    expect(linkState(join(agent, 'qiyu'), entity)).toBe('foreign')
+  })
+
+  it('安装时遇到这种链接：不覆盖、不重建（与 where 结论一致）', async () => {
+    const src = makeSource()
+    const agent = join(home, '.claude', 'skills')
+    mkdirSync(agent, { recursive: true })
+    const elsewhere = join(home, 'elsewhere')
+    mkdirSync(elsewhere)
+    symlinkSync(elsewhere, join(agent, 'qiyu'))
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    expect(r.links[0]?.state).toBe('foreign')
+    // 用户那条链接原样保留（没被删、没被重建）。
+    expect(readlinkSync(join(agent, 'qiyu'))).toBe(elsewhere)
+  })
+})
+
+// —— 审查 #3：重建 dangling 链接时必须说出原链接内容 ——
+describe('#3：重建悬空链接时的如实报告', () => {
+  it('重建前先读出原链接内容并写进警告', async () => {
+    const src = makeSource()
+    const agent = join(home, '.claude', 'skills')
+    mkdirSync(agent, { recursive: true })
+    const mine = join(home, 'my-own-skill')
+    symlinkSync(mine, join(agent, 'qiyu')) // 目标不存在 → dangling
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    const w = r.warnings.find((x) => x.includes('重建'))
+    expect(w).toBeDefined()
+    expect(w).toContain(mine)
+  })
+})
+
+// —— 审查 #4：SIGKILL 残留的暂存目录 ——
+describe('#4：崩溃残留的暂存目录清理', () => {
+  it('安装开始时清掉同前缀的旧暂存目录', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    // 模拟 SIGKILL 留下的残留：<实体名>.tmp-XXXXXX。
+    const stale = `${entity}.tmp-AbCdEf`
+    mkdirSync(stale, { recursive: true })
+    writeFileSync(join(stale, 'SKILL.md'), '半截正文\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    expect(existsSync(stale)).toBe(false)
+    expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(true)
+  })
+
+  it('不碰名字不像暂存目录的兄弟目录', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    const sibling = `${entity}-backup`
+    mkdirSync(sibling, { recursive: true })
+    writeFileSync(join(sibling, 'SKILL.md'), '用户自己的东西\n')
+
+    await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    expect(existsSync(join(sibling, 'SKILL.md'))).toBe(true)
+  })
+})
+
+// —— 审查 #59：清单 files 被篡改不得删掉用户文件 ——
+describe('#59：清单 files 被篡改时的清理保护', () => {
+  it('清单里多出一条用户文件：不被删，并有警告', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    // 用户自己的笔记。
+    write(entity, 'mine.md', 'my notes\n')
+    // 篡改清单：把用户文件登记成「上一版受管文件」，并把版本改旧。
+    const m = readManifest(entity)
+    writeFileSync(join(entity, MANIFEST), JSON.stringify({
+      ...m, version: '0.0.1', files: [...(m.files ?? []), 'mine.md'],
+    }))
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    // 用户文件不被删（清单的 files 只是「声明」，不是「证据」）。
+    expect(readFileSync(join(entity, 'mine.md'), 'utf8')).toBe('my notes\n')
+    // 如实说明为什么没删。
+    expect(r.warnings.some((w) => w.includes('mine.md') && w.includes('保留'))).toBe(true)
+    // 警告里不能说谎（「移除了上一版安装的文件」）。
+    expect(r.warnings.some((w) => w.includes('移除了上一版安装、本版不再包含的文件：mine.md'))).toBe(false)
+  })
+
+  it('用户改过上一版受管文件的内容：也不删（哈希对不上）', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    // 用户改了自己那份 protocols.md。
+    write(entity, 'protocols.md', '用户改过的协议\n')
+    // 新版包删掉 protocols.md → 本该被清理，但用户改过 → 保留。
+    rmSync(join(src, 'protocols.md'))
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(readFileSync(join(entity, 'protocols.md'), 'utf8')).toBe('用户改过的协议\n')
+    expect(r.warnings.some((w) => w.includes('protocols.md') && w.includes('保留'))).toBe(true)
+  })
+
+  it('未被改动的上一版受管文件仍然会被清理（哈希对得上）', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    rmSync(join(src, 'references'), { recursive: true })
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(existsSync(join(entity, 'references', 'deep.md'))).toBe(false)
+    expect(r.warnings.some((w) => w.includes('移除了上一版安装、本版不再包含的文件'))).toBe(true)
+  })
+})
+
+// —— 审查 #53：实体不可读时，dry-run 不得预告 updated ——
+describe('#53：实体不可读时的计划如实性', () => {
+  it('实体目录不可读（列不出内容）：即便 --force 也不预告 updated', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return // root 下 chmod 不拦读取
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    chmodSync(entity, 0o000)
+    try {
+      const plan = planInstall({ entityDir: entity, sourceDir: src, version: '1.1.0', force: true })
+      // 计划不能承诺一个必然失败的 updated。
+      expect(plan.status).not.toBe('updated')
+      expect(plan.action).toBe('none')
+      expect(plan.warnings.some((w) => w.includes('读取实体目录失败'))).toBe(true)
+    } finally {
+      chmodSync(entity, 0o755)
+    }
+  })
+
+  it('实体里单个文件不可读（目录仍可读）：--force 仍能覆盖（审查 I4 的既有语义）', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    chmodSync(join(entity, 'SKILL.md'), 0o000)
+    write(src, 'SKILL.md', '# 新版包内容\n')
+    try {
+      const plan = planInstall({ entityDir: entity, sourceDir: src, version: '1.1.0', force: true })
+      expect(plan.status).toBe('updated')
+      expect(plan.action).toBe('write')
+    } finally {
+      chmodSync(join(entity, 'SKILL.md'), 0o644)
+    }
+  })
+})
+
+// —— 审查 #23：用户把受管文件换成非普通文件时不得删除 ——
+describe('#23：受管文件被换成非普通文件时的保护', () => {
+  it('上一版受管文件被换成符号链接：保留不动并警告', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    // 用户把 references/deep.md 换成指向个人笔记的符号链接。
+    const personal = join(home, 'personal-notes')
+    mkdirSync(personal, { recursive: true })
+    writeFileSync(join(personal, 'deep.md'), '我的个人笔记\n')
+    rmSync(join(entity, 'references', 'deep.md'))
+    symlinkSync(join(personal, 'deep.md'), join(entity, 'references', 'deep.md'))
+    // 新版包删掉 references/deep.md → 上一版清单登记过它，本该被清理。
+    rmSync(join(src, 'references'), { recursive: true })
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    // 链接本身与它指向的个人文件都原样保留。
+    expect(lstatSync(join(entity, 'references', 'deep.md')).isSymbolicLink()).toBe(true)
+    expect(readFileSync(join(personal, 'deep.md'), 'utf8')).toBe('我的个人笔记\n')
+    expect(r.warnings.some((w) => w.includes('非普通文件'))).toBe(true)
+  })
+})
+
+// —— 审查 #37：清单里的 Windows 反斜杠逃逸条目 ——
+describe('#37：清单 files 里的反斜杠路径按分隔符处理', () => {
+  it('`..\\..\\..\\evil.txt` 这类条目让整份清单不可信：不删任何文件', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    // 实体目录是 home/.agents/skills/qiyu，三级 `..` 正好回到 home。
+    const outside = join(home, 'evil.txt')
+    writeFileSync(outside, '用户自己的文件\n')
+    // 篡改清单：追加一条 Windows 写法的逃逸条目（POSIX 上它只是一串含反斜杠的
+    // 文件名——若只把 '/' 当分隔符，这一条会被当成合法的单段名字放行）。
+    const m = readManifest(entity)
+    writeFileSync(join(entity, MANIFEST), JSON.stringify({
+      ...m, version: '0.0.1', files: [...(m.files ?? []), '..\\..\\..\\evil.txt'],
+    }))
+    // 新版包不再包含 references → 一份可信清单下本该被清理。
+    rmSync(join(src, 'references'), { recursive: true })
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    // 实体之外的用户文件原样保留。
+    expect(readFileSync(outside, 'utf8')).toBe('用户自己的文件\n')
+    // 非法条目 ⇒ 整份清单按「不可信」处理：连真实受管文件也不删（宁留不删）。
+    expect(existsSync(join(entity, 'references', 'deep.md'))).toBe(true)
+    expect(r.warnings.some((w) => w.includes('移除了上一版安装'))).toBe(false)
+    // 如实说明这些文件为什么还在（清单不可信时按「无法确认上一版」口径报告）。
+    expect(r.warnings.some((w) => w.includes('不在包内的文件'))).toBe(true)
+  })
+})
+
+// —— 审查 #40：d_type=DT_UNKNOWN 的文件系统上补 lstat 归类 ——
+describe('#40：withFileTypes 给出空壳 Dirent 时的类型归类', () => {
+  it('空壳 Dirent 下 contentHash 仍能看见文件与子目录（补 lstat）', () => {
+    const dir = join(home, 'd')
+    write(dir, 'a.md', 'A\n')
+    write(dir, 'sub/b.md', 'B\n')
+    // 符号链接不算受管正文（正常路径下也被忽略），开着开关时同样要忽略。
+    symlinkSync(join(dir, 'a.md'), join(dir, 'link.md'))
+    const empty = join(home, 'empty')
+    mkdirSync(empty)
+    const emptyHash = contentHash(empty)
+    const expected = contentHash(dir)
+    expect(expected).not.toBe(emptyHash) // 基线非空，否则下面的比较没有意义
+
+    fsReaddirFault.set(true)
+    try {
+      expect(contentHash(dir)).toBe(expected)
+    } finally {
+      fsReaddirFault.set(false)
+    }
+  })
+})
+

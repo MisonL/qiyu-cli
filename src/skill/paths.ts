@@ -15,13 +15,14 @@
 // 链接四态（linkState）：
 //   · missing —— 链接路径本身不存在（lstat ENOENT）。
 //   · foreign —— 路径存在但不是符号链接，或者是指向别处的符号链接：这块位置被
-//     别的东西占了，安装时不能覆盖、要报给用户看。
+//     别的东西占了，安装时不能覆盖、要报给用户看。链接目标真实存在、但实体目录
+//     自己不存在时，也是 foreign（2026-10-22 审查 Minor #2）。
 //   · dangling —— 是符号链接，但链接目标解析不到（实体目录被删了）。
 //   · ok —— 是符号链接且解析后指向实体目录。
 // 判定必须用 `lstatSync` 而不是 `statSync`：`statSync` 会顺着链接走，链接本身与
 // 「链接指向的东西」就分不开了 —— 而四态的全部意义正是区分这两者。
 
-import { lstatSync, realpathSync, type Stats } from 'node:fs'
+import { lstatSync, realpathSync, statSync, type Stats } from 'node:fs'
 import { symlink } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -85,6 +86,38 @@ export function agentSkillDirs(home: string): AgentDir[] {
   return result
 }
 
+/**
+ * 装了 Agent 根目录（如 `~/.claude`）但没有 skills 子目录的 agent，返回其**缺失的**
+ * skills 目录路径（不创建）。消费方是 `install.ts`：自动模式下一条链接都没建时，
+ * 用它区分「这台机器上根本没有 Agent」（正常，不告警）与「Agent 装了、但 skills
+ * 子目录还没建」（审查 B3：此前静默不建链、零警告，用户拿到的是「装好了」）。
+ *
+ * 根目录也不存在（`~/.claude` 本身就没有、或是文件）的 agent 不返回——那不是
+ * 「可以修」的状态，是没装。
+ */
+export function agentsMissingSkillDir(home: string): AgentDir[] {
+  const result: AgentDir[] = []
+  for (const { name, subdir } of AGENT_SKILL_SUBDIRS) {
+    const parts = subdir.split(path.sep)
+    const root = path.join(home, parts[0]!)
+    // 根必须是**真实目录**（`~/.claude` 是文件 → ENOTDIR 不算装了 Agent）。先判根
+    // 再判子目录：根是文件时 `lstat(root/skills)` 直接抛 ENOTDIR，顺序反了会把
+    // 一个正常状态（用户没有 ~/.claude 目录）变成异常。
+    let rootIsDir: boolean
+    try {
+      rootIsDir = statSync(root).isDirectory()
+    } catch (err) {
+      if (isEnoent(err) || isEnotdir(err)) continue
+      throw err
+    }
+    if (!rootIsDir) continue
+    const dir = path.join(home, subdir)
+    if (exists(dir)) continue
+    result.push({ name, dir })
+  }
+  return result
+}
+
 /** 实体目录的默认位置：`<home>/.agents/skills/qiyu`。 */
 export function defaultEntityDir(home: string): string {
   return path.join(home, '.agents', 'skills', 'qiyu')
@@ -93,20 +126,44 @@ export function defaultEntityDir(home: string): string {
 /**
  * 从 `agentDir` 指向 `entityDir` 的相对链接目标。用相对路径而非绝对路径，
  * 是为了让整个 `~` 目录可以整体搬迁/复制而不失效。
+ *
+ * ⚠️ 相对路径是**相对链接所在目录的真实落点**解析的，所以 `agentDir` 必须先过
+ * `realpathSync`（stow/dotfiles 布局下 `~/.claude/skills` 本身就是符号链接，真实
+ * 落点可能与字面路径深度不同；2026-10-22 审查 B1 实测：不归一化时建出的链接指向
+ * 不存在的路径，却报 state='ok'）。解析失败（目录不存在等）退回原值：此时建链本来
+ * 就会失败并进 warnings，不在这里制造第二个错误。
  */
 export function linkTarget(agentDir: string, entityDir: string): string {
-  return path.relative(agentDir, entityDir)
+  return path.relative(realpathOrSelf(agentDir), entityDir)
+}
+
+/** `realpathSync` 的「失败即退回原值」版本（供 linkTarget 使用，见其注释）。 */
+function realpathOrSelf(p: string): string {
+  try {
+    return realpathSync(p).toString()
+  } catch {
+    return p
+  }
 }
 
 export type LinkState = 'ok' | 'dangling' | 'foreign' | 'missing'
 
 /**
- * 判定 `linkPath` 相对 `entityDir` 的状态。比较前两边都过 `path.resolve`，
- * 抹平相对/绝对与 `..` 段的写法差异，避免「同一个目录、两种字符串」被判成 foreign。
+ * 判定 `linkPath` 相对 `entityDir` 的状态。
+ *
+ * 判「是不是同一个目录」用 **dev + ino**（`statSync` 两边，顺着链接走），不比较
+ * 路径字符串：macOS 默认 APFS 是大小写不敏感卷，而 `realpathSync` **不做大小写
+ * 归一化**（磁盘上是 `Qiyu`、传入 `qiyu`，realpath 只会把后者原样拼回去）——
+ * 字符串严格比较会把同一个目录判成 foreign，让 `where` 报错、让 install 拒绝修复
+ * 一条其实 ok 的链接（2026-10-22 审查 Minor #36 实测）。同 inode 判定对大小写不
+ * 敏感卷、大小写敏感卷、bind mount、符号链接都成立。
+ *
+ * inode 读不到（EACCES 等）时退回 realpath + `path.resolve` 的字符串比较；那种
+ * 环境下也读不到链接目标，调用方本来就会按异常收敛。
  *
  * 注意：自指或成环的符号链接（realpath 解析超过系统上限）会抛 ELOOP，**不落四态** ——
- * ELOOP 不在内部吞掉的错误之列（`lstatOrNull` 只吞 ENOENT，`realpathOrNull` 吞
- * ENOENT/ENOTDIR，其余一律照常抛）。Task 11 的 `skill where`
+ * ELOOP 不在内部吞掉的错误之列（`lstatOrNull` 只吞 ENOENT，`statOrNull`/`realpathOrNull`
+ * 只吞 ENOENT/ENOTDIR，其余一律照常抛）。Task 11 的 `skill where`
  * 若要在这种异常环境下仍然给出可读输出，需要自己在调用处兜住。
  */
 export function linkState(linkPath: string, entityDir: string): LinkState {
@@ -114,20 +171,34 @@ export function linkState(linkPath: string, entityDir: string): LinkState {
   if (stat === null) return 'missing'
   if (!stat.isSymbolicLink()) return 'foreign'
 
-  // 实体目录自己都不存在，链接必然悬空；不必再尝试解析链接目标。
-  if (lstatOrNull(entityDir) === null) return 'dangling'
+  // 顺着链接走：目标解析不到 → 链接悬空。ELOOP 不吞（自指/成环不落四态，见函数
+  // 注释）——判定不了就如实抛，由调用方按「不触碰、只报告」处理。
+  const linkTargetStat = statOrNull(linkPath)
+  if (linkTargetStat === null) return 'dangling'
+  const entityStat = statOrNull(entityDir)
+  // 实体目录自己不存在，但链接目标**能**解析到（说明它指向别处一个真实存在的东西）
+  // —— 按四态语义是 foreign（「路径存在但不是指向我们的链接」）。2026-10-22 审查
+  // Minor #2/#7 实测：此前这里在解析目标之前就短路成 dangling，导致 `where` 报
+  // dangling / dry-run 预告 rebuild，而真实安装（装好实体后再判定）报 foreign 并
+  // 拒绝覆盖——同一链接两种说法。
+  if (entityStat === null) return 'foreign'
 
-  // realpathSync 在目标解析不到时抛 ENOENT —— 链接悬空。
+  // 首选的判据：同一 inode（见函数注释）。只有两侧都拿到了 inode 才用。
+  if (hasInode(linkTargetStat) && hasInode(entityStat)) {
+    return linkTargetStat.dev === entityStat.dev && linkTargetStat.ino === entityStat.ino
+      ? 'ok'
+      : 'foreign'
+  }
+  // 兜底：realpath 后按字符串比（realpath 抛错已在上面 statOrNull 阶段被吞成 null）。
   const resolvedLink = realpathOrNull(linkPath)
-  if (resolvedLink === null) return 'dangling'
   const resolvedEntity = realpathOrNull(entityDir)
-  if (resolvedEntity === null) return 'dangling'
-
-  // 两边都过 realpath 后再 path.resolve 严格比较。POSIX 上 realpath 已消除
-  // `..`、重复斜杠与符号链接，严格相等即同一目录（本机已由用例覆盖）。Windows
-  // 上 realpath 预期返回卷上的规范写法，使大小写差异自然消解 —— 这一条是推断，
-  // 未在本机实测（见 spec §跨平台）。
+  if (resolvedLink === null || resolvedEntity === null) return 'foreign'
   return path.resolve(resolvedLink) === path.resolve(resolvedEntity) ? 'ok' : 'foreign'
+}
+
+/** `Stats` 是否带可用的 inode 数字（Windows 的 stat 也有 ino，但为 0 时不可比）。 */
+function hasInode(st: Stats): boolean {
+  return typeof st.ino === 'number' && st.ino !== 0 && typeof st.dev === 'number'
 }
 
 /**
@@ -146,7 +217,11 @@ export function linkPlan(
   platform: NodeJS.Platform,
 ): { target: string; type?: 'junction' } {
   if (platform === 'win32') {
-    return { target: path.resolve(path.dirname(linkPath), target), type: 'junction' }
+    // ⚠️ 解析基准必须是链接所在目录的**真实落点**：junction 的 target 是绝对路径，
+    // 而相对 target 是相对「链接实际所在的那个目录」解析的——agent 目录本身是符号
+    // 链接时，字面路径与真实落点深度不同（审查 B1 的同一根因）。realpath 失败
+    // （目录还不存在等）退回字面路径，与旧行为一致。
+    return { target: path.resolve(realpathOrSelf(path.dirname(linkPath)), target), type: 'junction' }
   }
   return { target }
 }
@@ -155,6 +230,11 @@ export function linkPlan(
  * 在 `linkPath` 创建指向 `target` 的链接。平台相关的一切都交给 `linkPlan`，
  * 这里只做一次 `symlink` 调用。调用方负责保证 `linkPath` 的父目录存在，
  * 以及 `linkPath` 当前不是已存在的东西（`symlink` 本身遇到已存在路径会 EEXIST）。
+ *
+ * `target` 必须是 `linkTarget(agentDir, entityDir)` 的计算结果——`linkPlan` 在
+ * win32 上按 `dirname(linkPath)` 解析相对 target，这个写法只在链接目录与
+ * `agentDir` 同一字符串时才成立（调用方传的就是同一个 `dir`）。
+ * 成功后调用方**必须**用 `linkState` 复核（审查 B1），本函数不替调用方判定。
  */
 export async function createSkillLink(linkPath: string, target: string): Promise<void> {
   const plan = linkPlan(linkPath, target, process.platform)
@@ -229,6 +309,20 @@ function lstatOrNull(p: string): Stats | null {
 function realpathOrNull(p: string): string | null {
   try {
     return realpathSync(p).toString()
+  } catch (err) {
+    if (isEnoent(err) || isEnotdir(err)) return null
+    throw err
+  }
+}
+
+/**
+ * `statSync`（**顺着**链接走）的「拿不到即 null」版本：吞 ENOENT/ENOTDIR。
+ * ELOOP **不吞**——成环链接在 `linkState` 里是「判定不了」，不是「目标不存在」
+ * （四态不覆盖这种情况，调用方按 foreign/unknown 处理）。其余错误照常抛。
+ */
+function statOrNull(p: string): Stats | null {
+  try {
+    return statSync(p)
   } catch (err) {
     if (isEnoent(err) || isEnotdir(err)) return null
     throw err

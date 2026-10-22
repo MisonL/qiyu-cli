@@ -3,10 +3,15 @@
 // 子项目里**唯一会写用户 home 目录**的代码，行为原则只有一条：**绝不静默覆盖用户改动**。
 //
 // 写入安全性（审查 C1/C2/I1 的落地形态——暂存 + 校验 + 逐文件 rename 换入）：
-//   · 先暂存：正文与清单先复制进实体旁的暂存目录 `<entity>.tmp-XXXXXX`（`mkdtempSync`
-//     生成，同父目录 ⇒ 同设备，rename 才必然成功），复制完做哈希校验。暂存阶段任何
-//     失败都清掉暂存并抛错，实体一个字节不变——不存在「删了旧文件之后复制才失败」的
-//     中间态。
+//   · 先暂存：正文与清单先复制进暂存目录 `<entity>.tmp-XXXXXX`（`mkdtempSync`
+//     生成），复制完做哈希校验。暂存阶段任何失败都清掉暂存并抛错，实体一个字节
+//     不变——不存在「删了旧文件之后复制才失败」的中间态。
+//   · 暂存位与实体**同设备**：暂存目录落在实体目录**真实落点**的父目录
+//     （`realpath(entityDir)` 的 dirname）。实体目录本身可能是指向网盘/大盘的
+//     符号链接（detect 明确认可这种形态），按字面路径建暂存会落在 home 所在卷
+//     上，换入时跨卷 EXDEV、每个文件都写失败却报「已更新」（2026-10-22 审查 B2
+//     实测）。设备判断万一仍不一致时，`renameSync` 捕获 EXDEV 降级为
+//     「复制 → 删源」并**如实警告**。
 //   · 后换入：暂存成功后才动实体，逐文件 `rename` 换入：目标是普通文件 → 原子替换
 //     （POSIX rename 语义，没有先删后写的窗口）；缺失 → 换入；符号链接/目录/设备
 //     → 一律不写、如实警告。rename 会替换符号链接本身、copy 会**写穿**符号链接
@@ -28,12 +33,18 @@
 //   · 同上但有 --force → 暂存 → 换入 → 清理「上一版有、本版没有」的受管文件
 //     （审查 I2 采纳的更优方案：以上一版清单界定，而不是删一切包外文件；清单不可
 //     识别则不清理、只警告；用户新增内容一律保留并警告），status='updated'。
+//   · **status 反映实际写盘结果**（2026-10-22 审查 B2）：计划说要写、实际一个文件
+//     都没写进去时，status 退回 'skipped' 并附明确警告——「报 updated 但实体零变化」
+//     是对 Agent 的谎报。
 //
 // 链接按 `linkState` 四态分派（**不能直接 createSkillLink**：symlink 已存在时它抛
 // EEXIST，2026-10-20 Task 7 实测）：
 //   · ok       → 不碰，记 state='ok'；
-//   · missing  → createSkillLink，成功记 'ok'；
-//   · dangling → 先 unlink 再 createSkillLink（重建），成功记 'ok'；
+//   · missing  → createSkillLink，成功后**复核** linkState，非 ok 不得报 ok
+//     （审查 B1：agent 目录本身是符号链接时，链接可能建到解析不到的地方），
+//     记 'ok'；
+//   · dangling → 先 unlink 再 createSkillLink（重建），成功记 'ok'；重建会删掉
+//     用户自己建的那条链接，**必须警告并记下原链接内容**（审查 Minor）；
 //   · foreign  → 不覆盖，记 'foreign' + 警告「已被占用」。
 // 链接阶段任何异常——建链失败、linkState 抛 ELOOP（自指循环链接不落四态，Task 7
 // 实测）、agent 目录不可检查（ENOTDIR/EACCES）——都收敛进 warnings，不让整个安装
@@ -50,14 +61,14 @@
 
 import { createHash } from 'node:crypto'
 import {
-  copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync,
-  renameSync, rmSync, statSync, unlinkSync, writeFileSync,
+  copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync,
+  realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import path from 'node:path'
 import { SKILL_CONTRACT_VERSION } from '../core/edition.js'
 import {
-  agentSkillDirs, createSkillLink, defaultEntityDir, LINK_NAME, linkState, linkTarget,
-  normalizeNewlines,
+  agentSkillDirs, agentsMissingSkillDir, createSkillLink, defaultEntityDir, LINK_NAME, linkState,
+  linkTarget, normalizeNewlines,
   type LinkState,
 } from './paths.js'
 
@@ -68,11 +79,25 @@ export const MANIFEST = '.qiyu-skill.json'
 const STAGING_SUFFIX = '.tmp-'
 
 /**
+ * 判断一个目录项名是否是本模块的暂存目录名（`<实体名>.tmp-<随机后缀>`）。
+ * 消费方是安装开始时的残留清理——只认这个形状，绝不碰用户自己取的别的名字。
+ */
+function isStagingName(name: string, entityBase: string): boolean {
+  return name.startsWith(`${entityBase}${STAGING_SUFFIX}`) && name.length > entityBase.length + STAGING_SUFFIX.length
+}
+
+/**
  * `.qiyu-skill.json` 的语义：安装清单 + 版本标记，不是逐字节指纹（spec D8）。
  *
  * `files` 是**可选**扩展（审查 I2）：记录本次安装写入的受管文件相对路径列表，
  * 供下一次 --force 区分「上一版遗留」与「用户新增」。旧版清单没有该字段时视为
  * 「无法识别上一版」，清理阶段不删任何文件、只警告。
+ *
+ * `file_hashes` 是 `files` 的旁证（2026-10-22 审查 #59）：`files` 可以被人为编辑
+ * ——任何能写这个文件的进程（含备份恢复、同步工具）往里加一条 `mine.md`，下一次
+ * `--force` 就会把用户的文件当成「上一版遗留」删掉。清理时只删「内容哈希与这里
+ * 记录的一致」的文件；不一致 → 视为用户改动，不删、只警告。旧清单没有这个字段时
+ * （本次修复之前装的）无从核对，受管文件一律不删、只警告（宁留不删）。
  */
 export interface Manifest {
   version: string
@@ -80,11 +105,19 @@ export interface Manifest {
   content_hash: string
   installed_at: string
   files?: string[]
+  /** 键是 `files` 里的相对路径，值是**换行归一化后**内容的 sha256（与 contentHash 同口径）。 */
+  file_hashes?: Record<string, string>
 }
 
 export interface InstallResult {
   entityDir: string
+  /**
+   * **实际**写盘结果（审查 B2）：与 `plannedStatus` 不一致时以这里为准。
+   * 计划要写、实际一个文件都没写进去 → 这里退为 `'skipped'`，绝不报 updated。
+   */
   status: 'installed' | 'skipped' | 'updated'
+  /** `planInstall` 当初给出的计划态（dry-run 的 planned_status 是同一个值）。 */
+  plannedStatus: 'installed' | 'skipped' | 'updated'
   links: { agent: string; path: string; state: LinkState }[]
   warnings: string[]
 }
@@ -132,19 +165,58 @@ function listFiles(dir: string): string[] {
     for (const ent of readdirSync(abs, { withFileTypes: true })) {
       const childRel = rel === '' ? ent.name : `${rel}/${ent.name}`
       if (rel === '' && ent.name === MANIFEST) continue
-      if (ent.isDirectory()) walk(path.join(abs, ent.name), childRel)
-      else if (ent.isFile()) out.push(childRel)
-      // 符号链接等：不属于受管正文，忽略（复制同样跳过，两侧口径一致；
-      // 源里的符号链接既不复制也不参与哈希，因此不会造成幂等漂移）。
+      const kind = direntKind(abs, ent)
+      if (kind === 'dir') walk(path.join(abs, ent.name), childRel)
+      else if (kind === 'file') out.push(childRel)
+      // 'other'（符号链接等非常规条目）：不属于受管正文，忽略（复制同样跳过，
+      // 两侧口径一致；源里的符号链接既不复制也不参与哈希，因此不会造成幂等漂移）。
     }
   }
   walk(dir, '')
   return out.sort()
 }
 
-/** 把相对路径（'/' 分隔）还原为平台路径。 */
+/**
+ * `Dirent` 的类型归类。`withFileTypes` 在 d_type=`DT_UNKNOWN` 的文件系统
+ * （CIFS 挂载、部分 XFS 等）上给出的是「既不是文件也不是目录也不是符号链接」的
+ * 空壳，Node 不会替我们补 stat（2026-10-22 审查 #40）。此时补一次 `lstatSync`
+ * 再归类——否则非空的网络盘实体会被 `contentHash` 判成空集，与本地源永远不一致，
+ * 安装永远 skipped、「--force 也收敛不了」。
+ *
+ * 补 stat 之后仍不是普通文件/目录（FIFO、设备、符号链接）→ `'other'`，照旧忽略。
+ * 条目在 readdir 与 lstat 之间消失（ENOENT）→ 按 `'other'` 忽略（它已不在）。
+ */
+function direntKind(abs: string, ent: { name: string; isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean }): 'file' | 'dir' | 'other' {
+  if (ent.isDirectory()) return 'dir'
+  if (ent.isFile()) return 'file'
+  if (ent.isSymbolicLink()) return 'other'
+  try {
+    const st = lstatSync(path.join(abs, ent.name))
+    if (st.isDirectory()) return 'dir'
+    if (st.isFile()) return 'file'
+  } catch (err) {
+    if (!isErrno(err, 'ENOENT')) throw err
+  }
+  return 'other'
+}
+
+/**
+ * 相对路径的**统一分隔符口径**（2026-10-22 审查 #37）：清单 `files` 里的两种分隔符
+ * 都当分隔符处理。只认 `/` 时，Windows 上 `..\\..\\evil` 会被当成一整段普通名字
+ * 穿过字符串层与父链层，三层防线退化为只剩 realpath 一层。
+ */
+const REL_SEP_RE = /[\\/]/
+
+/**
+ * 把相对路径（'/' 或 '\\' 分隔）还原为平台路径。
+ *
+ * 两种分隔符都按分隔符处理（审查 #37）：清单是外部数据，`..\\..\\evil` 这种
+ * Windows 写法必须在每一层防御里都被当成多段路径看待，否则前三层防线在 Windows
+ * 上形同虚设。我们自己写出的清单一律用 '/'（`listFiles` 的口径），所以这只影响
+ * 被篡改的清单——那种情况下「解析到实体目录内的另一个文件」正是我们要拦的。
+ */
 function joinRel(root: string, rel: string): string {
-  return path.join(root, ...rel.split('/'))
+  return path.join(root, ...rel.split(REL_SEP_RE))
 }
 
 /**
@@ -153,10 +225,13 @@ function joinRel(root: string, rel: string): string {
  * 清单 `files` 是**不可信输入**（用户可以编辑它、也可能被篡改），删除前必须当外部
  * 数据校验：绝对路径、盘符、`..` 段、空段（`a//b`）、`.` 段一律拒绝。只做字符串
  * 层面判定；符号链接父链造成的逃逸由 `verifyPlainParents` + `realpath` 复核兜住。
+ *
+ * 分隔符 `/` 与 `\` 都认（审查 #37）：判定要与平台无关——一份在 Linux 上写的清单
+ * 被带到 Windows（或反过来）时，两者的含义必须一致、防线层数不缩水。
  */
 function isContainedRel(rel: string): boolean {
-  if (rel === '' || path.isAbsolute(rel) || /^[A-Za-z]:/.test(rel)) return false
-  return rel.split('/').every((part) => part !== '' && part !== '.' && part !== '..')
+  if (rel === '' || path.isAbsolute(rel) || path.win32.isAbsolute(rel) || /^[A-Za-z]:/.test(rel)) return false
+  return rel.split(REL_SEP_RE).every((part) => part !== '' && part !== '.' && part !== '..')
 }
 
 /**
@@ -167,7 +242,7 @@ function isContainedRel(rel: string): boolean {
  */
 function verifyPlainParents(base: string, rel: string): 'ok' | 'missing' | 'unsafe' {
   let cur = base
-  for (const part of rel.split('/').slice(0, -1)) {
+  for (const part of rel.split(REL_SEP_RE).slice(0, -1)) {
     cur = path.join(cur, part)
     let st
     try {
@@ -222,19 +297,43 @@ function copyTree(src: string, dest: string, isRoot = true): void {
   }
 }
 
-/** 写安装清单（覆盖）。`installed_at` 用 ISO 8601，便于人读与机器解析。 */
+/**
+ * 单个文件的内容哈希：换行归一化后的 sha256（与 `contentHash` 里的逐文件口径一致）。
+ * 清单用它记录「本工具当时写下的内容」，供下一次 --force 清理时核对（审查 #59）。
+ */
+function fileHash(abs: string): string {
+  return createHash('sha256').update(normalizeNewlines(readFileSync(abs))).digest('hex')
+}
+
+/**
+ * 写安装清单（覆盖）。`installed_at` 用 ISO 8601，便于人读与机器解析。
+ *
+ * `file_hashes`（审查 #59）：与 `files` 一一对应的**逐文件内容哈希**。清单里的
+ * `files` 是「哪些文件是我们写的」的唯一依据，而它是一份可以被就地编辑的 JSON——
+ * 往 `files` 里追加一条用户自己的文件名，下一次 `--force` 就会把它当「上一版遗留」
+ * 删掉，且警告还说「移除了上一版安装的文件」（实测）。清理时改为只删「当前哈希与
+ * `file_hashes` 记录一致」的文件，其余一律保留并警告。
+ *
+ * ⚠️ 这不是完整性保护：`file_hashes` 与 `files` 在同一个文件里，能改 `files` 的
+ * 进程也能补一份对得上的哈希（本机没有密钥/签名可用）。它挡住的是两类**现实**场景：
+ * ① 备份恢复/同步工具/人工编辑让 `files` 多出条目（不会连哈希一起伪造）；
+ * ② 用户在上一版之后改过那个文件（哈希必然不符）。
+ */
 function writeManifest(
   dir: string,
   version: string,
   contentHashValue: string,
   files: string[],
 ): void {
+  const hashes: Record<string, string> = {}
+  for (const rel of files) hashes[rel] = fileHash(joinRel(dir, rel))
   const manifest: Manifest = {
     version,
     skill_contract_version: SKILL_CONTRACT_VERSION,
     content_hash: contentHashValue,
     installed_at: new Date().toISOString(),
     files,
+    file_hashes: hashes,
   }
   writeFileSync(path.join(dir, MANIFEST), JSON.stringify(manifest, null, 2) + '\n')
 }
@@ -249,6 +348,10 @@ function writeManifest(
  * 非法条目（绝对路径 / 含 `..` / 空段）直接丢弃。非法条目意味着清单被动过手脚，
  * 整份清单按「落后」处理（返回 null）比只丢几个条目更安全——否则一份被篡改的清单
  * 仍会被当作「上一版的准确记录」，清理范围就建立在不可信数据上（审查 N1）。
+ *
+ * `file_hashes` 同样是不可信输入，但判定方向相反：**形状不对就整份丢字段**
+ * （`file_hashes` 为 undefined = 「无从核对」，清理时保守不删任何文件），不接受
+ * 部分采用——半份可用的哈希表比没有更容易让后续维护者误以为「已经核对过了」。
  */
 function readManifestSafe(entityDir: string): Manifest | null {
   try {
@@ -264,12 +367,23 @@ function readManifestSafe(entityDir: string): Manifest | null {
         if (!raw.files.every((f) => typeof f === 'string' && isContainedRel(f))) return null
         files = raw.files as string[]
       }
-      return { ...raw as Manifest, files }
+      let fileHashes: Record<string, string> | undefined
+      if (raw.file_hashes !== undefined) {
+        if (!isStringRecord(raw.file_hashes)) return null
+        fileHashes = raw.file_hashes
+      }
+      return { ...raw as Manifest, files, file_hashes: fileHashes }
     }
     return null
   } catch {
     return null
   }
+}
+
+/** `v` 是否是「键值都为字符串」的普通对象（数组/嵌套值一律拒绝）。 */
+function isStringRecord(v: unknown): v is Record<string, string> {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false
+  return Object.values(v).every((x) => typeof x === 'string')
 }
 
 /** 判定路径是否存在且是目录；不存在或不是目录返回 false，其余错误照常抛。 */
@@ -326,29 +440,62 @@ function ensurePlainParents(base: string, rel: string, warnings: string[]): bool
 }
 
 /**
- * 把暂存目录里的文件逐个 `rename` 换入实体。目标不存在 → 换入；目标是普通文件 →
+ * 把暂存目录里的文件逐个换入实体。目标不存在 → 换入；目标是普通文件 →
  * **原子替换**（POSIX rename 语义，没有先删后写的窗口）；目标是符号链接/目录/设备
  * → 一律不写并警告——`rename` 会替换链接本身、`copyFile` 会写穿链接（审查 C2
  * WT1/WT2/WT3 实测），两种形态都会伤到用户数据，统一按「用户占用」处理。
  *
- * 单个文件失败只警告，不中断（其余文件照常换入）。返回是否**全部**换入成功——
- * 调用方据此决定要不要换清单：有文件没写进去时清单保持上一版，下一次安装的
- * 漂移探测才能如实报 stale（否则清单按「应该装上」的内容谎报 current）。
+ * 单文件失败只警告，不中断（其余文件照常换入）。返回各计数；调用方据此决定要不要
+ * 换清单，以及 status 该报什么（审查 B2：**status 必须反映实际写盘结果**）：
+ *   · `complete`（写了本包全部文件）→ 换清单；
+ *   · `written === 0` → 一个文件都没写进去，status 不得报 updated；
+ *   · 0 < `written` < 总数 → 部分写入，如实警告。
+ *
+ * 换入方式见 `moveFile`：同设备时 rename，EXDEV 时降级为复制 + 删源并记一条警告。
  */
-function swapIn(staging: string, entityDir: string, rels: string[], warnings: string[]): boolean {
-  let complete = true
+function swapIn(
+  staging: string,
+  entityDir: string,
+  rels: string[],
+  warnings: string[],
+): { complete: boolean; written: number; total: number } {
+  let written = 0
   for (const rel of rels) {
-    if (!ensurePlainParents(entityDir, rel, warnings)) { complete = false; continue }
+    if (!ensurePlainParents(entityDir, rel, warnings)) continue
     const to = joinRel(entityDir, rel)
-    if (!isSafeWriteTarget(to, `目标 ${rel} `, warnings)) { complete = false; continue }
+    if (!isSafeWriteTarget(to, `目标 ${rel} `, warnings)) continue
     try {
-      renameSync(joinRel(staging, rel), to)
+      moveFile(joinRel(staging, rel), to, warnings)
+      written++
     } catch (err) {
-      complete = false
       warnings.push(`写入 ${rel} 失败（${errMsg(err)}）：${to}`)
     }
   }
-  return complete
+  return { complete: written === rels.length, written, total: rels.length }
+}
+
+/**
+ * 把 `from` 换到 `to`：先 `renameSync`；遇到 `EXDEV`（跨设备）降级为
+ * 「`copyFileSync` 复制 → 删源」。
+ *
+ * EXDEV 的现实来源（2026-10-22 审查 B2 实测）：「实体目录是指向网盘/大盘的符号
+ * 链接」是 detect 明确认可的安装形态，但暂存目录若建在**符号链接的字面父目录**
+ * 上，两者可能不在同一设备。暂存改落 `realpath(entityDir)` 的父目录已消除主因
+ * （见 `stagingBaseDir`），本降级是第二道保险——卷的挂载点与路径推断未必一致。
+ *
+ * 降级窗口的语义：`copyFileSync` 覆盖目标时先截断再写入，不再是原子替换——这是
+ * 跨设备时唯一可用的手段，但**必须说出来**（warning 记下受影响的文件）：用户据此
+ * 知道这次更新不是原子的。用户内容仍受 `isSafeWriteTarget` + 父链验证保护。
+ */
+function moveFile(from: string, to: string, warnings: string[]): void {
+  try {
+    renameSync(from, to)
+  } catch (err) {
+    if (!isErrno(err, 'EXDEV')) throw err
+    copyFileSync(from, to)
+    unlinkSync(from)
+    warnings.push(`暂存目录与实体不在同一设备（EXDEV），已降级为「复制 → 删除源」换入（非原子）：${to}`)
+  }
 }
 
 /**
@@ -358,10 +505,20 @@ function swapIn(staging: string, entityDir: string, rels: string[], warnings: st
  *
  * 旧清单没有 `files`（本任务之前的安装）→ 无法识别上一版，**不删任何东西**，
  * 只把包外文件列进警告。
+ *
+ * **内容核对层（审查 #59）**：`files` 只是一份可以被编辑的 JSON，「清单里写着它」
+ * 不等于「它是我们写的」。删除前还要对得上 `file_hashes` 里记录的哈希：
+ *   · 有 `file_hashes`、且该条目的当前哈希与记录一致 → 是本工具写下的、未被改过，删除；
+ *   · 有 `file_hashes`、但该条目没有记录 / 哈希不一致 → 不是本工具写的内容（清单被
+ *     篡改，或用户改过），保留并警告；
+ *   · 旧清单没有 `file_hashes` → 无从核对，**不删**，只警告（宁留不删）。
+ * 这一层同样挡不住「连哈希一起伪造」——清单在实体目录里、与正文同权限，本机没有
+ * 密钥可用；它挡的是现实中的误伤来源（见 `writeManifest` 注释）。
  */
 function cleanupPreviousManaged(
   entityDir: string,
   prevFiles: string[] | undefined,
+  prevHashes: Record<string, string> | undefined,
   newFiles: string[],
   warnings: string[],
 ): void {
@@ -376,6 +533,7 @@ function cleanupPreviousManaged(
 
   const prev = new Set(prevFiles)
   const removed: string[] = []
+  const unverifiable: string[] = []
   for (const rel of prevFiles) {
     if (keep.has(rel)) continue
     // —— 纵深防御（审查 N1）：清单是外部数据，删除前逐层复核 ——
@@ -411,6 +569,24 @@ function cleanupPreviousManaged(
       warnings.push(`上一版安装的 ${rel} 解析后不在实体目录内，拒绝删除：${abs}`)
       continue
     }
+    // ④ 内容核对层（审查 #59）：清单里写着「这是我们写的」还不够——还要对得上
+    //    清单记录的哈希。对不上（用户改过 / 清单被改过）→ 不删。
+    const recorded = prevHashes?.[rel]
+    if (recorded === undefined) {
+      unverifiable.push(rel)
+      continue
+    }
+    let current: string
+    try {
+      current = fileHash(abs)
+    } catch (err) {
+      warnings.push(`读取上一版文件 ${rel} 计算哈希失败（${errMsg(err)}），未删除`)
+      continue
+    }
+    if (current !== recorded) {
+      unverifiable.push(rel)
+      continue
+    }
     try {
       unlinkSync(abs)
       removed.push(rel)
@@ -421,6 +597,12 @@ function cleanupPreviousManaged(
   if (removed.length > 0) {
     // 删除用户可见的文件必须说出来：--force 是「覆盖」授权，删除仍要如实报告。
     warnings.push(`移除了上一版安装、本版不再包含的文件：${removed.join('、')}`)
+  }
+  if (unverifiable.length > 0) {
+    // 清单说它是我们写的、内容却对不上（用户改过，或清单被改过）——不删，并说明。
+    warnings.push(
+      `以下文件在上一版清单中登记、但内容与记录不符（可能已被用户修改或清单被改动），已保留不动：${unverifiable.join('、')}`,
+    )
   }
 
   const extra = listFiles(entityDir).filter((f) => !keep.has(f) && !prev.has(f))
@@ -481,19 +663,25 @@ function writeInstalled(
   version: string,
   sourceHash: string,
   warnings: string[],
-  prevFiles?: string[],
-): void {
+  prev?: { files?: string[]; hashes?: Record<string, string> },
+): WriteOutcome {
   // 清单此刻是否存在（复审 Minor：「保持上一版」的措辞只在真有上一版清单时成立；
   // 首次安装中途被占用根本没写过清单，措辞要区分开）。必须在动实体**之前**判断。
   const hadPrevManifest = manifestExists(entityDir)
 
+  // 暂存位与实体同设备（审查 B2）：落在实体**真实落点**的父目录下。实体目录本身
+  // 不存在时 realpath 会失败——退回「逐级向上找最近一个存在的祖先再 realpath」，
+  // 这样即便父目录本身是符号链接，也能落在那条链的真实卷上。
+  const stagingBase = stagingBaseDir(entityDir)
+
   let staging: string | undefined
   try {
-    // mkdir/暂存位创建/复制/校验/清单全部算「暂存阶段」：任何一步失败都清掉暂存并
-    // 抛错，实体一个字节不变（审查 I1 的「先全部复制成功再动实体」）。暂存位创建
-    // 失败（父目录不可写等）同样包进这段文案，不给调用方裸 EACCES。
-    mkdirSync(path.dirname(entityDir), { recursive: true })
-    staging = mkdtempSync(`${entityDir}${STAGING_SUFFIX}`)
+    mkdirSync(stagingBase, { recursive: true })
+    // 崩溃残留（审查 Minor #4）：SIGKILL 打断的安装会留下 `qiyu.tmp-XXXXXX`，
+    // 里面还带着正文。在**新建本次暂存位之前**清理同前缀的旧目录——本次的暂存位
+    // 尚未创建，不存在「误删自己」的窗口。只认 `<实体名>.tmp-` 这个形状。
+    cleanupStaleStaging(stagingBase, path.basename(entityDir), warnings)
+    staging = mkdtempSync(path.join(stagingBase, `${path.basename(entityDir)}${STAGING_SUFFIX}`))
     copyTree(sourceDir, staging)
     if (contentHash(staging) !== sourceHash) {
       throw new Error('暂存内容与源不一致（防御性校验失败）')
@@ -516,25 +704,95 @@ function writeInstalled(
     if (!entityExists) {
       mkdirSync(path.dirname(entityDir), { recursive: true })
       renameSync(staging, entityDir)
-      return
+      return { complete: true, written: sourceFiles.length, total: sourceFiles.length, manifestKept: false }
     }
-    const complete = swapIn(staging, entityDir, sourceFiles, warnings)
-    cleanupPreviousManaged(entityDir, prevFiles, sourceFiles, warnings)
-    if (!complete) {
+    const swap = swapIn(staging, entityDir, sourceFiles, warnings)
+    // 清理只在「确实写进了东西」时跑：一个文件都没写进去（例如整盘只读、每次
+    // rename 都 EXDEV 且复制也失败）时删上一版遗留只会让实体更空，且与那份
+    // 「什么都没更新」的真实结果不相称。
+    if (swap.written > 0) {
+      cleanupPreviousManaged(entityDir, prev?.files, prev?.hashes, sourceFiles, warnings)
+    }
+    if (!swap.complete) {
       // 有文件没能换入（被占用/失败）：清单不换入，如实反映「实际装上的仍是旧内容」。
       // 下一次安装因此会报内容不同并提示 --force；用户清掉占用后重跑即可收敛。
+      const detail = swap.written === 0
+        ? `本次一个文件都没有写进去（${swap.total} 个文件全部失败）`
+        : `本次未能完整写入（${swap.total} 个文件中成功 ${swap.written} 个）`
       warnings.push(
         hadPrevManifest
-          ? '本次未能完整写入（有文件被占用或写入失败），安装清单保持上一版'
-          : '本次未能完整写入（有文件被占用或写入失败），安装清单未写入；清掉占用后重跑安装即可补全',
+          ? `${detail}，安装清单保持上一版`
+          : `${detail}，安装清单未写入；清掉占用后重跑安装即可补全`,
       )
-      return
+      return { complete: false, written: swap.written, total: swap.total, manifestKept: hadPrevManifest }
     }
     if (isSafeWriteTarget(path.join(entityDir, MANIFEST), '清单', warnings)) {
-      renameSync(path.join(staging, MANIFEST), path.join(entityDir, MANIFEST))
+      moveFile(path.join(staging, MANIFEST), path.join(entityDir, MANIFEST), warnings)
     }
+    return { complete: true, written: swap.written, total: swap.total, manifestKept: false }
   } finally {
     rmSync(staging, { recursive: true, force: true })
+  }
+}
+
+/** `writeInstalled` 的实际结果；`installSkill` 据此给出与写盘事实一致的 status。 */
+interface WriteOutcome {
+  /** 本包全部文件都写进去了（清单是否换入另算）。 */
+  complete: boolean
+  written: number
+  total: number
+  /** 写不全时旧清单是否还在（措辞用）。 */
+  manifestKept: boolean
+}
+
+/**
+ * 暂存目录的落点：实体目录**真实落点**的父目录，保证暂存与实体在同一设备上
+ * （审查 B2——`renameSync` 跨设备抛 EXDEV，而旧实现假定「同父目录 ⇒ 同设备」，
+ * 对「实体目录是指向网盘/大盘的符号链接」这种 detect 明确认可的形态并不成立）。
+ *
+ * 实体目录本身可能还不存在（首次安装）：逐级向上找到最近一个存在的祖先，
+ * 对它 realpath 后再拼回缺失的那几段。
+ */
+function stagingBaseDir(entityDir: string): string {
+  const abs = path.resolve(entityDir)
+  const parts = abs.split(path.sep)
+  for (let i = parts.length; i > 0; i--) {
+    const candidate = parts.slice(0, i).join(path.sep) || path.sep
+    try {
+      const real = realpathSync(candidate).toString()
+      return path.dirname(path.join(real, ...parts.slice(i)))
+    } catch {
+      continue
+    }
+  }
+  return path.dirname(abs)
+}
+
+/**
+ * 清理 SIGKILL 残留的暂存目录（审查 Minor #4）：只删 `stagingBase` 下名字形如
+ * `<entityBase>.tmp-XXXXXX` 的**目录**。删不掉只警告，不让安装失败。
+ *
+ * 安全性：`mkdtempSync` 生成的目录名带随机后缀、只由本工具创建；用户若恰好手工建了
+ * 一个同形状的目录，最坏结果是被当成残留清掉——但这个概率极低，而残留正文会随源
+ * 大小无限增长、还可能被按目录扫描的 skill 工具当成第二个同名 skill。
+ */
+function cleanupStaleStaging(stagingBase: string, entityBase: string, warnings: string[]): void {
+  let entries
+  try {
+    entries = readdirSync(stagingBase, { withFileTypes: true })
+  } catch {
+    return // 目录还不存在等：本次新建时自然会建出来。
+  }
+  for (const ent of entries) {
+    if (!isStagingName(ent.name, entityBase)) continue
+    const abs = path.join(stagingBase, ent.name)
+    try {
+      if (!lstatSync(abs).isDirectory()) continue
+      rmSync(abs, { recursive: true, force: true })
+      warnings.push(`清理了上次安装中断时残留的暂存目录：${abs}`)
+    } catch (err) {
+      warnings.push(`清理残留暂存目录失败（${errMsg(err)}）：${abs}`)
+    }
   }
 }
 
@@ -547,8 +805,10 @@ function writeInstalled(
  *   · 'write'            —— 调 `writeInstalled`（首次安装 / 真空实体 / --force 覆盖）；
  *   · 'rewrite-manifest' —— 只重写清单（正文一致、清单落后/损坏）；
  *   · 'none'             —— 一个字节都不写。
- * `status` 是安装完成后 `InstallResult.status` 的值（写盘中途失败不改变它——与
- * 重构前的行为一致）。
+ * `status` 是**计划预期的**安装完成后 `InstallResult.status`（dry-run 的
+ * planned_status 取自这里）。真实安装的实际 status 由 `installSkill` 按写盘结果
+ * 修正——计划说要写、实际一个文件都没写进去时，实际 status 会退回 'skipped'
+ * （审查 B2）。
  *
  * 抛错边界与 `installSkill` 一致：源目录不可用、实体路径被文件占用。调用方
  * （命令层）把它们转成可读错误；dry-run 也照此报告——计划能预见到失败，就不该
@@ -563,6 +823,8 @@ export interface InstallPlan {
   warnings: string[]
   /** `action === 'write'` 且实体已有上一版清单时，上一版受管文件列表（清理用）。 */
   prevFiles?: string[]
+  /** 上一版清单记录的逐文件哈希（清理前的内容核对，审查 #59）。 */
+  prevFileHashes?: Record<string, string>
 }
 
 export function planInstall(opts: {
@@ -611,14 +873,27 @@ export function planInstall(opts: {
 
   // —— 分类（审查 I4：分类读取可能因 EACCES 等抛错；失败按「内容不同」处理，
   // 让 --force 仍然可用、无 force 则跳过 + 警告，不把用户卡死） ——
+  // 「目录列不出来」与「目录里的某个文件读不出来」是**两种**失败：
+  //   · listError（列目录失败，如实体目录 chmod 000）：换入要往这个目录里 rename，
+  //     同样会被拒——--force 也救不了，实装必然失败。计划如实说「读不到，不覆盖」，
+  //     不给一个必然落空的 updated 承诺（审查 #53）。
+  //   · hashError（某个文件读不出来，如 SKILL.md chmod 000）：rename 覆盖它需要的
+  //     是目录写权限而不是该文件的读权限，--force 仍能修好（审查 I4 的既有用例）。
   let vacuous = false
   let targetHash: string | null = null
-  let readError: unknown = null
+  let listError: unknown = null
+  let hashError: unknown = null
   try {
     vacuous = isVacuous(entityDir)
-    if (!vacuous) targetHash = contentHash(entityDir)
   } catch (err) {
-    readError = err
+    listError = err
+  }
+  if (listError === null && !vacuous) {
+    try {
+      targetHash = contentHash(entityDir)
+    } catch (err) {
+      hashError = err
+    }
   }
 
   if (vacuous) {
@@ -626,7 +901,7 @@ export function planInstall(opts: {
     const prev = readManifestSafe(entityDir)
     return {
       ...base, status: 'installed', action: 'write', warnings,
-      ...(prev?.files !== undefined ? { prevFiles: prev.files } : {}),
+      ...prevOf(prev),
     }
   }
 
@@ -651,19 +926,40 @@ export function planInstall(opts: {
     return { ...base, status: 'updated', action: 'rewrite-manifest', warnings }
   }
 
+  // 实体目录列不出来（chmod 000 等）：连「里面有什么」都判定不了，而换入本身也需要
+  // 该目录的写权限（`rename` 进一个不可遍历的目录同样被拒）。**有 --force 也不能**
+  // 承诺 updated —— 此前 dry-run --force 预告 updated、真实 --force 退 1 的分叉
+  // （审查 #53）就出在 force 分支无视了这个错误。
+  if (listError !== null) {
+    warnings.push(
+      `读取实体目录失败（${errMsg(listError)}），无法确认内容与写盘可行性，未覆盖；`
+      + `请先修复该目录的可读/可写权限再重跑（即使 --force 也会以同样的错误失败）：${entityDir}`,
+    )
+    return { ...base, status: 'skipped', action: 'none', warnings }
+  }
+
   if (force) {
     const prev = readManifestSafe(entityDir)
     return {
       ...base, status: 'updated', action: 'write', warnings,
-      ...(prev?.files !== undefined ? { prevFiles: prev.files } : {}),
+      ...prevOf(prev),
     }
   }
 
-  const reason = readError !== null
-    ? `读取实体目录内容失败（${errMsg(readError)}）`
+  const reason = hashError !== null
+    ? `读取实体目录内容失败（${errMsg(hashError)}）`
     : '实体目录内容与包内不同（可能被手工修改）'
   warnings.push(`${reason}，未覆盖；确认后可用 --force 覆盖：${entityDir}`)
   return { ...base, status: 'skipped', action: 'none', warnings }
+}
+
+/** 计划里带上上一版清单的清理依据（`files` + 逐文件哈希 `file_hashes`）。 */
+function prevOf(prev: Manifest | null): Pick<InstallPlan, 'prevFiles' | 'prevFileHashes'> {
+  if (prev === null) return {}
+  const out: Pick<InstallPlan, 'prevFiles' | 'prevFileHashes'> = {}
+  if (prev.files !== undefined) out.prevFiles = prev.files
+  if (prev.file_hashes !== undefined) out.prevFileHashes = prev.file_hashes
+  return out
 }
 
 /**
@@ -671,7 +967,9 @@ export function planInstall(opts: {
  * 只有「源目录不可用」「实体路径被文件占用」「暂存写入失败」这类无法继续的情况
  * 才抛错（调用方 Task 11 会转成 internal 错误信封）。
  *
- * 判定本身在 `planInstall`（只读）；本函数只负责按计划执行写操作。
+ * 判定本身在 `planInstall`（只读）；本函数只负责按计划执行写操作，并把**实际**
+ * 写盘结果翻译成 status（审查 B2：计划说要写但实际零写入时，status 退回 skipped
+ * 并警告——`data.status` 是 Agent 读的那一个字段，「报 updated、实体零变化」等于谎报）。
  */
 export async function installSkill(opts: InstallOptions): Promise<InstallResult> {
   const { home, sourceDir, version, force, noLink = false } = opts
@@ -680,17 +978,28 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
   const plan = planInstall({ entityDir, sourceDir, version, force })
   const warnings = [...plan.warnings]
 
+  let status: InstallResult['status'] = plan.status
   if (plan.action === 'write') {
-    writeInstalled(entityDir, sourceDir, plan.sourceFiles, version, plan.sourceHash, warnings, plan.prevFiles)
+    const outcome = writeInstalled(
+      entityDir, sourceDir, plan.sourceFiles, version, plan.sourceHash, warnings,
+      { files: plan.prevFiles, hashes: plan.prevFileHashes },
+    )
+    if (!outcome.complete && outcome.written === 0) {
+      // 零写入：status 必须反映事实。`installed` 也一样退——实体可能只是个空壳。
+      status = 'skipped'
+      warnings.push(
+        `实体目录内容与包内仍不一致（本次零写入），status 按实际结果记为 skipped；修复上述问题后重跑安装即可收敛`,
+      )
+    }
   } else if (plan.action === 'rewrite-manifest') {
     writeManifest(entityDir, version, plan.sourceHash, plan.sourceFiles)
   }
 
   // —— 链接：按四态分派；任何失败都收敛进 warnings ——
   const links: InstallResult['links'] = []
-  if (!noLink) await linkAgents(opts, entityDir, links, warnings)
+  if (!noLink) await linkAgents(opts, entityDir, links, warnings, status, plan.status)
 
-  return { entityDir, status: plan.status, links, warnings }
+  return { entityDir, status, plannedStatus: plan.status, links, warnings }
 }
 
 /** 对每个 agent 目录按 linkState 四态分派建链，结果与失败原因都写进 links/warnings。 */
@@ -699,6 +1008,8 @@ async function linkAgents(
   entityDir: string,
   links: InstallResult['links'],
   warnings: string[],
+  status: InstallResult['status'],
+  plannedStatus: InstallResult['status'],
 ): Promise<void> {
   const { home, linkDirs } = opts
 
@@ -718,9 +1029,22 @@ async function linkAgents(
       dirs = agentSkillDirs(home).map((a) => ({ dir: a.dir, agent: a.name }))
     } catch (err) {
       // ~/.claude 是文件时 lstat 抛 ENOTDIR（Task 7 实测）：收敛，不让整个安装失败。
+      // 审查 B3：这也是「装了 Agent 却零链接」的一种，探测失败的原因已经在这句话里。
       warnings.push(`探测 agent skills 目录失败（${errMsg(err)}），本次不建链接`)
       return
     }
+  }
+
+  // 自动模式下一条都没链上（审查 B3 / #58）：`agentSkillDirs` 只返回**已存在**的
+  // 目录，所以「装了 Agent 但没 skills 子目录」和「这台机器根本没装 Agent」在这里
+  // 都表现为 dirs 为空。用户拿到的是「安装成功」，而 skill 不会被任何 Agent 加载。
+  //
+  // 不替用户创建目录（spec D1），但要说出来。`idempotent`（本次既没写盘也没别的
+  // 警告）时把「已存在」也写进这条：命令层只在 result.warnings 为空时补那句
+  // 「已存在且内容一致」，这里补上它就不会被吞掉——幂等重跑同样要告诉用户
+  // 「没建链、skill 不会被加载」。
+  if (linkDirs === undefined && dirs.length === 0) {
+    warnNoAgentLinked(home, status === 'skipped' && plannedStatus === 'skipped' && warnings.length === 0, warnings)
   }
 
   for (const { dir, agent } of dirs) {
@@ -760,17 +1084,80 @@ async function linkAgents(
       links.push({ agent, path: linkPath, state })
     } else {
       // missing / dangling：建链；dangling 必须先删（createSkillLink 遇已存在路径抛 EEXIST）。
+      //
+      // 重建 dangling 会**删掉用户自己建的那条链接**（审查 Minor #3：目标暂时不存在
+      // 的自建链接也会落进 dangling）。删除用户数据必须说出来：把原链接内容记进警告，
+      // 用户据此可以自行恢复。
+      let previousTarget: string | null = null
       try {
-        if (state === 'dangling') unlinkSync(linkPath)
-        await createSkillLink(linkPath, linkTarget(dir, entityDir))
-        links.push({ agent, path: linkPath, state: 'ok' })
+        if (state === 'dangling') {
+          previousTarget = readlinkSync(linkPath, { encoding: 'utf8' })
+          unlinkSync(linkPath)
+        }
+        const target = linkTarget(dir, entityDir)
+        await createSkillLink(linkPath, target)
+        if (previousTarget !== null) {
+          warnings.push(`已重建 ${agent} 的悬空链接（原链接 → ${previousTarget}，现为 → ${target}）：${linkPath}`)
+        }
+        // 事后复核（审查 B1 双保险）：建链“成功”不等于“agent 能解析到实体”——
+        // agent 目录本身是符号链接时，相对路径若按错误的前缀算就会指向不存在的位置。
+        // 复核不是 ok 就**如实**记 dangling，不得报 ok。
+        const after = linkState(linkPath, entityDir)
+        if (after === 'ok') {
+          links.push({ agent, path: linkPath, state: 'ok' })
+        } else {
+          let resolved: string | null = null
+          try { resolved = readlinkSync(linkPath, { encoding: 'utf8' }) } catch { /* 读回失败不影响结论 */ }
+          warnings.push(
+            `${agent} 的链接已创建但复核状态为 ${after}——Agent 很可能加载不到本 skill`
+            + `（链接内容 ${resolved ?? '?'}，实体 ${entityDir}；若 agent skills 目录本身是符号链接请检查其落点）：${linkPath}`,
+          )
+          links.push({ agent, path: linkPath, state: after })
+        }
       } catch (err) {
-        warnings.push(`${agent} 建链失败（${errMsg(err)}）：${linkPath}`)
+        const reason = previousTarget !== null ? `（原链接 → ${previousTarget} 已被移除）` : ''
+        warnings.push(`${agent} 建链失败${reason}（${errMsg(err)}）：${linkPath}`)
         // 如实报告失败后的真实状态（dangling 已删但建失败 → missing；删失败 → 仍 dangling）。
         links.push({ agent, path: linkPath, state: recheckState(linkPath, entityDir, state) })
       }
     }
   }
+}
+
+/**
+ * 零链接时的如实提示（审查 B3 / #58）：skill 装好了，但没有任何 Agent 会加载它。
+ *
+ * 分两种情况：
+ *   · 装了 Agent 根目录（`~/.claude`、`~/.codex`）但缺 skills 子目录 → 用户 mkdir
+ *     一下再重跑 `qiyu skill install` 就能建链；
+ *   · 连 Agent 根目录都没有 → 这台机器上没装 Agent，属正常状态，也说一声（否则
+ *     「装好了」的提示会让人以为 skill 已经能用了）。
+ *
+ * **不替用户创建目录**（spec D1）：只提示，不 mkdir。
+ *
+ * `idempotent`（本次一个字节都没写、也没有别的警告）时，句首补上「已存在且内容
+ * 一致、未做任何改动」——命令层只在 `result.warnings` 为空时才补这句，这里补上
+ * 就不会被吞掉：幂等重跑同样要告诉用户「没建链、skill 不会被加载」。
+ */
+function warnNoAgentLinked(home: string, idempotent: boolean, warnings: string[]): void {
+  let missing: string[]
+  try {
+    missing = agentsMissingSkillDir(home).map((a) => a.dir)
+  } catch {
+    missing = []
+  }
+  const prefix = idempotent ? 'skill 已存在且内容一致，未做任何改动；' : ''
+  if (missing.length > 0) {
+    warnings.push(
+      `${prefix}已装 Agent 但缺少 skills 子目录，本次未建链：${missing.join('、')}；`
+      + `创建这些目录后重跑 \`qiyu skill install\` 即可建链（skill 不会被任何 Agent 加载）`,
+    )
+    return
+  }
+  warnings.push(
+    `${prefix}未发现任何 Agent skills 目录（~/.claude/skills、~/.codex/skills），`
+    + '本次未建链：skill 不会被任何 Agent 加载；装好 Agent 后重跑 `qiyu skill install` 即可建链',
+  )
 }
 
 /** 建链失败后重新判定状态；判定本身再抛（ELOOP 等）就退回尝试前的状态。 */
