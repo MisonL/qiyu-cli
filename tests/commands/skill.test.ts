@@ -723,8 +723,15 @@ describe('skill check', () => {
     }
   })
 
-  // —— 追加审查 [55]：EACCES 不得把用户引向 --force 这条死路 ——
-  it('[55] 实体目录不可读（EACCES）→ install 的警告改说「修权限」，不再推荐 --force', async () => {
+  // —— 追加审查 [55]：EACCES 不得把用户引向死路 ——
+  //
+  // ⚠️ 文案的唯一出处是 `install.ts` 的 `planInstall`，且它区分两种失败（G2 落地）：
+  //   · listError（**目录**列不出来，如实体目录 chmod 000）→ 如实说 --force 也会失败；
+  //   · hashError（**单个文件**读不出来）→ rename 覆盖要的是目录写权限，--force 真能修好。
+  // 命令层曾（G3 单独落地时）把两者统一改写成「不可读，--force 也失败」，那在 hashError
+  // 分支上是**反向误导**（实测 --force 退 0、status=updated、文件已换入）。故命令层的改写
+  // 已删除，下面三条用例改钉 install.ts 的实际文案，并各自验证 --force 的真实能力。
+  it('[55] 实体目录不可读（chmod 000）→ 不推荐 --force，改说「先修权限」且如实说 --force 也会失败', async () => {
     if (process.platform === 'win32' || process.getuid?.() === 0) return
     expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
     chmodSync(entity, 0o000)
@@ -732,16 +739,36 @@ describe('skill check', () => {
       out = ''; err = ''
       expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
       expect(data().status).toBe('skipped')
-      // 变异「删除命令层的警告改写」→ 原文案「确认后可用 --force 覆盖」回来 → 本用例红。
-      expect(metaWarnings()).toContain('不可读')
-      expect(metaWarnings()).toContain('请先修复目录权限')
+      expect(metaWarnings()).toContain('请先修复该目录的可读/可写权限')
+      expect(metaWarnings()).toContain('即使 --force 也会以同样的错误失败')
       expect(metaWarnings()).not.toContain('确认后可用 --force 覆盖')
     } finally {
       chmodSync(entity, 0o755)
     }
   })
-  it('[55] 真正的内容不同（可读）→ 仍然推荐 --force（改写只针对不可读）', async () => {
-    // 与上面成对：只钉「不可读不推 --force」时把「推 --force」整段删掉也能绿。
+  it('[55] 单文件读不出来（目录可读）→ --force 真能修好，因此仍推荐 --force', async () => {
+    // 与上一条成对，钉住「两种失败不许用同一句话」：把这两条合并成一种文案 → 必有一条红。
+    if (process.platform === 'win32' || process.getuid?.() === 0) return
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    writeFileSync(join(entity, 'SKILL.md'), '# 用户改过的正文\n')
+    chmodSync(join(entity, 'SKILL.md'), 0o000)
+    try {
+      out = ''; err = ''
+      expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+      expect(data().status).toBe('skipped')
+      expect(metaWarnings()).toContain('确认后可用 --force 覆盖')
+
+      // 实测证据：--force 确实修得动（依赖的是目录写权限，不是该文件的读权限）。
+      out = ''; err = ''
+      expect(await skillCommand(['install', '--dir', entity, '--force', '--no-link'])).toBe(0)
+      expect(data().status).toBe('updated')
+      expect(metaWarnings()).not.toContain('不可读')
+    } finally {
+      chmodSync(join(entity, 'SKILL.md'), 0o644)
+    }
+  })
+  it('[55] 真正的内容不同（且可读）→ 同样推荐 --force', async () => {
+    // 与第一条成对：只钉「不可读不推 --force」时把「推 --force」整段删掉也能绿。
     expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
     writeFileSync(join(entity, 'SKILL.md'), '# 用户改过的正文\n')
     out = ''; err = ''
@@ -752,26 +779,23 @@ describe('skill check', () => {
   // —— 追加审查 [54]：写盘失败必须如实报告，不许谎报成功 ——
   //
   // [54] 说的是「全部文件写失败时仍报 status:'updated'、exit 0，与 warnings 自相矛盾」。
-  // 实测（本 worktree，临时 home）当前的形态是：一个文件都没写进去时 status 报的是
-  // `installed`（plan 阶段算出来的值）+ 每个文件一条「写入 X 失败」+ 「本次未能完整写入」。
-  // 即 status **仍然只反映 plan**（B2 的根因），与 [54] 同源。本组只允许改
-  // `src/commands/{tree,skill,skill-specs,spec-types}.ts`、`src/skill/detect.ts`、
-  // `src/postinstall.ts`——`install.ts` 的 swapIn/planInstall 归 B 组（B2）。
-  // 所以这里钉住**命令层能保证的部分**：失败必须逐条写进 meta.warnings（不静默），
-  // 且实体零变化、不得出现「已存在/已是最新」这类成功话术；status 的语义修正留给 B2。
-  it('[54] 实体目录只读 → 每个文件写入失败都必须进 warnings（不静默，且实体零变化）', async () => {
+  // 根因（status 只反映 plan、不反映实际写盘）已由 B2 修掉：`installSkill` 在零写入时把
+  // status 退回 `skipped`，并新增 `plannedStatus` 区分「计划态」。本用例钉住实际结果。
+  it('[54] 实体目录只读 → 每个文件写入失败都必须进 warnings（不静默，且实体零变化、status 如实）', async () => {
     if (process.platform === 'win32' || process.getuid?.() === 0) return
     mkdirSync(entity, { recursive: true })
     chmodSync(entity, 0o500) // 只读：目录内不能 rename/新建
     try {
       expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
-      expect(metaWarnings()).toContain('未能完整写入')
+      // 零写入的措辞（B2 落地后的实际文案）：逐文件失败 + 汇总一条。旧版是
+      // 「本次未能完整写入」，现在会区分 zero/total 并给出写入计数。
+      expect(metaWarnings()).toContain('本次一个文件都没有写进去')
       expect(metaWarnings()).toContain('写入 SKILL.md 失败')
       // 实体一个字节没变，也没有任何「已存在」的成功话术。
       expect(existsSync(join(entity, 'SKILL.md'))).toBe(false)
       expect(metaWarnings()).not.toContain('已存在')
-      // ⚠️ 已知缺口（B2 负责，G3 不越界）：`status` 仍报 plan 阶段的 'installed'。
-      expect(data().status).toBe('installed')
+      // status 如实反映写盘结果（B2）：零写入 → skipped，不是 plan 阶段的 'installed'。
+      expect(data().status).toBe('skipped')
     } finally {
       chmodSync(entity, 0o755)
     }

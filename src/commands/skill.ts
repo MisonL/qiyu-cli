@@ -514,22 +514,15 @@ async function skillInstall(argv: string[]): Promise<number> {
   if (result.status === 'skipped' && result.warnings.length === 0) {
     allWarnings.push(`skill 已存在且内容一致，未做任何改动：${result.entityDir}`)
   }
-  // 追加审查 [55]：install.ts 把「读不了实体目录」归进「内容不同」，统一收尾
-  // 「确认后可用 --force 覆盖」——但 --force 对不可读目录**必然失败**（EACCES），
-  // 提示把用户引向死路。命令层手里有 errno 的真实文案，把这条死路改成可行动的修法。
-  // （修法的另一半——install.ts 的 reason 文案——在 install.ts，归 B 组；本层先把
-  // 面向用户的输出改对，那一侧落地后这里的改写自然变成恒等映射。）
-  for (let i = 0; i < allWarnings.length; i++) {
-    const w = allWarnings[i]!
-    if (!w.startsWith('读取实体目录内容失败（')) continue
-    const tail = '，未覆盖；确认后可用 --force 覆盖：'
-    const at = w.indexOf(tail)
-    if (at === -1) continue
-    allWarnings[i] = w.slice(0, at)
-      + '，未覆盖；该目录**不可读**，--force 对不可读目录同样会失败（不要用它试）。'
-      + '请先修复目录权限（如 chmod u+rx）再重跑：'
-      + w.slice(at + tail.length)
-  }
+  // ⚠️ 审查 [55] 的文案归 `install.ts` 的 `planInstall`（B 组已落地），**命令层不再改写**：
+  // 它现在区分两种失败并各给各的出口 ——
+  //   · `listError`（目录列不出来，如实体目录 chmod 000）：rename 进这个目录同样被拒，
+  //     如实说「即使 --force 也会以同样的错误失败，先修权限」；
+  //   · `hashError`（某个文件读不出来）：rename 覆盖需要的是**目录**写权限而不是该文件的
+  //     读权限，`--force` 确实能修好 —— 仍推荐 `--force`。
+  // 命令层此前（G3 单独落地时）把两者统一改写成「不可读，--force 也失败（不要用它试）」，
+  // 这在 `hashError` 分支上是**反向误导**（实测 `--force` 退 0、status=updated、文件已换入）。
+  // 两层各写一份文案必然漂移，这里删掉改写，只保留 install.ts 那唯一一处。
 
   // ⚠️ installSkill 的显式 linkDirs 分支用 `agentSkillDirs(home)` 反查 agent 名；
   // 该调用失败（如无关的 `~/.claude` 是文件 → ENOTDIR）时它静默退回「目录路径当
