@@ -31,10 +31,9 @@
 
 import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { PACKAGE_VERSION } from './core/edition.js'
-import { resolveSkillSourceDir } from './skill/detect.js'
+import { resolveEntityDirSources, resolveSkillSourceDir } from './skill/detect.js'
 import { installSkill } from './skill/install.js'
 import { envIndex } from './skill/paths.js'
 
@@ -101,17 +100,20 @@ export async function runPostinstall(opts: PostinstallOptions): Promise<number> 
       return 0
     }
 
-    // 自定义实体位置：空串/纯空白视同未设（与 detect.ts 的 resolveEntityDir 同口径），
-    // 相对路径按 `opts.cwd` 解析成绝对路径——installSkill 内部所有路径运算都按绝对路径处理。
-    // 绝对路径不受 cwd 影响（`path.resolve` 对绝对输入直接返回，不会拼接基准）。
-    const requestedDir = env.get('npm_config_qiyu_skill_dir')?.trim()
-    // ⚠️ `process.cwd()` 只在调用方没注入 `cwd` 时求值（`??` 短路），但**不是**
-    // 「正常路径走不到」——多数测试用例并不注入 cwd，所以这条兜底在测试里确实会跑。
-    // 它是纯函数里唯一一次读进程状态：生产入口一律显式注入，判定输入仍以 opts 为准。
-    const baseCwd = opts.cwd ?? process.cwd()
-    const entityDir = requestedDir !== undefined && requestedDir !== ''
-      ? path.resolve(baseCwd, requestedDir)
-      : undefined
+    // 自定义实体位置：走全仓唯一的实体解析（`skill/detect.ts` 的 `resolveEntityDirSources`，
+    // G3 审查 C3）。相对路径按 `opts.cwd`（= `INIT_CWD ?? cwd`）解析成绝对路径——installSkill
+    // 内部所有路径运算都按绝对路径处理，绝对输入不受基准影响。
+    // `testGate: false`：postinstall 的 env 是 npm 给的（判据已由上面的 npx / 全局标记挡过）。
+    // 让它吃测试门会和 `npm test` 自己设的 `INIT_CWD` / `VITEST` 冲突，测试永远覆盖不到安装分支。
+    // 默认位置不在这里拼：落回 `default` 时交给 installSkill 按 `opts.home` 取
+    // `defaultEntityDir`（同一份事实，不在本文件重写一遍路径）。
+    const resolution = resolveEntityDirSources({
+      env: opts.env,
+      home: opts.home,
+      baseDir: opts.cwd ?? process.cwd(),
+      testGate: false,
+    })
+    const entityDir = !resolution.decided || resolution.source === 'default' ? undefined : resolution.dir
 
     const result = await installSkill({
       home: opts.home,

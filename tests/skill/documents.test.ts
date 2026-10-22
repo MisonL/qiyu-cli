@@ -27,6 +27,7 @@ describe('skill 文档', () => {
         'report-tables': REPORT_TABLES,
         'task-ids': SYNC_TASKS.map((t) => t.id),
         'endpoint-ids': allEndpoints().map((e) => e.id),
+        'callable-endpoint-ids': allEndpoints().filter((e) => e.callable).map((e) => e.id),
       },
     })
     expect(r.violations).toEqual([])

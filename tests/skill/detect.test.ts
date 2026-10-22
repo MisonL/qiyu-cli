@@ -22,7 +22,8 @@ import { tmpdir } from 'node:os'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import {
-  __resetSkillDetectionForTest, detectSkillState, resolveEntityDir, resolveSkillSourceDir, skillWarning,
+  __resetSkillDetectionForTest, detectSkillState, entityUndeterminedNote, npmRelativeBase,
+  resolveEntityDir, resolveEntityDirSources, resolveSkillSourceDir, skillWarning,
 } from '../../src/skill/detect.js'
 import { contentHash, MANIFEST } from '../../src/skill/install.js'
 import { defaultEntityDir } from '../../src/skill/paths.js'
@@ -262,15 +263,30 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
   it('非测试环境返回默认实体位置（纯字符串计算，不碰磁盘）', () => {
     process.env.NODE_ENV = 'production'
     delete process.env.QIYU_SKILL_DIR
+    // vitest 恒设 `VITEST=true`；这条钉的是「生产语义」（非测试进程），所以一并清掉。
+    delete process.env.VITEST
     expect(resolveEntityDir()).toBe(defaultEntityDir(homedir()))
   })
 
-  // —— 终审 I2：postinstall 与漂移探测必须走同一条位置通路 ——
-  it('npm_config_qiyu_skill_dir 生效（装到自定义目录后不再误报「未安装」）', () => {
+  // —— 终审 I2 + G3 追加审查 [21]：npm_config 是 postinstall 的位置通道，但不得泄进测试 ——
+  //
+  // 门在两个方向都要被钉住：
+  //   · 生产（非测试进程）：npm_config 必须被认识（否则装到自定义目录后每条命令误报「未安装」）；
+  //   · 测试（NODE_ENV=test / VITEST）：门排在 npm_config **之前**，宿主 `.npmrc` 配的
+  //     `qiyu-skill-dir` 不得让测试去 stat 真实路径、也不得把漂移提示写进 output.ts 的
+  //     模块级 pendingSkillWarning（[21] 实测 4 条红）。
+  // 门本身从这里直接调 `resolveEntityDirSources` 验证（不经 `resolveEntityDir`），
+  // 因为 `resolveEntityDir` 只是它的薄包装；两侧都钉，任一侧被改回去都有红。
+  const withoutNodeTest = (): void => {
+    process.env.NODE_ENV = 'production'
+    delete process.env.VITEST
+  }
+
+  it('npm_config_qiyu_skill_dir 在生产进程里生效（装到自定义目录后不再误报「未安装」）', () => {
     // 复现终审 P22：postinstall 用这条通路装到 custom-skill，探测此前只认
     // QIYU_SKILL_DIR，于是每条命令都提示「未安装到默认路径」并建议再装一份。
-    // 变异「删掉 resolveEntityDir 里的 npm_config 分支」→ 本用例红。
-    process.env.NODE_ENV = 'test'
+    // 变异「删掉 npm_config 分支」→ 本用例红。
+    withoutNodeTest()
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = join(home, 'custom-skill')
     expect(resolveEntityDir()).toBe(join(home, 'custom-skill'))
@@ -279,7 +295,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
   it('全大写键 NPM_CONFIG_QIYU_SKILL_DIR 同样生效（spec D8 键名不敏感）', () => {
     // 归一化与 postinstall 共用 paths.ts 的 readEnvByNormalizedKey；变异「不做小写归一化」
     // → 本用例红（Windows 上环境变量名大小写不敏感，探测不能只认小写拼法）。
-    process.env.NODE_ENV = 'test'
+    withoutNodeTest()
     delete process.env.QIYU_SKILL_DIR
     process.env.NPM_CONFIG_QIYU_SKILL_DIR = join(home, 'custom-upper')
     expect(resolveEntityDir()).toBe(join(home, 'custom-upper'))
@@ -287,7 +303,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
 
   it('QIYU_SKILL_DIR 优先于 npm_config_qiyu_skill_dir', () => {
     // 显式命令层变量优先于 npm 注入的配置（后者是 postinstall 现场留下的）。
-    process.env.NODE_ENV = 'test'
+    withoutNodeTest()
     process.env.QIYU_SKILL_DIR = join(home, 'explicit')
     process.env.npm_config_qiyu_skill_dir = join(home, 'from-npm')
     expect(resolveEntityDir()).toBe(join(home, 'explicit'))
@@ -296,11 +312,37 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
   it('npm_config_qiyu_skill_dir 的相对路径按 cwd 解析成绝对路径', () => {
     // 与 postinstall 同语义（installSkill 内部全部按绝对路径运算）；resolveEntityDir
     // 只做字符串解析，不碰磁盘——home 下并没有这个目录。
-    process.env.NODE_ENV = 'test'
+    withoutNodeTest()
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = './rel-skill'
     expect(resolveEntityDir()).toBe(resolve('./rel-skill'))
     expect(isAbsolute(resolveEntityDir()!)).toBe(true)
+  })
+
+  it('[21] NODE_ENV=test + npm_config 已设 + 未设 QIYU_SKILL_DIR → undefined（宿主变量不泄进测试）', () => {
+    // 变异「把 npm_config 分支挪回测试门之前」→ 本用例红（返回的是宿主路径而不是 undefined）。
+    process.env.NODE_ENV = 'test'
+    delete process.env.QIYU_SKILL_DIR
+    process.env.npm_config_qiyu_skill_dir = join(home, 'host-npm-entity')
+    expect(resolveEntityDir()).toBeUndefined()
+  })
+
+  it('[21] VITEST=true（NODE_ENV 被改成别的值）同样挡掉 npm_config', () => {
+    // vitest 恒设 VITEST=true：只认 NODE_ENV 时，CI 机器把 NODE_ENV 设成 production
+    // 就能让测试去读宿主 `.npmrc` 的 qiyu-skill-dir。变异「looksLikeNodeTest 去掉 VITEST」
+    // → 本用例红。
+    process.env.NODE_ENV = 'production'
+    process.env.VITEST = 'true'
+    delete process.env.QIYU_SKILL_DIR
+    process.env.npm_config_qiyu_skill_dir = join(home, 'host-npm-entity')
+    expect(resolveEntityDir()).toBeUndefined()
+  })
+
+  it('[21] 生产语义下 npm_config 仍被认识（门只关测试，不关生产）', () => {
+    // 与上面两条成对：只钉「挡」不钉「不挡」，实现直接 return undefined 也能全绿。
+    const env = { NODE_ENV: 'production', npm_config_qiyu_skill_dir: join(home, 'prod-npm-entity') }
+    const r = resolveEntityDirSources({ env, baseDir: home })
+    expect(r).toMatchObject({ decided: true, source: 'npm_config_qiyu_skill_dir', dir: join(home, 'prod-npm-entity') })
   })
 
   it('npm_config_qiyu_skill_dir 为空串 / 纯空白视为未设（测试门仍然生效）', () => {
@@ -308,6 +350,65 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = '   '
     expect(resolveEntityDir()).toBeUndefined()
+  })
+
+  // —— G3 审查 C3/C4：唯一实现 + 相对路径绝对化 ——
+
+  it('[C4] QIYU_SKILL_DIR 的相对路径按 baseDir 解析成绝对路径（不是原样返回）', () => {
+    // 此前 `QIYU_SKILL_DIR=rel` 原样返回：install 按进程 cwd 装、where 按另一处 cwd 比，
+    // 链接报 dangling。变异「去掉 path.resolve」→ 本用例红。
+    const r = resolveEntityDirSources({ env: { QIYU_SKILL_DIR: 'rel-entity' }, baseDir: join(home, 'base') })
+    expect(r).toMatchObject({ decided: true, source: 'QIYU_SKILL_DIR', dir: join(home, 'base', 'rel-entity') })
+  })
+
+  it('[C4] --dir 的相对路径同样按 baseDir 绝对化，且来源如实标 --dir', () => {
+    const r = resolveEntityDirSources({ flagDir: 'rel-flag', env: {}, baseDir: join(home, 'base') })
+    expect(r).toMatchObject({ decided: true, source: '--dir', dir: join(home, 'base', 'rel-flag') })
+  })
+
+  it('[C4] 默认位置也绝对化，但以注入的 home 为根（不解析成真实 home）', () => {
+    // 相对路径不得被解析成真实 home 下的路径：显式来源不经过 home，默认位置只用注入的 home。
+    const r = resolveEntityDirSources({ env: { NODE_ENV: 'production' }, home: join(home, 'fake-home') })
+    expect(r).toMatchObject({ decided: true, source: 'default', dir: join(home, 'fake-home', '.agents', 'skills', 'qiyu') })
+  })
+
+  it('[C3] npmRelativeBase：INIT_CWD 优先，缺失时退回注入的 cwd', () => {
+    // postinstall / 命令层 / 启动探测三处解析共用这条基准：「装到哪里」与「去哪里找」才是同一个。
+    expect(npmRelativeBase({ INIT_CWD: '/from/init' }, () => '/from/cwd')).toBe('/from/init')
+    expect(npmRelativeBase({}, () => '/from/cwd')).toBe('/from/cwd')
+    // 空白 INIT_CWD 视为未设（与其它环境变量同口径）。
+    expect(npmRelativeBase({ INIT_CWD: '  ' }, () => '/from/cwd')).toBe('/from/cwd')
+  })
+
+  it('[C3] 生产进程里 npm_config 的相对路径按 INIT_CWD（而不是进程 cwd）解析', () => {
+    // 这正是审查 [17] 的复现：postinstall 按 INIT_CWD 装到 install-cwd/my-skill，
+    // 而探测按包根 cwd 算出 pkgroot/my-skill —— 用户看到的「装好了却每条命令都说没装」。
+    const r = resolveEntityDirSources({
+      env: { NODE_ENV: 'production', INIT_CWD: join(home, 'install-cwd'), npm_config_qiyu_skill_dir: './my-skill' },
+      baseDir: npmRelativeBase(
+        { INIT_CWD: join(home, 'install-cwd') },
+        () => join(home, 'pkgroot'),
+      ),
+    })
+    expect(r).toMatchObject({ decided: true, dir: join(home, 'install-cwd', 'my-skill') })
+  })
+
+  it('[57] QIYU_DISABLE_SKILL_PROBE 显式关闭探测，且给出可解释的原因', () => {
+    // 显式开关：关闭时不留「为什么没提示」的空白（`skill where` 报告 entityUndeterminedNote）。
+    const env = { NODE_ENV: 'production', QIYU_DISABLE_SKILL_PROBE: '1', npm_config_qiyu_skill_dir: join(home, 'x') }
+    const r = resolveEntityDirSources({ env, home })
+    expect(r.decided).toBe(false)
+    if (!r.decided) expect(r.reason).toBe('env')
+    expect(entityUndeterminedNote(r)).toContain('QIYU_DISABLE_SKILL_PROBE')
+    // 显式来源不受显式开关影响（用户点名了目录，就没有「未确定」可言）。
+    expect(resolveEntityDirSources({ flagDir: join(home, 'y'), env, home })).toMatchObject({ decided: true })
+  })
+
+  it('[57] 测试门关掉时给出可解释的原因（不是静默）', () => {
+    const env = { NODE_ENV: 'test' }
+    const r = resolveEntityDirSources({ env, home })
+    expect(r.decided).toBe(false)
+    expect(entityUndeterminedNote(r, env)).toContain('--dir')
   })
 })
 

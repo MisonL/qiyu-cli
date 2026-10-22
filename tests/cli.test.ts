@@ -446,6 +446,41 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     expect(err).toBe('')
   })
 
+  // —— G3 追加审查 [21] / [57]：测试门的两侧与「不静默」 ——
+  it('[21] 宿主 npm_config_qiyu_skill_dir + NODE_ENV=test + 未设 QIYU_SKILL_DIR → 不读宿主路径', async () => {
+    // 变异「npm_config 分支排在测试门之前」→ 本用例红（meta.warnings 出现「未安装到宿主路径」）。
+    // 现实中 CI 机器的 `.npmrc` 里配了 `qiyu-skill-dir` 就会经 npm_config_* 注入所有子进程。
+    vi.stubEnv('NODE_ENV', 'test')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    vi.stubEnv('npm_config_qiyu_skill_dir', join(home, 'host-npm-entity'))
+    expect(await run(['--version'])).toBe(0)
+    const parsed = JSON.parse(out)
+    expect(parsed.ok).toBe(true)
+    expect('meta' in parsed, '宿主 npm_config 不得泄进测试进程').toBe(false)
+    expect(out).not.toContain('host-npm-entity')
+  })
+
+  it('[21] VITEST=true（NODE_ENV 被改成 production）同样挡掉宿主 npm_config', async () => {
+    // 变异「looksLikeNodeTest 去掉 VITEST」→ 本用例红。vitest 恒设 VITEST=true。
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('VITEST', 'true')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    vi.stubEnv('npm_config_qiyu_skill_dir', join(home, 'host-npm-entity'))
+    expect(await run(['--version'])).toBe(0)
+    expect('meta' in JSON.parse(out)).toBe(false)
+  })
+
+  it('[57] QIYU_DISABLE_SKILL_PROBE 显式关闭 → 不静默，meta.warnings 说明原因', async () => {
+    // 变异「关闭时不写任何提示」→ 本用例红。用户主动关了探测，得看得见「为什么没提示」。
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('QIYU_DISABLE_SKILL_PROBE', '1')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    expect(await run(['--version'])).toBe(0)
+    const parsed = JSON.parse(out)
+    expect(parsed.data).toEqual({ version: PACKAGE_VERSION, skill_contract_version: 1 })
+    expect(parsed.meta.warnings.join('\n')).toContain('QIYU_DISABLE_SKILL_PROBE')
+  })
+
   it('已安装且与包内一致（current）→ 0，无 meta 键', async () => {
     vi.stubEnv('QIYU_SKILL_DIR', entity)
     // 用真实安装命令铺出 current 态（清单的版本与内容哈希都与包内一致）。

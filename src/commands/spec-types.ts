@@ -20,8 +20,18 @@
 // 分层红线之外，它是 commands 层里最底层的一块，被各命令模块与 `tree.ts` 的
 // `COMMAND_TREE` 共同消费。
 
-/** 位置参数的取值域——`skill check` 据此比对正文里出现的表名 / 报表表 / 任务 id / 接口 id。 */
-export type Domain = 'tables' | 'report-tables' | 'task-ids' | 'endpoint-ids'
+/**
+ * 位置参数的取值域——`skill check` 据此比对正文里出现的表名 / 报表表 / 任务 id / 接口 id。
+ *
+ * ⚠️ `endpoint-ids` 与 `callable-endpoint-ids` 是**两个**域，不是一个域的两种写法（G3 审查 C2）：
+ *   · `endpoint-ids` —— 注册表全集，`api schema <id>` 用它。查形状对 `callable: false` 的
+ *     接口同样合法（实测 `api schema crm.modifyOrder` 退出码 0），用 callable 子集会让
+ *     正文里合法的 schema 查询被判 `unknown_positional`（假阳性）。
+ *   · `callable-endpoint-ids` —— 只含 `callable: true`，`api call <id>` 用它。调不可调用的
+ *     接口运行时必然 exit 2（实测 `api call crm.modifyOrder` → 「接口不可主动调用」），
+ *     用全集会让这条**必然失败**的调用被判合法（假阴性，正是 check 要防的）。
+ */
+export type Domain = 'tables' | 'report-tables' | 'task-ids' | 'endpoint-ids' | 'callable-endpoint-ids'
 
 export interface FlagSpec {
   name: string

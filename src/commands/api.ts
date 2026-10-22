@@ -39,12 +39,16 @@ export const API_SPECS: CommandSpec[] = [
   {
     path: ['api', 'call'],
     flags: [...GLOBAL_FLAGS, ...CALL_FLAGS],
-    positionals: [{ name: '接口id', domain: 'endpoint-ids' }],
+    // `callable-endpoint-ids`（G3 审查 C2）：`api call` 只能调 `callable: true` 的接口，
+    // 用全集会把 `api call crm.modifyOrder`（真实 exit 2「不可主动调用」）判成合法。
+    positionals: [{ name: '接口id', domain: 'callable-endpoint-ids' }],
     rejected: REJECTED_FLAGS,
   },
   {
     path: ['api', 'schema'],
     flags: [...GLOBAL_FLAGS, ...SCHEMA_FLAGS],
+    // 与 `api call` 不同：`api schema` 只查形状，对 `callable: false` 的接口同样合法
+    // （实测 `api schema crm.modifyOrder` → 退出码 0），所以这里用全集 `endpoint-ids`。
     positionals: [{ name: '接口id', domain: 'endpoint-ids' }],
     rejected: REJECTED_FLAGS,
   },

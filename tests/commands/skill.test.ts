@@ -439,6 +439,28 @@ describe('skill where', () => {
     })
   })
 
+  it('[57] 探测被门挡掉时 where 如实报告原因（不静默）', async () => {
+    // 变异「门关掉时不写任何提示」→ 本用例红。用户在自己设了 NODE_ENV=test 的容器里
+    // 看不到「未安装/已过期」提示，where 必须说清「为什么没提示、怎么让它提示」。
+    // 本文件 beforeEach 设了 NODE_ENV=test 且 QIYU_SKILL_DIR='' → 门关着。
+    expect(await skillCommand(['where'])).toBe(0)
+    expect(metaWarnings()).toContain('实体目录未确定')
+    expect(metaWarnings()).toContain('QIYU_SKILL_DIR')
+  })
+
+  it('[57] 显式给了 QIYU_SKILL_DIR 时门不生效：实体照常报告、且不报「未确定」', async () => {
+    // 启动探测只认 env 级显式来源（`--dir` 是逐命令参数，cli.run() 的探测看不到它）。
+    // 变异「门无条件生效」→ 本用例红（QIYU_SKILL_DIR 是显式来源，必须照常报告）。
+    vi.stubEnv('QIYU_SKILL_DIR', entity)
+    expect(await skillCommand(['where'])).toBe(0)
+    expect(metaWarnings()).not.toContain('实体目录未确定')
+    expect(data().entity).toMatchObject({ path: entity, source: 'QIYU_SKILL_DIR' })
+    // 对照：`--dir` 同样照常报告（命令层自己解析，与启动探测无关）。
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({ path: entity, source: '--dir' })
+  })
+
   it('是纯只读命令：探测后链接与实体原样保留', async () => {
     mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
@@ -503,6 +525,37 @@ describe('skill check', () => {
     expect(violations.length).toBeGreaterThan(0)
     expect(violations[0]).toMatchObject({ rule: 'unknown_command' })
     expect(String(violations[0]?.detail)).toContain('qiyu nope')
+  })
+
+  // ⚠️ 这条用例存在的唯一理由：**消费生产接线**。`tests/skill/check.test.ts` 的 `ctx`
+  // 是测试本地组装的，`commands/skill.ts` 里 `checkContext()` 的域闭集被换错它看不见
+  // （实测：把 `callable-endpoint-ids` 截断成 `.slice(0, 5)`，那边 32 条全绿）。包内正文
+  // 用的又都是 `<接口id>` 占位符，默认 check 同样不可见。这里往实体目录写**具体**接口 id、
+  // 走 `--installed` 基准，让断言落在真实的 `checkContext()` 上。
+  //   - `data.overview.session`：callable，且在 callable 子集里排第 14 位（下标 13）
+  //     → 任何「截断/换域」变异都会把它判成 unknown_positional。
+  //   - `crm.modifyOrder`：注册表里真实存在但 `callable: false` → schema 合法、call 必报。
+  it('[C2] 生产 checkContext：api call 认 callable 子集、api schema 认全集（具体接口 id 端到端）', async () => {
+    mkdirSync(entity, { recursive: true })
+    writeFileSync(join(entity, 'SKILL.md'), [
+      '# 域接线探针',
+      '',
+      '- 形状查询：`qiyu api schema crm.modifyOrder`',
+      '- 调用：`qiyu api call data.overview.session --body {}`',
+      '',
+    ].join('\n'))
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(0)
+    // 变异「callable 子集截断」→ 这里冒出 unknown_positional（data.overview.session 不在前 5）
+    // 变异「endpoint-ids 换成 callable 子集」→ 这里冒出 unknown_positional（crm.modifyOrder 不在子集）
+    expect(data().violations).toEqual([])
+
+    // 反向对照（假阴性防线）：同一条不可调用 id 换到 api call，必须报出来。
+    writeFileSync(join(entity, 'SKILL.md'), '# 域接线探针\n\n`qiyu api call crm.modifyOrder`\n')
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(1)
+    const violations = data().violations as Array<Record<string, unknown>>
+    expect(violations[0]).toMatchObject({ rule: 'unknown_positional' })
+    expect(String(violations[0]?.detail)).toContain('crm.modifyOrder')
   })
 
   it('--installed 与 --compare 互斥 → 2', async () => {
@@ -583,6 +636,178 @@ describe('skill check', () => {
     expect((d.differences as string[]).join('\n')).toContain('不存在')
   })
 
+  // —— G3 审查 C3/C4：实体目录解析的唯一实现 + 相对路径绝对化 ——
+  it('[C4] --dir 给相对路径 → install 与 where 看到同一个绝对路径（不再 install 报 ok / where 报 dangling）', async () => {
+    // 复现：此前 `--dir rel` 原样返回，install 按进程 cwd 装、where 按同一 cwd 比，
+    // 但链接目标按相对路径算出 → where 报 dangling。绝对化之后两处必然一致。
+    // 变异「去掉 path.resolve」→ 本用例红（entity.path 不是绝对路径）。
+    const rel = 'qiyu-rel-entity'
+    const cwd = process.cwd()
+    process.chdir(home)
+    try {
+      expect(await skillCommand(['install', '--dir', rel, '--no-link'])).toBe(0)
+      expect(data().entity_dir).toBe(join(home, rel))
+      out = ''; err = ''
+      expect(await skillCommand(['where', '--dir', rel])).toBe(0)
+      expect(data().entity).toMatchObject({ path: join(home, rel), source: '--dir', state: 'ok' })
+    } finally {
+      process.chdir(cwd)
+    }
+  })
+  it('[C4] QIYU_SKILL_DIR 给相对路径 → where 报告绝对路径（source 如实标注）', async () => {
+    // 变异「QIYU_SKILL_DIR 分支不 resolve」→ 本用例红。
+    const cwd = process.cwd()
+    process.chdir(home)
+    try {
+      vi.stubEnv('QIYU_SKILL_DIR', 'qiyu-rel-env')
+      expect(await skillCommand(['where'])).toBe(0)
+      expect(data().entity).toMatchObject({ path: join(home, 'qiyu-rel-env'), source: 'QIYU_SKILL_DIR' })
+    } finally {
+      process.chdir(cwd)
+    }
+  })
+  it('[C3] npm_config 通道的命令层与探测层口径一致（同一 env 解析出同一个目录）', async () => {
+    // 变异「命令层与探测层各写一份解析」→ 本用例红。
+    const envDir = join(home, 'npm-entity')
+    vi.stubEnv('npm_config_qiyu_skill_dir', envDir)
+    expect(await skillCommand(['where'])).toBe(0)
+    expect(data().entity).toMatchObject({ path: envDir, source: 'npm_config_qiyu_skill_dir' })
+  })
+  // —— 追加审查 [55]：实体目录不可读必须与「没有 SKILL.md」分开 ——
+  //
+  // [55] 的根因：`hasSkillDoc` 用 `catch { return false }` 把所有失败都当成「没有 SKILL.md」。
+  // 实测 chmod 000 时 stat(SKILL.md) 抛 EACCES（父目录读不了）→ 报「未安装（没有 SKILL.md）」。
+  // 现在三态分明：读不到 SKILL.md 本身（EACCES/ELOOP）→ checkFailed「不可读」；
+  // ENOENT → 「未安装」；其余错误由 probeDir 先拦。
+  /** 一个「可 stat、但读不了 SKILL.md」的实体：SKILL.md 是指向自身 → stat 抛 ELOOP。 */
+  const unreadableEntity = (): string => {
+    mkdirSync(entity, { recursive: true })
+    symlinkSync('SKILL.md', join(entity, 'SKILL.md'))
+    return entity
+  }
+
+  it('[55] SKILL.md 读不了（ELOOP）→ check --installed 报环境错误，不谎报「没有 SKILL.md」', async () => {
+    unreadableEntity()
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(1)
+    const e = envelope().error as Record<string, unknown>
+    expect(e.code).toBe('skill_check_failed')
+    // 变异「probeSkillDoc 的 unreadable 分支退回 missing」→ 本用例红（消息变成「没有 SKILL.md」）。
+    expect(String(e.message)).not.toContain('没有 SKILL.md')
+  })
+  it('[55] 实体目录确实没有 SKILL.md → 仍然报「未安装（没有 SKILL.md）」', async () => {
+    // 与上面那条成对：只钉一侧时「恒报不可读」也能活。
+    mkdirSync(entity, { recursive: true })
+    writeFileSync(join(entity, 'notes.md'), '# 随手记\n')
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(1)
+    const e = envelope().error as Record<string, unknown>
+    expect(String(e.message)).toContain('没有 SKILL.md')
+  })
+  it('[55] SKILL.md 读不了 → check --compare 记「不可读」并退 1', async () => {
+    unreadableEntity()
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+    const d = data()
+    expect((d.differences as string[]).join('\n')).toContain('不可读')
+  })
+  it('[55] 实体目录本身不可读（chmod 000）→ check --installed 报环境错误（probeDir 通道）', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return // root 下 chmod 不拦读取
+    const locked = join(home, 'locked')
+    mkdirSync(join(locked, 'entity'), { recursive: true })
+    chmodSync(locked, 0o000)
+    try {
+      expect(await skillCommand(['check', '--installed', '--dir', join(locked, 'entity')])).toBe(1)
+      const e = envelope().error as Record<string, unknown>
+      expect(e.code).toBe('skill_check_failed')
+      expect(String(e.message)).toContain('EACCES')
+    } finally {
+      chmodSync(locked, 0o755)
+    }
+  })
+
+  // —— 追加审查 [55]：EACCES 不得把用户引向 --force 这条死路 ——
+  it('[55] 实体目录不可读（EACCES）→ install 的警告改说「修权限」，不再推荐 --force', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    chmodSync(entity, 0o000)
+    try {
+      out = ''; err = ''
+      expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+      expect(data().status).toBe('skipped')
+      // 变异「删除命令层的警告改写」→ 原文案「确认后可用 --force 覆盖」回来 → 本用例红。
+      expect(metaWarnings()).toContain('不可读')
+      expect(metaWarnings()).toContain('请先修复目录权限')
+      expect(metaWarnings()).not.toContain('确认后可用 --force 覆盖')
+    } finally {
+      chmodSync(entity, 0o755)
+    }
+  })
+  it('[55] 真正的内容不同（可读）→ 仍然推荐 --force（改写只针对不可读）', async () => {
+    // 与上面成对：只钉「不可读不推 --force」时把「推 --force」整段删掉也能绿。
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    writeFileSync(join(entity, 'SKILL.md'), '# 用户改过的正文\n')
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    expect(metaWarnings()).toContain('确认后可用 --force 覆盖')
+  })
+
+  // —— 追加审查 [54]：写盘失败必须如实报告，不许谎报成功 ——
+  //
+  // [54] 说的是「全部文件写失败时仍报 status:'updated'、exit 0，与 warnings 自相矛盾」。
+  // 实测（本 worktree，临时 home）当前的形态是：一个文件都没写进去时 status 报的是
+  // `installed`（plan 阶段算出来的值）+ 每个文件一条「写入 X 失败」+ 「本次未能完整写入」。
+  // 即 status **仍然只反映 plan**（B2 的根因），与 [54] 同源。本组只允许改
+  // `src/commands/{tree,skill,skill-specs,spec-types}.ts`、`src/skill/detect.ts`、
+  // `src/postinstall.ts`——`install.ts` 的 swapIn/planInstall 归 B 组（B2）。
+  // 所以这里钉住**命令层能保证的部分**：失败必须逐条写进 meta.warnings（不静默），
+  // 且实体零变化、不得出现「已存在/已是最新」这类成功话术；status 的语义修正留给 B2。
+  it('[54] 实体目录只读 → 每个文件写入失败都必须进 warnings（不静默，且实体零变化）', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return
+    mkdirSync(entity, { recursive: true })
+    chmodSync(entity, 0o500) // 只读：目录内不能 rename/新建
+    try {
+      expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+      expect(metaWarnings()).toContain('未能完整写入')
+      expect(metaWarnings()).toContain('写入 SKILL.md 失败')
+      // 实体一个字节没变，也没有任何「已存在」的成功话术。
+      expect(existsSync(join(entity, 'SKILL.md'))).toBe(false)
+      expect(metaWarnings()).not.toContain('已存在')
+      // ⚠️ 已知缺口（B2 负责，G3 不越界）：`status` 仍报 plan 阶段的 'installed'。
+      expect(data().status).toBe('installed')
+    } finally {
+      chmodSync(entity, 0o755)
+    }
+  })
+
+  // —— G3 审查 C1：skill 家族自身必须在命令闭集里 ——
+  it('[C1] 正文引用 `qiyu skill install/check/where` 不被判 unknown_command', async () => {
+    // 变异「COMMAND_TREE 去掉 ...SKILL_SPECS」→ 本用例红（unknown_command + 退 1）。
+    // 这三条是 CLI 自己天天在教的命令（detect 的提示、README），check 不能把它们判成不存在。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    writeFileSync(join(entity, 'SKILL.md'), [
+      '# 正文',
+      '',
+      '升级后运行 `qiyu skill install --force` 更新正文。',
+      '排查：`qiyu skill where`；复核：`qiyu skill check --installed`。',
+      '',
+    ].join('\n'))
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(0)
+    expect(data().violations).toEqual([])
+  })
+  it('[C1] skill 家族自身的漂移对 check 可见：`skill where --bogus` / `skill install extra` 判违规', async () => {
+    // 变异「tree 不含 skill」时这两行都会是 unknown_command（规则不同）→ 本用例红。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    writeFileSync(join(entity, 'SKILL.md'), [
+      '# 正文',
+      '',
+      '`qiyu skill where --bogus`',
+      '`qiyu skill install extra`',
+      '',
+    ].join('\n'))
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(1)
+    const rules = (data().violations as Array<Record<string, unknown>>).map((v) => v.rule)
+    expect(rules).toEqual(['unknown_flag', 'unknown_positional'])
+  })
   it('--compare 内容哈希失败 → 退出 1（无法完成比较 ≠ 一致，审查 M3）', async () => {
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
     // 非 .md 文件不参与 checkSkillDir，但参与 contentHash——把它变成不可读，

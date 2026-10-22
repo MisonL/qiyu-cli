@@ -12,7 +12,7 @@ import { REPORT_TABLES } from '../../src/query/metric-catalog.js'
 import { SYNC_TASKS } from '../../src/sync/registry.js'
 import { allEndpoints } from '../../src/core/registry/index.js'
 
-// 与 `commands/skill.ts` 的 CHECK_CONTEXT 同一份组装方式：四个取值域闭集从各自权威
+// 与 `commands/skill.ts` 的 `checkContext()` 同一份组装方式：五个取值域闭集从各自权威
 // 位置取，`check.ts` 自己不认识它们（终审 I1 的分层要求）。
 const ctx: CheckContext = {
   tree: COMMAND_TREE,
@@ -23,6 +23,7 @@ const ctx: CheckContext = {
     'report-tables': REPORT_TABLES,
     'task-ids': SYNC_TASKS.map((t) => t.id),
     'endpoint-ids': allEndpoints().map((e) => e.id),
+    'callable-endpoint-ids': allEndpoints().filter((e) => e.callable).map((e) => e.id),
   },
 }
 
@@ -81,6 +82,27 @@ describe('checkSkillDoc', () => {
       rule: 'unknown_positional',
       detail: expect.stringContaining('totally.bogus.id'),
     })
+    expect(r.violations[0]!.detail).toContain('endpoint-ids 闭集')
+  })
+  // G3 审查 C2：`api call` 与 `api schema` 的接口 id 域**不同**——
+  // `api call` 只能调 callable 的（运行时 exit 2），`api schema` 对不可调用的同样合法（只查形状）。
+  // 两条都钉住：只钉一侧时「两个域互换」或「都用全集」会有一侧活着。
+  it('[C2] api call 调不可调用接口 → unknown_positional（运行时必然 exit 2）', () => {
+    const nonCallable = allEndpoints().find((e) => !e.callable)!
+    const r = checkSkillDoc(`\`qiyu api call ${nonCallable.id}\``, ctx)
+    expect(r.violations).toHaveLength(1)
+    expect(r.violations[0]).toMatchObject({
+      rule: 'unknown_positional',
+      detail: expect.stringContaining('callable-endpoint-ids 闭集'),
+    })
+  })
+  it('[C2] api schema 查同一个不可调用接口 → 零违规（只查形状，合法）', () => {
+    const nonCallable = allEndpoints().find((e) => !e.callable)!
+    expect(checkSkillDoc(`\`qiyu api schema ${nonCallable.id}\``, ctx).violations).toEqual([])
+  })
+  it('[C2] api schema 查不存在的接口 → unknown_positional（全集域照样拦截）', () => {
+    const r = checkSkillDoc('`qiyu api schema totally.bogus.id`', ctx)
+    expect(r.violations[0]).toMatchObject({ rule: 'unknown_positional' })
     expect(r.violations[0]!.detail).toContain('endpoint-ids 闭集')
   })
   it('位置参数取值不在域闭集 → unknown_positional（表名）', () => {

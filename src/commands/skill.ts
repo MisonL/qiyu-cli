@@ -14,7 +14,8 @@
 //   · where   —— 纯只读：报告实体路径与各 agent 链接状态，**只报告、不修复、不删除**
 //                （spec D2）。要修复就让用户重跑 `qiyu skill install`。
 //
-// 实体定位统一为 `--dir` > `QIYU_SKILL_DIR` > `defaultEntityDir(os.homedir())`；
+// 实体定位统一为 `--dir` > `QIYU_SKILL_DIR` > `npm_config_qiyu_skill_dir` > `defaultEntityDir(os.homedir())`
+// （唯一实现在 `skill/detect.ts` 的 `resolveEntityDirSources`，G3 审查 C3）；
 // home 一律取 `os.homedir()`（测试用 `HOME` 注入，绝不读写真实 `~`）。
 //
 // `skill where` 的逐 agent 兜异常（brief 硬要求）：`linkState` 对自指/成环链接抛 ELOOP，
@@ -26,7 +27,7 @@
 
 import { lstatSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve as resolvePath } from 'node:path'
+import { join } from 'node:path'
 import { describeArgs, fail, ok, setSkillWarning, usageFail } from '../output.js'
 import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from '../core/edition.js'
 import { ERROR_KINDS } from '../core/errors.js'
@@ -35,12 +36,16 @@ import { TABLES } from '../store/schema.js'
 import { REPORT_TABLES } from '../query/metric-catalog.js'
 import { SYNC_TASKS } from '../sync/registry.js'
 import { COMMAND_TREE } from './tree.js'
+import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult } from '../skill/check.js'
 import { contentHash, installSkill, planInstall, type InstallPlan } from '../skill/install.js'
-import { resolveSkillSourceDir } from '../skill/detect.js'
 import {
-  AGENT_SKILL_SUBDIRS, agentSkillDirs, agentSkillSubdir, defaultEntityDir, LINK_NAME, linkState,
-  readEnvByNormalizedKey, type AgentDir, type LinkState,
+  entityUndeterminedNote, npmRelativeBase, resolveEntityDirSources, resolveSkillSourceDir,
+  type EntitySource,
+} from '../skill/detect.js'
+import {
+  AGENT_SKILL_SUBDIRS, agentSkillDirs, agentSkillSubdir, LINK_NAME, linkState,
+  type AgentDir, type LinkState,
 } from '../skill/paths.js'
 
 /**
@@ -62,7 +67,8 @@ const SKILL_USAGE = `用法：qiyu skill <子命令> [参数]
                            报告实体目录与各 agent 链接状态（只读，不修复；
                            无法判定时 state=unknown、exists=null——不是「不存在」）
 
-实体目录定位：--dir > QIYU_SKILL_DIR > ~/.agents/skills/qiyu
+实体目录定位：--dir > QIYU_SKILL_DIR > npm_config_qiyu_skill_dir > ~/.agents/skills/qiyu
+              （相对路径一律按当前目录解析成绝对路径）
 --link 取值：claude-code、codex（可重复）。点名的 agent 目录不存在时不创建目录，只警告。
 --dry-run 只输出将要做的动作，不写盘。
 
@@ -164,25 +170,59 @@ function parseOrFail(argv: string[], spec: FlagSpec, sub: string): Parsed | numb
 
 // —— 路径与错误工具 ——
 
-type EntitySource = '--dir' | 'QIYU_SKILL_DIR' | 'npm_config_qiyu_skill_dir' | 'default'
+/** 实体来源类型（唯一实现在 `skill/detect.ts` 的 `resolveEntityDirSources`）。 */
+export type { EntitySource }
 
 /**
  * 实体定位：`--dir` > `QIYU_SKILL_DIR` > `npm_config_qiyu_skill_dir` > 默认位置。
  *
  * 第三条是 postinstall 的安装通道（spec C5：`npm i -g` 时唯一跨版本可用的自定义位置）。
  * 不认它的话，用 postinstall 装到自定义目录的用户跑 `skill where` / `check --installed`
- * 会对着默认路径报「未安装」，和漂移探测（detect.resolveEntityDir，同一套读取）口径不一致
- * （终审 I2 的连带面）。空白视为未设，与另外两条同口径。
+ * 会对着默认路径报「未安装」，与漂移探测口径分叉（终审 I2 的连带面）。
+ *
+ * ⚠️ 这里**不再自己写一遍优先级**（G3 审查 C3）：三份实现各自漂移过，现在统一调用
+ * `detect.resolveEntityDirSources`。相对路径按 `process.cwd()` 解析成绝对路径（C4）——
+ * 此前 `--dir rel` 原样返回，install 按进程 cwd 装而 where 按另一处 cwd 比，链接报 dangling。
+ * 命令层**不受测试门影响**（用户显式给的位置照常使用）；测试门只作用于启动探测
+ * （`cli.ts` 的 `resolveEntityDir`）与本层的「未确定」情形（见 `skill where` 的报告）。
+ *
+ * ⚠️ **基准为什么是 `process.cwd()` 而不是 `npmRelativeBase`（INIT_CWD ?? cwd）**：
+ * 本层解析的 `--dir` / `QIYU_SKILL_DIR` 都是用户在自己 shell 里敲的，天然以进程 cwd 为基准；
+ * 而 npm 生命周期里 `INIT_CWD` 是「用户敲 npm 的目录」，可能与本进程 cwd 不同。若本层也
+ * 吃 `INIT_CWD`，`npm test`（恒设 `INIT_CWD` = 仓库根）下任何 chdir 到临时目录的用例都会
+ * 被解析回仓库根——相对路径逃出临时 home，正是 C4 要防的那类事故。真实发行形态是 `npx`
+ * （cwd 与 INIT_CWD 相同），二者不产生分叉；`npm run` 里带相对 `npm_config_qiyu_skill_dir`
+ * 调用 qiyu 属于窄边界，见 G3 报告的「遗留边界」。
  */
-function resolveEntity(flagDir: string | undefined): { dir: string; source: EntitySource } {
-  if (flagDir !== undefined) return { dir: flagDir, source: '--dir' }
-  const env = process.env.QIYU_SKILL_DIR?.trim()
-  if (env !== undefined && env !== '') return { dir: env, source: 'QIYU_SKILL_DIR' }
-  const fromNpm = readEnvByNormalizedKey(process.env, 'npm_config_qiyu_skill_dir')
-  if (fromNpm !== undefined) {
-    return { dir: resolvePath(fromNpm), source: 'npm_config_qiyu_skill_dir' }
-  }
-  return { dir: defaultEntityDir(homedir()), source: 'default' }
+export function resolveEntity(flagDir: string | undefined): { dir: string; source: EntitySource } {
+  const resolved = resolveEntityDirSources({
+    flagDir,
+    env: process.env,
+    baseDir: process.cwd(),
+    // 命令层不受测试门影响：`skill where --dir X` 在测试里必须照常报告 X，
+    // 且它必须认 npm_config 这条 postinstall 通道（终审 I2）。
+    testGate: false,
+  })
+  if (!resolved.decided) throw new Error('实体目录解析失败：既无显式来源也无默认位置')
+  return { dir: resolved.dir, source: resolved.source }
+}
+
+/**
+ * 启动探测（`cli.run()` 里那次）的同一条解析：门开着时返回目录，门关着时返回 undefined
+ * 并给出原因。`skill where` 用它解释「为什么这次没有未安装/已过期提示」（追加审查 [57]：
+ * 门不能静默）。
+ *
+ * npm 生命周期里 cwd 是包根，所以基准取 `INIT_CWD ?? cwd`（与 postinstall 同一条）。
+ */
+function startupProbeStatus(): { dir: string | undefined; note: string | undefined } {
+  const env = process.env
+  const resolved = resolveEntityDirSources({
+    env,
+    baseDir: npmRelativeBase(env, () => process.cwd()),
+    home: homedir(),
+  })
+  if (resolved.decided) return { dir: resolved.dir, note: undefined }
+  return { dir: undefined, note: entityUndeterminedNote(resolved, env) }
 }
 
 function isErrno(err: unknown, code: string): boolean {
@@ -349,11 +389,8 @@ function planLinks(
 }
 
 async function skillInstall(argv: string[]): Promise<number> {
-  const parsed = parseOrFail(
-    argv,
-    { value: ['--dir'], repeat: ['--link'], bool: ['--force', '--dry-run', '--no-link'] },
-    'install',
-  )
+  // flag 集从 `SKILL_SPECS` 派生（G3 审查 C1）：解析器与 spec 同源，不再有第二份事实源。
+  const parsed = parseOrFail(argv, skillFlagSpecs('install'), 'install')
   if (typeof parsed === 'number') return parsed
 
   const linkNames = [...new Set(parsed.lists.get('--link') ?? [])]
@@ -475,6 +512,22 @@ async function skillInstall(argv: string[]): Promise<number> {
   if (result.status === 'skipped' && result.warnings.length === 0) {
     allWarnings.push(`skill 已存在且内容一致，未做任何改动：${result.entityDir}`)
   }
+  // 追加审查 [55]：install.ts 把「读不了实体目录」归进「内容不同」，统一收尾
+  // 「确认后可用 --force 覆盖」——但 --force 对不可读目录**必然失败**（EACCES），
+  // 提示把用户引向死路。命令层手里有 errno 的真实文案，把这条死路改成可行动的修法。
+  // （修法的另一半——install.ts 的 reason 文案——在 install.ts，归 B 组；本层先把
+  // 面向用户的输出改对，那一侧落地后这里的改写自然变成恒等映射。）
+  for (let i = 0; i < allWarnings.length; i++) {
+    const w = allWarnings[i]!
+    if (!w.startsWith('读取实体目录内容失败（')) continue
+    const tail = '，未覆盖；确认后可用 --force 覆盖：'
+    const at = w.indexOf(tail)
+    if (at === -1) continue
+    allWarnings[i] = w.slice(0, at)
+      + '，未覆盖；该目录**不可读**，--force 对不可读目录同样会失败（不要用它试）。'
+      + '请先修复目录权限（如 chmod u+rx）再重跑：'
+      + w.slice(at + tail.length)
+  }
 
   // ⚠️ installSkill 的显式 linkDirs 分支用 `agentSkillDirs(home)` 反查 agent 名；
   // 该调用失败（如无关的 `~/.claude` 是文件 → ENOTDIR）时它静默退回「目录路径当
@@ -504,26 +557,50 @@ async function skillInstall(argv: string[]): Promise<number> {
 // —— skill check ——
 
 /**
- * 校验上下文：命令树 / 表名 / 错误 kind / 四个位置参数取值域，全部从各自的权威位置取。
+ * 校验上下文：命令树 / 表名 / 错误 kind / 位置参数取值域，全部从各自的权威位置取。
  *
  * 取值域闭集在这里组装而不是让 `skill/check.ts` 去 import：`skill/` 若要自己取
  * `SYNC_TASKS` / `allEndpoints()` / `REPORT_TABLES`，就会把 sync 注册表乃至
  * `core/registry/specs.json` 拉进它的依赖面（`skill check` 因此连带加载注册表）。
- * 命令层本来就是组合根，四个闭集在这里并成一份注入。
+ * 命令层本来就是组合根，各份闭集在这里并成一份注入。
  *
  * `domains` 的键是 `Domain` 联合类型（`Record<Domain, …>`）：`Domain` 加一个成员而
  * 不在这里补闭集，`tsc` 会直接报缺键——取值域不会悄悄少一份。
+ *
+ * ⚠️ `endpoint-ids`（全集）与 `callable-endpoint-ids`（`callable: true` 子集）是**两个**域
+ * （G3 审查 C2，各按命令的取值域引用）：`api schema` 查形状，对不可调用的接口同样合法；
+ * `api call` 只能调 callable 的——给 `api call` 用全集会把一条运行时必然 exit 2 的
+ * 调用判成合法（假阴性），给 `api schema` 用 callable 子集会把合法的 schema 查询判成
+ * `unknown_positional`（假阳性）。两份闭集来自同一个 `allEndpoints()`，不会各抄一份。
+ *
+ * ⚠️ **惰性构造**（G3 追加审查 [20]）：这份上下文只有 `skill check` 用得到，而
+ * `skill install` / `skill where` 与契约校验无关——值域闭集（154 条接口 id 等在内存里
+ * 现拼出来的数组）不该在模块初始化时就建好。改成首次用到才建、之后复用同一个对象。
+ * ⚠️ 如实说明边界：**模块图**没变——本文件仍静态 import `tree.js` 与各注册表
+ * （`findSpec` 与各闭集都来自它们）。要把「install/where 不加载命令图」做实，得把
+ * `cli.ts` 的分派改成动态 import；而 `cli.js` 本来就静态 import 全部 8 个命令模块
+ * （审查 [20] 复核实测：cli.js 子图 58 个模块 = skill.js 的 57 个 + cli.js 本身，
+ * diff 为空），对真实 CLI 用户是零收益。这条取舍已写进 G3 报告。
  */
-const CHECK_CONTEXT: CheckContext = {
-  tree: COMMAND_TREE,
-  tableNames: TABLES.map((t) => t.name),
-  errorKinds: ERROR_KINDS,
-  domains: {
-    tables: TABLES.map((t) => t.name),
-    'report-tables': REPORT_TABLES,
-    'task-ids': SYNC_TASKS.map((t) => t.id),
-    'endpoint-ids': allEndpoints().map((e) => e.id),
-  },
+let checkContextCache: CheckContext | undefined
+/** 校验上下文（首次调用时构造，之后复用同一份——闭集是常量，语义与急切构造相同）。 */
+function checkContext(): CheckContext {
+  if (checkContextCache === undefined) {
+    const endpoints = allEndpoints()
+    checkContextCache = {
+      tree: COMMAND_TREE,
+      tableNames: TABLES.map((t) => t.name),
+      errorKinds: ERROR_KINDS,
+      domains: {
+        tables: TABLES.map((t) => t.name),
+        'report-tables': REPORT_TABLES,
+        'task-ids': SYNC_TASKS.map((t) => t.id),
+        'endpoint-ids': endpoints.map((e) => e.id),
+        'callable-endpoint-ids': endpoints.filter((e) => e.callable).map((e) => e.id),
+      },
+    }
+  }
+  return checkContextCache
 }
 
 type CheckOutcome = { result: CheckResult } | { error: string }
@@ -531,7 +608,7 @@ type CheckOutcome = { result: CheckResult } | { error: string }
 /** `checkSkillDir` 不吞错（brief 第 2 条）：命令层守卫，转成可读错误。 */
 function runCheck(dir: string): CheckOutcome {
   try {
-    return { result: checkSkillDir(dir, CHECK_CONTEXT) }
+    return { result: checkSkillDir(dir, checkContext()) }
   } catch (e) {
     return { error: errMsg(e) }
   }
@@ -580,21 +657,35 @@ function probeDir(dir: string): DirProbe {
  * 只凭「目录存在」会把空目录（或只有几个无关 `.md` 的目录）判成「已安装且通过」，
  * 与「目录不存在 → 未安装」自相矛盾。`SKILL.md` 是 skill 的入口正文，它不在就不是
  * 一份可用的安装。
+ *
+ * ⚠️ **「没有」与「读不了」必须分开**（追加审查 [55]）：此前 `catch { return false }`
+ * 把所有失败都当成「目录里没有 SKILL.md」——实体目录 `chmod 000` 时输出
+ * 「skill 未安装到 …（目录里没有 SKILL.md）」，那是**事实错误**（目录读不了 ≠ 没有
+ * SKILL.md），用户会去重装而不是修权限。现在三态分明：读到了 / 确实没有 / 读不了。
  */
-function hasSkillDoc(dir: string): boolean {
+type SkillDocProbe =
+  | { kind: 'present' }
+  | { kind: 'missing' }
+  | { kind: 'unreadable'; error: string }
+
+function probeSkillDoc(dir: string): SkillDocProbe {
   try {
-    return statSync(join(dir, 'SKILL.md')).isFile()
-  } catch {
-    return false
+    return statSync(join(dir, 'SKILL.md')).isFile() ? { kind: 'present' } : { kind: 'missing' }
+  } catch (e) {
+    // ENOENT：目录里确实没有 SKILL.md（真·未安装）。其余错误（EACCES/EPERM/ELOOP…）
+    // 是「读不了」，必须如实报环境问题，不能谎报成「没有」。
+    if (isErrno(e, 'ENOENT')) return { kind: 'missing' }
+    return { kind: 'unreadable', error: errMsg(e) }
   }
 }
 
+/** `hasSkillDoc` 的布尔版（只回答「有 / 没有」，不回答「读不了」）——保留给旧调用点。 */
+function hasSkillDoc(dir: string): boolean {
+  return probeSkillDoc(dir).kind === 'present'
+}
+
 async function skillCheck(argv: string[]): Promise<number> {
-  const parsed = parseOrFail(
-    argv,
-    { value: ['--dir'], repeat: [], bool: ['--installed', '--compare'] },
-    'check',
-  )
+  const parsed = parseOrFail(argv, skillFlagSpecs('check'), 'check')
   if (typeof parsed === 'number') return parsed
 
   const wantInstalled = parsed.flags.has('--installed')
@@ -632,7 +723,11 @@ async function skillCheck(argv: string[]): Promise<number> {
       })
     }
     // 审查 M2：空目录 / 零 SKILL.md 不是「已安装且通过」。
-    if (!hasSkillDoc(entityDir)) return notInstalled(entityDir, '目录里没有 SKILL.md')
+    // 追加审查 [55]：读不了 ≠ 没有——不可读时走 checkFailed（环境异常），只有确实
+    // 没有 SKILL.md 才报「未安装」。变异「退回统一的 hasSkillDoc」→ 对应用例红。
+    const doc = probeSkillDoc(entityDir)
+    if (doc.kind === 'unreadable') return checkFailed(entityDir, doc.error)
+    if (doc.kind === 'missing') return notInstalled(entityDir, '目录里没有 SKILL.md')
     const outcome = runCheck(entityDir)
     if ('error' in outcome) return checkFailed(entityDir, outcome.error)
     return reportSingle('installed', entityDir, outcome.result)
@@ -659,43 +754,51 @@ async function skillCheck(argv: string[]): Promise<number> {
     differences.push(`已安装路径不可用：${entityDir}（${why}）`)
     installedData.error = why
     installedFailed = true
-  } else if (!hasSkillDoc(entityDir)) {
-    // 审查 M2：`present` 与 `--installed` 的「已安装」判据必须一致——没有 SKILL.md
-    // 的目录不算一份可用的安装，不能判成 present=true + 零违规。
-    differences.push(`已安装目录缺少 SKILL.md：${entityDir}`)
-    installedData.error = '缺少 SKILL.md'
-    installedFailed = true
   } else {
-    const outcome = runCheck(entityDir)
-    if ('error' in outcome) {
-      differences.push(`已安装目录读取失败：${outcome.error}`)
-      installedData.error = outcome.error
+    // 追加审查 [55]：读不了 ≠ 没有 SKILL.md（同 `--installed` 的判据）。
+    const doc = probeSkillDoc(entityDir)
+    if (doc.kind === 'unreadable') {
+      differences.push(`已安装目录不可读：${entityDir}（${doc.error}）`)
+      installedData.error = doc.error
+      installedFailed = true
+    } else if (doc.kind === 'missing') {
+      // 审查 M2：`present` 与 `--installed` 的「已安装」判据必须一致——没有 SKILL.md
+      // 的目录不算一份可用的安装，不能判成 present=true + 零违规。
+      differences.push(`已安装目录缺少 SKILL.md：${entityDir}`)
+      installedData.error = '缺少 SKILL.md'
       installedFailed = true
     } else {
-      installedViolations = outcome.result.violations.length
-      installedUnverifiable = outcome.result.warnings
-      installedData.present = true
-      installedData.violations = outcome.result.violations
-      installedData.unverifiable = outcome.result.warnings
-      // 内容哈希与违规数：前者回答「两份正文是否一致」，后者回答「判定结果是否一致」。
-      try {
-        if (contentHash(pkgDir) !== contentHash(entityDir)) {
-          // 「正文内容不同」计入 bad：`--compare` 的存在意义就是发现「装过旧版、包升级
-          // 改了正文」（spec D2.1 的洞），而它在 CI 里唯一的信号就是退出码。同一
-          // `differences` 数组里的其它成因（目录不存在 / 缺 SKILL.md / 读取失败 / 哈希
-          // 比较失败）一律退 1，唯独内容漂移退 0 = 检测到了却不报（终审 I3）。
-          differences.push('包内与已安装的正文内容不同（content_hash 不一致）')
+      const outcome = runCheck(entityDir)
+      if ('error' in outcome) {
+        differences.push(`已安装目录读取失败：${outcome.error}`)
+        installedData.error = outcome.error
+        installedFailed = true
+      } else {
+        installedViolations = outcome.result.violations.length
+        installedUnverifiable = outcome.result.warnings
+        installedData.present = true
+        installedData.violations = outcome.result.violations
+        installedData.unverifiable = outcome.result.warnings
+        // 内容哈希与违规数：前者回答「两份正文是否一致」，后者回答「判定结果是否一致」。
+        try {
+          if (contentHash(pkgDir) !== contentHash(entityDir)) {
+            // 「正文内容不同」计入 bad：`--compare` 的存在意义就是发现「装过旧版、包升级
+            // 改了正文」（spec D2.1 的洞），而它在 CI 里唯一的信号就是退出码。同一
+            // `differences` 数组里的其它成因（目录不存在 / 缺 SKILL.md / 读取失败 / 哈希
+            // 比较失败）一律退 1，唯独内容漂移退 0 = 检测到了却不报（终审 I3）。
+            differences.push('包内与已安装的正文内容不同（content_hash 不一致）')
+            installedFailed = true
+          }
+        } catch (e) {
+          // 审查 M3：无法完成内容比较 = 无法完成比较，退出码必须为 1。
+          differences.push(`内容哈希比较失败：${errMsg(e)}`)
           installedFailed = true
         }
-      } catch (e) {
-        // 审查 M3：无法完成内容比较 = 无法完成比较，退出码必须为 1。
-        differences.push(`内容哈希比较失败：${errMsg(e)}`)
-        installedFailed = true
-      }
-      if (installedViolations !== pkgOutcome.result.violations.length) {
-        differences.push(
-          `违规数不同：包内 ${pkgOutcome.result.violations.length} 处，已安装 ${installedViolations} 处`,
-        )
+        if (installedViolations !== pkgOutcome.result.violations.length) {
+          differences.push(
+            `违规数不同：包内 ${pkgOutcome.result.violations.length} 处，已安装 ${installedViolations} 处`,
+          )
+        }
       }
     }
   }
@@ -778,11 +881,16 @@ function probeAgentLinks(
 }
 
 async function skillWhere(argv: string[]): Promise<number> {
-  const parsed = parseOrFail(argv, { value: ['--dir'], repeat: [], bool: [] }, 'where')
+  const parsed = parseOrFail(argv, skillFlagSpecs('where'), 'where')
   if (typeof parsed === 'number') return parsed
 
   const { dir: entityDir, source } = resolveEntity(parsed.values.get('--dir'))
   const warnings: string[] = []
+
+  // 启动探测的门是否在这台机器/这个进程上关掉了（追加审查 [57]）：where 是排查命令，
+  // 它要说清「为什么别的命令没有 meta.warnings」。显式来源不经过门，此时不会有这条。
+  const probe = startupProbeStatus()
+  if (probe.note !== undefined) warnings.push(probe.note)
 
   // 实体状态：只读 stat；ENOENT 是「未安装」，其余异常如实记 unknown。
   let entity: Record<string, unknown>

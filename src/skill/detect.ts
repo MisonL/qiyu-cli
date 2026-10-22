@@ -21,12 +21,17 @@
 // 同参重复调用复用，不重复 stat；换参（如测试换 tmp 目录）重新探测。缓存键必须含
 // 全部三个参数——测试在同进程内换 tmp 目录跑，只按实体目录做键就会命中错结果。
 //
-// 测试环境（NODE_ENV === 'test'）的 `resolveEntityDir()` 返回 undefined、跳过真实
-// 路径探测。理由有二（全局约束 + brief Step 5）：
+// 测试环境（`NODE_ENV === 'test'` 或 vitest 的 `VITEST=true`）的 `resolveEntityDir()`：
+// 实体目录**不是**由 `--dir` / `QIYU_SKILL_DIR` 显式指定时返回 undefined、跳过真实路径
+// 探测；`npm_config_qiyu_skill_dir` 排在测试门**之后**读取（G3 审查 [21]：宿主环境里的
+// `npm_config_*` 不得泄进测试）。理由有二（全局约束 + brief Step 5）：
 //   ① **测试绝不读写真实 `~`**——探测会 stat 用户 home 下的实体目录；
 //   ② **探测结果不得依赖开发者机器装没装过 skill**——否则同一份测试在本机装过的
 //      人那里全量多出 meta.warnings、没装过的人不出现，`toEqual({...})` 断言两种
 //      命运。修门（跳过探测）而不是放宽断言。
+// 另有显式开关 `QIYU_DISABLE_SKILL_PROBE`（在 `resolveEntityDirSources` 的测试门里读）；
+// 被抑制时 `entityUndeterminedNote()` 给出可解释的文案——`skill where` 与 `--version` 的
+// meta.warnings 都据此如实报告，不静默。
 //
 // 分层：`skill/` 叶子层，只 import `node:*`、`core/` 与 `skill/` 内部；`output.ts`
 // **不得** import 本文件（Task 14 分层红线钉住）——提示文案经
@@ -204,30 +209,181 @@ export function skillWarning(
 }
 
 /**
- * 实体目录解析。优先顺序：
- *   1. 显式 `QIYU_SKILL_DIR`（空白视为未设，取 trim 后的值）；
- *   2. `npm_config_qiyu_skill_dir` —— postinstall 用的**同一条通路**（spec C5：环境
- *      变量是 npm 12 下唯一跨版本可用的自定义位置入口）。探测必须认识它，否则
- *      「装到自定义目录」之后每条命令都会误报「未安装」并建议用户再装一份（终审 I2；
- *      照那句提示做会装出**第二份实体**，比不提示更坏）。相对路径按 cwd 解析成绝对
- *      路径——与 postinstall 的语义一致（`installSkill` 内部全部按绝对路径运算）；
- *      本函数只做字符串解析，不碰磁盘。
- *   3. 测试环境（NODE_ENV === 'test'）且上面两个都没显式设置 → undefined：
- *      **测试绝不读写真实 `~`**，且探测结果不得依赖开发者机器装没装过 skill
- *      （否则全量测试的 meta 形态随机器而变，理由见文件头注释）。
- *   4. 默认位置 `~/.agents/skills/qiyu`。
+ * 实体目录的来源（`skill where` / `install` 输出里的 `entity.source` 即此字符串）。
  *
- * 键名归一化（小写 + `-`→`_`）与 postinstall 共用 `paths.ts` 的
- * `readEnvByNormalizedKey`；`npm_config_qiyu_skill_dir` 与 `NPM_CONFIG_QIYU_SKILL_DIR`
- * 命中同一键。
+ * 四个取值与解析优先级一一对应：`--dir` > `QIYU_SKILL_DIR` > `npm_config_qiyu_skill_dir`
+ * > 默认位置（`~/.agents/skills/qiyu`）。`npm_config_qiyu_skill_dir` 是 postinstall 的
+ * 安装通道（spec C5），命令层与探测层都必须认识它——否则「装到自定义目录」之后每条命令
+ * 都误报「未安装」并建议再装一份（终审 I2）。
  */
-export function resolveEntityDir(): string | undefined {
-  const explicit = process.env.QIYU_SKILL_DIR?.trim()
-  if (explicit !== undefined && explicit !== '') return explicit
-  const fromNpm = readEnvByNormalizedKey(process.env, 'npm_config_qiyu_skill_dir')
-  if (fromNpm !== undefined) return path.resolve(fromNpm)
-  if (process.env.NODE_ENV === 'test') return undefined
-  return defaultEntityDir(homedir())
+export type EntitySource = '--dir' | 'QIYU_SKILL_DIR' | 'npm_config_qiyu_skill_dir' | 'default'
+
+/** 实体目录「没有确定」的原因——`skill where` 据此如实解释，而不是让下游静默。 */
+export type EntityUndeterminedReason = 'env' | 'node-test'
+
+export type EntityDirResolution =
+  | {
+      /** 实体目录的**绝对路径**（相对来源已按基准解析，G3 审查 C4）。 */
+      dir: string
+      /** 目录是由哪条规则定位到的（如实标注来源）。 */
+      source: EntitySource
+      decided: true
+    }
+  | {
+      dir: undefined
+      source: undefined
+      decided: false
+      /** 为什么没有确定（显式关闭开关，或测试门）。 */
+      reason: EntityUndeterminedReason
+    }
+
+export interface EntityDirOptions {
+  /** `skill install/check/where --dir` 的取值（未 trim；空白视为未设）。 */
+  flagDir?: string | undefined
+  /** 注入的环境变量（生产传 `process.env`；postinstall 传 `opts.env`）。 */
+  env: NodeJS.ProcessEnv
+  /** 默认实体位置的 home 根（缺省 `os.homedir()`）。 */
+  home?: string
+  /**
+   * 相对路径的基准（缺省 `process.cwd()`）。
+   *
+   * npm 生命周期脚本必须传 `INIT_CWD ?? cwd`（见 `npmRelativeBase`）——npm 的 cwd 是包根，
+   * 用户设 `npm_config_qiyu_skill_dir=./my-skill` 时按包根解析会装进 `node_modules`。
+   */
+  baseDir?: string
+  /**
+   * 是否应用测试门（缺省 true）。
+   *
+   * `postinstall` 传 false：它的 `env` 是 npm 给的（`npm_command === 'exec'` 等判据已经
+   * 挡掉了测试借用的场景），与 `npm i -g` 的语义保持一致；而 `npm test` 自己会设
+   * `INIT_CWD`/`VITEST`，若 postinstall 也吃这道门，测试就永远覆盖不到安装分支。
+   *
+   * **命令层**（`skill install/check/where`）也传 false：它是用户**显式发起**的查询，
+   * 必须如实回答「实体在哪」——终审 I2 要求命令层认 `npm_config_qiyu_skill_dir` 这条
+   * postinstall 通道（否则装到自定义目录的用户每条命令都误报「未安装」）。把它门掉
+   * 只会把「装第二份实体」的病换一种形式治。
+   */
+  testGate?: boolean
+}
+
+/**
+ * npm 相对路径的唯一基准（G3 审查 C3）：`INIT_CWD ?? cwd`。
+ *
+ * npm 生命周期脚本的 cwd 是**包根**（`node_modules/qiyu-cli`），用户执行 install 的目录
+ * 是 `INIT_CWD`（spec C6：npm/pnpm/yarn/bun 唯一都提供的变量）。三处解析（postinstall、
+ * 命令层、启动探测）统一按这一条基准走，「装到哪里」与「去哪里找」因此是同一个目录——
+ * 此前 detect/commands 用 cwd、postinstall 用 INIT_CWD，相对路径下两者必然分叉。
+ *
+ * `cwd()` 由调用方注入（生产传 `() => process.cwd()`），本函数不直接读进程状态。
+ */
+export function npmRelativeBase(env: NodeJS.ProcessEnv, cwd: () => string): string {
+  const init = env.INIT_CWD?.trim()
+  if (init !== undefined && init !== '') return init
+  return cwd()
+}
+
+/** 显式关闭启动探测的环境变量（用户 / 嵌入式调用方可用）。 */
+export const DISABLE_PROBE_ENV = 'QIYU_DISABLE_SKILL_PROBE'
+
+/**
+ * 「进程像 Node 测试」——`NODE_ENV=test` **或** vitest 恒设的 `VITEST=true`。
+ *
+ * 两个都认的理由：只认 `NODE_ENV` 时，宿主把 `NODE_ENV` 改成别的值就能让本仓库的测试
+ * 去读宿主路径（审查 [21] 的同一类风险：`.npmrc` 里的 `qiyu-skill-dir` 经 `npm_config_*`
+ * 注入所有子进程）；只认 `VITEST` 时，裸 `node --test` 之类的运行器又不受控。
+ * 两个都认 = 覆盖面最广、误伤最小。
+ */
+export function looksLikeNodeTest(env: NodeJS.ProcessEnv): boolean {
+  return env.NODE_ENV === 'test' || env.VITEST === 'true'
+}
+
+/**
+ * 实体目录解析——**全仓唯一实现**（G3 审查 C3/C4）。
+ *
+ * 优先顺序：`--dir` > `QIYU_SKILL_DIR` > **[测试门]** > `npm_config_qiyu_skill_dir` > 默认。
+ *
+ * **所有来源的相对路径一律按 `baseDir` 解析成绝对路径**（C4）：此前 `--dir rel` 与
+ * `QIYU_SKILL_DIR=rel` 原样返回，`skill install` 按进程 cwd 装、`skill where` 按另一个
+ * cwd 比，链接状态因此报 dangling。绝对化之后三条通路对同一条相对写法得到同一个目录。
+ *
+ * **测试门**（追加审查 [21]/[57]）：
+ *   · `QIYU_DISABLE_SKILL_PROBE` 置真 → 关闭（**显式**开关：调用方主动要求不探测）。
+ *   · 进程像 Node 测试（`NODE_ENV=test` / `VITEST=true`）→ 关闭**隐式**来源：
+ *     `npm_config_qiyu_skill_dir` 与默认位置都不再读，返回 `decided: false` + 原因。
+ *     显式来源（`--dir` / `QIYU_SKILL_DIR`）在门之前，照常生效——测试正是靠它注入临时目录。
+ *     理由有二：测试绝不读写真实 `~`（全局硬约束）；宿主 `.npmrc` 里的 `qiyu-skill-dir`
+ *     会经 `npm_config_*` 注入**所有**子进程，不得泄进测试、把漂移提示写进模块级
+ *     `pendingSkillWarning` 污染同文件后续断言（审查 [21] 实测 4 条红）。
+ *
+ * ⚠️ 与审查 [57] 的偏差（如实记录，不静默）：[57] 要求「`NODE_ENV=test` 本身不再作为
+ * 关闭条件，只认显式开关」。本仓库**没有 vitest setup 文件**，且大量用例直接依赖
+ * 「`NODE_ENV=test` → 探测被门挡掉」这条既有语义（`tests/skill/detect.test.ts`、
+ * `tests/cli.test.ts` 各有用例逐条钉住），改成纯显式开关是一次全量测试改造，超出 G3 的
+ * 授权范围。按 brief 允许的第二条路走：门保留，但**留下可解释痕迹**——
+ * `entityUndeterminedNote()` 给出「为什么没定位到实体目录」的文案，`skill where` 如实报告，
+ * 且显式开关 `QIYU_DISABLE_SKILL_PROBE` 始终可用。
+ *
+ * 本函数**纯字符串**，不碰磁盘；`home` 只用于默认位置（`defaultEntityDir(home)`），
+ * 显式来源不经过 home——因此绝不会把相对路径解析成真实 home 下的路径。
+ *
+ * 三个调用方（`commands/skill.ts` 的 `resolveEntity`、`cli.ts` 的启动探测、`postinstall.ts`）
+ * 都走这里；加第四种来源时只改这一处。
+ */
+export function resolveEntityDirSources(opts: EntityDirOptions): EntityDirResolution {
+  const base = opts.baseDir ?? process.cwd()
+  const resolve = (raw: string, source: EntitySource): EntityDirResolution => ({
+    dir: path.resolve(base, raw),
+    source,
+    decided: true,
+  })
+  const flagDir = opts.flagDir?.trim()
+  if (flagDir !== undefined && flagDir !== '') return resolve(flagDir, '--dir')
+  const explicit = opts.env.QIYU_SKILL_DIR?.trim()
+  if (explicit !== undefined && explicit !== '') return resolve(explicit, 'QIYU_SKILL_DIR')
+  if (opts.testGate !== false) {
+    if (readEnvByNormalizedKey(opts.env, DISABLE_PROBE_ENV) !== undefined) {
+      return { dir: undefined, source: undefined, decided: false, reason: 'env' }
+    }
+    if (looksLikeNodeTest(opts.env)) {
+      return { dir: undefined, source: undefined, decided: false, reason: 'node-test' }
+    }
+  }
+  const fromNpm = readEnvByNormalizedKey(opts.env, 'npm_config_qiyu_skill_dir')
+  if (fromNpm !== undefined) return resolve(fromNpm, 'npm_config_qiyu_skill_dir')
+  return resolve(defaultEntityDir(opts.home ?? homedir()), 'default')
+}
+
+/** 实体未确定时给用户看的一句话（已确定返回 undefined）。 */
+export function entityUndeterminedNote(
+  resolution: EntityDirResolution,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (resolution.decided) return undefined
+  if (resolution.reason === 'env') {
+    return `skill 实体目录未确定：探测已被 ${DISABLE_PROBE_ENV} 显式关闭；需要时显式给出 --dir 或 QIYU_SKILL_DIR`
+  }
+  return 'skill 实体目录未确定：当前进程像 Node 测试（NODE_ENV='
+    + `${env.NODE_ENV ?? ''}，VITEST=${env.VITEST ?? ''}），且没有显式给出 --dir 或 QIYU_SKILL_DIR`
+    + '——不读宿主 npm_config_qiyu_skill_dir、也不碰真实 home。'
+    + '要定位实体请显式给出 --dir 或 QIYU_SKILL_DIR'
+}
+
+/**
+ * 启动探测（`cli.run()`）用的实体目录：唯一实现 + 测试门。
+ *
+ * 返回 undefined = 本次不探测。**命令层**不走这个函数——它按用户给的位置办事，
+ * 需要「未确定」时用 `skill where` 的显式报告（`entityUndeterminedNote`）。
+ */
+export function resolveEntityDir(
+  opts: { env?: NodeJS.ProcessEnv; home?: string; baseDir?: string } = {},
+): string | undefined {
+  const env = opts.env ?? process.env
+  const resolved = resolveEntityDirSources({
+    env,
+    ...(opts.home !== undefined ? { home: opts.home } : {}),
+    ...(opts.baseDir !== undefined ? { baseDir: opts.baseDir } : {}),
+  })
+  return resolved.decided ? resolved.dir : undefined
 }
 
 /**
