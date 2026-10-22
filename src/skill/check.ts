@@ -68,17 +68,21 @@ export interface CheckContext {
 }
 
 /**
- * 「第一个位置参数必须紧跟命令词」的命令路径。
+ * 「第一个位置参数必须紧跟命令词」的判据：**只**读 spec 的第一个槽位（`PositionalSpec.first`）。
  *
  * 真实 CLI 里 `api call` 把 `argv[0]` 直接当接口 id（`callOne` 的 `const [id] = argv`），
- * flag 写在它前面会得到「接口 id 必须是第一个参数」并退出 2。其余命令（`sync run` /
- * `db describe` / `stats fields`）的解析器先剥 flag，flag 与位置参数可以交错，**不能**
- * 一并套用这条规则 —— 否则 `qiyu sync run --full dim.staff` 这种合法写法会被误报。
+ * flag 写在它前面会得到「接口 id 必须是第一个参数」并退出 2。其余命令（`api schema` /
+ * `sync run` / `db describe` / `stats fields`）的解析器先剥 flag，flag 与位置参数可以交错，
+ * **不能**一并套用这条规则 —— 否则 `qiyu sync run --full dim.staff` 这种合法写法会被误报。
  *
- * ⚠️ 这是运行时约定的**第二事实源**：`CommandSpec` 里没有对应字段，而本组不能改
- * `commands/spec-types.ts`（别的组在并行改它）。将来应把它建模进 spec（见报告的遗留问题）。
+ * ⚠️ 这里**不再**维护命令路径清单（G1 的 `FIRST_POSITIONAL_STRICT` 已删）：那份清单是
+ * `CommandSpec` 之外的第二事实源，新增同类命令时只改解析器、漏改清单就会静默失效。
+ * 现在唯一的声明处是各命令模块的 spec（`api.ts` 的 `API_SPECS`），由
+ * `tests/commands/command-tree.test.ts` 的「解析器行为 vs spec 标记」反向对齐用例守着。
  */
-const FIRST_POSITIONAL_STRICT: readonly string[] = ['api call']
+function hasFirstPositionalRule(spec: CommandSpec): boolean {
+  return spec.positionals[0]?.first === true
+}
 
 /** 转义正则元字符：表名来自 `CheckContext` 注入，按字面匹配而不是正则模式。 */
 function escapeRegExp(text: string): string {
@@ -201,8 +205,9 @@ function checkCommand(cmd: CommandRef, ctx: CheckContext, violations: Violation[
   }
 
   // 3b：少数命令把 argv[0] 直接当第一个位置参数（`api call` 的接口 id）——flag 落在那个
-  // 槽位上同样退出 2（`qiyu api call --yes ticket.search`）。
-  if (FIRST_POSITIONAL_STRICT.includes(spec.path.join(' '))) {
+  // 槽位上同样退出 2（`qiyu api call --yes ticket.search`）。判据来自 spec 的槽位标记
+  // （`PositionalSpec.first`），本文件不再维护命令清单。
+  if (hasFirstPositionalRule(spec)) {
     const atSlot = cmd.flags.find((f) => f.tokenIndex === spec.path.length)
     if (atSlot) {
       violations.push({

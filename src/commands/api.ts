@@ -41,7 +41,12 @@ export const API_SPECS: CommandSpec[] = [
     flags: [...GLOBAL_FLAGS, ...CALL_FLAGS],
     // `callable-endpoint-ids`（G3 审查 C2）：`api call` 只能调 `callable: true` 的接口，
     // 用全集会把 `api call crm.modifyOrder`（真实 exit 2「不可主动调用」）判成合法。
-    positionals: [{ name: '接口id', domain: 'callable-endpoint-ids' }],
+    //
+    // ⚠️ `first: true`（G9）—— 唯一一条带位置纪律的命令：`callOne` 是 `const [id] = argv`，
+    // 把 `argv[0]` 直接当接口 id，`qiyu api call --yes ticket.search` 报「接口 id 必须是
+    // 第一个参数」退出 2。相邻的 `api schema` **不标**：它先用 `filter` 剥掉 flag 再取
+    // 位置参数，`api schema --pretty ticket.search` 与 `ticket.search --pretty` 同答。
+    positionals: [{ name: '接口id', domain: 'callable-endpoint-ids', first: true }],
     rejected: REJECTED_FLAGS,
   },
   {
