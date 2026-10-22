@@ -50,6 +50,7 @@
 //   它的接口有**逐行可信时间戳**，按天切片反而白白放大 31 倍窗口数。
 import { callPaced, nowIsoOf } from './pace.js'
 import { shanghaiDayIso } from '../day.js'
+import { MAX_SHANGHAI_SAFE_MS } from '../../core/time.js'
 import type { Store } from '../../store/types.js'
 import type { SyncTask, FetchResult, FetchCtx, WindowRef } from '../types.js'
 
@@ -332,8 +333,15 @@ export const REPORT_TASKS: SyncTask[] = [
         // C 中-4：脏时间戳逐行丢弃（与其他任务的脏单行口径一致），绝不因一行
         // 非数字/空串的 ts 抛 RangeError 断掉整窗。秒级 ts（10 位）静默落 1970 ——
         // 形态不符即丢弃（小时对齐的毫秒戳约 1.7e12，秒级差 1000 倍，判据取 > 1e11）。
+        //
+        // ⚠️ gap 2 的写路径同款收口：只有下界不够 —— 微秒误写（`1792467000000000000`）
+        // 远大于 1e11，能过旧判据，随后 `new Date(n).toISOString()`（本行 hour_ts）与
+        // `shanghaiDayIso(n)`（baseRow 的 stat_date）都抛 RangeError，**整窗 fetch 失败**
+        //（与读侧「一条脏值炸整条命令」同一失败模式）。上界取 `MAX_SHANGHAI_SAFE_MS`
+        // 而不是 `MAX_DATE_MS`：两者都要「能回显成 +08:00 ISO」，差 8h 就会在
+        // `shanghaiDayIso` 的偏移后一段重新抛。
         const n = Number(ts)
-        if (isEmptyKey(sid) || !Number.isFinite(n) || n <= 1e11) continue
+        if (isEmptyKey(sid) || !Number.isFinite(n) || n <= 1e11 || n > MAX_SHANGHAI_SAFE_MS) continue
         // 修复批 4：stat_date 按**本行的 hour_ts** 推导上海日（不再用窗口起点）——
         // 31 天窗口里行跨多个自然日，用窗口起点会把它们全标成窗口首日。
         // 删除范围仍是 [dayOf(w.start), dayOf(w.end)]（writeRows 的天对齐边界），

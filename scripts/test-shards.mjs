@@ -26,8 +26,37 @@ import { realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 const DEFAULT_SHARDS = 4
-const MAX_SHARDS = 8
+export const MAX_SHARDS = 8
 const DEFAULT_HEAP_MB = 2048
+
+/**
+ * 从环境变量字面量里解析分片数与堆上限（**纯函数**，不读 `process.env`、不 `process.exit`）。
+ *
+ * ⚠️ 拆成纯函数是为了**可测**（gap 9）：旧版直接在 `readOptions()` 里 `process.exit(2)`，
+ * 测试无法断言「非法值退 2」，只能绕道 spawn 一个真进程；而 spawn 真 runner 会递归调
+ * vitest（2026-10-05 事故的直接原因）。现在非法值以 `{ error }` 返回，由调用方决定退出码。
+ *
+ * @returns `{ shards, heapMb, warn? }` 或 `{ error }`（error 是给用户看的中文说明）
+ */
+export function parseOptions(env = {}) {
+  const rawShardsText = env.QIYU_TEST_SHARDS
+  const rawShards = Number(rawShardsText ?? DEFAULT_SHARDS)
+  if (!Number.isInteger(rawShards) || rawShards < 1) {
+    return { error: `QIYU_TEST_SHARDS 必须是 ≥1 的整数，收到：${rawShardsText}` }
+  }
+  const shards = Math.min(rawShards, MAX_SHARDS)
+  // 上限告警随结果带出（不在解析里就往 stderr 写），测试可断言它「有没有出现」。
+  const warn = rawShards > MAX_SHARDS
+    ? `⚠️ QIYU_TEST_SHARDS=${rawShards} 超过上限，按 ${MAX_SHARDS} 片执行`
+    : undefined
+
+  const rawHeapText = env.QIYU_TEST_HEAP_MB
+  const heapMb = Number(rawHeapText ?? DEFAULT_HEAP_MB)
+  if (!Number.isInteger(heapMb) || heapMb < 256) {
+    return { error: `QIYU_TEST_HEAP_MB 必须是 ≥256 的整数，收到：${rawHeapText}` }
+  }
+  return { shards, heapMb, ...(warn === undefined ? {} : { warn }) }
+}
 
 /**
  * 读分片数与堆上限。**只在真正要跑测试时调用** —— 顶层直接读环境变量会让
@@ -35,20 +64,13 @@ const DEFAULT_HEAP_MB = 2048
  * （2026-10-20 实测踩到：审查者 import 它核对分片构成，结果无意中跑了两次全量）。
  */
 function readOptions() {
-  const rawShards = Number(process.env.QIYU_TEST_SHARDS ?? DEFAULT_SHARDS)
-  if (!Number.isInteger(rawShards) || rawShards < 1) {
-    console.error(`QIYU_TEST_SHARDS 必须是 ≥1 的整数，收到：${process.env.QIYU_TEST_SHARDS}`)
+  const parsed = parseOptions(process.env)
+  if (parsed.error !== undefined) {
+    console.error(parsed.error)
     process.exit(2)
   }
-  const shards = Math.min(rawShards, MAX_SHARDS)
-  if (rawShards > MAX_SHARDS) {
-    console.warn(`⚠️ QIYU_TEST_SHARDS=${rawShards} 超过上限，按 ${MAX_SHARDS} 片执行`)
-  }
-  const heapMb = Number(process.env.QIYU_TEST_HEAP_MB ?? DEFAULT_HEAP_MB)
-  if (!Number.isInteger(heapMb) || heapMb < 256) {
-    console.error(`QIYU_TEST_HEAP_MB 必须是 ≥256 的整数，收到：${process.env.QIYU_TEST_HEAP_MB}`)
-    process.exit(2)
-  }
+  const { shards, heapMb, warn } = parsed
+  if (warn !== undefined) console.warn(warn)
   return { shards, heapMb }
 }
 
@@ -58,16 +80,46 @@ const walk = (dir) =>
     return statSync(p).isDirectory() ? walk(p) : p.endsWith('.test.ts') ? [p] : []
   })
 
-/** 按文件字节数降序贪心装箱：最重的先放，每次放进当前最轻的一片。 */
-export function planShards(files, count) {
-  const sorted = [...files].sort((a, b) => statSync(b).size - statSync(a).size)
+/**
+ * 按文件字节数降序贪心装箱：最重的先放，每次放进当前最轻的一片。
+ * ⚠️ `sizeOf` 可注入（缺省 `statSync` 取真实大小）：测试要构造「几片 / 每片多重」
+ * 而不必在磁盘上造真实文件（纯函数层即可覆盖「不重不漏」）。
+ */
+export function planShards(files, count, sizeOf = (f) => statSync(f).size) {
+  const sorted = [...files].sort((a, b) => sizeOf(b) - sizeOf(a))
   const buckets = Array.from({ length: count }, () => ({ files: [], weight: 0 }))
   for (const f of sorted) {
     const lightest = buckets.reduce((a, b) => (a.weight <= b.weight ? a : b))
     lightest.files.push(f)
-    lightest.weight += statSync(f).size
+    lightest.weight += sizeOf(f)
   }
   return buckets.map((b) => b.files).filter((g) => g.length > 0)
+}
+
+/**
+ * 跑一个分片时，spawn 的参数表（**纯函数**，不 spawn）。
+ *
+ * ⚠️ 每一片都必须带三样东西，缺一不可（2026-10-05 事故的防护，见文件头）：
+ *   1. `--max-old-space-size=${heapMb}` —— 堆上限，把「无界增长」关进笼子；
+ *   2. `--maxWorkers=1` —— 不让 vitest 按 CPU 数起满 worker；
+ *   3. `--no-file-parallelism` —— 文件之间也不并行。
+ * 拆成纯函数是为了让测试能**逐字**断言这三样都在，而不是靠源文本正则碰运气。
+ */
+export function buildShardArgs({ heapMb, vitestBin, files }) {
+  return [
+    `--max-old-space-size=${heapMb}`,
+    vitestBin, 'run',
+    '--maxWorkers=1', '--no-file-parallelism',
+    ...files,
+  ]
+}
+
+/**
+ * 分片结果 → 整体退出码（**纯函数**）。任一片非 0 即整体 1 —— 分片不得掩盖失败：
+ * 一片失败而其余通过时，若返回 0，CI 会绿着放行（这正是要防的静默失败）。
+ */
+export function aggregateExit(results) {
+  return results.some((r) => r.code !== 0) ? 1 : 0
 }
 
 const vitestBin = join(process.cwd(), 'node_modules', 'vitest', 'vitest.mjs')
@@ -77,12 +129,7 @@ function runShard(files, index, heapMb) {
     const started = Date.now()
     const child = spawn(
       process.execPath,
-      [
-        `--max-old-space-size=${heapMb}`,
-        vitestBin, 'run',
-        '--maxWorkers=1', '--no-file-parallelism',
-        ...files,
-      ],
+      buildShardArgs({ heapMb, vitestBin, files }),
       { stdio: 'inherit', env: process.env },
     )
     child.on('close', (code, signal) => {
@@ -115,12 +162,12 @@ async function main() {
   }
   console.log(`  合计墙钟：${(totalMs / 1000).toFixed(1)}s\n`)
 
-  const failed = results.filter((r) => r.code !== 0)
-  if (failed.length > 0) {
+  const exit = aggregateExit(results)
+  if (exit !== 0) {
+    const failed = results.filter((r) => r.code !== 0)
     console.error(`❌ ${failed.length}/${results.length} 片失败`)
-    return 1
   }
-  return 0
+  return exit
 }
 
 // ⚠️ **只在被直接执行时才跑**：本模块导出 `planShards` 供核对分片构成用，

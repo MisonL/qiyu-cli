@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { shanghaiDayStart, parseTimeArg, msToShanghaiIso } from '../../src/core/time.js'
+import {
+  shanghaiIso, shanghaiDayStart, shanghaiDayIso, parseTimeArg, msToShanghaiIso,
+  MAX_DATE_MS, MAX_SHANGHAI_SAFE_MS, SHANGHAI_OFFSET_MS,
+} from '../../src/core/time.js'
 
 const T = Date.UTC(2026, 8, 15, 4, 0, 0)   // 上海 2026-09-15 12:00
 describe('core/time —— 上海时间（E 与 D 同源）', () => {
@@ -85,5 +88,56 @@ describe('core/time —— 上海时间（E 与 D 同源）', () => {
     expect(msToShanghaiIso(8.7e15)).toBe('8700000000000000')
     // 超大相对时长同样回 usage，而不是崩到 internal
     expect(parseTimeArg('999999999d', () => T, '--since')).toBeNull()
+  })
+
+  // gap 2：`shanghaiIso` 先加上海偏移再 `toISOString()`，所以判据必须落在「偏移后」的量上。
+  // 旧守卫 `|ms| > MAX_DATE_MS` 放行了 (MAX_DATE_MS−8h, MAX_DATE_MS] 这段——守卫放行、实际抛。
+  it('shanghaiIso 在 Date 上限附近不抛 RangeError（gap 2，判据落在偏移后）', () => {
+    // 常量关系：安全上界 = Date 上限 − 8h（偏移后的量）。
+    expect(MAX_SHANGHAI_SAFE_MS).toBe(MAX_DATE_MS - SHANGHAI_OFFSET_MS)
+
+    // 四个边界值一律不抛。
+    for (const v of [MAX_DATE_MS, MAX_DATE_MS - 1, MAX_SHANGHAI_SAFE_MS + 1, MAX_SHANGHAI_SAFE_MS]) {
+      expect(() => shanghaiIso(v), String(v)).not.toThrow()
+    }
+
+    // 旧守卫放行、实际抛的那一段（(safe, MAX_DATE_MS]）现在原样回显为字符串。
+    expect(shanghaiIso(MAX_DATE_MS)).toBe(String(MAX_DATE_MS))
+    expect(shanghaiIso(MAX_DATE_MS - 1)).toBe(String(MAX_DATE_MS - 1))
+    expect(shanghaiIso(MAX_SHANGHAI_SAFE_MS + 1)).toBe(String(MAX_SHANGHAI_SAFE_MS + 1))
+
+    // 恰在安全上界：偏移后仍可表示，输出合法 +08:00 ISO。
+    const atSafe = shanghaiIso(MAX_SHANGHAI_SAFE_MS)
+    expect(atSafe).toMatch(/\+08:00$/)
+    expect(() => new Date(atSafe)).not.toThrow()
+    expect(atSafe).toBe('+275760-09-13T00:00:00+08:00')
+  })
+
+  it('msToShanghaiIso 的上界与 shanghaiIso 同源，边界值不抛（gap 2）', () => {
+    // number 入参：安全上界内合法 ISO，界外原样回显。
+    expect(msToShanghaiIso(MAX_SHANGHAI_SAFE_MS)).toBe('+275760-09-13T00:00:00+08:00')
+    expect(msToShanghaiIso(MAX_DATE_MS)).toBe(String(MAX_DATE_MS))
+    // 字符串入参同样不抛（旧实现 msToShanghaiIso('8640000000000000') → THROW）。
+    expect(msToShanghaiIso(String(MAX_DATE_MS))).toBe(String(MAX_DATE_MS))
+    expect(msToShanghaiIso(String(MAX_SHANGHAI_SAFE_MS))).toBe('+275760-09-13T00:00:00+08:00')
+    // ⚠️ 本函数**自己的**守卫（而不是委托给 shanghaiIso 的那一层）必须有判别力：
+    // 同一个越界时刻写成 ISO 串时，`Number('+275760-…Z')` 是 NaN → 走 `Date.parse` 分支
+    // 得到 MAX_DATE_MS。若这里仍用 `> MAX_DATE_MS`，它会被放行到 `shanghaiIso`，
+    // 而本函数把返回值 `String(v)` 直接交给它 —— 后者回显的是**转换后的数字**，不是原串。
+    // 两个守卫同源（MAX_SHANGHAI_SAFE_MS）时，原串原样回显。
+    expect(msToShanghaiIso('+275760-09-13T00:00:00Z')).toBe('+275760-09-13T00:00:00Z')
+  })
+
+  it('shanghaiDayIso 的负侧极端值不抛 RangeError（gap 2 的日对齐分支）', () => {
+    // shanghaiDayStart 向下取整会把极端负值推出 Date 范围（实测 -8.64e15 → -8640000028800000），
+    // 旧实现 new Date(dayStart).toISOString() 随即抛 RangeError。
+    expect(() => shanghaiDayIso(-MAX_DATE_MS)).not.toThrow()
+    expect(() => shanghaiDayIso(-MAX_SHANGHAI_SAFE_MS)).not.toThrow()
+    // 越界分支原样回显 String(ms)（保住可解释）。
+    expect(shanghaiDayIso(-MAX_DATE_MS)).toBe(String(-MAX_DATE_MS))
+    // 正侧上限附近仍能产出合法 UTC ISO（dayIso 走的是 .000Z 形态）。
+    const atSafe = shanghaiDayIso(MAX_SHANGHAI_SAFE_MS)
+    expect(() => new Date(atSafe)).not.toThrow()
+    expect(atSafe).toMatch(/Z$/)
   })
 })

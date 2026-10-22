@@ -24,7 +24,7 @@ import { suggestNames, thrownToQueryExit } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
 import type { StoreConfig } from '../store/types.js'
-import { msToShanghaiIso } from '../core/time.js'
+import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
 import type { StoreFlags } from './store-flags.js'
@@ -122,7 +122,11 @@ function shapeSqlOf(kind: TimeColumnKind, col: string): string[] {
   // 声称数据从 1970 年开始。写路径对秒级时间戳已有同口径（`n <= 1e11` 丢弃）。
   if (kind === 'epoch-ms') {
     const n = `TRY_CAST(${col} AS BIGINT)`
-    return [`${n} > 100000000000`, `${n} <= 8640000000000000`]
+    // ⚠️ gap 2：上界必须与 `msToShanghaiIso` 的守卫同源（`MAX_SHANGHAI_SAFE_MS`，
+    // = MAX_DATE_MS − 8h）。旧值 `8640000000000000` 恰好把「偏移后越界、回显时抛
+    // RangeError」的值放进候选集 —— 一条脏值让整条 `db tables` 变 internal。
+    // 导出常量而不是在这里写字面量，是为了让「形状合格」与「能回显」永远是同一集合。
+    return [`${n} > 100000000000`, `${n} <= ${MAX_SHANGHAI_SAFE_MS}`]
   }
   const shape = kind === 'iso-day'
     ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
