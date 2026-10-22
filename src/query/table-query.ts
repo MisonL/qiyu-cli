@@ -115,9 +115,11 @@ function aggExprOf(tc: TimeColumn): { mn: string; mx: string } {
  *   · iso-day / iso-instant：`regexp_matches(...)` + `TRY_CAST(... AS TIMESTAMPTZ) IS NOT NULL`
  *     —— 实测 `'2026-10-14T02:00Z'`（无秒）通过正则但 `TRY_CAST` 为 NULL，只按正则判会
  *     让它在 `arg_min` 里被静默踢出 time_range（正确性审查 F3）；
- *   · epoch-ms：`TRY_CAST(... AS BIGINT)` 落在合理区间 `(1e11, 8.64e15]`
+ *   · epoch-ms：`TRY_CAST(... AS BIGINT)` 落在合理区间 `(1e11, MAX_SHANGHAI_SAFE_MS]`
  *     —— `-1` 是七鱼「无值」哨兵、秒级/微秒级是单位误写，都不该被当成 1970/万年后的时刻
  *     （正确性审查 F5）。写路径对秒级时间戳已有同口径丢弃（`reports.ts` 的 `n <= 1e11`）。
+ *     上界是 `MAX_DATE_MS − 8h` 而不是 `MAX_DATE_MS`：回显要加上海偏移，差这 8 小时
+ *     就会在 `shanghaiIso` 里抛 `RangeError`（F 维度审查 gap 2）。
  *
  * ⚠️ 口径必须与 `commands/db.ts` 的 `shapeSqlOf` **逐字一致**（同一条 README 承诺：
  * 「脏值不进 time_range」）。两处分叉的话，同一条脏库会在 `db tables` 被排除、
