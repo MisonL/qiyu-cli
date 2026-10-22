@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { checkSkillDoc, checkSkillDir, type CheckContext } from '../../src/skill/check.js'
@@ -158,8 +158,14 @@ describe('checkSkillDoc', () => {
     const r = checkSkillDoc('这里是 tag 列表，不是 `tag` 表', ctx)
     expect(r.violations).toEqual([])
   })
-  it('词边界：`staffing` 含表名 staff 但不命中 table_name', () => {
-    // 变异「regex 去掉 (?<![\\w-])/(?![\\w-])」或「includes(name)」→ 本用例红。
+  it('词边界：以表名结尾的标识符不命中 table_name（左 lookbehind）', () => {
+    // 变异「正则去掉 (?<![\\w-])」→ 本用例红（`my_sessions` / `all_tags` 会命中）。
+    // ⚠️ 审查 Minor 指出的判别力缺口：原用例 `staffing` 只钉住**右**边界，删掉左侧仍绿。
+    const r = checkSkillDoc('`my_sessions` 与 `all_tags` 是内部标识符', ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('词边界：右边界（`staffing` 含表名 staff 但不命中 table_name）', () => {
+    // 变异「正则去掉 (?![\\w-])」→ 本用例红。
     const r = checkSkillDoc('`staffing` 是英文单词', ctx)
     expect(r.violations).toEqual([])
   })
@@ -179,11 +185,301 @@ describe('checkSkillDoc', () => {
     expect(checkSkillDoc('`axb`', special).violations).toEqual([])
     expect(checkSkillDoc('`a.b`', special).violations[0]).toMatchObject({ rule: 'table_name' })
   })
+  it('表名与位置参数域不矛盾：真实接口 id 里的表名片段不报 table_name（审查 52）', () => {
+    // `staff.list.new` 是**真实接口 id**（在 endpoint-ids 闭集里），但它的 `staff` 段
+    // 恰好也是一张表名。旧正则只把 `[\w-]` 当词字符，`.` 不在其中 → 误报 table_name
+    // 「出现表名 staff」，把**正确内容判成违规**。
+    // 变异「点号边界 (?<!\\w\\.) / (?!\\.\\w) 去掉」→ 本用例红。
+    const id = 'staff.list.new'
+    expect(allEndpoints().some((e) => e.id === id)).toBe(true)
+    const r = checkSkillDoc(`\`qiyu api schema ${id}\``, ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('点号边界：`dim.staff` 这类任务 id 不报 table_name（审查 52）', () => {
+    // 变异「点号边界去掉」→ 本用例红（`staff` 前面是 `m.` → 旧正则命中）。
+    const r = checkSkillDoc('`qiyu sync run dim.staff`', ctx)
+    expect(r.violations.filter((v) => v.rule === 'table_name')).toEqual([])
+  })
+  it('点号边界：`staff.group.list.new` 不报 table_name（审查 52）', () => {
+    const r = checkSkillDoc('`qiyu api schema staff.group.list.new`', ctx)
+    expect(r.violations.filter((v) => v.rule === 'table_name')).toEqual([])
+  })
+  it('点号边界：句末的 `staff.` 仍命中 table_name（那确实是在提表名）', () => {
+    // 右边界只排除「点号后紧跟词字符」，句末的点号不排除。
+    const r = checkSkillDoc('查 `staff.` 的数据', ctx)
+    expect(r.violations[0]).toMatchObject({ rule: 'table_name' })
+  })
+  it('点号边界：独立的 `staff` 仍命中 table_name', () => {
+    const r = checkSkillDoc('查 `staff` 表', ctx)
+    expect(r.violations[0]).toMatchObject({ rule: 'table_name' })
+  })
   it('violations 按行升序（跨规则合并后排序）', () => {
     // kind 在第 1 行、表名在第 5 行；收集顺序是「表名先于 kind」，不排序时表名会排前面。
     const r = checkSkillDoc('`kind: ambiguous`\n\n\n\n查 `sessions` 表', ctx)
     expect(r.violations.map((v) => v.rule)).toEqual(['unknown_kind', 'table_name'])
     expect(r.violations.map((v) => v.line)).toEqual([1, 5])
+  })
+})
+
+describe('审查 A1：bool flag 不吞位置参数（位置参数域校验不得被架空）', () => {
+  it('`sync run --full <未知任务>` → unknown_positional', () => {
+    // 实测：旧 check 给 0 违规；真实 CLI `qiyu sync run --full no_such_task` 退出 2 未知任务。
+    // 变异「check 层重建位置参数时把 bool flag 也当吃值的」→ 本用例红。
+    const r = checkSkillDoc('`qiyu sync run --full no_such_task`', ctx)
+    expect(r.violations).toHaveLength(1)
+    expect(r.violations[0]).toMatchObject({
+      rule: 'unknown_positional', detail: expect.stringContaining('no_such_task'),
+    })
+  })
+  it('`sync run --quiet <未知任务>` → unknown_positional', () => {
+    const r = checkSkillDoc('`qiyu sync run --quiet no_such_task`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['unknown_positional'])
+  })
+  it('`api call --yes <未知接口>` → unknown_positional（外加 flag 位置违规）', () => {
+    // 真实 CLI：`qiyu api call --yes no.such.endpoint` 退出 2「接口 id 必须是第一个参数」。
+    // 取值域这一层同样不能放过它（两处都不该判通过）。
+    const r = checkSkillDoc('`qiyu api call --yes no.such.endpoint`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_positional', 'unknown_positional'])
+  })
+  it('正例：bool flag 之后是合法任务 id → 零违规', () => {
+    // 误报方向同样要守：`--full` 是 bool，`dim.staff` 回到位置参数后按 task-ids 域校验通过。
+    const r = checkSkillDoc('`qiyu sync run --full dim.staff`', ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('正例：bool flag 夹在两个合法任务之间 → 零违规', () => {
+    expect(checkSkillDoc('`qiyu sync run dim.staff --quiet dim.staff_groups`', ctx).violations).toEqual([])
+  })
+  it('值位 flag 仍吞一个取值：`sync run --since 7d <未知任务>` → unknown_positional', () => {
+    // 变异「value flag 也不吞」→ 本用例红（`7d` 会被当成任务 id 报违规）。
+    const r = checkSkillDoc('`qiyu sync run --since 7d no_such_task`', ctx)
+    expect(r.violations).toHaveLength(1)
+    expect(r.violations[0]).toMatchObject({ detail: expect.stringContaining('no_such_task') })
+  })
+  it('未知 flag 不吞后面的值：`sync run --bogus dim.staff` 只报 unknown_flag', () => {
+    // 未知 flag 已会报 unknown_flag，再把 `dim.staff` 吞掉只会掩盖位置参数的问题。
+    const r = checkSkillDoc('`qiyu sync run --bogus dim.staff`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['unknown_flag'])
+  })
+  it('值位 flag 缺取值 → flag_missing_value（`db tables --db`）', () => {
+    // 实测：旧 check 0 违规；真实 CLI `qiyu db tables --db` 退出 2「--db 缺少取值」。
+    // 变异「缺值不报」→ 本用例红。
+    const r = checkSkillDoc('`qiyu db tables --db`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_missing_value'])
+    expect(r.violations[0]!.detail).toContain('--db')
+  })
+  it('值位 flag 后紧跟另一个 flag → flag_missing_value（`db tables --db --profile p`）', () => {
+    const r = checkSkillDoc('`qiyu db tables --db --profile p`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_missing_value'])
+  })
+  it('占位符是取值模板，不算缺值：`db describe <表> --db <路径>` 零违规', () => {
+    const r = checkSkillDoc('`qiyu db describe <表> --db <路径>`', ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('等号形态的 flag 取值不算缺值：`query --table=<表> --limit=10` 零违规', () => {
+    expect(checkSkillDoc('`qiyu query --table=<表> --limit=10`', ctx).violations).toEqual([])
+  })
+})
+
+describe('审查 A2：引号取值（合法文档不得被判违规）', () => {
+  it('CRON 取值含空格 → 零违规', () => {
+    // 实测：旧 check 报 4 条 unknown_positional（「多出的不接受：3 / * / * / *"」）。
+    // 变异「切词改回 split(/\\s+/)」→ 本用例红。
+    const r = checkSkillDoc('`qiyu sync install --schedule "0 3 * * *"`', ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('JSON body 含空格 → 零违规', () => {
+    // 实测：旧 check 报 3 条 unknown_positional。
+    const r = checkSkillDoc(`\`qiyu api call ticket.search --body '{"opStart": 1, "opEnd": 2}'\``, ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('围栏里的 CRON 同样零违规', () => {
+    const r = checkSkillDoc('```bash\nqiyu sync install --schedule "0 3 * * *"\n```', ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('引号内的 # 不被当注释截断', () => {
+    // 实测：旧实现把取值从 `#` 处截断，产出 `#` / `b"}'` 两条假位置参数。
+    // 变异「stripComment 去掉引号保护」→ 本用例红。
+    const r = checkSkillDoc("```\nqiyu api call ticket.search --body '{\"keyword\":\"a # b\"}'\n```", ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('反例：未加引号的 JSON 仍按多个位置参数判违规', () => {
+    // 修复不能变成「什么都放过」：不写引号时 shell 真的会把取值拆开，判违规是对的。
+    const r = checkSkillDoc('`qiyu api call ticket.search --body {"opStart": 1}`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['unknown_positional'])
+  })
+  it('反例：引号里的未知任务照样报 unknown_positional', () => {
+    const r = checkSkillDoc('`qiyu sync run "no such task"`', ctx)
+    expect(r.violations[0]).toMatchObject({ rule: 'unknown_positional' })
+  })
+})
+
+describe('审查 A3：flag 的位置（写在子命令位 / 第一个位置参数位必失败）', () => {
+  it('`db --profile prod tables` → flag_before_subcommand', () => {
+    // 实测：旧 check 0 违规；真实 CLI 退出 2「未知子命令：--profile」。
+    // 变异「findSpec 之前把 flag 剥掉 / 不做 flag 位置判定」→ 本用例红。
+    const r = checkSkillDoc('`qiyu db --profile prod tables`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_subcommand'])
+    expect(r.violations[0]!.detail).toContain('--profile')
+  })
+  it('`sync --db /tmp/x.duckdb run` → flag_before_subcommand', () => {
+    const r = checkSkillDoc('`qiyu sync --db /tmp/x.duckdb run`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_subcommand'])
+  })
+  it('`db --profile tables`（无取值，flag 之后就是子命令名）→ flag_before_subcommand', () => {
+    const r = checkSkillDoc('`qiyu db --profile tables`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_subcommand'])
+  })
+  it('`api call --yes ticket.search` → flag_before_positional（接口 id 必须是第一个参数）', () => {
+    const r = checkSkillDoc('`qiyu api call --yes ticket.search`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_positional'])
+    expect(r.violations[0]!.detail).toContain('--yes')
+  })
+  it('`api call --body <JSON> ticket.search` → flag_before_positional', () => {
+    const r = checkSkillDoc('`qiyu api call --body <JSON> ticket.search`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_positional'])
+  })
+  it('正例：`api call ticket.search --yes` 零违规', () => {
+    expect(checkSkillDoc('`qiyu api call ticket.search --yes`', ctx).violations).toEqual([])
+  })
+  it('正例：其余命令 flag 与位置参数可交错（`sync run --full dim.staff`）', () => {
+    expect(checkSkillDoc('`qiyu sync run --full dim.staff`', ctx).violations).toEqual([])
+  })
+  it('正例：`db tables --profile prod`（flag 在命令词之后）零违规', () => {
+    expect(checkSkillDoc('`qiyu db tables --profile prod`', ctx).violations).toEqual([])
+  })
+  it('全局 flag 写在子命令位：与真实 CLI 一致地报（`qiyu --pretty api list` 真实退出 2）', () => {
+    // ⚠️ 旧用例写的是「不误报 flag_before_subcommand」—— 那与真实 CLI 相反：顶层 `run()`
+    // 把 argv[0] 当子命令，`--pretty` 走的是「--pretty 不接受额外参数」分支，退出码 2。
+    // 所以这一行本来就该失败，只是失败原因不是 rejected_flag。两条都要报。
+    const r = checkSkillDoc('`qiyu --pretty api list`', ctx)
+    expect(r.violations.map((v) => v.rule)).toEqual(['rejected_flag', 'flag_before_subcommand'])
+  })
+})
+
+describe('审查 A4：&& / ; / > / < 降级为 warning（与 | 一致）', () => {
+  it('`store init && sync run` → warning，零违规', () => {
+    // 实测：旧 check 报 4 条 unknown_positional。
+    // 变异「UNVERIFIABLE_RE 不含 &&」→ 本用例红。
+    const r = checkSkillDoc('`qiyu store init && qiyu sync run`', ctx)
+    expect(r.violations).toEqual([])
+    expect(r.warnings).toHaveLength(1)
+  })
+  it('`store init; sync run` → warning，零违规', () => {
+    // 实测：旧 check 报 unknown_command「未知命令：qiyu store init; qiyu sync run」。
+    const r = checkSkillDoc('`qiyu store init; qiyu sync run`', ctx)
+    expect(r.violations).toEqual([])
+    expect(r.warnings).toHaveLength(1)
+  })
+  it('`api list > /tmp/x.json` → warning，零违规', () => {
+    // 实测：旧 check 报 2 条 unknown_positional。
+    const r = checkSkillDoc('`qiyu api list > /tmp/x.json`', ctx)
+    expect(r.violations).toEqual([])
+    expect(r.warnings).toHaveLength(1)
+  })
+  it('`api list < /tmp/in.json` → warning，零违规', () => {
+    const r = checkSkillDoc('`qiyu api list < /tmp/in.json`', ctx)
+    expect(r.violations).toEqual([])
+    expect(r.warnings).toHaveLength(1)
+  })
+  it('占位符之后的重定向：`query --sql <SQL> > out.json` 既不报违规也不报 warning', () => {
+    // brief 指定用例：`>` 在占位符之后，扫描已止步。
+    const r = checkSkillDoc('`qiyu query --sql <SQL> > out.json`', ctx)
+    expect(r.violations).toEqual([])
+    expect(r.warnings).toEqual([])
+  })
+  it('引号外的单个 < 与 > 都降级（`query --sql <SQL` 之外的裸符号）', () => {
+    expect(checkSkillDoc('`qiyu api list >x`', ctx).warnings).toHaveLength(1)
+    expect(checkSkillDoc('`qiyu api list <x`', ctx).warnings).toHaveLength(1)
+  })
+  it('等号形态的占位符不被 `>` 误伤：`query --table=<表>` 零违规零 warning', () => {
+    // `--table=<表>` 里的 `<`/`>` 是模板括号，不是重定向。
+    const r = checkSkillDoc('`qiyu query --table=<表>`', ctx)
+    expect(r.violations).toEqual([])
+    expect(r.warnings).toEqual([])
+  })
+  it('引号里的 > 是数据（比较运算符），不降级也不报违规', () => {
+    // shell 语义：`--sql 'SELECT a > b'` 的 `>` 在引号里，不是重定向。
+    const r = checkSkillDoc("`qiyu query --sql 'SELECT count(*) FROM x WHERE a > b'`", ctx)
+    expect(r.violations.filter((v) => v.rule !== 'sql_sequence')).toEqual([])
+  })
+})
+
+describe('审查 52：表名扫描与位置参数取值域不矛盾', () => {
+  it('真实接口 id `staff.list.new` 里的 staff 段不报 table_name', () => {
+    // 变异「表名正则去掉点号边界」→ 本用例红。
+    const r = checkSkillDoc('`qiyu api schema staff.list.new`', ctx)
+    expect(r.violations).toEqual([])
+  })
+  it('任务 id `dim.staff` 不报 table_name（三个变体）', () => {
+    for (const doc of ['`qiyu sync run dim.staff`', '`qiyu sync run dim.staff dim.staff_groups`',
+      '`qiyu sync run dim.staff_groups`']) {
+      expect(checkSkillDoc(doc, ctx).violations, doc).toEqual([])
+    }
+  })
+  it('`staff.group.list.new` 不报 table_name', () => {
+    expect(checkSkillDoc('`qiyu api schema staff.group.list.new`', ctx).violations).toEqual([])
+  })
+  it('真正的表名仍要报：`staff` / 句末 `staff.` / 散文里的 staff', () => {
+    for (const doc of ['查 `staff` 表', '查 `staff.` 的数据', '看 `the staff table`']) {
+      const r = checkSkillDoc(doc, ctx)
+      expect(r.violations[0], doc).toMatchObject({ rule: 'table_name', detail: expect.stringContaining('staff') })
+    }
+  })
+  it('左边界：`my_sessions` / `all_tags` 不报 table_name', () => {
+    expect(checkSkillDoc('`my_sessions` 与 `all_tags`', ctx).violations).toEqual([])
+  })
+})
+
+describe('审查 13：checkSkillDir 递归子目录', () => {
+  it('子目录里的未知命令要被校验，detail 带子目录前缀', () => {
+    // 变异「collectMarkdownFiles 不递归」→ 本用例红（子目录里的违规看不见）。
+    const dir = mkdtempSync(join(tmpdir(), 'qiyu-skill-check-'))
+    try {
+      mkdirSync(join(dir, 'references'))
+      writeFileSync(join(dir, 'SKILL.md'), '# 入口\n')
+      writeFileSync(join(dir, 'references', 'a.md'), '第一行\n`qiyu nope sub`\n')
+      const r = checkSkillDir(dir, ctx)
+      expect(r.violations).toHaveLength(1)
+      expect(r.violations[0]).toMatchObject({ line: 2, rule: 'unknown_command' })
+      expect(r.violations[0]!.detail).toContain('references/a.md:2')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  it('多级子目录、隐藏目录与隐藏文件不参与', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qiyu-skill-check-'))
+    try {
+      mkdirSync(join(dir, 'references', 'deep'), { recursive: true })
+      mkdirSync(join(dir, '.draft'))
+      writeFileSync(join(dir, 'references', 'deep', 'b.md'), '`qiyu nope deep`\n')
+      writeFileSync(join(dir, '.draft', 'c.md'), '`qiyu nope hidden-dir`\n')
+      writeFileSync(join(dir, '.hidden.md'), '`qiyu nope hidden-file`\n')
+      const r = checkSkillDir(dir, ctx)
+      expect(r.violations.map((v) => v.detail.split(' ')[0])).toEqual(['references/deep/b.md:1'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  it('符号链接：指向目录内的收，指向目录外的不收', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qiyu-skill-check-'))
+    const outside = mkdtempSync(join(tmpdir(), 'qiyu-skill-outside-'))
+    try {
+      mkdirSync(join(dir, 'references'))
+      writeFileSync(join(dir, 'references', 'a.md'), '`qiyu nope inside`\n')
+      writeFileSync(join(outside, 'evil.md'), '`qiyu nope outside`\n')
+      symlinkSync(join(dir, 'references'), join(dir, 'linked'))
+      symlinkSync(outside, join(dir, 'escape'))
+      const r = checkSkillDir(dir, ctx)
+      // 同一份 `references/a.md` 经两条路径各扫一次：detail 里报告的是**逻辑路径**，
+      // 用户按原样就能找到文件（realpath 化的写法会冒出 tmpdir 的绝对路径）。
+      expect(r.violations.map((v) => v.detail.split(' ')[0])).toEqual([
+        'linked/a.md:1', 'references/a.md:1',
+      ])
+      expect(r.violations.every((v) => v.detail.includes('inside'))).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 })
 
@@ -210,7 +506,7 @@ describe('checkSkillDir', () => {
     try {
       writeFileSync(join(dir, 'a.md'), '`qiyu nope a`\n')
       writeFileSync(join(dir, 'b.md'), '`qiyu nope b`\n')
-      // 变异「删掉 .sort()」→ 输出按 ['b.md','a.md'] 的顺序，本用例红。
+      // 变异「删掉 collectMarkdownFiles 里的 .sort()」→ 输出按 ['b.md','a.md'] 的顺序，本用例红。
       fsState.readdir = () => ['b.md', 'a.md']
       const r = checkSkillDir(dir, ctx)
       expect(r.violations.map((v) => v.detail.split(' ')[0])).toEqual(['a.md:1', 'b.md:1'])

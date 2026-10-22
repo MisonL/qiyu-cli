@@ -23,35 +23,43 @@
 // ```` ``` ```` 就把后面的示例命令整段漏掉。
 //
 // 命令切词（scanCommand）的裁定语义：
-//   · 路径 token 在第一个 `<...>` 占位符处封口；占位符是 flag 的取值或位置参数模板，
-//     不是子命令（`qiyu query <表>` 不该产出路径 `['query','<表>']`）。
-//   · 占位符之前出现的**字面** token 同时收进 `path` 与 `positionals`：前者给 `findSpec`
-//     做最长前缀匹配，后者供 `skill check` 在命中 spec 后切出位置参数取值、校验取值域
-//     （终审 I1）。占位符本身不是字面值，两个字段都不收。
+//   · 切词**认识引号**（`splitWords`）：`'…'` / `"…"` 整体算一个词（去引号），其余按非空白
+//     切。`--schedule "0 3 * * *"` 是「flag + 一个取值」而不是五个词；未闭合的引号退化为
+//     `\S+`，不丢整段（全审查 A2）。
+//   · refs 层**不做「哪个 token 是 flag 取值」的判断**：它不认识命令树（零业务依赖），
+//     旧版在这里按「flag 之后紧跟的词就是取值」一刀吞，把 bool flag（`--full`）之后的
+//     位置参数也吞掉，`skill check` 的位置参数域校验因此整段失效（全审查 A1），也把
+//     flag 的位置抹平（`db --profile prod tables` 被判通过，全审查 A3）。现在 `tokens`
+//     原样保留**全部** token（命令词 / 位置参数 / flag / flag 取值 / 占位符），由 check
+//     层按 `spec.flags` 的 `kind` 重建位置参数。
+//   · 路径 token 在第一个 `<...>` 占位符处封口：占位符是取值或位置参数模板，不是子命令
+//     （`qiyu query <表>` 不该把 `<表>` 当成子命令）。封口只影响「命令路径」的判定，
+//     占位符本身留在 `tokens` 里（否则 `--table <表>` 会被误判成「--table 缺少取值」）。
 //   · flag 跨占位符继续收（`--since <时间>` 的 `--since` 仍可静态校验），但**在管道 /
-//     省略号处止步** —— 管道右侧是另一条命令，`| head -20` 的 `-20` 不属于 qiyu，
-//     收进来 Task 6 会误报 unknown_flag。占位符之后的管道不判 unverifiable（路径已封口，
-//     规则 3 的不可判定判定仍只看占位符之前）。
-//   · flag 的紧邻字面值不当路径 token，也不当位置参数（`--table sessions` 的 `sessions`
-//     是取值）；`--table=<表>` 按 `=` 切出 flag 名 —— Task 6 比对的是 flag 名。
-//   · 只有 flag 没路径的 `qiyu --help` 不记成命令引用（见 scanCommand 内注释）。
+//     选择 / 省略符号处止步** —— 管道右侧是另一条命令，`| head -20` 的 `-20` 不属于 qiyu。
+//     占位符之后的这些符号不判 unverifiable（路径已封口，后面本来就不校验）。
+//   · `--table=<表>` 按 `=` 切出 flag 名 —— check 层比对的是 flag 名，取值已内联。
+//   · 只有 flag / 占位符、没有命令词的 `qiyu --help` 不记成命令引用（见 scanCommand 内注释）。
+//
+// ⚠️ 本文件**不认识命令树**（零业务依赖、零 import）：命令路径的切分、flag 的取值归属、
+// 位置参数的重建都在 check 层做（那里有 `CommandSpec`）。提取器一旦内置 flag 表，就会与
+// `commands/spec-types.ts` 漂成第二事实源 —— 那样 bool flag 与值位 flag 的区别就得写两遍。
 
 /**
  * 一条命令引用。
  *
- * `path` 与 `positionals` 都是**占位符之前的字面 token**（同一个顺序，见 scanCommand）：
- *   · `path`      —— 喂给 `findSpec` 按最长前缀匹配命令路径（多余 token 不参与比较）；
- *   · `positionals` —— 同一串 token 的显式副本，供 `skill check` 在命中 spec 之后按
- *     `spec.path.length` 切出**位置参数取值**并校验其取值域（终审 I1）。两者内容相同
- *     是刻意的：refs 层不认识命令树（零业务依赖），拆不出「命令词 / 位置参数」的分界；
- *     分界由 check 层用 `spec.path` 的已知长度来切。
- *   · `<...>` 占位符与 flag 的取值（`--table sessions` 的 `sessions`）**不在**其中——
- *     占位符不是字面值、flag 取值不是位置参数。
+ * `tokens` 是**全部** token，按原文顺序、引号已去：命令词、位置参数、flag、flag 的取值、
+ * `<...>` 占位符模板都在里面。refs 层不认识命令树（零业务依赖），因此**不判断**哪个 token
+ * 是 flag 的取值、哪个是位置参数 —— 那是 check 层拿到 `spec.flags` 之后的事（按 `kind`
+ * 重建：bool 不吞、value/repeatable 吞、未知名不吞）。
+ *
+ * `flags` 记下每个 flag 的**名字**（`--table=<表>` 归一为 `--table`）与它在 `tokens` 里的
+ * **下标**。下标是「flag 写在哪儿」的唯一证据：check 层据此判 `flag_before_subcommand`
+ * （flag 落在子命令位）与「接口 id 必须是第一个参数」这类位置违规（全审查 A3）。
  */
 export interface CommandRef {
-  path: string[]
-  positionals: string[]
-  flags: string[]
+  tokens: string[]
+  flags: { name: string; tokenIndex: number }[]
   line: number
 }
 
@@ -80,13 +88,6 @@ const COMMAND_RE = /^qiyu\s+(.*)$/
 /** 占位符：整个词就是 `<...>`。只认这种完整形态，`--table=<表>` 靠等号切分归一。 */
 const PLACEHOLDER_RE = /^<[^>]*>$/
 
-/**
- * 无法静态判定的符号：管道（`|`）、省略号（`…` 或 `...`）。
- *
- * 占位符之前出现 → 整条记 unverifiable；占位符之后出现 → 到此为止，后面是另一条命令。
- */
-const UNVERIFIABLE_RE = /[|…]|\.\.\./
-
 /** 规则里钉死的话术，`skill check` 把它原样放进 warnings。 */
 const REASON_CHOICE = '含选择/省略符号'
 
@@ -99,6 +100,81 @@ const FROM_RE = /\bFROM\b/
 
 /** 围栏行注释：`#` 在行首或前面是空白才算注释，`a#b` / URL 锚点不受影响。 */
 const COMMENT_RE = /(^|\s)#.*$/
+
+/**
+ * 切词用的引号模式：单引号串 / 双引号串 / 非空白串，三选一，逐个匹配（全审查 A2）。
+ * 未闭合的引号匹配不上前两个分支，自然退化为 `\S+` —— 不丢整段。
+ */
+const QUOTED_TOKEN_RE = /'([^']*)'|"([^"]*)"|(\S+)/g
+
+/** 占位符（整词 `<...>`）判定：check 层重建位置参数时用它跳过模板。 */
+export function isPlaceholderToken(word: string): boolean {
+  return PLACEHOLDER_RE.test(word)
+}
+
+/**
+ * `--flag=<占位符>`：flag 名 + 内联取值模板（`--table=<表>`）。整体按 flag 处理 ——
+ * 它的 `<`/`>` 是模板括号而不是重定向：A4 扩了 `>`/`<` 之后，若不先接住这种形态，
+ * 一条合法的等号写法会被误降级成「无法静态判定」。
+ */
+const INLINE_PLACEHOLDER_FLAG_RE = /^-+[\w-]+=<[^>]*>$/
+
+/** 一个词：去引号后的内容 + 原文形态。 */
+interface Word {
+  /** 去引号后的内容（取值本身）。 */
+  text: string
+  /** 原文形态（保留引号）—— 判断「符号是不是在引号里」要用它。 */
+  raw: string
+}
+
+/**
+ * 切词：引号内的整段算**一个词**（去引号），其余按非空白切（全审查 A2）。
+ *
+ * 为什么切词要认引号：`--schedule "0 3 * * *"` 的取值本身就是空格分隔的 5 段 CRON，
+ * `--body '{"opStart": 1}'` 的取值是带空格的 JSON —— 按裸空白切会把一个合法取值拆成多个
+ * 位置参数，把**正确内容判成违规**（check 自己的原则：误报比漏报更糟）。
+ *
+ * 原文形态（`raw`）是 A4 的前提：shell 语义下 `"a > b"` 里的 `>` 是**数据**（比较运算符），
+ * 只有**引号外**的 `>` 才是重定向。少了这个区分，`--sql 'SELECT a > b'` 会被误判成
+ * 「无法静态判定」。
+ */
+function tokenize(text: string): Word[] {
+  const words: Word[] = []
+  for (const m of text.matchAll(QUOTED_TOKEN_RE)) {
+    if (m[1] !== undefined) words.push({ text: m[1], raw: m[0] })
+    else if (m[2] !== undefined) words.push({ text: m[2], raw: m[0] })
+    else words.push({ text: m[3]!, raw: m[0] })
+  }
+  return words
+}
+
+/**
+ * 切词的公开形态：只给词本身（去引号后的文本）。
+ */
+export function splitWords(text: string): string[] {
+  return tokenize(text).map((w) => w.text)
+}
+
+/**
+ * 剥围栏行的 `#` 注释，但**引号内的 `#` 保留**（全审查 A2）。
+ *
+ * `qiyu api call ticket.search --body '{"keyword":"a # b"}'` 的 `#` 在单引号里，是 JSON
+ * 取值的一部分；旧版直接拿 `COMMENT_RE`（行首或空白后的 `#` 到行尾）剥，会把取值从 `#`
+ * 处截断，留下半截 JSON 与两条假位置参数。
+ *
+ * 做法：先把每个引号段（含未闭合到行尾的那种）临时替换成不含空白、不含 `#` 的编号占位串，
+ * 按原口径剥注释，再换回原文。引号段整体可能含空白，编号占位串对切词等价（切词本来就
+ * 把引号段当一个词）。
+ */
+function stripComment(line: string): string {
+  const quoted: string[] = []
+  const masked = line.replace(/'(?:[^']*)'|"(?:[^"]*)"|'(?:[^']*)$|"(?:[^"]*)$/g, (seg) => {
+    quoted.push(seg)
+    return `\u0000${quoted.length - 1}\u0000`
+  })
+  const stripped = masked.replace(COMMENT_RE, '$1')
+  return stripped.replace(/\u0000(\d+)\u0000/g, (_, i: string) => quoted[Number(i)]!)
+}
 
 interface Segment {
   text: string
@@ -183,9 +259,10 @@ function collectSurfaces(text: string): { segments: Segment[]; blocks: FenceBloc
     }
 
     if (inFence) {
-      // 围栏内容行：先剥注释，再按源文本顺序拆成「行内片段 + 夹在中间的裸文本」两个面。
-      // 交错产出（而不是先收行内再收裸文本）是为了让 commands 顺序与原文一致。
-      const noComment = raw.replace(COMMENT_RE, '$1')
+      // 围栏内容行：先剥注释（引号内的 `#` 保留），再按源文本顺序拆成「行内片段 + 夹在
+      // 中间的裸文本」两个面。交错产出（而不是先收行内再收裸文本）是为了让 commands
+      // 顺序与原文一致。
+      const noComment = stripComment(raw)
       let cursor = 0
       for (const m of noComment.matchAll(INLINE_CODE_RE)) {
         push(noComment.slice(cursor, m.index), line)
@@ -206,9 +283,42 @@ function collectSurfaces(text: string): { segments: Segment[]; blocks: FenceBloc
 }
 
 /**
- * 导出给 `skill check` 的表名扫描：与 `extractRefs` **完全相同**的扫描面（行内代码片段
- * 与围栏内容行，含缩进容忍 / 长度配对 / 围栏内反引号）。brief 规则 1「只在行内代码与
- * 围栏块里扫」若由 Task 6 重写一遍围栏解析，必然与这里的逻辑漂移 —— 复用是唯一不漂的写法。
+ * 无法静态判定的信号。占位符之前出现 → 整条记 unverifiable（不阻塞）；占位符之后出现 →
+ * 到此为止（右侧是另一条命令或重定向目标，它的 flag / 位置参数不属于本命令）。
+ *
+ * ⚠️ 复合 / 重定向符号与 `|` **同等对待**（全审查 A4）：旧版只认 `|`，于是
+ * `qiyu store init && qiyu sync run` 里的 `&&` / `qiyu` / `sync` / `run` 被当成位置参数
+ * 报四条违规，而 `qiyu store init | tee log` 正确降级为 warning —— 同一族 shell 组合语法
+ * 两极分化，文档作者被迫拆行。
+ *
+ * ⚠️ 占位符判定在前：整个词是 `<...>` 的（`<SQL>`、`<表>`）先被 PLACEHOLDER_RE 接走，
+ * 单个 `<` 才落到这里。所以 `qiyu query --sql <SQL> > out.json` 的 `>` 出现在占位符之后，
+ * 走「止步」分支而不是 unverifiable。
+ *
+ * 两个正则分开是刻意的（判据不同，理由见 hasShellOperator）：
+ *   · `SHELL_OPERATOR_RE` —— shell **结构**符号，只认**引号外**的；
+ *   · `ELLIPSIS_RE` —— **内容级**省略信号，整词都认（与引号无关）。
+ */
+const SHELL_OPERATOR_RE = /[|]|&&|;|>|</
+const ELLIPSIS_RE = /…|\.\.\./
+
+/**
+ * 一个词里是否含 shell 结构符号（引号外）或省略号。
+ *
+ * 两条判据的差别是有意的：
+ *   · 结构符号（`|`/`&&`/`;`/`>`/`<`）看**引号外** —— 引号里的是数据；
+ *   · 省略号（`…`/`...`）**整词**都看 —— 它不表示 shell 结构，只表示「这里有省略，
+ *     静态判不了」（`qiyu query --sql "SELECT * FROM x WHERE …"`）。
+ */
+function hasShellOperator(word: Word): boolean {
+  if (ELLIPSIS_RE.test(word.text)) return true
+  return SHELL_OPERATOR_RE.test(word.raw.replace(/'[^']*'|"[^"]*"/g, ''))
+}
+
+/**
+ * 导出给 `skill check` 的表名扫描：扫描面与 `extractRefs` 完全一致（行内代码 + 围栏内容行，
+ * 含缩进容忍 / 长度配对 / 围栏内反引号）。brief 规则 1「只在行内代码与围栏块里扫」若由
+ * Task 6 重写一遍围栏解析，必然与这里的逻辑漂移 —— 复用是唯一不漂的写法。
  * 占位符 / 管道等命令语义不在这里做，本函数只回答「哪些文本算代码面」。
  */
 export function collectSegments(text: string): { text: string; line: number }[] {
@@ -224,71 +334,68 @@ function normalizeFlag(word: string): string {
 /**
  * 扫描一个片段里的命令引用。
  *
- * 三条边界，都以「占位符之前」为界：
- *   · 路径 token 只收到第一个 `<...>` 为止。占位符之后是调用方要填的值或模板里的可选
- *     部分，再往里收会把值当子命令（`qiyu query <表>` 不该产出路径 `['query','<表>']`）。
- *   · 选择/省略符号（`|`、`…`、`...`）只在占位符之前判定为 unverifiable；占位符之后
- *     遇到即止步（管道右侧是另一条命令），不再往 flags / positionals 里收。
- *   · flag 的紧邻字面值是它的取值（`--table sessions` 的 `sessions`），不是位置参数 ——
- *     把 flag 取值当位置参数去查域，会让合法命令被判成违规。
+ * refs 层**只提取、不判断**（本文件的分层约定）：它不认识命令树，所以
+ *   · 不判断「哪个 token 是 flag 的取值」—— 旧版在这里一刀切吞掉 flag 紧邻的词，
+ *     bool flag（`--full`）之后的位置参数也被吞掉，`skill check` 的位置参数域校验
+ *     因此整段失效（审查 A1），flag 的位置也被抹平（审查 A3）。现在 `tokens` 原样保留
+ *     全部 token，由 check 层按 `spec.flags` 的 `kind` 重建位置参数。
+ *   · 不判断「哪些 token 是命令路径」—— 同样交给 check 层（它有命令树）。
  *
- * flag 例外地跨占位符收集：`--since <时间>` 里 `<时间>` 是 `--since` 的取值，后面的
- * `--since` 仍是可静态校验的 flag。brief 测试 2 钉死了这一点
- * （`` `qiyu query --table <表> --since <时间>` `` → flags 含 `--table` 与 `--since`）。
- * 它与规则 2 「之前的部分即命令路径 + flag」的字面说法有出入，取舍理由见报告。
- *
- * `path` 与 `positionals` 装的是**同一串字面 token**（内容相同，但各自独立数组，避免
- * 两个消费方共享可变引用）：refs 层不认识命令树，拆不出「命令词 / 位置参数」的分界；
- * 等 `findSpec` 在 check 层命中后，按 `spec.path.length` 切掉命令词，余下即位置参数
- * 取值（终审 I1）。
+ * 这里仍然要裁定的三件事：
+ *   · **切词**：认引号（`splitWords`），`--schedule "0 3 * * *"` 是一个取值不是五个词
+ *     （审查 A2）。围栏行的 `#` 注释也认引号（`stripComment`）。
+ *   · **占位符**：整词 `<...>` 是模板不是字面值。它**留在 `tokens` 里**（否则
+ *     `--table <表>` 会被误判成「`--table` 缺少取值」），但命令路径到此为止 ——
+ *     `qiyu query <表>` 的 `<表>` 不是子命令。
+ *   · **无法静态判定的符号**：`|`、`…`、`...`、`&&`、`;`、`>`、`<`（审查 A4）。占位符
+ *     之前遇到 → 整条记 unverifiable（warning，不阻塞）；占位符之后遇到 → 到此为止
+ *     （管道 / 重定向右侧是另一条命令或别的目标，不属于本命令）。
  */
 function scanCommand(content: string, line: number, refs: Refs): void {
   const m = COMMAND_RE.exec(content)
   if (!m) return
 
-  const words = m[1]!.split(/\s+/).filter((w) => w !== '')
+  const words = tokenize(m[1]!)
   const tokens: string[] = []
-  const flags: string[] = []
+  const flags: { name: string; tokenIndex: number }[] = []
   let closed = false
-  let expectFlagValue = false
 
   for (const word of words) {
-    if (PLACEHOLDER_RE.test(word)) {
-      // 占位符是前一个 flag 的取值或独立位置参数：命令结构在此封口，占位符本身不入列。
+    const text = word.text
+    if (isPlaceholderToken(text)) {
+      // 占位符是前一个 flag 的取值或独立位置参数：命令结构在此封口。它仍进 tokens ——
+      // check 层要靠它判断「flag 的取值是模板而不是缺值」。
       closed = true
-      expectFlagValue = false
+      tokens.push(text)
       continue
     }
-    if (UNVERIFIABLE_RE.test(word)) {
+    // 引号里的符号是**数据**（`--sql 'SELECT a > b'` 的 `>` 是比较运算符），只有引号外的
+    // 才算 shell 语法（A4）。`hasShellOperator` 按**原文**里的真闭合引号段排除，因此
+    // `{"k":"a>b"}` 这种引号夹在词中间的形态也判得对。
+    if (hasShellOperator(word) && !INLINE_PLACEHOLDER_FLAG_RE.test(text)) {
       if (!closed) {
-        // 选择/省略符号：整条无法判定，记入 unverifiable 而不是猜一个路径。
+        // 选择 / 省略 / 复合 / 重定向符号：整条无法判定，记入 unverifiable 而不是猜结构。
         refs.unverifiable.push({ text: content, line, reason: REASON_CHOICE })
         return
       }
-      // 占位符之后：管道右侧是另一条命令，它的 flag / 位置参数不属于本命令，到此为止。
+      // 占位符之后：右侧是另一条命令或重定向目标，它的 flag / 位置参数不属于本命令。
       break
     }
-    if (word.startsWith('-')) {
-      flags.push(normalizeFlag(word))
-      expectFlagValue = true
-      continue
+    if (text.startsWith('-')) {
+      flags.push({ name: normalizeFlag(text), tokenIndex: tokens.length })
     }
-    if (expectFlagValue && tokens.length > 0) {
-      // flag 的紧邻字面值是它的取值，不当路径 token / 位置参数。要求已有 token 是防止
-      // 「全局 flag 在最前」的写法（`qiyu --pretty api list`）把子命令吞成取值。
-      expectFlagValue = false
-      continue
-    }
-    expectFlagValue = false
-    if (!closed) tokens.push(word)
+    tokens.push(text)
   }
 
-  // 没有路径 token 的 `qiyu --help` 之类不记成命令引用：`Refs.commands` 的语义是
-  // 「正文声称存在这条命令路径」，只有 flag 的调用不构成这种声称（而且 `--help` 是全局
-  // flag，各命令都接受，记下来反而会让 check 用空路径去匹配、误报未知命令）。
-  if (tokens.length === 0) return
+  // 只有 flag / 占位符、没有命令词的 `qiyu --help` 之类不记成命令引用：`Refs.commands`
+  // 的语义是「正文声称存在这条命令路径」，只有 flag 的调用不构成这种声称（而且
+  // `--help` 是全局 flag，各命令都接受，记下来反而会让 check 用空路径去匹配、误报
+  // 未知命令）。
+  const flagIndexes = new Set(flags.map((f) => f.tokenIndex))
+  const hasCommandWord = tokens.some((t, i) => !flagIndexes.has(i) && !isPlaceholderToken(t))
+  if (!hasCommandWord) return
 
-  refs.commands.push({ path: [...tokens], positionals: [...tokens], flags, line })
+  refs.commands.push({ tokens, flags, line })
 }
 
 function scanKind(content: string, line: number, refs: Refs): void {
