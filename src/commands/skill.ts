@@ -55,14 +55,16 @@ const SKILL_USAGE = `用法：qiyu skill <子命令> [参数]
 子命令：
   skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
                            安装 skill 正文到实体目录，并链接到已存在的 agent 目录
-  skill check   [--installed | --compare] [--dir <path>]
+  skill check   [--installed [--dir <path>] | --compare [--dir <path>]]
                            校验 skill 正文引用与 CLI 契约是否一致（有违规退出码 1；
                            --compare 下内容不一致、已安装那份不可用同样算失败）
   skill where   [--dir <path>]
                            报告实体目录与各 agent 链接状态（只读，不修复；
-                           无法判定时 state=unknown、exists=null——不是「不存在」）
+                           实体路径无法判定时 exists=null，链接无法判定时
+                           state=unknown（带 error）——都不是「不存在」）
 
-实体目录定位：--dir > QIYU_SKILL_DIR > ~/.agents/skills/qiyu
+实体目录定位：--dir > QIYU_SKILL_DIR > npm_config_qiyu_skill_dir（postinstall 的安装
+通道，含大小写/连字符归一）> ~/.agents/skills/qiyu
 --link 取值：claude-code、codex（可重复）。点名的 agent 目录不存在时不创建目录，只警告。
 --dry-run 只输出将要做的动作，不写盘。
 

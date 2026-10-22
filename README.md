@@ -62,7 +62,8 @@ npm 无法确认可信版本、也就无法 pin 版本，`--allow-scripts` 同�
 （npm 仍退 0，只有一行 warn，极易被当成成功）。npx 场景下它还会主动跳过（不往你的 home 写东西）。
 所以**不要指望 postinstall：直接运行 `qiyu skill install`**。
 
-安装是幂等的：内容一致时不动任何文件（要覆盖你改过的正文得加 `--force`）。其他子命令：
+安装是幂等的：正文一致时不动正文（清单缺失或损坏时会补写 `.qiyu-skill.json`）；要覆盖
+你改过的正文得加 `--force`。其他子命令：
 `qiyu skill where` 报告实体目录与各 Agent 的链接状态（只读，不修复）；`qiyu skill check`
 校验 skill 引用的命令/表/错误 kind 是否仍存在（有违规退出码 1，CI 可跑；`--compare` 模式下
 两份正文内容不一致、或已安装那份不可用，同样退 1）。
@@ -135,7 +136,7 @@ qiyu query --table <表> [--since T] [--until T] [--group-by <列>]
 qiyu stats fields <报表>              指标自描述（声明 + 本地观测分布 + -1 哨兵）
 qiyu skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
                                      安装 skill 正文并链接进各 Agent 的 skills 目录
-qiyu skill check [--installed | --compare] [--dir <path>]
+qiyu skill check [--installed [--dir <path>] | --compare [--dir <path>]]
                                      校验 skill 引用的命令/表/错误 kind（有违规退出码 1；
                                      --compare 下内容不一致也算失败）
 qiyu skill where [--dir <path>]      报告实体目录与各 Agent 链接状态（只读，不修复）

@@ -70,7 +70,7 @@ const USAGE = `用法：qiyu <子命令> [参数]
   stats fields <报表表>     指标声明（带出处）+ 本地观测分布 + -1 哨兵
   skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
                            安装 skill 正文并链接到已存在的 agent 目录
-  skill check [--installed | --compare] [--dir <path>]
+  skill check [--installed [--dir <path>] | --compare [--dir <path>]]
                            校验 skill 正文引用与 CLI 契约（有违规退出码 1；
                            --compare 下内容不一致也算失败）
   skill where [--dir <path>] 报告实体目录与各 agent 链接状态（只读，不修复）
