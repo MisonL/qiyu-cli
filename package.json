@@ -34,6 +34,7 @@
   ],
   "scripts": {
     "build": "tsc && node scripts/copy-assets.mjs",
+    "check:pack": "node scripts/check-pack.mjs",
     "prepare": "npm run build",
     "postinstall": "node dist/postinstall.js || exit 0",
     "test": "node scripts/test-shards.mjs",

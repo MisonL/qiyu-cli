@@ -1,0 +1,124 @@
+// tests/build-contract.test.ts —— 构建产物的契约与门禁（G7 / gap 5 / [42]）。
+//
+// 测试与 CI 的分工：
+//   · 本文件钉住**契约**：build 脚本必须包含 copy-assets、排除名单必须含清单文件名、
+//     CI 必须真的调用产物门禁、门禁判定逻辑本身要能拒绝坏产物；
+//   · 真实产物（`npm pack` 的文件清单、注入后的版本）由 `scripts/check-pack.mjs`
+//     在 CI 里断言 —— 本仓库的测试只 import `src/**`，不跑真实构建。
+//
+// 为什么契约也要测：门禁最容易被「顺手简化」掉。删掉 CI 那一步、或把 build 改回纯
+// `tsc`，功能测试全绿而发布包静默坏掉 —— 只有这里的用例会红。
+
+import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { checkPack, PLACEHOLDER_VERSION } from '../scripts/pack-gate.mjs'
+import { MANIFEST } from '../src/skill/paths.js'
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+const read = (rel: string): string => readFileSync(join(repoRoot, rel), 'utf8')
+
+/** 一组合法的产物数据：门禁应当通过；各用例只改坏其中一处。 */
+function goodPack(): { files: string[]; editionSource: string; pkgVersion: string } {
+  return {
+    files: [
+      'dist/cli.js',
+      'dist/postinstall.js',
+      'dist/core/edition.js',
+      'dist/skill/qiyu/SKILL.md',
+      'dist/skill/qiyu/errors.md',
+    ],
+    editionSource: "export const PACKAGE_VERSION = '1.2.3';\n",
+    pkgVersion: '1.2.3',
+  }
+}
+
+describe('G7：build 脚本契约', () => {
+  it('build 必须同时跑 tsc 与 copy-assets（只留 tsc = 产物缺 skill 正文与版本注入）', () => {
+    const pkg = JSON.parse(read('package.json')) as { scripts: Record<string, string> }
+    const build = pkg.scripts.build ?? ''
+    expect(build).toContain('tsc')
+    expect(build).toContain('scripts/copy-assets.mjs')
+  })
+
+  it('prepare 挂在 build 上（npm ci / npm pack 因此都会触发完整构建）', () => {
+    const pkg = JSON.parse(read('package.json')) as { scripts: Record<string, string> }
+    expect(pkg.scripts.prepare).toBe('npm run build')
+  })
+
+  it('copy-assets 拷贝 skill 正文时把清单文件列进排除名单', () => {
+    const source = read('scripts/copy-assets.mjs')
+    // 锚定「skill 正文拷贝」那一行，而不是只看文件里出现过 MANIFEST。
+    const line = source.split('\n').find((l) => l.includes("copyDirFresh('src/skill/qiyu'"))
+    expect(line, '找不到 skill 正文的 copyDirFresh 调用').toBeDefined()
+    expect(line).toContain('new Set([MANIFEST])')
+  })
+
+  it('copy-assets 的 MANIFEST 字面量与 paths.ts 一致（漂移会让真清单漏进包）', () => {
+    const source = read('scripts/copy-assets.mjs')
+    const m = /^const MANIFEST = '([^']*)'/m.exec(source)
+    expect(m?.[1]).toBe(MANIFEST)
+  })
+})
+
+describe('G7：CI 必须真的跑产物门禁', () => {
+  const ci = read('.github/workflows/ci.yml')
+
+  it('CI 调用了 scripts/check-pack.mjs', () => {
+    expect(ci).toContain('node scripts/check-pack.mjs')
+  })
+
+  it('产物门禁只在一个矩阵项跑（产物与 Node 版本无关，三个都跑纯拖慢 CI）', () => {
+    const step = ci.split('\n').find((l) => l.includes('node scripts/check-pack.mjs'))
+    // 上一步的 if 条件与 run 在同一 step 块里；向前找到最近的 if: 行。
+    const lines = ci.split('\n')
+    const idx = lines.findIndex((l) => l.includes('node scripts/check-pack.mjs'))
+    const block = lines.slice(Math.max(0, idx - 4), idx + 1).join('\n')
+    expect(block).toMatch(/if:\s*matrix\.node-version\s*==\s*'20\.12'/)
+  })
+})
+
+describe('G7：门禁判定逻辑', () => {
+  it('合法产物 → 无问题', () => {
+    expect(checkPack(goodPack())).toEqual([])
+  })
+
+  it('缺 SKILL.md（copy-assets 没跑）→ 拒绝', () => {
+    const input = goodPack()
+    input.files = input.files.filter((f) => !f.endsWith('/SKILL.md'))
+    expect(checkPack(input).some((p) => p.includes('SKILL.md'))).toBe(true)
+  })
+
+  it('skill 正文只有一篇（参考文档没拷进来）→ 拒绝', () => {
+    const input = goodPack()
+    input.files = input.files.filter((f) => !f.endsWith('/errors.md'))
+    expect(checkPack(input).some((p) => p.includes('dist/skill/qiyu/'))).toBe(true)
+  })
+
+  it('缺 postinstall.js → 拒绝', () => {
+    const input = goodPack()
+    input.files = input.files.filter((f) => !f.endsWith('postinstall.js'))
+    expect(checkPack(input).some((p) => p.includes('postinstall'))).toBe(true)
+  })
+
+  it('edition.js 仍是占位版本（版本注入没跑）→ 拒绝', () => {
+    const input = goodPack()
+    input.editionSource = `export const PACKAGE_VERSION = '${PLACEHOLDER_VERSION}';\n`
+    expect(checkPack(input).some((p) => p.includes('占位版本'))).toBe(true)
+  })
+
+  it('edition.js 版本与 package.json 不一致 → 拒绝', () => {
+    const input = goodPack()
+    input.editionSource = "export const PACKAGE_VERSION = '9.9.9';\n"
+    expect(checkPack(input).some((p) => p.includes('不一致'))).toBe(true)
+  })
+
+  it('edition.js 里 PACKAGE_VERSION 出现多处（tsc 输出形态变了）→ 拒绝', () => {
+    const input = goodPack()
+    input.editionSource =
+      "export const PACKAGE_VERSION = '1.2.3';\nexport const PACKAGE_VERSION = '1.2.3';\n"
+    expect(checkPack(input).some((p) => p.includes('期望 1 次'))).toBe(true)
+  })
+})
