@@ -138,29 +138,42 @@ vi.mock('node:fs', async (importOriginal) => {
       // 模拟「另一进程在这两步之间把实体建出来了」。逐文件换入不拦。
       // ⚠️ 这个分支必须排在下面的通用分支**之前**：通用分支对任何非 null 的 kind 都抛
       // （且会把 ENOTEMPTY 渲染成 EACCES），先命中就永远到不了这里。
-      if ((kind === 'ENOTEMPTY' || kind === 'ENOTEMPTY_STALE_MANIFEST')
+      const ENOTEMPTY_KINDS = new Set(['ENOTEMPTY', 'ENOTEMPTY_STALE_MANIFEST', 'ENOTEMPTY_MANIFEST_DIR', 'ENOTEMPTY_EXACT'])
+      if (kind !== null && ENOTEMPTY_KINDS.has(kind)
         && from.includes('.tmp-') && !to.includes('.tmp-') && !to.endsWith('.md') && !to.endsWith(MANIFEST)) {
         // ⚠️ 真实竞态里，错误发生时**实体已经在**（另一个进程刚写完）。只抛错不建实体
         // 会把场景变成「实体不存在」，重判定会给出 installed —— 与真实竞态不同。
         // 所以这里先把「另一进程的成果」落到磁盘，再抛错。
         actual.mkdirSync(to, { recursive: true })
+        const realTo = actual.realpathSync(to)
         if (kind === 'ENOTEMPTY_STALE_MANIFEST') {
-          // 另一种并发赢家：正文与包内**一致**，只有清单落后（版本/契约版本旧）。
+          // 并发赢家形态 A：正文与包内**一致**，只有清单落后（版本/契约版本旧）。
           // 用暂存目录里的真实产物铺过去（此刻标记已被 unlink，内容与源逐字节相同）。
           actual.cpSync(from, to, { recursive: true, force: true })
-          actual.writeFileSync(actual.realpathSync(to) + '/' + MANIFEST, JSON.stringify({
+          actual.writeFileSync(realTo + '/' + MANIFEST, JSON.stringify({
             version: '0.0.1', skill_contract_version: 0, content_hash: 'stale',
             files: ['SKILL.md'], installed_at: new Date(0).toISOString(),
           }))
+        } else if (kind === 'ENOTEMPTY_MANIFEST_DIR') {
+          // 并发赢家形态 B：正文与包内**逐字节一致**，但清单位置被一个目录占用。
+          // planInstall 对这种状态返回 action='none' + 「清单已被非普通文件占用」警告，
+          // 且 **--force 也无效**（复审 W3 的第六形态）。
+          actual.cpSync(from, to, { recursive: true, force: true })
+          actual.rmSync(realTo + '/' + MANIFEST, { force: true })
+          actual.mkdirSync(realTo + '/' + MANIFEST)
+        } else if (kind === 'ENOTEMPTY_EXACT') {
+          // 并发赢家形态 C：与包内**完全一致**（正文 + 全新清单）—— planInstall 走幂等
+          // 分支（action='none'、零警告），并发文案必须说「内容与包内一致」（复审 W4）。
+          actual.cpSync(from, to, { recursive: true, force: true })
         } else {
-          actual.writeFileSync(actual.realpathSync(to) + '/SKILL.md', '---\nname: qiyu\n---\n# qiyu\n')
+          actual.writeFileSync(realTo + '/SKILL.md', '---\nname: qiyu\n---\n# qiyu\n')
         }
         const e = new Error('ENOTEMPTY: directory not empty, rename') as NodeJS.ErrnoException
         e.code = 'ENOTEMPTY'
         throw e
       }
       // 只拦「换入」的那一步（源在暂存目录里），不拦首次安装的整目录 rename。
-      if (kind !== null && kind !== 'ENOTEMPTY' && kind !== 'ENOTEMPTY_STALE_MANIFEST' && from.includes('.tmp-')) {
+      if (kind !== null && !kind.startsWith('ENOTEMPTY') && from.includes('.tmp-')) {
         const e = new Error(`${kind === 'EXDEV' ? 'EXDEV: cross-device link not permitted' : 'EACCES: permission denied'}`) as NodeJS.ErrnoException
         e.code = kind
         throw e
@@ -1371,6 +1384,46 @@ describe('并发安装（gap 8）', () => {
     expect(contentHash(entity)).toBe(contentHash(src))
   })
 
+  it('④ 并发赢家正文一致、但清单被目录占用 → 不得劝 --force（复审 W3：--force 对此无效）', async () => {
+    const src = makeSource()
+    // 实体初始必须**不存在**（否则 plan 直接是 action='none'，根本走不到写入/并发分支）。
+    // mock 在撞 ENOTEMPTY 的瞬间把「正文与源逐字节一致 + 清单位置被目录占用」的结果落到磁盘。
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+
+    fsRenameFault.set('ENOTEMPTY_MANIFEST_DIR')
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+      expect(r.status).toBe('skipped')
+      const joined = r.warnings.join('\n')
+      // 变异「不区分 manifestBlocked」→ 会落到「内容仍不同（…）；…加 --force」分支 → 红。
+      expect(joined, '正文一致时不得说「仍不同」').not.toContain('仍不同')
+      expect(joined, '清单被占用时 --force 无效，不得劝用户用它').not.toContain('加 --force')
+      expect(joined).toContain('非普通文件占用')
+    } finally {
+      fsRenameFault.set(null)
+    }
+  })
+
+  it('⑤ 并发赢家完全一致（正文与清单都一致）→ 必须说「内容与包内一致」（复审 W4：正向文案零覆盖）', async () => {
+    const src = makeSource()
+    // mock 在撞 ENOTEMPTY 的瞬间把「与包内完全一致的实体（正文 + 新清单）」落到磁盘。
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+
+    fsRenameFault.set('ENOTEMPTY_EXACT')
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+      expect(r.status).toBe('skipped')
+      const joined = r.warnings.join('\n')
+      // 变异「sameContent 恒 false（永远说仍不同）」→ 本行红：正向「一致」文案有人钉。
+      expect(joined, '完全一致时必须说「内容与包内一致」').toContain('内容与包内一致')
+      expect(joined).not.toContain('仍不同')
+    } finally {
+      fsRenameFault.set(null)
+    }
+  })
+
   it('② 崩溃残留清理不得删掉「正被并发安装使用」的暂存目录（按年龄判）', async () => {
     const src = makeSource()
     const entity = defaultEntityDir(home)
@@ -1396,6 +1449,28 @@ describe('并发安装（gap 8）', () => {
     // 老的被清掉了，且如实告知。
     expect(existsSync(old), '过期残留目录没被清理').toBe(false)
     expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(true)
+    // 复审 W1：旁挂标记本身满足 isStagingName 的前缀，枚举时不排除它就会在清理后
+    // 对它再 lstat，多出一条假的「清理残留暂存目录失败（ENOENT）」。
+    expect(r.warnings.some((w) => w.includes('失败')), JSON.stringify(r.warnings)).toBe(false)
+  })
+
+  it('②b 孤儿标记（目录已不在）按年龄清理（复审 W2：SIGKILL 落在 finally 两条 rmSync 之间）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+    // 孤儿标记：对应的暂存目录已经不存在。
+    const orphan = `${join(dirname(entity), `${entity.split('/').pop()}.tmp-Orphan7`)}.marker`
+    writeFileSync(orphan, '标记\n')
+    const longAgo = new Date(Date.now() - 60 * 60_000)
+    utimesSync(orphan, longAgo, longAgo)
+    // 年轻的孤儿标记不动（可能与某次正在进行/即将开始的安装相关）。
+    const youngOrphan = `${join(dirname(entity), `${entity.split('/').pop()}.tmp-Young77`)}.marker`
+    writeFileSync(youngOrphan, '标记\n')
+
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+
+    expect(existsSync(orphan), '过期孤儿标记没被清理，会永久留在 skills 目录里').toBe(false)
+    expect(existsSync(youngOrphan)).toBe(true)
   })
 
   it('③ 并发赢家只差清单（正文一致、清单版本落后）→ 不得说「内容仍不同（计划要求 --force）」', async () => {

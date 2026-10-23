@@ -52,7 +52,9 @@ try {
   // shell 解析，所以这里传**拼好的整条命令**而不是数组，避免 DEP0190 的转义歧义。
   const isWin = process.platform === 'win32'
   const cmd = 'npm pack --dry-run --json'
-  packStdout = execFileSync(isWin ? 'cmd.exe' : 'npm', isWin ? ['/d', '/s', '/c', cmd] : ['pack', '--dry-run', '--json'], {
+  // cmd.exe 走 %ComSpec%（复审 W6）：可能被环境改写，硬编码 'cmd.exe' 会无视配置。
+  const shellCmd = process.env.ComSpec || 'cmd.exe'
+  packStdout = execFileSync(isWin ? shellCmd : 'npm', isWin ? ['/d', '/s', '/c', cmd] : ['pack', '--dry-run', '--json'], {
     cwd: root,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],

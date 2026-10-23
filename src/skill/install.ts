@@ -851,6 +851,9 @@ function cleanupStaleStaging(
     return // 目录还不存在等：本次新建时自然会建出来。
   }
   for (const ent of entries) {
+    // 旁挂标记本身也满足 `isStagingName` 的前缀（`<staging>.marker`）—— 复审 W1：
+    // 不排除它就会在清理后对它再 lstat，得到一条假的「清理残留暂存目录失败（ENOENT）」。
+    if (ent.name.endsWith(STAGING_MARKER_SUFFIX)) continue
     if (!isStagingName(ent.name, entityBase)) continue
     const abs = path.join(stagingBase, ent.name)
     try {
@@ -867,6 +870,22 @@ function cleanupStaleStaging(
       warnings.push(`清理了上次安装中断时残留的暂存目录：${abs}`)
     } catch (err) {
       warnings.push(`清理残留暂存目录失败（${errMsg(err)}）：${abs}`)
+    }
+  }
+  // 孤儿标记（复审 W2）：SIGKILL 若落在 `finally` 的两条 rmSync 之间，目录已删、标记
+  // 还在。这类标记没有对应目录，永远清不掉，会永久留在 skills 目录里。按年龄一并清。
+  for (const ent of entries) {
+    if (!ent.name.endsWith(STAGING_MARKER_SUFFIX)) continue
+    const abs = path.join(stagingBase, ent.name)
+    const stagingDir = abs.slice(0, -STAGING_MARKER_SUFFIX.length)
+    if (isStagingName(path.basename(stagingDir), entityBase) === false) continue
+    if (existsSync(stagingDir)) continue   // 目录还在：由上面的循环处理
+    try {
+      const st = lstatSync(abs)
+      if (now - st.mtimeMs < STALE_STAGING_MIN_AGE_MS) continue
+      rmSync(abs, { force: true })
+    } catch {
+      // 并发删掉了等：无副作用，不必打扰用户。
     }
   }
 }
@@ -1077,16 +1096,26 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
       //     实体目录列不出）才是「仍不同」。
       const replan = planInstall({ entityDir, sourceDir, version, force })
       status = 'skipped'
+      // ⚠️ `action === 'none'` **带警告**还有两种完全不同的情形（复审 W3）：
+      //   · 内容不同且未加 force → 提示加 --force 是正确的；
+      //   · 清单被目录/符号链接占用（正文逐字节一致）→ `--force` **无效**（planInstall
+      //     在 force 分支之前就拦下了），劝用户加 --force 是错的建议。
+      // 判据用警告文案里的关键词区分（planInstall 的这两条文案是稳定的），而不是再算一遍
+      // 内容哈希——那会与 planInstall 形成第二事实源。
+      const manifestBlocked = replan.warnings.some((w) => w.includes('清单已被非普通文件占用'))
       const sameContent =
         replan.warnings.length === 0
         && (replan.action === 'none' || replan.action === 'rewrite-manifest')
       warnings.push(
         replan.action === 'rewrite-manifest'
           ? `另一个并发安装已完成，实体内容与包内一致，仅安装清单落后；重跑一次 qiyu skill install 即会补写清单（无需 --force）：${entityDir}`
-          : sameContent
-            ? `另一个并发安装已完成，实体内容与包内一致：${entityDir}`
-            : `另一个并发安装已完成，但实体内容与包内仍不同（${replan.warnings[0] ?? '计划要求 --force'}）；`
-              + `如需以本包为准请重跑 qiyu skill install（内容不同时加 --force）`,
+          : manifestBlocked
+            ? `另一个并发安装已完成，实体内容与包内一致，但安装清单被非普通文件占用；`
+              + `先处理该占用再重跑 qiyu skill install（--force 对此无效）：${entityDir}`
+            : sameContent
+              ? `另一个并发安装已完成，实体内容与包内一致：${entityDir}`
+              : `另一个并发安装已完成，但实体内容与包内仍不同（${replan.warnings[0] ?? '计划要求 --force'}）；`
+                + `如需以本包为准请重跑 qiyu skill install（内容不同时加 --force）`,
       )
     } else if (!outcome.complete && outcome.written === 0) {
       // 零写入：status 必须反映事实。`installed` 也一样退——实体可能只是个空壳。
