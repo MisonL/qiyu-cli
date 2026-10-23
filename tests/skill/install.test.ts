@@ -18,7 +18,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
-  contentHash, installSkill, MANIFEST, planInstall, type Manifest,
+  contentHash, installSkill, MANIFEST, planInstall, STAGING_MARKER_CONTENT, type Manifest,
 } from '../../src/skill/install.js'
 import { defaultEntityDir, linkState, linkTarget } from '../../src/skill/paths.js'
 import { SKILL_CONTRACT_VERSION } from '../../src/core/edition.js'
@@ -108,6 +108,15 @@ const fsReaddirFault = vi.hoisted(() => {
   }
 })
 
+/**
+ * 所有「并发赢家形态」的注入种类。**兜底分支用它做反判**（复审 N2）：写
+ * `!kind.startsWith('ENOTEMPTY')` 会让一个忘了登记的新变体既不进并发分支、也不进
+ * 兜底，直接落到真实 renameSync —— mock 静默失效而用例照常绿。
+ */
+const ENOTEMPTY_KINDS = new Set([
+  'ENOTEMPTY', 'ENOTEMPTY_STALE_MANIFEST', 'ENOTEMPTY_MANIFEST_DIR', 'ENOTEMPTY_EXACT',
+])
+
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
   return {
@@ -138,7 +147,6 @@ vi.mock('node:fs', async (importOriginal) => {
       // 模拟「另一进程在这两步之间把实体建出来了」。逐文件换入不拦。
       // ⚠️ 这个分支必须排在下面的通用分支**之前**：通用分支对任何非 null 的 kind 都抛
       // （且会把 ENOTEMPTY 渲染成 EACCES），先命中就永远到不了这里。
-      const ENOTEMPTY_KINDS = new Set(['ENOTEMPTY', 'ENOTEMPTY_STALE_MANIFEST', 'ENOTEMPTY_MANIFEST_DIR', 'ENOTEMPTY_EXACT'])
       if (kind !== null && ENOTEMPTY_KINDS.has(kind)
         && from.includes('.tmp-') && !to.includes('.tmp-') && !to.endsWith('.md') && !to.endsWith(MANIFEST)) {
         // ⚠️ 真实竞态里，错误发生时**实体已经在**（另一个进程刚写完）。只抛错不建实体
@@ -173,7 +181,9 @@ vi.mock('node:fs', async (importOriginal) => {
         throw e
       }
       // 只拦「换入」的那一步（源在暂存目录里），不拦首次安装的整目录 rename。
-      if (kind !== null && !kind.startsWith('ENOTEMPTY') && from.includes('.tmp-')) {
+      // 复审 N2：兜底必须用**集合反判**——写 `!kind.startsWith('ENOTEMPTY')` 会让未登记
+      // 的 `ENOTEMPTY_*` 变体既不进上面的分支、也不进兜底，mock 静默失效（用例照常绿）。
+      if (kind !== null && !ENOTEMPTY_KINDS.has(kind) && from.includes('.tmp-')) {
         const e = new Error(`${kind === 'EXDEV' ? 'EXDEV: cross-device link not permitted' : 'EACCES: permission denied'}`) as NodeJS.ErrnoException
         e.code = kind
         throw e
@@ -1081,7 +1091,7 @@ describe('#4：崩溃残留的暂存目录清理', () => {
     // 终审 F3 + 复审 N2：真正的暂存位带**旁挂**独占标记（`<staging>.marker`），
     // 清理只认带标记的目录（名字形状挡不住用户的 `qiyu.tmp-backup/`，而标记放目录里
     // 又有被源正文撞名的污染路径）。这里照实模拟本模块自己的残留。
-    writeFileSync(`${stale}.marker`, '标记\n')
+    writeFileSync(`${stale}.marker`, STAGING_MARKER_CONTENT)
     // ⚠️ 必须把 mtime 拨老：清理按年龄判（gap 8 —— 年轻的可能是另一个并发安装正在写的，
     // 无差别删会把它打成 ENOENT / 「暂存内容与源不一致」）。
     const longAgo = new Date(Date.now() - 60 * 60_000)
@@ -1384,6 +1394,24 @@ describe('并发安装（gap 8）', () => {
     expect(contentHash(entity)).toBe(contentHash(src))
   })
 
+  it('⑥ 注入一个**未登记**的 ENOTEMPTY 变体时 mock 不得静默失效（复审 N2：兜底用集合反判）', async () => {
+    const src = makeSource()
+    // 只有把兜底写成 `!ENOTEMPTY_KINDS.has(kind)`，这个变体才会被拦（渲染成 EACCES 语义的
+    // 通用分支）。旧写法 `!kind.startsWith('ENOTEMPTY')` 下它既不进并发分支也不进兜底，
+    // 直接走真实 renameSync —— mock 静默失效、用例照常绿。
+    fsRenameFault.set('ENOTEMPTY_UNREGISTERED')
+    try {
+      // mock 生效 ⇒ 换入被拦、安装以错误终止（EACCES 语义的通用分支）。
+      // 若兜底写成 `!kind.startsWith('ENOTEMPTY')`，这个变体会直接走真实 renameSync，
+      // 于是安装**成功**、本断言失败 —— 正是要抓的「mock 静默失效」。
+      await expect(
+        installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true }),
+      ).rejects.toThrow(/EACCES|permission denied/)
+    } finally {
+      fsRenameFault.set(null)
+    }
+  })
+
   it('④ 并发赢家正文一致、但清单被目录占用 → 不得劝 --force（复审 W3：--force 对此无效）', async () => {
     const src = makeSource()
     // 实体初始必须**不存在**（否则 plan 直接是 action='none'，根本走不到写入/并发分支）。
@@ -1419,6 +1447,9 @@ describe('并发安装（gap 8）', () => {
       // 变异「sameContent 恒 false（永远说仍不同）」→ 本行红：正向「一致」文案有人钉。
       expect(joined, '完全一致时必须说「内容与包内一致」').toContain('内容与包内一致')
       expect(joined).not.toContain('仍不同')
+      // ⚠️ 不能只查「内容与包内一致」——它也是「仅清单落后」文案的公共子串（复审 W4）。
+      // 完全一致时不得落到那条分支。
+      expect(joined, '完全一致时不得说「清单落后」').not.toContain('清单落后')
     } finally {
       fsRenameFault.set(null)
     }
@@ -1433,12 +1464,15 @@ describe('并发安装（gap 8）', () => {
     const young = join(dirname(entity), `${entity.split('/').pop()}.tmp-ABC123`)
     mkdirSync(young)
     write(young, 'SKILL.md', '# 另一个进程正在写\n')
+    // ⚠️ 必须带标记：不带的话第一循环在标记判据处就跳过，**年龄**判据没人钉
+    // （复审实测：去掉年龄守卫用例仍绿 —— 正是因为年轻夹具缺标记）。
+    writeFileSync(`${young}.marker`, STAGING_MARKER_CONTENT)
 
     // 造一个「很久以前」的残留目录：mtime 拨回 1 小时前，且带本模块的独占标记。
     const old = join(dirname(entity), `${entity.split('/').pop()}.tmp-OLD999`)
     mkdirSync(old)
     write(old, 'SKILL.md', '# 上次崩溃的残留\n')
-    writeFileSync(`${old}.marker`, '标记\n')
+    writeFileSync(`${old}.marker`, STAGING_MARKER_CONTENT)
     const longAgo = new Date(Date.now() - 60 * 60_000)
     utimesSync(old, longAgo, longAgo)
 
@@ -1454,18 +1488,56 @@ describe('并发安装（gap 8）', () => {
     expect(r.warnings.some((w) => w.includes('失败')), JSON.stringify(r.warnings)).toBe(false)
   })
 
+  it('②d 用户目录里恰好有个同名 `.marker`（内容不是我们的）不得被当成残留删除（复审 N1 的另一面）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+    // 用户的备份目录 + 它旁边一个同名文件（内容完全不同）。
+    const mine = join(dirname(entity), `${entity.split('/').pop()}.tmp-backup`)
+    mkdirSync(mine)
+    writeFileSync(join(mine, 'important.md'), '用户自己的数据\n')
+    writeFileSync(`${mine}.marker`, '用户自己的备注\n')
+    const longAgo = new Date(Date.now() - 24 * 60 * 60_000)
+    utimesSync(mine, longAgo, longAgo)
+    utimesSync(`${mine}.marker`, longAgo, longAgo)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+
+    // 变异「isOurMarker 退回 existsSync」→ 这个目录会被当残留删掉 → 红。
+    expect(existsSync(join(mine, 'important.md')), '用户目录被当成残留删除了').toBe(true)
+    expect(existsSync(`${mine}.marker`), '用户的同名文件被当成孤儿标记删除了').toBe(true)
+    expect(r.warnings.some((w) => w.includes('残留'))).toBe(false)
+  })
+
+  it('②c 用户自己的普通文件 `<实体>.tmp-*.marker` 不得被当成孤儿标记删除（复审 N1：判据必须认内容）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+    // 用户自己写的一个普通文件：名字满足「前缀 + .marker」，但内容不是我们的标记。
+    const userFile = `${join(dirname(entity), `${entity.split('/').pop()}.tmp-MyNotes`)}.marker`
+    writeFileSync(userFile, '我自己记的一段内容\n')
+    const longAgo = new Date(Date.now() - 24 * 60 * 60_000)
+    utimesSync(userFile, longAgo, longAgo)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+
+    expect(existsSync(userFile), '用户同名普通文件被静默删除了').toBe(true)
+    expect(readFileSync(userFile, 'utf8')).toBe('我自己记的一段内容\n')
+    expect(r.warnings).toEqual([])
+  })
+
   it('②b 孤儿标记（目录已不在）按年龄清理（复审 W2：SIGKILL 落在 finally 两条 rmSync 之间）', async () => {
     const src = makeSource()
     const entity = defaultEntityDir(home)
     mkdirSync(dirname(entity), { recursive: true })
     // 孤儿标记：对应的暂存目录已经不存在。
     const orphan = `${join(dirname(entity), `${entity.split('/').pop()}.tmp-Orphan7`)}.marker`
-    writeFileSync(orphan, '标记\n')
+    writeFileSync(orphan, STAGING_MARKER_CONTENT)
     const longAgo = new Date(Date.now() - 60 * 60_000)
     utimesSync(orphan, longAgo, longAgo)
     // 年轻的孤儿标记不动（可能与某次正在进行/即将开始的安装相关）。
     const youngOrphan = `${join(dirname(entity), `${entity.split('/').pop()}.tmp-Young77`)}.marker`
-    writeFileSync(youngOrphan, '标记\n')
+    writeFileSync(youngOrphan, STAGING_MARKER_CONTENT)
 
     await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
 

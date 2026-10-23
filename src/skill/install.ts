@@ -99,9 +99,24 @@ const STAGING_SUFFIX = '.tmp-'
  */
 const STAGING_MARKER_SUFFIX = '.marker'
 
+/**
+ * 标记文件的**内容**：写入与孤儿清理的校验同源（复审 N1）。
+ * 它同时是「这个标记确实由本模块写下」的判据——只认名字会误删用户的同名普通文件。
+ */
+export const STAGING_MARKER_CONTENT = 'qiyu skill install 的暂存目录；崩溃残留清理只认带此标记的目录\n'
+
 /** 某个暂存目录对应的标记文件路径。 */
 function stagingMarkerPath(staging: string): string {
   return `${staging}${STAGING_MARKER_SUFFIX}`
+}
+
+/** 该路径是否是一个**由本模块写下**的标记（普通文件 + 内容逐字匹配）。 */
+function isOurMarker(p: string): boolean {
+  try {
+    return lstatSync(p).isFile() && readFileSync(p, 'utf8') === STAGING_MARKER_CONTENT
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -716,7 +731,7 @@ function writeInstalled(
     // 标记写在暂存目录**旁边**（不是里面）：它因此不参与 contentHash、不会被
     // copyTree 的源撞名覆盖、也不会被换入实体（复审 N2）。崩溃残留（含正文、尚未
     // 换入）带标记，下次安装可安全清理（终审 F3）。
-    writeFileSync(stagingMarkerPath(staging), 'qiyu skill install 的暂存目录；崩溃残留清理只认带此标记的目录\n')
+    writeFileSync(stagingMarkerPath(staging), STAGING_MARKER_CONTENT)
     writeManifest(staging, version, sourceHash, sourceFiles)
   } catch (err) {
     if (staging !== undefined) {
@@ -862,7 +877,7 @@ function cleanupStaleStaging(
       // 独占标记（终审 F3）：没有标记的同名目录**不是**本模块的暂存位——可能是用户
       // 自己建的 `qiyu.tmp-backup/`。宁留不删，也不给一条「已清理残留」的错误归因。
       // 标记是**旁挂文件**（复审 N2），所以用户目录里就算有个同名文件也不算数。
-      if (!existsSync(stagingMarkerPath(abs))) continue
+      if (!isOurMarker(stagingMarkerPath(abs))) continue
       // 年轻 = 可能有别的 install 正在写它。留到下次再清（`--force` 也救不了误删）。
       if (now - st.mtimeMs < STALE_STAGING_MIN_AGE_MS) continue
       rmSync(abs, { recursive: true, force: true })
@@ -874,6 +889,11 @@ function cleanupStaleStaging(
   }
   // 孤儿标记（复审 W2）：SIGKILL 若落在 `finally` 的两条 rmSync 之间，目录已删、标记
   // 还在。这类标记没有对应目录，永远清不掉，会永久留在 skills 目录里。按年龄一并清。
+  //
+  // ⚠️ 判据是**内容**而不是名字（复审 N1）：只看名字的话，用户自己的普通文件
+  // `<实体>.tmp-*.marker` 会被静默删除（且不给任何警告）。标记内容是本模块写死的固定串，
+  // 它才是「这确实是我写的」的判据——这也是 W5（用户目录 + 同名标记）能再窄一层的同一
+  // 思路：伪造固定串才可能误删，比「名字撞上」难得多，故不再引入 pid 校验之类的机制。
   for (const ent of entries) {
     if (!ent.name.endsWith(STAGING_MARKER_SUFFIX)) continue
     const abs = path.join(stagingBase, ent.name)
@@ -882,10 +902,12 @@ function cleanupStaleStaging(
     if (existsSync(stagingDir)) continue   // 目录还在：由上面的循环处理
     try {
       const st = lstatSync(abs)
+      if (!st.isFile()) continue                       // 符号链接/目录/设备：不是我们的
       if (now - st.mtimeMs < STALE_STAGING_MIN_AGE_MS) continue
+      if (readFileSync(abs, 'utf8') !== STAGING_MARKER_CONTENT) continue
       rmSync(abs, { force: true })
     } catch {
-      // 并发删掉了等：无副作用，不必打扰用户。
+      // 读不出来 / 并发删掉了等：无副作用，不必打扰用户。
     }
   }
 }
@@ -1114,8 +1136,9 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
               + `先处理该占用再重跑 qiyu skill install（--force 对此无效）：${entityDir}`
             : sameContent
               ? `另一个并发安装已完成，实体内容与包内一致：${entityDir}`
-              : `另一个并发安装已完成，但实体内容与包内仍不同（${replan.warnings[0] ?? '计划要求 --force'}）；`
-                + `如需以本包为准请重跑 qiyu skill install（内容不同时加 --force）`,
+              : `另一个并发安装已完成，但实体内容与包内仍不同：${replan.warnings[0] ?? '计划要求 --force'}。`
+                + `按上面那条警告的指引处理后再重跑 qiyu skill install（只有「内容被手工修改」`
+                + `这一类才需要 --force；目录不可读时 --force 同样失败）`,
       )
     } else if (!outcome.complete && outcome.written === 0) {
       // 零写入：status 必须反映事实。`installed` 也一样退——实体可能只是个空壳。
