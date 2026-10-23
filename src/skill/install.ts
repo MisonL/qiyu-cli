@@ -68,12 +68,15 @@ import path from 'node:path'
 import { SKILL_CONTRACT_VERSION } from '../core/edition.js'
 import {
   agentSkillDirs, agentsMissingSkillDir, createSkillLink, defaultEntityDir, LINK_NAME, linkState,
-  linkTarget, normalizeNewlines,
+  linkTarget, MANIFEST, normalizeNewlines,
   type LinkState,
 } from './paths.js'
 
-/** 安装清单文件名：落在实体目录根部，记录版本与内容哈希（Task 10 的安装态探测读它）。 */
-export const MANIFEST = '.qiyu-skill.json'
+/**
+ * 安装清单文件名（D6：事实源已收敛到 `paths.ts`，这里 re-export 只为保持既有 import
+ * 路径兼容——`detect.ts` 与两个测试文件仍从本模块取它）。
+ */
+export { MANIFEST }
 
 /** 暂存目录前缀：`<entity>.tmp-`（`mkdtempSync` 在其后追加唯一随机后缀）。 */
 const STAGING_SUFFIX = '.tmp-'

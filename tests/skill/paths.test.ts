@@ -3,7 +3,7 @@ import {
   mkdtempSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync, readdirSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import path, { join } from 'node:path'
 import {
   AGENT_SKILL_SUBDIRS, LINK_NAME, agentSkillDirs, agentSkillSubdir, agentsMissingSkillDir,
   defaultEntityDir, envIndex, linkPlan, linkState, linkTarget, createSkillLink, normalizeNewlines,
@@ -70,6 +70,31 @@ describe('paths', () => {
     expect(linkPlan(link, rel, 'win32')).toEqual({ target: join(home, '.agents', 'skills', 'qiyu'), type: 'junction' })
     expect(linkPlan(link, rel, 'darwin')).toEqual({ target: rel })
     expect(linkPlan(link, rel, 'linux')).toEqual({ target: rel })
+  })
+
+  // —— D3.15：win32 用例必须真的走 win32 路径运算，而不是在 POSIX 上跑 POSIX path ——
+  it('linkPlan 的 win32 分支显式用 path.win32：`C:\\\\...` 形态的输入得到 Windows 语义的结果', () => {
+    // 变异「linkPlan 内部仍用平台 path（忽略注入的 pathImpl）」→ 本用例红：
+    // POSIX 的 path.resolve('C:\\Users\\m\\.claude\\skills', '..\\..\\.agents\\skills\\qiyu')
+    // 会把反斜杠当普通字符、产出 `/<cwd>/C:\\Users\\...` 这种非 Windows 路径。
+    const winLink = 'C:\\Users\\m\\.claude\\skills\\qiyu'
+    const winRel = '..\\..\\.agents\\skills\\qiyu'
+    const plan = linkPlan(winLink, winRel, 'win32', path.win32)
+    expect(plan).toEqual({ target: 'C:\\Users\\m\\.agents\\skills\\qiyu', type: 'junction' })
+    // 反证：同一输入走 POSIX path 得到的是另一种形状（证明上面那条断言真的分派了 win32）。
+    expect(linkPlan(winLink, winRel, 'win32', path.posix).target).not.toBe(plan.target)
+    // 非 win32 平台不受 pathImpl 影响：原样保留相对 target。
+    expect(linkPlan(winLink, winRel, 'darwin', path.win32)).toEqual({ target: winRel })
+  })
+
+  it('defaultEntityDir 在 win32 语义下拼出 `C:\\Users\\m\\.agents\\skills\\qiyu`（D1 的 Windows 覆盖）', () => {
+    // 变异「defaultEntityDir 内部仍用平台 path」→ 本用例红（POSIX 下会拼成
+    // `C:\\Users\\m/.agents/skills/qiyu`，分隔符混用、不是 Windows 形态）。
+    expect(defaultEntityDir('C:\\Users\\m', path.win32)).toBe('C:\\Users\\m\\.agents\\skills\\qiyu')
+    // 默认参数仍是当前平台语义（不改既有调用点的行为）。
+    expect(defaultEntityDir(home)).toBe(join(home, '.agents', 'skills', 'qiyu'))
+    // 叶子名与 LINK_NAME 同源（D6）：换 LINK_NAME 的变异会让这里跟着变，两条断言同时红。
+    expect(defaultEntityDir('C:\\Users\\m', path.win32).endsWith(`\\${LINK_NAME}`)).toBe(true)
   })
   it('normalizeNewlines 把 CRLF 折成 LF', () => {
     expect(normalizeNewlines(Buffer.from('a\r\nb\r\n')).toString()).toBe('a\nb\n')

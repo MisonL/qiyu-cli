@@ -140,4 +140,25 @@ describe('scripts/copy-assets.mjs', () => {
     expect(r.status).not.toBe(0)
     expect(r.stderr).toContain('version 不可用')
   })
+
+  // —— D3.10：`export const …` 匹配到多处时的歧义保护 ——
+  it('export 行出现多次（歧义）→ 非 0 退出，拒绝猜哪一行是版本', () => {
+    // 变异「去掉 `matches.length !== 1` 的检查」→ 本用例红：脚本会拿第一处匹配注入、
+    // 退 0，把一份有歧义的构建产物当成成功。
+    // 构造：两处 `export const PACKAGE_VERSION = '...'`（第二处是重复导出/打包残留的形态）。
+    const root = makeMiniRepo({
+      edition: [
+        "// 注释里提到 '0.0.0-dev' 是正常的，不能被替换",
+        "export const PACKAGE_VERSION = '0.0.0-dev';",
+        "export const PACKAGE_VERSION = '0.0.0-dev';",
+        '',
+      ].join('\n'),
+    })
+    const r = runScript(root)
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('出现 2 次')
+    // 歧义时**一个字节都不写**：两行都还是占位值（没有「猜一处先注入」的半成品）。
+    const edition = readFileSync(join(root, 'dist/core/edition.js'), 'utf8')
+    expect(edition.match(/PACKAGE_VERSION = '0\.0\.0-dev'/g)).toHaveLength(2)
+  })
 })

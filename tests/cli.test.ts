@@ -9,7 +9,7 @@ import { run } from '../src/cli.js'
 // （Task 13 只改 `dist/core/edition.js`，而测试导入的是 `src/core/edition.ts`）；
 // 「构建产物非占位」由 Task 13 的产物级测试钉住。
 import { PACKAGE_VERSION } from '../src/core/edition.js'
-import { __resetSkillDetectionForTest } from '../src/skill/detect.js'
+import { resetSkillDetectionCache } from '../src/skill/detect.js'
 import { setSkillWarning } from '../src/output.js'
 
 let out = ''
@@ -426,12 +426,12 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     vi.stubEnv('QIYU_SKILL_DIR', '')
     setSkillWarning(undefined)
     // 探测按参数元组缓存；上一个用例的结论不能漏到这一个。
-    __resetSkillDetectionForTest()
+    resetSkillDetectionCache()
   })
   afterEach(() => {
     vi.unstubAllEnvs()
     setSkillWarning(undefined)
-    __resetSkillDetectionForTest()
+    resetSkillDetectionCache()
     rmSync(home, { recursive: true, force: true })
   })
 
@@ -487,7 +487,7 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     expect(await run(['skill', 'install', '--dir', entity, '--no-link'])).toBe(0)
     out = ''; err = ''
     // 安装前那次探测已按同一组参数缓存了 absent —— 不清缓存这里会读到旧结论。
-    __resetSkillDetectionForTest()
+    resetSkillDetectionCache()
     expect(await run(['--version'])).toBe(0)
     // current 不提示：没有 meta 键（而不是 meta:{warnings:[]}）。
     expect('meta' in JSON.parse(out)).toBe(false)

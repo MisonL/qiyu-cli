@@ -306,6 +306,35 @@ describe('COMMAND_TREE', () => {
       void accepted
     }
   })
+
+  // —— D3.14：spec → parser 的**反向**漂移（解析器多认一个 spec 没有的 flag）——
+  //
+  // 上面那条只证明「spec 里的每个 flag 解析器都认」（正向）；解析器多认一个 spec 没写的
+  // flag 时它**全绿** —— 而那条漂移会让 `skill check` 对正文里一个实际可用的写法判
+  // `unknown_flag`（假阳性），正是 spec 存在的意义所在。
+  //
+  // ⚠️ 为什么不能用「拿 flag 表挨个试解析器」的做法：解析器的接受集从 `SKILL_SPECS`
+  // 派生（`skillFlagSpecs`），**同一个事实源**，那样比是同义反复、永远不会红。
+  // 所以要拿一个 spec 里没有的候选名去探。候选取自 `GLOBAL_FLAGS` 之外、别条命令
+  // 真实存在的 flag（`--force` 之于 where 有语义、`--db` 之于 skill 是存储 flag）——
+  // 它们一旦被加进 skill 的受支持集，本用例必须报出来。
+  it('[D3.14] 反向漂移：skill 三条不接受任何 spec 之外的候选 flag（加进接受集即红）', async () => {
+    const CANDIDATES = ['--force', '--db', '--profile', '--backend', '--all', '--yes', '--body']
+    for (const sub of ['install', 'check', 'where'] as const) {
+      const spec = SKILL_SPECS.find((x) => x.path.join(' ') === `skill ${sub}`)!
+      const names = new Set(spec.flags.map((f) => f.name))
+      for (const cand of CANDIDATES) {
+        // 前提自检：候选必须确实不在 spec 里（否则本用例在这条候选上无意义）。
+        if (names.has(cand)) continue
+        out = ''; err = ''
+        await skillCommand([sub, cand, 'x', '--zzz-spec-probe'])
+        // 解析器必须把它当**未知**参数（出现在「未知参数：…」清单里）；
+        // 变异「把 --force 从 install 的解析器受支持集里加进 where」→ 本用例红。
+        expect(unknownSegment(messageOf()), `skill ${sub} 不该接受 ${cand}`)
+          .toContain(cand)
+      }
+    }
+  })
   it('skill 家族的命令名都在 true 的树里：正文引用不会被判 unknown_command（G3 审查 C1 命令层探针）', async () => {
     // cli.ts 的 COMMANDS 有 `skill`；若是「skill install」这类正文写法，真实 CLI 会分派到
     // skillCommand 再按子命令裁决——所以 tree 里必须出现 `skill <子命令>`。

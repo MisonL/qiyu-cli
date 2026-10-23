@@ -14,9 +14,9 @@
 //   · where   —— 纯只读：报告实体路径与各 agent 链接状态，**只报告、不修复、不删除**
 //                （spec D2）。要修复就让用户重跑 `qiyu skill install`。
 //
-// 实体定位统一为 `--dir` > `QIYU_SKILL_DIR` > `npm_config_qiyu_skill_dir` > `defaultEntityDir(os.homedir())`
+// 实体定位统一为 `--dir` > `QIYU_SKILL_DIR` > `npm_config_qiyu_skill_dir` > `defaultEntityDir(resolveHome())`
 // （唯一实现在 `skill/detect.ts` 的 `resolveEntityDirSources`，G3 审查 C3）；
-// home 一律取 `os.homedir()`（测试用 `HOME` 注入，绝不读写真实 `~`）。
+// home 一律经 `resolveHome()`（见该函数注释：测试用 `QIYU_HOME_FOR_TEST` 注入，绝不读写真实 `~`）。
 //
 // `skill where` 的逐 agent 兜异常（brief 硬要求）：`linkState` 对自指/成环链接抛 ELOOP，
 // `agentSkillDirs` 在 `~/.claude` 是文件时抛 ENOTDIR（Task 7 实测）。一个坏链接不能让
@@ -40,7 +40,8 @@ import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult } from '../skill/check.js'
 import { contentHash, installSkill, planInstall, type InstallPlan } from '../skill/install.js'
 import {
-  entityUndeterminedNote, npmRelativeBase, resolveEntityDirSources, resolveSkillSourceDir,
+  entityUndeterminedNote, npmRelativeBase, resetSkillDetectionCache, resolveEntityDirSources,
+  resolveSkillSourceDir,
   type EntitySource,
 } from '../skill/detect.js'
 import {
@@ -176,6 +177,32 @@ function parseOrFail(argv: string[], spec: FlagSpec, sub: string): Parsed | numb
 export type { EntitySource }
 
 /**
+ * 测试注入 home 的环境变量（D1）。**仅供测试注入**，不做路径校验——它只改变 skill
+ * 子系统的默认实体目录位置与 agent 目录探测根，**不读任何凭证**。
+ *
+ * ⚠️ 为什么需要它：`os.homedir()` 在 Windows 上读 `USERPROFILE`、POSIX 上读 `HOME`，
+ * 而测试原本只 stub `HOME` —— Windows 上跑测试会真的把 skill 写进用户 home。
+ * 用一个显式变量把「测试的 home」与平台环境变量解耦，测试因此不再依赖平台差异。
+ *
+ * 空串 / 纯空白按未设处理（与 `QIYU_SKILL_DIR` 同一条口径）：否则测试里
+ * `vi.stubEnv('QIYU_HOME_FOR_TEST', '')` 会把默认实体目录算成相对路径。
+ */
+export const HOME_FOR_TEST_ENV = 'QIYU_HOME_FOR_TEST'
+
+/**
+ * skill 子系统在命令层使用的 home。优先级：`QIYU_HOME_FOR_TEST`（非空）?? `os.homedir()`。
+ *
+ * 收成一个函数的所有调用点都走它（install 的链接探测、where 的 agent 探测、启动探测的
+ * 默认实体位、默认实体目录）：任何一处漏了，Windows 上就仍会碰真实 home（D1 的变异点）。
+ * `env` 可注入只为把「空串视为未设」这条纯规则测得不碰磁盘。
+ */
+export function resolveHome(env: NodeJS.ProcessEnv = process.env): string {
+  const injected = env[HOME_FOR_TEST_ENV]?.trim()
+  if (injected !== undefined && injected !== '') return injected
+  return homedir()
+}
+
+/**
  * 实体定位：`--dir` > `QIYU_SKILL_DIR` > `npm_config_qiyu_skill_dir` > 默认位置。
  *
  * 第三条是 postinstall 的安装通道（spec C5：`npm i -g` 时唯一跨版本可用的自定义位置）。
@@ -201,6 +228,8 @@ export function resolveEntity(flagDir: string | undefined): { dir: string; sourc
     flagDir,
     env: process.env,
     baseDir: process.cwd(),
+    // D1：默认实体位也以注入的 home 为根（否则 Windows 上无 --dir 的 install 仍写真实 home）。
+    home: resolveHome(),
     // 命令层不受测试门影响：`skill where --dir X` 在测试里必须照常报告 X，
     // 且它必须认 npm_config 这条 postinstall 通道（终审 I2）。
     testGate: false,
@@ -221,7 +250,7 @@ function startupProbeStatus(): { dir: string | undefined; note: string | undefin
   const resolved = resolveEntityDirSources({
     env,
     baseDir: npmRelativeBase(env, () => process.cwd()),
-    home: homedir(),
+    home: resolveHome(),
   })
   if (resolved.decided) return { dir: resolved.dir, note: undefined }
   return { dir: undefined, note: entityUndeterminedNote(resolved, env) }
@@ -412,7 +441,7 @@ async function skillInstall(argv: string[]): Promise<number> {
   // 校验过后才收窄成联合类型（校验前是用户输入，不能直接断言）。
   const agentNames = linkNames as AgentDir['name'][]
 
-  const home = homedir()
+  const home = resolveHome()
   const { dir: entityDir, source } = resolveEntity(parsed.values.get('--dir'))
   const sourceDir = resolveSkillSourceDir()
   if (sourceDir === undefined) return sourceMissing()
@@ -504,9 +533,14 @@ async function skillInstall(argv: string[]): Promise<number> {
   }
 
   // ⚠️ 安装成功必须清掉启动时探测出的「未安装/已过期」提示（Task 10 审查疑虑 2）：
-  // cli.run() 在分派前探测、注入进程级提示；同一进程里安装成功后再输出，
-  // 那条提示已经过时。只提示、不改退出码——清掉即可，不重新探测（缓存同参仍旧）。
+  // cli.run() 在分派前探测、注入进程级提示；同一进程里安装成功后再输出，那条提示已经过时。
+  // 这里是**输出层**的残留，与探测缓存是两回事（D5），两个都要清：
+  //   · setSkillWarning(undefined) —— 清掉已经注入进程的那句文本；
+  //   · resetSkillDetectionCache() —— 让同进程内**下一次** cli.run() 重新探测。只清文本
+  //     不失效缓存的话，先 `--version`（absent）→ install → 再 `--version`，第三条仍会
+  //     命中旧的 absent 结论并再次报「skill 未安装」（D5 的实测顺序）。
   setSkillWarning(undefined)
+  resetSkillDetectionCache()
 
   const allWarnings = [...warnings, ...result.warnings]
   // installSkill 对幂等命中返回 skipped 且**无警告**（一个字节都没写）。命令层补一句
@@ -904,7 +938,7 @@ async function skillWhere(argv: string[]): Promise<number> {
     }
   }
 
-  const probed = probeAgentLinks(homedir(), entityDir)
+  const probed = probeAgentLinks(resolveHome(), entityDir)
   warnings.push(...probed.warnings)
   return ok(
     { entity, links: probed.links },

@@ -1,8 +1,10 @@
 // tests/commands/skill.test.ts —— F 子项目 Task 11：`qiyu skill install/check/where` 命令层。
 //
-// 全部在临时 home 下跑：`--dir` 显式注入实体位置，`HOME` 注入 agent 目录探测的根
-// （`os.homedir()` 在 POSIX 上读 `HOME`）。**绝不读写真实 `~`**；`QIYU_SKILL_DIR`
-// 每个用例前清成空串（命令层把它当「未设」）。
+// 全部在临时 home 下跑：`--dir` 显式注入实体位置，`QIYU_HOME_FOR_TEST` 注入 agent 目录
+// 探测的根（D1：命令层的 home 只经 `resolveHome()` 取，见 `src/commands/skill.ts`）。
+// **绝不读写真实 `~`**；`HOME` / `USERPROFILE` 在本文件里**刻意不动**——它们是平台相关
+// 的，Windows 上命令层根本不读它们，靠它们隔离是 D1 要消灭的那种假安全。
+// `QIYU_SKILL_DIR` 每个用例前清成空串（命令层把它当「未设」）。
 //
 // brief 的 14 条要点逐条对应下面的用例；另补了几条 brief 在「约束」里点名、
 // 但没列进 14 条的行为：where 的逐 agent 兜异常（ELOOP / ENOTDIR）、check 模式互斥、
@@ -10,16 +12,17 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
-  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
-  symlinkSync, writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
+  rmSync, symlinkSync, writeFileSync,
 } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { skillCommand } from '../../src/commands/skill.js'
-import { MANIFEST } from '../../src/skill/install.js'
-import { __resetSkillDetectionForTest } from '../../src/skill/detect.js'
+import { HOME_FOR_TEST_ENV, resolveHome, skillCommand } from '../../src/commands/skill.js'
+import { MANIFEST, installSkill } from '../../src/skill/install.js'
+import { resetSkillDetectionCache, resolveSkillSourceDir } from '../../src/skill/detect.js'
 import { ok, setSkillWarning } from '../../src/output.js'
-import { SKILL_CONTRACT_VERSION } from '../../src/core/edition.js'
+import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from '../../src/core/edition.js'
+import { SYNC_TASKS } from '../../src/sync/registry.js'
 import { run } from '../../src/cli.js'
 
 let out = ''
@@ -34,19 +37,28 @@ beforeEach(() => {
   entity = join(home, 'entity')
   vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
   vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  // D1：命令层的 home 走 QIYU_HOME_FOR_TEST（不 stub HOME/USERPROFILE——那正是要消灭的
+  // 平台依赖）。启动探测（cli.run）仍读 process.env 的 NODE_ENV 做测试门，照旧 stub。
+  vi.stubEnv(HOME_FOR_TEST_ENV, home)
+  // ⚠️ 兜底网（2026-10-22 G4 实测的教训）：**做 D1 变异时**（把 resolveHome 改回
+  // homedir()）命令层会回落到平台 home —— 本文件当时真的在真实 `~` 下写出了两条悬空
+  // 链接。变异是「证明守卫在岗」的必要手段，但守卫一旦停用，隔离就不能只靠它。
+  // 所以平台 home 变量在这里也一并指到临时目录：即便守卫被摘掉，落点仍是 tmp。
+  // D1 的三条用例在用例内**覆盖**这两个变量（指向另一个 tmp），判别力不受影响。
   vi.stubEnv('HOME', home)
+  vi.stubEnv('USERPROFILE', home)
   vi.stubEnv('NODE_ENV', 'test')
   // 空串 = 未设（命令层的解析与 detect.resolveEntityDir 同口径）。
   vi.stubEnv('QIYU_SKILL_DIR', '')
   setSkillWarning(undefined)
-  __resetSkillDetectionForTest()
+  resetSkillDetectionCache()
 })
 afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllEnvs()
   rmSync(home, { recursive: true, force: true })
   setSkillWarning(undefined)
-  __resetSkillDetectionForTest()
+  resetSkillDetectionCache()
 })
 
 /** stdout 的 JSON 信封。 */
@@ -221,7 +233,121 @@ describe('skill install', () => {
   })
 })
 
-// —— I1 回归：dry-run 的计划必须与真实 install 的判定一致（四种边界态） ——
+// —— D1：命令层的 home 注入缝（Windows 上测试绝不写真实 home） ——
+//
+// 病根：`os.homedir()` 在 Windows 读 `USERPROFILE`，而旧测试只 stub `HOME` ——
+// Windows 上跑测试就真的往用户 home 写 skill。修法是命令层所有 home 取值收进
+// `resolveHome()`，优先级 `QIYU_HOME_FOR_TEST`（非空）?? `homedir()`。
+describe('D1：命令层 home 注入缝 QIYU_HOME_FOR_TEST', () => {
+  it('install 把链接建到注入的 home，而不是 HOME/USERPROFILE 指向的另一个目录', async () => {
+    // 变异「resolveHome 改回 homedir()」→ 本用例红：链接会建到 platformHome 下。
+    const platformHome = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-d1-platform-')))
+    const alt = join(platformHome, '.claude', 'skills')
+    mkdirSync(alt, { recursive: true })
+    // 注入的 home 也真有 agent 目录（否则 install 会走「目录不存在 → 不建链」分支，
+    // 那证明不了「建到哪个 home」）。
+    mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
+    // Windows 读 USERPROFILE、POSIX 读 HOME：两个都指到 platformHome，模拟「平台默认 home」。
+    vi.stubEnv('HOME', platformHome)
+    vi.stubEnv('USERPROFILE', platformHome)
+    try {
+      expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+      // 注入的 home 下建链
+      expect(lstatSync(join(home, '.claude', 'skills', 'qiyu')).isSymbolicLink()).toBe(true)
+      // 平台 home 的 agent 目录一个条目都没多出来（链接与实体都不许落在那里）
+      expect(readdirSync(alt)).toEqual([])
+    } finally {
+      rmSync(platformHome, { recursive: true, force: true })
+    }
+  })
+
+  it('where 的 agent 探测同样走注入的 home（不读平台 home）', async () => {
+    // 变异「probeAgentLinks 处仍用 homedir()」→ 本用例红：注入 home 下的链接报 missing。
+    const platformHome = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-d1-platform-')))
+    mkdirSync(join(platformHome, '.claude', 'skills'), { recursive: true })
+    vi.stubEnv('HOME', platformHome)
+    vi.stubEnv('USERPROFILE', platformHome)
+    try {
+      mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
+      expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+      // 链接路径按注入的 home 拼；平台 home 下的那个 agent 目录不该出现在任何条目里。
+      expect(linkOf('claude-code')).toMatchObject({
+        path: join(home, '.claude', 'skills', 'qiyu'), state: 'missing',
+      })
+      expect(out).not.toContain(platformHome)
+    } finally {
+      rmSync(platformHome, { recursive: true, force: true })
+    }
+  })
+
+  it('未给 --dir 时默认实体位以注入的 home 为根（不是平台 home）', async () => {
+    // 变异「resolveEntity 不传 home」→ 本用例红：默认实体位落到 platformHome/.agents/...。
+    const platformHome = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-d1-platform-')))
+    vi.stubEnv('HOME', platformHome)
+    vi.stubEnv('USERPROFILE', platformHome)
+    try {
+      expect(await skillCommand(['install', '--no-link'])).toBe(0)
+      expect(data().entity_dir).toBe(join(home, '.agents', 'skills', 'qiyu'))
+      expect(existsSync(join(home, '.agents', 'skills', 'qiyu', 'SKILL.md'))).toBe(true)
+      expect(existsSync(join(platformHome, '.agents'))).toBe(false)
+    } finally {
+      rmSync(platformHome, { recursive: true, force: true })
+    }
+  })
+
+  it('QIYU_HOME_FOR_TEST 为空串 / 纯空白时按未设处理（回落到平台 home 语义，不解析成相对路径）', () => {
+    // 变异「读 process.env 直接返回、不 trim 不判空」→ 本用例红（返回 '' 或 '   '）。
+    // 纯函数级断言：注入 env 字面量，不碰磁盘、不读真实 home。
+    expect(resolveHome({ [HOME_FOR_TEST_ENV]: '' })).toBe(homedir())
+    expect(resolveHome({ [HOME_FOR_TEST_ENV]: '   ' })).toBe(homedir())
+    expect(resolveHome({ [HOME_FOR_TEST_ENV]: ` ${home} ` })).toBe(home)
+  })
+})
+
+// —— D5：同进程内 install 之后探测缓存必须失效 ——
+//
+// 病根：`detectSkillState` 按（实体、源、版本）元组缓存，永不过期。`cli.run()` 在同一
+// 进程内被多次调用是真实形态（测试与嵌入式用法）：先 `--version`（无 skill，缓存 absent）
+// → `skill install` → 再 `--version`，第三条仍从缓存读 absent 并报「skill 未安装」。
+//
+// ⚠️ 这三条用例**必须**在同文件、同模块实例里连着调 `run()`，且中途**不得**
+// `vi.resetModules()` / 手动 `resetSkillDetectionCache()` —— 那正好掩盖问题。
+describe('D5：同进程 install 后探测缓存失效', () => {
+  it('先 --version（无 skill）→ install → 再 --version：第三条不再报未安装', async () => {
+    // 变异「install 成功路径删掉 resetSkillDetectionCache()」→ 本用例红（第三条仍带
+    // 「skill 未安装」；实测过：只保留 setSkillWarning(undefined) 时它照样红）。
+    vi.stubEnv('QIYU_SKILL_DIR', entity)
+    expect(await run(['--version'])).toBe(0)
+    expect(JSON.parse(out).meta.warnings.join('\n')).toContain('未安装')
+
+    out = ''; err = ''
+    expect(await run(['skill', 'install', '--no-link'])).toBe(0)
+    expect(data().status).toBe('installed')
+
+    out = ''; err = ''
+    expect(await run(['--version'])).toBe(0)
+    expect(out).not.toContain('未安装')
+    // 装的是本进程这份源码的包内正文 → 探测结论是 current，完全不该有 meta。
+    expect('meta' in JSON.parse(out)).toBe(false)
+  })
+
+  it('反例：不清缓存时同一条命令确实会残留提示（证明上一条靠的是失效而非巧合）', async () => {
+    // 这条是**判别力基线**：它直接演示缓存的行为，保证上面那条不是「本来就不缓存」。
+    // 变异「detectSkillState 完全不缓存」→ 本用例红。
+    vi.stubEnv('QIYU_SKILL_DIR', entity)
+    expect(await run(['--version'])).toBe(0)
+    expect(JSON.parse(out).meta.warnings.join('\n')).toContain('未安装')
+    // 绕过命令层直接装（不经过 install 的失效调用），模拟「缓存没被清」的世界。
+    await installSkill({
+      home, entityDir: entity, sourceDir: resolveSkillSourceDir()!, version: PACKAGE_VERSION, force: false,
+    })
+    out = ''; err = ''
+    expect(await run(['--version'])).toBe(0)
+    expect(JSON.parse(out).meta.warnings.join('\n')).toContain('未安装')
+  })
+})
+
+
 //
 // 审查实测过四种分叉：A 用户改正文、B 空实体、C 清单被删、D 用户新增文件。
 // 修法是从 install.ts 抽出 `planInstall` 供两边共用；这组用例是防漂移的硬要求——
@@ -849,3 +975,189 @@ describe('skill check', () => {
     }
   })
 })
+
+// —— G4/D3：判别力补强（逐条对应 brief 的 15 项） ——
+
+describe('D3.2：planInstall 的「清单被目录占用」分支', () => {
+  it('`.qiyu-skill.json` 被建成目录：plan 给出明确 warning、action=none，不崩也不谎报 updated', async () => {
+    // 变异「writeTargetWarning 只判 isFile 不判非普通文件（直接返回 null）」→ 本用例红：
+    // action 会变成 rewrite-manifest、status 变 updated，而真实安装根本写不进清单。
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    // 正文一致、只有清单被换成了目录 → 计划本来会走 rewrite-manifest。
+    rmSync(join(entity, MANIFEST))
+    mkdirSync(join(entity, MANIFEST))
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link', '--dry-run'])).toBe(0)
+    expect(data()).toMatchObject({ action: 'skip', planned_status: 'skipped' })
+    expect(metaWarnings()).toContain('已被非普通文件占用')
+    expect(metaWarnings()).toContain(MANIFEST)
+    // 真实安装同一状态下也是 skipped（dry-run 与实装同判据），且清单目录原样保留。
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    expect(data().status).toBe('skipped')
+    expect(lstatSync(join(entity, MANIFEST)).isDirectory()).toBe(true)
+  })
+})
+
+describe('D3.3：planLinks 的 ELOOP 兜底（自环链接）', () => {
+  /** 在 claude-code 的 skills 目录里放一条自指链接（stat 顺着走 → ELOOP）。 */
+  const selfLoop = (): void => {
+    mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
+    mkdirSync(entity, { recursive: true })
+    symlinkSync('qiyu', join(home, '.claude', 'skills', 'qiyu'))
+  }
+
+  it('dry-run：不崩、该 agent 记 unknown，warning 点名 ELOOP 并说明安装时会跳过', async () => {
+    // 变异「planLinks 的 try/catch 去掉（让 ELOOP 冒泡）」→ 本用例红：整条命令抛错退 1。
+    selfLoop()
+    expect(await skillCommand(['install', '--dir', entity, '--dry-run'])).toBe(0)
+    const links = data().links as Array<Record<string, unknown>>
+    expect(links).toEqual([
+      expect.objectContaining({ agent: 'claude-code', state: 'unknown', action: 'unknown' }),
+    ])
+    expect(metaWarnings()).toContain('ELOOP')
+    // dry-run 绝不触碰链接：自环原样还在。
+    expect(lstatSync(join(home, '.claude', 'skills', 'qiyu')).isSymbolicLink()).toBe(true)
+  })
+
+  it('真实安装：同样不崩，按占用处理（不删自环链接），实体照常装上', async () => {
+    // 变异「linkAgents 的 catch 分支改成 unlink 自环链接后重建」→ 本用例红（链接消失）。
+    selfLoop()
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    expect(data().status).toBe('installed')
+    const links = data().links as Array<Record<string, unknown>>
+    expect(links).toEqual([expect.objectContaining({ agent: 'claude-code', state: 'foreign' })])
+    expect(metaWarnings()).toContain('ELOOP')
+    expect(metaWarnings()).toContain('按占用处理')
+    // 自环原样保留，实体正文照常写进去了。
+    expect(lstatSync(join(home, '.claude', 'skills', 'qiyu')).isSymbolicLink()).toBe(true)
+    expect(existsSync(join(entity, 'SKILL.md'))).toBe(true)
+  })
+})
+
+describe('D3.4：`skill where` 的 not_a_directory 分支', () => {
+  it('--dir 指向普通文件 → 0，entity.exists=true / state=not_a_directory（不崩、不谎报 missing）', async () => {
+    // 变异「state 恒为 'ok'」或「catch 掉 isDirectory 判定」→ 本用例红。
+    writeFileSync(entity, '不是目录\n')
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({ path: entity, exists: true, state: 'not_a_directory' })
+    // 实体不是目录时仍逐 agent 报告（链接状态照常），且不是错误信封。
+    expect(envelope().ok).toBe(true)
+    expect((data().links as unknown[]).length).toBe(2)
+  })
+})
+
+describe('D3.6：check --installed / --compare 的目录不可读与 checkFailed', () => {
+  // 用「父目录 chmod 000」构造 EACCES（root 下 chmod 不拦读取，跳过并声明）。
+  const canChmod = process.platform !== 'win32' && process.getuid?.() !== 0
+
+  it('--installed：父目录不可读 → ok:false、code=skill_check_failed、退出码 1（不崩栈）', async () => {
+    // 变异「probeDir 的 error 分支退回 notInstalled」→ 本用例红（错误码变 skill_not_installed）。
+    if (!canChmod) return
+    const locked = join(home, 'locked')
+    mkdirSync(join(locked, 'entity'), { recursive: true })
+    chmodSync(locked, 0o000)
+    try {
+      expect(await skillCommand(['check', '--installed', '--dir', join(locked, 'entity')])).toBe(1)
+      const e = envelope().error as Record<string, unknown>
+      expect(envelope()).toMatchObject({ ok: false })
+      expect(e.code).toBe('skill_check_failed')
+      expect(String(e.message)).toContain('读取 skill 目录失败')
+      expect(String(e.message)).toContain('EACCES')
+    } finally {
+      chmodSync(locked, 0o755)
+    }
+  })
+
+  it('--compare：父目录不可读 → 退出码 1，differences 说明「路径不可用」并带错因', async () => {
+    // 变异「compare 分支不区分 probe.error 与 !isDir」→ 本用例红（差异文案丢失错因）。
+    if (!canChmod) return
+    const locked = join(home, 'locked')
+    mkdirSync(join(locked, 'entity'), { recursive: true })
+    chmodSync(locked, 0o000)
+    try {
+      expect(await skillCommand(['check', '--compare', '--dir', join(locked, 'entity')])).toBe(1)
+      const d = data()
+      expect((d.differences as string[]).join('\n')).toContain('已安装路径不可用')
+      expect((d.differences as string[]).join('\n')).toContain('EACCES')
+      expect(d.installed).toMatchObject({ present: false })
+      expect(String((d.installed as Record<string, unknown>).error)).toContain('EACCES')
+    } finally {
+      chmodSync(locked, 0o755)
+    }
+  })
+})
+
+describe('D3.12：cli.run() 探测被门挡掉时，上一条命令的 skillWarning 不得残留', () => {
+  it('先植入哨兵提示 → 门挡掉探测（NODE_ENV=test 且无显式来源）→ 输出里没有哨兵', async () => {
+    // 变异「run() 只在探测成功时才 setSkillWarning」→ 本用例红（哨兵被带进本次输出）。
+    setSkillWarning('skill 未安装到哨兵位置（哨兵）')
+    vi.stubEnv('NODE_ENV', 'test')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    expect(await run(['--version'])).toBe(0)
+    expect(out).not.toContain('哨兵')
+    expect('meta' in JSON.parse(out)).toBe(false)
+  })
+
+  it('显式关闭开关时替换为可解释文案（不是残留的旧提示）', async () => {
+    // 与上一条成对：门因 QIYU_DISABLE_SKILL_PROBE 关掉时要换成原因，而不是留着旧的。
+    setSkillWarning('旧提示（哨兵）')
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('QIYU_DISABLE_SKILL_PROBE', '1')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    expect(await run(['--version'])).toBe(0)
+    expect(out).not.toContain('哨兵')
+    expect(JSON.parse(out).meta.warnings.join('\n')).toContain('QIYU_DISABLE_SKILL_PROBE')
+  })
+})
+
+describe('D3.13：CHECK_CONTEXT 的生产接线（域互换 / 截断都必须红）', () => {
+  // 这条用例消费的是 `src/commands/skill.ts` 的 `checkContext()` 本体——`tests/skill/check.test.ts`
+  // 的 ctx 是那边本地组装的，域闭集换错它看不见。包内正文用的全是 `<占位符>`，默认
+  // `check`（包内基准）也不可见——所以往实体目录写**具体值**、走 `--installed`。
+  //
+  // ⚠️ 报表表名**不能**做正向探针：TABLES 里同样有它们，正文写出来必然先命中 `table_name`
+  // （独立的硬红线）。所以 report-tables 域的可判别证据只有反例：真任务 id 在报表位必须报。
+  //   · dim.staff：真任务 id、不含表名 → 放报表位必须 unknown_positional（域是 report-tables 的证据）；
+  //   · staff：真表名但不是报表表 → 报表位同样报（域被换成 tables 全集就会消失）；
+  //   · reports.overview：真任务 id 且在 SYNC_TASKS 里排第 3 位之后 → task-ids 域没被截断，
+  //     同时它是「task-ids 没被换成 report-tables」的证据（换掉它就不在闭集里了）。
+  const doc = (lines: string[]): void => {
+    mkdirSync(entity, { recursive: true })
+    writeFileSync(join(entity, 'SKILL.md'), ['# 域接线探针', '', ...lines, ''].join('\n'))
+  }
+
+  it('task-ids 与 report-tables 两个域没有被互换（互不为对方的子集）', async () => {
+    // 变异「domains['report-tables'] = SYNC_TASKS.map(id)」→ 第一段红（dim.staff 会被当成合法报表表）；
+    // 变异「domains['report-tables'] = tables 全集」→ 第二段红；
+    // 变异「domains['task-ids'] = REPORT_TABLES」→ 第三段红（reports.overview 冒出 unknown_positional）；
+    // 变异「task-ids 截断成前 3 个」→ 第三段红（见下一条用例）。
+    doc(['- 指标：`qiyu stats fields dim.staff`'])
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(1)
+    let violations = data().violations as Array<Record<string, unknown>>
+    expect(violations).toContainEqual(expect.objectContaining({
+      rule: 'unknown_positional', detail: expect.stringContaining('dim.staff'),
+    }))
+
+    doc(['- 指标：`qiyu stats fields staff`'])
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(1)
+    violations = data().violations as Array<Record<string, unknown>>
+    expect(violations.some((v) => v.rule === 'unknown_positional' && String(v.detail).includes('staff'))).toBe(true)
+
+    doc(['- 同步：`qiyu sync run reports.overview`'])
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--installed', '--dir', entity]), 'reports.overview 是合法任务 id').toBe(0)
+    expect(data().violations).toEqual([])
+  })
+
+  it('task-ids 闭集没有被截断（只留前 3 个的变异必须红）', async () => {
+    // 变异「'task-ids': SYNC_TASKS.map(t => t.id).slice(0, 3)」→ 本用例红：reports.overview
+    // 不在前三个（dim.staff / dim.staff_groups / dim.staff_group_members）。
+    expect(SYNC_TASKS.findIndex((t) => t.id === 'reports.overview')).toBeGreaterThanOrEqual(3)
+    doc(['- 同步：`qiyu sync run reports.overview`'])
+    expect(await skillCommand(['check', '--installed', '--dir', entity])).toBe(0)
+    expect(data().violations).toEqual([])
+  })
+})
+

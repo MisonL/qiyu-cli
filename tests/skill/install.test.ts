@@ -1327,3 +1327,150 @@ describe('并发安装（gap 8）', () => {
   })
 })
 
+// —— G4/D3：cleanupPreviousManaged 的四层防御与「非普通文件」保护 ——
+//
+// `cleanupPreviousManaged` 有四层独立防御（审查 N1 系列）：① 清单解析校验
+// （`readManifestSafe` 的 `isContainedRel`）② 清理处的 `isContainedRel`
+// ③ `verifyPlainParents`（父链必须全是真实目录）④ `isRealpathContained`（真实落点仍在内）。
+// 「非普通文件」检查（`st.isFile()`）是四层之外的第五条。
+//
+// ⚠️ **本组实测结论（写进报告）**：② 与 ④ 目前**不可单独触发**，删掉它们不会有红 ——
+//   · ② 与 ① 是同一个函数、同一份输入：能过 ① 的必然能过 ②（反之亦然），清理处那次
+//     调用是纯冗余；能触达 ② 的输入必须让 ① 放行（就不可能含非法条目）。
+//   · ④ 只在「父链是真目录、终点路径却解析到实体外」时才拦得下，而那种形态必然让
+//     终点不是普通文件（符号链接）→ 先被 `st.isFile()` 拦掉；硬链接的 realpath 仍在
+//     实体内，④ 也拦不住。即 ④ 的可达触发面被③与非普通文件检查覆盖。
+// 下面的用例因此钉住「每层的**可观测效果**」而非「每层都可单独变异」，并在报告里
+// 逐条写明哪一层不可达、由谁兜底。
+describe('D3.7：cleanupPreviousManaged 的四层防御', () => {
+  /** 装一份清单 files 含 references/deep.md 的实体。 */
+  async function seed(): Promise<string> {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    return src
+  }
+  /** 新版包：删掉 references/ 并改 SKILL.md → 逼出 updated（否则清理不跑）。 */
+  function bump(src: string): void {
+    rmSync(join(src, 'references'), { recursive: true, force: true })
+    write(src, 'SKILL.md', '# 新版包内容\n')
+  }
+
+  it('第 ① 层（清单解析校验）：逃逸条目让整份清单不可信，同清单里的真实受管文件也不删', async () => {
+    // 变异「readManifestSafe 去掉 `raw.files.every(... isContainedRel)` 检查」→ 本用例红
+    // （逃逸条目被当合法条目，同一份清单里的 references/deep.md 会被删掉）。
+    // ⚠️ 与 #37 的差别：#37 钉的是「实体外的 evil.txt 不被删」，本用例钉的是
+    // 「整份清单按不可信处理 ⇒ 连真实受管文件也不删」（宁留不删的语义）。
+    const src = await seed()
+    const entity = defaultEntityDir(home)
+    const m = readManifest(entity)
+    writeFileSync(join(entity, MANIFEST), JSON.stringify({
+      ...m, version: '0.0.1', files: [...(m.files ?? []), '..\\..\\..\\evil.txt'],
+    }))
+    bump(src)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(r.status).toBe('updated')
+    expect(existsSync(join(entity, 'references', 'deep.md'))).toBe(true)
+    expect(r.warnings.some((w) => w.includes('移除了上一版安装'))).toBe(false)
+  })
+
+  it('第 ② 层（isContainedRel 的二次调用）：绝对路径条目同样让清单不可信，不删任何文件', async () => {
+    // ⚠️ 如本组注释所述：② 与 ① 同源，删掉 ② 不会有红（不可达冗余）。本用例钉住的是
+    // 这条判据的**可观测效果**（绝对路径 ⇒ 整份清单不可信 ⇒ 宁留不删），供将来若把
+    // ① / ② 拆成两套判据时继续有效。
+    const src = await seed()
+    const entity = defaultEntityDir(home)
+    const m = readManifest(entity)
+    writeFileSync(join(entity, MANIFEST), JSON.stringify({
+      ...m, version: '0.0.1', files: [...(m.files ?? []), join(home, 'abs-escape.md')],
+    }))
+    bump(src)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(r.status).toBe('updated')
+    expect(existsSync(join(entity, 'references', 'deep.md'))).toBe(true)
+    expect(r.warnings.some((w) => w.includes('移除了上一版安装'))).toBe(false)
+  })
+
+  it('第 ③ 层（verifyPlainParents）：父链是符号链接时拒绝删除，实体外文件原样', async () => {
+    // 变异「cleanupPreviousManaged 去掉 verifyPlainParents 的两条分支」→ 哪些用例红？
+    // 实测：单独删 ③ 时 N1-G1 与本条**都仍绿** —— `unlink` 会顺着 `references` 链接删到
+    // 实体外，但那一步之前还有第 ④ 层（realpath 复核）拦下。所以 ③ 单独删除**不可判红**，
+    // 它拦下的形态与 ④ 重叠（见报告「不可达/多余」一节，由控制器裁决）。
+    // 本用例钉住该形态的**可观测结果**：实体外的个人文件、链接本身都原样，且有警告。
+    const src = await seed()
+    const entity = defaultEntityDir(home)
+    const personal = join(home, 'personal-notes')
+    mkdirSync(personal)
+    writeFileSync(join(personal, 'deep.md'), '我的个人笔记\n')
+    rmSync(join(entity, 'references'), { recursive: true })
+    symlinkSync(personal, join(entity, 'references'))
+    bump(src)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(r.status).toBe('updated')
+    expect(readFileSync(join(personal, 'deep.md'), 'utf8')).toBe('我的个人笔记\n')
+    expect(lstatSync(join(entity, 'references')).isSymbolicLink()).toBe(true)
+    expect(r.warnings.some((w) => w.includes('references'))).toBe(true)
+  })
+
+  it('第 ④ 层（isRealpathContained）在正常形态下不误拦：真实受管文件照常被清理', async () => {
+    // ⚠️ ④ 的**可达触发面实测为空**：能走到这里的路径，父链已过 ③（全真目录）、终点已过
+    // `st.isFile()`（普通文件），此时 realpath 必然落在实体内。所以「删掉 ④ → 红」这条
+    // 做不到（报告里有实测记录）。本用例钉住它的另一面：它**不会**把正常删除全拦死。
+    const src = await seed()
+    const entity = defaultEntityDir(home)
+    bump(src)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(r.status).toBe('updated')
+    expect(existsSync(join(entity, 'references', 'deep.md'))).toBe(false)
+    expect(r.warnings.some((w) => w.includes('移除了上一版安装'))).toBe(true)
+  })
+})
+
+// —— D3.1：cleanupPreviousManaged 的非普通文件保护（目录 / 符号链接都不得跟随删除） ——
+describe('D3.1：受管文件被换成目录 / 实体外符号链接时的保护', () => {
+  it('上一版受管文件被用户换成**目录**：--force 不删目录、不跟随，警告如实', async () => {
+    // 变异「视图里去掉 `!st.isFile()` 分支（非普通文件照删）」→ 本用例红：
+    // unlinkSync 对目录抛 EISDIR；若改成 rmSync 递归删，用户目录里的文件会消失。
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    rmSync(join(entity, 'references', 'deep.md'))
+    mkdirSync(join(entity, 'references', 'deep.md'))
+    writeFileSync(join(entity, 'references', 'deep.md', 'mine.txt'), '我的文件\n')
+    rmSync(join(src, 'references'), { recursive: true })
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(r.status).toBe('updated')
+    expect(lstatSync(join(entity, 'references', 'deep.md')).isDirectory()).toBe(true)
+    expect(readFileSync(join(entity, 'references', 'deep.md', 'mine.txt'), 'utf8')).toBe('我的文件\n')
+    expect(r.warnings.some((w) => w.includes('非普通文件'))).toBe(true)
+  })
+
+  it('上一版受管文件被换成**指向实体外的符号链接**：不跟随、不删目标、链接原样', async () => {
+    // 变异「lstatSync 换成 statSync（顺着链接走）」→ 本用例红（目标被当成受管文件删掉）。
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false })
+    const entity = defaultEntityDir(home)
+    const outside = join(home, 'outside-precious.md')
+    writeFileSync(outside, '实体外的珍贵文件\n')
+    rmSync(join(entity, 'references', 'deep.md'))
+    symlinkSync(outside, join(entity, 'references', 'deep.md'))
+    rmSync(join(src, 'references'), { recursive: true })
+    write(src, 'SKILL.md', '# 新版包内容\n')
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.1.0', force: true })
+
+    expect(lstatSync(join(entity, 'references', 'deep.md')).isSymbolicLink()).toBe(true)
+    expect(readFileSync(outside, 'utf8')).toBe('实体外的珍贵文件\n')
+    expect(r.warnings.some((w) => w.includes('非普通文件'))).toBe(true)
+  })
+})

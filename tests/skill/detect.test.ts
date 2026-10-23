@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import {
-  __resetSkillDetectionForTest, detectSkillState, entityUndeterminedNote, npmRelativeBase,
+  resetSkillDetectionCache, detectSkillState, entityUndeterminedNote, npmRelativeBase,
   resolveEntityDir, resolveEntityDirSources, resolveSkillSourceDir, skillWarning,
 } from '../../src/skill/detect.js'
 import { contentHash, MANIFEST } from '../../src/skill/install.js'
@@ -31,16 +31,49 @@ import { setSkillWarning } from '../../src/output.js'
 import { run } from '../../src/cli.js'
 import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from '../../src/core/edition.js'
 
+/**
+ * `statSync` 的故障注入开关（D3.5，默认 null = 走真实实现）。
+ *
+ * 为什么必须在**顶层** `vi.mock` 而不是用例内 `vi.spyOn`：`node:fs` 的命名导出不可
+ * 重定义（spyOn 抛 `Cannot redefine property`），而 `detect.ts` 的 `import { statSync }
+ * from 'node:fs'` 在模块求值时已绑定 —— 事后改导出对象的属性影响不到它（实测：
+ * 用 `process.getBuiltinModule` 拿同一份对象再覆盖，用例仍读到真实 stat）。顶层 mock
+ * 只替换这一个函数，其余函数原样转出；需要故障的用例设开关、`finally` 清空。
+ */
+const fsStatFault = vi.hoisted(() => {
+  const state: { path: string | null } = { path: null }
+  return {
+    armFor(p: string): void { state.path = p },
+    clear(): void { state.path = null },
+    matched(p: unknown): boolean { return state.path !== null && String(p) === state.path },
+  }
+})
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return {
+    ...actual,
+    statSync: ((p: Parameters<typeof actual.statSync>[0], opts?: unknown) => {
+      if (fsStatFault.matched(p)) {
+        const e = new Error('EACCES: permission denied') as NodeJS.ErrnoException
+        e.code = 'EACCES'
+        throw e
+      }
+      return (actual.statSync as (a: unknown, b?: unknown) => unknown)(p, opts)
+    }) as typeof actual.statSync,
+  }
+})
+
 let home: string
 
 beforeEach(() => {
   // macOS 上 `/var` 指向 `/private/var`：realpath 归一化后路径字符串才稳定可比。
   home = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-detect-')))
-  __resetSkillDetectionForTest()
+  resetSkillDetectionCache()
 })
 afterEach(() => {
   rmSync(home, { recursive: true, force: true })
-  __resetSkillDetectionForTest()
+  resetSkillDetectionCache()
 })
 
 /** 写文件（自动建父目录）。 */
@@ -141,6 +174,26 @@ describe('detectSkillState —— 判定矩阵', () => {
     }
   })
 
+  // —— D3.5：stat 的非 ENOENT 错误必须当 unknown，不得谎报 absent ——
+  //
+  // 病根（判别力缺口）：`probe()` 只把 ENOENT 认成 absent，其余错误都重抛进 catch → unknown。
+  // 这条**只能用注入**证明：chmod 造不出「stat 本身抛 EACCES 但路径确实存在」以外的形态
+  // （上面那条 chmod 用例走的是 readFileSync 的 EACCES，probe 的 stat 分支根本没被单独钉住）。
+  // 变异「probe 的 catch 从 `if ENOENT → absent; throw` 改成 `catch { return absent }`」→ 本用例红
+  // （结论变 absent，`skillWarning` 会谎报「未安装」）。
+  it('stat 抛 EACCES（非 ENOENT）→ unknown，不是 absent（否则 meta.warnings 谎报未安装）', () => {
+    const src = makeSource()
+    const entity = join(home, 'entity')
+    installEntity(entity, src, '1.0.0')
+    // 只拦「stat 实体目录本身」那一次：其余 stat（源目录等）走真实实现。
+    fsStatFault.armFor(entity)
+    try {
+      expect(detectSkillState(entity, src, '1.0.0')).toEqual({ kind: 'unknown' })
+    } finally {
+      fsStatFault.clear()
+    }
+  })
+
   it('实体路径是文件（不是目录）→ unknown，不抛', () => {
     const src = makeSource()
     const entity = join(home, 'entity-is-file')
@@ -180,7 +233,7 @@ describe('detectSkillState —— 按参数元组缓存', () => {
     expect(detectSkillState(entity, src, '9.9.9')).toEqual({ kind: 'stale', installedVersion: '1.0.0' })
 
     // reset 后回到原键，重新探测 → current。
-    __resetSkillDetectionForTest()
+    resetSkillDetectionCache()
     expect(detectSkillState(entity, src, '1.0.0')).toEqual({ kind: 'current' })
   })
 

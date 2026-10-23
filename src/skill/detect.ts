@@ -62,9 +62,14 @@ export type SkillState =
   | { kind: 'current' }
   | { kind: 'unknown' }
 
-// ⚠️ 进程内一次判定：命中后**不随文件系统变化**（装完 skill 再调同参仍返回旧结论，
-// 这正是「一个进程只探测一次」的语义）。`__resetSkillDetectionForTest()` 仅测试用，
-// 生产路径不存在清除动作——CLI 每个命令都是新进程，缓存天然只活一次命令。
+// 进程内判定：同参只探测一次（spec D2.1 的「零成本」）。缓存**不会随文件系统变化自动
+// 失效**，所以凡是「本进程刚改过实体目录」的路径都必须主动调 `resetSkillDetectionCache()`。
+//
+// ⚠️ 已知的生产形态是「CLI 每个命令一个新进程，缓存天然只活一次命令」，但 `cli.run()`
+// 在同一进程里被多次调用是**真实存在的形态**（测试与嵌入式用法）：先 `--version`（探测
+// 出 absent 并缓存）、再 `skill install` 装好实体、再 `--version` —— 不失效的话第三条仍
+// 报「skill 未安装」（2026-10-22 review G4 的 D5）。因此 `skill install` 成功路径显式
+// 失效，`resetSkillDetectionCache()` 是**正式的生产入口**，不再只是测试开关。
 const cache = new Map<string, SkillState>()
 
 /**
@@ -416,8 +421,14 @@ function isRealDirectory(p: string): boolean {
   }
 }
 
-/** 清进程内探测缓存（测试用；不清的话换 tmp 目录装好实体后仍命中旧结果）。 */
-export function __resetSkillDetectionForTest(): void {
+/**
+ * 清进程内探测缓存。
+ *
+ * **生产入口**（D5）：`skill install` 成功后会改变实体目录内容，同进程内后续的
+ * `cli.run()` 必须重新探测，否则 `meta.warnings` 仍报「skill 未安装」（缓存按参数元组
+ * 命中旧结论）。测试同样用它隔离用例（换 tmp 目录装好实体后不调用就会命中旧结果）。
+ */
+export function resetSkillDetectionCache(): void {
   cache.clear()
 }
 

@@ -33,6 +33,17 @@ export interface AgentDir {
 }
 
 /**
+ * 安装清单文件名：落在实体目录根部，记录版本与内容哈希（`install.ts` 写、
+ * `detect.ts` 与 `install.ts` 读）。
+ *
+ * 它是**路径事实**，所以收敛在 paths.ts 这个事实源里（G4/D6）：此前 `install.ts` 与
+ * `scripts/copy-assets.mjs` 各写一份字面量，改一处必漏另一处。`install.ts` 仍 re-export
+ * 以保持既有 import 路径兼容；`copy-assets.mjs` 是纯 JS 构建脚本（不能 import TS），
+ * 两侧字面量的一致性由 `tests/skill/constants.test.ts` 的交叉校验用例钉住。
+ */
+export const MANIFEST = '.qiyu-skill.json'
+
+/**
  * agent skills 目录下的链接名。skill 身份固定为 `qiyu`（正文 frontmatter 同名），
  * 不随实体位置变化。
  *
@@ -118,9 +129,16 @@ export function agentsMissingSkillDir(home: string): AgentDir[] {
   return result
 }
 
-/** 实体目录的默认位置：`<home>/.agents/skills/qiyu`。 */
-export function defaultEntityDir(home: string): string {
-  return path.join(home, '.agents', 'skills', 'qiyu')
+/**
+ * 实体目录的默认位置：`<home>/.agents/skills/qiyu`（叶子名与 `LINK_NAME` 同一份事实，
+ * D6：此前这里另写了一个 `'qiyu'` 字面量，与链接名两处镜像）。
+ *
+ * `pathImpl` 是**平台语义注入缝**（D3.15 / D1）：默认用当前平台的 `path`，测试可以传
+ * `path.win32` 在不切平台的前提下钉住 Windows 的拼接结果。注入只改变路径运算，不改变
+ * 任何目录选择。
+ */
+export function defaultEntityDir(home: string, pathImpl: typeof path = path): string {
+  return pathImpl.join(home, '.agents', 'skills', LINK_NAME)
 }
 
 /**
@@ -208,6 +226,11 @@ function hasInode(st: Stats): boolean {
  * `dirname(linkPath)` 解析成绝对路径，并指定 type `'junction'`；其他平台原样
  * 保留相对 target、不指定 type（POSIX 下 Node 会自行判断 file/dir）。
  *
+ * `pathImpl` 是**平台语义注入缝**（D3.15，与 `defaultEntityDir` 同一个理由）：默认用
+ * 当前平台的 `path`（行为与以前逐字相同），测试可以传 `path.win32` 并用 win32 形态的
+ * 输入，在不切平台的前提下钉住 Windows 分支真正走的是 win32 的路径运算
+ * ——此前那条「win32」用例在 POSIX 机器上实际跑的是 POSIX `path.resolve`。
+ *
  * ⚠️ Windows 上 junction 的真实行为未在本机实测（spec §跨平台 已声明未覆盖）；
  * 这里保证的只是决策逻辑本身，由用例钉住。
  */
@@ -215,13 +238,14 @@ export function linkPlan(
   linkPath: string,
   target: string,
   platform: NodeJS.Platform,
+  pathImpl: typeof path = path,
 ): { target: string; type?: 'junction' } {
   if (platform === 'win32') {
     // ⚠️ 解析基准必须是链接所在目录的**真实落点**：junction 的 target 是绝对路径，
     // 而相对 target 是相对「链接实际所在的那个目录」解析的——agent 目录本身是符号
     // 链接时，字面路径与真实落点深度不同（审查 B1 的同一根因）。realpath 失败
     // （目录还不存在等）退回字面路径，与旧行为一致。
-    return { target: path.resolve(realpathOrSelf(path.dirname(linkPath)), target), type: 'junction' }
+    return { target: pathImpl.resolve(realpathOrSelf(pathImpl.dirname(linkPath)), target), type: 'junction' }
   }
   return { target }
 }

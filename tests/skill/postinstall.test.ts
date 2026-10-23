@@ -17,8 +17,9 @@ import {
   existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { runPostinstall, mainEntry } from '../../src/postinstall.js'
+import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { runPostinstall, mainEntry, isEntry } from '../../src/postinstall.js'
 import { defaultEntityDir } from '../../src/skill/paths.js'
 import { npmRelativeBase, resolveEntityDirSources } from '../../src/skill/detect.js'
 
@@ -414,6 +415,36 @@ describe('runPostinstall', () => {
       } finally {
         process.chdir(before)
       }
+    })
+  })
+
+  // —— D3.11：入口守卫 `isEntry()` 的两条分支 ——
+  //
+  // 病根：`if (isEntry()) { process.exitCode = await mainEntry(...) }` 这条接线此前零覆盖，
+  // 两条分支各自删掉都不会有红。注入 `argv` / `moduleUrl` 之后可以不 spawn 子进程
+  // 就把两条分支各钉一条（spawn 真进程会跑真实 home，违反硬约束）。
+  describe('D3.11：入口守卫 isEntry 的两条分支', () => {
+    it('argv[1] 就是本模块 → true（mainEntry 会被执行的那一支）', () => {
+      // 变异「isEntry 恒 false」→ 本用例红。
+      const selfPath = fileURLToPath(import.meta.url)
+      expect(isEntry([process.execPath, selfPath], import.meta.url)).toBe(true)
+      // realpath 归一化：macOS 的 /var → /private/var，符号链接写法也要判真。
+      const viaSymlinkBase = realpathSync(dirname(selfPath))
+      expect(isEntry([process.execPath, join(viaSymlinkBase, basename(selfPath))], import.meta.url)).toBe(true)
+    })
+
+    it('argv[1] 是别的文件 / 缺失 → false（mainEntry 不被执行、进程启动不改 exitCode）', () => {
+      // 变异「isEntry 恒 true」或「去掉 argv[1] 判空」→ 本用例红。
+      const other = join(home, 'somewhere-else.mjs')
+      write(other, '', '')
+      expect(isEntry([process.execPath, other], import.meta.url)).toBe(false)
+      expect(isEntry([process.execPath], import.meta.url)).toBe(false)
+      expect(isEntry([process.execPath, ''], import.meta.url)).toBe(false)
+      // 路径不存在（realpathSync 抛 ENOENT）也必须收敛成 false，不向上抛。
+      expect(() => isEntry([process.execPath, join(home, 'nope.mjs')], import.meta.url)).not.toThrow()
+      expect(isEntry([process.execPath, join(home, 'nope.mjs')], import.meta.url)).toBe(false)
+      // 模块 URL 不匹配（被别的入口 import）→ false。
+      expect(isEntry([process.execPath, other], 'file:///definitely/other.js')).toBe(false)
     })
   })
 })

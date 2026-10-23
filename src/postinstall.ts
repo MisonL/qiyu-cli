@@ -151,12 +151,17 @@ export async function runPostinstall(opts: PostinstallOptions): Promise<number> 
  *
  * 外层包 try/catch：argv[1] 不存在时 realpathSync 抛 ENOENT——入口判定失败只能是
  * 「没被当入口」，不能反过来把进程搞挂（与「任何路径 exit 0」同一条底线）。
+ *
+ * `argv` / `moduleUrl` 可注入（D3.11）：默认就是 `process.argv` 与 `import.meta.url`
+ * （行为不变），注入缝让「真分支 / 假分支」可以在**不 spawn 子进程**的前提下各钉一条。
+ * 子进程方式也能测，但它要跑真实的 npm 安装判据与真实 home——注入更稳、也更符合
+ * 本仓库「测试绝不碰真实 ~」的硬约束。
  */
-function isEntry(): boolean {
-  const argv1 = process.argv[1]
+export function isEntry(argv: readonly string[] = process.argv, moduleUrl: string = import.meta.url): boolean {
+  const argv1 = argv[1]
   if (argv1 === undefined || argv1 === '') return false
   try {
-    return import.meta.url === pathToFileURL(realpathSync(argv1)).href
+    return moduleUrl === pathToFileURL(realpathSync(argv1)).href
   } catch {
     return false
   }
