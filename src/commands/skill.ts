@@ -213,7 +213,7 @@ export function resolveHome(env: NodeJS.ProcessEnv = process.env): string {
  * `detect.resolveEntityDirSources`。相对路径按 `process.cwd()` 解析成绝对路径（C4）——
  * 此前 `--dir rel` 原样返回，install 按进程 cwd 装而 where 按另一处 cwd 比，链接报 dangling。
  * 命令层**不受测试门影响**（用户显式给的位置照常使用）；测试门只作用于启动探测
- * （`cli.ts` 的 `resolveEntityDir`）与本层的「未确定」情形（见 `skill where` 的报告）。
+ * （`cli.ts` 的启动探测）与本层的「未确定」情形（见 `skill where` 的报告）。
  *
  * ⚠️ **基准为什么是 `process.cwd()` 而不是 `npmRelativeBase`（INIT_CWD ?? cwd）**：
  * 本层解析的 `--dir` / `QIYU_SKILL_DIR` 都是用户在自己 shell 里敲的，天然以进程 cwd 为基准；

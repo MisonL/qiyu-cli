@@ -138,18 +138,29 @@ vi.mock('node:fs', async (importOriginal) => {
       // 模拟「另一进程在这两步之间把实体建出来了」。逐文件换入不拦。
       // ⚠️ 这个分支必须排在下面的通用分支**之前**：通用分支对任何非 null 的 kind 都抛
       // （且会把 ENOTEMPTY 渲染成 EACCES），先命中就永远到不了这里。
-      if (kind === 'ENOTEMPTY' && from.includes('.tmp-') && !to.includes('.tmp-') && !to.endsWith('.md') && !to.endsWith(MANIFEST)) {
+      if ((kind === 'ENOTEMPTY' || kind === 'ENOTEMPTY_STALE_MANIFEST')
+        && from.includes('.tmp-') && !to.includes('.tmp-') && !to.endsWith('.md') && !to.endsWith(MANIFEST)) {
         // ⚠️ 真实竞态里，错误发生时**实体已经在**（另一个进程刚写完）。只抛错不建实体
         // 会把场景变成「实体不存在」，重判定会给出 installed —— 与真实竞态不同。
         // 所以这里先把「另一进程的成果」落到磁盘，再抛错。
         actual.mkdirSync(to, { recursive: true })
-        actual.writeFileSync(actual.realpathSync(to) + '/SKILL.md', '---\nname: qiyu\n---\n# qiyu\n')
+        if (kind === 'ENOTEMPTY_STALE_MANIFEST') {
+          // 另一种并发赢家：正文与包内**一致**，只有清单落后（版本/契约版本旧）。
+          // 用暂存目录里的真实产物铺过去（此刻标记已被 unlink，内容与源逐字节相同）。
+          actual.cpSync(from, to, { recursive: true, force: true })
+          actual.writeFileSync(actual.realpathSync(to) + '/' + MANIFEST, JSON.stringify({
+            version: '0.0.1', skill_contract_version: 0, content_hash: 'stale',
+            files: ['SKILL.md'], installed_at: new Date(0).toISOString(),
+          }))
+        } else {
+          actual.writeFileSync(actual.realpathSync(to) + '/SKILL.md', '---\nname: qiyu\n---\n# qiyu\n')
+        }
         const e = new Error('ENOTEMPTY: directory not empty, rename') as NodeJS.ErrnoException
         e.code = 'ENOTEMPTY'
         throw e
       }
       // 只拦「换入」的那一步（源在暂存目录里），不拦首次安装的整目录 rename。
-      if (kind !== null && kind !== 'ENOTEMPTY' && from.includes('.tmp-')) {
+      if (kind !== null && kind !== 'ENOTEMPTY' && kind !== 'ENOTEMPTY_STALE_MANIFEST' && from.includes('.tmp-')) {
         const e = new Error(`${kind === 'EXDEV' ? 'EXDEV: cross-device link not permitted' : 'EACCES: permission denied'}`) as NodeJS.ErrnoException
         e.code = kind
         throw e
@@ -1054,9 +1065,10 @@ describe('#4：崩溃残留的暂存目录清理', () => {
     const stale = `${entity}.tmp-AbCdEf`
     mkdirSync(stale, { recursive: true })
     writeFileSync(join(stale, 'SKILL.md'), '半截正文\n')
-    // 终审 F3：真正的暂存位带独占标记，清理只认带标记的目录（名字形状挡不住用户的
-    // `qiyu.tmp-backup/`）。这里照实模拟本模块自己的残留。
-    writeFileSync(join(stale, '.qiyu-staging'), '标记\n')
+    // 终审 F3 + 复审 N2：真正的暂存位带**旁挂**独占标记（`<staging>.marker`），
+    // 清理只认带标记的目录（名字形状挡不住用户的 `qiyu.tmp-backup/`，而标记放目录里
+    // 又有被源正文撞名的污染路径）。这里照实模拟本模块自己的残留。
+    writeFileSync(`${stale}.marker`, '标记\n')
     // ⚠️ 必须把 mtime 拨老：清理按年龄判（gap 8 —— 年轻的可能是另一个并发安装正在写的，
     // 无差别删会把它打成 ENOENT / 「暂存内容与源不一致」）。
     const longAgo = new Date(Date.now() - 60 * 60_000)
@@ -1079,6 +1091,24 @@ describe('#4：崩溃残留的暂存目录清理', () => {
 
     expect(existsSync(young), '年轻暂存目录被误删 —— 并发安装会撞 ENOENT').toBe(true)
     expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(false)
+  })
+
+  it('源目录里恰好有 `.qiyu-staging` 时不得污染实体（复审 N2：标记在目录里会被撞名）', async () => {
+    const src = makeSource()
+    // 极端但可达：源正文里有一篇叫 `.qiyu-staging` 的文件。
+    write(src, '.qiyu-staging', '用户自己的内容\n')
+    const entity = defaultEntityDir(home)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    expect(r.status).toBe('installed')
+    // 该文件必须**被正常安装**（不能因为撞名被静默丢弃），且内容原样。
+    expect(readFileSync(join(entity, '.qiyu-staging'), 'utf8')).toBe('用户自己的内容\n')
+    // 实体哈希与源一致 → 后续安装不会被永远判「内容不同」。
+    expect(contentHash(entity)).toBe(contentHash(src))
+    // 幂等：第二次安装没有「内容不同」的假警告。
+    const again = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    expect(again.status).toBe('skipped')
+    expect(again.warnings).toEqual([])
   })
 
   it('同前缀但**没有独占标记**的用户目录不得删除（终审 F3：名字形状挡不住 qiyu.tmp-backup）', async () => {
@@ -1310,6 +1340,21 @@ describe('并发安装（gap 8）', () => {
       expect(r.warnings.some((w) => w.includes('内容与包内一致')), '内容不同时不得报「一致」').toBe(false)
       // 绝不能出现「安装失败」这类让 Agent 去重装的措辞。
       expect(r.warnings.some((w) => w.includes('安装失败'))).toBe(false)
+      // 判别力（复审 F6 残留）：上一版只钉住「内容不同 → 必须说仍不同」，对 **status** 那一半
+      // 零约束（把 `status = 'skipped'` 改回 `status = replan.status` 时用例仍全绿）。
+      expect(r.status, '本进程零写入，status 不得是 updated/installed').toBe('skipped')
+    } finally {
+      fsRenameFault.set(null)
+    }
+    // 同一竞态、`force: true`：旧实现会把零写入报成 updated（终审 F1 的另一半）。
+    // 必须先删掉实体，才走「判实体不存在 → rename 撞 ENOTEMPTY」这条并发分支。
+    rmSync(entity, { recursive: true, force: true })
+    fsRenameFault.set('ENOTEMPTY')
+    try {
+      const rf = await installSkill({ home, sourceDir: src, version: '1.0.0', force: true, noLink: true })
+      // 变异「status 改回 replan.status」→ 本行红（那时 replan 是 force 分支的 updated）。
+      expect(rf.status, 'force 下本进程仍零写入，不得谎报 updated').toBe('skipped')
+      expect(rf.warnings.some((w) => w.includes('仍不同'))).toBe(true)
     } finally {
       fsRenameFault.set(null)
     }
@@ -1340,7 +1385,7 @@ describe('并发安装（gap 8）', () => {
     const old = join(dirname(entity), `${entity.split('/').pop()}.tmp-OLD999`)
     mkdirSync(old)
     write(old, 'SKILL.md', '# 上次崩溃的残留\n')
-    write(old, '.qiyu-staging', '标记\n')
+    writeFileSync(`${old}.marker`, '标记\n')
     const longAgo = new Date(Date.now() - 60 * 60_000)
     utimesSync(old, longAgo, longAgo)
 
@@ -1351,6 +1396,28 @@ describe('并发安装（gap 8）', () => {
     // 老的被清掉了，且如实告知。
     expect(existsSync(old), '过期残留目录没被清理').toBe(false)
     expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(true)
+  })
+
+  it('③ 并发赢家只差清单（正文一致、清单版本落后）→ 不得说「内容仍不同（计划要求 --force）」', async () => {
+    // 复审 F1 残留的第五形态：`consistent` 只看 `action === 'none'` 时，这一形态
+    // （action='rewrite-manifest'、warnings 为空）会被误说成「内容仍不同」并劝用户加
+    // --force，而实际重跑一次（不带 force）就能把清单补上。
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+
+    fsRenameFault.set('ENOTEMPTY_STALE_MANIFEST')
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+      expect(r.status).toBe('skipped')
+      const joined = r.warnings.join('\n')
+      // 变异「sameContent 退回只看 action === 'none'」→ 本行红（会报「仍不同（计划要求 --force）」）。
+      expect(joined, '正文一致、仅清单落后时不得说「仍不同」').not.toContain('仍不同')
+      // 只说「无需 --force」，不能说「加 --force」（文案里那句「无需 --force」是有意为之）。
+      expect(joined, '也不得劝用户加 --force').not.toContain('加 --force')
+      expect(joined).toContain('清单落后')
+    } finally {
+      fsRenameFault.set(null)
+    }
   })
 })
 

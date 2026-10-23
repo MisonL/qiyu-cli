@@ -48,7 +48,7 @@ beforeEach(() => {
   vi.stubEnv('HOME', home)
   vi.stubEnv('USERPROFILE', home)
   vi.stubEnv('NODE_ENV', 'test')
-  // 空串 = 未设（命令层的解析与 detect.resolveEntityDir 同口径）。
+  // 空串 = 未设（命令层的解析与 detect 的实体目录解析同口径）。
   vi.stubEnv('QIYU_SKILL_DIR', '')
   setSkillWarning(undefined)
   resetSkillDetectionCache()

@@ -13,7 +13,7 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { checkPack, PLACEHOLDER_VERSION } from '../scripts/pack-gate.mjs'
+import { checkPack, parsePackJson, PLACEHOLDER_VERSION } from '../scripts/pack-gate.mjs'
 import { MANIFEST } from '../src/skill/paths.js'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -141,5 +141,35 @@ describe('G7：门禁判定逻辑', () => {
     input.editionSource =
       "export const PACKAGE_VERSION = '1.2.3';\nexport const PACKAGE_VERSION = '1.2.3';\n"
     expect(checkPack(input).some((p) => p.includes('期望 1 次'))).toBe(true)
+  })
+})
+
+// —— 复审 N1：`npm pack --json` 有三种顶层形态，解析必须都认 ——
+//
+// 旧实现只认「数组」与「单对象带 files」，npm ≥12 改成按包名键控
+// `{"qiyu-cli": {…}}` 后整条门禁直接 fail（等于门禁不存在）。本机 npm 12.2.1 实测。
+describe('G7/N1：npm pack --json 三种输出形态', () => {
+  const files = [{ path: 'dist/cli.js', size: 1, mode: 420 }]
+
+  it('npm 10/11：顶层是数组', () => {
+    expect(parsePackJson(`[{"files":${JSON.stringify(files)}}]`)).toEqual(['dist/cli.js'])
+  })
+
+  it('npm 11 单包：顶层是带 files 的对象', () => {
+    expect(parsePackJson(JSON.stringify({ files }))).toEqual(['dist/cli.js'])
+  })
+
+  it('npm ≥12：顶层按包名键控', () => {
+    expect(parsePackJson(JSON.stringify({ 'qiyu-cli': { files } }))).toEqual(['dist/cli.js'])
+  })
+
+  it('前面混入 prepare 的日志行（含 `[`）也能找到 JSON', () => {
+    const stdout = [
+      '> qiyu-cli@0.1.0 prepare',
+      '[copy-assets] 已复制注册表参数表 → dist/core/registry/params',
+      '> tsc && node scripts/copy-assets.mjs',
+      JSON.stringify({ 'qiyu-cli': { files } }),
+    ].join('\n')
+    expect(parsePackJson(stdout)).toEqual(['dist/cli.js'])
   })
 })

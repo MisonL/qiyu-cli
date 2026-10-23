@@ -264,7 +264,7 @@ describe('detectSkillState —— 按参数元组缓存', () => {
   })
 })
 
-describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
+describe('启动探测取实体目录 —— 测试环境绝不探测真实 ~', () => {
   const savedEnv = process.env.NODE_ENV
   const savedDir = process.env.QIYU_SKILL_DIR
   // 终审 I2：`npm_config_qiyu_skill_dir` 是 postinstall 的自定义位置通路，探测必须认识它。
@@ -339,8 +339,8 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
   //   · 测试（NODE_ENV=test / VITEST）：门排在 npm_config **之前**，宿主 `.npmrc` 配的
   //     `qiyu-skill-dir` 不得让测试去 stat 真实路径、也不得把漂移提示写进 output.ts 的
   //     模块级 pendingSkillWarning（[21] 实测 4 条红）。
-  // 门本身从这里直接调 `resolveEntityDirSources` 验证（不经 `resolveEntityDir`），
-  // 因为 `resolveEntityDir` 只是它的薄包装；两侧都钉，任一侧被改回去都有红。
+  // 门本身由本组直接调 `resolveEntityDirSources` 验证（`startupEntityDir()` 就是它的
+  // 生产调用形态，与 `cli.ts` 逐字对应）。
   const withoutNodeTest = (): void => {
     process.env.NODE_ENV = 'production'
     delete process.env.VITEST
@@ -374,8 +374,8 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
   })
 
   it('npm_config_qiyu_skill_dir 的相对路径按 cwd 解析成绝对路径', () => {
-    // 与 postinstall 同语义（installSkill 内部全部按绝对路径运算）；resolveEntityDir
-    // 只做字符串解析，不碰磁盘——home 下并没有这个目录。
+    // 与 postinstall 同语义（installSkill 内部全部按绝对路径运算）；解析只做字符串
+    // 拼接，不碰磁盘——home 下并没有这个目录。
     withoutNodeTest()
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = './rel-skill'

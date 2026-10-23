@@ -15,7 +15,7 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { checkPack } from './pack-gate.mjs'
+import { checkPack, parsePackJson } from './pack-gate.mjs'
 
 /** 仓库根：本脚本在 `<root>/scripts/` 下，向上两级。不依赖 cwd。 */
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -23,34 +23,6 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 function fail(message) {
   console.error(`[check-pack] 错误：${message}`)
   process.exit(1)
-}
-
-/**
- * 解析 `npm pack --dry-run --json` 的 stdout（npm 10/11 输出数组，个别版本输出单对象）。
- *
- * ⚠️ 不能按「首个 `[` 字符」切：prepare 的日志行 `[copy-assets] ...` 里就带 `[`。
- * 正确做法是**逐行起点**往后试解析，第一个能解析出带 `files` 数组的结果即命中
- * （日志行永远不是合法 JSON，会被跳过）。
- */
-function parsePackJson(stdout) {
-  const lines = stdout.split('\n')
-  let offset = 0
-  for (const line of lines) {
-    const trimmed = line.trimStart()
-    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
-      try {
-        const parsed = JSON.parse(stdout.slice(offset + (line.length - trimmed.length)))
-        const entry = Array.isArray(parsed) ? parsed[0] : parsed
-        if (entry && Array.isArray(entry.files)) {
-          return entry.files.map((f) => (typeof f === 'string' ? f : f.path)).filter(Boolean)
-        }
-      } catch {
-        // 不是 JSON 起点（多半是日志行），继续往下试。
-      }
-    }
-    offset += line.length + 1
-  }
-  fail(`npm pack --dry-run --json 的输出里找不到含 files 的 JSON：${stdout.slice(0, 200)}`)
 }
 
 /** 递归列出目录下的 `.md`（相对路径，`/` 分隔）；目录不存在返回空数组。 */
@@ -73,9 +45,14 @@ function listSourceDocs(dir, prefix = '') {
 
 let packStdout
 try {
-  // Windows 上 npm 是 .cmd 包装（终审 F8）；CI 只跑 ubuntu，这里顺手兼容本地 Windows。
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  packStdout = execFileSync(npm, ['pack', '--dry-run', '--json'], {
+  // ⚠️ Windows（复审 F8）：`execFileSync('npm.cmd', …)` **不行** —— Node 自 CVE-2024-27980
+  // 起在 `_WIN32` 下对 `.bat`/`.cmd` 且 `shell` 未设时直接返回 `UV_EINVAL`
+  // （`process_wrap.cc` / `spawn_sync.cc`），libuv 的 PATH 搜索也不追加 `.cmd`。
+  // 正确形态是走 shell（`cmd.exe` 会按 PATHEXT 找到 npm.cmd）。shell 模式下参数由
+  // shell 解析，所以这里传**拼好的整条命令**而不是数组，避免 DEP0190 的转义歧义。
+  const isWin = process.platform === 'win32'
+  const cmd = 'npm pack --dry-run --json'
+  packStdout = execFileSync(isWin ? 'cmd.exe' : 'npm', isWin ? ['/d', '/s', '/c', cmd] : ['pack', '--dry-run', '--json'], {
     cwd: root,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],
@@ -84,7 +61,12 @@ try {
   fail(`npm pack --dry-run --json 执行失败：${err.message}`)
 }
 
-const files = parsePackJson(packStdout)
+let files
+try {
+  files = parsePackJson(packStdout)
+} catch (err) {
+  fail(err instanceof Error ? err.message : String(err))
+}
 
 const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'))
 if (typeof pkg.version !== 'string' || pkg.version === '') {

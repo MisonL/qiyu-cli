@@ -194,19 +194,21 @@ describe('护栏：flag 归一化（审查 Minor-2）', () => {
       { name: '--since', tokenIndex: 3 },
     ])
   })
-  // —— 终审 F7：单横线取值不是 flag ——
-  it('`--since -7d` 的 `-7d` 不算 flag（真实解析器的值位守卫只拒 `--` 开头）', () => {
-    // 变异「flag 判定退回 startsWith('-')」→ 本用例红：`-7d` 进 flags 后，
-    // check 层会双报 unknown_flag + flag_missing_value（正文里合法的调用被判错）。
+  // —— 复审 F7 纠正：`-` 开头一律记为 flag（提取层不做「是不是取值」的判断）——
+  //
+  // 曾经改成「单横线只有单字母短旗才算」，前提是「`--since -7d` 是合法调用」——**前提是错的**：
+  // 真实 CLI 对 `query --since -7d` 退 2（「--since 无法解析：-7d」）、对 `query --timeout -1`
+  // 也退 2（「必须是非负数」）。若按那个改法，这两条非法调用会变成 check 零违规（漏报）。
+  // 提取层只回答「哪些 token 长得像 flag」，取值合法性交给 check 层。
+  it('`--since -7d` 里的 `-7d` 仍记为 flag（取值合法性不在本层判断）', () => {
     const r = extractRefs('`qiyu query --sql "SELECT 1" --since -7d`')
-    expect(flagNames(r)).toEqual(['--sql', '--since'])
-    expect(r.commands[0]!.tokens).toContain('-7d')
+    expect(flagNames(r)).toEqual(['--sql', '--since', '-7d'])
   })
-  it('`--timeout -1` 的 `-1` 同样不是 flag', () => {
+  it('`--timeout -1` 里的 `-1` 同样记为 flag', () => {
     const r = extractRefs('`qiyu query --table sessions --timeout -1`')
-    expect(flagNames(r)).toEqual(['--table', '--timeout'])
+    expect(flagNames(r)).toEqual(['--table', '--timeout', '-1'])
   })
-  it('单字母短旗 `-h` 仍是 flag', () => {
+  it('单字母短旗 `-h` 记为 flag', () => {
     const r = extractRefs('`qiyu db tables -h`')
     expect(flagNames(r)).toEqual(['-h'])
   })

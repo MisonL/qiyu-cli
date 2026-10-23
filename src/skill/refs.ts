@@ -381,12 +381,15 @@ function scanCommand(content: string, line: number, refs: Refs): void {
       // 占位符之后：右侧是另一条命令或重定向目标，它的 flag / 位置参数不属于本命令。
       break
     }
-    // flag 判定（终审 F7）：`--` 开头一律是 flag；单横线只有**单字母短旗**（`-h`）算，
-    // 其余（`-7d`、`-1` 这类取值）不算。真实解析器的值位守卫只拒 `--` 开头
-    // （`query.ts` 的「取值恰好是已知 flag 才算缺值」、`store-flags.ts` / `sync.ts` 同），
-    // `--since -7d` 是合法调用；旧版把 `-7d` 记成 flag，会双报 unknown_flag + missing_value。
-    // 负数/带字母数字的取值都以数字开头，单字母正则天然把它们排除。
-    if (text.startsWith('--') || /^-[A-Za-z]$/.test(text)) {
+    // flag 判定：`-` 开头一律记为 flag（提取层不判断「这个 token 是不是某个 flag 的取值」
+    // ——那要看 spec 的 kind，属 check 层）。
+    //
+    // ⚠️ 复审纠正：曾经改过「单横线只有单字母短旗才算」，理由是「`--since -7d` 是合法调用」。
+    // 那个前提**是错的**：真实 CLI 对 `query --since -7d` 退 2（`--since 无法解析：-7d`），
+    // 对 `query --timeout -1` 同样退 2（「必须是非负数」）。解析器的值位守卫只拒 `--` 开头，
+    // 但**取值语义层**（`parseTimeArg` / `parseTimeoutMs`）会拒绝它。改了之后这两条非法调用
+    // 变成 check 零违规（漏报），比误报更糟。取值是否合法应由 check 层按真实语义校验。
+    if (text.startsWith('-')) {
       flags.push({ name: normalizeFlag(text), tokenIndex: tokens.length })
     }
     tokens.push(text)

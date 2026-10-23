@@ -79,3 +79,53 @@ export function checkPack({ files, editionSource, pkgVersion, expectedSkillDocs 
 
   return problems
 }
+
+/**
+ * 解析 `npm pack --dry-run --json` 的 stdout。
+ *
+ * 已知三种顶层形态（都实测过）：
+ *   · npm 10/11：数组 `[{ …, files: [...] }]`
+ *   · npm 11 单包：对象 `{ …, files: [...] }`
+ *   · npm ≥12：**按包名键控** `{ "qiyu-cli": { …, files: [...] } }`（复审 N1：
+ *     旧实现只认前两种，在 npm 12 上整条门禁直接 fail，等于门禁不存在）
+ *
+ * ⚠️ 不能按「首个 `[` 字符」切：prepare 的日志行 `[copy-assets] ...` 里就带 `[`。
+ * 正确做法是**逐行起点**往后试解析（日志行永远不是合法 JSON，会被跳过）。
+ *
+ * 解析不出时**抛错**（本模块是纯函数层，不退出进程）；调用方决定怎么报。
+ */
+export function parsePackJson(stdout) {
+  const lines = stdout.split('\n')
+  let offset = 0
+  for (const line of lines) {
+    const trimmed = line.trimStart()
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(stdout.slice(offset + (line.length - trimmed.length)))
+        const files = extractFiles(parsed)
+        if (files !== null) return files
+      } catch {
+        // 不是 JSON 起点（多半是日志行），继续往下试。
+      }
+    }
+    offset += line.length + 1
+  }
+  throw new Error(`npm pack --dry-run --json 的输出里找不到含 files 的 JSON：${stdout.slice(0, 200)}`)
+}
+
+/** 从任一种顶层形态里取出文件路径数组；取不到返回 null。 */
+function extractFiles(parsed) {
+  const pick = (e) => {
+    if (!e || typeof e !== 'object' || !Array.isArray(e.files)) return null
+    return e.files.map((f) => (typeof f === 'string' ? f : f.path)).filter(Boolean)
+  }
+  if (Array.isArray(parsed)) return pick(parsed[0])
+  const direct = pick(parsed)
+  if (direct !== null) return direct
+  // npm ≥12：`{ "<包名>": { …, files } }`。取第一个带 files 的值（单包 dry-run 只会有一个键）。
+  for (const value of Object.values(parsed)) {
+    const nested = pick(value)
+    if (nested !== null) return nested
+  }
+  return null
+}
