@@ -110,10 +110,22 @@ function stagingMarkerPath(staging: string): string {
   return `${staging}${STAGING_MARKER_SUFFIX}`
 }
 
-/** 该路径是否是一个**由本模块写下**的标记（普通文件 + 内容逐字匹配）。 */
+/**
+ * 该路径是否是一个**由本模块写下**的标记（普通文件 + 内容逐字匹配）。
+ *
+ * 判据为什么是**内容**而不只是名字（复审 N1/W5）：名字形状挡不住用户的
+ * `qiyu.tmp-*.marker`，只认名字会把用户数据当残留删掉；标记内容是本模块写死的固定串，
+ * 要误删得先伪造它 —— 比「名字撞上」难得多，所以不引入 pid 校验之类更重的机制。
+ *
+ * ⚠️ 先看大小再读（复审 N5）：这条路径在 `postinstall` 的自动安装里也会跑，对任意同名
+ * 文件做整文件读取会让一个 300MB 的同名文件拖慢安装（实测 538ms / RSS +600MB）。
+ * 我们的标记只有一行，4096 字节的余量足够，超出即不是我们的。
+ */
 function isOurMarker(p: string): boolean {
   try {
-    return lstatSync(p).isFile() && readFileSync(p, 'utf8') === STAGING_MARKER_CONTENT
+    const st = lstatSync(p)
+    if (!st.isFile() || st.size > 4096) return false
+    return readFileSync(p, 'utf8') === STAGING_MARKER_CONTENT
   } catch {
     return false
   }
@@ -904,7 +916,9 @@ function cleanupStaleStaging(
       const st = lstatSync(abs)
       if (!st.isFile()) continue                       // 符号链接/目录/设备：不是我们的
       if (now - st.mtimeMs < STALE_STAGING_MIN_AGE_MS) continue
-      if (readFileSync(abs, 'utf8') !== STAGING_MARKER_CONTENT) continue
+      // 与第一循环**同一个谓词**（复审 N1：内联复制会静默漂移，「逐字相等」的强度
+      // 就没人保证了）。
+      if (!isOurMarker(abs)) continue
       rmSync(abs, { force: true })
     } catch {
       // 读不出来 / 并发删掉了等：无副作用，不必打扰用户。
@@ -1137,8 +1151,8 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
             : sameContent
               ? `另一个并发安装已完成，实体内容与包内一致：${entityDir}`
               : `另一个并发安装已完成，但实体内容与包内仍不同：${replan.warnings[0] ?? '计划要求 --force'}。`
-                + `按上面那条警告的指引处理后再重跑 qiyu skill install（只有「内容被手工修改」`
-                + `这一类才需要 --force；目录不可读时 --force 同样失败）`,
+                + `按上面那条警告的指引处理后再重跑 qiyu skill install（「内容被手工修改」或`
+                + `某个文件读不出这两类，--force 有效；整个目录列不出来时 --force 同样失败）`,
       )
     } else if (!outcome.complete && outcome.written === 0) {
       // 零写入：status 必须反映事实。`installed` 也一样退——实体可能只是个空壳。

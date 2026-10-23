@@ -115,12 +115,31 @@ const fsReaddirFault = vi.hoisted(() => {
  */
 const ENOTEMPTY_KINDS = new Set([
   'ENOTEMPTY', 'ENOTEMPTY_STALE_MANIFEST', 'ENOTEMPTY_MANIFEST_DIR', 'ENOTEMPTY_EXACT',
+  'ENOTEMPTY_UNREADABLE',
 ])
+
+/**
+ * `readFileSync` 的读取记录（默认 null = 不记录）：为 true 时把每次调用的路径记进数组。
+ * 用来断言「大文件没有被整读」（复审 N5：时间断言没判别力 —— 8MB 读得够快）。
+ */
+const fsReadLog = vi.hoisted(() => {
+  const paths: string[] = []
+  return {
+    paths,
+    active: false,
+    set(active: boolean): void { this.active = active; if (active) paths.length = 0 },
+    record(p: unknown): void { if (this.active) paths.push(String(p)) },
+  }
+})
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
   return {
     ...actual,
+    readFileSync: ((p: Parameters<typeof actual.readFileSync>[0], ...rest: unknown[]) => {
+      fsReadLog.record(p)
+      return (actual.readFileSync as (...args: unknown[]) => unknown)(p, ...rest)
+    }) as typeof actual.readFileSync,
     readdirSync: ((p: Parameters<typeof actual.readdirSync>[0], opts?: unknown) => {
       const real = (actual.readdirSync as (a: unknown, b?: unknown) => unknown)(p, opts)
       const withTypes = typeof opts === 'object' && opts !== null
@@ -169,6 +188,12 @@ vi.mock('node:fs', async (importOriginal) => {
           actual.cpSync(from, to, { recursive: true, force: true })
           actual.rmSync(realTo + '/' + MANIFEST, { force: true })
           actual.mkdirSync(realTo + '/' + MANIFEST)
+        } else if (kind === 'ENOTEMPTY_UNREADABLE') {
+          // 并发赢家形态 D：实体被建成**不可读目录**（chmod 000）。planInstall 返回
+          // action='none' + 「读取实体目录失败…即使 --force 也会以同样的错误失败」，
+          // 并发文案必须指引用户按那条警告处理，**不得**再劝 --force（复审 W3 第七形态）。
+          actual.cpSync(from, to, { recursive: true, force: true })
+          if (process.getuid?.() !== 0) actual.chmodSync(realTo, 0o000)
         } else if (kind === 'ENOTEMPTY_EXACT') {
           // 并发赢家形态 C：与包内**完全一致**（正文 + 全新清单）—— planInstall 走幂等
           // 分支（action='none'、零警告），并发文案必须说「内容与包内一致」（复审 W4）。
@@ -1392,6 +1417,76 @@ describe('并发安装（gap 8）', () => {
     const forced = await installSkill({ home, sourceDir: src, version: '1.0.0', force: true, noLink: true })
     expect(forced.status).toBe('updated')
     expect(contentHash(entity)).toBe(contentHash(src))
+  })
+
+  it('⑨ 并发赢家是不可读目录 → 文案必须指引「按警告处理」，不得劝 --force（复审 N3：这条文案零覆盖）', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return  // root / Windows 下 chmod 不拦读取
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+
+    fsRenameFault.set('ENOTEMPTY_UNREADABLE')
+    let r
+    try {
+      r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    } finally {
+      fsRenameFault.set(null)
+      try { chmodSync(entity, 0o755) } catch { /* 实体可能没建出来 */ }
+    }
+    const joined = r.warnings.join('\n')
+    // 变异「并发文案整体退回旧文本」→ 本行红。
+    expect(joined, '目录不可读时不得劝用户加 --force').not.toContain('加 --force')
+    expect(joined, '必须指引用户按上面那条警告处理').toContain('按上面那条警告')
+  })
+
+  it('⑦ 标记内容必须**逐字**相等：前缀/包含关系不算（复审 N1：谓词强度要有人钉）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+    // 内容以我们的标记开头、但后面多了东西 —— 不是我们写的那个文件。
+    const nearMiss = join(dirname(entity), `${entity.split('/').pop()}.tmp-NearMiss`)
+    mkdirSync(nearMiss)
+    writeFileSync(join(nearMiss, 'SKILL.md'), 'x\n')
+    writeFileSync(`${nearMiss}.marker`, STAGING_MARKER_CONTENT.trimEnd() + ' 额外内容\n')
+    const longAgo = new Date(Date.now() - 24 * 60 * 60_000)
+    utimesSync(nearMiss, longAgo, longAgo)
+    utimesSync(`${nearMiss}.marker`, longAgo, longAgo)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+
+    // 变异「`===` 改成 `includes` / `startsWith`」→ 这个目录会被当残留删掉 → 红。
+    expect(existsSync(join(nearMiss, 'SKILL.md')), '仅内容前缀相同的目录被误删').toBe(true)
+    expect(r.warnings.some((w) => w.includes('残留'))).toBe(false)
+  })
+
+  it('⑧ 标记文件超大时不得整读（复审 N5：postinstall 的自动安装也走这条路）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+    const big = join(dirname(entity), `${entity.split('/').pop()}.tmp-BigFile`)
+    mkdirSync(big)
+    writeFileSync(join(big, 'SKILL.md'), 'x\n')
+    // 8MB：远超标记大小，函数应直接按「不是我们的」处理而不整读。
+    writeFileSync(`${big}.marker`, Buffer.alloc(8 * 1024 * 1024, 0x61))
+    const longAgo = new Date(Date.now() - 24 * 60 * 60_000)
+    utimesSync(big, longAgo, longAgo)
+    utimesSync(`${big}.marker`, longAgo, longAgo)
+
+    fsReadLog.set(true)
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+      expect(r.status).toBe('installed')
+    } finally {
+      fsReadLog.set(false)
+    }
+
+    // 目录与文件都保留（不是我们的）。
+    expect(existsSync(join(big, 'SKILL.md')), '用户的大目录被当成残留删了').toBe(true)
+    expect(existsSync(`${big}.marker`), '用户的大文件被当成孤儿标记删了').toBe(true)
+    // 关键断言（复审 N5，判别力靠「读没读」而不是耗时 —— 时间断言对 8MB 没有判别力）：
+    // 大于 4096 字节的标记必须在 isOurMarker 里被 size 守卫挡下、**一次都不读**。
+    expect(fsReadLog.paths, '8MB 同名文件被整读了（size 守卫失效）')
+      .not.toContain(`${big}.marker`)
   })
 
   it('⑥ 注入一个**未登记**的 ENOTEMPTY 变体时 mock 不得静默失效（复审 N2：兜底用集合反判）', async () => {
