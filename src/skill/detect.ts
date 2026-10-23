@@ -23,7 +23,7 @@
 // 同参重复调用复用，不重复 stat；换参（如测试换 tmp 目录）重新探测。缓存键必须含
 // 全部三个参数——测试在同进程内换 tmp 目录跑，只按实体目录做键就会命中错结果。
 //
-// 测试环境（`NODE_ENV === 'test'` 或 vitest 的 `VITEST=true`）的 `resolveEntityDir()`：
+// 测试环境（`NODE_ENV === 'test'` 或 vitest 的 `VITEST=true`）的 `resolveEntityDirSources()`：
 // 实体目录**不是**由 `--dir` / `QIYU_SKILL_DIR` 显式指定时返回 undefined、跳过真实路径
 // 探测；`npm_config_qiyu_skill_dir` 排在测试门**之后**读取（G3 审查 [21]：宿主环境里的
 // `npm_config_*` 不得泄进测试）。理由有二（全局约束 + brief Step 5）：
@@ -376,24 +376,6 @@ export function entityUndeterminedNote(
     + `${env.NODE_ENV ?? ''}，VITEST=${env.VITEST ?? ''}），且没有显式给出 --dir 或 QIYU_SKILL_DIR`
     + '——不读宿主 npm_config_qiyu_skill_dir、也不碰真实 home。'
     + '要定位实体请显式给出 --dir 或 QIYU_SKILL_DIR'
-}
-
-/**
- * 启动探测（`cli.run()`）用的实体目录：唯一实现 + 测试门。
- *
- * 返回 undefined = 本次不探测。**命令层**不走这个函数——它按用户给的位置办事，
- * 需要「未确定」时用 `skill where` 的显式报告（`entityUndeterminedNote`）。
- */
-export function resolveEntityDir(
-  opts: { env?: NodeJS.ProcessEnv; home?: string; baseDir?: string } = {},
-): string | undefined {
-  const env = opts.env ?? process.env
-  const resolved = resolveEntityDirSources({
-    env,
-    ...(opts.home !== undefined ? { home: opts.home } : {}),
-    ...(opts.baseDir !== undefined ? { baseDir: opts.baseDir } : {}),
-  })
-  return resolved.decided ? resolved.dir : undefined
 }
 
 /**

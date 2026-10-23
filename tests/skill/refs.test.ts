@@ -194,6 +194,22 @@ describe('护栏：flag 归一化（审查 Minor-2）', () => {
       { name: '--since', tokenIndex: 3 },
     ])
   })
+  // —— 终审 F7：单横线取值不是 flag ——
+  it('`--since -7d` 的 `-7d` 不算 flag（真实解析器的值位守卫只拒 `--` 开头）', () => {
+    // 变异「flag 判定退回 startsWith('-')」→ 本用例红：`-7d` 进 flags 后，
+    // check 层会双报 unknown_flag + flag_missing_value（正文里合法的调用被判错）。
+    const r = extractRefs('`qiyu query --sql "SELECT 1" --since -7d`')
+    expect(flagNames(r)).toEqual(['--sql', '--since'])
+    expect(r.commands[0]!.tokens).toContain('-7d')
+  })
+  it('`--timeout -1` 的 `-1` 同样不是 flag', () => {
+    const r = extractRefs('`qiyu query --table sessions --timeout -1`')
+    expect(flagNames(r)).toEqual(['--table', '--timeout'])
+  })
+  it('单字母短旗 `-h` 仍是 flag', () => {
+    const r = extractRefs('`qiyu db tables -h`')
+    expect(flagNames(r)).toEqual(['-h'])
+  })
 })
 
 describe('护栏：围栏注释剥离（审查 Minor-4）', () => {

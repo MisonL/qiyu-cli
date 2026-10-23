@@ -61,7 +61,7 @@
 
 import { createHash } from 'node:crypto'
 import {
-  copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync,
+  copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync,
   realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import path from 'node:path'
@@ -82,8 +82,22 @@ export { MANIFEST }
 const STAGING_SUFFIX = '.tmp-'
 
 /**
+ * 暂存目录的**独占标记**（终审 F3）：清理崩溃残留时只认带这个文件的目录。
+ *
+ * 为什么名字形状不够：`isStagingName` 只能判「前缀 + 长度」，用户自己的
+ * `qiyu.tmp-backup/` 恰好符合（`backup` 正好也是 6 位字母数字，收紧到 mkdtemp 的
+ * 后缀形态也挡不住）。而 `mkdtemp` 的随机后缀与用户名字无法从名字上区分，所以用
+ * 一个**只有本模块会写**的标记文件做判据——用户目录不会平白多出它。
+ *
+ * 兼容性：旧版本留下的残留没有标记，从此不会被自动清理（宁留不删，与本轮 [59] 的
+ * 「宁留不删」同一取向）。标记在换入实体前删除，不会进入已安装的实体目录。
+ */
+const STAGING_MARKER = '.qiyu-staging'
+
+/**
  * 判断一个目录项名是否是本模块的暂存目录名（`<实体名>.tmp-<随机后缀>`）。
- * 消费方是安装开始时的残留清理——只认这个形状，绝不碰用户自己取的别的名字。
+ * 消费方是安装开始时的残留清理——**名字形状只是第一道筛**，真正的判据是
+ * `STAGING_MARKER` 标记文件（见其注释：用户目录可能恰好同名）。
  */
 function isStagingName(name: string, entityBase: string): boolean {
   return name.startsWith(`${entityBase}${STAGING_SUFFIX}`) && name.length > entityBase.length + STAGING_SUFFIX.length
@@ -689,6 +703,10 @@ function writeInstalled(
     if (contentHash(staging) !== sourceHash) {
       throw new Error('暂存内容与源不一致（防御性校验失败）')
     }
+    // 标记必须在哈希校验**之后**写：contentHash 会把标记文件算进去，先写会让
+    // 「暂存内容与源不一致」永远成立。写在这里，崩溃残留（含正文、尚未换入）就带标记，
+    // 下次安装可安全清理（终审 F3）。
+    writeFileSync(path.join(staging, STAGING_MARKER), 'qiyu skill install 的暂存目录；崩溃残留清理只认带此标记的目录\n')
     writeManifest(staging, version, sourceHash, sourceFiles)
   } catch (err) {
     if (staging !== undefined) rmSync(staging, { recursive: true, force: true })
@@ -706,6 +724,8 @@ function writeInstalled(
     }
     if (!entityExists) {
       mkdirSync(path.dirname(entityDir), { recursive: true })
+      // 标记是暂存目录的，不属于安装结果：换入前删掉（否则它会进实体、改变 contentHash）。
+      try { unlinkSync(path.join(staging, STAGING_MARKER)) } catch { /* 已被删掉也无妨 */ }
       try {
         renameSync(staging, entityDir)
         return { complete: true, written: sourceFiles.length, total: sourceFiles.length, manifestKept: false }
@@ -823,6 +843,9 @@ function cleanupStaleStaging(
     try {
       const st = lstatSync(abs)
       if (!st.isDirectory()) continue
+      // 独占标记（终审 F3）：没有标记的同名目录**不是**本模块的暂存位——可能是用户
+      // 自己建的 `qiyu.tmp-backup/`。宁留不删，也不给一条「已清理残留」的错误归因。
+      if (!existsSync(path.join(abs, STAGING_MARKER))) continue
       // 年轻 = 可能有别的 install 正在写它。留到下次再清（`--force` 也救不了误删）。
       if (now - st.mtimeMs < STALE_STAGING_MIN_AGE_MS) continue
       rmSync(abs, { recursive: true, force: true })
@@ -1022,14 +1045,22 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
       { files: plan.prevFiles, hashes: plan.prevFileHashes },
     )
     if (outcome.concurrent === true) {
-      // 并发（gap 8）：另一个进程先建出了实体，本进程零写入但**不是失败**——
-      // 实体内容由那次安装决定，必须重新判定后如实报告，否则 Agent 会以为要重装。
+      // 并发（gap 8）：另一个进程先建出了实体，本进程**一个文件都没写**。
+      // 所以 status 恒为 skipped —— 此前这里用 `replan.status` 覆盖它，而 `skipped`
+      // 在 planInstall 里有**四种**含义（幂等一致 / 内容不同且未加 force / 清单被占用 /
+      // 目录列不出），于是内容不同时会谎报「一致」，--force 下更会把零写入报成 updated
+      // （终审 F1：重新引入了 B2 刚消灭的那类谎报）。
+      //
+      // 「一致与否」只认一个判据：没有任何要写/要改的动作、也没有任何警告
+      // （`action === 'none'` 是幂等分支的产物；其余三种都带 warnings）。
       const replan = planInstall({ entityDir, sourceDir, version, force })
-      status = replan.status
+      status = 'skipped'
+      const consistent = replan.action === 'none' && replan.warnings.length === 0
       warnings.push(
-        replan.status === 'skipped'
+        consistent
           ? `另一个并发安装已完成，实体内容与包内一致：${entityDir}`
-          : `另一个并发安装已完成，但实体内容与包内仍不同（${replan.warnings[0] ?? '计划要求 --force'}）；如需以本包为准请重跑并加 --force`,
+          : `另一个并发安装已完成，但实体内容与包内仍不同（${replan.warnings[0] ?? '计划要求 --force'}）；`
+            + `如需以本包为准请重跑 qiyu skill install（内容不同时加 --force）`,
       )
     } else if (!outcome.complete && outcome.written === 0) {
       // 零写入：status 必须反映事实。`installed` 也一样退——实体可能只是个空壳。

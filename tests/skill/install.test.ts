@@ -1054,6 +1054,9 @@ describe('#4：崩溃残留的暂存目录清理', () => {
     const stale = `${entity}.tmp-AbCdEf`
     mkdirSync(stale, { recursive: true })
     writeFileSync(join(stale, 'SKILL.md'), '半截正文\n')
+    // 终审 F3：真正的暂存位带独占标记，清理只认带标记的目录（名字形状挡不住用户的
+    // `qiyu.tmp-backup/`）。这里照实模拟本模块自己的残留。
+    writeFileSync(join(stale, '.qiyu-staging'), '标记\n')
     // ⚠️ 必须把 mtime 拨老：清理按年龄判（gap 8 —— 年轻的可能是另一个并发安装正在写的，
     // 无差别删会把它打成 ENOENT / 「暂存内容与源不一致」）。
     const longAgo = new Date(Date.now() - 60 * 60_000)
@@ -1075,6 +1078,24 @@ describe('#4：崩溃残留的暂存目录清理', () => {
     const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
 
     expect(existsSync(young), '年轻暂存目录被误删 —— 并发安装会撞 ENOENT').toBe(true)
+    expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(false)
+  })
+
+  it('同前缀但**没有独占标记**的用户目录不得删除（终审 F3：名字形状挡不住 qiyu.tmp-backup）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    // 用户的备份目录，恰好长得像暂存目录（`backup` 也是 6 位字母数字，收紧后缀也挡不住），
+    // 且很久没动过（年龄守卫会放行）。唯一能区分它的是：它没有本模块写的标记文件。
+    const mine = `${entity}.tmp-backup`
+    mkdirSync(mine, { recursive: true })
+    writeFileSync(join(mine, 'important.md'), '用户自己的数据\n')
+    const longAgo = new Date(Date.now() - 24 * 60 * 60_000)
+    utimesSync(mine, longAgo, longAgo)
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+
+    expect(existsSync(join(mine, 'important.md')), '用户目录被当成崩溃残留删掉了').toBe(true)
+    // 也不能谎称「清理了残留」——它根本没被清理。
     expect(r.warnings.some((w) => w.includes('残留的暂存目录'))).toBe(false)
   })
 
@@ -1279,9 +1300,14 @@ describe('并发安装（gap 8）', () => {
     fsRenameFault.set('ENOTEMPTY')
     try {
       const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
-      // 关键断言：不把并发当成失败。重判定后实体内容与包内一致 → skipped。
+      // 关键断言：不把并发当成失败。
       expect(r.status).toBe('skipped')
       expect(r.warnings.some((w) => w.includes('并发'))).toBe(true)
+      // 判别力（终审 F1/F6）：mock 的「另一进程」只写了一份**内容不同**的 SKILL.md，
+      // 所以文案必须如实说「仍不同」。旧断言只查 includes('并发')，两个分支都含这二字、
+      // 永远绿，抓不到「内容不同却报一致」的谎报。
+      expect(r.warnings.some((w) => w.includes('仍不同')), '内容不同时必须报「仍不同」').toBe(true)
+      expect(r.warnings.some((w) => w.includes('内容与包内一致')), '内容不同时不得报「一致」').toBe(false)
       // 绝不能出现「安装失败」这类让 Agent 去重装的措辞。
       expect(r.warnings.some((w) => w.includes('安装失败'))).toBe(false)
     } finally {
@@ -1310,10 +1336,11 @@ describe('并发安装（gap 8）', () => {
     mkdirSync(young)
     write(young, 'SKILL.md', '# 另一个进程正在写\n')
 
-    // 造一个「很久以前」的残留目录：mtime 拨回 1 小时前。
+    // 造一个「很久以前」的残留目录：mtime 拨回 1 小时前，且带本模块的独占标记。
     const old = join(dirname(entity), `${entity.split('/').pop()}.tmp-OLD999`)
     mkdirSync(old)
     write(old, 'SKILL.md', '# 上次崩溃的残留\n')
+    write(old, '.qiyu-staging', '标记\n')
     const longAgo = new Date(Date.now() - 60 * 60_000)
     utimesSync(old, longAgo, longAgo)
 

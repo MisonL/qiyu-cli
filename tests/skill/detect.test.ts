@@ -1,6 +1,6 @@
 // tests/skill/detect.test.ts —— 安装态探测（Task 10，设计稿 D2.1）。
 //
-// 全部在临时目录里构造实体与源目录，绝不读写真实 `~`。`resolveEntityDir()` 的
+// 全部在临时目录里构造实体与源目录，绝不读写真实 `~`。`startupEntityDir()` 的
 // `NODE_ENV === 'test'` 门有独立用例：测试环境下不探测真实路径，探测结果因此
 // 不依赖「开发者机器上装没装过 skill」。
 //
@@ -23,13 +23,24 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import {
   resetSkillDetectionCache, detectSkillState, entityUndeterminedNote, npmRelativeBase,
-  resolveEntityDir, resolveEntityDirSources, resolveSkillSourceDir, skillWarning,
+  resolveEntityDirSources, resolveSkillSourceDir, skillWarning,
 } from '../../src/skill/detect.js'
 import { contentHash, MANIFEST } from '../../src/skill/install.js'
 import { defaultEntityDir } from '../../src/skill/paths.js'
 import { setSkillWarning } from '../../src/output.js'
 import { run } from '../../src/cli.js'
 import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from '../../src/core/edition.js'
+
+/**
+ * 启动探测取到的实体目录（终审 F4：`resolveEntityDir` 曾是一个**零生产调用点**的包装，
+ * `cli.ts` 已改直调 `resolveEntityDirSources`；测试钉着死包装等于验证一条不在生产路径上
+ * 的代码）。这里按 `cli.ts` 的真实调用形态（`process.env` + `npmRelativeBase()`）取，
+ * 与生产同一条路。
+ */
+function startupEntityDir(): string | undefined {
+  const r = resolveEntityDirSources({ env: process.env, baseDir: npmRelativeBase(process.env, () => process.cwd()) })
+  return r.decided ? r.dir : undefined
+}
 
 /**
  * `statSync` 的故障注入开关（D3.5，默认 null = 走真实实现）。
@@ -284,19 +295,19 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     // 没装过的人不会，同一份代码两种结果。未显式注入两个变量之一时，测试门保持原样。
     process.env.NODE_ENV = 'test'
     delete process.env.QIYU_SKILL_DIR
-    expect(resolveEntityDir()).toBeUndefined()
+    expect(startupEntityDir()).toBeUndefined()
   })
 
   it('显式设了 QIYU_SKILL_DIR 时优先用它（测试可注入临时目录）', () => {
     process.env.NODE_ENV = 'test'
     process.env.QIYU_SKILL_DIR = join(home, 'custom-entity')
-    expect(resolveEntityDir()).toBe(join(home, 'custom-entity'))
+    expect(startupEntityDir()).toBe(join(home, 'custom-entity'))
   })
 
   it('QIYU_SKILL_DIR 为空串视为未设（空路径不是有意义的实体位置）', () => {
     process.env.NODE_ENV = 'test'
     process.env.QIYU_SKILL_DIR = ''
-    expect(resolveEntityDir()).toBeUndefined()
+    expect(startupEntityDir()).toBeUndefined()
   })
 
   it('QIYU_SKILL_DIR 为纯空白同样视为未设（审查 M1）', () => {
@@ -304,13 +315,13 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     // 探测会 stat 一个叫「   」的目录并给出「skill 未安装到    」的文案。
     process.env.NODE_ENV = 'test'
     process.env.QIYU_SKILL_DIR = '   '
-    expect(resolveEntityDir()).toBeUndefined()
+    expect(startupEntityDir()).toBeUndefined()
   })
 
   it('路径前后有空白时按 trim 后的值使用', () => {
     process.env.NODE_ENV = 'test'
     process.env.QIYU_SKILL_DIR = '  /tmp/some-entity  '
-    expect(resolveEntityDir()).toBe('/tmp/some-entity')
+    expect(startupEntityDir()).toBe('/tmp/some-entity')
   })
 
   it('非测试环境返回默认实体位置（纯字符串计算，不碰磁盘）', () => {
@@ -318,7 +329,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     delete process.env.QIYU_SKILL_DIR
     // vitest 恒设 `VITEST=true`；这条钉的是「生产语义」（非测试进程），所以一并清掉。
     delete process.env.VITEST
-    expect(resolveEntityDir()).toBe(defaultEntityDir(homedir()))
+    expect(startupEntityDir()).toBe(defaultEntityDir(homedir()))
   })
 
   // —— 终审 I2 + G3 追加审查 [21]：npm_config 是 postinstall 的位置通道，但不得泄进测试 ——
@@ -342,7 +353,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     withoutNodeTest()
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = join(home, 'custom-skill')
-    expect(resolveEntityDir()).toBe(join(home, 'custom-skill'))
+    expect(startupEntityDir()).toBe(join(home, 'custom-skill'))
   })
 
   it('全大写键 NPM_CONFIG_QIYU_SKILL_DIR 同样生效（spec D8 键名不敏感）', () => {
@@ -351,7 +362,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     withoutNodeTest()
     delete process.env.QIYU_SKILL_DIR
     process.env.NPM_CONFIG_QIYU_SKILL_DIR = join(home, 'custom-upper')
-    expect(resolveEntityDir()).toBe(join(home, 'custom-upper'))
+    expect(startupEntityDir()).toBe(join(home, 'custom-upper'))
   })
 
   it('QIYU_SKILL_DIR 优先于 npm_config_qiyu_skill_dir', () => {
@@ -359,7 +370,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     withoutNodeTest()
     process.env.QIYU_SKILL_DIR = join(home, 'explicit')
     process.env.npm_config_qiyu_skill_dir = join(home, 'from-npm')
-    expect(resolveEntityDir()).toBe(join(home, 'explicit'))
+    expect(startupEntityDir()).toBe(join(home, 'explicit'))
   })
 
   it('npm_config_qiyu_skill_dir 的相对路径按 cwd 解析成绝对路径', () => {
@@ -368,8 +379,8 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     withoutNodeTest()
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = './rel-skill'
-    expect(resolveEntityDir()).toBe(resolve('./rel-skill'))
-    expect(isAbsolute(resolveEntityDir()!)).toBe(true)
+    expect(startupEntityDir()).toBe(resolve('./rel-skill'))
+    expect(isAbsolute(startupEntityDir()!)).toBe(true)
   })
 
   it('[21] NODE_ENV=test + npm_config 已设 + 未设 QIYU_SKILL_DIR → undefined（宿主变量不泄进测试）', () => {
@@ -377,7 +388,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     process.env.NODE_ENV = 'test'
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = join(home, 'host-npm-entity')
-    expect(resolveEntityDir()).toBeUndefined()
+    expect(startupEntityDir()).toBeUndefined()
   })
 
   it('[21] VITEST=true（NODE_ENV 被改成别的值）同样挡掉 npm_config', () => {
@@ -388,7 +399,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     process.env.VITEST = 'true'
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = join(home, 'host-npm-entity')
-    expect(resolveEntityDir()).toBeUndefined()
+    expect(startupEntityDir()).toBeUndefined()
   })
 
   it('[21] 生产语义下 npm_config 仍被认识（门只关测试，不关生产）', () => {
@@ -402,7 +413,7 @@ describe('resolveEntityDir —— 测试环境绝不探测真实 ~', () => {
     process.env.NODE_ENV = 'test'
     delete process.env.QIYU_SKILL_DIR
     process.env.npm_config_qiyu_skill_dir = '   '
-    expect(resolveEntityDir()).toBeUndefined()
+    expect(startupEntityDir()).toBeUndefined()
   })
 
   // —— G3 审查 C3/C4：唯一实现 + 相对路径绝对化 ——

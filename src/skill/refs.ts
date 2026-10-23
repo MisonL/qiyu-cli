@@ -381,7 +381,12 @@ function scanCommand(content: string, line: number, refs: Refs): void {
       // 占位符之后：右侧是另一条命令或重定向目标，它的 flag / 位置参数不属于本命令。
       break
     }
-    if (text.startsWith('-')) {
+    // flag 判定（终审 F7）：`--` 开头一律是 flag；单横线只有**单字母短旗**（`-h`）算，
+    // 其余（`-7d`、`-1` 这类取值）不算。真实解析器的值位守卫只拒 `--` 开头
+    // （`query.ts` 的「取值恰好是已知 flag 才算缺值」、`store-flags.ts` / `sync.ts` 同），
+    // `--since -7d` 是合法调用；旧版把 `-7d` 记成 flag，会双报 unknown_flag + missing_value。
+    // 负数/带字母数字的取值都以数字开头，单字母正则天然把它们排除。
+    if (text.startsWith('--') || /^-[A-Za-z]$/.test(text)) {
       flags.push({ name: normalizeFlag(text), tokenIndex: tokens.length })
     }
     tokens.push(text)

@@ -28,25 +28,36 @@ export const REQUIRED_POSTINSTALL = 'dist/postinstall.js'
  *   files: readonly string[],
  *   editionSource: string,
  *   pkgVersion: string,
+ *   expectedSkillDocs?: readonly string[],
  * }} input
  *   `files` 是 `npm pack --dry-run --json` 里归一化后的文件路径列表；
  *   `editionSource` 是构建后 `dist/core/edition.js` 的全文；
- *   `pkgVersion` 是 `package.json` 的 `version`。
+ *   `pkgVersion` 是 `package.json` 的 `version`；
+ *   `expectedSkillDocs` 是**源码目录** `src/skill/qiyu/` 下的全部 `.md` 映射成的包内
+ *   路径。给了它就逐文件比对（终审 F9：此前只要 ≥2 篇，6 篇缺 5 篇仍绿）；不给时退回
+ *   「至少两篇」的弱判据（仅当调用方无法提供源清单时）。
  * @returns {string[]} 问题描述列表；空数组表示门禁通过。
  */
-export function checkPack({ files, editionSource, pkgVersion }) {
+export function checkPack({ files, editionSource, pkgVersion, expectedSkillDocs }) {
   const problems = []
   const fileSet = new Set(files)
 
-  if (!fileSet.has(REQUIRED_SKILL_ENTRY)) {
-    problems.push(`发布包缺少 ${REQUIRED_SKILL_ENTRY}（copy-assets 没有跑，或 skill 正文没被拷贝）`)
-  }
-  // skill 正文不止 SKILL.md 一篇（references/ 下还有多篇）；入口在而其余不在同样是坏包。
-  const skillMdCount = files.filter(
-    (f) => f.startsWith('dist/skill/qiyu/') && f.endsWith('.md'),
-  ).length
-  if (skillMdCount < 2) {
-    problems.push(`发布包里 dist/skill/qiyu/ 下的 .md 只有 ${skillMdCount} 篇（至少应有 SKILL.md 与参考文档）`)
+  if (Array.isArray(expectedSkillDocs) && expectedSkillDocs.length > 0) {
+    const missing = expectedSkillDocs.filter((p) => !fileSet.has(p))
+    if (missing.length > 0) {
+      problems.push(`发布包缺少 skill 正文（copy-assets 没有跑，或正文没被拷贝）：${missing.join('、')}`)
+    }
+  } else {
+    if (!fileSet.has(REQUIRED_SKILL_ENTRY)) {
+      problems.push(`发布包缺少 ${REQUIRED_SKILL_ENTRY}（copy-assets 没有跑，或 skill 正文没被拷贝）`)
+    }
+    // 兜底：入口在而参考文档不在同样是坏包。
+    const skillMdCount = files.filter(
+      (f) => f.startsWith('dist/skill/qiyu/') && f.endsWith('.md'),
+    ).length
+    if (skillMdCount < 2) {
+      problems.push(`发布包里 dist/skill/qiyu/ 下的 .md 只有 ${skillMdCount} 篇（至少应有 SKILL.md 与参考文档）`)
+    }
   }
 
   if (!fileSet.has(REQUIRED_POSTINSTALL)) {

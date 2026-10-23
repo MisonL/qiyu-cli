@@ -709,11 +709,6 @@ function probeSkillDoc(dir: string): SkillDocProbe {
   }
 }
 
-/** `hasSkillDoc` 的布尔版（只回答「有 / 没有」，不回答「读不了」）——保留给旧调用点。 */
-function hasSkillDoc(dir: string): boolean {
-  return probeSkillDoc(dir).kind === 'present'
-}
-
 async function skillCheck(argv: string[]): Promise<number> {
   const parsed = parseOrFail(argv, skillFlagSpecs('check'), 'check')
   if (typeof parsed === 'number') return parsed

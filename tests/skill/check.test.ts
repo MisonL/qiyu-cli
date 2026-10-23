@@ -552,6 +552,32 @@ describe('审查 13：checkSkillDir 递归子目录', () => {
       rmSync(outside, { recursive: true, force: true })
     }
   })
+  it('符号链接目录环不得让同一违规重复报告（终审 F2：`loop -> .` 此前靠 ENAMETOOLONG 才停）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qiyu-skill-check-'))
+    try {
+      writeFileSync(join(dir, 'SKILL.md'), '`qiyu nope cycle`\n')
+      // 指向自身的链接：realpath === root，能通过「指向目录内部」的收编判定；
+      // 旧实现会一直递归到路径撞上 ENAMETOOLONG，同一条违规报几十次。
+      symlinkSync(dir, join(dir, 'loop'))
+      const r = checkSkillDir(dir, ctx)
+      expect(r.violations).toHaveLength(1)
+      expect(r.violations[0]!.detail).toContain('SKILL.md:1')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  it('多层目录环（a -> b, b -> a）同样只报一次', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qiyu-skill-check-'))
+    try {
+      mkdirSync(join(dir, 'a'))
+      writeFileSync(join(dir, 'a', 'x.md'), '`qiyu nope cycle2`\n')
+      symlinkSync(join(dir, 'a'), join(dir, 'a', 'to-a'))
+      const r = checkSkillDir(dir, ctx)
+      expect(r.violations).toHaveLength(1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('checkSkillDir', () => {

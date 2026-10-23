@@ -375,12 +375,45 @@ export function checkSkillDoc(text: string, ctx: CheckContext): CheckResult {
  *
  * 四条约束：
  *   · 隐藏项（`.` 开头）跳过；
- *   · 符号链接只在**指向目录内部**时收（避免读目录外的内容，也避免目录环）；
+ *   · 符号链接只在**指向目录内部**时收（避免读目录外的内容）；目录环另由递归栈上的
+ *     realpath 集合挡住（终审 F2：只比 root 挡不住 `loop -> .` 这类指向祖先的链接，
+ *     此前靠路径长度撞 ENAMETOOLONG 才停，同一违规会被报几十次）；
  *   · 目录不存在 / 不可读时**抛错**（由调用方守卫），不静默当成「没有文件」；
  *   · 返回的相对路径用**逻辑路径**（相对被检查的目录），不是 realpath —— 展示给用户看
  *     的是「正文里叫什么」，不是「磁盘上实际落在哪儿」。
  */
-function collectMarkdownFiles(dir: string, root: string, prefix: string, out: { abs: string; rel: string }[]): void {
+function collectMarkdownFiles(
+  dir: string,
+  root: string,
+  prefix: string,
+  out: { abs: string; rel: string }[],
+  stack: Set<string> = new Set(),
+): void {
+  // 递归栈去重：进入一个**真实目录**前记录，返回时移除。环（`loop -> .` 或
+  // `a/link -> a`）会在第二次进入同一真实目录时被挡下；而同一目录的不同**逻辑**
+  // 路径（两条并列链接）仍会各自展开——栈是路径级的，不是全局 visited。
+  let realDir: string
+  try {
+    realDir = realpathSync(dir)
+  } catch {
+    realDir = dir   // realpath 失败：退回字面路径（目录本身仍可能可读）
+  }
+  if (stack.has(realDir)) return
+  stack.add(realDir)
+  try {
+    collectMarkdownFilesInner(dir, root, prefix, out, stack)
+  } finally {
+    stack.delete(realDir)
+  }
+}
+
+function collectMarkdownFilesInner(
+  dir: string,
+  root: string,
+  prefix: string,
+  out: { abs: string; rel: string }[],
+  stack: Set<string>,
+): void {
   const names = readdirSync(dir)   // 目录不存在 → ENOENT（与旧实现同一条错误面）
   for (const name of [...names].sort()) {
     if (name.startsWith('.')) continue
@@ -414,7 +447,7 @@ function collectMarkdownFiles(dir: string, root: string, prefix: string, out: { 
       isFile = st.isFile()
     }
     if (isDir) {
-      collectMarkdownFiles(full, root, rel, out)
+      collectMarkdownFiles(full, root, rel, out, stack)
       continue
     }
     if (isFile && name.endsWith('.md')) out.push({ abs: full, rel })

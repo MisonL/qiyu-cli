@@ -21,7 +21,12 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (rel: string): string => readFileSync(join(repoRoot, rel), 'utf8')
 
 /** 一组合法的产物数据：门禁应当通过；各用例只改坏其中一处。 */
-function goodPack(): { files: string[]; editionSource: string; pkgVersion: string } {
+function goodPack(): {
+  files: string[]
+  editionSource: string
+  pkgVersion: string
+  expectedSkillDocs: string[]
+} {
   return {
     files: [
       'dist/cli.js',
@@ -29,9 +34,12 @@ function goodPack(): { files: string[]; editionSource: string; pkgVersion: strin
       'dist/core/edition.js',
       'dist/skill/qiyu/SKILL.md',
       'dist/skill/qiyu/errors.md',
+      'dist/skill/qiyu/setup.md',
     ],
     editionSource: "export const PACKAGE_VERSION = '1.2.3';\n",
     pkgVersion: '1.2.3',
+    // 与 check-pack.mjs 同构：源码目录里的 .md 全集映射成包内路径。
+    expectedSkillDocs: ['dist/skill/qiyu/SKILL.md', 'dist/skill/qiyu/errors.md', 'dist/skill/qiyu/setup.md'],
   }
 }
 
@@ -60,6 +68,17 @@ describe('G7：build 脚本契约', () => {
     const source = read('scripts/copy-assets.mjs')
     const m = /^const MANIFEST = '([^']*)'/m.exec(source)
     expect(m?.[1]).toBe(MANIFEST)
+  })
+
+  // —— 终审 F5：占位版本号有**三份**字面量，漂移会让门禁的「仍是占位版本」检查静默失效 ——
+  it('占位版本三处字面量一致：edition.ts / copy-assets.mjs / pack-gate.mjs', () => {
+    const edition = /export const PACKAGE_VERSION = '([^']*)'/.exec(read('src/core/edition.ts'))
+    expect(edition?.[1], '找不到 edition.ts 的 PACKAGE_VERSION').toBeDefined()
+    const copyAssets = /^const PLACEHOLDER = '([^']*)'/m.exec(read('scripts/copy-assets.mjs'))
+    expect(copyAssets?.[1], '找不到 copy-assets.mjs 的 PLACEHOLDER').toBeDefined()
+    // 源码里的那个占位值就是三者共同的事实源：
+    expect(copyAssets?.[1]).toBe(edition![1])
+    expect(PLACEHOLDER_VERSION).toBe(edition![1])
   })
 })
 
@@ -91,10 +110,12 @@ describe('G7：门禁判定逻辑', () => {
     expect(checkPack(input).some((p) => p.includes('SKILL.md'))).toBe(true)
   })
 
-  it('skill 正文只有一篇（参考文档没拷进来）→ 拒绝', () => {
+  it('源码有 3 篇正文、包里只有 1 篇（数量判据会漏）→ 逐文件比对拒绝（终审 F9）', () => {
     const input = goodPack()
-    input.files = input.files.filter((f) => !f.endsWith('/errors.md'))
-    expect(checkPack(input).some((p) => p.includes('dist/skill/qiyu/'))).toBe(true)
+    input.files = input.files.filter((f) => f !== 'dist/skill/qiyu/errors.md' && f !== 'dist/skill/qiyu/setup.md')
+    const problems = checkPack(input)
+    expect(problems.some((p) => p.includes('errors.md')), '缺的每篇都要点名').toBe(true)
+    expect(problems.some((p) => p.includes('setup.md'))).toBe(true)
   })
 
   it('缺 postinstall.js → 拒绝', () => {
