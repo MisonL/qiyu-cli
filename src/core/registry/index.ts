@@ -37,6 +37,13 @@ export interface EndpointSpec {
    * → 本字段刻意**不**携带"判定式"信息：严格形式是两族的安全交集。
    */
   maxWindowDays?: number
+  /**
+   * 文档页所属分组（Apifox 目录路径，如 `工单系统`、`机器人/知识库管理`）。
+   * 来源是生成脚本抓取的 `x-apifox-folder`；**不是稳定契约** —— 厂商可能随时
+   * 调整文档目录结构。4 个文档外接口（export.session 一族）没有该键。
+   * 缺失 = 文档页无分组，不是数据缺口；`api list` 仅在存在时输出。
+   */
+  category?: string
   note?: string
 }
 
@@ -153,6 +160,18 @@ export function loadSpecs(raw: unknown): EndpointSpec[] {
         )
       }
     }
+    // ⚠️ `category` 是**可选**的（4 个文档外接口没有文档页、自然没有分组），
+    // 但**存在时必须是非空字符串**。判据与 `maxWindowDays` 同型：`null` 也必须拒 ——
+    // `api list` 的判据是 `e.category !== undefined`，`null` 会漏到输出层，
+    // 而 `field_notes.category` 明写「缺失 = 文档页无分组」。三处口径必须一致。
+    if (o.category !== undefined) {
+      if (typeof o.category !== 'string' || o.category.trim() === '') {
+        throw new Error(
+          `specs.json[${o.id}] 的 category 必须是非空字符串，或整个省略该键` +
+            `（省略 = 文档页无分组）；不接受 null。实际是 ${JSON.stringify(o.category)}。`,
+        )
+      }
+    }
     // ⚠️ 入站推送（`direction: 'inbound'`）是七鱼回调我方，**不存在可主动调用的 URL**。
     // 它的 path 是占位符 `"/"`（truthy），上面那条 `callable && !path` 拦不住它 ——
     // 误标 callable 会拼出 `https://qiyukf.com/?appKey=...` 发出去。矛盾组合必须在加载时炸。
@@ -191,14 +210,10 @@ export function loadSpecs(raw: unknown): EndpointSpec[] {
     // ⚠️ `method` 缺失时 undici 默认 GET；若请求带 body 会抛
     // "Request with GET/HEAD method cannot have body" —— 一个与真实原因
     // （注册表缺字段）毫无关系的错误。
-    // ⚠️ **本计划 11 条骨架里 method 全是 `POST`，没有一条 GET**（2026-10-06 核实）。
-    // 枚举里保留 `GET` 是为了**完整的 154 条**：设计稿 §5.2 的类型定义就是
-    // `'POST' | 'GET'`，且 `call()` 按 `spec.method` 发请求，删掉它会让将来
-    // 出现的 GET 接口无处登记。但**不要据此以为本计划验过 GET 路径** ——
-    // `call()` 对任何 method 都带 body 发（`body: bodyStr`），GET + body 会
-    // 被 undici 拒，由 `isLocalRequestError` 接住报 usage（有测试，但那个测试
-    // 是用 mock 抛 TypeError 模拟的，不是真的发了一个 GET）。等 154 条里出现
-    // 真 GET 接口时，`call()` 必须补上"GET 不带 body"的分支。
+    // ⚠️ **154 条里只有 1 条 GET**（`get_token`，2026-10-24 核实）：它是
+    // `direction: inbound` + `callable: false`，生产上不可达。`call()` 的
+    // GET 分支（不带 body 发送 + 签名 `md5('')`）目前只由**合成 spec 的测试**
+    // 覆盖（http.test.ts），不是线上实测 —— 如实记录，别把它读成"GET 已实测"。
     if (o.method !== 'POST' && o.method !== 'GET') {
       throw new Error(
         `specs.json[${o.id}] 的 method 取值非法：${JSON.stringify(o.method)}。` +

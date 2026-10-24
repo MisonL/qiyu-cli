@@ -1,6 +1,6 @@
 // tests/core/ratelimit.test.ts
 import { describe, it, expect } from 'vitest'
-import { TokenBucket, RATE_LIMITS, limitFor } from '../../src/core/ratelimit.js'
+import { TokenBucket, RATE_LIMITS, limitFor, registeredRateLimit } from '../../src/core/ratelimit.js'
 
 describe('令牌桶', () => {
   it('配额内放行，超出则拒绝', () => {
@@ -161,6 +161,36 @@ describe('限频表', () => {
       if (r === null) continue
       expect(['doc', 'observed'], `${id} 缺少 source`).toContain(r.source)
     }
+  })
+
+  it('每一行都标注了 scope —— 27 行全部是 endpoint，没有一行漏标', () => {
+    // ⚠️ 设计稿 §9.1 的限流示例信封里声明了 `scope`，此前零生产者（G1 补）。
+    // 逐行断言而**不是**只断言"值 ∈ 联合类型"：后者对一个错填成
+    // 'endpoint' 之外任何合法值的行仍然绿，而本表的实测结论只有一个 ——
+    // 183 次探测确认限频按路径独立，从未观测到跨接口共享配额。
+    // → 若未来真的实测到 global，这里必须显式改成受影响的那些行，不能放宽成"两种都行"。
+    const limited = Object.entries(RATE_LIMITS).filter(([, r]) => r !== null)
+    expect(limited.length, '限频行数变了就要连带复核本断言').toBe(27)
+    for (const [id, r] of limited) {
+      expect(r!.scope, `${id} 的 scope`).toBe('endpoint')
+    }
+    // 显式 null 的 6 行没有对象可挂 scope —— 它们靠"值是 null"表达无限频，
+    // 与"未登记"由 `registeredRateLimit` 区分（见下一条）。
+    expect(Object.values(RATE_LIMITS).filter((r) => r === null).length).toBe(6)
+  })
+
+  it('registeredRateLimit 是三态，limitFor 是两态 —— 两者不能互相替代', () => {
+    // ⚠️ 三态的意义：`call()` 要的是"未登记与显式 null 都不限频"（两态即可），
+    // 而 `api schema` 必须**如实区分**"没测过"与"测过、确实没有" —— 把前者
+    // 报成 null 等于谎称实测无限频，Agent 会据此去掉退避。
+    expect(registeredRateLimit('event.queryQueueStatus'), '显式 null = 实测无限频').toBeNull()
+    expect(registeredRateLimit('statistic.overview')).toMatchObject({ limit: 1, windowSeconds: 30 })
+    expect(registeredRateLimit('某个没登记过的接口'), '未登记 = undefined，不是 null').toBeUndefined()
+    // 两态视图把两者压成 null（`call()` 依赖这个语义）
+    expect(limitFor('event.queryQueueStatus')).toBeNull()
+    expect(limitFor('某个没登记过的接口')).toBeNull()
+    // 原型链守卫对三态视图同样生效
+    expect(registeredRateLimit('constructor')).toBeUndefined()
   })
 
   it('未登记的接口默认不限频，而不是默认限频', () => {

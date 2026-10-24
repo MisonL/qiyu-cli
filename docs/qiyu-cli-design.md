@@ -740,6 +740,8 @@ qiyu sync verify [task]         # 校验本地与远端一致性
 
 **限频粒度是实测出来的：按路径各自独立**（183 次探测）：同一路径上 30 秒内的连续调用总是返回 `14009`，而**跨不同路径的 7 次连续调用全部成功**。这正是**报表同步策略的关键** —— 应该**按天**轮转（同一天内不同接口背靠背调用），而不是逐个接口串行推进：31 天从约 2.6 小时降到约 16 分钟。见 §6.2。
 
+> **`RateLimit.scope` 的交付状态（2026-10-24，G1）**：限频表每一行都带 `scope` 字段，**27 个非 null 行全部是 `'endpoint'`** —— 上面的 183 次探测只支持「按路径独立」这一种结论，从未观测到跨接口共享配额（`'global'`）。联合类型里保留 `'global'` 只是给「将来真的实测到」留一个显式落点；**出现第二种取值必须同时改 `ratelimit.ts` 的注释、`ratelimit.test.ts` 的逐行断言与 `api schema` 的 `field_notes.rate_limit`**。消费方：`api schema <id>` 的 `data.rate_limit` 三态输出 —— 未登记不输出该键（没测过）、显式 `null`（实测无限频）、对象（含 `limit`/`window_seconds`/`source`/`scope`）。
+
 ### 7.4.1 报表时间跨度上限（逐接口实测，并不统一）
 
 | 上限 | 接口 | 错误 | 来源 |
@@ -1133,6 +1135,12 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 - **退出码**：`0` 成功 · `1` 业务错误 · `2` 用法错误 · `3` 网络错误 · `4` 需要 `--yes`
 - **退出码 4 必须携带** `confirm_required: true` + `confirm_arg: "--yes"` + `risk: "irreversible"` + `target`，以及 `retryable: false`
 
+> **`retry_strategy` / `fallback` 的交付状态（2026-10-24，G1）**：上面示例里这两个字段**已有生产者** —— `api call` 撞限流（`kind: rate_limit`）且该接口**非危险**、有同步任务映射、本地库文件存在时，输出 `retry_strategy: "switch_to_local"` 与 `fallback: "qiyu query --table <表>"`，并在 `hint` 里点名该接口的其余本地表。三处诚实边界：
+> ① **只承诺「有表可查」**，不承诺表非空、更不承诺覆盖调用方要的时间窗 —— hint 要求先 `qiyu db tables` / `qiyu sync status` 确认；
+> ② **危险接口不给**（调用方要的是写操作，一个本地读的表名帮不上忙，反而可能被误读成本地也能执行）；
+> ③ 无映射 / 库文件不存在 / 探测异常 → **两个键都不出现**（不编一个指向不存在表的命令），原始限流错误原样返回。
+> 实现分层：`commands/local-fallback.ts` 是零依赖注入槽（`api.ts` 只 import 它，保住 auth/api 零 store 加载红线），`commands/local-fallback-wiring.ts` 持有映射与探测，由 `cli.ts` 在启动时接线。
+
 ### 9.2 静默失败防护
 
 **0 行是比报错危险得多的失败模式** —— Agent 的错误处理根本不会触发，它会向人类汇报"上周没有满意度数据。"
@@ -1144,7 +1152,9 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 
 ### 9.3 时区
 
-**所有相对时间都在 `Asia/Shanghai` 下解析**（可在 profile 中配置），并且响应回显 `resolved_range`。
+**所有相对时间都在 `Asia/Shanghai` 下解析**，并且响应回显 `resolved_range`。
+
+> **范围收窄（2026-10-24）**：本节早前写的「可在 profile 中配置」**删除** —— 实现是硬编码 `Asia/Shanghai`，没有任何 profile 键能改它；在配置面声明一个不存在的开关正是「声明了但没人读」。若未来出现真实的多时区需求，应作为独立子项目带三时区测试矩阵交付，而不是顺手加一个没人实现的键。
 
 > Agent 常运行在 UTC 容器里，于是 `yesterday` 解析成 UTC 的昨天，而七鱼的报表使用 Asia/Shanghai 的自然日——8 小时前的数据会被归到错误的一天，**而且不会抛出任何错误**。
 
@@ -1163,6 +1173,10 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 - **在 `realname`/`nickname`/`username` 三个字段上，共有 89 个不同字符串映射到不止一个 staffId，单个字符串最多对应 7 个候选。**
 - → **必须以 `username` 作为解析键。** `realname` 和 `nickname` 是展示名，重名是合理现象；用它们解析会频繁命中 `ambiguous`，CLI 必须列出候选而不是随便挑一个。
 - **组名同样有歧义**：33 个组名中有 21 个包含 `/`，所以裸的叶子名可能在多个父节点下撞名 → **组查询必须使用完整的 `/` 分隔路径**，并采用同样的 `ambiguous` 处理。
+
+> **交付状态（2026-10-24 调查结论）**：本节描述的 `--assignee "张三"` 名称解析**尚未实现，且当前无落点**。历史溯源（`git log a800b65` + 2026-09-30 会话记录）：它出自原始设计稿的「阶段 2 语义层」——`qiyu ticket create --assignee "张三"` 这类**工单写命令**。评审裁决「语义层只保留写操作与名称解析」，但工单写命令族**从未进入路线图任何子项目**（A/B/C1/D/E/F 都不含），于是本节成了一个没有宿主的孤立契约。
+> → 处置：设计稿保留本节作为**未来规格**，路线图 G2 标注「依赖 ticket 写命令族，随其交付落地」。skill 正文（`ambiguous` 预告）维持现状不删 —— 它描述的是服务端可能返回的 `kind`，与本地语义层是否实现无关。
+> → 若要做：必须同时交付 `ticket.create` / `ticket.modify` / `ticket.transfer` 这一族写命令（含 `--yes` 门禁）与本节的解析器，并复用 `staff` 表（`username` 为解析键、`realname`/`nickname` 走候选列表）；单独实现解析器没有任何命令会调用它。
 
 ### 9.5 状态码
 
