@@ -309,7 +309,10 @@ function probeAgentDirs(home: string): AgentProbe {
 function sourceMissing(): number {
   return fail({
     code: 'internal', kind: 'internal', retryable: false,
-    message: '找不到包内 skill 源目录（dist/skill/qiyu 与 src/skill/qiyu 都不存在）',
+    // 源目录的解析规则是「与 skill/detect 模块同层」（发布态 dist/skill/qiyu、
+    // 源码态 src/skill/qiyu）——文案如实描述**检查位置**，不要写成「两个候选都不存在」。
+    message: '找不到包内 skill 源目录（与 skill/detect 同层的 qiyu/ 目录不存在；'
+      + '发布态应为 dist/skill/qiyu，源码态应为 src/skill/qiyu）',
     hint: 'CLI 安装包可能不完整，请重装 qiyu-cli 后重试',
   })
 }
