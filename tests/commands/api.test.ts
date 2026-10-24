@@ -1,8 +1,9 @@
 // tests/commands/api.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { apiCommand } from '../../src/commands/api.js'
+import { apiCommand, assertGetHasNoBody } from '../../src/commands/api.js'
 import { authCommand } from '../../src/commands/auth.js'
 import { __resetBuckets } from '../../src/core/http.js'
+import { setLocalFallbackProvider } from '../../src/commands/local-fallback.js'
 // `registry_complete` 那条测试要拿注册表**实际条数**与 `meta.registry_note` 比对，
 // 才能证明该字段是由数据推导的、不是一个独立写死的常量。
 import { allEndpoints } from '../../src/core/registry/index.js'
@@ -1615,6 +1616,140 @@ describe('api schema', () => {
       expect(err, 'internal 只出 stdout，不补 stderr（与 callOne 同一出口）').toBe('')
     } finally {
       setParamsRoot(undefined)
+    }
+  })
+})
+
+describe('限流 → 本地 fallback 建议（G1）', () => {
+  // ⚠️ 设计稿 §9.1 的限流错误示例声明了 `retry_strategy` / `fallback`，此前**零生产者**
+  // （output.ts 的注释写着「本计划不填」）—— Agent 照文档去找，永远找不到。
+  // 这里钉住三个方向：映射存在 → 两字段出现；危险接口 → 不给；无映射 → 不给。
+  const rateLimited = () => vi.fn(() => Promise.resolve(new Response(
+    JSON.stringify({ code: 200, message: '14009 api call too frequent' }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )))
+  beforeEach(() => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+  })
+  afterEach(() => { setLocalFallbackProvider(undefined) })
+
+  it('读接口撞限流且有本地表 → retry_strategy + fallback（首表）+ hint 说明边界', async () => {
+    vi.stubGlobal('fetch', rateLimited())
+    setLocalFallbackProvider((id) => (id === 'ticket.search' ? { tables: ['tickets', 'ticket_logs'] } : undefined))
+    expect(await apiCommand(['call', 'ticket.search'])).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('rate_limit')
+    expect(e.retry_strategy).toBe('switch_to_local')
+    expect(e.fallback).toBe('qiyu query --table tickets')
+    // 多表接口必须在 hint 里点名其余表 —— 只说首表会让 Agent 以为本地只有那部分数据
+    expect(e.hint).toContain('ticket_logs')
+    // ⚠️ 诚实边界：「有表」不等于「有数据」/「覆盖你的时间窗」。这句不能省 ——
+    // 省了 Agent 会直接采信一个空表或半个月前的快照。
+    expect(e.hint).toMatch(/db tables|sync status/)
+    expect(e.hint).toMatch(/不承诺|不等于|未必|先.*确认/)
+  })
+
+  it('无映射 → 两个键都不出现（不编一个查不到的命令）', async () => {
+    vi.stubGlobal('fetch', rateLimited())
+    setLocalFallbackProvider(() => undefined)
+    expect(await apiCommand(['call', 'ticket.search'])).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('rate_limit')
+    // output.test.ts 钉着「未提供就不出现键」—— 这里验证调用链真的没提供
+    expect(e).not.toHaveProperty('retry_strategy')
+    expect(e).not.toHaveProperty('fallback')
+  })
+
+  it('危险接口撞限流 → 不给本地建议（要的是写操作，不是读数）', async () => {
+    // message.send 是危险接口；即使有人给它造了映射也不能出现建议。
+    // 用 --no-validate 跳过 body 表校验（本用例只关心限流分支），--yes 过门禁。
+    // ⚠️ 报文形状与读接口不同：message.send 的信封直接以 `code: 14009` 表达限流
+    // （不像形状 C 把 "14009 …" 塞进 message 文本）。
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(
+      JSON.stringify({ code: 14009, message: 'api call too frequent' }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))))
+    setLocalFallbackProvider(() => ({ tables: ['some_table'] }))
+    expect(await apiCommand(['call', 'message.send', '--body', '{}', '--yes', '--no-validate'])).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('rate_limit')
+    expect(e).not.toHaveProperty('retry_strategy')
+    expect(e).not.toHaveProperty('fallback')
+  })
+
+  it('探测抛异常 → 原始限流错误原样返回，不变成内部错误', async () => {
+    // ⚠️ 这是「fallback 探测绝不能改变原始错误」的行为级证明：
+    // 若异常漏出 `localFallbackFor`，一条 14009 会变成 internal（退出码 1、kind 全变）。
+    vi.stubGlobal('fetch', rateLimited())
+    setLocalFallbackProvider(() => { throw new Error('boom') })
+    expect(await apiCommand(['call', 'ticket.search'])).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('rate_limit')
+    expect(e.code).toBe('14009')
+  })
+})
+
+describe('RateLimit.scope 与 api schema 的三态输出（G1）', () => {
+  it('有限频接口 → rate_limit 对象含 limit/window_seconds/source/scope', async () => {
+    expect(await apiCommand(['schema', 'statistic.overview'])).toBe(0)
+    const o = JSON.parse(out)
+    expect(o.data.rate_limit).toEqual({
+      limit: 1, window_seconds: 30, source: 'observed', scope: 'endpoint',
+    })
+    expect(o.meta.field_notes.rate_limit).toMatch(/三种|三态|不出现该键/)
+  })
+
+  it('实测无限频（显式 null）→ rate_limit 为 null，不是缺键', async () => {
+    // ⚠️ 三态的第二态：`null` 表示"实测过，确实没有"。与缺键（没测过）压成一个
+    // 会让 Agent 把"未测量"当"无限制"，从而去掉退避。
+    expect(await apiCommand(['schema', 'event.queryQueueStatus'])).toBe(0)
+    const o = JSON.parse(out)
+    expect(o.data).toHaveProperty('rate_limit')
+    expect(o.data.rate_limit).toBeNull()
+  })
+
+  it('未登记限频 → 不输出 rate_limit 键（没测过，说什么都是编的）', async () => {
+    expect(await apiCommand(['schema', 'ticket.search'])).toBe(0)
+    expect(JSON.parse(out).data).not.toHaveProperty('rate_limit')
+  })
+})
+
+describe('category 接入（G1）', () => {
+  it('api list 有分组的接口输出 category，文档外接口不输出该键', async () => {
+    await apiCommand(['list', '--all'])
+    const all = rows()
+    const withCat = all.find((r) => r.id === 'ticket.search')!
+    expect(withCat.category).toBe('工单系统')
+    // export.session 一族是 4 个文档外接口 —— 没有文档页就没有分组
+    const exportRow = all.find((r) => r.id === 'export.session')!
+    expect(exportRow).not.toHaveProperty('category')
+    // 前提校验：注册表里确实两种都存在，否则上面两条在描述一个不存在的分支
+    expect(all.some((r) => typeof r.category === 'string')).toBe(true)
+    expect(all.some((r) => !('category' in r))).toBe(true)
+  })
+
+  it('field_notes.category 说清来源与稳定度（Apifox 目录、不是契约）', async () => {
+    await apiCommand(['list'])
+    const note = JSON.parse(out).meta.field_notes.category
+    expect(note).toMatch(/Apifox|文档/)
+    expect(note, '必须劝阻把它当稳定枚举用').toMatch(/不是稳定契约|仅供|不要据此/)
+  })
+})
+
+describe('assertGetHasNoBody（G1）', () => {
+  it('GET + body 抛普通 Error（→ 退出码 2），GET 无 body 放行，POST 不受影响', () => {
+    const get = { id: 'x', title: 't', method: 'GET', path: '/p', direction: 'outbound',
+                  callable: true, dangerous: false, auth: 'checksum', verified: false,
+                  envelope: null } as const
+    const post = { ...get, method: 'POST' } as const
+    expect(() => assertGetHasNoBody(get as never, { a: 1 })).toThrow(/GET.*不接受请求体/)
+    expect(() => assertGetHasNoBody(get as never, undefined)).not.toThrow()
+    // null / 0 / "" 是合法 JSON body —— 对 GET 同样必须拒（判据是 !== undefined）
+    expect(() => assertGetHasNoBody(get as never, null)).toThrow(/GET/)
+    expect(() => assertGetHasNoBody(post as never, { a: 1 })).not.toThrow()
+    // 不挂 kind：这是用法错误，走 usage 双通道（与 assertNoValidateStrictConflict 同型）
+    try { assertGetHasNoBody(get as never, {}) } catch (e) {
+      expect((e as { kind?: string }).kind).toBeUndefined()
     }
   })
 })

@@ -9,6 +9,7 @@ import {
   resolveSkillSourceDir, skillWarning,
 } from './skill/detect.js'
 import { apiCommand } from './commands/api.js'
+import { wireLocalFallback } from './commands/local-fallback-wiring.js'
 import { storeCommand } from './commands/store.js'
 import { syncCommand } from './commands/sync.js'
 import { dbCommand } from './commands/db.js'
@@ -19,6 +20,13 @@ import { skillCommand } from './commands/skill.js'
 // 它只 import 各命令模块、不含入口逻辑，将来 `src/skill/check.ts` 从**那里**消费。
 // 本文件 re-export 只是兼容入口（计划原文写的是 `cli.ts` 汇总），免得调用方改路径。
 export { COMMAND_TREE } from './commands/tree.js'
+
+// —— 限流 fallback 接线（G1 契约小件）——
+// `api call` 的限流错误要附「改用本地查询」建议（retry_strategy/fallback），
+// 而该建议需要 sync 任务注册表与本地库探测；`commands/api.ts` 按分层红线
+// 不得 import 它们（auth/api 零 store 加载），所以由入口层把默认提供者装进
+// `local-fallback.ts` 的注入槽。模块级执行一次即可（进程生命周期）。
+wireLocalFallback()
 
 const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   auth: authCommand,

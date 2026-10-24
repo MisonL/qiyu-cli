@@ -15,7 +15,7 @@
 | `kind: bad_time` | 时间戳超期。CLI 已自动重签重试过；仍失败说明本机时钟真的偏了——校准系统时间 |
 | `kind: param` | 参数错误。按 message 与 hint 修正；重试无用 |
 | `kind: usage` | 调用方式有误（退出码 2）。改命令或参数重来；原样重试毫无意义 |
-| `kind: rate_limit` | 限流。看 `retry_after`：`source` 为 `fallback` 表示该秒数是保守兜底、不是实测冷却（睡完可能再吃一次限流）；秒数超过 60 就不要干等——转本地查询通道先做别的分析，稍后再回来 |
+| `kind: rate_limit` | 限流。看 `retry_after`：`source` 为 `fallback` 表示该秒数是保守兜底、不是实测冷却（睡完可能再吃一次限流）；秒数超过 60 就不要干等——转本地查询通道先做别的分析，稍后再回来。若错误里带 `retry_strategy: switch_to_local` 与 `fallback` 命令，说明本地库有对应表，**可直接改查本地**；但表存在不等于已同步或覆盖你要的时间窗，先按 `hint` 用 `qiyu db tables` / `qiyu sync status` 确认行数与水位再采信 |
 | `kind: window_too_large` | 时间跨度超限。上限天数看报文里的数字（如「> 31」即 31 天），或查 `qiyu api list` 输出里该接口的 `max_window_days`；按它切片、分批请求 |
 | `kind: window_misaligned` | 时间边界没对齐自然日（结束边界不得晚于今天零点）。切片修不好——把边界对齐到自然日再试 |
 | `kind: module_offline` | 模块未开通。永久失败，找人类开通，不要重试 |
