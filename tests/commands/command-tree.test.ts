@@ -44,12 +44,16 @@ describe('COMMAND_TREE', () => {
       'sync install', 'sync run', 'sync status', 'sync tasks', 'sync uninstall', 'sync verify',
     ])
   })
-  it('每条 spec 都带 --help/-h，且都拒绝 --pretty', () => {
+  it('每条 spec 都带 --help/-h，且 rejected 为空（G1 起 --pretty 已实现、机制保留）', () => {
     for (const s of COMMAND_TREE) {
       const names = s.flags.map((f) => f.name)
       expect(names, s.path.join(' ')).toContain('--help')
       expect(names, s.path.join(' ')).toContain('-h')
-      expect(s.rejected, s.path.join(' ')).toContain('--pretty')
+      // G1（2026-10-24）：--pretty 已实现为缩进输出，REJECTED_FLAGS 清空。
+      // 断言每条 spec 的 rejected 数组存在且为空 —— 若将来又出现「已知但拒绝」的
+      // flag，这里要改成受影响的子集，而不是恢复全量拒绝。
+      expect(s.rejected, s.path.join(' ')).toEqual([])
+      expect(names, s.path.join(' ')).toContain('--pretty')
     }
   })
   it('api call 接受 --body/--yes/--no-validate/--strict，api list 只接受 --all', () => {
@@ -286,7 +290,7 @@ describe('COMMAND_TREE', () => {
       const spec = SKILL_SPECS.find((x) => x.path.join(' ') === `skill ${sub}`)!
       expect(spec, `SKILL_SPECS 里缺 skill ${sub}`).toBeDefined()
       expect(spec.positionals).toEqual([])
-      expect(spec.rejected).toContain('--pretty')
+      expect(spec.rejected).toEqual([]) // G1：rejected 机制保留但为空
       const rejected = new Set(spec.rejected)
       const accepted = spec.flags.map((f) => f.name).filter((n) => !rejected.has(n))
       const specProbe = await (async (): Promise<string> => {

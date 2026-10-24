@@ -429,9 +429,14 @@ describe('stats fields', () => {
     }
   })
 
-  it('--pretty / 未知参数 / 值位缺失 / 缺表名 → usage；--help → 0', async () => {
-    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath(), '--pretty'])).toBe(2)
-    expect(err).toMatch(/--pretty/)
+  it('--pretty 已实现（缩进）/ 未知参数 / 值位缺失 / 缺表名 → usage；--help → 0', async () => {
+    // G1 起 --pretty 是合法输出开关：成功 + 缩进（原「显式拒绝」断言翻转）。
+    // 本用例此前到不了库（--pretty 在开库前被拦），现在要真的建库。
+    await fresh().then((s) => s.close())
+    out = ''; err = ''
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath(), '--pretty'])).toBe(0)
+    expect(err).toBe('')
+    expect(out.startsWith('{\n  "ok": true,'), 'stats fields --pretty 必须缩进').toBe(true)
 
     out = ''; err = ''
     expect(await statsCommand(['fields', 'daily_overview', '--bogus'])).toBe(2)

@@ -65,8 +65,12 @@ describe('spec-types', () => {
     expect(GLOBAL_FLAGS.map((f) => f.name)).toEqual(['--help', '-h', '--pretty'])
     expect(GLOBAL_FLAGS.every((f) => f.kind === 'bool')).toBe(true)
   })
-  it('REJECTED_FLAGS 只含 --pretty', () => {
-    expect(REJECTED_FLAGS).toEqual(['--pretty'])
+  it('REJECTED_FLAGS 为空（G1 起 --pretty 已实现，机制保留）', () => {
+    // ⚠️ 2026-10-24（G1）前这里钉 `['--pretty']`。--pretty 实现为缩进输出后，
+    // rejected 清单清空 —— 但**机制保留**（CommandSpec.rejected 字段、check 的
+    // rejected_flag 规则、先查 rejected 再查 accepted 的次序都在）。
+    // 将来出现"已知但显式拒绝"的 flag 时：登记进 REJECTED_FLAGS 的同时必须改这里。
+    expect(REJECTED_FLAGS).toEqual([])
   })
   it('STORE_FLAGS 是三个值位', () => {
     expect(STORE_FLAGS.map((f) => f.name)).toEqual(['--db', '--profile', '--backend'])

@@ -27,7 +27,7 @@ import { readWatermark } from '../sync/state.js'
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
-import { ok, fail, usageFail, describeArgs } from '../output.js'
+import { ok, fail, usageFail, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
 import type { Store } from '../store/types.js'
 import { GLOBAL_FLAGS, STORE_FLAGS, renderFlagNames, valueFlagNames } from './spec-types.js'
@@ -220,6 +220,7 @@ function storeInitFail(e: unknown): number {
 
 /** sync run 的完整编排（从 flags/env 到退出码）。返回值即命令退出码。 */
 export async function runSyncRun(argv: string[]): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const clock = (): number => Date.now()
   // —— flag 解析（store.ts 同族：值位守卫，--开头算缺值）——
   // 已知 token 集（help 分流的豁免名单）= 全局 flag + 本命令的**布尔** flag。
@@ -241,7 +242,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     process.stdout.write(SYNC_RUN_USAGE)
     return 0
   }
-  if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+  // G1：--pretty 已实现。与 help 的次序保持原样（help 分流在前）；解析循环里
+  // `--pretty` 落进未知参数分支会报错，所以在 KNOWN 里收下并在原拒绝点开启。
+  if (argv.includes('--pretty')) setPretty(true)
 
   const flags: Record<string, string> = {}
   const taskIds: string[] = []
@@ -254,7 +257,8 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       }
       flags[a] = v
       i++
-    } else if (RUN_BOOL_FLAGS.includes(a)) {
+    } else if (RUN_BOOL_FLAGS.includes(a) || a === '--pretty') {
+      // G1：--pretty 是已实现的输出开关（布尔）。收下避免报「未知参数」。
       flags[a] = a
     } else if (a.startsWith('-')) {
       return usageFail(`未知参数：${describeArgs([a])}。可用：${RUN_AVAILABLE}`)

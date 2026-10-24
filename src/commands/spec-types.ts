@@ -12,9 +12,11 @@
 //   · 「完整」**包含全局 flag**：各命令组装 spec 时写成 `[...GLOBAL_FLAGS, ...业务 flag]`。
 //     校验方只查这一份，不再另行合并（两处各合一次是漂移的来源）。但必须**先查
 //     `rejected` 再查 `flags`**——`--pretty` 同时在两者里，顺序反了会把它判合法。
-//   · `--pretty` 建模成 `rejected` 而不是合法 flag：每个模块都走 `usageFail` 拒绝它，
-//     spec §11.2 E 也明令不要用。命中 `rejected` 要单独给「已知但未实现」话术，区别于
-//     「该命令不接受此 flag」。
+//   · `--pretty` 曾建模成 `rejected`（承诺过、未实现）：每个模块都用 `usageFail` 拒绝它，
+//     spec §11.2 E 也明令不要用。**2026-10-24（G1）起它已实现**（缩进 JSON），
+//     `REJECTED_FLAGS` 清空为空数组 —— **机制保留**（`rejected` 字段与 `skill check`
+//     的 `rejected_flag` 规则都在，将来若再出现"已知但显式拒绝"的 flag 直接登记），
+//     只是当前没有任何 flag 属于这一类。
 //
 // 本文件必须保持零依赖（只含类型、常量与几个纯函数）：`core/`、`query/`、`sync/`
 // 分层红线之外，它是 commands 层里最底层的一块，被各命令模块与 `tree.ts` 的
@@ -81,16 +83,16 @@ export interface CommandSpec {
   flags: FlagSpec[]
   /** 位置参数槽位，语义见 `PositionalSpec`（含 `repeatable` / `first` 两条纪律）。 */
   positionals: PositionalSpec[]
-  /** 已知但显式拒绝的 flag（当前只有 `--pretty`）。 */
+  /** 已知但显式拒绝的 flag（当前为空：`--pretty` 已于 2026-10-24 实现）。 */
   rejected: string[]
 }
 
 /**
  * 所有命令都接受的全局 flag（解析器里的 `KNOWN`）。
  *
- * ⚠️ `--pretty` 同时出现在 `REJECTED_FLAGS` 里：校验方必须**先查 `rejected` 再查
- * `flags`**，否则它会因为「在完整接受集里」被判合法——而每个模块实际都用 `usageFail`
- * 拒绝它，skill 里照写必然失败。
+ * ⚠️ `--pretty` 曾同时出现在 `REJECTED_FLAGS` 里，校验方必须先查 `rejected` 再查
+ * `flags`。**2026-10-24（G1）起它已实现**，`REJECTED_FLAGS` 为空 —— 顺序规则保留
+ * （机制仍在），将来再有"已知但显式拒绝"的 flag 时仍然先查 `rejected`。
  */
 export const GLOBAL_FLAGS: FlagSpec[] = [
   { name: '--help', kind: 'bool' },
@@ -126,9 +128,26 @@ export function renderFlagNames(
   return flags.map((f) => f.name).join(opts.separator ?? '、')
 }
 
-/** 显式拒绝的 flag。从 GLOBAL_FLAGS 里手写一份，而不是 filter 派生——`kind` 是 bool，
- *  「是否被拒绝」不是能从 kind 推出来的属性，硬推会把 `--help` 也卷进来。 */
-export const REJECTED_FLAGS: string[] = ['--pretty']
+/** 显式拒绝的 flag。**当前为空**（`--pretty` 已于 2026-10-24 实现），机制保留：
+ *  「已知但显式拒绝」是独立的错误类别（区别于「未知参数」），将来有新成员时直接登记这里，
+ *  `skill check` 的 `rejected_flag` 规则会自动生效。 */
+export const REJECTED_FLAGS: string[] = []
+
+/**
+ * `--pretty` 被写在**子命令之前**时的统一话术（G1）。
+ *
+ * 为什么不是「未知子命令」：`--pretty` 是真实存在、已实现的**输出格式开关**，
+ * 把它说成"未知子命令"是一句事实错误。它也确实不能改整个命令组 —— 输出开关
+ * 必须挂在**具体的那条叶命令**上（`store init --pretty`），因为要格式化的是
+ * 那条命令的 JSON。所以回答"怎么写才有效"，而不是"你写错了"。
+ *
+ * 分派层的 8 个伪命令分支（cli/api/auth/store/sync/db/stats/skill）共用这一句，
+ * 同一形状的输入在各层得到同一答案。
+ */
+export function prettyAfterSubcommand(group: string): string {
+  return `--pretty 是输出格式开关，必须写在具体子命令之后（如 \`qiyu ${group} … --pretty\`）。` +
+    '写在这里没有可修饰的命令'
+}
 
 /**
  * 存储定位三件套（store 命令同族）。值位语义唯一事实源在 `store-flags.ts`：
