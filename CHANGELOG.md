@@ -139,6 +139,11 @@
 - **时间形态 SQL 谓词收敛为唯一实现**（`src/query/time-shape.ts`）：`db tables`/
   `db describe` 的 `time_range` 与 `query --table` 的过滤/覆盖曾各存一份逐字副本，
   只靠注释与字符串相等测试防守（gap 2 的缺陷正来自这两份副本）；现由构造保证同口径
+- **skill 源目录解析改为与本模块同层**（CodeRabbit 审查）：仓库 `prepare` 挂在 build 上，
+  任何 `npm install` 都会产出 `dist/`——「dist 优先」的旧解析让源码态（vitest/tsx/本地开发）
+  读到**上一次构建的旧正文**而不是刚改的 `src/skill/qiyu/*.md`：`skill check` 对旧文本
+  报零违规、探测哈希到旧值、`skill install` 装出旧副本。现在源码态取 `src/skill/qiyu`、
+  发布态取 `dist/skill/qiyu`（两种形态都在 detect 模块同层），与运行代码永远一致
 - `api call` / `api schema` 的用法错误出口补上控制字符净化（此前可向 stderr 注入 ANSI/OSC）
 - 脱敏对分析结果的副作用现在会声明：对敏感列 `GROUP BY`/`DISTINCT` 时提示「不同原值会映射成
   同一个脱敏值」；值级兜底命中非敏感列（11 位订单号等）时提示「可能是业务数字被误改」

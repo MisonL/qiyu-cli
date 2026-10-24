@@ -21,6 +21,7 @@ import {
 import { tmpdir } from 'node:os'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   resetSkillDetectionCache, detectSkillState, entityUndeterminedNote, npmRelativeBase,
   resolveEntityDirSources, resolveSkillSourceDir, skillWarning,
@@ -481,6 +482,16 @@ describe('resolveSkillSourceDir —— 包内 skill 目录', () => {
     const src = resolveSkillSourceDir()
     expect(src).toBeDefined()
     expect(existsSync(join(src as string, 'SKILL.md'))).toBe(true)
+  })
+
+  it('源码态必须解析到与本模块同层的 src/skill/qiyu，不得读过期的 dist 副本（CodeRabbit minor）', () => {
+    // 仓库 prepare 挂在 build 上，任何 npm install/ci 都会产出 dist/。
+    // 「dist 优先」的旧解析在开发态会把刚改的 src/skill/qiyu/*.md 换成上一次
+    // 构建的旧正文：skill check 对旧文本报零违规、探测哈希到旧值、install 装旧副本。
+    // 源码态（vitest 下 detect 的 import.meta.url 指向 src/skill/detect.ts）
+    // 必须取同层正文。
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
+    expect(resolveSkillSourceDir()).toBe(join(repoRoot, 'src', 'skill', 'qiyu'))
   })
 
   it('PACKAGE_VERSION 来自 core/edition（本文件的探测目标版本）', () => {

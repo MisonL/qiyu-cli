@@ -44,8 +44,8 @@ export interface PostinstallOptions {
   home: string
   /**
    * brief 签名之外的**扩展**（可选）：覆盖包内 skill 源目录解析。缺省时走
-   * `resolveSkillSourceDir()`（dist 优先、src 回退），测试需要构造「源目录不存在」
-   * 这类场景时才注入。
+   * `resolveSkillSourceDir()`（与 detect 模块同层的 qiyu 目录），测试需要构造
+   * 「源目录不存在」这类场景时才注入。
    */
   sourceDir?: string
   /**

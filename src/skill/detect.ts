@@ -379,19 +379,22 @@ export function entityUndeterminedNote(
 }
 
 /**
- * 包内 skill 源目录解析：发布形态是 `<包根>/dist/skill/qiyu`（Task 13 复制进去），
- * 源码态回退 `<repo>/src/skill/qiyu`。两者都不存在（如被裁剪的运行环境）返回
- * undefined **不抛**——探测是旁路，源都找不到就整个静默跳过。
+ * 包内 skill 源目录解析：**与本模块同层**的 `qiyu/` 目录。
+ *
+ * 本文件在源码态是 `src/skill/detect.ts`、发布态是 `dist/skill/detect.js` ——
+ * 两种形态下正文都在同层的 `qiyu/`（构建期由 `copy-assets.mjs` 复制进
+ * `dist/skill/qiyu/`）。因此不需要在包根下猜路径。
+ *
+ * ⚠️ **不能先查 `<包根>/dist/skill/qiyu`**（CodeRabbit 审查）：仓库的 `prepare` 挂在
+ * `npm run build` 上，任何 `npm install` / `npm ci` 都会产出 `dist/`。先查 dist 会让
+ * 源码态（vitest / tsx / 本地开发）读到**构建期的旧副本**而不是刚改的 `src/` 正文：
+ * `skill check` 对旧文本报零违规、启动探测哈希到旧值、`skill install` 装出旧副本。
+ * 同层目录不存在（如被裁剪的运行环境）返回 undefined **不抛**——探测是旁路，
+ * 源找不到就整个静默跳过。
  */
 export function resolveSkillSourceDir(): string | undefined {
-  // 本文件在源码态是 src/skill/detect.ts、发布态是 dist/skill/detect.js ——
-  // 两级 dirname 后两种形态都落在包根，候选路径因此是同一句话。
-  const base = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
-  for (const rel of ['dist/skill/qiyu', 'src/skill/qiyu']) {
-    const dir = path.join(base, rel)
-    if (isRealDirectory(dir)) return dir
-  }
-  return undefined
+  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'qiyu')
+  return isRealDirectory(dir) ? dir : undefined
 }
 
 /** 路径存在且是目录（顺符号链接）；其余一律 false，不抛。 */
