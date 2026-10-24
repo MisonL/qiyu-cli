@@ -51,8 +51,31 @@ export interface ErrorPayload {
   target?: string
 }
 
+/**
+ * 输出是否缩进（`--pretty`，G1 交付）。
+ *
+ * ⚠️ **为什么是模块级开关 + 各命令自设，而不是在 `cli.ts` 统一检测**：
+ * ① `--pretty` 的**值位语义**必须由各命令自己的解析器裁决 —— `--body --pretty`
+ *    里的 `--pretty` 是 body 的值（`api call` 实测报「不是合法 JSON」），
+ *    cli.ts 在分派前扫描 argv 会把它误当成开关；
+ * ② 命令模块的测试直接调用 `xxxCommand(argv)`（不经 cli.ts），入口层统一检测
+ *    在那些测试里根本不会跑；
+ * ③ 各命令原有的「未知/位置参数 → help → --pretty」次序必须逐字保留 ——
+ *    设置点就放在**原先拒绝 `--pretty` 的同一位置**，次序天然不变。
+ *
+ * 生命周期：每条命令入口在函数开头 `setPretty(false)` 重置（同一进程内
+ * `run()` 会被测试反复调用，不重置会让上一条命令的开关泄漏到下一条）。
+ * 进程级只有一次真实设置点：命令在「命令行已证明合法」之后调用 `setPretty(true)`。
+ */
+let prettyOutput = false
+
+/** 设置输出是否缩进。命令入口以 `false` 重置，原拒绝点以 `true` 打开。 */
+export function setPretty(on: boolean): void {
+  prettyOutput = on
+}
+
 function write(obj: unknown): void {
-  process.stdout.write(JSON.stringify(obj) + '\n')
+  process.stdout.write(JSON.stringify(obj, null, prettyOutput ? 2 : undefined) + '\n')
 }
 
 /**

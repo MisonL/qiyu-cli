@@ -53,9 +53,28 @@ describe('checkSkillDoc', () => {
     const r = checkSkillDoc('`qiyu api list --no-validate`', ctx)
     expect(r.violations[0]).toMatchObject({ rule: 'unknown_flag', detail: expect.stringContaining('--no-validate') })
   })
-  it('推荐 --pretty → rejected_flag', () => {
-    const r = checkSkillDoc('`qiyu api list --pretty`', ctx)
+  it('推荐 rejected 清单里的 flag → rejected_flag（G1 起 --pretty 已实现，规则用合成 flag 钉住）', () => {
+    // ⚠️ 2026-10-24（G1）前本用例写 `--pretty` —— 那时它在 REJECTED_FLAGS 里，
+    // 每个 leaf 显式拒绝它。G1 实现后 `--pretty` 成为合法 flag，`rejected_flag`
+    // 对它不再触发；规则本身保留（REJECTED_FLAGS 机制 + check 的先查 rejected），
+    // 所以用一条**合成 spec**（带合成的 rejected flag）钉住规则的存活：
+    // 若把 check 的「先查 rejected」删掉/改成只查 accepted，本用例红。
+    const syntheticCtx: CheckContext = {
+      ...ctx,
+      tree: [
+        {
+          path: ['api', 'list'],
+          flags: [{ name: '--help', kind: 'bool' }, { name: '--legacy', kind: 'bool' }],
+          positionals: [],
+          rejected: ['--legacy'],
+        },
+      ],
+    }
+    const r = checkSkillDoc('`qiyu api list --legacy`', syntheticCtx)
     expect(r.violations[0]).toMatchObject({ rule: 'rejected_flag' })
+    // `--pretty` 现在合法：不再触发任何违规
+    const pretty = checkSkillDoc('`qiyu api list --pretty`', ctx)
+    expect(pretty.violations.filter((v) => v.rule === 'rejected_flag')).toEqual([])
   })
   it('出现表名 → table_name', () => {
     const r = checkSkillDoc('查 `sessions` 表', ctx)
@@ -418,12 +437,13 @@ describe('审查 A3：flag 的位置（写在子命令位 / 第一个位置参�
   it('正例：`db tables --profile prod`（flag 在命令词之后）零违规', () => {
     expect(checkSkillDoc('`qiyu db tables --profile prod`', ctx).violations).toEqual([])
   })
-  it('全局 flag 写在子命令位：与真实 CLI 一致地报（`qiyu --pretty api list` 真实退出 2）', () => {
-    // ⚠️ 旧用例写的是「不误报 flag_before_subcommand」—— 那与真实 CLI 相反：顶层 `run()`
-    // 把 argv[0] 当子命令，`--pretty` 走的是「--pretty 不接受额外参数」分支，退出码 2。
-    // 所以这一行本来就该失败，只是失败原因不是 rejected_flag。两条都要报。
+  it('全局 flag 写在子命令位：与真实 CLI 一致地报 flag_before_subcommand（G1 后不再报 rejected_flag）', () => {
+    // ⚠️ 真实 CLI：顶层 `run()` 把 argv[0] 当子命令，`--pretty` 落进「必须写在
+    // 具体子命令之后」的指引分支，退出码 2。G1 前 check 还叠加一条 rejected_flag
+    // （--pretty 当时在 REJECTED_FLAGS）；G1 实现后 rejected 清单为空，
+    // 只剩 flag_before_subcommand —— 位置错误仍在，性质变化如实反映。
     const r = checkSkillDoc('`qiyu --pretty api list`', ctx)
-    expect(r.violations.map((v) => v.rule)).toEqual(['rejected_flag', 'flag_before_subcommand'])
+    expect(r.violations.map((v) => v.rule)).toEqual(['flag_before_subcommand'])
   })
 })
 

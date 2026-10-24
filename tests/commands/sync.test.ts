@@ -443,9 +443,13 @@ describe('sync run —— store 与凭证前置检查', () => {
     expect(JSON.parse(out).error.kind).toBe('auth_missing')
   })
 
-  it('--pretty → usageFail 2（统一为子命令后可用：run 也显式拒绝，不静默忽略）', async () => {
-    expect(await syncCommand(['tasks', '--pretty'])).toBe(2)
-    expect(JSON.parse(out).error.message).toMatch(/--pretty/)
+  it('--pretty 已实现（G1）：tasks --pretty 成功且缩进；裸 --pretty 指引正确写法', async () => {
+    // ⚠️ G1 前是「显式拒绝」；现在它是真实的输出开关。
+    expect(await syncCommand(['tasks', '--pretty'])).toBe(0)
+    expect(out.startsWith('{\n  "ok": true,'), 'tasks --pretty 必须缩进').toBe(true)
+    out = ''; err = ''
+    expect(await syncCommand(['--pretty'])).toBe(2)
+    expect(JSON.parse(out).error.message).toMatch(/--pretty 是输出格式开关/)
   })
 })
 

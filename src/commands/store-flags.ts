@@ -33,6 +33,10 @@ if (!STORE_VALUE_FLAG_NAMES.every((n) => n.startsWith('--'))) {
  * 值位守卫（沿 store.ts 的 v1 计划缺陷与 B 的 isBodyValue 惯例）：值位缺失或以 `--`
  * 开头 → 报缺值。否则 `store init --db --profile x` 会把 `--profile` 当成路径。
  * ⚠️ 错误文案 `${flag} 缺少取值` 逐字保持——多个既有测试钉着它。
+ *
+ * `--pretty` 是已知布尔开关（G1 实现后收下，不再进 `rest`）：它不带值，进了 `rest`
+ * 会被调用方当未知参数误拒。值位守卫仍先于它 —— `store init --db --pretty` 报
+ * 「--db 缺少取值」，与 `--profile` 同款（下一个 token 以 `--` 开头即缺值）。
  */
 export function parseStoreFlags(argv: string[]): StoreFlags & { rest: string[] } {
   const out: StoreFlags & { rest: string[] } = { rest: [] }
@@ -44,6 +48,9 @@ export function parseStoreFlags(argv: string[]): StoreFlags & { rest: string[] }
       // a 已由上面的 includes 收窄为三件套之一，slice(2) 得到 db/profile/backend。
       out[a.slice(2) as keyof StoreFlags] = v
       i++
+    } else if (a === '--pretty') {
+      // G1：已实现的输出开关 —— 解析层收下；开启动作在命令层（原拒绝点 setPretty(true)）。
+      continue
     } else out.rest.push(a)
   }
   return out

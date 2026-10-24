@@ -27,7 +27,7 @@ import {
 } from '../query/table-query.js'
 import type { BuiltTableQuery } from '../query/table-query.js'
 import { openGuardedSession } from './db.js'
-import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
+import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -206,6 +206,10 @@ function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
       i++
     } else if (a === '--no-mask') {
       out.noMask = true
+    } else if (a === '--pretty') {
+      // G1：已知输出开关（不带值）。不收下会落进 rest 被报成「未知参数：--pretty」。
+      // 值位守卫仍优先：`--sql --pretty` 报「--sql 缺少取值」（--pretty ∈ FLAG_TOKENS）。
+      continue
     } else out.rest.push(a)
   }
   return out
@@ -462,6 +466,7 @@ export interface QueryDeps {
 }
 
 export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   // 次序沿 store.ts / db.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 未知参数。
   // ⚠️ 本文件实际调用的是**自有的** `parseFlags`（语义故意不同：`--sql` 允许取值以 `--`
   // 开头，见文件头）；这一步在整条次序里的位置与 store.ts 的 parseStoreFlags 相同。
@@ -473,7 +478,8 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     process.stdout.write(USAGE)
     return 0
   }
-  if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
+  // G1：--pretty 已实现 —— 命令行合法即开启缩进输出（原拒绝点，次序不变）。
+  if (argv.includes('--pretty')) setPretty(true)
 
   let flags: ReturnType<typeof parseFlags>
   try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }

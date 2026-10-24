@@ -164,8 +164,14 @@ describe('store 命令面与 help', () => {
     expect(await storeCommand(['--bogus', '--help'])).toBe(2)
   })
 
-  it('store init --pretty → 2（合法 flag、未实现）', async () => {
-    expect(await storeCommand(['init', '--db', dbPath(), '--pretty'])).toBe(2)
+  it('store init --pretty → 成功且缩进（G1 已实现）；--db --pretty 仍报缺值（值位优先）', async () => {
+    // ⚠️ G1 前是「显式拒绝退出 2」；现在 --pretty 是真实的输出开关。
+    // 值位守卫必须先于它：`--db --pretty` 里的 --pretty 是 --db 的（假想）取值位置。
+    expect(await storeCommand(['init', '--db', dbPath(), '--pretty'])).toBe(0)
+    expect(out.startsWith('{\n  "ok": true,'), 'init --pretty 必须缩进').toBe(true)
+    out = ''; err = ''
+    expect(await storeCommand(['init', '--db', '--pretty'])).toBe(2)
+    expect(err).toMatch(/--db 缺少取值/)
   })
 
   it('store --help --pretty → 0', async () => {
