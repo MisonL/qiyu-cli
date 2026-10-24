@@ -200,9 +200,12 @@ describe('修复批 2 文档联动 —— 契约诚实性收口（锚内容不�
     expect(s).toMatch(/`notes`（修复批 2 新增）/)
   })
 
-  it('D spec §九：store_not_initialized 的 hint 口径 = qiyu store init（与 C1 同）', () => {
+  it('D spec §九：store_not_initialized 的 hint 按成因分流（E 期 F1 收窄「一律」）', () => {
     const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
-    expect(s).toMatch(/hint \*\*一律指 `qiyu store init`\*\*/)
+    // 修复批 2 的主体仍在（空库指 store init），但「一律」已被架构审查 F1 推翻：
+    // 他人库 / 非 DuckDB 文件 / 依赖未安装跑 store init 必然再次失败。
+    expect(s).toMatch(/hint \*\*按成因分流\*\*/)
+    expect(s).toMatch(/F1 推翻「一律」/)
   })
 
   it('D spec §八：迁移编号实况（v9 的 G2 两列）已记录', () => {
@@ -210,11 +213,12 @@ describe('修复批 2 文档联动 —— 契约诚实性收口（锚内容不�
     expect(s).toMatch(/v9（sync_state 补 resolved_range_start\/end 两列/)
   })
 
-  it('设计稿 §9.5：hint 口径与 D 交付后同指 store init（不再承诺改指 sync run）', () => {
+  it('设计稿 §9.5：hint 口径按成因分流（空库指 store init，他人库换 --db）', () => {
     const s = read('docs/qiyu-cli-design.md')
     const l = s.split('\n').find((x) => /`kind: "store_not_initialized"`/.test(x)) ?? ''
     expect(l).toMatch(/qiyu store init/)
     expect(l).toMatch(/同口径/)
+    expect(l).toMatch(/F1 收窄/)
   })
 
   it('README 输出契约段：ok 双轨 + sync 输出（resolved_range/gaps/sensitive_columns）', () => {

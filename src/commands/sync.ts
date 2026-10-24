@@ -16,9 +16,11 @@
 //     `range_status='complete'` 或 `last_synced_at` 非空的行。引擎在窗口执行前就
 //     markPending 落行，所以「有行」不等于「跑通过」：全败的 run 同样留下 pending 行，
 //     按「有行」放行会把调度器装在一个从未成功同步的库上（探测名不副实）。
-//   · store_not_initialized 的 hint 一律指 `qiyu store init`（spec §九：D 交付后
-//     仍指 store init —— `sync run` 首跑虽会自动建库，但「初始化存储」的最小命令是
-//     store init；本文件内三处出口同口径）。
+//   · store_not_initialized 的 hint 按**成因**分流（spec §九 + 架构审查 F1）：`sync run`
+//     首跑虽会自动建库，但「初始化存储」的最小命令是 store init —— 只对「不存在 / 空库」
+//     成立；「路径不是 DuckDB 文件」「他人库（有表无 schema_version）」「依赖未安装」跑
+//     store init 会再次失败，必须指换 --db 路径 / 装依赖，否则 Agent 进
+//     store init → sync 死循环（同步侧的 storeInitFail 保留底层 hint 是同一裁定）。
 // 输出键一律下划线命名（spec §七：range_status / gaps_count / local_rows /
 // expected_from_api / state_windows_consistent）——本仓 Agent 契约的统一形态。
 import { homedir } from 'node:os'
@@ -238,10 +240,15 @@ async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?
     const names = await store.tables()
     if (!names.includes('schema_version')) {
       await store.close()
+      // 成因分形（store.ts 同款）：有表无 schema_version 是他人库——store init 会再次
+      // 拒绝（duckdb.ts init 的他人库防线），引导过去就是 store init → sync status 死循环；
+      // 空库（无任何表）才是「init 可补」的成因。
       return { code: fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
+        hint: names.length > 0
+          ? '目标数据库不是本 CLI 创建的，请换 --db 路径'
+          : '空库（无任何表）。请先运行：qiyu store init',
       }) }
     }
     return { store }

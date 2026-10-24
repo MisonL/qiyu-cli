@@ -50,4 +50,15 @@ describe('skill 文档', () => {
       expect(readFileSync(join(dir, f), 'utf8'), f).not.toMatch(/`qiyu[^`]*--pretty/)
     }
   })
+  // 回归钉（CodeRabbit CLI minor）：`store_not_initialized` 有多种成因，只有「库不存在 /
+  // 迁移未跑完」能靠 store init 解决；「他人库 / 路径不是 DuckDB 文件 / 依赖未安装」跑
+  // store init 会再次失败 —— 无条件指它会把 Agent 送进 store init → sync run 死循环
+  // （sync-run.ts storeInitFail 保底层 hint 的同一裁定，架构审查 F1）。
+  it('errors.md 的 store_not_initialized 按 hint 行动，不无条件推荐 store init', () => {
+    const text = readFileSync(join(dir, 'errors.md'), 'utf8')
+    const row = text.split('\n').find((l) => l.includes('`kind: store_not_initialized`')) ?? ''
+    expect(row, '找不到 store_not_initialized 行').not.toBe('')
+    expect(row).toContain('按 `hint` 行动')
+    expect(row).not.toMatch(/先跑 `qiyu store init`/)
+  })
 })

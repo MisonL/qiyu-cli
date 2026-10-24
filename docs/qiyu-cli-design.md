@@ -1166,7 +1166,7 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 
 ### 9.5 状态码
 
-- `kind: "store_not_initialized"` + 指向 `qiyu store init` 的提示（C1 阶段与 D 交付后**同口径**：修复批 2 裁定不改指 `qiyu sync run` —— `sync run` 首跑虽会自动建库，但「初始化存储」的最小命令是 store init；C1 与 D 的 `store status`/`sync status`/`sync verify`/`sync install` 四处出口同文案）
+- `kind: "store_not_initialized"` + 指向 `qiyu store init` 的提示（C1 阶段与 D 交付后**同口径**：修复批 2 裁定不改指 `qiyu sync run` —— `sync run` 首跑虽会自动建库，但「初始化存储」的最小命令是 store init。**E 期架构审查 F1 收窄**：仅「库不存在 / 空库」四处出口（`store status`/`sync status`/`sync verify`/`sync install`）同指 store init；「他人库 / 非 DuckDB 文件 / 依赖未安装」跑 store init 会再次失败，hint 改指成因（换 `--db` 路径 / 装依赖），skill 正文 errors.md 据此让 Agent 按 `hint` 行动）
 - `kind: "auth_missing"` + `retryable: false` + 指向 §4.2 的提示
 - `kind: "store_locked"` + 说明正在同步的提示（C1 阶段：写进程持锁，无同步概念；D 交付后为同步窗口）
 

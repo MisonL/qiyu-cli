@@ -279,7 +279,7 @@ describe('buildCoverageQuery / buildMinQuery（契约 B/D）', () => {
 
   it('无谓词时覆盖 = 全表极值；ISO 列带形态谓词（脏值不进覆盖）', () => {
     const cov = buildCoverageQuery({ table: t('daily_overview'), now: NOW })
-    // 形态谓词与 commands/db.ts 的 shapeSqlOf 逐字一致；极值按时刻取（正确性审查 F1/F3/F6）。
+    // 形态谓词与 commands/db.ts 共用 query/time-shape.ts 的同一实现；极值按时刻取（正确性审查 F1/F3/F6）。
     expect(cov.sql).toBe(
       'SELECT arg_min("stat_date", TRY_CAST("stat_date" AS TIMESTAMPTZ)) AS mn, ' +
       'arg_max("stat_date", TRY_CAST("stat_date" AS TIMESTAMPTZ)) AS mx, ' +

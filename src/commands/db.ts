@@ -20,6 +20,7 @@ import { statSync } from 'node:fs'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
+import { timeShapeClauses } from '../query/time-shape.js'
 import { suggestNames, thrownToQueryExit } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
@@ -109,6 +110,11 @@ function piiColumnsOf(t: TableDef): string[] {
  * 时间列的**约定形态**（可注入 SQL 片段，`timeRangeOf` 与 `dirtyTimeValues` 共用同一份
  * ——两处口径一旦分叉，就会出现「算极值时排除、计数时不排除」这种自相矛盾的状态）。
  *
+ * 实现与 `query/table-query.ts` 共用 `query/time-shape.ts` 的同一函数 —— 口径由构造保证，
+ * 不再靠「逐字一致」的注释与字符串相等测试（同一条 README 承诺：「脏值不进 time_range」；
+ * 两处分叉的话，同一条脏库会在 `db tables` 被排除、在 `query --table` 被当成覆盖范围）。
+ * 具体判据与实测约束（F3/F5/gap 2）见该模块头注释。
+ *
  * 两端都锚定（CodeRabbit 终审 minor）：只锚开头会放过 `'2026-10-12garbage'`（它字典序上
  * `g` > `T`，反而赢下 MAX）与只有日期的 `'2026-10-13'`（`msToShanghaiIso` 按 UTC 解析，
  * 输出偏 8 小时）。形态与写路径逐字对应：
@@ -117,27 +123,7 @@ function piiColumnsOf(t: TableDef): string[] {
  * 兼容旧值：允许省略毫秒（`.000` 之外的零毫秒形态在库里也存在）。
  */
 function shapeSqlOf(kind: TimeColumnKind, col: string): string[] {
-  // ⚠️ epoch-ms 也必须有判据（正确性审查 F5）：`TRY_CAST(... AS BIGINT) IS NULL` 只挡
-  // 非数字，`-1`（七鱼「无值」哨兵）、秒级/微秒级误写全部「合法」——会让 time_range
-  // 声称数据从 1970 年开始。写路径对秒级时间戳已有同口径（`n <= 1e11` 丢弃）。
-  if (kind === 'epoch-ms') {
-    const n = `TRY_CAST(${col} AS BIGINT)`
-    // ⚠️ gap 2：上界必须与 `msToShanghaiIso` 的守卫同源（`MAX_SHANGHAI_SAFE_MS`，
-    // = MAX_DATE_MS − 8h）。旧值 `8640000000000000` 恰好把「偏移后越界、回显时抛
-    // RangeError」的值放进候选集 —— 一条脏值让整条 `db tables` 变 internal。
-    // 导出常量而不是在这里写字面量，是为了让「形状合格」与「能回显」永远是同一集合。
-    return [`${n} > 100000000000`, `${n} <= ${MAX_SHANGHAI_SAFE_MS}`]
-  }
-  const shape = kind === 'iso-day'
-    ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
-    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
-  // ⚠️ 形态正则之外还要 `TRY_CAST` 可解析（正确性审查 F3）：`'2026-10-14T02:00Z'`
-  // 能过宽松正则，但 `TRY_CAST(... AS TIMESTAMPTZ)` 是 NULL —— 只按正则判会让它
-  // 在 `arg_min` 里被静默踢出 time_range，既不在极值里、也不计入脏值。
-  return [
-    `regexp_matches(${col}, '${shape}')`,
-    `TRY_CAST(${col} AS TIMESTAMPTZ) IS NOT NULL`,
-  ]
+  return timeShapeClauses(kind, col)
 }
 
 /**
@@ -243,18 +229,23 @@ export async function openGuardedSession(
   } catch (e) { return { exit: thrownToQueryExit(e, TABLES) } }
 
   try {
-    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」；
-    // hint 沿 sync.ts openRo 形态：同时指「换 --db 路径」与「qiyu store init」）。
+    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
     // 口径与实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
-    const sv = await session.run(
-      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
-    if (sv.rows.length === 0) {
+    // ⚠️ 成因分形（sync.ts openRo / store.ts 同款）：「有表但无 schema_version」是**他人库**
+    // —— store init 会再次拒绝（duckdb.ts init 的他人库防线），无条件引导过去就是
+    // store init → db tables 死循环；「零表」才是「init 可补」的成因。
+    const tables = await session.run(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
+    const names = tables.rows.map((r) => String(r.table_name))
+    if (!names.includes('schema_version')) {
       await session.close()
       return {
         exit: fail({
           code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
           message: `数据库结构不完整（缺表）：${config.path}`,
-          hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
+          hint: names.length > 0
+            ? '目标数据库不是本 CLI 创建的，请换 --db 路径'
+            : '空库（无任何表）。请先运行：qiyu store init',
         }),
       }
     }

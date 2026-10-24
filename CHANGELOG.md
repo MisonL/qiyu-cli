@@ -128,6 +128,17 @@
   忽略），`--pretty --help` 与 `--help --pretty` 还会因书写顺序得到 2 / 0 两种结果
 - **`sync run` 的存储失败不再一律提示 `store init`**：「路径不是 DuckDB 文件」「他人库」
   「依赖未安装」跑 `store init` 必然再次失败，现保留底层错误的 hint
+- **`store_not_initialized` 的提示全线按成因分流**（CodeRabbit 审查）：此前 `sync status`/
+  `sync verify`/`sync install` 与 `db tables`/`db describe` 对「有表但无 schema_version」
+  的**他人库**也建议「或先运行 store init」——而 store init 遇他人库会再次拒绝，Agent 会
+  进 `store init` ↔ 原命令的死循环。现在空库（零表）才指 store init、他人库指换 `--db`
+  路径；skill 正文 `errors.md` 相应改为「**按 `hint` 行动**」，不再无条件推荐 store init
+- **`query --table` 的空表提示不再被库漂移警告吞掉**：0 行且无时间过滤时，「该表无数据」
+  此前要求 `warnings` 为空，于是「库中缺列」警告一出现，空表提示就静默消失——缺列说的是
+  schema、空表说的是数据，两件独立事实现在同时报告
+- **时间形态 SQL 谓词收敛为唯一实现**（`src/query/time-shape.ts`）：`db tables`/
+  `db describe` 的 `time_range` 与 `query --table` 的过滤/覆盖曾各存一份逐字副本，
+  只靠注释与字符串相等测试防守（gap 2 的缺陷正来自这两份副本）；现由构造保证同口径
 - `api call` / `api schema` 的用法错误出口补上控制字符净化（此前可向 stderr 注入 ANSI/OSC）
 - 脱敏对分析结果的副作用现在会声明：对敏感列 `GROUP BY`/`DISTINCT` 时提示「不同原值会映射成
   同一个脱敏值」；值级兜底命中非敏感列（11 位订单号等）时提示「可能是业务数字被误改」

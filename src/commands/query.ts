@@ -381,10 +381,14 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
   // 0 行 ≠ 没有数据（spec §十 / 红线 3）：给了时间过滤而 0 行时附可操作提示。
   if (result.rows.length === 0 && (input.since !== undefined || input.until !== undefined)) {
     warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until))
-  } else if (result.rows.length === 0 && warnings.length === 0) {
+  } else if (result.rows.length === 0) {
     // 没给时间过滤也 0 行：spec §十 把「空表」列为 warnings 的触发条件。
     // 这里必须能区分「表空」与「查询没命中」—— `--table` 通道没有 WHERE 子句（除了时间过滤），
     // 所以 0 行且无时间过滤**只可能**是表里没有行。文案与 `stats fields` 的空表警告同源。
+    // ⚠️ 不看 warnings 是否已有其他条目（CodeRabbit inline minor）：走到这里的其他警告
+    // 只有「库中缺列」漂移（plan.warnings 只在给了时间过滤时非空，那走上一分支）——
+    // 缺列说的是 schema、空表说的是数据，两件独立事实都该说；压掉后者 Agent 会把
+    // 「0 行」误读成缺列的副作用。
     warnings.push('该表无数据；先运行 `qiyu sync run`')
   }
 
