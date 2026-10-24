@@ -52,6 +52,10 @@
 - 同步 schema 迁移 v9：`sync_state` 补 `resolved_range_start`/`resolved_range_end` 两列
 - `store_not_initialized` 的 hint 统一为 `qiyu store init`（C1 与同步引擎同口径）
 - CI（`.github/workflows/ci.yml`）：push/PR 到 `main` 时对 Node 20.12（engines 下限）、22（维护期 LTS）与 24（当前 LTS）跑 `npm ci` → `npm run typecheck` → `npm test`；此前仓库无任何 CI，测试只在本地跑
+- CI 增加**发布产物门禁**（`npm run check:pack`，只在 Node 20.12 矩阵项跑）：用
+  `npm pack --dry-run --json` 断言 skill 正文逐篇在包内、`dist/postinstall.js` 存在、
+  `dist/core/edition.js` 的版本已注入且与 `package.json` 一致 —— 防「构建脚本退化时功能测试
+  仍全绿、发布包静默缺文件」（测试直接 import `src/**`，从不触碰构建产物）
 - Node 下限由 ≥20.10 修正为 **≥20.12**：会话导出的 zip 解压用 `DecompressionStream('deflate-raw')`，该格式 Node 20.12 起才被接受（20.10/20.11 抛 `format is invalid`，CI 在 20.10 上实测 11 个 pipeline 用例失败后确认）；此前的 `engines` 声明与实现不符
 - 同步引擎修复：请求区间**整体**早于接口下界时（如 `--until` 指向 40 天前），此前从哨兵起点 0 按 31 天切片会切出数百窗（702 窗实测），首窗被 op 守卫拒绝、其余各发一次无意义调用（生产上 opStart 被服务端静默钳制）——现收成单窗直送守卫，显式失败一次、gap 可见
 - **F 子项目（Skill 化）**：
@@ -129,6 +133,19 @@
   同一个脱敏值」；值级兜底命中非敏感列（11 位订单号等）时提示「可能是业务数字被误改」
 - `query()`/`query_table()`/`COLUMNS()` 这类在内部再执行 SQL 的构造会声明脱敏缺口
   （此前 `SELECT * FROM query('SELECT userName AS n …')` 完全静默）
+- **`skill install` 的三类数据安全问题**：① 并发安装撞 `ENOTEMPTY` 时此前退 1 并把原因
+  归成权限问题，现在按实体实际状态收敛（本进程零写入 → `status: skipped` + 如实文案）；
+  ② 崩溃残留清理此前会**无差别删除**同前缀暂存目录（把另一个正在进行的安装删掉），
+  现在按 mtime 年龄（10 分钟）判活，且只认带独占标记的目录 —— 用户的
+  `qiyu.tmp-backup/` 不再被误删；③ 清单 `files` 可被篡改来删用户文件，现在按逐文件
+  哈希核对，只删「内容与记录一致」的受管文件（旧清单无哈希则宁留不删）
+- **`skill check` 的目录环与分词**：自指符号链接（`loop -> .`）此前会把同一条违规报几十次
+  （靠路径长度撞上限才停），现在按递归栈的 realpath 集合挡环；`bool` flag 不再吞掉它后面的
+  位置参数、引号内的复合符号不再误判为不可校验
+- **`skill where` 无法判定时不再谎报「不存在」**：实体路径报 `exists: null`、链接报
+  `state: unknown`（带 `error`）
+- 同进程内 `skill install` 之后再跑命令，`meta.warnings` 不再残留「skill 未安装」
+  （探测缓存按参数元组命中旧结论，install 成功后现在会失效）
 - 超范围时间值（微秒级脏值、`--since 999999999d`）不再让整条命令以 `internal` 崩溃；
   带时刻的 ISO 也会回验日历日（`2026-02-30T00:00:00` 不再静默进位成 3/2）
 

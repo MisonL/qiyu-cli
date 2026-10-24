@@ -393,6 +393,12 @@ CI（`.github/workflows/ci.yml`）在 push/PR 到 `main` 时对 Node 20.12（eng
 22（维护期 LTS）与 24（当前 LTS）跑 `npm ci` → `npm run typecheck` → `npm test`；测试并发
 限制来自 `package.json` 的 test 脚本，CI 不另传并发参数。
 
+除上述三步外，CI 还会在**最低版本矩阵项**跑一次**发布产物门禁**（`npm run check:pack`）：
+用 `npm pack --dry-run --json` 取真实包内容，断言 skill 正文逐篇在包内、`dist/postinstall.js`
+存在、`dist/core/edition.js` 的版本已注入且与 `package.json` 一致。它防的是「构建脚本退化
+（例如 build 只剩 tsc）时功能测试仍全绿、发布包却静默缺文件」——`npm test` 直接 import
+`src/**`，从不触碰构建产物，只有这一步会。本地想跑同一条门禁：`npm run check:pack`。
+
 ### 目录结构
 
 ```
