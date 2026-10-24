@@ -18,6 +18,7 @@
 // 上海日零点。这是刻意的 —— Agent 要据此知道过滤实际覆盖了哪个自然日（`--since 9/15 12:00`
 // 实际从 9/15 00:00 起算；`--until 9/20` 实际覆盖到 9/20 全天）。契约 C。
 import { shanghaiDayIso, shanghaiDayStart, shanghaiIso } from '../core/time.js'
+import { timeShapeClauses } from './time-shape.js'
 import { suggestNames } from './errors.js'
 import { describeArgs } from '../output.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
@@ -27,7 +28,7 @@ type TimeColumn = NonNullable<TableDef['timeColumn']>
 
 /**
  * `--table` 的用法类错误（未知表/列、敏感列、区间无效）。
- * 纯函数只负责抛，命令层统一转 `usageFail`（退出码 2）—— 与 `parseFlags` 的异常形态同款。
+ * 纯函数只负责抛，命令层统一转 `usageFail`（退出码 2）—— 与 `parseStoreFlags` 的异常形态同款。
  */
 export class TableQueryUsageError extends Error {
   constructor(message: string) {
@@ -111,34 +112,16 @@ function aggExprOf(tc: TimeColumn): { mn: string; mx: string } {
 /**
  * 时间列的**可用值谓词**（脏值不进 MIN/MAX、不进覆盖统计、不进主查询的时间过滤）。
  *
- * 判据 = 「形态正则命中」**且**「能解析成时刻/整数」：
- *   · iso-day / iso-instant：`regexp_matches(...)` + `TRY_CAST(... AS TIMESTAMPTZ) IS NOT NULL`
- *     —— 实测 `'2026-10-14T02:00Z'`（无秒）通过正则但 `TRY_CAST` 为 NULL，只按正则判会
- *     让它在 `arg_min` 里被静默踢出 time_range（正确性审查 F3）；
- *   · epoch-ms：`TRY_CAST(... AS BIGINT)` 落在合理区间 `(1e11, 8.64e15]`
- *     —— `-1` 是七鱼「无值」哨兵、秒级/微秒级是单位误写，都不该被当成 1970/万年后的时刻
- *     （正确性审查 F5）。写路径对秒级时间戳已有同口径丢弃（`reports.ts` 的 `n <= 1e11`）。
+ * 实现与 `commands/db.ts` 共用 `query/time-shape.ts` 的同一函数 —— 口径由构造保证，
+ * 不再靠「逐字一致」的注释与字符串相等测试（同一条 README 承诺：「脏值不进 time_range」；
+ * 两处分叉的话，同一条脏库会在 `db tables` 被排除、在 `query --table` 被当成覆盖范围）。
+ * 具体判据与实测约束（F3/F5/gap 2）见该模块头注释。
  *
- * ⚠️ 口径必须与 `commands/db.ts` 的 `shapeSqlOf` **逐字一致**（同一条 README 承诺：
- * 「脏值不进 time_range」）。两处分叉的话，同一条脏库会在 `db tables` 被排除、
- * 在 `query --table` 被当成覆盖范围 —— 同一状态两种说法。
  * ⚠️ 主查询的时间谓词也需要它（正确性审查 F8）：否则 `'2026-10-15garbage'` 会出现在
  * rows / group-by 计数里，而 `data_coverage` 把它排除，同一响应内自相矛盾。
  */
 function shapeClause(tc: TimeColumn): string[] {
-  if (tc.kind === 'epoch-ms') {
-    const n = `TRY_CAST(${quote(tc.name)} AS BIGINT)`
-    return [`${n} > 100000000000`, `${n} <= 8640000000000000`]
-  }
-  const shape = tc.kind === 'iso-day'
-    ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
-    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
-  // ⚠️ `regexp_matches`，不要用 `~`（实测 DuckDB 1.5.6-r.1 的 `~` 不是正则匹配）。
-  // 秒必须存在（`:[0-9]{2}` 不再是可选项）：`T02:00Z` 能过宽松正则却 cast 不了。
-  return [
-    `regexp_matches(${quote(tc.name)}, '${shape}')`,
-    `TRY_CAST(${quote(tc.name)} AS TIMESTAMPTZ) IS NOT NULL`,
-  ]
+  return timeShapeClauses(tc.kind, quote(tc.name))
 }
 
 /**

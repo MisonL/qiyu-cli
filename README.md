@@ -44,6 +44,33 @@ cd qiyu-cli && npm install && npm run build
 > `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。
 > 该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
 
+### 装完之后：安装 skill（推荐）
+
+`qiyu` 附带一份 Agent 操作协议（skill），装到 `~/.agents/skills/qiyu` 并链接进各 Agent 的
+skills 目录（当前支持 Claude Code 的 `~/.claude/skills` 与 Codex 的 `~/.codex/skills`）。
+
+**当前版本，自动安装基本不会发生**，请直接跑一次：
+
+```bash
+qiyu skill install        # 安装 / 更新 skill 正文并建链接
+```
+
+原因如实说：`package.json` 里虽有 `postinstall`，但它**只在 npm 全局安装、且不是 npx 调用时**
+才尝试安装（判据是 `npm_config_global === 'true'` 且 `npm_command !== 'exec'`）。而
+**npm 12 / pnpm 12 / bun 默认阻断安装脚本**；更麻烦的是，以 tarball / `file:` 方式安装时
+npm 无法确认可信版本、也就无法 pin 版本，`--allow-scripts` 同样不生效——脚本**根本没跑**
+（npm 仍退 0，只有一行 warn，极易被当成成功）。npx 场景下它还会主动跳过（不往你的 home 写东西）。
+所以**不要指望 postinstall：直接运行 `qiyu skill install`**。
+
+安装是幂等的：正文一致时不动正文（清单缺失或损坏时会补写 `.qiyu-skill.json`）；要覆盖
+你改过的正文得加 `--force`。其他子命令：
+`qiyu skill where` 报告实体目录与各 Agent 的链接状态（只读，不修复）；`qiyu skill check`
+校验 skill 引用的命令/表/错误 kind 是否仍存在（有违规退出码 1，CI 可跑；`--compare` 模式下
+两份正文内容不一致、或已安装那份不可用，同样退 1）。
+
+> 兜底提示：若 skill 未安装或已过期，`qiyu` 每次成功输出都会在 `meta.warnings` 里提醒
+> 「未安装 / 已过期」——提示只写进 JSON，不改退出码。
+
 ## 配置凭证
 
 凭证通过环境变量读取：
@@ -107,6 +134,13 @@ qiyu query --sql <SQL>               任意只读 SQL（三层沙箱 + 默认脱
 qiyu query --table <表> [--since T] [--until T] [--group-by <列>]
                                      受约束查询通道（列白名单、时间列语义化、精确脱敏）
 qiyu stats fields <报表>              指标自描述（声明 + 本地观测分布 + -1 哨兵）
+qiyu skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
+                                     安装 skill 正文并链接进各 Agent 的 skills 目录
+qiyu skill check [--installed [--dir <path>] | --compare [--dir <path>]]
+                                     校验 skill 引用的命令/表/错误 kind（有违规退出码 1；
+                                     --compare 下内容不一致也算失败）
+qiyu skill where [--dir <path>]      报告实体目录与各 Agent 链接状态（只读，不修复）
+qiyu --version                       包版本 + skill_contract_version
 ```
 
 ## 输出契约
@@ -294,8 +328,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 
 ## 当前状态
 
-本仓库已交付设计稿中的**前五个子项目**：认证与通用 API 通道、API 参数校验
-（`api schema`/body 分级校验）、存储层、同步引擎、查询接口与只读沙箱。
+本仓库已交付设计稿中的**前六个子项目**：认证与通用 API 通道、API 参数校验
+（`api schema`/body 分级校验）、存储层、同步引擎、查询接口与只读沙箱、Skill 化
+（`qiyu skill install` / `skill check` / `skill where`，见上方「装完之后：安装 skill」）。
 
 **已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
 限频感知（`retry_after`）、本地数据仓库——`store init` / `store status`（存储层已交付，
@@ -307,6 +342,12 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 或 `last_synced_at` 非空的行——全败的 run 只留 pending，不算跑通）。
 查询与只读沙箱——`db tables` / `db describe` / `query --sql` / `query --table` / `stats fields`
 （三层只读沙箱、默认脱敏、时间列三形态语义化、`-1` 哨兵呈现、声明与观测分离）。
+Skill 化——`skill install`（复制正文 + 建 Agent 链接，幂等，`--dry-run` 只算计划）/
+`skill check`（校验正文引用的命令、表名、错误 `kind` 与位置参数取值是否仍存在；
+`--installed`/`--compare` 改基准；有违规退出码 1，`--compare` 下内容不一致也算失败）/
+`skill where`（只读报告实体目录与各 Agent 链接四态：
+`ok`/`missing`/`dangling`/`foreign`，无法判定时报 `unknown` 而非「不存在」），
+外加 `qiyu --version`（输出包版本与 `skill_contract_version`）。
 
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
@@ -319,7 +360,6 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 
 - `auth login`（配置文件写入）——目前只支持环境变量；
 - `--pretty`（人类可读输出）——目前只输出紧凑 JSON；
-- `F` 子项目的 Skill 化（Agent 操作协议、`skill check`）——查询命令本身已可用，见「当前状态」；
 
 `api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
@@ -333,10 +373,17 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 ```bash
 npm install
 npm run typecheck         # 类型检查（含测试）
-npm test                  # 运行测试
+npm test                  # 运行测试（默认 4 分片并行，≈50s）
 
-# ⚠️ 测试必须单进程运行。vitest.config.ts 已写死 maxWorkers: 1 +
-#    fileParallelism: false，但命令行参数会覆盖配置——不要去掉这两个限制。
+# ⚠️ 每个分片内部仍是**单进程单 worker**。vitest.config.ts 写死 maxWorkers: 1 +
+#    fileParallelism: false，分片 runner 也照传这两个参数——不要去掉。
+#    分片数是固定值（默认 4，上限 8），不随 CPU 数放大：2026-10-05 的内存耗尽事故
+#    根因是「无界循环 × 无界增长」，不是并发本身。
+
+QIYU_TEST_SHARDS=1 npm test   # 单片串行（≈110s，排查时序问题或复现 CI 时用）
+npm run test:single           # 等价写法
+QIYU_TEST_SHARDS=8 npm test   # 更多分片（16 核机器上收益递减）
+QIYU_TEST_HEAP_MB=1024 npm test   # 收紧每片 Node 堆上限（默认 2048）
 ```
 
 测试覆盖了响应信封归一化、错误分类、签名、脱敏、限频、注册表校验、CLI 契约等。
@@ -345,6 +392,12 @@ npm test                  # 运行测试
 CI（`.github/workflows/ci.yml`）在 push/PR 到 `main` 时对 Node 20.12（engines 下限）、
 22（维护期 LTS）与 24（当前 LTS）跑 `npm ci` → `npm run typecheck` → `npm test`；测试并发
 限制来自 `package.json` 的 test 脚本，CI 不另传并发参数。
+
+除上述三步外，CI 还会在**最低版本矩阵项**跑一次**发布产物门禁**（`npm run check:pack`）：
+用 `npm pack --dry-run --json` 取真实包内容，断言 skill 正文逐篇在包内、`dist/postinstall.js`
+存在、`dist/core/edition.js` 的版本已注入且与 `package.json` 一致。它防的是「构建脚本退化
+（例如 build 只剩 tsc）时功能测试仍全绿、发布包却静默缺文件」——`npm test` 直接 import
+`src/**`，从不触碰构建产物，只有这一步会。本地想跑同一条门禁：`npm run check:pack`。
 
 ### 目录结构
 

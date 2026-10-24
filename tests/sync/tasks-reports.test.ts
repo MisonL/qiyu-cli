@@ -408,6 +408,45 @@ describe('报表任务 fetch（http mock）', () => {
     }
   })
 
+  // gap 2 写路径：读侧的上界守卫（`MAX_SHANGHAI_SAFE_MS`）在写侧也要有同款判据。
+  // 旧判据只有 `n <= 1e11` 下界 —— 微秒误写（1792467000000000000）远大于 1e11，能过，
+  // 随后 `new Date(n).toISOString()`（hour_ts）与 `shanghaiDayIso(n)`（stat_date）
+  // 双双抛 RangeError，**整窗 fetch 失败**（一行脏数据断掉整窗，与读侧同一失败模式）。
+  it('staff_attendance：超上界的脏时间戳逐行丢弃，不抛 RangeError 断整窗（gap 2 写路径）', async () => {
+    const row = (id: number, ts: unknown) => ({ staffId: id, date: ts, loginDuration: 1 })
+    const H = 3_600_000
+    const BASE = 1_700_000_000_000 - (1_700_000_000_000 % H)
+    const fetchMock = respondQueue([() => okC({
+      result: [
+        row(1000002, BASE),
+        row(1000002, 1_792_467_000_000_000_000),   // 微秒误写：远超 Date 上限
+        row(1000002, BASE + H),
+      ],
+      total: 3,
+    })])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      // 不抛：旧实现在这里抛 RangeError: Invalid time value。
+      const r = await runTask(reportById('reports.staff_attendance')!, ctx(store))
+      expect(r.status).toBe('complete')
+      // 脏行被丢弃，干净两行照常落库（fetched 只计投影后的行 —— 与 C 中-4 同一口径）。
+      expect(r.rows).toEqual({ fetched: 2, written: 2 })
+      const rows = await store.query(
+        'SELECT staff_id, hour_ts, stat_date FROM staff_attendance ORDER BY hour_ts')
+      expect(rows.rows.map((x) => x.hour_ts)).toEqual(
+        [new Date(BASE).toISOString(), new Date(BASE + H).toISOString()])
+      // stat_date 必须与 hour_ts 同一自然日（baseRow 的 shanghaiDayIso 没被越界值带歪）。
+      expect(rows.rows.map((x) => x.stat_date)).toEqual([
+        new Date(shanghaiDayStart(BASE)).toISOString(),
+        new Date(shanghaiDayStart(BASE + H)).toISOString(),
+      ])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('修复批 4 扩展②：staff_attendance 的 stat_date 由本行 hour_ts 推导（不再全落窗口首日）', async () => {
     // 31 天窗口里行跨多个自然日：stat_date 跟随该行自己的业务日（此前用窗口起点，
     // 整窗的行都会被标成窗口首日）

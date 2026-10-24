@@ -4,6 +4,28 @@ import { dirname } from 'node:path'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { ok, fail, usageFail, sanitizeControlChars } from '../output.js'
+import { parseStoreFlags } from './store-flags.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import type { CommandSpec } from './spec-types.js'
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu store …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ */
+export const STORE_SPECS: CommandSpec[] = [
+  {
+    path: ['store', 'init'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['store', 'status'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+]
 
 const USAGE = `用法：qiyu store <子命令> [参数]
 
@@ -17,29 +39,7 @@ const USAGE = `用法：qiyu store <子命令> [参数]
    也可用 --db / QIYU_DB_PATH 直接指定库路径。
 `
 
-const KNOWN = new Set(['--help', '-h', '--pretty'])
-
-/**
- * `--db/--profile/--backend` 的值位解析。⚠️ 与 db.ts / stats.ts 的同名函数**逐字相同**
- * （query.ts 的是第四份、语义有意不同）—— 改动必须三处同步（架构审查 M-2）。
- */
-function parseFlags(argv: string[]): { db?: string; profile?: string; backend?: string; rest: string[] } {
-  const out: { db?: string; profile?: string; backend?: string; rest: string[] } = { rest: [] }
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]
-    if (a === '--db' || a === '--profile' || a === '--backend') {
-      const v = argv[i + 1]
-      // 值位守卫（B 的 isBodyValue 同族惯例）：值位缺失或以 -- 开头 → 报缺值，
-      // 否则 `store init --db --profile x` 会把 --profile 当路径（v1 计划缺陷）。
-      if (v === undefined || v.startsWith('--')) throw new Error(`${a} 缺少取值`)
-      if (a === '--db') out.db = v
-      else if (a === '--profile') out.profile = v
-      else out.backend = v
-      i++
-    } else out.rest.push(a)
-  }
-  return out
-}
+const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 export function thrownToExit(e: unknown): number {
   const err = e as { kind?: string; message?: string; hint?: string; retryable?: boolean }
@@ -87,8 +87,8 @@ export async function storeCommand(argv: string[]): Promise<number> {
     if (sub === '--pretty') return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
     return usageFail(`未知子命令：${sub}\n可用子命令：init、status`)
   }
-  // 子命令级：**先 parseFlags**（消费带值 flag 的值位置），再判未知参数（spec §7.3/验收 46）。
-  // ⚠️ 次序不能反：若先过滤「未知 token」再 parseFlags，`store init --db <path>` 的
+  // 子命令级：**先 parseStoreFlags**（消费带值 flag 的值位置），再判未知参数（spec §7.3/验收 46）。
+  // ⚠️ 次序不能反：若先过滤「未知 token」再 parseStoreFlags，`store init --db <path>` 的
   // --db 及其值会被当未知参数误拒（v1 计划的实测缺陷，D/F 组独立发现）。
   if (rest.includes('--help') || rest.includes('-h')) {
     const rawRest = rest.filter((a) => !KNOWN.has(a))
@@ -99,8 +99,8 @@ export async function storeCommand(argv: string[]): Promise<number> {
   if (rest.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
 
   let flags
-  try { flags = parseFlags(rest) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
-  // parseFlags 之后剩下的 rest 才是真正的未知参数（带值 flag 的值位已被消费）
+  try { flags = parseStoreFlags(rest) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+  // parseStoreFlags 之后剩下的 rest 才是真正的未知参数（带值 flag 的值位已被消费）
   if (flags.rest.length > 0) return usageFail(`未知参数：${flags.rest.join(' ')}`)
 
   let resolved

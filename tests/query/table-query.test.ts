@@ -6,6 +6,9 @@ import { describe, it, expect } from 'vitest'
 import {
   buildCoverageQuery, buildMinQuery, buildTableQuery, effectiveBound,
 } from '../../src/query/table-query.js'
+import {
+  MAX_DATE_MS, MAX_SHANGHAI_SAFE_MS, SHANGHAI_OFFSET_MS, msToShanghaiIso,
+} from '../../src/core/time.js'
 import { tableByName } from '../../src/store/schema.js'
 import type { TableDef } from '../../src/store/schema.js'
 
@@ -199,7 +202,7 @@ describe('buildTableQuery · --group-by（契约 E/F）', () => {
     expect(plan.sql).toBe(
       'SELECT "session_type", COUNT(*) AS count FROM "sessions"' +
       ' WHERE TRY_CAST("startTime" AS BIGINT) > 100000000000' +
-      ' AND TRY_CAST("startTime" AS BIGINT) <= 8640000000000000' +
+      ` AND TRY_CAST("startTime" AS BIGINT) <= ${MAX_SHANGHAI_SAFE_MS}` +
       ' AND TRY_CAST("startTime" AS BIGINT) >= ? AND TRY_CAST("startTime" AS BIGINT) <= ?' +
       ' GROUP BY "session_type" ORDER BY count DESC, "session_type"')
     expect(plan.params).toEqual([since, NOW])
@@ -269,14 +272,14 @@ describe('buildCoverageQuery / buildMinQuery（契约 B/D）', () => {
       'SELECT MIN(TRY_CAST("startTime" AS BIGINT)) AS mn, ' +
       'MAX(TRY_CAST("startTime" AS BIGINT)) AS mx, NULL AS days FROM "sessions"' +
       ' WHERE TRY_CAST("startTime" AS BIGINT) > 100000000000' +
-      ' AND TRY_CAST("startTime" AS BIGINT) <= 8640000000000000' +
+      ` AND TRY_CAST("startTime" AS BIGINT) <= ${MAX_SHANGHAI_SAFE_MS}` +
       ' AND TRY_CAST("startTime" AS BIGINT) >= ? AND TRY_CAST("startTime" AS BIGINT) <= ?')
     expect(cov.params).toEqual(plan.params)
   })
 
   it('无谓词时覆盖 = 全表极值；ISO 列带形态谓词（脏值不进覆盖）', () => {
     const cov = buildCoverageQuery({ table: t('daily_overview'), now: NOW })
-    // 形态谓词与 commands/db.ts 的 shapeSqlOf 逐字一致；极值按时刻取（正确性审查 F1/F3/F6）。
+    // 形态谓词与 commands/db.ts 共用 query/time-shape.ts 的同一实现；极值按时刻取（正确性审查 F1/F3/F6）。
     expect(cov.sql).toBe(
       'SELECT arg_min("stat_date", TRY_CAST("stat_date" AS TIMESTAMPTZ)) AS mn, ' +
       'arg_max("stat_date", TRY_CAST("stat_date" AS TIMESTAMPTZ)) AS mx, ' +
@@ -295,7 +298,7 @@ describe('buildCoverageQuery / buildMinQuery（契约 B/D）', () => {
     expect(buildMinQuery(t('sessions')).sql)
       .toBe('SELECT MIN(TRY_CAST("startTime" AS BIGINT)) AS mn FROM "sessions"'
         + ' WHERE TRY_CAST("startTime" AS BIGINT) > 100000000000'
-        + ' AND TRY_CAST("startTime" AS BIGINT) <= 8640000000000000')
+        + ` AND TRY_CAST("startTime" AS BIGINT) <= ${MAX_SHANGHAI_SAFE_MS}`)
     // 空串在字典序上小于一切 ISO —— 不带形态谓词时 MIN 会返回它，
     // 命令层据此判「该列无可用值」而丢掉缺省下界（CodeRabbit 终审 minor）。
     // 极值按时刻取（正确性审查 F2）。
@@ -309,5 +312,24 @@ describe('buildCoverageQuery / buildMinQuery（契约 B/D）', () => {
     expect(() => buildCoverageQuery({ table: t('staff'), now: NOW }))
       .toThrow(/没有时间列/)
     expect(() => buildMinQuery(t('staff'))).toThrow(/没有时间列/)
+  })
+
+  // gap 2：epoch-ms 形状谓词的上界必须与 `msToShanghaiIso` 的守卫同源（MAX_SHANGHAI_SAFE_MS），
+  // 否则「形状合格」与「能回显」是两个集合 —— 边界值被 SQL 放进候选集、下游回显时抛 RangeError。
+  it('epoch-ms 上界收紧到 MAX_SHANGHAI_SAFE_MS：形状合格集 ⊆ 能回显集（gap 2）', () => {
+    // 常量关系钉死：安全上界 = Date 上限 − 上海偏移（不是 Date 上限本身）。
+    expect(MAX_SHANGHAI_SAFE_MS).toBe(MAX_DATE_MS - SHANGHAI_OFFSET_MS)
+
+    const sql = buildMinQuery(t('sessions')).sql
+    // 旧的字面量上界（= MAX_DATE_MS）会放行「偏移后越界」的值，必须已消失。
+    expect(sql).not.toContain('<= 8640000000000000')
+    expect(sql).toContain(`<= ${MAX_SHANGHAI_SAFE_MS}`)
+
+    // 语义不变量：谓词内边界能回显成合法 ISO；边界外一个的原样回显、绝不抛。
+    const atBound = msToShanghaiIso(MAX_SHANGHAI_SAFE_MS)
+    expect(() => new Date(atBound)).not.toThrow()
+    expect(atBound).toMatch(/\+08:00$/)
+    // 旧上界（MAX_DATE_MS）落在新候选集之外：msToShanghaiIso 对它原样回显、不抛 RangeError。
+    expect(msToShanghaiIso(MAX_DATE_MS)).toBe(String(MAX_DATE_MS))
   })
 })

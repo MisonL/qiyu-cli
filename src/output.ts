@@ -91,10 +91,79 @@ export function ok(data: unknown, meta?: unknown): number {
   // "这个接口没有载荷"（robot.transfer.config 实测就是这样）与"我解析错了"。
   // 这与本计划在信封层反复强调的「`data` 键缺失是一种有意义的编码」是同一件事 ——
   // 输出层不能自己制造那种歧义。
-  write(meta === undefined
+  const withSkill = mergeSkillWarning(meta)
+  write(withSkill === undefined
     ? { ok: true, data: data ?? null }
-    : { ok: true, data: data ?? null, meta })
+    : { ok: true, data: data ?? null, meta: withSkill })
   return EXIT.OK
+}
+
+/**
+ * 待并入下一次成功输出 `meta.warnings` 的安装态提示（Task 10，spec D2.1）。
+ *
+ * ⚠️ **为什么是模块级注入而不是 `ok()` 自己探测**：`output.ts` 属于 CLI 输出层，
+ * 而探测在 `skill/`（叶子层）。分层红线（Task 14 用测试钉住）要求
+ * `output.ts`/`core/`/`commands/` 不得 import `skill/` —— 直接在这里
+ * `import { skillWarning } from './skill/detect.js'` 会让这条红线失守。所以由
+ * `cli.ts`（允许 import 两边）探测后经 `setSkillWarning()` 注入一句纯文本，
+ * `ok()` 只负责合并。探测本身只发生一次、且在命令启动时（缓存见 detect.ts）。
+ *
+ * 生命周期是**进程级**：cli.ts 在 `run()` 开头设一次，进程内所有成功输出都带上
+ * 同一条提示；测试用 `setSkillWarning(undefined)` 清除。
+ */
+let pendingSkillWarning: string | undefined
+
+/** 设置（或清除，传 undefined）下一次及后续成功输出要带的安装态提示。 */
+export function setSkillWarning(text: string | undefined): void {
+  pendingSkillWarning = text
+}
+
+/**
+ * 把 `pendingSkillWarning` 合并进 `meta.warnings`。
+ *
+ * 不变量（brief 逐条要求，测试钉住）：
+ *   · `pendingSkillWarning === undefined` → 返回**原样的** meta（不新建空 meta、
+ *     不补空 warnings 数组）——大量现有断言是 `toEqual({...})`，多一个键就全红；
+ *   · meta 是普通对象 → **复制**出新对象再合并（不改调用方的对象），已有
+ *     `warnings` 数组则 append，否则新建；
+ *   · meta 不是对象（字符串/数组/null 等）→ 原样返回，不硬塞提示；
+ *   · meta 为 undefined 且有提示 → 新建 `{ warnings: [提示] }`（这是提示唯一
+ *     能出现的通道，也是唯一允许新建 meta 的情形）。
+ *
+ * ⚠️ **元素形状跟随既有数组保持同质**（审查 I3，控制器裁定）：不同命令的
+ * `meta.warnings` 形状不同——`api call` 是结构化对象数组
+ * （`{ kind, field?, message }`，见 api.ts），其余命令多为字符串数组。消费者按
+ * 自己的形状读：`api call` 的消费者按 `w.kind` 过滤，若往对象数组里塞一个裸字符串，
+ * `w.kind` 就是 `undefined`，静默丢失（或更糟：字符串被当对象取值）。所以：
+ *   ① 没有 warnings → 新建字符串数组 `[text]`；
+ *   ② 有数组且**首元素是非 null 对象** → 按对象形状 append
+ *      `{ kind: 'skill_drift', message: text }`（与 api.ts 同形）；
+ *   ③ 其余（空数组 / 字符串数组 / 首元素是 null 等）→ append 字符串。
+ * 每个命令的 warnings 数组因此保持自身同质，两类读者都不被破坏。
+ */
+function mergeSkillWarning(meta: unknown): unknown {
+  if (pendingSkillWarning === undefined) return meta
+  if (meta === undefined) return { warnings: [pendingSkillWarning] }
+  // 数组也是 object，但它不是「meta 对象」——不能给它挂 warnings 键（JSON 里
+  // 数组的可枚举自有属性会被序列化掉一部分，形态不可预期）。只认普通对象。
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return meta
+
+  const existing = (meta as { warnings?: unknown }).warnings
+  let warnings: unknown[]
+  if (!Array.isArray(existing)) {
+    warnings = [pendingSkillWarning]
+  } else if (existing.length > 0 && isPlainObject(existing[0])) {
+    // 既有元素是结构化对象：保持同形，新元素带 kind 便于消费者过滤。
+    warnings = [...existing, { kind: 'skill_drift', message: pendingSkillWarning }]
+  } else {
+    warnings = [...existing, pendingSkillWarning]
+  }
+  return { ...(meta as Record<string, unknown>), warnings }
+}
+
+/** 非 null 的普通对象（数组不算——它是容器，不是元素形状）。 */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function exitCodeFor(kind: string): number {

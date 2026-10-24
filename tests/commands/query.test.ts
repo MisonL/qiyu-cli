@@ -430,9 +430,11 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(err).toMatch(/--db 缺少取值/)
   })
 
-  it('库缺少 schema_version（空库 / 他人库）→ store_not_initialized 退出码 1 + hint 指 store init', async () => {
+  it('库缺少 schema_version（空库 / 他人库）→ store_not_initialized，空库指 store init、他人库换 --db（架构审查 F1）', async () => {
     // 合法 DuckDB 但没跑过本 CLI 的迁移：`SELECT 1` 在沙箱里能跑，但 masked 的语义
-    // 建立在本 CLI 的 PII 列集上 —— 必须拒绝，把 Agent 引向 store init 而不是改 SQL。
+    // 建立在本 CLI 的 PII 列集上 —— 必须拒绝。但「缺表」有两大类成因：
+    //   · 空库（零表）→ store init 可补建；
+    //   · 他人库（有表无 schema_version）→ store init 会再次失败，需换 --db 路径。
     const mod = (await import('@duckdb/node-api')) as unknown as {
       DuckDBInstance: {
         create: (p: string, o?: unknown) => Promise<{
@@ -463,7 +465,9 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(await queryCommand(['--sql', 'SELECT * FROM alien', '--db', alien])).toBe(1)
     e = errorOf()
     expect(e.kind).toBe('store_not_initialized')
-    expect(String(e.hint)).toMatch(/store init/)
+    expect(String(e.message)).toMatch(/缺表/)
+    expect(String(e.hint)).not.toMatch(/store init/)
+    expect(String(e.hint)).toMatch(/换 --db 路径/)
   })
 
   it('库不存在 → store_not_initialized 退出码 1 + hint 指 store init', async () => {
@@ -571,6 +575,20 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toMatch(/该表无数据/)
     expect(warnings[0]).toMatch(/sync run/)
+  })
+
+  it('空表 + 缺列漂移 → 两条警告并存，缺列不吞「表无数据」（CodeRabbit inline minor）', async () => {
+    await seed()   // robot_summary 无数据
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try { await s.query('ALTER TABLE "robot_summary" DROP COLUMN "payload"') } finally { await s.close() }
+
+    expect(await qAt('--table', 'robot_summary')).toBe(0)
+    const warnings = meta().warnings as string[]
+    // 缺列说的是 schema、空表说的是数据，两件独立事实都要说。
+    // 旧守卫 `warnings.length === 0` 让前者压掉后者：Agent 会把 0 行误读成缺列的副作用。
+    expect(warnings.some((x) => /库中缺列 payload/.test(x))).toBe(true)
+    expect(warnings.some((x) => /该表无数据/.test(x))).toBe(true)
   })
 
   it('iso-day：--since 9/15 12:00 向下取整后仍包含 stat_date=9/15 零点的行（spec §四 的核心语义）', async () => {

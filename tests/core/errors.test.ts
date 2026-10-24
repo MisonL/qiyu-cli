@@ -1,6 +1,6 @@
 // tests/core/errors.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { classify, redactInternal, type ErrorKind } from '../../src/core/errors.js'
+import { classify, redactInternal, ERROR_KINDS, type ErrorKind } from '../../src/core/errors.js'
 import { fail } from '../../src/output.js'
 
 // ErrorKind 闭集用例要观察 fail() 的 stdout 信封（与 tests/output.test.ts 同款 spy）。
@@ -470,5 +470,69 @@ describe('ErrorKind 闭集（E 组扩展）', () => {
     expect(JSON.parse(out)).toMatchObject({
       ok: false, error: { code: 'query_timeout', kind: 'query_timeout', retryable: false },
     })
+  })
+})
+
+describe('ERROR_KINDS 运行时常量', () => {
+  // 全量清单（20 个，当前版本真正会产出的 kind）—— F 子项目 Task 4。
+  // ⚠️ 必须 `as const`：元素类型要是**字面量联合**，下方
+  // `Exclude<ErrorKind, (typeof ALL)[number]>` 才可能非空（标注成 `readonly string[]`
+  // 会让它恒为 `never`，编译期护栏变成空转）。顺序与 `errors.ts` 的声明顺序一致。
+  const ALL = [
+    'auth', 'auth_missing', 'bad_time', 'param', 'rate_limit', 'module_offline',
+    'window_too_large', 'window_misaligned', 'not_in_queue', 'pending',
+    'route_not_found', 'internal', 'network', 'usage', 'unknown',
+    'needs_confirmation', 'store_locked', 'store_not_initialized',
+    'query_timeout', 'sync_not_run',
+  ] as const
+
+  it('包含当前版本全部会产出的 kind', () => {
+    for (const k of ALL) {
+      expect(ERROR_KINDS, `ERROR_KINDS 少了 ${k}`).toContain(k)
+    }
+  })
+
+  // ⚠️ `ambiguous` 是路线图 **G2（§9.4 名称解析）** 才交付的 kind，当前版本不存在。
+  // `skill check` 拿 ERROR_KINDS 当权威源，所以这里必须反向钉住：
+  // 一旦有人把它加进来，这条会红 —— 而那意味着 skill 正文允许引用一个
+  // 运行时产不出来的 kind，正是本常量要防的事（设计稿 §11.4）。
+  it('不包含尚未实现的 ambiguous（G2 才交付）', () => {
+    expect(ERROR_KINDS).not.toContain('ambiguous')
+  })
+
+  it('无重复', () => {
+    expect(new Set(ERROR_KINDS).size).toBe(ERROR_KINDS.length)
+  })
+
+  it('不多不少 —— 与上面那份清单互为闭集', () => {
+    expect([...ERROR_KINDS].sort()).toEqual([...ALL].sort())
+  })
+
+  // 编译期双向校验（vitest 只转译、不查类型，所以真正的护栏是 `npm run typecheck`）：
+  //   · ALL 多出常量里没有的值 → 下方 `satisfies readonly ErrorKind[]` 报 TS1360；
+  //   · 常量多出 ALL 里没有的值（有人加 kind 却忘了同步这份清单）→ `Unlisted`
+  //     不再是 `never`，`noUnlistedKind: true` 报 TS2322。
+  // ⚠️ 这里**不能**写成 `const ks: readonly ErrorKind[] = ERROR_KINDS` ——
+  // `ErrorKind` 本身就是从 `ERROR_KINDS` 派生的，那种断言永远为真，
+  // 看着像护栏、实际测不到任何漂移（本任务自审时删掉过一次）。
+  //
+  // ⚠️ 本用例**没有运行时断言**，这是有意的（复审 M-3）：真正的判据全在类型层，
+  // 而 vitest 只转译、不查类型 —— 写成 `expect(noUnlistedKind).toBe(true)` 是恒真的
+  // （类型不过就根本不会运行到这一行），正是本仓库反复要消灭的「声明了但没人读」。
+  // 保留一个 `it` 只在类型出错时给出可读的失败位置（typecheck 会指向这里）。
+  it('两份清单在类型层面也互为闭集（判据在类型层，靠 npm run typecheck）', () => {
+    const ks = ALL satisfies readonly ErrorKind[]
+    type Unlisted = Exclude<ErrorKind, (typeof ALL)[number]>
+    const noUnlistedKind: [Unlisted] extends [never] ? true : never = true
+    // 仅为消除未使用变量告警；不是断言。
+    void ks
+    void noUnlistedKind
+  })
+
+  // 数量在**运行时**也有区分度：上面的 `satisfies` 拦不住「两边同时删掉一个」
+  // （ALL 少一个、ERROR_KINDS 也少一个 → 双向闭集仍成立）。这条补住那个方向。
+  it('成员数量为 20（两边同时少一个时仍能发现）', () => {
+    expect(ERROR_KINDS.length).toBe(20)
+    expect(ALL.length).toBe(20)
   })
 })

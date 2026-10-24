@@ -1,6 +1,6 @@
 // src/commands/sync.ts —— D-T12：sync 命令骨架；D-T13：run 子命令挂载；
 // D-T14：status / verify / install / uninstall 四子命令。
-// 骨架沿 store.ts：parseFlags → usageFail/fail 双通道 → thrownToExit 扩展。
+// 骨架沿 store.ts：parseStoreFlags → usageFail/fail 双通道 → thrownToExit 扩展。
 // --pretty 统一裁决（T12 遗留 minor，T13 落地）：沿 api.ts 族——承诺过、未实现的
 // flag 一律 usageFail 显式拒绝（退出码 2），顶层/子命令级/run/tasks 同答，无豁免集。
 //
@@ -16,9 +16,11 @@
 //     `range_status='complete'` 或 `last_synced_at` 非空的行。引擎在窗口执行前就
 //     markPending 落行，所以「有行」不等于「跑通过」：全败的 run 同样留下 pending 行，
 //     按「有行」放行会把调度器装在一个从未成功同步的库上（探测名不副实）。
-//   · store_not_initialized 的 hint 一律指 `qiyu store init`（spec §九：D 交付后
-//     仍指 store init —— `sync run` 首跑虽会自动建库，但「初始化存储」的最小命令是
-//     store init；本文件内三处出口同口径）。
+//   · store_not_initialized 的 hint 按**成因**分流（spec §九 + 架构审查 F1）：`sync run`
+//     首跑虽会自动建库，但「初始化存储」的最小命令是 store init —— 只对「不存在 / 空库」
+//     成立；「路径不是 DuckDB 文件」「他人库（有表无 schema_version）」「依赖未安装」跑
+//     store init 会再次失败，必须指换 --db 路径 / 装依赖，否则 Agent 进
+//     store init → sync 死循环（同步侧的 storeInitFail 保留底层 hint 是同一裁定）。
 // 输出键一律下划线命名（spec §七：range_status / gaps_count / local_rows /
 // expected_from_api / state_windows_consistent）——本仓 Agent 契约的统一形态。
 import { homedir } from 'node:os'
@@ -32,13 +34,90 @@ import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
 import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail } from '../output.js'
-import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso } from './sync-run.js'
+import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
 import {
   currentPlatform, runScheduleCommand, planInstall, planUninstall,
 } from '../schedule/install.js'
 import type { Platform } from '../schedule/install.js'
 import type { Store } from '../store/types.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
+import type { CommandSpec, FlagSpec } from './spec-types.js'
+import { STORE_VALUE_FLAG_NAMES } from './store-flags.js'
+
+/** `sync install` 的业务 flag。 */
+const INSTALL_FLAGS: FlagSpec[] = [
+  { name: '--schedule', kind: 'value' },
+  { name: '--yes', kind: 'bool' },
+  ...STORE_FLAGS,
+]
+/** `sync uninstall` 的业务 flag：**只有** `--yes`（见下方 spec 的说明）。 */
+const UNINSTALL_FLAGS: FlagSpec[] = [{ name: '--yes', kind: 'bool' }]
+
+/** `sync tasks` 的 flag：没有业务 flag，`flags` 就是全局那一份。 */
+const TASKS_FLAGS: FlagSpec[] = [...GLOBAL_FLAGS]
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu sync …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ *
+ * ⚠️ `sync run` 的 spec 在这里而不在 `sync-run.ts`：spec 描述的是**命令路径**，而路径的
+ * 分派在 `syncCommand`；`runSyncRun` 只拿到剥掉 `run` 之后的参数。解析器的 flag 常量由
+ * `sync-run.ts` 导出（`RUN_FLAGS`）、这里引用，所以 spec 与解析器仍同源。
+ *
+ * ⚠️ **`sync uninstall` 不列 `STORE_FLAGS`（与 brief 表格的一处刻意偏离）。**
+ * brief 写「照实写上，因为 CLI 接受它们」，但实测并非如此：`syncUninstall` 的解析是
+ * `parseSubFlags(argv, [], ['--yes'])`，`--db` 会落进「未知参数：--db」退出码 2
+ * （`node dist/cli.js sync uninstall --db /tmp/x` 实测）。`sync.ts` 里的存储定位数组
+ * 只被 `storeArgsFor` 用于 **install** 的调度命令透传，uninstall 的 `planUninstall`
+ * 不接存储参数。把不接受的 flag 写进接受集，正是 `skill check` 要防的假阴性
+ * （skill 里写 `qiyu sync uninstall --db …` 会被判合法、实际必失败）——
+ * 所以这里以解析器为准。若将来让 uninstall 也透传存储定位，把 `...STORE_FLAGS` 加回来即可。
+ */
+export const SYNC_SPECS: CommandSpec[] = [
+  { path: ['sync', 'tasks'], flags: TASKS_FLAGS, positionals: [], rejected: REJECTED_FLAGS },
+  {
+    path: ['sync', 'run'],
+    flags: [...GLOBAL_FLAGS, ...RUN_FLAGS],
+    positionals: [{ name: '任务', domain: 'task-ids', repeatable: true }],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['sync', 'status'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [{ name: '任务', domain: 'task-ids', repeatable: true }],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['sync', 'verify'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [{ name: '任务', domain: 'task-ids', repeatable: true }],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['sync', 'install'],
+    flags: [...GLOBAL_FLAGS, ...INSTALL_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['sync', 'uninstall'],
+    flags: [...GLOBAL_FLAGS, ...UNINSTALL_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+]
+
+/**
+ * 解析器用的 flag 名，全部从上面的常量派生，不另写一份。
+ * ⚠️ `sync run` 的解析器在 `sync-run.ts`（它自己从 `RUN_FLAGS` 派生 `RUN_VALUE_FLAGS` /
+ * `RUN_BOOL_FLAGS`），这里的 `SYNC_SPECS` 只引用同一个 `RUN_FLAGS` —— 两侧同源。
+ */
+const STORE_VALUE_FLAGS: string[] = [...STORE_VALUE_FLAG_NAMES]
+const INSTALL_VALUE_FLAGS = valueFlagNames(INSTALL_FLAGS)
+const INSTALL_BOOL_FLAGS = INSTALL_FLAGS.filter((f) => f.kind === 'bool').map((f) => f.name)
+const TASKS_VALUE_FLAGS = valueFlagNames(TASKS_FLAGS)
+const UNINSTALL_BOOL_FLAGS = UNINSTALL_FLAGS.map((f) => f.name)
 
 const USAGE = `用法：qiyu sync <子命令> [参数]
 
@@ -61,7 +140,7 @@ win32=schtasks。安装前置：库已初始化且**至少成功同步过一次*
 range_status=complete 或 last_synced_at 非空的行；全败的 run 只留 pending，不算跑通）。
 `
 
-const KNOWN = new Set(['--help', '-h', '--pretty'])
+const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 // —— 通用 flag 解析（store.ts 同族：值位守卫，--开头算缺值）——
 
@@ -161,10 +240,15 @@ async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?
     const names = await store.tables()
     if (!names.includes('schema_version')) {
       await store.close()
+      // 成因分形（store.ts 同款）：有表无 schema_version 是他人库——store init 会再次
+      // 拒绝（duckdb.ts init 的他人库防线），引导过去就是 store init → sync status 死循环；
+      // 空库（无任何表）才是「init 可补」的成因。
       return { code: fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
+        hint: names.length > 0
+          ? '目标数据库不是本 CLI 创建的，请换 --db 路径'
+          : '空库（无任何表）。请先运行：qiyu store init',
       }) }
     }
     return { store }
@@ -193,7 +277,7 @@ async function syncStatus(argv: string[]): Promise<number> {
   if (help !== null) return help
   let parsed: ParsedFlags
   try {
-    parsed = parseSubFlags(argv, ['--db', '--profile', '--backend'])
+    parsed = parseSubFlags(argv, STORE_VALUE_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
   const tasks = selectTasks(parsed.rest)
   if (typeof tasks === 'number') return tasks
@@ -259,7 +343,7 @@ async function syncVerify(argv: string[]): Promise<number> {
   if (help !== null) return help
   let parsed: ParsedFlags
   try {
-    parsed = parseSubFlags(argv, ['--db', '--profile', '--backend'])
+    parsed = parseSubFlags(argv, STORE_VALUE_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
   const tasks = selectTasks(parsed.rest)
   if (typeof tasks === 'number') return tasks
@@ -357,8 +441,11 @@ async function syncVerify(argv: string[]): Promise<number> {
 
 const RATELIMIT_PREFIX = '__ratelimit__:'
 
-/** install 要透传进调度命令的存储定位参数（修复批 4 #4）。 */
-const STORE_FLAGS = ['--db', '--profile', '--backend'] as const
+/**
+ * install 要透传进调度命令的存储定位参数（修复批 4 #4）。
+ * 名单取自 `STORE_VALUE_FLAGS`（spec 的 `STORE_FLAGS` 派生）——不再本地手写一份。
+ */
+const INSTALL_STORE_PASSTHROUGH: readonly string[] = STORE_VALUE_FLAGS
 
 /**
  * 调度条目的存储定位参数（修复批 4 #4 + 批 6 #1）。
@@ -379,7 +466,7 @@ function storeArgsFor(parsed: ParsedFlags, resolved: { path: string; backend: st
   const args: string[] = []
   const push = (flag: string, value: string): void => { args.push(flag, value) }
   // ① 显式 flag 原样透传（批 4 #4）
-  for (const f of STORE_FLAGS) {
+  for (const f of INSTALL_STORE_PASSTHROUGH) {
     const v = parsed.values[f]
     if (v !== undefined) push(f, v)
   }
@@ -439,7 +526,7 @@ async function syncInstall(argv: string[]): Promise<number> {
   if (help !== null) return help
   let parsed: ParsedFlags
   try {
-    parsed = parseSubFlags(argv, ['--schedule', '--db', '--profile', '--backend'], ['--yes'])
+    parsed = parseSubFlags(argv, INSTALL_VALUE_FLAGS, INSTALL_BOOL_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
   if (parsed.rest.length > 0) return usageFail(`未知参数：${parsed.rest.join(' ')}`)
   const schedule = parsed.values['--schedule']
@@ -520,7 +607,7 @@ async function syncUninstall(argv: string[]): Promise<number> {
   if (help !== null) return help
   let parsed: ParsedFlags
   try {
-    parsed = parseSubFlags(argv, [], ['--yes'])
+    parsed = parseSubFlags(argv, [], UNINSTALL_BOOL_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
   if (parsed.rest.length > 0) return usageFail(`未知参数：${parsed.rest.join(' ')}`)
   const yes = parsed.flags.has('--yes')
@@ -599,7 +686,7 @@ export async function syncCommand(argv: string[]): Promise<number> {
   if (rest.includes('--pretty')) return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
 
   try {
-    const parsed = parseSubFlags(rest, [])
+    const parsed = parseSubFlags(rest, TASKS_VALUE_FLAGS)
     if (parsed.rest.length > 0) return usageFail(`未知参数：${parsed.rest.join(' ')}`)
   } catch (e) { return usageFail((e as Error).message) }
 

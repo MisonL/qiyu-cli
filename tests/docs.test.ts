@@ -79,12 +79,13 @@ describe('readme.test.ts —— C1 追加断言（防文档说假话）', () => 
     const notYet = /尚未实现[\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
     expect(notYet).not.toMatch(/store init/)
   })
-  it('「子项目计数」随交付推进：E 交付后为「前五个」，且不再残留「前两个」', () => {
-    // 该锚最初（C1 组）钉的是「前两个子项目」不动裁决；E 交付后那句话成了不实声明
-    // （同节紧接列出 store/sync/query），审查 Minor 15 改为随事实推进的正锚。
+  it('「子项目计数」随交付推进：F 交付后为「前六个」，且不再残留旧计数', () => {
+    // 该锚最初（C1 组）钉的是「前两个子项目」不动裁决；E 交付后改成「前五个」，
+    // F 交付后再改成「前六个」——同一审查结论：交付推进时这句话必须同步，
+    // 否则它就成了被测试钉死的不实声明。
     const md = read('README.md')
-    expect(md).toMatch(/前五个子项目/)
-    expect(md).not.toMatch(/前两个子项目/)
+    expect(md).toMatch(/前六个子项目/)
+    expect(md).not.toMatch(/前五个子项目/)
   })
 })
 
@@ -199,9 +200,12 @@ describe('修复批 2 文档联动 —— 契约诚实性收口（锚内容不�
     expect(s).toMatch(/`notes`（修复批 2 新增）/)
   })
 
-  it('D spec §九：store_not_initialized 的 hint 口径 = qiyu store init（与 C1 同）', () => {
+  it('D spec §九：store_not_initialized 的 hint 按成因分流（E 期 F1 收窄「一律」）', () => {
     const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
-    expect(s).toMatch(/hint \*\*一律指 `qiyu store init`\*\*/)
+    // 修复批 2 的主体仍在（空库指 store init），但「一律」已被架构审查 F1 推翻：
+    // 他人库 / 非 DuckDB 文件 / 依赖未安装跑 store init 必然再次失败。
+    expect(s).toMatch(/hint \*\*按成因分流\*\*/)
+    expect(s).toMatch(/F1 推翻「一律」/)
   })
 
   it('D spec §八：迁移编号实况（v9 的 G2 两列）已记录', () => {
@@ -209,11 +213,12 @@ describe('修复批 2 文档联动 —— 契约诚实性收口（锚内容不�
     expect(s).toMatch(/v9（sync_state 补 resolved_range_start\/end 两列/)
   })
 
-  it('设计稿 §9.5：hint 口径与 D 交付后同指 store init（不再承诺改指 sync run）', () => {
+  it('设计稿 §9.5：hint 口径按成因分流（空库指 store init，他人库换 --db）', () => {
     const s = read('docs/qiyu-cli-design.md')
     const l = s.split('\n').find((x) => /`kind: "store_not_initialized"`/.test(x)) ?? ''
     expect(l).toMatch(/qiyu store init/)
     expect(l).toMatch(/同口径/)
+    expect(l).toMatch(/F1 收窄/)
   })
 
   it('README 输出契约段：ok 双轨 + sync 输出（resolved_range/gaps/sensitive_columns）', () => {
@@ -406,12 +411,27 @@ describe('CI 工作流 —— 承诺的检查必须真的接在 npm 脚本上', 
     // （注释里说明该约束是允许的；断言只看非注释行）
     const ciCode = ci.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')
     expect(ciCode).not.toMatch(/maxWorkers|fileParallelism|--no-file-parallelism/)
+    // 分片数 CI 必须显式钉成 1：GitHub runner 只有 2 核，分片反而更慢
+    // （每片都要重起 Node + 转换缓存）。这条是**收敛**不是放宽 —— 但它得被钉住，
+    // 否则删掉它就悄悄变慢，而没人会发现 CI 慢了。
+    expect(ciCode).toMatch(/QIYU_TEST_SHARDS:\s*1/)
   })
 
-  it('package.json test 脚本自带单进程限制（CI 复用它的前提）', () => {
+  it('npm test 链上的每一环都自带单进程限制（CI 复用它的前提）', () => {
     const pkg = JSON.parse(read('package.json')) as { scripts: Record<string, string> }
-    expect(pkg.scripts.test).toMatch(/--maxWorkers=1/)
-    expect(pkg.scripts.test).toMatch(/--no-file-parallelism/)
+    // npm test 走固定分片 runner（scripts/test-shards.mjs）。单进程限制因此不在
+    // package.json 那一行字面里，而在 runner 里 —— 断言跟着搬家，但**判据不放宽**：
+    // runner 必须逐字带上 --maxWorkers=1 与 --no-file-parallelism。
+    //
+    // ⚠️ 这条断言护的是 2026-10-05 那次内存耗尽事故：CI 只跑 `npm test`，
+    // 所以并发限制必须烤进这条命令链的任何一环，且不能被环境变量悄悄改掉。
+    expect(pkg.scripts.test).toMatch(/scripts\/test-shards\.mjs/)
+    const runner = read('scripts/test-shards.mjs')
+    expect(runner).toMatch(/--maxWorkers=1/)
+    expect(runner).toMatch(/--no-file-parallelism/)
+    // 分片数必须**固定上限**，不得随 CPU 数放大 —— 「16 核起满 worker」正是事故形态。
+    expect(runner).toMatch(/MAX_SHARDS/)
+    expect(runner).not.toMatch(/cpus\(\)|availableParallelism/)
     expect(pkg.scripts.typecheck).toMatch(/tsc/)
   })
 

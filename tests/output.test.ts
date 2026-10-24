@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { ok, fail, usageFail, describeArgs, sanitizeControlChars } from '../src/output.js'
+import { ok, fail, usageFail, describeArgs, sanitizeControlChars, setSkillWarning } from '../src/output.js'
 
 let out: string
 // ⚠️ 用法错误现在**双通道**（stderr 给人、stdout 给 Agent），所以 err 也要捕获。
@@ -331,5 +331,116 @@ describe('describeArgs —— 错误消息必须指名它抱怨的那个参数',
 
   it('普通参数原样拼接，不加引号也不转义 —— 报错要可直接照抄', () => {
     expect(describeArgs(['--al', 'extra'])).toBe('--al、extra')
+  })
+})
+
+describe('setSkillWarning —— 安装态提示的注入式合并（Task 10）', () => {
+  // ⚠️ `pendingSkillWarning` 是模块级状态：每条用例前后都清掉，否则会污染同文件
+  // 其余用例（它们不期望 meta 里多出 warnings）。
+  beforeEach(() => setSkillWarning(undefined))
+  afterEach(() => setSkillWarning(undefined))
+
+  it('设了提示：ok() 把它并入 meta.warnings，data 与退出码不变', () => {
+    setSkillWarning('skill 已过期')
+    const code = ok({ rows: 1 })
+    const parsed = JSON.parse(out)
+    expect(code, '退出码必须仍是 0 —— 提示不改退出码').toBe(0)
+    expect(parsed.data, 'data 原样 —— 提示不改 data').toEqual({ rows: 1 })
+    expect(parsed.meta.warnings).toEqual(['skill 已过期'])
+  })
+
+  it('meta 已有 warnings 数组：追加而不是覆盖，其余字段原样保留', () => {
+    setSkillWarning('skill 已过期')
+    ok({ a: 1 }, { warnings: ['已有警告'], endpoint: 'ticket.search' })
+    expect(JSON.parse(out).meta).toEqual({
+      warnings: ['已有警告', 'skill 已过期'],
+      endpoint: 'ticket.search',
+    })
+  })
+
+  it('meta 是对象但没有 warnings：新建数组', () => {
+    setSkillWarning('skill 已过期')
+    ok({ a: 1 }, { rows: 2 })
+    expect(JSON.parse(out).meta).toEqual({ rows: 2, warnings: ['skill 已过期'] })
+  })
+
+  it('既有 warnings 是结构化对象数组（api call 形态）：按对象形状追加 kind=skill_drift', () => {
+    // ⚠️ 审查 I3（控制器裁定）：`api call` 的 meta.warnings 是
+    // `{ kind, field?, message }` 对象数组，消费者按 `w.kind` 过滤。往里塞裸字符串
+    // 会让 `w.kind` 变成 undefined —— 提示被静默丢弃。元素形状必须跟随既有数组。
+    setSkillWarning('skill 已过期')
+    ok({ a: 1 }, { warnings: [{ kind: 'body_unknown_field', field: 'foo', message: '未知字段' }] })
+    const warnings = JSON.parse(out).meta.warnings
+    expect(warnings).toHaveLength(2)
+    // 既有元素原样保留
+    expect(warnings[0]).toEqual({ kind: 'body_unknown_field', field: 'foo', message: '未知字段' })
+    // 新元素是对象，带 kind 与 message
+    expect(warnings[1]).toEqual({ kind: 'skill_drift', message: 'skill 已过期' })
+    // 整组同质：每个元素都是非 null 对象（没有混入裸字符串）
+    expect(warnings.every((w: unknown) => typeof w === 'object' && w !== null)).toBe(true)
+  })
+
+  it('既有 warnings 是字符串数组：追加字符串，保持字符串同质', () => {
+    setSkillWarning('skill 已过期')
+    ok({ a: 1 }, { warnings: ['已有警告'] })
+    const warnings = JSON.parse(out).meta.warnings
+    expect(warnings).toEqual(['已有警告', 'skill 已过期'])
+    expect(warnings.every((w: unknown) => typeof w === 'string')).toBe(true)
+  })
+
+  it('既有 warnings 是空数组：按字符串形态追加（无形状可跟随）', () => {
+    setSkillWarning('skill 已过期')
+    ok({ a: 1 }, { warnings: [] })
+    expect(JSON.parse(out).meta.warnings).toEqual(['skill 已过期'])
+  })
+
+  it('不修改调用方传入的 meta 对象（合并是复制出来的新对象）', () => {
+    const meta: { warnings: string[] } = { warnings: ['已有'] }
+    setSkillWarning('提示')
+    ok({ a: 1 }, meta)
+    expect(meta.warnings).toEqual(['已有'])
+  })
+
+  it('未设提示（current / unknown 态）：meta 保持原样，不新建空 meta、不加空 warnings', () => {
+    // ⚠️ 这条守的是「不打扰」：大量现有断言是 toEqual({...})，多一个空 meta
+    // 或空的 warnings 数组都会让它们全红。
+    setSkillWarning(undefined)
+    ok({ a: 1 })
+    expect(JSON.parse(out)).not.toHaveProperty('meta')
+    out = ''
+    ok({ a: 1 }, { rows: 2 })
+    const parsed = JSON.parse(out)
+    expect(parsed.meta).toEqual({ rows: 2 })
+    expect(parsed.meta).not.toHaveProperty('warnings')
+  })
+
+  it('meta 不是对象（字符串 / 数组 / null）：不改动，也不把提示塞进去', () => {
+    setSkillWarning('提示')
+    ok({ a: 1 }, 'meta-is-string')
+    expect(JSON.parse(out).meta).toBe('meta-is-string')
+    out = ''
+    ok({ a: 1 }, ['meta-is-array'])
+    expect(JSON.parse(out).meta).toEqual(['meta-is-array'])
+    out = ''
+    ok({ a: 1 }, null)
+    expect(JSON.parse(out).meta).toBeNull()
+  })
+
+  it('setSkillWarning(undefined) 之后不再出现提示（同一进程内可清除）', () => {
+    setSkillWarning('提示')
+    ok({ a: 1 })
+    expect(JSON.parse(out).meta.warnings).toEqual(['提示'])
+    setSkillWarning(undefined)
+    out = ''
+    ok({ a: 1 })
+    expect(JSON.parse(out)).not.toHaveProperty('meta')
+  })
+
+  it('只影响 ok()：fail() 的错误信封不带提示（错误形态是另一份契约）', () => {
+    setSkillWarning('提示')
+    fail({ code: 'x', kind: 'param', retryable: false, message: 'm' })
+    const parsed = JSON.parse(out)
+    expect(parsed).not.toHaveProperty('meta')
+    expect(parsed.error).not.toHaveProperty('warnings')
   })
 })

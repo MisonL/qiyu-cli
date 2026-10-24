@@ -11,9 +11,10 @@ describe('联动文案（B 上线后不得与事实相反）', () => {
     expect(md).toMatch(/响应体不做校验/)
     expect(md).toMatch(/不要删字段/)               // ⑰ strict 误拒指引
     expect(md).not.toMatch(/第一个子项目/)          // ⑯ 改为「前 N 个子项目」随交付推进
-    // E 交付后由「前两个」改「前五个」（审查 Minor 15：该句曾是不实声明且被本文件当正锚钉死）
-    expect(md).toMatch(/前五个子项目/)
-    expect(md).not.toMatch(/前两个子项目/)
+    // E 交付后由「前两个」改「前五个」，F 交付后再改「前六个」（同一审查结论：该句
+    // 曾是不实声明且被本文件当正锚钉死——所以每交付一个子项目就要同步推进）。
+    expect(md).toMatch(/前六个子项目/)
+    expect(md).not.toMatch(/前五个子项目/)
     expect(md).toMatch(/--no-validate/)            // 命令一览补 flag
   })
   it('验收 23：README 安全段不再无条件说「绝不发出任何请求，直接返回退出码 4」', () => {

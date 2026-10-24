@@ -1,7 +1,7 @@
 // src/commands/db.ts —— E 组查询命令骨架；Task 6：`db tables`（spec §8.1），
 // Task 7：`db describe`（spec §8.2）。
 //
-// 形态沿 store.ts / sync.ts：parseFlags（值位守卫）→ usageFail/fail 双通道 →
+// 形态沿 store.ts / sync.ts：parseStoreFlags（值位守卫）→ usageFail/fail 双通道 →
 // 查询层统一错误出口 thrownToQueryExit。
 //
 // 三条硬约束：
@@ -20,12 +20,37 @@ import { statSync } from 'node:fs'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
+import { timeShapeClauses } from '../query/time-shape.js'
 import { suggestNames, thrownToQueryExit } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
 import type { StoreConfig } from '../store/types.js'
-import { msToShanghaiIso } from '../core/time.js'
+import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
+import { parseStoreFlags } from './store-flags.js'
+import type { StoreFlags } from './store-flags.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import type { CommandSpec } from './spec-types.js'
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu db …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * 值位解析走共享的 `parseStoreFlags`（它从 `STORE_FLAGS` 派生接受集），与这里同源。
+ */
+export const DB_SPECS: CommandSpec[] = [
+  {
+    path: ['db', 'tables'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+  {
+    path: ['db', 'describe'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [{ name: '表', domain: 'tables' }],
+    rejected: REJECTED_FLAGS,
+  },
+]
 
 const USAGE = `用法：qiyu db <子命令> [参数]
 
@@ -38,37 +63,10 @@ const USAGE = `用法：qiyu db <子命令> [参数]
 存储定位：--db / --profile / --backend（store 命令同族）。
 `
 
-const KNOWN = new Set(['--help', '-h', '--pretty'])
+const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 /** PII 提示（设计稿 §6.5 要求 `db tables` / `db describe` 必须携带）。 */
 const PII_NOTICE = '本数据库包含客户 PII；不要将其写入日志或对外报表'
-
-export interface StoreFlags { db?: string; profile?: string; backend?: string }
-
-/**
- * `--db/--profile/--backend` 的值位解析（架构审查 M-2 的互指锚点）。
- * ⚠️ 与 store.ts / stats.ts 的同名函数**逐字相同**（query.ts 的是第四份、语义有意不同
- * ——`FLAG_TOKENS` 值位守卫）。改动这里必须同步那两处，或干脆收成共享模块：
- * 新增共享定位 flag（如 `--config`）时漏改任何一份，那条命令会静默把它当位置参数。
- * 各有命令级测试钉「--db 缺少取值」的形态，漂移会红。
- */
-function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
-  const out: StoreFlags & { rest: string[] } = { rest: [] }
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]
-    if (a === '--db' || a === '--profile' || a === '--backend') {
-      const v = argv[i + 1]
-      // 值位守卫（沿 store.ts）：值位缺失或以 -- 开头 → 报缺值，
-      // 否则 `db tables --db --profile x` 会把 --profile 当路径。
-      if (v === undefined || v.startsWith('--')) throw new Error(`${a} 缺少取值`)
-      if (a === '--db') out.db = v
-      else if (a === '--profile') out.profile = v
-      else out.backend = v
-      i++
-    } else out.rest.push(a)
-  }
-  return out
-}
 
 /**
  * 只读命令的库前置检查（ENOENT / 非普通文件 / 权限三分 → 退出码，否则 null）。
@@ -112,6 +110,11 @@ function piiColumnsOf(t: TableDef): string[] {
  * 时间列的**约定形态**（可注入 SQL 片段，`timeRangeOf` 与 `dirtyTimeValues` 共用同一份
  * ——两处口径一旦分叉，就会出现「算极值时排除、计数时不排除」这种自相矛盾的状态）。
  *
+ * 实现与 `query/table-query.ts` 共用 `query/time-shape.ts` 的同一函数 —— 口径由构造保证，
+ * 不再靠「逐字一致」的注释与字符串相等测试（同一条 README 承诺：「脏值不进 time_range」；
+ * 两处分叉的话，同一条脏库会在 `db tables` 被排除、在 `query --table` 被当成覆盖范围）。
+ * 具体判据与实测约束（F3/F5/gap 2）见该模块头注释。
+ *
  * 两端都锚定（CodeRabbit 终审 minor）：只锚开头会放过 `'2026-10-12garbage'`（它字典序上
  * `g` > `T`，反而赢下 MAX）与只有日期的 `'2026-10-13'`（`msToShanghaiIso` 按 UTC 解析，
  * 输出偏 8 小时）。形态与写路径逐字对应：
@@ -120,23 +123,7 @@ function piiColumnsOf(t: TableDef): string[] {
  * 兼容旧值：允许省略毫秒（`.000` 之外的零毫秒形态在库里也存在）。
  */
 function shapeSqlOf(kind: TimeColumnKind, col: string): string[] {
-  // ⚠️ epoch-ms 也必须有判据（正确性审查 F5）：`TRY_CAST(... AS BIGINT) IS NULL` 只挡
-  // 非数字，`-1`（七鱼「无值」哨兵）、秒级/微秒级误写全部「合法」——会让 time_range
-  // 声称数据从 1970 年开始。写路径对秒级时间戳已有同口径（`n <= 1e11` 丢弃）。
-  if (kind === 'epoch-ms') {
-    const n = `TRY_CAST(${col} AS BIGINT)`
-    return [`${n} > 100000000000`, `${n} <= 8640000000000000`]
-  }
-  const shape = kind === 'iso-day'
-    ? '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
-    : '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
-  // ⚠️ 形态正则之外还要 `TRY_CAST` 可解析（正确性审查 F3）：`'2026-10-14T02:00Z'`
-  // 能过宽松正则，但 `TRY_CAST(... AS TIMESTAMPTZ)` 是 NULL —— 只按正则判会让它
-  // 在 `arg_min` 里被静默踢出 time_range，既不在极值里、也不计入脏值。
-  return [
-    `regexp_matches(${col}, '${shape}')`,
-    `TRY_CAST(${col} AS TIMESTAMPTZ) IS NOT NULL`,
-  ]
+  return timeShapeClauses(kind, col)
 }
 
 /**
@@ -242,18 +229,23 @@ export async function openGuardedSession(
   } catch (e) { return { exit: thrownToQueryExit(e, TABLES) } }
 
   try {
-    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」；
-    // hint 沿 sync.ts openRo 形态：同时指「换 --db 路径」与「qiyu store init」）。
+    // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
     // 口径与实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
-    const sv = await session.run(
-      "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='schema_version'")
-    if (sv.rows.length === 0) {
+    // ⚠️ 成因分形（sync.ts openRo / store.ts 同款）：「有表但无 schema_version」是**他人库**
+    // —— store init 会再次拒绝（duckdb.ts init 的他人库防线），无条件引导过去就是
+    // store init → db tables 死循环；「零表」才是「init 可补」的成因。
+    const tables = await session.run(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
+    const names = tables.rows.map((r) => String(r.table_name))
+    if (!names.includes('schema_version')) {
       await session.close()
       return {
         exit: fail({
           code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
           message: `数据库结构不完整（缺表）：${config.path}`,
-          hint: '目标数据库不是本 CLI 创建的，请换 --db 路径，或先运行：qiyu store init',
+          hint: names.length > 0
+            ? '目标数据库不是本 CLI 创建的，请换 --db 路径'
+            : '空库（无任何表）。请先运行：qiyu store init',
         }),
       }
     }
@@ -265,7 +257,7 @@ export async function openGuardedSession(
 }
 
 async function dbTables(argv: string[]): Promise<number> {
-  // 子命令级次序沿 store.ts：--help 分流 → --pretty 显式拒绝 → parseFlags → 未知参数。
+  // 子命令级次序沿 store.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 未知参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const rawRest = argv.filter((a) => !KNOWN.has(a))
     if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
@@ -274,8 +266,8 @@ async function dbTables(argv: string[]): Promise<number> {
   }
   if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
 
-  let flags: ReturnType<typeof parseFlags>
-  try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+  let flags: ReturnType<typeof parseStoreFlags>
+  try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
   if (flags.rest.length > 0) return usageFail(`未知参数：${flags.rest.join(' ')}`)
 
   const opened = await openGuardedSession(flags)
@@ -393,7 +385,7 @@ function describeColumn(c: ColumnDef): {
 }
 
 async function dbDescribe(argv: string[]): Promise<number> {
-  // 子命令级次序沿 dbTables：--help 分流 → --pretty 显式拒绝 → parseFlags → 位置参数。
+  // 子命令级次序沿 dbTables：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const rawRest = argv.filter((a) => !KNOWN.has(a))
     if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
@@ -402,8 +394,8 @@ async function dbDescribe(argv: string[]): Promise<number> {
   }
   if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
 
-  let flags: ReturnType<typeof parseFlags>
-  try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+  let flags: ReturnType<typeof parseStoreFlags>
+  try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
 
   // 未知 flag（`--bogus`）会落进 rest —— 先按 `-` 前缀挑出来，避免被当成表名。
   const flagish = flags.rest.filter((a) => a.startsWith('-'))

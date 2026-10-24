@@ -1,0 +1,450 @@
+// tests/skill/postinstall.test.ts —— postinstall 尽力而为入口（Task 13）。
+//
+// 契约只有一条：**任何输入都返回 0**。postinstall 是 `npm i -g` 的便利路径，不是
+// 主路径（spec C4：npm 12 / pnpm 12 / bun 默认阻断它；真正的兜底是首次运行检测）。
+// 它一旦以非 0 退出就会阻断整个 npm 安装，所以「不抛、恒 0」比「装成功」重要。
+//
+// 全部注入：`home` 由测试给临时目录，`env` 是显式字面量（**不读 process.env**）——
+// 真实 `~` 与运行本测试时的 npm 环境（`npm test` 自己就会设 `npm_config_*`）都
+// 不参与判定。源目录同样注入：`runPostinstall` 收 `sourceDir` 覆盖，否则走
+// `resolveSkillSourceDir()`（在测试进程里会解析到仓库 src/skill/qiyu）。
+//
+// 用例构成：brief 五条 + 控制者补三条（环境变量通路、幂等、npx 判据优先）+ 审查
+// fix round 1 补四条（I1 force:false 数据保护、M2 相对路径基准 cwd、M3 键名大小写）。
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import {
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { runPostinstall, mainEntry, isEntry } from '../../src/postinstall.js'
+import { defaultEntityDir } from '../../src/skill/paths.js'
+import { npmRelativeBase, resolveEntityDirSources } from '../../src/skill/detect.js'
+
+let home: string
+
+beforeEach(() => {
+  // realpath 归一化：macOS 的 /var → /private/var，否则断言里的路径字符串对不上。
+  home = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-postinstall-')))
+})
+afterEach(() => {
+  rmSync(home, { recursive: true, force: true })
+})
+
+/** 写文件（自动建父目录）。 */
+function write(dir: string, rel: string, content: string): void {
+  const p = join(dir, rel)
+  mkdirSync(dirname(p), { recursive: true })
+  writeFileSync(p, content)
+}
+
+/** 构造一份最小 skill 源目录（内容与真实包内结构无关，只要求可复制）。 */
+function makeSource(): string {
+  const src = join(home, 'pkg-skill')
+  write(src, 'SKILL.md', '# qiyu\n')
+  write(src, 'protocols.md', '协议正文\n')
+  return src
+}
+
+/** 实体目录下是否出现 skill 正文（判定「装了没」）。 */
+function installed(entityDir: string): boolean {
+  return existsSync(join(entityDir, 'SKILL.md'))
+}
+
+describe('runPostinstall', () => {
+  it('brief ①：npm_config_global=true 时执行安装（默认实体目录出现正文）', async () => {
+    const sourceDir = makeSource()
+    const code = await runPostinstall({
+      env: { npm_config_global: 'true', npm_command: 'install' },
+      home,
+      sourceDir,
+    })
+    expect(code).toBe(0)
+    expect(installed(defaultEntityDir(home))).toBe(true)
+  })
+
+  it('brief ②：npm_command=exec 时不安装，只返回提示', async () => {
+    const sourceDir = makeSource()
+    const code = await runPostinstall({
+      env: { npm_command: 'exec' },
+      home,
+      sourceDir,
+    })
+    expect(code).toBe(0)
+    expect(existsSync(join(home, '.agents'))).toBe(false)
+  })
+  it('brief ③：env 为空（pnpm/yarn/bun 无法区分）时不安装、不写任何文件', async () => {
+    const sourceDir = makeSource()
+    const code = await runPostinstall({ env: {}, home, sourceDir })
+    expect(code).toBe(0)
+    // 一个字节都不写：连父目录 ~/.agents 都不该出现。
+    expect(existsSync(join(home, '.agents'))).toBe(false)
+  })
+
+  it('brief ④：源目录不存在时返回提示、不抛', async () => {
+    const code = await runPostinstall({
+      env: { npm_config_global: 'true', npm_command: 'install' },
+      home,
+      sourceDir: join(home, 'does-not-exist'),
+    })
+    expect(code).toBe(0)
+    expect(existsSync(join(home, '.agents'))).toBe(false)
+  })
+
+  it('brief ⑤：任何输入返回 0（含实体路径被文件占用这类安装失败）', async () => {
+    const sourceDir = makeSource()
+    // 让默认实体路径的父链被普通文件占住：installSkill 会抛，postinstall 必须吞掉并返回 0。
+    write(home, '.agents', '我是文件不是目录\n')
+    await expect(runPostinstall({
+      env: { npm_config_global: 'true', npm_command: 'install' },
+      home,
+      sourceDir,
+    })).resolves.toBe(0)
+  })
+
+  it('补 ①：npm_config_qiyu_skill_dir 把实体装到指定路径（环境变量通路）', async () => {
+    const sourceDir = makeSource()
+    const target = join(home, 'custom-entity')
+    const code = await runPostinstall({
+      env: {
+        npm_config_global: 'true',
+        npm_command: 'install',
+        npm_config_qiyu_skill_dir: target,
+      },
+      home,
+      sourceDir,
+    })
+    expect(code).toBe(0)
+    expect(installed(target)).toBe(true)
+    // 默认实体位置不该同时被写（自定义路径优先，不是「两边都装」）。
+    expect(installed(defaultEntityDir(home))).toBe(false)
+  })
+
+  it('补 ①b：环境变量名的大小写/连字符变体同样生效（spec D8）', async () => {
+    const sourceDir = makeSource()
+    const target = join(home, 'custom-entity')
+    // Windows 环境变量名大小写不敏感；npm 对含连字符的键做 `_` 归一化。
+    // 实现先把键转小写再查，`npm_config_qiyu-skill-dir` 因此也能命中。
+    const code = await runPostinstall({
+      env: {
+        npm_config_global: 'true',
+        npm_command: 'install',
+        'npm_config_qiyu-skill-dir': target,
+      },
+      home,
+      sourceDir,
+    })
+    expect(code).toBe(0)
+    expect(installed(target)).toBe(true)
+  })
+
+  it('补 ②：重复调用两次不抛，第二次 status 为 skipped（幂等）', async () => {
+    const sourceDir = makeSource()
+    const env = { npm_config_global: 'true', npm_command: 'install' }
+    await expect(runPostinstall({ env, home, sourceDir })).resolves.toBe(0)
+    const entityDir = defaultEntityDir(home)
+    const before = readdirSync(entityDir).sort()
+    await expect(runPostinstall({ env, home, sourceDir })).resolves.toBe(0)
+    // 第二次什么都不写（installSkill 的幂等命中），文件集合不变。
+    expect(readdirSync(entityDir).sort()).toEqual(before)
+    expect(installed(entityDir)).toBe(true)
+  })
+
+  it('补 ③：npm_command=exec 即便 global=true 也不安装（npx 判据优先）', async () => {
+    const sourceDir = makeSource()
+    // 捕捉 stderr，证明命中的是 **npx 分支**而不是「非全局安装」分支——两条分支都
+    // 不写文件，只断言文件系统分不出判据次序（这条用例的名字承诺的正是次序）。
+    const messages: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages.push(String(chunk))
+      return true
+    })
+    let code: number
+    try {
+      code = await runPostinstall({
+        env: { npm_config_global: 'true', npm_command: 'exec' },
+        home,
+        sourceDir,
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(code).toBe(0)
+    expect(existsSync(join(home, '.agents'))).toBe(false)
+    expect(messages.join('')).toContain('通过 npx 执行')
+  })
+
+  it('审查 M3：env 键名全大写（NPM_CONFIG_GLOBAL）同样命中（spec D8 大小写不敏感）', async () => {
+    const sourceDir = makeSource()
+    const code = await runPostinstall({
+      env: { NPM_CONFIG_GLOBAL: 'true', NPM_COMMAND: 'install' },
+      home,
+      sourceDir,
+    })
+    expect(code).toBe(0)
+    expect(installed(defaultEntityDir(home))).toBe(true)
+  })
+
+  it('审查 I1：重跑不覆盖用户手改的正文（force:false 的数据保护承诺）', async () => {
+    const sourceDir = makeSource()
+    const env = { npm_config_global: 'true', npm_command: 'install' }
+    await runPostinstall({ env, home, sourceDir })
+
+    // 手改实体里的正文（用户加了自己的内容）。
+    const entityDir = defaultEntityDir(home)
+    const edited = '# qiyu\n\n用户手改的正文，绝不能被自动路径覆盖\n'
+    writeFileSync(join(entityDir, 'SKILL.md'), edited)
+
+    // 捕捉 stderr：既要证明「未覆盖」被如实说出来，也要确认没有谎报「已覆盖」。
+    const messages: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages.push(String(chunk))
+      return true
+    })
+    let code: number
+    try {
+      code = await runPostinstall({ env, home, sourceDir })
+    } finally {
+      spy.mockRestore()
+    }
+
+    expect(code).toBe(0)
+    // ① 用户改动原样保留（逐字节）。
+    expect(readFileSync(join(entityDir, 'SKILL.md'), 'utf8')).toBe(edited)
+    // ② 警告如实说明未覆盖。
+    expect(messages.join('')).toContain('未覆盖')
+  })
+
+  // —— 审查 B3 / #58：postinstall 的输出也要带上「零链接」提示 ——
+  it('审查 B3：装了 Agent 但没有 skills 子目录 → postinstall 输出提示建链方法', async () => {
+    const sourceDir = makeSource()
+    mkdirSync(join(home, '.claude'), { recursive: true }) // 装了 Agent，没建过 skills
+    const messages: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages.push(String(chunk))
+      return true
+    })
+    let code: number
+    try {
+      code = await runPostinstall({
+        env: { npm_config_global: 'true', npm_command: 'install' },
+        home,
+        sourceDir,
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(code).toBe(0)
+    const out = messages.join('')
+    expect(out).toContain('skills 子目录')
+    expect(out).toContain('skill 不会被任何 Agent 加载')
+    // 不替用户创建目录（spec D1）。
+    expect(existsSync(join(home, '.claude', 'skills'))).toBe(false)
+  })
+
+  it('审查 #58：完全没有 Agent 时 postinstall 也说明「不会被加载」', async () => {
+    const sourceDir = makeSource()
+    const messages: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages.push(String(chunk))
+      return true
+    })
+    let code: number
+    try {
+      code = await runPostinstall({
+        env: { npm_config_global: 'true', npm_command: 'install' },
+        home,
+        sourceDir,
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(code).toBe(0)
+    expect(messages.join('')).toContain('skill 不会被任何 Agent 加载')
+  })
+
+  describe('审查 M2：npm_config_qiyu_skill_dir 的路径解析基准', () => {
+    it('相对路径按注入的 cwd 解析（不是进程 cwd）', async () => {
+      const sourceDir = makeSource()
+      const cwd = join(home, 'user-proj')
+      mkdirSync(cwd, { recursive: true })
+      const code = await runPostinstall({
+        env: {
+          npm_config_global: 'true',
+          npm_command: 'install',
+          npm_config_qiyu_skill_dir: 'rel-dir',
+        },
+        home,
+        sourceDir,
+        cwd,
+      })
+      expect(code).toBe(0)
+      expect(installed(join(cwd, 'rel-dir'))).toBe(true)
+      // 实体只落在注入的 cwd 下：若实现退回 `path.resolve(rel)`（进程 cwd 基准），
+      // 上面那条断言就会落空——不必再断言进程 cwd 里的路径，那会在回归时污染仓库根。
+      expect(installed(defaultEntityDir(home))).toBe(false)
+    })
+
+    it('绝对路径不受 cwd 影响', async () => {
+      const sourceDir = makeSource()
+      const abs = join(home, 'absolute-entity')
+      const elsewhere = join(home, 'elsewhere')
+      mkdirSync(elsewhere, { recursive: true })
+      const code = await runPostinstall({
+        env: {
+          npm_config_global: 'true',
+          npm_command: 'install',
+          npm_config_qiyu_skill_dir: abs,
+        },
+        home,
+        sourceDir,
+        // 故意给一个完全无关的 cwd：绝对路径不应该被它拼接。
+        cwd: elsewhere,
+      })
+      expect(code).toBe(0)
+      expect(installed(abs)).toBe(true)
+      // 没有被拼进 cwd 之下。
+      expect(existsSync(join(elsewhere, 'absolute-entity'))).toBe(false)
+    })
+  })
+
+  // —— G3 审查 C3：postinstall 与探测 / 命令层按**同一条基准**解析相对路径 ——
+  describe('G3 审查 C3：与探测层同一条解析（装的位置 = 认的位置）', () => {
+    it('相对 npm_config 在 postinstall 与探测层解析出同一个绝对路径', async () => {
+      // 复现审查 [17]：postinstall 按 INIT_CWD 装到 install-cwd/my-skill，而探测按包根
+      // cwd 算出 pkgroot/my-skill——「装好了却每条命令都说没装」。变异「两处各写一份基准」
+      // → 本用例红。
+      const sourceDir = makeSource()
+      const installCwd = join(home, 'install-cwd')
+      mkdirSync(installCwd, { recursive: true })
+      const pkgRoot = join(home, 'pkgroot')
+      mkdirSync(pkgRoot, { recursive: true })
+      const env = {
+        npm_config_global: 'true',
+        npm_command: 'install',
+        npm_config_qiyu_skill_dir: './my-skill',
+        INIT_CWD: installCwd,
+      }
+      // `mainEntry` 的 `cwd` 代表进程 cwd（npm 生命周期里是包根）。
+      expect(await mainEntry({ env, home, sourceDir, cwd: pkgRoot })).toBe(0)
+      expect(installed(join(installCwd, 'my-skill'))).toBe(true)
+      // 探测层（生产语义，同一份 env）认的必须是**同一个**目录。
+      const probe = resolveEntityDirSources({ env: { ...env, VITEST: undefined }, baseDir: npmRelativeBase(env, () => pkgRoot) })
+      expect(probe).toMatchObject({ decided: true, dir: join(installCwd, 'my-skill') })
+    })
+
+    it('postinstall 不吃测试门：npm test（VITEST/NODE_ENV=test）下仍然执行安装', async () => {
+      // postinstall 的 env 由 npm 给，npx/全局判据已经挡过测试借用场景；若它也吃测试门，
+      // 本仓库测试永远覆盖不到安装分支。变异「testGate 缺省（true）」→ 本用例红
+      //（entityDir 变成 undefined，装到默认位置而不是 npm_config 指定的位置）。
+      const sourceDir = makeSource()
+      const target = join(home, 'npm-under-test')
+      const code = await runPostinstall({
+        env: { npm_config_global: 'true', npm_command: 'install', npm_config_qiyu_skill_dir: target, NODE_ENV: 'test', VITEST: 'true' },
+        home,
+        sourceDir,
+      })
+      expect(code).toBe(0)
+      expect(installed(target)).toBe(true)
+    })
+  })
+
+  // —— 复审 N1/N3：入口接线（mainEntry） ——
+  //
+  // 上面所有用例都直接调 `runPostinstall`，入口段（取 `INIT_CWD ?? process.cwd()`
+  // 并兜住异常）零覆盖——复审实测「入口去掉 `INIT_CWD ??`」与「去掉 catch」两类
+  // 变异在旧测试上存活。这里直接钉 `mainEntry`（入口唯一做的事就是调它）。
+  describe('入口接线 mainEntry（复审 N1/N3）', () => {
+    it('INIT_CWD 优先于进程 cwd 作为相对路径基准（入口真的把它传下去了）', async () => {
+      const sourceDir = makeSource()
+      const userProj = join(home, 'user-proj')
+      mkdirSync(userProj, { recursive: true })
+      const code = await mainEntry({
+        env: {
+          npm_config_global: 'true',
+          npm_command: 'install',
+          npm_config_qiyu_skill_dir: 'rel-dir',
+          INIT_CWD: userProj,
+        },
+        home,
+        sourceDir,
+        // 进程 cwd 故意给一个无关目录：若入口只传 process.cwd()，落点会错。
+        cwd: join(home, 'wrong-base'),
+      })
+      expect(code).toBe(0)
+      expect(installed(join(userProj, 'rel-dir'))).toBe(true)
+    })
+
+    it('INIT_CWD 缺失时退回注入的进程 cwd', async () => {
+      const sourceDir = makeSource()
+      const base = join(home, 'proc-cwd')
+      mkdirSync(base, { recursive: true })
+      const code = await mainEntry({
+        env: {
+          npm_config_global: 'true',
+          npm_command: 'install',
+          npm_config_qiyu_skill_dir: 'rel-dir',
+        },
+        home,
+        sourceDir,
+        cwd: base,
+      })
+      expect(code).toBe(0)
+      expect(installed(join(base, 'rel-dir'))).toBe(true)
+    })
+
+    it('取 cwd 失败也退 0（复审 N1：异常不得漏出入口）', async () => {
+      const sourceDir = makeSource()
+      // 注入一个「取 cwd 就抛」的场景：不给 cwd、也不给 INIT_CWD，并把进程 cwd
+      // 临时删掉——process.cwd() 会抛 ENOENT。用 chdir 到临时目录再删除它来构造。
+      const doomed = join(home, 'doomed')
+      mkdirSync(doomed, { recursive: true })
+      const before = process.cwd()
+      process.chdir(doomed)
+      rmSync(doomed, { recursive: true, force: true })
+      try {
+        const code = await mainEntry({
+          env: { npm_config_global: 'true', npm_command: 'install' },
+          home,
+          sourceDir,
+          // 不传 cwd：逼入口走 process.cwd()，此时它必抛。
+        })
+        expect(code).toBe(0)
+      } finally {
+        process.chdir(before)
+      }
+    })
+  })
+
+  // —— D3.11：入口守卫 `isEntry()` 的两条分支 ——
+  //
+  // 病根：`if (isEntry()) { process.exitCode = await mainEntry(...) }` 这条接线此前零覆盖，
+  // 两条分支各自删掉都不会有红。注入 `argv` / `moduleUrl` 之后可以不 spawn 子进程
+  // 就把两条分支各钉一条（spawn 真进程会跑真实 home，违反硬约束）。
+  describe('D3.11：入口守卫 isEntry 的两条分支', () => {
+    it('argv[1] 就是本模块 → true（mainEntry 会被执行的那一支）', () => {
+      // 变异「isEntry 恒 false」→ 本用例红。
+      const selfPath = fileURLToPath(import.meta.url)
+      expect(isEntry([process.execPath, selfPath], import.meta.url)).toBe(true)
+      // realpath 归一化：macOS 的 /var → /private/var，符号链接写法也要判真。
+      const viaSymlinkBase = realpathSync(dirname(selfPath))
+      expect(isEntry([process.execPath, join(viaSymlinkBase, basename(selfPath))], import.meta.url)).toBe(true)
+    })
+
+    it('argv[1] 是别的文件 / 缺失 → false（mainEntry 不被执行、进程启动不改 exitCode）', () => {
+      // 变异「isEntry 恒 true」或「去掉 argv[1] 判空」→ 本用例红。
+      const other = join(home, 'somewhere-else.mjs')
+      write(other, '', '')
+      expect(isEntry([process.execPath, other], import.meta.url)).toBe(false)
+      expect(isEntry([process.execPath], import.meta.url)).toBe(false)
+      expect(isEntry([process.execPath, ''], import.meta.url)).toBe(false)
+      // 路径不存在（realpathSync 抛 ENOENT）也必须收敛成 false，不向上抛。
+      expect(() => isEntry([process.execPath, join(home, 'nope.mjs')], import.meta.url)).not.toThrow()
+      expect(isEntry([process.execPath, join(home, 'nope.mjs')], import.meta.url)).toBe(false)
+      // 模块 URL 不匹配（被别的入口 import）→ false。
+      expect(isEntry([process.execPath, other], 'file:///definitely/other.js')).toBe(false)
+    })
+  })
+})

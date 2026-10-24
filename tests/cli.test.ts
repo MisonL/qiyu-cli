@@ -1,5 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { run } from '../src/cli.js'
+// 版本常量从 `core/edition.ts` 取（唯一定义点）：断言对**同一个常量**，
+// 单一事实源 —— 源码里数值若被改动，断言跟着改的就是那一处，不会出现测试
+// 与实现的字面量各抄一份、改一处忘另一处。⚠️ 它**不**保护构建期覆写
+// （Task 13 只改 `dist/core/edition.js`，而测试导入的是 `src/core/edition.ts`）；
+// 「构建产物非占位」由 Task 13 的产物级测试钉住。
+import { PACKAGE_VERSION } from '../src/core/edition.js'
+import { resetSkillDetectionCache } from '../src/skill/detect.js'
+import { setSkillWarning } from '../src/output.js'
 
 let out = ''
 let err = ''
@@ -336,5 +347,150 @@ describe('store 子命令注册', () => {
     vi.spyOn(process.stdout, 'write').mockImplementation((s) => { o += s; return true })
     await run(['--help'])
     expect(o).toMatch(/\[--backend <name>\]/)
+  })
+})
+
+describe('qiyu --version（Task 12，spec D6）', () => {
+  // 为什么 Agent 需要它：已安装的 skill 正文与 CLI 可能**不配套**（skill 是
+  // 单独安装的副本）。`skill_contract_version` 是正文契约的版本号，Agent 拿它
+  // 与 skill 里声明的期望值比对，才能判断手上的正文能不能配这份 CLI。
+  // 输出走 `ok()` 而非裸文本：全局约束只给 `--help` 开了裸文本的口子。
+  it('--version → 0，stdout 是 { ok:true, data:{ version, skill_contract_version } }', async () => {
+    expect(await run(['--version'])).toBe(0)
+    const parsed = JSON.parse(out)
+    expect(parsed.ok).toBe(true)
+    // 键名逐字钉住（Agent 契约的一部分）：改名等于把能力对 Agent 关掉。
+    expect(parsed.data).toEqual({
+      version: PACKAGE_VERSION,
+      skill_contract_version: 1,
+    })
+    expect(typeof parsed.data.version).toBe('string')
+    expect(parsed.data.skill_contract_version).toBe(1)
+    // 版本查询是成功输出，不该在 stderr 留任何东西。
+    expect(err).toBe('')
+  })
+
+  it('--version 不吞额外参数 —— 未知 flag 必须点名（纪律与 --help 一致）', async () => {
+    expect(await run(['--version', '--bod'])).toBe(2)
+    // stderr 给人读、stdout 给 Agent 读，两个通道都要点名 `--bod`。
+    expect(err).toContain('未知参数：--bod')
+    expect(err).toContain('--version 不接受额外参数')
+    expect(JSON.parse(out).error.message).toContain('--bod')
+  })
+
+  it('--version --help 仍给版本 JSON（不开第二个裸文本输出口）', async () => {
+    // 裁定：`--help`/`-h`/`--pretty` 是 --version 的合法附带 token，但带了
+    // `--help` 也输出**版本 JSON**，而不是 USAGE 裸文本 —— 全局约束只允许
+    // 裸文本 `--help` 这一处例外，`qiyu --version --help` 不是那处例外。
+    expect(await run(['--version', '--help'])).toBe(0)
+    const parsed = JSON.parse(out) // 不抛即「合法 JSON」
+    expect(parsed.ok).toBe(true)
+    expect(parsed.data.skill_contract_version).toBe(1)
+  })
+
+  it('-v 不是 --version 的短别名（保持「未知子命令」退出码 2）', async () => {
+    // brief 明确不引入短别名（避免与未来的 -v 冲突）。这条钉住"将来别顺手加"。
+    expect(await run(['-v'])).toBe(2)
+    expect(err).toContain('未知子命令')
+  })
+
+  it('--version --pretty 仍返回 0（豁免清单与 --help 逐字一致）', async () => {
+    // 裁定 1：`--pretty` 是**合法 flag**（承诺过、未实现），不是"额外参数" ——
+    // 与 `--help --pretty` 同答。没有这条断言时，从豁免清单里删掉 `'--pretty'`
+    // 会让 `qiyu --version --pretty` 从 0 变成 2，而整个测试文件仍全绿（审查 M3）。
+    expect(await run(['--version', '--pretty'])).toBe(0)
+    expect(JSON.parse(out).ok).toBe(true)
+    expect(err).toBe('')
+  })
+
+  it('顶层 USAGE 必须列出 --version —— 帮助里看不到的能力等于不存在', async () => {
+    expect(await run(['--help'])).toBe(0)
+    expect(out).toContain('--version')
+  })
+})
+
+describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）', () => {
+  // ⚠️ 为什么必须单独测：`--version` 走 `ok()` 的目的之一，是让 skill 安装态提示
+  // （Task 10，spec D2.1）能经 `meta.warnings` 合并进版本输出。但本文件其余用例
+  // 全跑在 `NODE_ENV=test` 且未设 `QIYU_SKILL_DIR` 下，探测被门挡掉、`meta` 永远
+  // 不出现 —— 于是「把 `return ok(...)` 改成直写 stdout」这种回退在全量 1365 个
+  // 用例下都绿，提示会从 `--version` 静默消失（审查 I1 实测的变异 8）。
+  // 这里显式设 `QIYU_SKILL_DIR` 打开探测（只碰临时目录，绝不读写真实 `~`）。
+  let home = ''
+  let entity = ''
+
+  beforeEach(() => {
+    // macOS 上 `/var` 指向 `/private/var`：realpath 归一化后路径字符串才稳定可比。
+    home = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-version-')))
+    entity = join(home, 'entity')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    setSkillWarning(undefined)
+    // 探测按参数元组缓存；上一个用例的结论不能漏到这一个。
+    resetSkillDetectionCache()
+  })
+  afterEach(() => {
+    vi.unstubAllEnvs()
+    setSkillWarning(undefined)
+    resetSkillDetectionCache()
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('实体目录不存在 → 0，data 不变，meta.warnings 提示未安装', async () => {
+    vi.stubEnv('QIYU_SKILL_DIR', join(entity, 'missing'))
+    expect(await run(['--version'])).toBe(0)
+    const parsed = JSON.parse(out)
+    // 提示只加在 meta 上：data 的形状与内容一个字都不能变（Task 10 的「只提示、
+    // 绝不改退出码、绝不改 data」不变量）。
+    expect(parsed.data).toEqual({ version: PACKAGE_VERSION, skill_contract_version: 1 })
+    expect(parsed.meta.warnings[0]).toContain('未安装')
+    expect(err).toBe('')
+  })
+
+  // —— G3 追加审查 [21] / [57]：测试门的两侧与「不静默」 ——
+  it('[21] 宿主 npm_config_qiyu_skill_dir + NODE_ENV=test + 未设 QIYU_SKILL_DIR → 不读宿主路径', async () => {
+    // 变异「npm_config 分支排在测试门之前」→ 本用例红（meta.warnings 出现「未安装到宿主路径」）。
+    // 现实中 CI 机器的 `.npmrc` 里配了 `qiyu-skill-dir` 就会经 npm_config_* 注入所有子进程。
+    vi.stubEnv('NODE_ENV', 'test')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    vi.stubEnv('npm_config_qiyu_skill_dir', join(home, 'host-npm-entity'))
+    expect(await run(['--version'])).toBe(0)
+    const parsed = JSON.parse(out)
+    expect(parsed.ok).toBe(true)
+    expect('meta' in parsed, '宿主 npm_config 不得泄进测试进程').toBe(false)
+    expect(out).not.toContain('host-npm-entity')
+  })
+
+  it('[21] VITEST=true（NODE_ENV 被改成 production）同样挡掉宿主 npm_config', async () => {
+    // 变异「looksLikeNodeTest 去掉 VITEST」→ 本用例红。vitest 恒设 VITEST=true。
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('VITEST', 'true')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    vi.stubEnv('npm_config_qiyu_skill_dir', join(home, 'host-npm-entity'))
+    expect(await run(['--version'])).toBe(0)
+    expect('meta' in JSON.parse(out)).toBe(false)
+  })
+
+  it('[57] QIYU_DISABLE_SKILL_PROBE 显式关闭 → 不静默，meta.warnings 说明原因', async () => {
+    // 变异「关闭时不写任何提示」→ 本用例红。用户主动关了探测，得看得见「为什么没提示」。
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('QIYU_DISABLE_SKILL_PROBE', '1')
+    vi.stubEnv('QIYU_SKILL_DIR', '')
+    expect(await run(['--version'])).toBe(0)
+    const parsed = JSON.parse(out)
+    expect(parsed.data).toEqual({ version: PACKAGE_VERSION, skill_contract_version: 1 })
+    expect(parsed.meta.warnings.join('\n')).toContain('QIYU_DISABLE_SKILL_PROBE')
+  })
+
+  it('已安装且与包内一致（current）→ 0，无 meta 键', async () => {
+    vi.stubEnv('QIYU_SKILL_DIR', entity)
+    // 用真实安装命令铺出 current 态（清单的版本与内容哈希都与包内一致）。
+    expect(await run(['skill', 'install', '--dir', entity, '--no-link'])).toBe(0)
+    out = ''; err = ''
+    // 安装前那次探测已按同一组参数缓存了 absent —— 不清缓存这里会读到旧结论。
+    resetSkillDetectionCache()
+    expect(await run(['--version'])).toBe(0)
+    // current 不提示：没有 meta 键（而不是 meta:{warnings:[]}）。
+    expect('meta' in JSON.parse(out)).toBe(false)
+    expect(err).toBe('')
   })
 })

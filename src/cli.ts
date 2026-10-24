@@ -2,13 +2,23 @@
 import { pathToFileURL } from 'node:url'
 import { realpathSync } from 'node:fs'
 import { authCommand } from './commands/auth.js'
-import { fail, usageFail, describeArgs } from './output.js'
+import { fail, usageFail, describeArgs, setSkillWarning, ok } from './output.js'
+import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from './core/edition.js'
+import {
+  detectSkillState, entityUndeterminedNote, npmRelativeBase, resolveEntityDirSources,
+  resolveSkillSourceDir, skillWarning,
+} from './skill/detect.js'
 import { apiCommand } from './commands/api.js'
 import { storeCommand } from './commands/store.js'
 import { syncCommand } from './commands/sync.js'
 import { dbCommand } from './commands/db.js'
 import { queryCommand } from './commands/query.js'
 import { statsCommand } from './commands/stats.js'
+import { skillCommand } from './commands/skill.js'
+// `COMMAND_TREE` 的**权威位置**是 `commands/tree.ts`（worktree 裁定，见那里顶部注释）：
+// 它只 import 各命令模块、不含入口逻辑，将来 `src/skill/check.ts` 从**那里**消费。
+// 本文件 re-export 只是兼容入口（计划原文写的是 `cli.ts` 汇总），免得调用方改路径。
+export { COMMAND_TREE } from './commands/tree.js'
 
 const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   auth: authCommand,
@@ -18,6 +28,9 @@ const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
   db: dbCommand,
   query: queryCommand,
   stats: statsCommand,
+  // skill 是 F 子项目对用户的正式门面（install/check/where 三子命令）。
+  // `commands/skill.ts` 是全仓唯一允许 import `skill/` 的 commands 文件（分层豁免）。
+  skill: skillCommand,
 }
 
 /**
@@ -26,6 +39,11 @@ const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
  * 不能让它落到「未知子命令」分支（实测那会输出「未知子命令：--help」，退出码 2）。
  */
 const USAGE = `用法：qiyu <子命令> [参数]
+
+全局选项：
+  --help, -h               输出本帮助（唯一以裸文本而非 JSON 输出的情形）
+  --version                输出版本 JSON：包版本与 skill 正文契约版本
+                           （Agent 用它判断已安装的 skill 与 CLI 是否配套）
 
 子命令：
   auth whoami              检查凭证是否已配置
@@ -51,6 +69,12 @@ const USAGE = `用法：qiyu <子命令> [参数]
   query --table <表> [--since <时间>] [--until <时间>] [--group-by <列>]
                            受约束查询通道（列白名单、时间列语义化、精确脱敏）
   stats fields <报表表>     指标声明（带出处）+ 本地观测分布 + -1 哨兵
+  skill install [--dir <path>] [--link <agent>]... [--no-link] [--force] [--dry-run]
+                           安装 skill 正文并链接到已存在的 agent 目录
+  skill check [--installed [--dir <path>] | --compare [--dir <path>]]
+                           校验 skill 正文引用与 CLI 契约（有违规退出码 1；
+                           --compare 下内容不一致也算失败）
+  skill where [--dir <path>] 报告实体目录与各 agent 链接状态（只读，不修复）
 
 查询族参数：
   query --limit <n> / --timeout <秒> / --no-mask
@@ -69,6 +93,38 @@ const USAGE = `用法：qiyu <子命令> [参数]
 `
 
 export async function run(argv: string[]): Promise<number> {
+  // —— skill 安装态探测（Task 10，设计稿 D2.1）：只提示，绝不改退出码、data、文件 ——
+  // 每个命令启动时探测一次：装了但过期 / 未装时往 meta.warnings 注入一句提示；
+  // 探测失败（unknown）静默跳过，不影响命令本身。cli.ts 是唯一允许同时 import
+  // output.js 与 skill/ 的入口层，探测经 setSkillWarning 注入而不是让 output.ts
+  // 反向 import skill/（分层红线，Task 14 钉住）。
+  // 实体目录解析走全仓唯一实现（`skill/detect.ts` 的 `resolveEntityDirSources`）：
+  // 显式通道（--dir / QIYU_SKILL_DIR）照常；Node 测试进程里宿主 npm_config 与真实 home
+  // 都不读（测试绝不读写真实 `~`，宿主 `.npmrc` 的 npm_config_* 也不得泄进测试）。
+  // 每次 run() 都显式 setSkillWarning(...)（探测不了就是 undefined）——同一进程内
+  // 多次 run 不残留上一条的提示。
+  //
+  // ⚠️ 门因**显式开关**（QIYU_DISABLE_SKILL_PROBE）关掉时不能静默（G3 追加审查 [57]）：
+  // 用户主动关了探测，就得看得见「为什么没有提示」。而 Node 测试进程这一路**不写**
+  // meta.warnings——那会让每条测试命令都多一条无关警告（审查 [21] 实测的正是这种污染）。
+  // 测试路径的解释由 `qiyu skill where` 给出（排查命令看得见即可）。
+  const entityResolution = resolveEntityDirSources({
+    env: process.env,
+    baseDir: npmRelativeBase(process.env, () => process.cwd()),
+  })
+  const skillEntityDir = entityResolution.decided ? entityResolution.dir : undefined
+  const skillSourceDir = resolveSkillSourceDir()
+  const suppressedNote = !entityResolution.decided && entityResolution.reason === 'env'
+    ? entityUndeterminedNote(entityResolution)
+    : undefined
+  setSkillWarning(
+    skillEntityDir !== undefined && skillSourceDir !== undefined
+      ? skillWarning(
+          detectSkillState(skillEntityDir, skillSourceDir, PACKAGE_VERSION),
+          { entityDir: skillEntityDir, currentVersion: PACKAGE_VERSION },
+        )
+      : suppressedNote,
+  )
   const [sub, ...rest] = argv
   if (sub === '--help' || sub === '-h') {
     // ⚠️ `--help` 不吞额外参数（2026-10-08 修）—— 与叶子命令同一条次序
@@ -87,11 +143,30 @@ export async function run(argv: string[]): Promise<number> {
     process.stdout.write(USAGE)
     return 0
   }
+  // ⚠️ `--version`（Task 12，spec D6）：输出**机器可读**的包版本与 skill 正文
+  // 契约版本。为什么需要它：skill 正文是单独安装的副本，可能与本 CLI 不配套；
+  // Agent 靠 `skill_contract_version` 判断手上的正文能不能配这份 CLI
+  // （键名逐字为 `version` 与 `skill_contract_version`，是 Agent 契约的一部分）。
+  // 额外参数纪律与 `--help` **完全一致**（同一份豁免清单：`--help`/`-h`/`--pretty`
+  // 是合法 token，其余含位置参数一律 2）—— 分派层每条伪命令守同一条规则，
+  // 免得再出现「多带一个 flag 把用法错误静默吞成 0」的旧坑。
+  // ⚠️ `--version --help` 给**版本 JSON** 而不是 USAGE：全局约束只给裸文本
+  // `--help` 开了一个口子，不能开第二个。
+  // 输出走 `ok()`（而非自己写 stdout）：skill 安装态提示要能经 `meta.warnings`
+  // 合并进来，且成功信封的形态由 output.ts 一处统一。
+  if (sub === '--version') {
+    const extra = rest.filter((a) => a !== '--help' && a !== '-h' && a !== '--pretty')
+    if (extra.length > 0) {
+      return usageFail(`未知参数：${describeArgs(extra)}。--version 不接受额外参数`)
+    }
+    return ok({ version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION })
+  }
   // ⚠️ 分派层的 `--pretty` 必须与叶子层同答（2026-10-08 统一）。此前它落到
   // 「未知子命令：--pretty」—— 而 `--pretty` 是**承诺过、只是未实现**的合法 flag
   // （与 ㉖ 在叶子层修的是同一句话），把合法 flag 说成"未知子命令"是同一类事实错误；
   // 且 `qiyu --pretty --help` 此前被静默吞成 2（而 `qiyu api list --pretty --help` 是 0）。
-  // 次序与叶子层逐字一致：**未知/位置 → help → `--pretty`**。
+  // 次序：**未知/位置 → help → version → `--pretty`**（叶子命令没有 --version，
+  // 前两步与叶子层逐字一致；version 只在分派层存在）。
   if (sub === '--pretty') {
     const unknown = rest.filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
     const positional = rest.filter((a) => !a.startsWith('-'))

@@ -1,7 +1,10 @@
 // src/commands/query.ts —— E-T8/T9：`query --sql`（spec §五）与 `query --table`（spec §六）。
 //
-// 形态沿 store.ts / db.ts：parseFlags（值位守卫）→ usageFail/fail 双通道 →
+// 形态沿 store.ts / db.ts：parseStoreFlags（值位守卫）→ usageFail/fail 双通道 →
 // 查询层统一错误出口 thrownToQueryExit。
+//
+// ⚠️ 本文件另有一份自己的 `parseFlags`（下方的 `FLAG_TOKENS` 值位守卫：`--sql` 允许取值
+// 以 `--` 开头的行注释），**不与 store-flags.ts 的 parseStoreFlags 合并** —— 语义有意不同。
 //
 // 三条硬约束：
 //   · 执行只走 `query/sandbox.ts` 的三层只读沙箱（spec §5.1）——本文件不直接触碰
@@ -25,6 +28,38 @@ import {
 import type { BuiltTableQuery } from '../query/table-query.js'
 import { openGuardedSession } from './db.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
+import type { CommandSpec, FlagSpec } from './spec-types.js'
+
+/**
+ * `query` 的业务 flag。`--group-by` 标 `repeatable`：可重复给（每次吃一个值）。
+ * 存储定位三件套直接用 `STORE_FLAGS`（与 `parseStoreFlags` 同一份事实源）。
+ */
+const QUERY_FLAGS: FlagSpec[] = [
+  { name: '--sql', kind: 'value' },
+  { name: '--table', kind: 'value' },
+  { name: '--since', kind: 'value' },
+  { name: '--until', kind: 'value' },
+  { name: '--group-by', kind: 'repeatable' },
+  { name: '--limit', kind: 'value' },
+  { name: '--timeout', kind: 'value' },
+  { name: '--no-mask', kind: 'bool' },
+  ...STORE_FLAGS,
+]
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu query …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * `query` 没有位置参数：表名走 `--table <表>` 的**值位**，不是位置参数。
+ */
+export const QUERY_SPECS: CommandSpec[] = [
+  {
+    path: ['query'],
+    flags: [...GLOBAL_FLAGS, ...QUERY_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+]
 
 const USAGE = `用法：qiyu query <查询方式> [参数]
 
@@ -45,20 +80,21 @@ const USAGE = `用法：qiyu query <查询方式> [参数]
 只接受单条 SELECT / DESCRIBE / SHOW / EXPLAIN；写操作、多语句、文件与网络访问一律被沙箱拦截。
 `
 
-const KNOWN = new Set(['--help', '-h', '--pretty'])
+const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
-/** 值位参数（缺值或值以 `--` 开头 → 报缺值，防止把下一个 flag 当取值）。 */
-const VALUE_FLAGS = new Set([
-  '--sql', '--table', '--since', '--until', '--group-by',
-  '--limit', '--timeout', '--db', '--profile', '--backend',
-])
+/**
+ * 值位参数（缺值或值以 `--` 开头 → 报缺值，防止把下一个 flag 当取值）。
+ * 从 `QUERY_FLAGS` 派生而不是手写：`--db/--profile/--backend` 与 spec 的 `STORE_FLAGS`
+ * 同源，`--group-by` 以 `repeatable` 形态自动落入值位。
+ */
+const VALUE_FLAGS = new Set(valueFlagNames(QUERY_FLAGS))
 
 /**
  * 全部已知 flag token（含布尔 flag 与 help/pretty）。
  * 值位守卫用它区分两件事：「取值恰好是下一个 flag」（真缺值）与
  * 「取值只是以 `--` 开头」（SQL 的行注释，合法输入）。
  */
-const FLAG_TOKENS = new Set([...VALUE_FLAGS, '--no-mask', '--help', '-h', '--pretty'])
+const FLAG_TOKENS = new Set([...VALUE_FLAGS, ...QUERY_FLAGS.map((f) => f.name), ...GLOBAL_FLAG_NAMES])
 
 /**
  * 超时上界 = Node 定时器的最大延迟（2^31−1 ms）。超过它 setTimeout 会**溢出成 1ms**
@@ -345,10 +381,14 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
   // 0 行 ≠ 没有数据（spec §十 / 红线 3）：给了时间过滤而 0 行时附可操作提示。
   if (result.rows.length === 0 && (input.since !== undefined || input.until !== undefined)) {
     warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until))
-  } else if (result.rows.length === 0 && warnings.length === 0) {
+  } else if (result.rows.length === 0) {
     // 没给时间过滤也 0 行：spec §十 把「空表」列为 warnings 的触发条件。
     // 这里必须能区分「表空」与「查询没命中」—— `--table` 通道没有 WHERE 子句（除了时间过滤），
     // 所以 0 行且无时间过滤**只可能**是表里没有行。文案与 `stats fields` 的空表警告同源。
+    // ⚠️ 不看 warnings 是否已有其他条目（CodeRabbit inline minor）：走到这里的其他警告
+    // 只有「库中缺列」漂移（plan.warnings 只在给了时间过滤时非空，那走上一分支）——
+    // 缺列说的是 schema、空表说的是数据，两件独立事实都该说；压掉后者 Agent 会把
+    // 「0 行」误读成缺列的副作用。
     warnings.push('该表无数据；先运行 `qiyu sync run`')
   }
 
@@ -422,7 +462,9 @@ export interface QueryDeps {
 }
 
 export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promise<number> {
-  // 次序沿 store.ts / db.ts：--help 分流 → --pretty 显式拒绝 → parseFlags → 未知参数。
+  // 次序沿 store.ts / db.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 未知参数。
+  // ⚠️ 本文件实际调用的是**自有的** `parseFlags`（语义故意不同：`--sql` 允许取值以 `--`
+  // 开头，见文件头）；这一步在整条次序里的位置与 store.ts 的 parseStoreFlags 相同。
   if (argv.includes('--help') || argv.includes('-h')) {
     // --help 不吞额外参数；--pretty 豁免（同族惯例）。
     // 措辞不用「未知参数」：`--sql` 是已知参数、只是不能与 --help 同时出现（同一条闸门）。

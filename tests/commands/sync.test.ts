@@ -128,6 +128,23 @@ describe('sync 用法', () => {
   })
 })
 
+// 复审 I-3：`sync run` 的「可用：…」整句此前**没有任何运行时断言** —— 有人调换
+// `RUN_FLAGS` 的顺序（历史文案逐字变了）或改分隔符，全量仍绿。这里把整句逐字钉住：
+// 顺序（`--full --since --until --quiet` 交错，不是「先布尔后值位」）与分隔符（空格，
+// 不是「、」）都是 Agent 实际读到的内容，不是实现细节。
+describe('sync run —— 未知 flag 的「可用：」文案（逐字）', () => {
+  it('未知 flag 报出的整句与历史文案逐字一致（顺序 + 空格分隔）', async () => {
+    out = ''; err = ''
+    expect(await syncCommand(['run', '--bogus'])).toBe(2)
+    expect(err).toContain(
+      '未知参数：--bogus。可用：--full --since --until --quiet --db --profile --backend')
+    // stderr 与 stdout JSON 的 message 是同一句（usageFail 双通道）——
+    // 顺带证明这条断言抓到的是**运行时**输出，不是源码文本。
+    expect(JSON.parse(out).error.message).toContain(
+      '未知参数：--bogus。可用：--full --since --until --quiet --db --profile --backend')
+  })
+})
+
 // —— D-T13：sync run ——（mock 网络层 fetch，真库落库；契约沿 spec §七）
 
 /** 形状 A 成功信封（dim/reports 族实测形态）。 */

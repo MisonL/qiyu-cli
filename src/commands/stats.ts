@@ -1,6 +1,6 @@
 // src/commands/stats.ts —— E-T10：`stats fields <table>`（spec §九）。
 //
-// 形态沿 db.ts / query.ts：parseFlags（值位守卫）→ usageFail/fail 双通道 →
+// 形态沿 db.ts / query.ts：parseStoreFlags（值位守卫）→ usageFail/fail 双通道 →
 // 查询层统一错误出口 thrownToQueryExit。
 //
 // 三条硬约束：
@@ -15,7 +15,24 @@ import { METRIC_CATALOG, REPORT_TABLES, declareMetric } from '../query/metric-ca
 import type { MetricDecl } from '../query/metric-catalog.js'
 import { TABLES } from '../store/schema.js'
 import { openGuardedSession } from './db.js'
+import { parseStoreFlags } from './store-flags.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import type { CommandSpec } from './spec-types.js'
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu stats …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * 位置参数的 `report-tables` 域就是 `REPORT_TABLES` 闭集，校验方据此比对正文里的表名。
+ */
+export const STATS_SPECS: CommandSpec[] = [
+  {
+    path: ['stats', 'fields'],
+    flags: [...GLOBAL_FLAGS, ...STORE_FLAGS],
+    positionals: [{ name: '报表表', domain: 'report-tables' }],
+    rejected: REJECTED_FLAGS,
+  },
+]
 
 const USAGE = `用法：qiyu stats <子命令> [参数]
 
@@ -29,7 +46,7 @@ const USAGE = `用法：qiyu stats <子命令> [参数]
 存储定位：--db / --profile / --backend（store 命令同族）。
 `
 
-const KNOWN = new Set(['--help', '-h', '--pretty'])
+const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 /**
  * -1 哨兵（spec §9.2，逐字）。设计稿 §6.2 用 A/B 实测证明：数据充足的 31 天窗口
@@ -39,29 +56,6 @@ const SENTINEL = {
   value: -1,
   meaning: '该窗口或筛选条件没有匹配到数据（设计稿 §6.2 实测：报表面族统一哨兵，厂商未文档化）',
 } as const
-
-interface StoreFlags { db?: string; profile?: string; backend?: string }
-
-// ⚠️ 与 db.ts / store.ts 的 parseFlags **逐字相同**（query.ts 的是第四份、语义有意不同），
-// 另两处各有同款注释互指（架构审查 M-2）。改动必须三处同步，否则新增共享定位 flag 时
-// 某条命令会静默把它当位置参数。
-function parseFlags(argv: string[]): StoreFlags & { rest: string[] } {
-  const out: StoreFlags & { rest: string[] } = { rest: [] }
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]
-    if (a === '--db' || a === '--profile' || a === '--backend') {
-      const v = argv[i + 1]
-      // 值位守卫（沿 db.ts / query.ts）：值位缺失或以 -- 开头 → 报缺值，
-      // 否则 `stats fields x --db --profile y` 会把 --profile 当路径。
-      if (v === undefined || v.startsWith('--')) throw new Error(`${a} 缺少取值`)
-      if (a === '--db') out.db = v
-      else if (a === '--profile') out.profile = v
-      else out.backend = v
-      i++
-    } else out.rest.push(a)
-  }
-  return out
-}
 
 /**
  * 观测 SQL（spec §9.2 原型 SQL，探针 17 实测通过）。
@@ -160,7 +154,7 @@ interface Observed {
 }
 
 async function statsFields(argv: string[]): Promise<number> {
-  // 子命令级次序沿 db.ts：--help 分流 → --pretty 显式拒绝 → parseFlags → 位置参数。
+  // 子命令级次序沿 db.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const extra = argv.filter((a) => !KNOWN.has(a))
     if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)
@@ -169,8 +163,8 @@ async function statsFields(argv: string[]): Promise<number> {
   }
   if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
 
-  let flags: ReturnType<typeof parseFlags>
-  try { flags = parseFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+  let flags: ReturnType<typeof parseStoreFlags>
+  try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
 
   const flagish = flags.rest.filter((a) => a.startsWith('-'))
   if (flagish.length > 0) return usageFail(`未知参数：${flagish.join(' ')}`)

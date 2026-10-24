@@ -1,6 +1,22 @@
 // src/commands/auth.ts
 import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail, describeArgs, EXIT } from '../output.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS } from './spec-types.js'
+import type { CommandSpec } from './spec-types.js'
+
+/**
+ * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu auth …` 是否真的存在。
+ * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * 本文件没有业务 flag：`KNOWN` 直接就是全局那三个。
+ */
+export const AUTH_SPECS: CommandSpec[] = [
+  {
+    path: ['auth', 'whoami'],
+    flags: [...GLOBAL_FLAGS],
+    positionals: [],
+    rejected: REJECTED_FLAGS,
+  },
+]
 
 const AUTH_USAGE = `用法：qiyu auth whoami
 
@@ -113,7 +129,7 @@ export async function authCommand(argv: string[]): Promise<number> {
   //   · `--help`/`-h` 必须在 KNOWN 里，否则 `whoami --help` 会报
   //     「未知参数：--help」—— 正是本条要修的那句事实错误（③）。
   // 此前这里既没有 help 特判、也没有 KNOWN 集合，三条全部落空。
-  const KNOWN = new Set(['--help', '-h', '--pretty'])
+  const KNOWN = new Set(GLOBAL_FLAG_NAMES)
   const unknown = argv.slice(1).filter((a) => a.startsWith('-') && !KNOWN.has(a))
   if (unknown.length > 0) {
     return usageFail(`未知参数：${describeArgs(unknown)}。auth whoami 不接受任何参数`)

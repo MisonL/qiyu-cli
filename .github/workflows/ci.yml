@@ -36,6 +36,19 @@ jobs:
 
       - run: npm run typecheck
 
-      # 单进程限制已在 package.json 的 test 脚本里写死（--maxWorkers=1
-      # --no-file-parallelism），CI 直接复用，不要在这里另传并发参数。
+      # 发布产物门禁（gap 5 / [42]）：npm test 直接 import src/**，构建脚本退化时
+      # （例如 build 只剩 tsc、copy-assets 不再跑）测试仍全绿，发布包却会静默缺
+      # skill 正文、缺 postinstall，且 dist/core/edition.js 带着 0.0.0-dev 占位版本。
+      # 这里对真实 npm 包内容断言（npm pack 会再触发一次 prepare，属幂等重建，
+      # 保证校验的就是本次构建的产物）。
+      # 只在最低版本矩阵项跑：产物内容与 Node 版本无关，三个都跑纯属拖慢 CI。
+      - if: matrix.node-version == '20.12'
+        run: node scripts/check-pack.mjs
+
+      # npm test = 固定分片 runner（scripts/test-shards.mjs）。GitHub runner 只有 2 核，
+      # 分片反而更慢（每片都要重新起 Node + 转换缓存），所以 CI 显式要求单片。
+      # 每片内部仍是 --maxWorkers=1 --no-file-parallelism，事故防护（2026-10-05 内存耗尽）
+      # 一条都没松。
       - run: npm test
+        env:
+          QIYU_TEST_SHARDS: 1
