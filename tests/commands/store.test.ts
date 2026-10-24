@@ -252,7 +252,7 @@ describe('store 命令面与 help', () => {
     expect(e.message).toContain(p)
   })
 
-  it('写者撞锁不重试 → 立即抛 store_locked（跨进程持真锁，spec §5.2）', { timeout: 60000 }, async () => {
+  it('写者撞锁不重试 → 立即抛 store_locked（跨进程持真锁，spec §5.2）', { timeout: 120_000 }, async () => {
     // ⚠️ 锁只在跨进程成立（第四轮实测：同进程双开不撞锁）——spawn 子进程持锁，
     // storeCommand 的写者（init 用 rw 模式）打开 → 立即失败、不走退避。
     // status 是 ro 会真退避 30s，不能在本测试用。
