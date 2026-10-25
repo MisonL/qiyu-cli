@@ -9,6 +9,21 @@
 
 ### 新增
 
+- 契约小件（G1 第一批，2026-10-24）：
+  - 限流错误新增 `retry_strategy: "switch_to_local"` 与 `fallback: "qiyu query --table <表>"` ——
+    仅 `api call` 撞限流且接口非危险、有同步任务映射、本地库文件存在时出现；多表接口在 `hint`
+    点名其余表，并明确「表存在 ≠ 已同步/覆盖窗口」。无映射/探测失败时两个键都不出现，
+    原始限流错误原样返回
+  - `api schema` 输出 `rate_limit` 三态（缺键 = 未登记 / `null` = 实测无限频 / 对象含 `scope`），
+    `RateLimit.scope` 27 行全部 `'endpoint'`（按路径独立，无全局配额实证）
+  - `api list` 输出 `category`（Apifox 文档目录；4 个文档外接口无该键），`EndpointSpec.category`
+    补类型与加载期校验，`field_notes.category` 说明它不是稳定契约
+  - `call()` 的 GET 分支：GET 不带 body 发送（签名 `md5('')`），GET + body 在本地报用法错误
+    （不静默丢弃）；`api call` 侧由 `assertGetHasNoBody` 先行拦截
+- `--pretty` 已实现（G1 第二批，2026-10-24）：输出缩进 JSON（人类可读）。写在具体子命令之后
+  （如 `qiyu api list --pretty`）；用法错误仍是紧凑 JSON。各命令在原「显式拒绝」位置开启开关，
+  错误次序逐字保留；`REJECTED_FLAGS` 清空但 rejected 机制与 `skill check` 的 rejected_flag
+  规则保留
 - `qiyu auth login [--profile <name>]` —— 把**环境变量**里的凭证写入配置文件（G1 第三批）：
   合并保留该 profile 下的 `store`/`robots` 键、原子写（`0700` 目录 + `0600` 临时文件 +
   `rename` 换入）、符号链接拒绝、**绝不回显**凭证。不接受 `--app-key`/`--app-secret`
@@ -20,11 +35,6 @@
 - `auth whoami` 输出补 `source`（`env`/`file`/`mixed` 三态）与 `robots`（配置里的
   robotId → 显示名映射，未校验有效性）；后者是 `sync run` 知识库类目任务的**兜底驱动源**
   （`store.options.knowledgeRobotIds` 优先，向后兼容）
-
-- `--pretty` 已实现（G1 第二批，2026-10-24）：输出缩进 JSON（人类可读）。写在具体子命令之后
-  （如 `qiyu api list --pretty`）；用法错误仍是紧凑 JSON。各命令在原「显式拒绝」位置开启开关，
-  错误次序逐字保留；`REJECTED_FLAGS` 清空但 rejected 机制与 `skill check` 的 rejected_flag
-  规则保留
 
 - 注册表补全至 154 条接口（150 个文档页 + 4 个文档外接口），并新增每接口的 `params/` 参数表。
 - `qiyu api schema <id>` —— 查看接口请求参数表与响应形状

@@ -607,6 +607,22 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
     expect(() => loadSpecs([{ ...base, maxWindowDays: null }])).toThrow(/maxWindowDays/)
   })
 
+  it('category 可选，但存在时必须是非空字符串 —— null 与空串必须在加载时炸', () => {
+    // ⚠️ 与 maxWindowDays 是同一条约定的另一个实例：`api list` 的判据是
+    // `e.category !== undefined`，所以 `null` 会漏到输出层并原样变成
+    // `"category": null`，而 field_notes.category 明写「未输出该键 = 文档页无分组」
+    // —— 三处口径必须一致，否则 Agent 拿到一个既不是字符串、也不是"没有该键"的值。
+    // ⚠️ 空串同理：它是"有分组但名字是空的"，比缺键更坏 —— 缺键至少诚实。
+    // `trim()` 判据还挡住纯空白（`"  "`），它与空串在终端上不可见。
+    expect(() => loadSpecs([{ ...base, category: null }])).toThrow(/category/)
+    expect(() => loadSpecs([{ ...base, category: '' }])).toThrow(/category/)
+    expect(() => loadSpecs([{ ...base, category: '   ' }])).toThrow(/category/)
+    expect(() => loadSpecs([{ ...base, category: 123 }])).toThrow(/category/)
+    // 反向：省略合法（4 个文档外接口没有文档页）、正常值合法
+    expect(() => loadSpecs([base])).not.toThrow()
+    expect(() => loadSpecs([{ ...base, category: '工单系统' }])).not.toThrow()
+  })
+
   it('loadSpecs 的抛错消息不得含 Markdown —— 崩溃栈也是纯文本通道', () => {
     // ⚠️ 同一条规则（"输出给谁看，就按谁的格式写"）的**第三个出口**（2026-10-06 补）：
     // api.test.ts 的两条哨兵守了 help 文本（stdout）与 stderr；而 `loadSpecs` 的
@@ -615,9 +631,9 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
     // 实测缺口：maxWindowDays 的消息里写着 `或**整个省略该键**`，终端上就是字面星号。
     //
     // ⚠️ 逐行按 **throw 点清单**点名（⑳ 的教训），不按"我记得有哪几个" ——
-    // `loadSpecs` 共 **16** 个抛错分支（2026-10-08：`path` 键缺失那条从
-    // "静默放行"改成显式抛错，15 → 16），每行附**期望命中的分支特征**：少了它，
-    // 夹具一旦漂移到别的分支，这一行会拿另一条消息的"无 `**`"结果假通过。
+    // `loadSpecs` 共 **17** 个抛错分支（2026-10-24：G1 补 `category` 存在即校验，
+    // 16 → 17），每行附**期望命中的分支特征**：少了它，夹具一旦漂移到别的分支，
+    // 这一行会拿另一条消息的"无 `**`"结果假通过。
     const without = (k: string) => {
       const o: Record<string, unknown> = { ...base }
       delete o[k]
@@ -638,6 +654,7 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
       ['path 不以 / 开头', [{ ...base, path: 'openapi/x' }], /path 必须是/],
       ['缺 verified', [without('verified')], /verified/],
       ['maxWindowDays 非法（本条的实测来源）', [{ ...base, maxWindowDays: null }], /maxWindowDays/],
+      ['category 非法（2026-10-24 补）', [{ ...base, category: null }], /category/],
       ['入站却标为可调用', [{ ...base, direction: 'inbound', callable: true }], /入站接口/],
       ['envelope 拼错', [{ ...base, envelope: 'E' }], /envelope/],
       ['缺 title', [without('title')], /title/],
