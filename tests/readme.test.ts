@@ -68,13 +68,20 @@ describe('联动文案（B 上线后不得与事实相反）', () => {
     expect(rm).toMatch(/^7\..*~~[^~]*params[^~]*~~[^\n]*✅/m)
     expect(rm).toMatch(/^4\..*~~[^~]*B vs A\/E[^~]*~~[^\n]*✅/m)
   })
-  it('验收 35：CHANGELOG [未发布] 段含 api schema', async () => {
+  it('验收 35：CHANGELOG 当前版本段含 api schema', async () => {
     const cl = read('CHANGELOG.md')
-    // ⚠️ ` [\\s\\S]* ` 会吃到文件末尾 —— 把 api schema 挪到后续版本段断言仍绿。限定在
-    //    「[未发布]」到下一个 `## ` 版本标题之间。
-    expect(cl).toMatch(/\[未发布\][\s\S]*?(?=\n## )/)
-    const start = cl.indexOf('[未发布]')
-    const section = cl.slice(start, cl.indexOf('\n## ', start))
+    // ⚠️ 不钉 `[未发布]` 这个标题字面量（发版时它会改名为 `[0.2.0] - <日期>`，
+    //    钉标题会让断言在发版当天变红，而它真正要守的是「**本版本**段里写了 api schema」）。
+    //    按 package.json 的版本号定位段落；`[未发布]` 优先（开发期）。
+    // ⚠️ 段边界必须收在下一个 `## ` 之前 —— 裸 `[\\s\\S]*` 会吃到文件末尾，
+    //    把 api schema 挪进历史版本段断言也照样绿。
+    const version = (JSON.parse(read('package.json')) as { version: string }).version
+    const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const heading = new RegExp(`## \\[(?:未发布|${escaped})\\]`).exec(cl)
+    expect(heading, 'CHANGELOG 必须有当前版本段（[未发布] 或版本号）').not.toBeNull()
+    const start = heading!.index!
+    const next = cl.indexOf('\n## ', start)
+    const section = cl.slice(start, next === -1 ? undefined : next)
     expect(section).toContain('api schema')
   })
 })
