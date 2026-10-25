@@ -1,7 +1,9 @@
 // src/commands/api.ts
 import { allEndpoints, byId, assertCallable, assertConfirmed } from '../core/registry/index.js'
+import type { EndpointSpec } from '../core/registry/index.js'
 import { resolveCredentials } from '../core/credentials.js'
 import { call } from '../core/http.js'
+import { registeredRateLimit } from '../core/ratelimit.js'
 import type { QiyuError } from '../core/errors.js'
 import type { ParamSpec } from '../core/registry/params.js'
 import type { ValidationOverride } from '../core/registry/validation-overrides.js'
@@ -10,6 +12,7 @@ import { loadParams } from '../core/registry/params.js'
 import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/validate.js'
 import { ok, fail, usageFail, describeArgs, setPretty, EXIT } from '../output.js'
 import { sanitizeMessage } from '../core/sanitize.js'
+import { localFallbackFor } from './local-fallback.js'
 import { GLOBAL_FLAGS, prettyAfterSubcommand, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -234,6 +237,11 @@ function list(argv: string[]): number {
       // 与 `transferHuman` 是精确比较（summary 在 31 天 + 1 毫秒就拒绝）。
       // 按严格形式校验对两族都正确，按向下取整理解则会在 summary 上多取一天并拿到 14004。
       ...(e.maxWindowDays !== undefined ? { max_window_days: e.maxWindowDays } : {}),
+      // ⚠️ category 与 max_window_days 同款：**只在存在时输出**。
+      // 4 个文档外接口（export.session 一族）没有文档页、自然没有分组 ——
+      // 缺失 = 文档页无分组，不是数据缺口。来源是 Apifox 目录（x-apifox-folder），
+      // 厂商调整文档结构时它可能变，不是稳定契约（见 field_notes.category）。
+      ...(e.category !== undefined ? { category: e.category } : {}),
     }))
   // 注册表当前只有 11 条，而完整注册表最终是 154 条（150 文档页 + 4 文档外）。不告诉 Agent 这一点，
   // 它会把这 11 条当成 API 的全部能力，甚至据此判断"某功能不存在"。
@@ -310,6 +318,13 @@ function list(argv: string[]): number {
         '时间跨度上界（天），**按精确比较理解**：必须 `end - start <= max_window_days * 86400000` 毫秒。' +
         '不要按"向下取整"切到 N 天零若干小时 —— 部分接口（robot.statistic.summary）会拒绝。' +
         '未输出该键的接口没有已知上限',
+      // ⚠️ category 的**来源与稳定度**都必须说清：它是 Apifox 文档目录路径，
+      // 不是厂商 API 契约的一部分。不说清，Agent 会把它当稳定枚举去写分支逻辑
+      // （如按 category 前缀选接口），而厂商调一次文档结构就全线失效。
+      category:
+        '文档页所属分组（Apifox 目录路径，如 `工单系统`、`机器人/知识库管理`），' +
+        '**仅供人读/检索，不是稳定契约** —— 厂商调整文档结构时会变。' +
+        '未输出该键 = 文档页无分组（4 个文档外接口），不是数据缺口。不要据此写分支逻辑',
       // ⚠️ **必须说清"没有哪些字段"**（2026-10-05 加）。上面每条都只解释**存在**的
       // 字段，而 Agent 真正会做错的动作是：读到 `id` + `title` 就以为可以据此拼出
       // 一次调用 —— 但注册表**没有** `params`/`responseShape`（见「已知缺口」），
@@ -370,10 +385,32 @@ async function schema(argv: string[]): Promise<number> {
       params, response_shape: file.responseShape,
       ...(ov?.oneOf ? { one_of: ov.oneOf } : {}),
     }
+    // ⚠️ rate_limit 是**三态**（G1 交付，设计稿 §9.1 示例里声明过该字段）：
+    //   · 未登记（undefined）→ **不输出该键**（没测过，说什么都是编的）
+    //   · 显式 null          → 输出 `null`（实测过，确实没有限频）
+    //   · 有限频             → 输出对象（含 scope，见 ratelimit.ts 的类型注释）
+    // 三态不能压成两态：把"没测过"也报成 null 等于谎称实测无限频，
+    // 而 Agent 会据此去掉退避逻辑。`limitFor` 把两者合并成 null（`call()` 要的
+    // 语义），这里必须用 `registeredRateLimit` 区分。
+    const rl = registeredRateLimit(spec.id)
+    if (rl !== undefined) {
+      data.rate_limit = rl === null
+        ? null
+        : { limit: rl.limit, window_seconds: rl.windowSeconds, source: rl.source, scope: rl.scope }
+    }
     return ok(data, {
       endpoint: spec.id,
       ...(spec.note ? { note: spec.note } : {}),
       field_notes: {
+        rate_limit:
+          '本键**三种形态含义不同**：' +
+          '① 不出现该键 = 该接口**未登记**在本地限频表（没测过，不要假定它与 null 同义）；' +
+          '② `null` = 实测过，**确实没有限频**；' +
+          '③ 对象 = 有限频：`limit`（窗口内允许次数）/ `window_seconds`（窗口长度）/ ' +
+          '`source`（`observed` = 对本租户实测 / `doc` = 抄自厂商文档、未实测）/' +
+          '`scope`（当前恒为 `endpoint` = 按路径各自独立；**尚未观测到跨接口共享配额**）。' +
+          '⚠️ 限频桶是**进程内**的，跨 `qiyu api call` 不共享状态 —— 本表只用于告诉调用方' +
+          '「撞上限流后该等多久」，不承诺 CLI 会替你排队',
         has_body_schema: 'true = 本接口有可比对的 body 参数表（body_kind 为 json 且 body 参数数 > 0）；不代表本次请求已校验，也不代表其余 bodyKind。本次校验结果见 api call 的 meta.warnings',
         body_kind: '只有 json 会被 api call 比对字段，其余（none/xml/multipart/text/form）原样透传不校验',
         auto: 'true = 仅对 callable 且 auth 为 checksum 的接口，CLI 自填鉴权 query 参数（appKey/time/checksum）；入站/eventType 接口由回调方提供，不标 auto，调用方不要也不能通过 --body 传',
@@ -577,9 +614,14 @@ async function callOne(argv: string[]): Promise<number> {
   // ⚠️ 命令行已证明合法，现在才谈接口是否存在 / 可调用 / 需确认。
   // 这三者都抛异常，由下方 catch 统一映射退出码（未知 id → usage 2、
   // 不可调用 → usage 2、危险未确认 → needs_confirmation 4）。
+  // ⚠️ spec 提升到 try 外：catch 里的 mapThrownToExit 需要它来判断
+  // 「限流错误要不要附本地 fallback 建议」（G1）。byId 抛错时它仍是 undefined，
+  // 那种错误是 usage，走不到 fallback 分支。
+  let spec: EndpointSpec | undefined
   try {
-    const spec = byId(id)
+    spec = byId(id)
     assertCallable(spec)
+    assertGetHasNoBody(spec, body)
     assertNoValidateStrictConflict(argv)
     const noValidate = argv.includes('--no-validate')
     const strict = argv.includes('--strict')
@@ -662,22 +704,63 @@ async function callOne(argv: string[]): Promise<number> {
       })
     }
     // 已分类的业务/网络错误与其余用法错误共用 mapThrownToExit，避免同族错误两种表现。
-    return mapThrownToExit(e)
+    // spec 传下去用于限流错误的本地 fallback 建议（G1）。
+    return mapThrownToExit(e, spec)
   }
 }
 
 /** 把 catch 到的异常映射为退出码与输出 —— `callOne` 与 `api schema` **共用**的唯一出口（spec §三 :207）。
  *  两类：① 已分类的业务/网络错误（kind!=='usage'）→ 只出 stdout JSON（失败也 classification 直传）；
  *        ② 其余（未知 id、不可调用、校验硬拒、`--no-validate`/`--strict` 冲突等）→ usage 双通道 + 退出码 2。
- *  ⚠️ 不含 needsConfirmation 分支 —— 那是 callOne 独有（schema 不过门禁），由 callOne 在调本函数前先判。 */
-function mapThrownToExit(e: unknown): number {
+ *  ⚠️ 不含 needsConfirmation 分支 —— 那是 callOne 独有（schema 不过门禁），由 callOne 在调本函数前先判。
+ *  ⚠️ `spec` 可选：只有 `callOne` 传（限流错误的本地 fallback 建议需要它，G1）；
+ *     `api schema` 不经过网络层，永远产不出 `rate_limit`，不传。 */
+function mapThrownToExit(e: unknown, spec?: EndpointSpec): number {
   // ⚠️ 用 `Partial<QiyuError>`（src/core/errors.ts:53，`retryAfter` 是 `{seconds,source}` 对象）——
   // 不要写成 `retryAfter: number`（fail() 的入参类型是对象，tsc 会 TS2322 红）。
   const err = e as Partial<QiyuError>
   if (err.kind && err.kind !== 'usage') {
+    // —— 限流 → 本地 fallback 建议（G1 交付；设计稿 §9.1 示例里声明过这两个字段）——
+    //
+    // ⚠️ 只对**非危险接口**给建议：危险接口的调用方要的是写操作，一个本地读的
+    // 表名帮不上忙，反而可能被误读成「本地也能执行这个操作」。
+    // ⚠️ 诚实边界：映射存在 + 库文件存在**只说明「有表可查」**，不承诺表非空、
+    // 也不承诺覆盖调用方要的时间窗 —— hint 里写明先 `db tables` / `sync status` 确认。
+    // 无映射 / 库文件不存在 / 探测失败 → 两个字段都**不输出**（output.test.ts 钉着
+    // 「未提供就不出现键」），原始限流错误原样返回。
+    let retryStrategy: string | undefined
+    let fallback: string | undefined
+    let hint = err.hint
+    if (err.kind === 'rate_limit' && spec && !spec.dangerous) {
+      const fb = localFallbackFor(spec.id)
+      if (fb) {
+        retryStrategy = 'switch_to_local'
+        const [first, ...rest] = fb.tables
+        fallback = `qiyu query --table ${first}`
+        const others = rest.length > 0 ? `（该接口另有本地表：${rest.join('、')}）` : ''
+        // ⚠️ 措辞必须只承诺**实际检查过的事**（CodeRabbit 2026-10-25 实测发现）。
+        // 探测只做了两件：① 该接口在同步任务里有对应表；② 配置指向的路径**是个文件**。
+        // 此前这里写「本地有对应表」，读起来像「那张表确实存在」—— 而把
+        // `QIYU_DB_PATH` 指向一个空文件（或任意普通文件）时本分支照样触发，
+        // 那个库根本没有这张表，`qiyu query --table tickets` 会直接失败。
+        // 探测不去打开库是有意的（打开要加载 DuckDB，与「api call 零 DuckDB」冲突），
+        // 所以正确的做法是**把边界写在明处**，让调用方先自己确认，而不是替它断言。
+        const note =
+          `该接口在同步任务里有本地表映射：${first}${others}。` +
+          '⚠️ 但这里只确认了「配置指向的库文件存在」，**没有打开库、没有确认这些表存在**，' +
+          '更没有确认它们有数据或覆盖你要的时间窗 —— 用之前先跑 `qiyu db tables` 看清单与行数。' +
+          '⚠️ 它还是**整表数据源，不是这次请求的等价替代** —— 不会带上你这次 body 里的任何' +
+          '筛选条件（时间窗、状态、关键字等），拿到的行可能根本不符合你要的条件。' +
+          '要用它请自己补 WHERE 条件（`--sql` 更灵活，`--since`/`--until` 只覆盖时间列）；' +
+          '水位与覆盖范围用 `qiyu sync status` 看。'
+        hint = hint ? `${hint} ${note}` : note
+      }
+    }
     return fail({
       code: err.code ?? 'unknown', kind: err.kind, retryable: err.retryable ?? false,
-      message: err.message ?? String(e), hint: err.hint, retryAfter: err.retryAfter,
+      message: err.message ?? String(e), hint, retryAfter: err.retryAfter,
+      ...(retryStrategy !== undefined ? { retryStrategy } : {}),
+      ...(fallback !== undefined ? { fallback } : {}),
     })
   }
   // 用法错误双通道：fail() 出 stdout JSON，同时手工补 stderr 一条（与 usageFail 的可见性一致）
@@ -697,5 +780,30 @@ export type SchemaParam = ParamSpec & { auto?: true }
 export function assertNoValidateStrictConflict(argv: string[]): void {
   if (argv.includes('--no-validate') && argv.includes('--strict')) {
     throw new Error('--no-validate 与 --strict 不能同时使用 —— 前者完全关闭校验，后者把提示升级为拒绝，两者直接矛盾')
+  }
+}
+
+/**
+ * GET 接口不接受请求体（G1）。抛普通 Error → 退出码 2（usage 双通道）。
+ *
+ * ⚠️ 当前 154 条注册表里**唯一的 GET**（`get_token`）是 `direction: inbound` +
+ * `callable: false`，`assertCallable` 先一步拦下 —— 所以本守卫在生产上不可达，
+ * 由 `api.test.ts` 直测 + `http.test.ts` 的合成 spec 覆盖。如实记录，别读成
+ * "GET 路径已线上实测"。`call()` 里还有一道同判据的守卫（防将来新命令绕过本层）。
+ *
+ * ⚠️ **不要在这条消息里承诺"参数走 query 串"**（2026-10-25 修正，评审发现）：
+ * `api call` 与 `call()` **都没有** query 参数的输入通道，URL 的查询串只由
+ * `signedQuery()` 生成（appKey/time/checksum）。对调用方来说那是一个不存在的能力 ——
+ * 它照做会去找一个没有的 flag。所以消息改成如实说明「目前没有该通道」。
+ * 真要支持时，必须同时交付：`api call` 的 query flag + `call()` 的拼装 + 签名口径
+ * 复核（签名只覆盖 body，query 参数不影响 checksum）+ 真实可调用 GET 的实测。
+ */
+export function assertGetHasNoBody(spec: EndpointSpec, body: unknown): void {
+  if (spec.method === 'GET' && body !== undefined) {
+    throw new Error(
+      `接口 ${spec.id} 是 GET 接口，不接受请求体 —— 去掉 --body。` +
+        '⚠️ 本 CLI **目前没有 GET 的 query 参数通道**（还没有可主动调用的 GET 接口），' +
+        '所以现在无法给它带任何参数；这道守卫是为了将来出现可调用 GET 时不静默丢弃 body',
+    )
   }
 }

@@ -168,6 +168,19 @@ qiyu --version                       包版本 + skill_contract_version
 `local_rate_limit` / `query_error` / `sandbox_blocked` / `query_timeout` / `unknown`）。
 合成词在官方错误码表里查不到；完整清单见 `qiyu --help`。
 
+错误信封还可能有这几个**可选**键（缺省即不出现该键）：
+
+- `retry_after: {seconds, source}` —— 建议等待秒数与它的来源（`observed` 实测 /
+  `doc` 文档值 / `local` 本地令牌桶 / `fallback` 保守兜底）
+- `retry_strategy` + `fallback` —— **只在 `api call` 撞限流、且该接口非危险操作、
+  有对应本地表、本地库文件存在时出现**：`"switch_to_local"` + 一条
+  `qiyu query --table <表>` 命令。⚠️ 表存在**不等于**已同步或覆盖你要的时间窗，
+  先 `qiyu db tables` 看行数、`qiyu sync status` 看水位再采信（`hint` 里也写了这句）
+- `confirm_required` / `confirm_arg` / `risk` / `target` —— 退出码 4 的四件套
+
+`api schema <id>` 的 `data.rate_limit` 是**三态**：不出现该键 = 该接口未登记在本地限频表
+（没测过）；`null` = 实测无限制；对象 = 有限频（含 `scope`，当前恒为 `endpoint`）。
+
 ### 退出码
 
 | 退出码 | 含义 | Agent 该做什么 |

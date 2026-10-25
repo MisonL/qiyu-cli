@@ -8,6 +8,17 @@ export interface RateLimit {
    * 表里混着"文档说 5 分钟"和"实测 30 秒"两类，不标注就无法判断可信度。
    */
   source: 'doc' | 'observed'
+  /**
+   * 限频的作用域。设计稿 §9.1 的示例信封里声明了该字段（G1 交付）。
+   *
+   * ⚠️ **目前只有 `'endpoint'` 一种取值，且全部 27 行都是它** —— 实测 183 次探测
+   * 确认限频按**路径**独立（同一路径 30 秒内连续调用必 14009，跨路径连续调用
+   * 全部成功），从未观测到跨接口共享配额（`'global'`）。保留这个联合类型是为了
+   * 让「将来出现第二种取值」有一个显式落点，而不是让消费方猜。
+   * → **若未来真的实测到 global 限频，必须同时更新本注释、`RATE_LIMITS` 行、
+   *   `ratelimit.test.ts` 的逐行断言与 `api schema` 的 `field_notes.rate_limit`。**
+   */
+  scope: 'endpoint' | 'global'
 }
 
 /**
@@ -23,38 +34,38 @@ export interface RateLimit {
  */
 export const RATE_LIMITS: Record<string, RateLimit | null> = {
   // 10 个报表接口：约 30 秒冷却，按路径各自独立
-  'statistic.overview':            { limit: 1, windowSeconds: 30, source: 'observed' },
-  'statistic.staffworklod':        { limit: 1, windowSeconds: 30, source: 'observed' },
-  'statistic.staffquality':        { limit: 1, windowSeconds: 30, source: 'observed' },
-  'statistic.staffAttendance':     { limit: 1, windowSeconds: 30, source: 'observed' },
-  'statistic.satisfaction.report': { limit: 1, windowSeconds: 30, source: 'observed' },
-  'statistic.performance':         { limit: 1, windowSeconds: 30, source: 'observed' },
-  'statistic.salaryDetail':        { limit: 1, windowSeconds: 30, source: 'observed' },
-  'robot.statistic.summary':       { limit: 1, windowSeconds: 30, source: 'observed' },
-  'ai.statistic.transferHuman':    { limit: 1, windowSeconds: 30, source: 'observed' },
-  'data.overview.session':         { limit: 1, windowSeconds: 30, source: 'observed' },
+  'statistic.overview':            { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'statistic.staffworklod':        { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'statistic.staffquality':        { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'statistic.staffAttendance':     { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'statistic.satisfaction.report': { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'statistic.performance':         { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'statistic.salaryDetail':        { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'robot.statistic.summary':       { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'ai.statistic.transferHuman':    { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
+  'data.overview.session':         { limit: 1, windowSeconds: 30, source: 'observed', scope: 'endpoint' },
 
   // 呼叫坐席/团队历史：实测约 20 秒冷却，超限返回 14402（设计稿 §4.3）
-  'icoutcall.history.seat':        { limit: 1, windowSeconds: 20, source: 'observed' },
-  'icoutcall.history.team':        { limit: 1, windowSeconds: 20, source: 'observed' },
+  'icoutcall.history.seat':        { limit: 1, windowSeconds: 20, source: 'observed', scope: 'endpoint' },
+  'icoutcall.history.team':        { limit: 1, windowSeconds: 20, source: 'observed', scope: 'endpoint' },
 
   // 报表域：ipcc 是 10 次/60 秒滚动窗口（与其余报表的 30 秒不同）
-  'data.overview.ipcc':            { limit: 10, windowSeconds: 60, source: 'observed' },
+  'data.overview.ipcc':            { limit: 10, windowSeconds: 60, source: 'observed', scope: 'endpoint' },
 
   // 知识库取数接口实测也是 14009，且冷却长达数分钟（不是 30 秒）
-  'robot.data.knowledge':          { limit: 1, windowSeconds: 180, source: 'observed' },
+  'robot.data.knowledge':          { limit: 1, windowSeconds: 180, source: 'observed', scope: 'endpoint' },
 
   // 会话导出：创建每 10 秒 6 次；检查无限频
-  'export.session':       { limit: 6, windowSeconds: 10, source: 'observed' },
+  'export.session':       { limit: 6, windowSeconds: 10, source: 'observed', scope: 'endpoint' },
   'export.session.check': null,
 
   // 咨询分类：实测 60 秒
-  'online.session.category.list': { limit: 1, windowSeconds: 60, source: 'observed' },
+  'online.session.category.list': { limit: 1, windowSeconds: 60, source: 'observed', scope: 'endpoint' },
 
   // 知识库：大部分 1/s，详情与规则回答 10/s
-  'ai.knowledge.getCategoryTree':  { limit: 1, windowSeconds: 1, source: 'observed' },
-  'ai.knowledge.search':           { limit: 1, windowSeconds: 1, source: 'observed' },
-  'ai.knowledge.getDetail':        { limit: 10, windowSeconds: 1, source: 'doc' },
+  'ai.knowledge.getCategoryTree':  { limit: 1, windowSeconds: 1, source: 'observed', scope: 'endpoint' },
+  'ai.knowledge.search':           { limit: 1, windowSeconds: 1, source: 'observed', scope: 'endpoint' },
+  'ai.knowledge.getDetail':        { limit: 10, windowSeconds: 1, source: 'doc', scope: 'endpoint' },
 
   // 知识库写接口：限流取自官方字段表（设计稿 §5.4.1），非实测 —— 这 5 个接口
   // 从未被调用过。⚠️ 三个 1/s 的接口（addKnowledge / editKnowledge / deleteKnowledges）
@@ -69,15 +80,15 @@ export const RATE_LIMITS: Record<string, RateLimit | null> = {
   // → 限频表真正约束的是**将来那个批量命令**（单进程内循环调用，如计划 2 的知识库
   //   批量编辑）；对当前的单次 `api call`，它只在"同一个进程内被调用多次"时才生效。
   // 单次 `api call` 撞 14500 时，`call()` 给出的保守 `retryAfter` 才是 Agent 的唯一依据。
-  'ai.knowledge.addKnowledge':             { limit: 1, windowSeconds: 1, source: 'doc' },
-  'ai.knowledge.editKnowledge':            { limit: 1, windowSeconds: 1, source: 'doc' },
-  'ai.knowledge.deleteKnowledges':         { limit: 1, windowSeconds: 1, source: 'doc' },
-  'ai.knowledge.editChannelAnswer':        { limit: 10, windowSeconds: 1, source: 'doc' },
-  'ai.knowledge.editKnowledgeNoSimilars':  { limit: 10, windowSeconds: 1, source: 'doc' },
+  'ai.knowledge.addKnowledge':             { limit: 1, windowSeconds: 1, source: 'doc', scope: 'endpoint' },
+  'ai.knowledge.editKnowledge':            { limit: 1, windowSeconds: 1, source: 'doc', scope: 'endpoint' },
+  'ai.knowledge.deleteKnowledges':         { limit: 1, windowSeconds: 1, source: 'doc', scope: 'endpoint' },
+  'ai.knowledge.editChannelAnswer':        { limit: 10, windowSeconds: 1, source: 'doc', scope: 'endpoint' },
+  'ai.knowledge.editKnowledgeNoSimilars':  { limit: 10, windowSeconds: 1, source: 'doc', scope: 'endpoint' },
 
-  'robot.data.getQuestionsByCategoryName':       { limit: 1, windowSeconds: 1, source: 'observed' },
-  'robot.data.queryStandardByEffectiveQuestion': { limit: 1, windowSeconds: 1, source: 'observed' },
-  'robot.data.queryStandardQuestionList':        { limit: 1, windowSeconds: 1, source: 'observed' },
+  'robot.data.getQuestionsByCategoryName':       { limit: 1, windowSeconds: 1, source: 'observed', scope: 'endpoint' },
+  'robot.data.queryStandardByEffectiveQuestion': { limit: 1, windowSeconds: 1, source: 'observed', scope: 'endpoint' },
+  'robot.data.queryStandardQuestionList':        { limit: 1, windowSeconds: 1, source: 'observed', scope: 'endpoint' },
 
   // 如实测：没有任何限频（设计稿 §7.4 明确列出这 5 个）
   // ⚠️ 显式写 null 而不是省略 —— 省略会退化成"未登记"的默认值，而这两者
@@ -93,6 +104,18 @@ export function limitFor(endpointId: string): RateLimit | null {
   // 必须用 hasOwn —— 否则 'constructor' / 'toString' 会命中原型链上的函数，
   // 返回一个没有 limit 字段的东西，后续取属性得到 undefined 而不是 null。
   return Object.hasOwn(RATE_LIMITS, endpointId) ? RATE_LIMITS[endpointId]! : null
+}
+
+/**
+ * **三态**查询（`api schema` 的消费方）：未登记 → `undefined`；
+ * 登记且实测无限制（显式 null）→ `null`；有限频 → `RateLimit`。
+ *
+ * ⚠️ 不要用它替换 `limitFor`：`call()` 的语义是"未登记与显式 null 都视为不限频"，
+ * 两者合并成 `null` 才是它要的。三态只用于**如实告诉 Agent 这个值是怎么来的** ——
+ * 「没测过」与「测过、确实没有」在审计上是两件事，不能压成一个。
+ */
+export function registeredRateLimit(endpointId: string): RateLimit | null | undefined {
+  return Object.hasOwn(RATE_LIMITS, endpointId) ? RATE_LIMITS[endpointId]! : undefined
 }
 
 /**

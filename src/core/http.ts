@@ -148,6 +148,10 @@ function networkError(e: unknown, creds: Credentials): QiyuError {
  * 真正的网络失败都是 `TypeError`，但前者**没有 `cause`**、后者有
  * （`cause` 是底层 socket 错误，形如 `ECONNREFUSED`）。
  *
+ * ⚠️ G1 起 `call()` 已在入口拦下 GET + body（直接抛 usage），所以这条分支
+ * 不再靠它兜底；保留分类是因为**其他**构造类错误（将来新增的参数拼装缺陷）
+ * 仍是本地用法问题，不能报成网络故障。
+ *
  * ⚠️ 必须把两者分开：构造错误是**本地用法问题**，重试一万次也一样，
  * 而网络失败必须退避重试。此前 `catch` 一律走 `networkError` —— 实测
  * `GET` + body 会被当成网络故障重试 3 次、返回退出码 3（"网络错误"），
@@ -177,6 +181,28 @@ export async function call(
 ): Promise<CallResult> {
   const now = opts.now ?? (() => Date.now())
   const creds = opts.credentials
+  // ⚠️ GET 请求**绝不带 body**（G1 交付）。此前 `call()` 对任何 method 都发
+  // `body: bodyStr`，GET + body 会被 undici 在构造阶段拒掉 —— 分类上兜住了
+  // （见 `isLocalRequestError`），但那是一条**错误驱动的**路径：先构造一个非法
+  // 请求、再靠异常猜原因。现在在入口就把两件事分开：
+  //   · GET + 调用方给了 body → 本地用法错误（静默丢弃会让 Agent 以为 body 生效了）；
+  //   · GET 不带 body → 正常发送，签名用 `md5('')`（`bodyStr ?? ''`，与"不传 body
+  //     的 POST"同一签名口径；这是 2026-10-02 真实凭证实测的约定）。
+  // ⚠️ 当前 154 条注册表里唯一的 GET（`get_token`）是 inbound、不可主动调用，
+  // 所以本分支目前只由合成 spec 的测试覆盖 —— 不要把它读成"线上 GET 已实测"。
+  if (spec.method === 'GET' && body !== undefined) {
+    throw Object.assign(
+      new Error(`接口 ${spec.id} 是 GET 接口，不接受请求体`),
+      { code: 'usage', kind: 'usage', retryable: false,
+        // ⚠️ 不要写「参数走 query 串」—— 本 CLI 没有 GET 的 query 参数通道（评审发现）。
+        // 写到不存在的通道上，调用方会去找一个没有的 flag。如实说明现状。
+        hint: '本 CLI 目前没有 GET 的 query 参数通道；若该接口需要参数，请去掉 body 后重试' + 
+              '（当前注册表里的 GET 接口都不可主动调用，普通调用走不到这里）' },
+    )
+  }
+  // ⚠️ 经上面的守卫，走到这里时 GET 必然无 body —— `buildBody(undefined)`
+  // 返回 undefined，fetch 收到的就是 `body: undefined`，签名口径 `md5('')`。
+  // 不再写 `GET ? undefined : buildBody(body)`：有守卫在，那是恒等分支。
   const bodyStr = buildBody(body)
 
   if (!opts.noRetry && !bucketFor(spec).tryAcquire(now())) {
