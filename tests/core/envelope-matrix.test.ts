@@ -21,8 +21,23 @@ import { fileURLToPath } from 'node:url'
 import { normalize } from '../../src/core/envelope.js'
 import type { EnvelopeShape } from '../../src/core/envelope.js'
 
-/** 本文件显式写过的形状（下面的自检会拿它跟类型定义对照）。 */
-const MATRIX_SHAPES = ['A', 'B', 'C', 'D', 'D-nf'] as const
+/**
+ * 矩阵**实际喂进过 `normalize` 的**形状。
+ *
+ * ⚠️ 这是一个**观测记录**，不是手抄清单：下面每个 `describe` 块的用例都在真正调用
+ * `normalize` 时把形状登记进来。自检只认这里 —— 早先的写法是手抄一份
+ * `MATRIX_SHAPES = ['A','B','C','D','D-nf']` 去跟类型定义比，Sourcery（2026-10-25）
+ * 指出它守不住真正该守的东西：往 `EnvelopeShape` 加一个新形状、再把它抄进
+ * `MATRIX_SHAPES`，自检照样通过，而那个形状的语义**没有任何用例**。观测式登记不会
+ * 有这个问题 —— 没跑过的形状不可能出现在集合里。
+ */
+const EXERCISED = new Set<string>()
+
+/** 带登记地调用 `normalize`：矩阵里所有断言都走这里，保证 `EXERCISED` 反映真实覆盖。 */
+function normalizeIn(raw: unknown, shape?: EnvelopeShape) {
+  if (shape !== undefined) EXERCISED.add(shape)
+  return normalize(raw, shape)
+}
 
 /** 5 种 message 类型 —— 设计稿 §9.0 实测到的全部形态。 */
 const MESSAGES = {
@@ -43,6 +58,9 @@ function envelope(code: unknown, message: unknown, extra: Record<string, unknown
   return o
 }
 
+// ⚠️ `EXERCISED` 是**运行期**登记，所以末尾那条覆盖度自检依赖「前面的用例先跑」。
+// vitest 在同一文件内按声明顺序串行执行 `it`，成立；若哪天把自检挪到前面，
+// 它会因为「一个形状都没登记」而红 —— 这是期望的失败方向（宁可误报，不可漏报）。
 describe('信封矩阵：形状 × message 类型（§12）', () => {
   // ——— 形状 C：数据藏在 message 里的 JSON 字符串 ———
   // 这一族**每个错误也返回 code:200**，所以「message 解析不出 JSON ⇒ 失败」是
@@ -60,13 +78,13 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
       ['integer', '200', true, false],   // '200' 是合法 JSON 数字 —— 载荷就是 200
       ['boolean', 'true', true, false],
     ] as const)('message=%s → ok=%s notFound=%s', (_label, message, ok, notFound) => {
-      const r = normalize(envelope(200, message), 'C')
+      const r = normalizeIn(envelope(200, message), 'C')
       expect(r.ok).toBe(ok)
       expect(r.notFound).toBe(notFound)
     })
 
     it('非 200 的 code 直接失败，message 原样作为 messageText', () => {
-      const r = normalize(envelope(14500, '内部错误'), 'C')
+      const r = normalizeIn(envelope(14500, '内部错误'), 'C')
       expect(r).toMatchObject({ ok: false, code: '14500', payload: undefined })
       expect(r.messageText).toBe('内部错误')
     })
@@ -74,7 +92,7 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
     it('message 缺失 / 非字符串 → 失败，且给出可诊断的 messageText', () => {
       // 没有 message 键时 messageText 是空串，下游错误分类会落到 unknown ——
       // 这正是要显式报告"响应缺少 message"的原因（不是静默成功）。
-      const r = normalize(envelope(200, undefined), 'C')
+      const r = normalizeIn(envelope(200, undefined), 'C')
       expect(r.ok).toBe(false)
       expect(r.messageText).toBe('响应缺少 message')
     })
@@ -87,7 +105,7 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
         ['14004 Not found param: robotId', '14004'],
         ['14009 api call too frequent', '14009'],
       ] as const) {
-        const r = normalize(envelope(200, text), 'C')
+        const r = normalizeIn(envelope(200, text), 'C')
         expect(r.code, text).toBe(expected)
         expect(r.ok).toBe(false)
       }
@@ -95,7 +113,7 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
 
     it('畸形 JSON（整数键未加引号）在严格解析失败后修复，判成功', () => {
       // 实测 session.user.profile 有 47% 的正常响应是这个形态（设计稿 §10.2）。
-      const r = normalize(envelope(200, '{5000004:"张三",5000001:"李四"}'), 'C')
+      const r = normalizeIn(envelope(200, '{5000004:"张三",5000001:"李四"}'), 'C')
       expect(r.ok).toBe(true)
       expect(r.payload).toEqual({ 5000004: '张三', 5000001: '李四' })
     })
@@ -110,7 +128,7 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
       ['empty-array', [], true],
       ['null', null, true],
     ] as const)('data=%s → notFound=%s', (_label, data, notFound) => {
-      const r = normalize(envelope(200, 'OK', { data }), 'A')
+      const r = normalizeIn(envelope(200, 'OK', { data }), 'A')
       expect(r.ok).toBe(true)
       expect(r.notFound).toBe(notFound)
     })
@@ -120,7 +138,7 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
       // 无论它是字符串/对象/数字/布尔/数组，ok 与 notFound 都只由 data 决定。
       // （实测 staff.list 的 message 就是 "OK"；不判 message 类型是刻意的。）
       for (const key of Object.keys(MESSAGES) as MessageKey[]) {
-        const r = normalize(envelope(200, MESSAGES[key], { data: { a: 1 } }), 'A')
+        const r = normalizeIn(envelope(200, MESSAGES[key], { data: { a: 1 } }), 'A')
         expect(r.ok, key).toBe(true)
         expect(r.notFound, key).toBe(false)
       }
@@ -131,7 +149,7 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
       // ⚠️ 传 `undefined` 而不是 `null`：`normalize` 的形参是 `EnvelopeShape | undefined`，
       // 唯一调用点 `http.ts:334` 也是 `spec.envelope ?? undefined` —— null 是调用方
       // 永远造不出的值，拿它当「未登记」的代表会把测试钉在一个不存在的入口上。
-      const r = normalize(envelope(200, 'OK', { data: [] }), undefined)
+      const r = normalizeIn(envelope(200, 'OK', { data: [] }), undefined)
       expect(r.ok).toBe(true)
       expect(r.notFound).toBe(false)
     })
@@ -145,19 +163,19 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
       ['object', { a: 1 }, false],
       ['empty-object', {}, true],
     ] as const)('result=%s → notFound=%s（已实测）', (_label, result, notFound) => {
-      const r = normalize(envelope(200, 'OK', { result, total: 0 }), 'B')
+      const r = normalizeIn(envelope(200, 'OK', { result, total: 0 }), 'B')
       expect(r.ok).toBe(true)
       expect(r.notFound).toBe(notFound)
     })
 
     it('total 不参与判定 —— tag.all 的 total 恒为 0、不可作数', () => {
-      const r = normalize(envelope(200, 'OK', { result: [{ id: 1 }], total: 0 }), 'B')
+      const r = normalizeIn(envelope(200, 'OK', { result: [{ id: 1 }], total: 0 }), 'B')
       expect(r.notFound).toBe(false)
     })
 
     it('message 的 5 种类型都不影响 result 分支', () => {
       for (const key of Object.keys(MESSAGES) as MessageKey[]) {
-        const r = normalize(envelope(200, MESSAGES[key], { result: [1] }), 'B')
+        const r = normalizeIn(envelope(200, MESSAGES[key], { result: [1] }), 'B')
         expect(r.ok, key).toBe(true)
         expect(r.notFound, key).toBe(false)
       }
@@ -172,28 +190,28 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
     //   两者从报文里无从分辨，所以注册表必须分开登记。矩阵必须把这**两种结论都钉住** ——
     //   写成一格（"D 族都不判 notFound"）会把 msgAssociate 的失败报成成功。
     it('形状 D：200 + 无 data → 成功，**不判** notFound（空壳是正常返回）', () => {
-      const r = normalize(envelope(200, 'OK'), 'D')
+      const r = normalizeIn(envelope(200, 'OK'), 'D')
       expect(r).toMatchObject({ ok: true, notFound: false, payload: undefined })
     })
 
     it('形状 D-nf：200 + 无 data → 成功但 **notFound=true**（空报文即查无此物）', () => {
-      const r = normalize(envelope(200, 'OK'), 'D-nf')
+      const r = normalizeIn(envelope(200, 'OK'), 'D-nf')
       expect(r).toMatchObject({ ok: true, notFound: true, payload: undefined })
     })
 
     it('形状 D-nf 有 data 时**不**判 notFound（命中路径）', () => {
-      const r = normalize(envelope(200, 'OK', { data: { content: 'x' } }), 'D-nf')
+      const r = normalizeIn(envelope(200, 'OK', { data: { content: 'x' } }), 'D-nf')
       expect(r).toMatchObject({ ok: true, notFound: false })
     })
 
     it('形状 D 的非 200 code → 失败', () => {
-      const r = normalize(envelope(14515, '权限不足'), 'D')
+      const r = normalizeIn(envelope(14515, '权限不足'), 'D')
       expect(r).toMatchObject({ ok: false, code: '14515' })
     })
 
     it('message 的 5 种类型都不改变形状 D 的结论', () => {
       for (const key of Object.keys(MESSAGES) as MessageKey[]) {
-        const r = normalize(envelope(200, MESSAGES[key]), 'D')
+        const r = normalizeIn(envelope(200, MESSAGES[key]), 'D')
         expect(r.ok, key).toBe(true)
         // 形状 D 上 message 即使能解析成空载荷，也不该判 notFound ——
         // 这类接口「没有数据」是设计如此，不是查无此物。
@@ -211,7 +229,7 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
       ['string', 'OK', true, false],   // ⚠️ 解析失败**不判错**（与形状 C 的关键区别）
       ['integer', '200', true, false],
     ] as const)('message=%s → ok=%s notFound=%s', (_label, message, ok, notFound) => {
-      const r = normalize(envelope(200, message), undefined)
+      const r = normalizeIn(envelope(200, message), undefined)
       expect(r.ok).toBe(ok)
       expect(r.notFound).toBe(notFound)
     })
@@ -220,7 +238,7 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
       // ⚠️ 只有字符串会被试探解析（`typeof o.message === 'string'`）。其余类型
       // 走到"200 但无载荷"的末尾分支 —— 宽松模式下不判 notFound（同 data/result 规则）。
       for (const key of ['json-object', 'integer', 'boolean', 'array'] as const) {
-        const r = normalize(envelope(200, MESSAGES[key]), undefined)
+        const r = normalizeIn(envelope(200, MESSAGES[key]), undefined)
         expect(r.ok, key).toBe(true)
         expect(r.notFound, key).toBe(false)
       }
@@ -231,38 +249,38 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
   describe('特殊形态', () => {
     it('裸数组（无信封）原样作为载荷，不判 notFound', () => {
       // ipcc.customfield.template.get 实测就是裸数组。
-      const r = normalize([{ id: 1 }])
+      const r = normalizeIn([{ id: 1 }])
       expect(r).toMatchObject({ ok: true, code: '200', notFound: false })
       expect(r.payload).toEqual([{ id: 1 }])
     })
 
     it('裸数组为空也不判 notFound（无从得知空数组的语义）', () => {
-      expect(normalize([]).notFound).toBe(false)
+      expect(normalizeIn([], undefined).notFound).toBe(false)
     })
 
     it.each([
       ['Spring 404', { status: 404, timestamp: 1, message: 'Not Found' }, '404'],
     ] as const)('%s 识别为失败，code 取 status', (_label, raw, code) => {
-      const r = normalize(raw)
+      const r = normalizeIn(raw)
       expect(r).toMatchObject({ ok: false, code })
     })
 
     it('带 code 的响应永远不会被当成 Spring 404（`!("code" in o)` 是判别式）', () => {
-      const r = normalize({ code: 200, status: 404, timestamp: 1, message: 'OK', data: { a: 1 } })
+      const r = normalizeIn({ code: 200, status: 404, timestamp: 1, message: 'OK', data: { a: 1 } })
       expect(r.ok).toBe(true)
     })
 
     it.each([
       ['string', 'x'], ['number', 1], ['null', null], ['boolean', true],
     ] as const)('裸标量（%s）判失败，而不是崩在属性访问上', (_label, raw) => {
-      const r = normalize(raw)
+      const r = normalizeIn(raw)
       expect(r.ok).toBe(false)
       expect(r.code).toBe('unknown')
     })
 
     it('staffInfo 分支：空数组是「无人在线」的合法状态，不是 notFound', () => {
       // chat.queue.group.query 实测 24 个组里 15 个是空 staffInfo。
-      const r = normalize({ code: 200, staffInfo: [] })
+      const r = normalizeIn({ code: 200, staffInfo: [] })
       expect(r).toMatchObject({ ok: true, notFound: false })
     })
   })
@@ -270,17 +288,30 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
   // ——— 覆盖度自检 ———
   it('矩阵覆盖了 `EnvelopeShape` 联合类型的**每一个**取值（从源码读，不靠手抄）', () => {
     // ⚠️ 第一版写的是 `expect(['A','B','C','D','D-nf']).toEqual(['A','B','C','D','D-nf'])`
-    // —— 拿一份手抄清单跟它自己比，恒真，等于没测。要守的是「矩阵没漏形状」，
-    // 就必须拿**类型的真实定义**当对照，所以这里读源码里的 union 字面量。
+    // —— 拿一份手抄清单跟它自己比，恒真，等于没测。第二版改成「手抄清单 vs 类型定义」，
+    // 仍是同一类缺陷的另一半（Sourcery 2026-10-25 发现）：往类型里加一个新形状、
+    // 再把它抄进那份清单，自检照样通过，而新形状**没有任何用例**。
+    // 现在的判据是**观测**：`EXERCISED` 只由 `normalizeIn` 在真实用例里登记，
+    // 没被跑过的形状不可能混进来。
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'core', 'envelope.ts'), 'utf8')
     const m = /export type EnvelopeShape\s*=([^\n]+)/.exec(src)
     expect(m, 'EnvelopeShape 的定义形态变了 —— 本自检要跟着改').not.toBeNull()
     const declared = [...m![1]!.matchAll(/'([^']+)'/g)].map((x) => x[1])
     expect(declared.length, '类型里至少要有一个形状').toBeGreaterThan(0)
 
-    // 矩阵的每个形状都必须真的被 `normalize` 认到**不同的**行为：对每个形状喂同一份
-    // 空报文，把三元组 (ok, notFound, payload===undefined) 记下来，要求
-    // 至少有两个形状给出不同结论（否则说明矩阵行是复制的、没在测区别）。
+    // ① 每个声明过的形状都必须被矩阵用例真正喂进过 `normalize`
+    const missing = declared.filter((s) => !EXERCISED.has(s))
+    expect(missing, `这些形状在类型里声明了，但矩阵没有任何用例跑过它们：${missing.join(', ')}`)
+      .toEqual([])
+    // ② 反向：矩阵也不许喂一个类型里没有的形状（防止测试比实现更宽而恒真）
+    const extra = [...EXERCISED].filter((s) => !declared.includes(s))
+    expect(extra, `矩阵喂了类型里不存在的形状：${extra.join(', ')}`).toEqual([])
+
+    // ③ 形状维度必须真的在区分行为：对每个形状喂同一份空报文，把三元组
+    // (ok, notFound, payload===undefined) 记下来，要求至少有两个形状给出不同结论
+    // （否则说明矩阵行是复制的、没在测区别）。
+    // ⚠️ 这里刻意用裸 `normalize` 而非 `normalizeIn`：这是自检自造的探针，
+    // 让它登记会把「覆盖度」变成自证。
     const signature = (shape: EnvelopeShape): string => {
       const r = normalize({ code: 200, message: 'OK' }, shape)
       return `${r.ok}/${r.notFound}/${r.payload === undefined}`
@@ -288,7 +319,5 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
     const sigs = declared.map((s) => signature(s as EnvelopeShape))
     expect(new Set(sigs).size, `全部形状给出同一结论（${sigs[0]}）—— 形状维度没有被测到`)
       .toBeGreaterThan(1)
-    // 且矩阵里显式写过的形状一个都不能少
-    for (const s of declared) expect(MATRIX_SHAPES as readonly string[]).toContain(s)
   })
 })
