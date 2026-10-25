@@ -54,12 +54,18 @@ describe('readme.test.ts —— C1 追加断言（防文档说假话）', () => 
     expect(md).toMatch(/store init/)
     expect(md).toMatch(/store status/)
   })
-  it('README 配置说明：手工编辑 + 凭证不支持写入（spec §3.2 边界）', () => {
+  it('README 配置说明：登录写入 + 手工编辑仍支持 + 权限分级（G1 翻转旧断言）', () => {
     const md = read('README.md')
     expect(md).toMatch(/手工编辑/)
-    expect(md).toMatch(/不支持.*写入|写入.*不支持/)
-    // 权限警告说明（O 组 O-14）：stderr 警告不阻断，需向 Agent 说明
-    expect(md).toMatch(/权限过宽.*警告|警告.*不阻断/)
+    // ⚠️ G1 起 `auth login` **已实现**，旧断言 `不支持.*写入` 已翻转：
+    // 现在承诺的是"可以写"，而且必须讲清它只从环境变量读（argv 会泄漏）。
+    expect(md).toMatch(/auth login/)
+    expect(md).toMatch(/环境变量.*--app-key|不接受.*--app-key/)
+    // 权限规则分两级（G1）：含凭证 → 拒绝；无凭证 → 警告不阻断。
+    // ⚠️ 旧的单句 `/权限过宽.*警告/` 已不足以描述现状 —— 只断言警告会让
+    // 「含凭证也照旧只警告」这个安全回退**照样通过**。
+    expect(md, '含凭证过宽必须承诺拒绝').toMatch(/拒绝读取|config_insecure/)
+    expect(md, '无凭证仍只警告').toMatch(/警告.*不阻断|不阻断.*警告/)
     // WAL 说明（Q 组 Q-低-2）：.wal 临时文件正常退出后消失，勿手工删除
     expect(md).toMatch(/\.wal/)
   })

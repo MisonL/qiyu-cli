@@ -8,15 +8,24 @@ import { setLocalFallbackProvider } from '../../src/commands/local-fallback.js'
 // 才能证明该字段是由数据推导的、不是一个独立写死的常量。
 import { allEndpoints } from '../../src/core/registry/index.js'
 import { setParamsRoot } from '../../src/core/registry/params.js'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 let out = ''
 let err = ''
+// ⚠️ **必须隔离 HOME**（G1 起）：`auth login` 已实现，本文件有两条用例会真的调它
+// （「悬空引用」清单里的 `['auth login', authCommand, ['login']]` 与 markdown 哨兵
+// 里的 `['login']`）；api 的凭证合流也会读 `~/.config/qiyu/config.json`。
+// 不隔离的后果是实测过的：开发机上真的被写出了一份带夹具凭证（appKey: "k"）的
+// 配置文件，而且「缺凭证 → auth_missing」那条会因为本机存在真实配置而假绿/假红。
+let home = ''
 beforeEach(() => {
   out = ''
   err = ''
+  home = mkdtempSync(join(tmpdir(), 'qiyu-api-'))
+  vi.stubEnv('HOME', home)
+  vi.stubEnv('QIYU_PROFILE', '')
   // ⚠️ 令牌桶是 http.ts 的**模块级** Map，同一测试文件内的用例共享它。
   // 本文件有 24 处 `apiCommand(['call', 'ticket.search', …])`（2026-10-08 三次重测：
   // 13 → 23 → 24，每次都是增删用例后没人跟着改），其中**恰好 5 处**
@@ -51,7 +60,10 @@ beforeEach(() => {
 })
 // 用例会 stubEnv 配凭证（否则"没发请求"的断言会因缺凭证而假通过），
 // 所以这里必须一并清掉，避免污染后续用例。
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs() })
+afterEach(() => {
+  vi.restoreAllMocks(); vi.unstubAllEnvs()
+  rmSync(home, { recursive: true, force: true })
+})
 
 const rows = () => JSON.parse(out).data as Array<Record<string, unknown>>
 
@@ -703,7 +715,11 @@ describe('api list', () => {
       // 同样无 `**`）—— 与上面「分支锚」要挡的是同一类漏网。
       // G1 起 --pretty 合法，call --pretty 从拒绝清单移除
       // G1 起 --pretty 合法，whoami --pretty 从拒绝清单移除
-      ['auth login 未实现', ['login'], authCommand, /auth login 尚未实现/],
+      // ⚠️ G1 起 `auth login` **已实现**（旧锚 `/auth login 尚未实现/` 已翻转）：
+      // 这条现在走「缺环境变量」分支 —— 它仍在**同一个 usageFail 调用点**上，
+      // 只是 message 换了。锚必须跟着换，否则这条退化成"任意 stderr"，
+      // 而本文件末尾那条 markdown 哨兵正是靠锚字符串证明"这条分支真被走到"。
+      ['auth login 缺环境变量', ['login'], authCommand, /需要从环境变量读取凭证/],
       ['auth 无子命令', [], authCommand, /用法：qiyu auth </],
       ['auth 未知子命令', ['未知子命令'], authCommand, /未知子命令：未知子命令/],
       ['auth whoami 多余参数', ['whoami', 'extra'], authCommand, /不接受任何参数/],
@@ -1339,9 +1355,9 @@ describe('api call —— 危险操作门禁', () => {
   })
 
   it('--pretty 之后的用法错误仍是紧凑 JSON（契约：用法错误永远紧凑）', async () => {
-    // ⚠️ 实测来源（CodeRabbit 2026-10-25）：`api schema --pretty` 缺 id 这类分支在
-    // `setPretty(true)` **之后**才报错，输出的是缩进错误信封，而 README「输出格式」
-    // 与设计稿 §11.2 写着「用法错误（退出码 2）仍是紧凑 JSON」。
+    // ⚠️ 实测来源（CodeRabbit 2026-10-25）：`api schema --pretty` 缺 id、`auth login --pretty`
+    // 缺环境变量 —— 这些分支在 `setPretty(true)` **之后**才报错，输出的是缩进错误信封，
+    // 而 README「输出格式」与设计稿 §11.2 写着「用法错误（退出码 2）仍是紧凑 JSON」。
     // 逐条断言命令级出口（不是只在 output.test.ts 测 usageFail）：命令的解析次序
     // 决定它走哪个分支，那正是当初出问题的地方。
     for (const [label, argv] of [

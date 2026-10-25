@@ -5,7 +5,9 @@
 ## 1. 不要读配置文件
 
 `~/.config/qiyu/config.json` 属于人类维护面：凭证与存储行为都由它（或环境变量）决定，
-CLI 对未知键 fail-closed 校验。读它没有收益——它决定的一切都能用命令与 flag 自描述获得：
+CLI 对未知键 fail-closed 校验。**G1 起文件里可能含凭证**（`auth login` 会写入
+`profiles.<name>.credentials`）——读它的风险从"越权"升到了"拿到机密"。
+读它没有收益——它决定的一切都能用命令与 flag 自描述获得：
 需要知道库路径与后端时用 `qiyu store status`（它的输出里**不含 profile**）。profile 与
 `--db` / `--backend` 一样是定位参数：给名字，交给命令自己解析成实际的库路径与后端。
 需要知道凭证状态时用 `qiyu auth whoami`。不要 cat、grep 或解析该文件，也不要把它的内容

@@ -1,7 +1,7 @@
 // tests/commands/sync.test.ts —— D-T12：sync tasks 子命令形态（骨架沿 store.ts）。
 // D-T13 追加：sync run 子命令 —— 区间参数/输出契约/进度/退出码/store 未初始化。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { syncCommand } from '../../src/commands/sync.js'
@@ -11,6 +11,7 @@ import { __setPlatform, __setRun, __resetScheduleDeps } from '../../src/schedule
 import { advanceWatermark, markPending, recordGap, readWatermark } from '../../src/sync/state.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { __resetBuckets } from '../../src/core/http.js'
+import { __resetPermissionWarnings } from '../../src/core/config.js'
 import { __setSleep as setReportSleep } from '../../src/sync/tasks/reports.js'
 import { __setSleep as setKnowledgeSleep } from '../../src/sync/tasks/knowledge.js'
 import type { Store } from '../../src/store/types.js'
@@ -31,6 +32,7 @@ beforeEach(() => {
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（store 配置与默认库路径都走 HOME）
   vi.stubEnv('QIYU_APP_KEY', 'test-key')
   vi.stubEnv('QIYU_APP_SECRET', 'test-secret')
+  __resetPermissionWarnings()   // 模块级警告去重表：用例之间必须互不污染
   // 注入的 sleep 代表「等满了 retryAfter」——令牌桶按真实时钟计窗，
   // 测试用清桶模拟时间推进（与真实等待后放行等价，T7/T11 夹具同款）
   __resetBuckets()
@@ -745,6 +747,97 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
         '--quiet'])
       expect(code).toBe(0)
       expect(bodies[0]).toMatchObject({ robotId: 1000001 })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('robots 键兜底：options.knowledgeRobotIds 缺席时用 profiles.<p>.robots 的键（G1）', async () => {
+    // ⚠️ 这条守的是「robots 不是死字段」。G1 起 `auth whoami` 会输出配置里的
+    // `profiles.<name>.robots` 映射，若不接一个真实消费方，它就是个声明了却没人读的
+    // 字段 —— 而那正是「契约诚实性」要消灭的形态（配置里写了 robotId，同步却当没看见）。
+    const cfgDir = join(dir, '.config', 'qiyu')
+    mkdirSync(cfgDir, { recursive: true })
+    writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
+      profiles: { default: {
+        store: { path: dbPath() },     // 不含 options.knowledgeRobotIds
+        robots: { '1000009': '甲', '1000010': '乙' },
+      } },
+    }))
+    const bodies: unknown[] = []
+    const fetchMock = vi.fn().mockImplementation((url: unknown) => {
+      const u = String(url)
+      if (u.includes('getCategoryTree')) {
+        bodies.push(JSON.parse((fetchMock.mock.calls.at(-1)?.[1] as { body: string }).body))
+        return okA([])
+      }
+      throw new Error('unexpected ' + u)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      const code = await syncCommand(['run', 'knowledge.categories', '--db', dbPath(), '--quiet'])
+      expect(code).toBe(0)
+      // 逐个 id 的出现次数不重要（空树会触发「假空重试」，同一 id 可能请求两遍）；
+      // 要钉的是**两个 id 都被驱动到**，且没有多余的 id。
+      const ids = (bodies as Array<{ robotId: number }>).map((b) => b.robotId)
+      expect(new Set(ids)).toEqual(new Set([1000009, 1000010]))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('配置不含凭证但权限过宽 → 只警告一次（sync run 会读两遍配置）', async () => {
+    // ⚠️ 实测来源：`sync run` 依次读两遍配置 —— 凭证合流（credentials-source）与
+    // resolveStoreConfig 各查一次权限。修之前 stderr 出现**两遍**同一条
+    // 「权限过宽（建议 chmod 600）」，用户会以为有两个不同的问题。
+    // ⚠️ 含凭证时是**拒绝**（不是警告），所以这条必须用不含凭证的配置 ——
+    // 那正是"警告不阻断"这半边口径唯一还能观察到的地方。
+    const cfgDir = join(dir, '.config', 'qiyu')
+    mkdirSync(cfgDir, { recursive: true })
+    writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
+      profiles: { default: { store: { path: dbPath() } } },
+    }))
+    chmodSync(join(cfgDir, 'config.json'), 0o644)
+    vi.stubGlobal('fetch', vi.fn(() => okA([])))
+    try {
+      await fresh().then((s) => s.close())
+      err = ''
+      await syncCommand(['run', 'knowledge.categories', '--db', dbPath(), '--quiet'])
+      const warnLines = err.split('\n').filter((l) => l.includes('权限过宽'))
+      expect(warnLines.length, `同一条警告出现了 ${warnLines.length} 次`).toBe(1)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('knowledgeRobotIds 优先于 robots 键（显式配置不被兜底覆盖）', async () => {
+    const cfgDir = join(dir, '.config', 'qiyu')
+    mkdirSync(cfgDir, { recursive: true })
+    writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
+      profiles: { default: {
+        store: { path: dbPath(), options: { knowledgeRobotIds: [1000009] } },
+        robots: { '1000010': '乙' },
+      } },
+    }))
+    const bodies: unknown[] = []
+    const fetchMock = vi.fn().mockImplementation((url: unknown) => {
+      const u = String(url)
+      if (u.includes('getCategoryTree')) {
+        bodies.push(JSON.parse((fetchMock.mock.calls.at(-1)?.[1] as { body: string }).body))
+        // ⚠️ 必须返回**非空树**：空结果会触发引擎的「假空重试」（spec §5.2，
+        // `fetchWithFakeEmptyRetry` 对 0 行再拉一次），于是每个 id 会请求两遍 ——
+        // 那是既有语义、不是本用例要测的东西，返回非空才数得清"几个 id"。
+        return okA([{ id: 500001, name: '根', children: null }])
+      }
+      throw new Error('unexpected ' + u)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await fresh().then((s) => s.close())
+      expect(await syncCommand(['run', 'knowledge.categories', '--db', dbPath(), '--quiet'])).toBe(0)
+      expect((bodies[0] as { robotId: number }).robotId).toBe(1000009)
+      expect(bodies.length, '只应请求显式配置的那一个 id').toBe(1)
     } finally {
       vi.unstubAllGlobals()
     }

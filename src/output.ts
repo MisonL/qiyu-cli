@@ -261,6 +261,26 @@ export function fail(error: ErrorInput): number {
  * 同时把**同一句话**作为 `{ok:false,error:{code:'usage',kind:'usage',...}}` 写进 stdout。
  * 这样两类读者都照顾到：人看 stderr，Agent 按契约读 stdout 的 JSON。
  */
+/**
+ * 「带 kind 的错误走 `fail()`，其余走 `usageFail()`」的统一出口（G1）。
+ *
+ * ⚠️ 为什么需要它：各命令的 catch 此前一律 `usageFail((e as Error).message)` ——
+ * 于是**带 kind 的错误**（如 `config_insecure`：配置含凭证但权限过宽，退出码 1、
+ * 只能由人 chmod 修）被降级成"用法错误，改参数重来"（退出码 2）。Agent 照退出码
+ * 的语义去改参数，而这件事与参数无关。
+ * → 有 `kind` 就如实透传（含 hint/retryable），没有才当用法错误。
+ */
+export function failFromTagged(e: unknown): number {
+  const err = e as { code?: string; kind?: string; retryable?: boolean; message?: string; hint?: string }
+  if (err.kind) {
+    return fail({
+      code: err.code ?? 'unknown', kind: err.kind, retryable: err.retryable ?? false,
+      message: err.message ?? String(e), hint: err.hint,
+    })
+  }
+  return usageFail(sanitizeMessage(err.message ?? String(e)))
+}
+
 export function usageFail(message: string, hint?: string): number {
   // ⚠️ stderr 是不受信文本进终端的主通道（security S4）：未知参数、未知表名、DuckDB 原文
   // 都拼进 message，未经净化就能注入 ANSI/OSC 序列。净化必须在**出口**做一次，
@@ -269,15 +289,13 @@ export function usageFail(message: string, hint?: string): number {
   const safe = sanitizeMessage(message)
   process.stderr.write(safe.endsWith('\n') ? safe : safe + '\n')
   // ⚠️ 用法错误**永远是紧凑 JSON**，即使 `--pretty` 已开启（CodeRabbit 2026-10-25 实测发现）。
-  // 契约写在 README「输出格式」与设计稿 §11.2：`--pretty` 只修饰**成功输出**，用法错误
-  // （退出码 2）保持紧凑 —— 理由不是审美，而是「先修参数，再看格式」：缩进的错误信封
-  // 恰好出现在「你这条命令根本没跑起来」的时刻，而读者判断格式开关是否生效时，
-  // 会拿它当「格式化已生效」的证据。
-  // 多条分支在 `setPretty(true)` **之后**才报用法错误（`api schema --pretty` 缺 id、
-  // `db describe --pretty` 缺表名、`query --pretty` 缺方式、`stats fields --pretty` 缺表名…），
-  // 实测那些路径输出的就是缩进错误信封。修在**唯一的出口**而不是逐个调用点调整次序 ——
-  // 调次序既脆弱，又会随新分支漂移（这正是本仓库反复踩过的「同一规则多处实现」）。
-  // 业务错误（`fail()`）不受影响：那是命令真的跑了的结果，与成功输出同属可缩进的一类。
+  // 契约写在 README「输出格式」与设计稿 §11.2：`--pretty` 只修饰**成功输出**，
+  // 用法错误（退出码 2）保持紧凑 —— 理由不是审美，而是"先修参数，再看格式"：
+  // 一个带缩进的错误信封恰好出现在"你这条命令根本没跑起来"的时刻，
+  // 而 Agent 判断格式是否生效时会拿它当"格式化已生效"的证据。
+  // 此前有多条分支在 `setPretty(true)` **之后**才报用法错误（如 `api schema --pretty`
+  // 缺 id、`auth login --pretty` 缺环境变量），那些路径输出的就是缩进错误信封。
+  // 现在在唯一的出口处强制收窄 —— 逐个调用点调整次序既脆弱又会随新分支漂移。
   const prevPretty = prettyOutput
   prettyOutput = false
   try {

@@ -1,8 +1,18 @@
 // src/store/config.ts
-import { readFileSync, statSync, existsSync } from 'node:fs'
+//
+// store 配置解析（命令行 > 环境变量 > 配置文件 > 内置默认，spec §3.2）。
+//
+// ⚠️ **G1 起「配置文件」这层载体抽到了 `core/config.ts`**：auth/api 需要读写同一份
+// 文件，而它们按分层红线不得 import `store/`。本文件保留全部 store 语义
+// （backend 枚举、路径展开、行为参数上界），配置文件的读取/键校验/权限检查
+// 一律委托 core 层 —— 这样 auth 与 store 看到的「未知键」「JSON 畸形」「权限过宽」
+// 是同一句话，不会出现两套口径。
+
 import { homedir } from 'node:os'
-import { join, dirname, isAbsolute } from 'node:path'
+import { dirname, join, isAbsolute } from 'node:path'
 import type { BackendName, StoreConfig } from './types.js'
+import { configPathFor, loadConfigFile, checkPermissions, configHasCredentials } from '../core/config.js'
+import type { ProfileBlock } from '../core/config.js'
 
 export interface StoreEnv { QIYU_DB_PATH?: string; QIYU_STORE_BACKEND?: string; QIYU_PROFILE?: string }
 export interface StoreFlags { db?: string; backend?: string; profile?: string }
@@ -15,12 +25,10 @@ export const DEFAULTS = {
   batchSize: 1000,
 } as const
 
-/** 已知键白名单 —— 未知键 fail-closed（spec §3.3）。 */
-const KNOWN_TOP = new Set(['defaultProfile', 'profiles'])
-const KNOWN_PROFILE = new Set(['store'])
+// store 块内的已知键 —— 未知键 fail-closed（spec §3.3）。
 // ⚠️ options（D-T13）：配置面的「透传不校验内容」键——StoreConfig.options 的落点。
 // config 层只保证它是对象、原样透传（消费方如 sync run 的 knowledgeRobotIds 自行
-// 校验内容）；放 KNOWN_STORE 让未知键检查放行。
+// 校验内容）；列进已知集让未知键检查放行。
 const KNOWN_STORE = new Set(['backend', 'path', 'readOnlyRetryMs', 'batchSize', 'options'])
 
 function assertKnownKeys(obj: Record<string, unknown>, known: Set<string>, prefix: string): void {
@@ -63,82 +71,54 @@ export function currentStoreEnv(): StoreEnv {
 
 /**
  * 解析 store 配置：命令行 > 环境变量 > 配置文件 > 内置默认（spec §3.2）。
- * ⚠️ 只读不写；配置文件由用户手工维护（`auth login` 归 G1，spec §3.5）。
+ * ⚠️ 只读不写；写入走 `auth login`（`commands/auth.ts` → `core/config.ts`）。
  */
 export function resolveStoreConfig(opts: ResolveOpts = {}): {
   config: StoreConfig; configPath: string; configExists: boolean
 } {
   const home = opts.home ?? homedir()
-  const configPath = opts.configPath ?? join(home, '.config', 'qiyu', 'config.json')
+  const configPath = opts.configPath ?? configPathFor(home)
   const env = opts.env ?? {}
   const flags = opts.flags ?? {}
 
-  let file: Record<string, unknown> = {}
-  const configExists = existsSync(configPath)
+  // ⚠️ 读文件与结构解析都在 core 层 —— 「未知键 / JSON 畸形 / 形态不对」的文案
+  // 与 auth/api 看到的是同一份，不会出现两套口径。
+  const { file, exists: configExists } = loadConfigFile(configPath)
+
   if (configExists) {
-    let raw: string
-    try {
-      raw = readFileSync(configPath, 'utf8')
-    } catch (e) {
-      throw new Error(`无法读取配置文件 ${configPath}：${e instanceof Error ? e.message : String(e)}`)
-    }
-    try {
-      file = JSON.parse(raw) as Record<string, unknown>
-    } catch (e) {
-      throw new Error(`配置文件 ${configPath} 不是合法 JSON：${e instanceof Error ? e.message : String(e)}`)
-    }
-    assertKnownKeys(file, KNOWN_TOP, '')
-    // ⚠️ 权限检查（spec §3.4）：POSIX 下 group/other 有任何位 → 警告，不阻断。
-    // C1 配置不含凭证；G1 加入凭证时此处须升级为拒绝（spec §3.4 的交接）。
-    if (process.platform !== 'win32') {
-      const mode = statSync(configPath).mode & 0o777
-      if ((mode & 0o077) !== 0) {
-        process.stderr.write(`配置文件 ${configPath} 权限过宽（建议 chmod 600）\n`)
-      }
-      // 父目录同款检查（spec §3.4 v3 扩面，I 组 M2 补——0777 目录可整体替换文件）。
-      // 注：目录只查 group/other 写位（0o755 是常规 umask 产物，不警告）；
-      // 文件本身仍查全部 group/other 位。
-      const dirMode = statSync(dirname(configPath)).mode & 0o777
-      if ((dirMode & 0o022) !== 0) {
-        process.stderr.write(`配置目录 ${dirname(configPath)} 权限过宽（建议 chmod 700）\n`)
-      }
+    // ⚠️ 权限检查（spec §3.4）：文件权限过宽 → 警告；**含凭证时升级为拒绝**（G1）。
+    const perm = checkPermissions(configPath, {
+      hasCredentials: configHasCredentials(file),
+      onWarn: (m) => process.stderr.write(`${m}\n`),
+    })
+    if (!perm.ok) {
+      // 拒绝路径抛普通 Error（无 kind）→ 调用方按用法错误处理。
+      // ⚠️ 文案必须点名**要执行的动作**，否则用户只知道自己错了。
+      const dir = dirname(configPath)
+      throw new Error(
+        perm.reason === 'file'
+          ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 可访问），已拒绝读取 —— 请执行 chmod 600 ${configPath}`
+          : `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证，已拒绝读取 —— 请执行 chmod 700 ${dir}`,
+      )
     }
   }
 
-  // ⚠️ profiles 类型守卫（K 组 M2）：数组/字符串会被 Object.entries 逐索引/逐字符枚举，
-  // 产生荒诞的 profile 名而不报错 —— fail-closed 显式拒绝。
-  if (file.profiles !== undefined && (file.profiles === null || typeof file.profiles !== 'object' || Array.isArray(file.profiles))) {
-    throw new Error('配置文件 profiles 必须是对象')
-  }
-  const profiles = (file.profiles ?? {}) as Record<string, Record<string, unknown>>
+  const profiles = file.profiles as Record<string, ProfileBlock>
   for (const [name, prof] of Object.entries(profiles)) {
-    if (prof === null || typeof prof !== 'object' || Array.isArray(prof)) {
-      throw new Error(`配置文件 profiles.${name} 必须是对象`)
-    }
-    assertKnownKeys(prof, KNOWN_PROFILE, `profiles.${name}.`)
-    // store 块存在但非对象（含 null）→ fail-closed 显式报错（不静默走默认，spec §3.3）
-    if (prof.store !== undefined && (prof.store === null || typeof prof.store !== 'object' || Array.isArray(prof.store))) {
-      throw new Error(`配置文件 profiles.${name}.store 必须是对象`)
-    }
-    const store = (prof.store ?? {}) as Record<string, unknown>
-    if (store !== null && typeof store === 'object' && !Array.isArray(store)) {
-      assertKnownKeys(store, KNOWN_STORE, `profiles.${name}.store.`)
-      // options：透传不校验内容（D-T13），但形态必须是对象（数组/标量显式拒绝）。
-      if (store.options !== undefined &&
-          (store.options === null || typeof store.options !== 'object' || Array.isArray(store.options))) {
-        throw new Error(`配置文件 profiles.${name}.store.options 必须是对象`)
-      }
+    const store = prof.store
+    if (store === undefined) continue
+    // store 块的**语义**校验仍在本层（core 只管「是对象、键已知」的通用形态）。
+    assertKnownKeys(store, KNOWN_STORE, `profiles.${name}.store.`)
+    // options：透传不校验内容（D-T13），但形态必须是对象（数组/标量显式拒绝）。
+    if (store.options !== undefined &&
+        (store.options === null || typeof store.options !== 'object' || Array.isArray(store.options))) {
+      throw new Error(`配置文件 profiles.${name}.store.options 必须是对象`)
     }
   }
 
-  // ⚠️ defaultProfile 非 string → fail-closed（K 组 M2：否则静默走默认库，用户写的
-  // profile 名被无声忽略，与 spec §3.3 的 fail-closed 精神相悖）。
-  if (file.defaultProfile !== undefined && typeof file.defaultProfile !== 'string') {
-    throw new Error('配置文件 defaultProfile 必须是字符串')
-  }
-  const profileName = flags.profile ?? env.QIYU_PROFILE ?? (file.defaultProfile as string | undefined) ?? 'default'
-  const prof = (profiles[profileName] ?? {}) as Record<string, unknown>
-  const storeBlock = ((prof.store ?? {}) as Record<string, unknown>)
+  const profileName = flags.profile ?? env.QIYU_PROFILE ?? file.defaultProfile ?? 'default'
+  const prof = profiles[profileName] ?? {}
+  const storeBlock = (prof.store ?? {}) as Record<string, unknown>
 
   const rawBackend = flags.backend ?? env.QIYU_STORE_BACKEND ?? (storeBlock.backend as string | undefined) ?? DEFAULTS.backend
   if (rawBackend !== 'duckdb') {
