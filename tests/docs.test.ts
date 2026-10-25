@@ -6,22 +6,26 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (p: string): string => readFileSync(join(root, p), 'utf8')
 
 /**
- * 当前版本的 CHANGELOG 段（从**上一个**未发布的版本节到下一个 `## ` 标题）。
+ * 当前版本的 CHANGELOG 段：`[未发布]` 段与 `package.json` 版本号段的**并集**。
  *
- * ⚠️ 此前这里逐字写 `/## \[未发布\].../`，7 条断言都钉着那个标题字面量 ——
- * 发版时把 `[未发布]` 改成 `[0.2.0] - <日期>` 就会让它们全红，而这些断言真正要守的
- * 是「**本版本**的更新日志里写了 X」，标题叫什么不是契约的一部分。
- * 现在按 `package.json` 的版本号定位段落：发版改名不动测试，而把条目误挪到
- * 历史版本段里仍然会红（那才是它们要防的）。
+ * ⚠️ 此前这些断言逐字写 `/## \[未发布\].../`，7 条都钉着那个标题字面量 ——
+ * 发版时把 `[未发布]` 改名为 `[0.2.0] - <日期>` 就会让它们全红，而它们真正要守的
+ * 是「**当前版本**的更新日志里写了 X」，标题叫什么不是契约的一部分。
+ *
+ * ⚠️ 为什么是**并集**而不是二选一（Sourcery 2026-10-25 发现）：
+ *   · 开发期：`package.json` 还是上一个已发布版本，新条目写在 `[未发布]` 里 ——
+ *     只看版本号段会漏掉它们；
+ *   · 发版后：`[未发布]` 要么没了（本次），要么是下一轮的空草稿 —— 只看 `[未发布]`
+ *     会去查一个空段，哪怕已发布段里条目齐全，断言照样红。
+ *   两段并起来，两种相位都对；而「条目被挪进**历史**版本段（0.1.0 之类）」这个
+ *   真正要防的形态仍然会红 —— 那正是这些断言的用意。
  */
 function currentChangelogSection(md: string): string {
   const version = JSON.parse(read('package.json')).version as string
   const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const section = (heading: string): string =>
     new RegExp(`## \\[${heading}\\][\\s\\S]*?(?=\\n## |$)`).exec(md)?.[0] ?? ''
-  // `[未发布]` 优先（开发期）；发版后该标题改名为版本号，此时按版本号锚定。
-  // 两个标题同时存在也不歧义 —— 显式按优先级取，而不是靠「谁出现得更早」。
-  return section('未发布') || section(escaped)
+  return [section('未发布'), section(escaped)].filter((x) => x !== '').join('\n')
 }
 
 describe('联动文案 —— C1 交付后不得说假话', () => {
