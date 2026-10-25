@@ -24,6 +24,17 @@
   （如 `qiyu api list --pretty`）；用法错误仍是紧凑 JSON。各命令在原「显式拒绝」位置开启开关，
   错误次序逐字保留；`REJECTED_FLAGS` 清空但 rejected 机制与 `skill check` 的 rejected_flag
   规则保留
+- `qiyu auth login [--profile <name>]` —— 把**环境变量**里的凭证写入配置文件（G1 第三批）：
+  合并保留该 profile 下的 `store`/`robots` 键、原子写（`0700` 目录 + `0600` 临时文件 +
+  `rename` 换入）、符号链接拒绝、**绝不回显**凭证。不接受 `--app-key`/`--app-secret`
+  （命令行参数会留在 shell 历史与 `ps` 输出里）
+- 凭证来源扩为**环境变量 > 配置文件**两个来源，`api call`/`sync run`/`sync verify` 三处
+  共用同一份合流逻辑（`credentials-source.ts`）：env 缺哪一项才读文件，超集时不读
+- 新增错误 kind：`config_insecure`（配置文件含凭证却权限过宽 —— group/other 可读，或父目录
+  可被整体替换 —— 退出码 1，重试无用）。**不含凭证**的文件维持「只在 stderr 警告、不阻断」
+- `auth whoami` 输出补 `source`（`env`/`file`/`mixed` 三态）与 `robots`（配置里的
+  robotId → 显示名映射，未校验有效性）；后者是 `sync run` 知识库类目任务的**兜底驱动源**
+  （`store.options.knowledgeRobotIds` 优先，向后兼容）
 
 - 注册表补全至 154 条接口（150 个文档页 + 4 个文档外接口），并新增每接口的 `params/` 参数表。
 - `qiyu api schema <id>` —— 查看接口请求参数表与响应形状

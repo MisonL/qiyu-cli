@@ -143,9 +143,15 @@ time     = current UTC second-level timestamp                 // 有效期 5 分
 ```bash
 export QIYU_APP_KEY=xxx        # Agent / CI 场景
 export QIYU_APP_SECRET=yyy
-qiyu auth login --profile prod # 人工使用：写入 ~/.config/qiyu/config.json（chmod 600）
-qiyu auth whoami               # 校验凭证并显示当前 profile
+qiyu auth login --profile prod # 人工使用：写入 ~/.config/qiyu/config.json（目录 0700 / 文件 0600）
+qiyu auth whoami               # 校验凭证并显示当前 profile（+ source / robots）
 ```
+
+**✅ 已交付（G1 第三批，2026-10-25）**：`auth login` 从**环境变量**读凭证（不接受
+`--app-key`/`--app-secret` —— argv 会留在 shell 历史与 `ps` 里），原子写（临时文件 +
+`rename` 换入），合并保留该 profile 的其它键，符号链接拒绝，绝不回显凭证。
+凭证两个来源都生效，优先级不变。**权限规则分两级**：含凭证的文件 group/other 可读时
+**拒绝读取**（`kind: config_insecure`，退出码 1）；不含凭证时维持「警告不阻断」。
 
 凭证从哪里来：七鱼管理后台 → “系统” → “扩展与集成” → 开发者 ID（`appSecret` 首次必须点击“重置”生成）。
 
@@ -1790,7 +1796,10 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 但 13 个知识库接口、机器人统计、机器人会话都依赖它。因此：
 - **`robotId` 必须在 CLI 配置文件中手工填写**（多个机器人时可用别名映射）
 - skill 必须明确告诉 Agent：`robotId` 缺失时去问人类，而不是尝试猜测或枚举
-- `qiyu auth whoami` 应显示当前配置的 `robotId` 及其名称
+- **✅ 已交付**：`qiyu auth whoami` 输出 `data.robots`（配置里 `profiles.<name>.robots`
+  的 robotId → 显示名映射）。它**只如实透出配置内容**，不校验有效性、不与本地库比对
+  （见下方"集合不一致告警"的裁决）。该映射同时是 `sync run` 知识库类目任务的兜底驱动源：
+  `store.options.knowledgeRobotIds` 缺席时用它，两者都有时以前者为准。
 
 同类无法通过 API 获得的 ID：`taskId`（手动外呼任务）、`robotCallJobId`（外呼机器人任务）—— 两者都没有「任务列表」接口。
 
@@ -1798,7 +1807,13 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 > 1. **从会话数据反推** —— 实测：`sessions.staffId = -robotId`（§7.5）。会话同步完成后，可通过 `SELECT DISTINCT -staffId FROM sessions WHERE session_type='robot'` 获得。**它只能发现产生过会话的机器人**。
 > 2. **知识库全量遍历** —— `robot.data.knowledge` 响应体中包含 `robotId`+`robotName`，且**全量拉取可覆盖全部 5 个机器人**（§10.5.2）。**它只能发现知识库非空的机器人**。
 >
-> 这两条路径**互补但仍不完整**（新建的、既无会话又无知识的机器人依然发现不了）→ **手工配置是基线；这两条只作校验和补充**。CLI 可以在 `auth whoami` 中告警「配置的 robotId 与实测发现的集合不一致」。
+> 这两条路径**互补但仍不完整**（新建的、既无会话又无知识的机器人依然发现不了）→ **手工配置是基线；这两条只作校验和补充**。
+>
+> **裁决（G1）**：`auth whoami` 的「配置的 robotId 与实测发现的集合不一致」告警**不实现**。
+> 原文措辞是「**可以**」而非「必须」，而判据是安全红线的直接冲突：`auth` 命令按分层约束
+> **零加载 `store/`**（`tests/store/layering.test.ts` 钉着，含传递闭包），要比对集合就必须
+> 查本地库 —— 那会把 DuckDB 拖进 `auth whoami` 的启动路径。缺失的这一能力在设计稿里
+> **不留悬空承诺**：`auth whoami` 的 `field_notes.robots` 逐字写明「未校验有效性、未与本地库比对」。
 
 ### 11.4 防漂移
 

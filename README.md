@@ -84,13 +84,38 @@ export QIYU_APP_SECRET=你的AppSecret
 
 ```bash
 qiyu auth whoami
-# {"ok":true,"data":{"configured":true}}
+# {"ok":true,"data":{"configured":true,"source":"env","profile":"default","robots":[]}}
 ```
 
-存储配置需**手工编辑** `~/.config/qiyu/config.json`——CLI 目前不会自动创建该文件（`auth login` 尚未实现）。也可用 `--db`/`QIYU_DB_PATH` 直接指定库路径。**凭证字段暂不支持写入该文件（会报未知键），请继续用 `QIYU_APP_KEY`/`QIYU_APP_SECRET` 环境变量。**若配置文件权限过宽（group/other 可读），CLI 会在 stderr 给出警告但不阻断执行；数据库正常关闭后 `.wal` 临时文件会自动消失，请勿手工删除。
+也可以把凭证**写进配置文件**，之后就不必每次 export：
+
+```bash
+export QIYU_APP_KEY=... QIYU_APP_SECRET=...
+qiyu auth login                      # 写入 default profile
+qiyu auth login --profile staging    # 写入指定 profile
+```
+
+`auth login` 只从**环境变量**读凭证——不接受 `--app-key`/`--app-secret`（命令行参数会留在
+shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.json`（目录 `0700`、文件 `0600`），
+合并保留该 profile 下已有的 `store`/`robots` 键，且**绝不回显**凭证（连末四位都不）。
+配置文件是符号链接时拒绝写入（防止穿透到任意路径）。
+
+凭证的两个来源都支持，优先级是**环境变量 > 配置文件**。两边各给一个也是合法的，
+此时 `auth whoami` 的 `source` 报 `mixed`。
+
+存储配置仍是**手工编辑** `~/.config/qiyu/config.json`；也可用 `--db`/`QIYU_DB_PATH` 直接指定库路径。
+**权限规则**：配置文件**含凭证**且 group/other 可读（如 `0644`）时，所有命令都会**拒绝读取**
+（`kind: config_insecure`，退出码 1，hint 点名要执行的 `chmod`）——因为落盘的 appSecret 对同机
+其他用户可读。不含凭证的文件维持「只在 stderr 警告、不阻断」。父目录 group/other **可写**
+（文件可被整体替换）时同样拒绝。`auth login` 自己会把权限收紧为 `0600`，所以这条只会出现在
+用户手工放宽之后。Windows 上跳过这些检查。数据库正常关闭后 `.wal` 临时文件会自动消失，请勿手工删除。
 
 > ⚠️ `whoami` **只检查凭证是否存在**，不校验它是否有效——一个拼错的 AppKey 同样返回
 > `configured: true`。第一次真实调用才是唯一的验证。
+>
+> `whoami` 输出的 `robots` 来自配置里的 `profiles.<name>.robots`（`{"1000001":"机器人A"}` 形态），
+> 同样**未校验有效性**。它是 `sync run` 的兜底来源：`store.options.knowledgeRobotIds` 缺席时，
+> 知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。
 
 ## 使用
 
@@ -111,7 +136,8 @@ qiyu api call message.send --body '{...}' --yes
 ### 命令一览
 
 ```
-qiyu auth whoami                     检查凭证是否已配置
+qiyu auth whoami                     检查凭证是否已配置（来源/robots）
+qiyu auth login [--profile <name>]   把环境变量里的凭证写入配置文件
 qiyu api list [--all]                列出接口
 qiyu api call <id> [--body <JSON>] [--yes] [--no-validate] [--strict]
                                      调用接口
@@ -345,7 +371,7 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 （`api schema`/body 分级校验）、存储层、同步引擎、查询接口与只读沙箱、Skill 化
 （`qiyu skill install` / `skill check` / `skill where`，见上方「装完之后：安装 skill」）。
 
-**已实现**：`auth whoami`、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
+**已实现**：`auth whoami`、`auth login`（从环境变量写入配置文件，原子写 + `0600`）、`api list`、`api call`、`api schema`、完整的错误分类与脱敏、危险门禁、
 限频感知（`retry_after`）、本地数据仓库——`store init` / `store status`（存储层已交付，
 含 `Store` 抽象、DuckDB 后端、schema 迁移与 `store_locked`/`store_not_initialized` 错误分类）
 与同步引擎——`sync tasks` / `sync run` / `sync status` / `sync verify` / `sync install` / `sync uninstall`
@@ -372,10 +398,6 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 **输出格式**：所有命令默认输出紧凑 JSON（一行、可解析）。`--pretty` 输出缩进 JSON（人类可读）——
 写在**具体子命令之后**（如 `qiyu api list --pretty`）。Agent 不需要它：默认输出已是合法 JSON，
 缩进只是给人看的。用法错误（退出码 2）仍是紧凑 JSON —— 先修参数，再看格式。
-
-**尚未实现**（调用时会**明确报错**，不会静默假装成功）：
-
-- `auth login`（配置文件写入）——目前只支持环境变量；
 
 `api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 

@@ -1,7 +1,7 @@
 // src/commands/api.ts
 import { allEndpoints, byId, assertCallable, assertConfirmed } from '../core/registry/index.js'
 import type { EndpointSpec } from '../core/registry/index.js'
-import { resolveCredentials } from '../core/credentials.js'
+import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
 import { call } from '../core/http.js'
 import { registeredRateLimit } from '../core/ratelimit.js'
 import type { QiyuError } from '../core/errors.js'
@@ -91,7 +91,7 @@ const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
      数字码（如 14009），也可能是本 CLI 合成的词（usage / network / internal /
-     auth_missing / confirm_required / store_locked / store_not_initialized / local_rate_limit / unknown）。合成词查不到官方错误码表。
+     auth_missing / config_insecure / confirm_required / store_locked / store_not_initialized / local_rate_limit / unknown）。合成词查不到官方错误码表。
 
 退出码：0 成功 · 1 业务错误 · 2 用法错误 · 3 网络错误 · 4 需要 --yes
 `
@@ -646,18 +646,12 @@ async function callOne(argv: string[]): Promise<number> {
     // Agent 会去改命令行参数，而正确动作是去配 QIYU_APP_KEY。
     // `auth whoami` 在同样情形下返回的也是退出码 1（kind 同样是 `auth_missing`，
     // 经 `exitCodeFor` 的 default 落到业务错误；不是 `auth`），两处必须一致。
-    let creds
-    try {
-      creds = resolveCredentials({}, {
-        appKey: process.env.QIYU_APP_KEY, appSecret: process.env.QIYU_APP_SECRET,
-      })
-    } catch (e) {
-      return fail({
-        code: 'auth_missing', kind: 'auth_missing', retryable: false,
-        message: e instanceof Error ? e.message : String(e),
-        hint: '设置 QIYU_APP_KEY / QIYU_APP_SECRET 环境变量',
-      })
-    }
+    // ⚠️ G1 起凭证有两个来源（环境变量 > 配置文件）—— 合流逻辑收在
+    // `credentials-source.ts`，三处调用点（api/sync/sync-run）共用一份，
+    // 避免「api 认配置文件、sync 只认环境变量」这种 Agent 看不出来的分叉。
+    const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv())
+    if (!credOutcome.ok) return fail(credOutcome.error)
+    const creds = credOutcome.creds
     const r = await call(spec, body, { credentials: creds })
     // ⚠️ 「成功但查无此物」必须显式标出来。设计稿 §9.2：0 行是比报错危险得多的
     // 失败模式 —— Agent 的错误处理根本不触发，它会向人类汇报"没有数据"。
