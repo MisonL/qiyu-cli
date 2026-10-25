@@ -268,10 +268,28 @@ export function usageFail(message: string, hint?: string): number {
   // 而同文件的 `未知参数` / `--help` 多余参数路径没补，两种行为并存正是缺口的来源。
   const safe = sanitizeMessage(message)
   process.stderr.write(safe.endsWith('\n') ? safe : safe + '\n')
-  return fail({
-    code: 'usage', kind: 'usage', retryable: false,
-    // message 去尾换行 —— stdout 的 JSON 里不该带控制字符；stderr 的文本保留换行便于阅读。
-    message: safe.replace(/\n+$/, ''),
-    ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
-  })
+  // ⚠️ 用法错误**永远是紧凑 JSON**，即使 `--pretty` 已开启（CodeRabbit 2026-10-25 实测发现）。
+  // 契约写在 README「输出格式」与设计稿 §11.2：`--pretty` 只修饰**成功输出**，用法错误
+  // （退出码 2）保持紧凑 —— 理由不是审美，而是「先修参数，再看格式」：缩进的错误信封
+  // 恰好出现在「你这条命令根本没跑起来」的时刻，而读者判断格式开关是否生效时，
+  // 会拿它当「格式化已生效」的证据。
+  // 多条分支在 `setPretty(true)` **之后**才报用法错误（`api schema --pretty` 缺 id、
+  // `db describe --pretty` 缺表名、`query --pretty` 缺方式、`stats fields --pretty` 缺表名…），
+  // 实测那些路径输出的就是缩进错误信封。修在**唯一的出口**而不是逐个调用点调整次序 ——
+  // 调次序既脆弱，又会随新分支漂移（这正是本仓库反复踩过的「同一规则多处实现」）。
+  // 业务错误（`fail()`）不受影响：那是命令真的跑了的结果，与成功输出同属可缩进的一类。
+  const prevPretty = prettyOutput
+  prettyOutput = false
+  try {
+    return fail({
+      code: 'usage', kind: 'usage', retryable: false,
+      // message 去尾换行 —— stdout 的 JSON 里不该带控制字符；stderr 的文本保留换行便于阅读。
+      message: safe.replace(/\n+$/, ''),
+      ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
+    })
+  } finally {
+    // 还原：用法错误是命令的终点，但同进程内连续多次 `run()`（测试里常见）时，
+    // 下一条命令不该因为上一条报了个用法错误就丢掉它的 `--pretty`。
+    prettyOutput = prevPretty
+  }
 }

@@ -1338,6 +1338,24 @@ describe('api call —— 危险操作门禁', () => {
     vi.unstubAllEnvs()
   })
 
+  it('--pretty 之后的用法错误仍是紧凑 JSON（契约：用法错误永远紧凑）', async () => {
+    // ⚠️ 实测来源（CodeRabbit 2026-10-25）：`api schema --pretty` 缺 id 这类分支在
+    // `setPretty(true)` **之后**才报错，输出的是缩进错误信封，而 README「输出格式」
+    // 与设计稿 §11.2 写着「用法错误（退出码 2）仍是紧凑 JSON」。
+    // 逐条断言命令级出口（不是只在 output.test.ts 测 usageFail）：命令的解析次序
+    // 决定它走哪个分支，那正是当初出问题的地方。
+    for (const [label, argv] of [
+      ['api schema 缺 id', ['schema', '--pretty']],
+      ['api call 缺 id', ['call', '--pretty']],
+      ['api list 位置参数', ['list', 'extra', '--pretty']],
+    ] as const) {
+      out = ''; err = ''
+      expect(await apiCommand([...argv]), label).toBe(2)
+      expect(out, `${label}：缩进错误信封违反「用法错误紧凑」的承诺`).not.toContain('\n  ')
+      expect(JSON.parse(out).error.kind).toBe('usage')
+    }
+  })
+
   it('未知参数报用法错误，而不是静默忽略', async () => {
     // 实测：`--bod '{"a":1}'`（拼错一个字母）被无声丢掉，请求照常发出、
     // body 为 undefined，服务端返回一个与拼写错误毫无关系的错误。
