@@ -28,6 +28,30 @@ function currentChangelogSection(md: string): string {
   return [section('未发布'), section(escaped)].filter((x) => x !== '').join('\n')
 }
 
+/**
+ * 发版一致性：CHANGELOG 底部的版本比较链接必须与标题**成对**出现。
+ *
+ * ⚠️ 为什么单独一条（CodeRabbit 2026-10-25）：`[0.2.0]: …compare/v0.1.0...v0.2.0`
+ * 这类链接引用是发版时**手写**的，漏掉 `## [0.2.0]` 标题不会有任何东西报错 ——
+ * 渲染出来只是「版本号没有链接」，而上面那些「段里写了 X」的断言都靠
+ * `currentChangelogSection` 按标题找段，标题缺了它们只会集体变红、指不出原因。
+ * 本条的判据是「链接存在 ⇒ 标题必须存在」：只要求**当前版本**这一对，
+ * 历史版本缺链接不归它管（那是历史，不该因为今天的规则被动改写）。
+ */
+describe('发版一致性 —— 版本链接与标题成对', () => {
+  it('`[<package.json 版本>]:` 链接存在时，必须有对应的 `## [<版本>]` 标题', () => {
+    const md = read('CHANGELOG.md')
+    const version = (JSON.parse(read('package.json')) as { version: string }).version
+    const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const hasLink = new RegExp(`^\\[${escaped}\\]:`, 'm').test(md)
+    // 没有链接就跳过（例如版本号刚 bump、还没补链接的中间态）—— 本条的承诺是
+    // 「有链接就必有标题」，不是「必须有链接」（后者会把「还没发版」判红）。
+    if (!hasLink) return
+    expect(md, `CHANGELOG 底部有 [${version}] 链接，但正文没有 \`## [${version}]\` 标题`)
+      .toMatch(new RegExp(`^## \\[${escaped}\\]`, 'm'))
+  })
+})
+
 describe('联动文案 —— C1 交付后不得说假话', () => {
   it('三个帮助入口的 code 清单都含两个新 code（锚定清单行本身，L 组 H2：auth.ts:155-156 既有注释已含这两个词，裸词断言会假绿）', () => {
     for (const f of ['src/cli.ts', 'src/commands/auth.ts', 'src/commands/api.ts']) {
