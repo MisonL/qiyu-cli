@@ -16,8 +16,8 @@ import type { MetricDecl } from '../query/metric-catalog.js'
 import { TABLES } from '../store/schema.js'
 import { openGuardedSession } from './db.js'
 import { parseStoreFlags } from './store-flags.js'
-import { ok, fail, usageFail, sanitizeControlChars, describeArgs } from '../output.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -154,14 +154,15 @@ interface Observed {
 }
 
 async function statsFields(argv: string[]): Promise<number> {
-  // 子命令级次序沿 db.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 位置参数。
+  // 子命令级次序沿 db.ts：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const extra = argv.filter((a) => !KNOWN.has(a))
     if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
   }
-  if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
+  // G1：--pretty 已实现 —— 原拒绝点开启缩进输出（次序不变：help → 这里 → 值位解析）。
+  if (argv.includes('--pretty')) setPretty(true)
 
   let flags: ReturnType<typeof parseStoreFlags>
   try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
@@ -299,6 +300,7 @@ async function statsFields(argv: string[]): Promise<number> {
 }
 
 export async function statsCommand(argv: string[]): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
   if (sub === undefined || sub === '--help' || sub === '-h') {
     // --help 不吞额外参数；--pretty 豁免（db.ts 同族惯例）
@@ -307,8 +309,17 @@ export async function statsCommand(argv: string[]): Promise<number> {
     process.stdout.write(USAGE)
     return 0
   }
-  // `--pretty` 是合法 flag（承诺过未实现），不是「未知子命令」（db.ts 同族）。
-  if (sub === '--pretty') return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
+  // G1：--pretty 是输出开关，必须写在具体子命令之后（`stats fields <表> --pretty`）。
+  if (sub === '--pretty') {
+    const extra = rest.filter((a) => !KNOWN.has(a))
+    if (extra.length > 0)
+      return usageFail(`未知参数：${extra.join(' ')}。--pretty 不接受额外参数`)
+    if (rest.includes('--help') || rest.includes('-h')) {
+      process.stdout.write(USAGE)
+      return 0
+    }
+    return usageFail(prettyAfterSubcommand('stats'))
+  }
   if (sub !== 'fields') {
     return usageFail(`未知子命令：${sub}\n可用子命令：fields`)
   }

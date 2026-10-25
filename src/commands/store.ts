@@ -3,9 +3,9 @@ import { statSync, lstatSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
-import { ok, fail, usageFail, sanitizeControlChars } from '../output.js'
+import { ok, fail, usageFail, sanitizeControlChars, setPretty } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -74,6 +74,7 @@ export function thrownToExit(e: unknown): number {
 }
 
 export async function storeCommand(argv: string[]): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
   if (sub === undefined || sub === '--help' || sub === '-h') {
     // --help 不吞额外参数；--pretty 豁免（B 惯例）
@@ -83,8 +84,20 @@ export async function storeCommand(argv: string[]): Promise<number> {
     return 0
   }
   if (sub !== 'init' && sub !== 'status') {
-    // store 级：--pretty 是合法 flag（承诺过未实现），不是「未知子命令」（B 惯例，cli.ts:54 同族）
-    if (sub === '--pretty') return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
+    // store 级：--pretty 是合法**输出开关**，但它必须写在具体子命令之后（`store init --pretty`）。
+    // 写在这里时没有任何子命令可修饰 —— 给出正确写法，而不是说成"未知子命令"（B 惯例）。
+    if (sub === '--pretty') {
+      const unknown = rest.filter((a) => a.startsWith('-') && !KNOWN.has(a))
+      const positional = rest.filter((a) => !a.startsWith('-'))
+      if (unknown.length + positional.length > 0) {
+        return usageFail(`未知参数：${[...unknown, ...positional].join(' ')}。--pretty 不接受额外参数`)
+      }
+      if (rest.includes('--help') || rest.includes('-h')) {
+        process.stdout.write(USAGE)
+        return 0
+      }
+      return usageFail(prettyAfterSubcommand('store'))
+    }
     return usageFail(`未知子命令：${sub}\n可用子命令：init、status`)
   }
   // 子命令级：**先 parseStoreFlags**（消费带值 flag 的值位置），再判未知参数（spec §7.3/验收 46）。
@@ -96,7 +109,8 @@ export async function storeCommand(argv: string[]): Promise<number> {
     process.stdout.write(USAGE)
     return 0
   }
-  if (rest.includes('--pretty')) return usageFail('--pretty 尚未实现 —— 目前只输出紧凑 JSON')
+  // G1：--pretty 已实现 —— 命令行合法即开启缩进输出（原拒绝点）。
+  if (rest.includes('--pretty')) setPretty(true)
 
   let flags
   try { flags = parseStoreFlags(rest) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }

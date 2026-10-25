@@ -96,14 +96,16 @@ describe('auth whoami', () => {
       expect(JSON.parse(out).error).toMatchObject({ code: 'usage', kind: 'usage' })
       expect(err.join('')).toContain(`未知参数：${extra}`)
     }
-    // ⚠️ `--pretty` 单独一条（2026-10-07 修）：它是**承诺过、只是未实现**的 flag，
-    // 三个子命令必须给同一句「尚未实现」—— 报「未知参数」是事实错误（会误导 Agent
-    // 怀疑自己拼错，或以为只有 list 支持它）。这里同时钉住两个要点：文案一致 +
-    // **不再**是「未知参数」。
+    // ⚠️ `--pretty` 单独一条（G1 2026-10-24 起**已实现**）：whoami 是合法叶命令，
+    // `whoami --pretty` 必须成功并输出缩进 JSON —— 旧断言（报「尚未实现」）已翻转。
     out = ''; err.length = 0
-    expect(await authCommand(['whoami', '--pretty'])).toBe(2)
-    expect(err.join('')).toContain('--pretty 尚未实现')
+    expect(await authCommand(['whoami', '--pretty'])).toBe(0)
     expect(err.join('')).not.toContain('未知参数')
+    expect(out.startsWith('{\n  "ok": true,'), 'whoami --pretty 必须缩进').toBe(true)
+    // 下一条（不带 --pretty）回到紧凑 —— 守入口 setPretty(false) 重置
+    out = ''
+    expect(await authCommand(['whoami'])).toBe(0)
+    expect(out.startsWith('{"ok":true,')).toBe(true)
     // 反向：不带多余参数时仍然正常
     out = ''; err.length = 0
     expect(await authCommand(['whoami'])).toBe(0)

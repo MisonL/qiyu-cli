@@ -2,13 +2,14 @@
 import { pathToFileURL } from 'node:url'
 import { realpathSync } from 'node:fs'
 import { authCommand } from './commands/auth.js'
-import { fail, usageFail, describeArgs, setSkillWarning, ok } from './output.js'
+import { fail, usageFail, describeArgs, setSkillWarning, setPretty, ok } from './output.js'
 import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from './core/edition.js'
 import {
   detectSkillState, entityUndeterminedNote, npmRelativeBase, resolveEntityDirSources,
   resolveSkillSourceDir, skillWarning,
 } from './skill/detect.js'
 import { apiCommand } from './commands/api.js'
+import { prettyAfterSubcommand } from './commands/spec-types.js'
 import { wireLocalFallback } from './commands/local-fallback-wiring.js'
 import { storeCommand } from './commands/store.js'
 import { syncCommand } from './commands/sync.js'
@@ -52,6 +53,9 @@ const USAGE = `用法：qiyu <子命令> [参数]
   --help, -h               输出本帮助（唯一以裸文本而非 JSON 输出的情形）
   --version                输出版本 JSON：包版本与 skill 正文契约版本
                            （Agent 用它判断已安装的 skill 与 CLI 是否配套）
+  --pretty                 输出缩进 JSON（人类可读；写在具体子命令之后，
+                           如 qiyu api list --pretty。默认紧凑输出已是合法 JSON，
+                           Agent 解析不需要它）
 
 子命令：
   auth whoami              检查凭证是否已配置
@@ -101,6 +105,7 @@ const USAGE = `用法：qiyu <子命令> [参数]
 `
 
 export async function run(argv: string[]): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   // —— skill 安装态探测（Task 10，设计稿 D2.1）：只提示，绝不改退出码、data、文件 ——
   // 每个命令启动时探测一次：装了但过期 / 未装时往 meta.warnings 注入一句提示；
   // 探测失败（unknown）静默跳过，不影响命令本身。cli.ts 是唯一允许同时 import
@@ -142,7 +147,7 @@ export async function run(argv: string[]): Promise<number> {
     // 错误变成了静默成功，与 `api list --al --help` 是同一个坑，分派层这一处漏了。
     // `--help --help` 仍给帮助：`--help`/`-h` 是这条伪命令仅有的合法 token
     // （与 `api list --help --help` 同答 —— 都不算"额外参数"）。
-    // ⚠️ `--pretty` 同样豁免（2026-10-08）：它是**合法 flag**（承诺过、未实现），
+    // ⚠️ `--pretty` 同样豁免（2026-10-08；G1 起已实现为缩进开关）：它是**合法 flag**，
     // 不是"额外参数"—— `qiyu --help --pretty` 给帮助（与 `api list --help --pretty` 同答）。
     const extra = rest.filter((a) => a !== '--help' && a !== '-h' && a !== '--pretty')
     if (extra.length > 0) {
@@ -167,26 +172,31 @@ export async function run(argv: string[]): Promise<number> {
     if (extra.length > 0) {
       return usageFail(`未知参数：${describeArgs(extra)}。--version 不接受额外参数`)
     }
+    // G1：--version --pretty → 缩进的版本 JSON（帮助/版本检查是例外：--pretty 有可修饰的对象）
+    if (rest.includes('--pretty')) setPretty(true)
     return ok({ version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION })
   }
   // ⚠️ 分派层的 `--pretty` 必须与叶子层同答（2026-10-08 统一）。此前它落到
-  // 「未知子命令：--pretty」—— 而 `--pretty` 是**承诺过、只是未实现**的合法 flag
+  // 「未知子命令：--pretty」—— 而 `--pretty` 是真实存在的输出开关（G1 已实现）
   // （与 ㉖ 在叶子层修的是同一句话），把合法 flag 说成"未知子命令"是同一类事实错误；
   // 且 `qiyu --pretty --help` 此前被静默吞成 2（而 `qiyu api list --pretty --help` 是 0）。
   // 次序：**未知/位置 → help → version → `--pretty`**（叶子命令没有 --version，
   // 前两步与叶子层逐字一致；version 只在分派层存在）。
+  // G1：--pretty 已实现，但它必须写在具体子命令之后（`qiyu api list --pretty`）。
+  // 写在顶层时没有任何可修饰的输出（帮助是裸文本、version 是另一条伪命令）。
   if (sub === '--pretty') {
     const unknown = rest.filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
     const positional = rest.filter((a) => !a.startsWith('-'))
     const extra = [...unknown, ...positional]
     if (extra.length > 0) {
-      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 尚未实现，不接受额外参数`)
+      // `qiyu --pretty api list` 落在这里 —— 提示正确写法比只报"未知参数"有用
+      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 必须写在具体子命令之后`)
     }
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
       return 0
     }
-    return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+    return usageFail(prettyAfterSubcommand('<子命令>'))
   }
   if (!sub) {
     return usageFail(`用法：qiyu <子命令> [参数]（\`qiyu --help\` 查看全部）`)

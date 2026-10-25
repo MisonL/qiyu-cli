@@ -1131,7 +1131,7 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 }}
 ```
 
-- stdout 只输出 JSON；`--pretty` 用于人类可读；日志走 stderr
+- stdout 只输出 JSON；`--pretty` 用于人类可读（**G1 已实现**：缩进 JSON，写在具体子命令之后；用法错误仍是紧凑 JSON —— 先修参数再看格式）；日志走 stderr
 - **退出码**：`0` 成功 · `1` 业务错误 · `2` 用法错误 · `3` 网络错误 · `4` 需要 `--yes`
 - **退出码 4 必须携带** `confirm_required: true` + `confirm_arg: "--yes"` + `risk: "irreversible"` + `target`，以及 `retryable: false`
 

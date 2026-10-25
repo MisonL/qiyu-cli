@@ -1,8 +1,9 @@
 // src/commands/sync.ts —— D-T12：sync 命令骨架；D-T13：run 子命令挂载；
 // D-T14：status / verify / install / uninstall 四子命令。
 // 骨架沿 store.ts：parseStoreFlags → usageFail/fail 双通道 → thrownToExit 扩展。
-// --pretty 统一裁决（T12 遗留 minor，T13 落地）：沿 api.ts 族——承诺过、未实现的
-// flag 一律 usageFail 显式拒绝（退出码 2），顶层/子命令级/run/tasks 同答，无豁免集。
+// --pretty（G1 已实现）：输出缩进开关，写在子命令之后。留在这里的只是历史裁决说明——
+// 当年「承诺过、未实现」时的统一拒绝已退役；现在的规则与 api 族一致：未知/位置参数 →
+// help → --pretty，各层同答。
 //
 // T14 语义（spec §7.6 / 简化裁定）：
 //   · status / verify 以 ro 打开库（spec §6.3：单写者模型下读者走 C1 退避）；
@@ -33,7 +34,7 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
 import { resolveCredentials } from '../core/credentials.js'
-import { ok, fail, usageFail } from '../output.js'
+import { ok, fail, usageFail, setPretty } from '../output.js'
 import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
 import {
@@ -41,7 +42,7 @@ import {
 } from '../schedule/install.js'
 import type { Platform } from '../schedule/install.js'
 import type { Store } from '../store/types.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 import { STORE_VALUE_FLAG_NAMES } from './store-flags.js'
 
@@ -160,7 +161,9 @@ function parseSubFlags(argv: string[], valueFlags: string[], boolFlags: string[]
       out.values[a] = v
       i++
     } else if (a === '--pretty') {
-      throw new Error('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+      // G1：已实现的输出开关 —— 收下（不带值）；开启动作在命令层（原拒绝点 setPretty(true)）。
+      // 值位守卫仍优先：`--since --pretty` 报「--since 缺少取值」。
+      out.flags.add('--pretty')
     } else if (a === '--help' || a === '-h') {
       out.flags.add('--help')
     } else if (boolFlags.includes(a)) {
@@ -279,6 +282,9 @@ async function syncStatus(argv: string[]): Promise<number> {
   try {
     parsed = parseSubFlags(argv, STORE_VALUE_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
+  // G1：--pretty 已实现（原拒绝点在 parseSubFlags 的 throw）。次序：未知参数（parse 的
+  // throw）→ help（subHelp）→ 这里开 pretty → selectTasks 的未知任务名仍报 usage（缩进）。
+  if (parsed.flags.has('--pretty')) setPretty(true)
   const tasks = selectTasks(parsed.rest)
   if (typeof tasks === 'number') return tasks
 
@@ -345,6 +351,8 @@ async function syncVerify(argv: string[]): Promise<number> {
   try {
     parsed = parseSubFlags(argv, STORE_VALUE_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
+  // G1：同 syncStatus —— 原拒绝点之后开 pretty。
+  if (parsed.flags.has('--pretty')) setPretty(true)
   const tasks = selectTasks(parsed.rest)
   if (typeof tasks === 'number') return tasks
 
@@ -529,6 +537,8 @@ async function syncInstall(argv: string[]): Promise<number> {
     parsed = parseSubFlags(argv, INSTALL_VALUE_FLAGS, INSTALL_BOOL_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
   if (parsed.rest.length > 0) return usageFail(`未知参数：${parsed.rest.join(' ')}`)
+  // G1：--pretty 已实现（原拒绝点在 parseSubFlags 的 throw）。
+  if (parsed.flags.has('--pretty')) setPretty(true)
   const schedule = parsed.values['--schedule']
   if (schedule === undefined) {
     return usageFail('缺少 --schedule CRON（5 段：分 时 日 月 周）', '例如：qiyu sync install --schedule "*/30 * * * *"')
@@ -610,6 +620,8 @@ async function syncUninstall(argv: string[]): Promise<number> {
     parsed = parseSubFlags(argv, [], UNINSTALL_BOOL_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
   if (parsed.rest.length > 0) return usageFail(`未知参数：${parsed.rest.join(' ')}`)
+  // G1：--pretty 已实现（原拒绝点在 parseSubFlags 的 throw）。
+  if (parsed.flags.has('--pretty')) setPretty(true)
   const yes = parsed.flags.has('--yes')
 
   let platform: Platform
@@ -657,6 +669,7 @@ async function syncUninstall(argv: string[]): Promise<number> {
 }
 
 export async function syncCommand(argv: string[]): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
   if (sub === undefined || sub === '--help' || sub === '-h') {
     const extra = rest.filter((a) => !KNOWN.has(a))
@@ -664,8 +677,18 @@ export async function syncCommand(argv: string[]): Promise<number> {
     process.stdout.write(USAGE)
     return 0
   }
+  // G1：--pretty 是输出开关，必须写在具体子命令之后（`sync status --pretty`）。
   if (sub === '--pretty') {
-    return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+    const unknown = rest.filter((a) => a.startsWith('-') && !KNOWN.has(a))
+    const positional = rest.filter((a) => !a.startsWith('-'))
+    if (unknown.length + positional.length > 0) {
+      return usageFail(`未知参数：${[...unknown, ...positional].join(' ')}。--pretty 不接受额外参数`)
+    }
+    if (rest.includes('--help') || rest.includes('-h')) {
+      process.stdout.write(USAGE)
+      return 0
+    }
+    return usageFail(prettyAfterSubcommand('sync'))
   }
   if (sub !== 'tasks' && sub !== 'run' && sub !== 'status' && sub !== 'verify'
     && sub !== 'install' && sub !== 'uninstall') {
@@ -683,7 +706,8 @@ export async function syncCommand(argv: string[]): Promise<number> {
     process.stdout.write(USAGE)
     return 0
   }
-  if (rest.includes('--pretty')) return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+  // G1：--pretty 已实现 —— 原拒绝点开启缩进输出。
+  if (rest.includes('--pretty')) setPretty(true)
 
   try {
     const parsed = parseSubFlags(rest, TASKS_VALUE_FLAGS)

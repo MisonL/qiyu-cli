@@ -1,7 +1,7 @@
 // src/commands/auth.ts
 import { resolveCredentials } from '../core/credentials.js'
-import { ok, fail, usageFail, describeArgs, EXIT } from '../output.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS } from './spec-types.js'
+import { ok, fail, usageFail, describeArgs, setPretty, EXIT } from '../output.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -35,6 +35,7 @@ const AUTH_USAGE = `用法：qiyu auth whoami
 `
 
 export async function authCommand(argv: string[]): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub] = argv
   // ⚠️ `--help` 不吞额外参数（2026-10-08 修）—— 与叶子命令同一条次序
   // （未知/位置参数 → help）：实测 `qiyu auth --help --bod` / `qiyu auth --help extra`
@@ -57,18 +58,19 @@ export async function authCommand(argv: string[]): Promise<number> {
   // ⚠️ 分派层的 `--pretty` 与叶子层同答（2026-10-08 统一）：次序 **未知/位置 → help
   // → `--pretty`**。此前它落到「未知子命令：--pretty」—— 把承诺过、未实现的合法 flag
   // 说成"未知子命令"，与 ㉖ 在叶子层修的是同一类事实错误。
+  // G1：--pretty 已实现，但必须写在具体子命令之后（`auth whoami --pretty`）。
   if (sub === '--pretty') {
     const unknown = argv.slice(1).filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
     const positional = argv.slice(1).filter((a) => !a.startsWith('-'))
     const extra = [...unknown, ...positional]
     if (extra.length > 0) {
-      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 尚未实现，不接受额外参数`)
+      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 不接受额外参数`)
     }
     if (argv.includes('--help') || argv.includes('-h')) {
       process.stdout.write(AUTH_USAGE)
       return EXIT.OK
     }
-    return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+    return usageFail(prettyAfterSubcommand('auth'))
   }
   if (sub === 'login') {
     // ⚠️ `login` 在「已知缺口」里明确未实现（配置文件写入留给计划 2）。
@@ -151,11 +153,8 @@ export async function authCommand(argv: string[]): Promise<number> {
     process.stdout.write(AUTH_USAGE)
     return EXIT.OK
   }
-  // ⚠️ `--pretty` 同上（2026-10-07 修）：它是承诺过、未实现的 flag，不是未知参数。
-  // 三个子命令给同一句，Agent 才学得到统一规则。
-  if (argv.includes('--pretty')) {
-    return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
-  }
+  // G1：--pretty 已实现 —— 原拒绝点开启缩进输出（次序不变：未知/位置 → help → 这里）。
+  if (argv.includes('--pretty')) setPretty(true)
   return whoami()
 }
 

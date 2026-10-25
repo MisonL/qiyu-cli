@@ -20,6 +20,10 @@
     补类型与加载期校验，`field_notes.category` 说明它不是稳定契约
   - `call()` 的 GET 分支：GET 不带 body 发送（签名 `md5('')`），GET + body 在本地报用法错误
     （不静默丢弃）；`api call` 侧由 `assertGetHasNoBody` 先行拦截
+- `--pretty` 已实现（G1 第二批，2026-10-24）：输出缩进 JSON（人类可读）。写在具体子命令之后
+  （如 `qiyu api list --pretty`）；用法错误仍是紧凑 JSON。各命令在原「显式拒绝」位置开启开关，
+  错误次序逐字保留；`REJECTED_FLAGS` 清空但 rejected 机制与 `skill check` 的 rejected_flag
+  规则保留
 
 - 注册表补全至 154 条接口（150 个文档页 + 4 个文档外接口），并新增每接口的 `params/` 参数表。
 - `qiyu api schema <id>` —— 查看接口请求参数表与响应形状

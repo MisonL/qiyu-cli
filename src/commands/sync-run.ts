@@ -10,8 +10,8 @@
 //     staff 表逐客服驱动，缺 dim 首跑必败。
 //   ③ robotId 注入：StoreConfig.options.knowledgeRobotIds（number[]）在配置层透传、
 //      本层传给 categories 任务消费（发现盲区的手工兜底路径）。
-//   ④ --pretty 统一裁决：沿 api.ts 族——承诺过、未实现的 flag 一律 usageFail 显式拒绝，
-//      不进任何子命令的合法集（T12 遗留 minor 的统一：tasks/run 同答）。
+//   ④ --pretty（G1 已实现）：输出缩进开关，写在子命令之后；解析循环收下它
+//      （见 RUN_BOOL_FLAGS 分支的 `|| a === '--pretty'`），开启动作在命令层。
 //   ⑤ 退出码：任一任务 complete/partial（部分成功）→ 0；全部 failed → 1；用法 → 2。
 //   ⑥ 中断裁决：不装 signal handler —— 事务边界是安全点，进程被 kill 时 DuckDB 回滚、
 //      水位不推，下次 run 从水位续跑（红线 3 钉死用例覆盖）。
@@ -27,7 +27,7 @@ import { readWatermark } from '../sync/state.js'
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
-import { ok, fail, usageFail, describeArgs } from '../output.js'
+import { ok, fail, usageFail, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
 import type { Store } from '../store/types.js'
 import { GLOBAL_FLAGS, STORE_FLAGS, renderFlagNames, valueFlagNames } from './spec-types.js'
@@ -220,6 +220,7 @@ function storeInitFail(e: unknown): number {
 
 /** sync run 的完整编排（从 flags/env 到退出码）。返回值即命令退出码。 */
 export async function runSyncRun(argv: string[]): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const clock = (): number => Date.now()
   // —— flag 解析（store.ts 同族：值位守卫，--开头算缺值）——
   // 已知 token 集（help 分流的豁免名单）= 全局 flag + 本命令的**布尔** flag。
@@ -241,7 +242,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     process.stdout.write(SYNC_RUN_USAGE)
     return 0
   }
-  if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+  // G1：--pretty 已实现。与 help 的次序保持原样（help 分流在前）；解析循环里
+  // `--pretty` 落进未知参数分支会报错，所以在 KNOWN 里收下并在原拒绝点开启。
+  if (argv.includes('--pretty')) setPretty(true)
 
   const flags: Record<string, string> = {}
   const taskIds: string[] = []
@@ -254,7 +257,8 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       }
       flags[a] = v
       i++
-    } else if (RUN_BOOL_FLAGS.includes(a)) {
+    } else if (RUN_BOOL_FLAGS.includes(a) || a === '--pretty') {
+      // G1：--pretty 是已实现的输出开关（布尔）。收下避免报「未知参数」。
       flags[a] = a
     } else if (a.startsWith('-')) {
       return usageFail(`未知参数：${describeArgs([a])}。可用：${RUN_AVAILABLE}`)
