@@ -686,3 +686,48 @@ describe('call', () => {
       '文档来源的限频行不能被标成 observed —— 那是一次对可信度的谎报').toBe('doc')
   })
 })
+
+describe('GET 请求不带 body（G1）', () => {
+  // ⚠️ 当前 154 条注册表里唯一的 GET（`get_token`）是 inbound、不可主动调用，
+  // 生产路径不可达 —— 本组用**合成 spec** 覆盖，不要把它读成"线上 GET 已实测"。
+  const GET_SPEC = {
+    id: 'synthetic.get', title: '合成 GET', method: 'GET' as const, path: '/openapi/synthetic/get',
+    direction: 'outbound' as const, callable: true, dangerous: false,
+    auth: 'checksum' as const, verified: false, envelope: 'C' as const,
+  }
+
+  it('GET 不传 body 时 fetch 收到 body: undefined，签名按 md5(空串) 计算', async () => {
+    // ⚠️ 这是 GET 分支的核心不变量。此前 `call()` 对任何 method 都发
+    // `body: bodyStr` —— 若某个调用点给 GET 传了 {}，undici 会在构造阶段抛
+    // TypeError（被 isLocalRequestError 兜成 usage），但那是一条**错误驱动**的路径。
+    // 现在要求：GET + 无 body → 正常发送、body 为 undefined、checksum == md5('')。
+    fetchMock.mockReturnValueOnce(ok({ code: 200, message: '{"data":null}' }))
+    await call(GET_SPEC as never, undefined, { credentials: CREDS })
+    const init = fetchMock.mock.calls[0][1]
+    expect(init.method).toBe('GET')
+    expect(init.body).toBeUndefined()
+    // 用与实现相同的口径独立重算：md5('') 参与签名（2026-10-02 真实凭证实测的约定）
+    const url = String(fetchMock.mock.calls[0][0])
+    const time = Number(/[?&]time=(\d+)&/.exec(url)![1])
+    expect(/&checksum=([0-9a-f]{40})$/.exec(url)![1]).toBe(checksum(CREDS.appSecret, '', time))
+  })
+
+  it('GET + body 在本地就抛 usage（零 fetch），不静默丢弃 body', async () => {
+    // ⚠️ 静默丢弃会让 Agent 以为参数生效了 —— 与「不传 body 与传 {} 是两条路径」
+    // 同一条诚实性要求。必须在发请求前拦下，且 kind 是 usage（改参数重来）。
+    const err = await call(GET_SPEC as never, { a: 1 }, { credentials: CREDS }).catch((e) => e)
+    expect(err).toMatchObject({ kind: 'usage', retryable: false })
+    expect(err.message).toMatch(/GET.*不接受请求体/)
+    // ⚠️ hint 不得指向不存在的通道（2026-10-25 评审发现）：本 CLI 没有 GET 的
+    // query 参数输入路径。承诺它会让调用方去找一个没有的 flag。
+    expect(err.hint ?? '').not.toMatch(/走 query 串/)
+    expect(err.hint ?? '').toMatch(/没有.*query 参数通道|无法.*参数/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('POST 仍照常发送 body —— GET 分支没有误伤 POST', async () => {
+    fetchMock.mockReturnValueOnce(ok({ code: 200, message: '{"data":null}' }))
+    await call(byId('ticket.search'), { a: 1 }, { credentials: CREDS })
+    expect(fetchMock.mock.calls[0][1].body).toBe('{"a":1}')
+  })
+})
