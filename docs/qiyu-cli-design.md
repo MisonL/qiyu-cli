@@ -1830,11 +1830,11 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 
 ## 12. 测试策略
 
-- `core/sign`：与七鱼文档中的 Java `QiyuPushCheckSum` 样例做**逐字节比对**；用原始 TCP 抓包验证实际发出的字节
-- `core/envelope`：对 40 个 key+type 签名样例做表驱动测试
-- `store`：对 DuckDB 和 SQLite 跑同一组用例，断言**类型与 upsert 语义完全一致**（已知差异见 §6.3）
+- **`core/sign`（已交付，2026-10-25）**：与七鱼官方 Java `QiyuPushCheckSum` 样例做**逐字节比对**。样例**已取得** —— 来自 Apifox 文档页 `doc-436971`（`.md` 后缀取全文字段表），存档在 `private/docs/apifox-436971-数据校验.md`（`private/` 已 gitignore，不入公开仓库）。`tests/core/sign.test.ts` 内置该样例的 Node 移植版 `javaEncode` 作对拍 oracle，配固定向量，并附一条**反恒真**断言（oracle 必须与实现给出不同中间结果，否则「两边一致」只是抄了同一份代码）。⚠️ 原始 TCP 抓包验证实际发出的字节 —— **未做**，仍挂账（需要抓包环境，且当前校验和已由签名对拍覆盖）
+- **`core/envelope`（已交付，2026-10-25）**：设计稿 §9.0 记录的 **40 条 key+type 实测签名样本不在仓库里**（会随服务端演化），故 `tests/core/envelope-matrix.test.ts` 改覆盖**形状 × `message` 类型**的语义矩阵（A / B / C / D / D-nf × string / object / integer / boolean / array），每格要么断言解释规则、要么显式标注无实测依据。矩阵附**覆盖度自检**：从 `src/core/envelope.ts` 读 `EnvelopeShape` 的真实定义，且覆盖判据是**观测式**的（`normalizeIn` 只在真实用例里登记被喂过的形状），双向断言「声明的形状都跑到了 / 跑到的形状都在声明里」，另要求至少两个形状给出不同结论 —— 手抄清单式的自检（清单 vs 类型定义）守不住「加了新形状但没有用例」这个形态
+- `store`：对 DuckDB 和 SQLite 跑同一组用例，断言**类型与 upsert 语义完全一致**（已知差异见 §6.3）。**随 C2（外部后端）交付** —— 当前只有 DuckDB 一个引擎，「两引擎一致」无对照物
 - `store/sandbox`：完整攻击用例集（§8.2 表格的全部 9 行）必须全部被拦截
-- `store` 时区：在三个时区（`Asia/Shanghai` / `UTC` / `America/New_York`）下跑同一组日期用例
+- **时区（已交付，2026-10-25）**：`tests/core/time-timezones.test.ts` 在三个时区（`Asia/Shanghai` / `UTC` / `America/New_York`）下跑同一组日期用例，断言结论逐字一致。**两条自检让一致断言有牙**：① 每个时区先探测本机小时数（20 / 12 / 8），切换未生效就响亮失败 —— 否则「三个都一样」只是「根本没切」；② 另有一条断言要求这组用例对时区**敏感**（三时区下本机日历日不全相同），否则用例可能恰好落在三时区同一天的区间里。用例覆盖跨日（上海已是次日、纽约仍是当日）、跨年、纽约夏令时起止日、无偏移 ISO、`yesterday` 与回显形态。⚠️ **每个时区都重新导入模块**（`vi.resetModules()` + 动态 import）：`Intl.DateTimeFormat` 在构造时就把时区定死，只切 `process.env.TZ` 的写法测不出「formatter 退回默认时区」这类缺陷（实测：构造于上海的 formatter 切到 UTC 后仍返回上海日期）。变异验证四次均转红：`yesterday` 改用本机日期 / 无偏移 ISO 交给 `Date.parse` / 本地零点代替上海零点 / 删掉 formatter 的 `timeZone`
 - `sync`：录制 HTTP fixture；验证幂等性（跑两次结果相同）、可断点续传的同步，以及无缺口的事务
 - `commands`：端到端 mock server；断言 stdout 是纯 JSON 且退出码正确
 - **`sync/knowledge`（新增；必须防采样假象）**：以**一次完整遍历的录制 fixture** 做断言（录制于 2026-09-30，12,778 行 —— **不要在断言里硬编码这个数字**，它会漂移；改为断言下列不变量，并让 fixture 自带行数）—— ① `isEnd` 驱动终止，且累计行数 `==` 声明的 `total`；② **断言全部 5 个 robotId 都出现**（若 fixture 被截断到前 1,000 行，这条断言必须失败 —— 那正是 §13#14 的错误）；③ 每条 `type=10` 行的 `refId` 都能解析到一条 `type=1` 行**且携带相同的 `groupId`**；④ 每行的 `pointId` 都能解析进 `knowledge_points`（4,805 条，全部可解析）；⑤ `COUNT(DISTINCT groupId) == COUNT(type=1)`；⑥ `groupId` 在**每一**行上都存在，且没有 `groupId` 跨越两个 `robotId`
