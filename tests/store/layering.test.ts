@@ -110,6 +110,43 @@ describe('分层约束（架构不变量）', () => {
         /(?:from\s*|import\s*\(\s*|import\s+)['"][^'"]*\/store\//)
     }
   })
+  // ⚠️ **传递闭包**版（G1 补）：上面那条只扫 `auth.ts` / `api.ts` 自身的源文本，
+  // 于是「auth.ts import 一个新工具模块，那个模块 import store/」可以静默穿透 ——
+  // 源文本里没有 `/store/`，而进程启动时 DuckDB 照样被加载。G1 恰恰就是在这个位置
+  // 动刀（抽 `core/config.ts` 让 auth/api 有配置能力而不碰 store），所以把守卫
+  // 升级成**从这两个入口出发的静态 import 传递闭包不得到达 `src/store/**`**。
+  // ⚠️ 只跟**相对路径**的 import（`./` `../`）：包名（`node:fs`、`@duckdb/node-api`）
+  // 解析不到仓内文件，且有上一条的字面量哨兵兜底。
+  it('auth/api 的**静态 import 传递闭包**不得到达 src/store/（G1：源文本防线之外的第二层）', () => {
+    const resolveSpec = (fromFile: string, spec: string): string | undefined => {
+      if (!spec.startsWith('.')) return undefined
+      // ⚠️ **必须处理 `.js` 后缀**：本仓库是 TS ESM（`moduleResolution: node16`），
+      // 源码里一律写 `'../core/config.js'` 而磁盘上是 `.ts`。不剥离后缀就一个也
+      // 解析不到 —— 变异验证会假绿（第一版就踩了：把 auth 链路改成 import store/
+      // 仍然 10 条全绿）。
+      const base = join(dirname(fromFile), spec.replace(/\.js$/, '.ts'))
+      for (const cand of [base, join(base.replace(/\.ts$/, ''), 'index.ts'), `${base}`]) {
+        if (existsSync(cand) && statSync(cand).isFile()) return cand
+      }
+      return undefined
+    }
+    for (const entry of ['auth.ts', 'api.ts'].map((n) => join(src, 'commands', n))) {
+      const seen = new Set<string>()
+      const queue = [entry]
+      const storeReached: string[] = []
+      while (queue.length > 0) {
+        const cur = queue.pop()!
+        if (seen.has(cur)) continue
+        seen.add(cur)
+        if (cur.startsWith(join(src, 'store') + sep)) { storeReached.push(cur); continue }
+        for (const spec of importSpecifiers(cur)) {
+          const target = resolveSpec(cur, spec)
+          if (target !== undefined) queue.push(target)
+        }
+      }
+      expect(storeReached, `${entry} 的 import 闭包到达了 src/store/`).toEqual([])
+    }
+  })
   // D5.1 的分层红线：`src/skill/` 是**叶子层**，它消费 core/ commands/ store/，这些层
   // 一律不得反向依赖它。反向 import 会让纯函数（output/tree/查询层）被迫加载 skill 探测
   // （读 home、读包内文件），而「未安装提示」本该是入口层的职责。

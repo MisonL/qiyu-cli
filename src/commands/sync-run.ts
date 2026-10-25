@@ -17,7 +17,8 @@
 //      水位不推，下次 run 从水位续跑（红线 3 钉死用例覆盖）。
 import { openStore } from '../store/index.js'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
-import { resolveCredentials } from '../core/credentials.js'
+import { fileProfile } from '../core/config.js'
+import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
 import { RateGate } from '../sync/rate-gate.js'
 import { runTask, runRotated } from '../sync/engine.js'
 import { SYNC_TASKS, taskById } from '../sync/registry.js'
@@ -165,6 +166,25 @@ function wireCategories(task: SyncTask, robotIds: number[], clock: () => number)
   }
 }
 
+/**
+ * 从配置文件读 `profiles.<name>.robots` 的 robotId 列表（G1 兜底来源）。
+ *
+ * ⚠️ 只取**键**（robotId），显示名是给人看的、注入面用不着。
+ * ⚠️ 任何读取失败一律返回 `[]`：本函数是**兜底**，不是主路径 —— 上面
+ * `resolveStoreConfig` 已经对同一份文件做过权限裁决与结构校验（含凭证且过宽
+ * 会在此前抛出），这里再抛一次只会把同一个问题报两遍，而且会掩盖真正的失败原因。
+ */
+function robotsFromConfig(configPath: string, profileFlag: string | undefined): number[] {
+  try {
+    const r = fileProfile(configPath, profileFlag ?? process.env.QIYU_PROFILE)
+    return Object.keys(r.profile?.robots ?? {})
+      .map((k) => Number(k))
+      .filter((n) => Number.isInteger(n) && n > 0)
+  } catch {
+    return []
+  }
+}
+
 /** 任务条目 → 输出形态（spec §七字段名）。 */
 function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: string | null,
   notes: string[] = []) {
@@ -278,18 +298,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
   }
 
   // —— 凭证前置（api.ts 同族：缺凭证是环境问题 → auth_missing 退出码 1）——
-  let creds
-  try {
-    creds = resolveCredentials({}, {
-      appKey: process.env.QIYU_APP_KEY, appSecret: process.env.QIYU_APP_SECRET,
-    })
-  } catch (e) {
-    return fail({
-      code: 'auth_missing', kind: 'auth_missing', retryable: false,
-      message: e instanceof Error ? e.message : String(e),
-      hint: '设置 QIYU_APP_KEY / QIYU_APP_SECRET 环境变量',
-    })
-  }
+  const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv())
+  if (!credOutcome.ok) return fail(credOutcome.error)
+  const creds = credOutcome.creds
 
   // —— store 打开（rw 单写者）——
   // ⚠️ close 覆盖 openStore 之后的**所有**路径（B 低-1，沿 store.ts 的 C1 形态）：
@@ -361,9 +372,14 @@ export async function runSyncRun(argv: string[]): Promise<number> {
           `配置文件 store.options.knowledgeRobotIds 必须是正整数数组（非法元素：${String(bad)}）`)
       }
     }
-    const robotIds = Array.isArray(rawIds)
-      ? rawIds.map((x) => Number(x)).filter((x) => Number.isInteger(x) && x > 0)
-      : []
+    const robotIds = rawIds !== undefined
+      ? (rawIds as number[]).map((x) => Number(x)).filter((x) => Number.isInteger(x) && x > 0)
+      // ⚠️ G1 起配置里的 `profiles.<name>.robots`（`auth whoami` 输出的那份映射）
+      // 是兜底来源 —— 否则它是个「声明了但没人读」的死字段。优先级：
+      // store.options.knowledgeRobotIds > robots 键（向后兼容：已配 options 的
+      // 行为逐字不变）。权限裁决复用上方 resolveStoreConfig 的结果（同一次
+      // 调用已经查过），这里只读不再裁决。
+      : robotsFromConfig(resolved.configPath, flags['--profile'])
 
     const ctxBase = {
       store,

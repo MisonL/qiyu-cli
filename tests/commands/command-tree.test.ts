@@ -34,11 +34,12 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks() })
 
 describe('COMMAND_TREE', () => {
-  it('覆盖全部 19 条叶命令（含 skill 三条，G3 审查 C1）', () => {
+  it('覆盖全部 20 条叶命令（含 skill 三条、auth 两条）', () => {
     // 16 → 19：`skill install/check/where` 是 cli.ts 正式注册的真实命令，此前不在树里，
     // 正文写 `` `qiyu skill install` `` 会被 check 判 unknown_command、退 1（假阳性）。
+    // 19 → 20：G1 交付 `auth login`（此前只有 `auth whoami`）。
     expect(paths).toEqual([
-      'api call', 'api list', 'api schema', 'auth whoami', 'db describe', 'db tables',
+      'api call', 'api list', 'api schema', 'auth login', 'auth whoami', 'db describe', 'db tables',
       'query', 'skill check', 'skill install', 'skill where', 'stats fields',
       'store init', 'store status',
       'sync install', 'sync run', 'sync status', 'sync tasks', 'sync uninstall', 'sync verify',

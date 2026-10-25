@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { ok, fail, usageFail, describeArgs, sanitizeControlChars, setSkillWarning } from '../src/output.js'
+import { ok, fail, usageFail, describeArgs, sanitizeControlChars, setSkillWarning, setPretty } from '../src/output.js'
 
 let out: string
 // ⚠️ 用法错误现在**双通道**（stderr 给人、stdout 给 Agent），所以 err 也要捕获。
@@ -442,5 +442,45 @@ describe('setSkillWarning —— 安装态提示的注入式合并（Task 10）'
     const parsed = JSON.parse(out)
     expect(parsed).not.toHaveProperty('meta')
     expect(parsed.error).not.toHaveProperty('warnings')
+  })
+})
+
+describe('--pretty 的边界：只修饰成功输出，用法错误永远紧凑', () => {
+  // ⚠️ 实测来源（CodeRabbit 2026-10-25，PR #12）：多条分支在 `setPretty(true)` **之后**
+  // 才报用法错误 —— `api schema --pretty`（缺 id）、`auth login --pretty`（缺环境变量）
+  // 等等，输出的就是**缩进**错误信封，而 README「输出格式」与设计稿 §11.2 逐字写着
+  // 「用法错误（退出码 2）仍是紧凑 JSON」。修在唯一的出口（usageFail）而不是逐个
+  // 调用点调整次序：次序调整既脆弱，又会随新分支漂移。
+  beforeEach(() => setPretty(false))
+  afterEach(() => setPretty(false))
+
+  it('开启 --pretty 后 usageFail 仍输出紧凑 JSON', () => {
+    setPretty(true)
+    usageFail('用法：qiyu api schema <接口id>')
+    expect(out, '用法错误被缩进了 —— 与 README/设计稿的承诺不符').not.toContain('\n  ')
+    expect(out.startsWith('{"ok":false,"error":')).toBe(true)
+    expect(JSON.parse(out).error.kind).toBe('usage')
+  })
+
+  it('usageFail 不改动全局开关 —— 之后的成功输出仍然缩进', () => {
+    setPretty(true)
+    usageFail('用法错误')
+    out = ''
+    ok({ a: 1 })
+    expect(out.startsWith('{\n  "ok": true,')).toBe(true)
+  })
+
+  it('对比：成功输出（ok）在 --pretty 下确实缩进 —— 证明上面的紧凑是刻意的', () => {
+    setPretty(true)
+    ok({ a: 1 })
+    expect(out).toContain('\n  ')
+  })
+
+  it('`fail()`（业务错误）仍受 --pretty 影响 —— 只收窄用法错误这一类', () => {
+    // 契约只承诺"用法错误紧凑"：业务错误（如 auth_missing）是**命令真的跑了**的结果，
+    // 与成功输出同属"给人看的格式化输出"。
+    setPretty(true)
+    fail({ code: 'auth_missing', kind: 'auth_missing', retryable: false, message: 'm' })
+    expect(out).toContain('\n  ')
   })
 })

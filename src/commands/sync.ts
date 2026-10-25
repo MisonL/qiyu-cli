@@ -33,7 +33,7 @@ import type { SyncTask } from '../sync/types.js'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
-import { resolveCredentials } from '../core/credentials.js'
+import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
 import { ok, fail, usageFail, setPretty } from '../output.js'
 import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
@@ -361,17 +361,9 @@ async function syncVerify(argv: string[]): Promise<number> {
   const needsUpstream = tasks.some((t) => t.kind === 'snapshot')
   let creds: { appKey: string; appSecret: string } | undefined
   if (needsUpstream) {
-    try {
-      creds = resolveCredentials({}, {
-        appKey: process.env.QIYU_APP_KEY, appSecret: process.env.QIYU_APP_SECRET,
-      })
-    } catch (e) {
-      return fail({
-        code: 'auth_missing', kind: 'auth_missing', retryable: false,
-        message: e instanceof Error ? e.message : String(e),
-        hint: '设置 QIYU_APP_KEY / QIYU_APP_SECRET 环境变量',
-      })
-    }
+    const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv())
+    if (!credOutcome.ok) return fail(credOutcome.error)
+    creds = credOutcome.creds
   }
 
   let resolved

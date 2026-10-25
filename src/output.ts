@@ -261,6 +261,26 @@ export function fail(error: ErrorInput): number {
  * 同时把**同一句话**作为 `{ok:false,error:{code:'usage',kind:'usage',...}}` 写进 stdout。
  * 这样两类读者都照顾到：人看 stderr，Agent 按契约读 stdout 的 JSON。
  */
+/**
+ * 「带 kind 的错误走 `fail()`，其余走 `usageFail()`」的统一出口（G1）。
+ *
+ * ⚠️ 为什么需要它：各命令的 catch 此前一律 `usageFail((e as Error).message)` ——
+ * 于是**带 kind 的错误**（如 `config_insecure`：配置含凭证但权限过宽，退出码 1、
+ * 只能由人 chmod 修）被降级成"用法错误，改参数重来"（退出码 2）。Agent 照退出码
+ * 的语义去改参数，而这件事与参数无关。
+ * → 有 `kind` 就如实透传（含 hint/retryable），没有才当用法错误。
+ */
+export function failFromTagged(e: unknown): number {
+  const err = e as { code?: string; kind?: string; retryable?: boolean; message?: string; hint?: string }
+  if (err.kind) {
+    return fail({
+      code: err.code ?? 'unknown', kind: err.kind, retryable: err.retryable ?? false,
+      message: err.message ?? String(e), hint: err.hint,
+    })
+  }
+  return usageFail(sanitizeMessage(err.message ?? String(e)))
+}
+
 export function usageFail(message: string, hint?: string): number {
   // ⚠️ stderr 是不受信文本进终端的主通道（security S4）：未知参数、未知表名、DuckDB 原文
   // 都拼进 message，未经净化就能注入 ANSI/OSC 序列。净化必须在**出口**做一次，
@@ -268,10 +288,26 @@ export function usageFail(message: string, hint?: string): number {
   // 而同文件的 `未知参数` / `--help` 多余参数路径没补，两种行为并存正是缺口的来源。
   const safe = sanitizeMessage(message)
   process.stderr.write(safe.endsWith('\n') ? safe : safe + '\n')
-  return fail({
-    code: 'usage', kind: 'usage', retryable: false,
-    // message 去尾换行 —— stdout 的 JSON 里不该带控制字符；stderr 的文本保留换行便于阅读。
-    message: safe.replace(/\n+$/, ''),
-    ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
-  })
+  // ⚠️ 用法错误**永远是紧凑 JSON**，即使 `--pretty` 已开启（CodeRabbit 2026-10-25 实测发现）。
+  // 契约写在 README「输出格式」与设计稿 §11.2：`--pretty` 只修饰**成功输出**，
+  // 用法错误（退出码 2）保持紧凑 —— 理由不是审美，而是"先修参数，再看格式"：
+  // 一个带缩进的错误信封恰好出现在"你这条命令根本没跑起来"的时刻，
+  // 而 Agent 判断格式是否生效时会拿它当"格式化已生效"的证据。
+  // 此前有多条分支在 `setPretty(true)` **之后**才报用法错误（如 `api schema --pretty`
+  // 缺 id、`auth login --pretty` 缺环境变量），那些路径输出的就是缩进错误信封。
+  // 现在在唯一的出口处强制收窄 —— 逐个调用点调整次序既脆弱又会随新分支漂移。
+  const prev = prettyOutput
+  prettyOutput = false
+  try {
+    return fail({
+      code: 'usage', kind: 'usage', retryable: false,
+      // message 去尾换行 —— stdout 的 JSON 里不该带控制字符；stderr 的文本保留换行便于阅读。
+      message: safe.replace(/\n+$/, ''),
+      ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
+    })
+  } finally {
+    // 还原 —— 用法错误是命令的终点，但还原让"同一个进程里连续两次 run"（测试里常见）
+    // 不会因为这条错误的副作用改变下一条命令的开关状态。
+    prettyOutput = prev
+  }
 }

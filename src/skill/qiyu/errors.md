@@ -10,7 +10,8 @@
 
 | 信号 | 动作 |
 |---|---|
-| `kind: auth_missing` | 凭证未配置。按 hint 设置环境变量后重跑；原命令重试无用 |
+| `kind: auth_missing` | 凭证未配置（环境变量与配置文件都没有）。按 hint 设置 `QIYU_APP_KEY`/`QIYU_APP_SECRET` 或让人类跑 `qiyu auth login`；原命令重试无用 |
+| `kind: config_insecure` | 配置文件**含凭证**但权限过宽（group/other 可读到 appSecret）。重试无用——转告人类执行 hint 里点名的 `chmod` 后重跑 |
 | `kind: auth` | 凭证被服务端拒绝（key 错、IP 不在白名单、接口无权限）。按 hint 修配置；重试无用 |
 | `kind: bad_time` | 时间戳超期。CLI 已自动重签重试过；仍失败说明本机时钟真的偏了——校准系统时间 |
 | `kind: param` | 参数错误。按 message 与 hint 修正；重试无用 |

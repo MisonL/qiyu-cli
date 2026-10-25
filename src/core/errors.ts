@@ -44,6 +44,10 @@ export const ERROR_KINDS = [
   // 此前只在 `sync.ts` 里以字符串字面量出现、不在本联合里，按 kind 分支的 Agent
   // 会收到一个未在任何类型/文档中出现的值（契约审查 C-03）。
   'sync_not_run',
+  // 配置层（G1）：配置文件**含凭证**却权限过宽（group/other 可访问，或父目录
+  // 可被整体替换）—— 退出码 1，重试无用，必须由人执行 chmod 收紧密码。
+  // ⚠️ 与 `auth_missing` 的区别：那是「没配」，这是「配了但落在不安全的位置」。
+  'config_insecure',
 ] as const
 
 // ⚠️ `sandbox_blocked` / `query_error` 是 **code** 不是 kind：查询层的这两类失败

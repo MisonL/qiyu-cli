@@ -474,7 +474,7 @@ describe('ErrorKind 闭集（E 组扩展）', () => {
 })
 
 describe('ERROR_KINDS 运行时常量', () => {
-  // 全量清单（20 个，当前版本真正会产出的 kind）—— F 子项目 Task 4。
+  // 全量清单（21 个，当前版本真正会产出的 kind）—— F 子项目 Task 4；G1 补 config_insecure。
   // ⚠️ 必须 `as const`：元素类型要是**字面量联合**，下方
   // `Exclude<ErrorKind, (typeof ALL)[number]>` 才可能非空（标注成 `readonly string[]`
   // 会让它恒为 `never`，编译期护栏变成空转）。顺序与 `errors.ts` 的声明顺序一致。
@@ -483,7 +483,7 @@ describe('ERROR_KINDS 运行时常量', () => {
     'window_too_large', 'window_misaligned', 'not_in_queue', 'pending',
     'route_not_found', 'internal', 'network', 'usage', 'unknown',
     'needs_confirmation', 'store_locked', 'store_not_initialized',
-    'query_timeout', 'sync_not_run',
+    'query_timeout', 'sync_not_run', 'config_insecure',
   ] as const
 
   it('包含当前版本全部会产出的 kind', () => {
@@ -531,8 +531,8 @@ describe('ERROR_KINDS 运行时常量', () => {
 
   // 数量在**运行时**也有区分度：上面的 `satisfies` 拦不住「两边同时删掉一个」
   // （ALL 少一个、ERROR_KINDS 也少一个 → 双向闭集仍成立）。这条补住那个方向。
-  it('成员数量为 20（两边同时少一个时仍能发现）', () => {
-    expect(ERROR_KINDS.length).toBe(20)
-    expect(ALL.length).toBe(20)
+  it('成员数量为 21（两边同时少一个时仍能发现）', () => {
+    expect(ERROR_KINDS.length).toBe(21)
+    expect(ALL.length).toBe(21)
   })
 })

@@ -89,7 +89,7 @@ const USAGE = `用法：qiyu <子命令> [参数]
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
      数字码（如 14009），也可能是本 CLI 合成的词（usage / network / internal /
-     auth_missing / confirm_required / store_locked / store_not_initialized /
+     auth_missing / config_insecure / confirm_required / store_locked / store_not_initialized /
      local_rate_limit / query_error / sandbox_blocked / query_timeout / unknown）。
      合成词查不到官方错误码表。
 
