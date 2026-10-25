@@ -15,7 +15,7 @@
 | `kind: bad_time` | 时间戳超期。CLI 已自动重签重试过；仍失败说明本机时钟真的偏了——校准系统时间 |
 | `kind: param` | 参数错误。按 message 与 hint 修正；重试无用 |
 | `kind: usage` | 调用方式有误（退出码 2）。改命令或参数重来；原样重试毫无意义 |
-| `kind: rate_limit` | 限流。看 `retry_after`：`source` 为 `fallback` 表示该秒数是保守兜底、不是实测冷却（睡完可能再吃一次限流）；秒数超过 60 就不要干等——转本地查询通道先做别的分析，稍后再回来。若错误里带 `retry_strategy: switch_to_local` 与 `fallback` 命令，说明本地库有对应表——但那只是**整表数据源，不是这次请求的等价替代**：它不会带上你 body 里的筛选条件（时间窗/状态/关键字等），要自己补 WHERE（`--sql` 或 `--since`/`--until`）；表存在也不等于已同步或覆盖你要的时间窗，先按 `hint` 用 `qiyu db tables` / `qiyu sync status` 确认行数与水位再采信 |
+| `kind: rate_limit` | 限流。看 `retry_after`：`source` 为 `fallback` 表示该秒数是保守兜底、不是实测冷却（睡完可能再吃一次限流）；秒数超过 60 就不要干等——转本地查询通道先做别的分析，稍后再回来。若错误里带 `retry_strategy: switch_to_local` 与 `fallback` 命令，说明**该接口在同步任务里有本地表映射、且配置指向的库文件存在**——CLI 只检查了这两件事，**没有打开库、没有确认那张表真的存在**（把库路径指向别的文件时这条建议照样会出现），所以先跑 `qiyu db tables` 确认表在清单里。即便在，那也只是**整表数据源，不是这次请求的等价替代**：它不会带上你 body 里的筛选条件（时间窗/状态/关键字等），要自己补 WHERE（`--sql` 或 `--since`/`--until`）；表存在也不等于已同步或覆盖你要的时间窗，先按 `hint` 用 `qiyu db tables` / `qiyu sync status` 确认行数与水位再采信 |
 | `kind: window_too_large` | 时间跨度超限。上限天数看报文里的数字（如「> 31」即 31 天），或查 `qiyu api list` 输出里该接口的 `max_window_days`；按它切片、分批请求 |
 | `kind: window_misaligned` | 时间边界没对齐自然日（结束边界不得晚于今天零点）。切片修不好——把边界对齐到自然日再试 |
 | `kind: module_offline` | 模块未开通。永久失败，找人类开通，不要重试 |

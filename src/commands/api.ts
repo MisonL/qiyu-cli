@@ -746,13 +746,21 @@ function mapThrownToExit(e: unknown, spec?: EndpointSpec): number {
         const [first, ...rest] = fb.tables
         fallback = `qiyu query --table ${first}`
         const others = rest.length > 0 ? `（该接口另有本地表：${rest.join('、')}）` : ''
+        // ⚠️ 措辞必须只承诺**实际检查过的事**（CodeRabbit 2026-10-25 实测发现）。
+        // 探测只做了两件：① 该接口在同步任务里有对应表；② 配置指向的路径**是个文件**。
+        // 此前这里写「本地有对应表」，读起来像「那张表确实存在」—— 而把
+        // `QIYU_DB_PATH` 指向一个空文件（或任意普通文件）时本分支照样触发，
+        // 那个库根本没有这张表，`qiyu query --table tickets` 会直接失败。
+        // 探测不去打开库是有意的（打开要加载 DuckDB，与「api call 零 DuckDB」冲突），
+        // 所以正确的做法是**把边界写在明处**，让调用方先自己确认，而不是替它断言。
         const note =
-          `本地有对应表：${fallback}${others}。` +
-          '⚠️ 那是**整表数据源，不是这次请求的等价替代** —— 它不会带上你这次 body 里的任何' +
+          `该接口在同步任务里有本地表映射：${first}${others}。` +
+          '⚠️ 但这里只确认了「配置指向的库文件存在」，**没有打开库、没有确认这些表存在**，' +
+          '更没有确认它们有数据或覆盖你要的时间窗 —— 用之前先跑 `qiyu db tables` 看清单与行数。' +
+          '⚠️ 它还是**整表数据源，不是这次请求的等价替代** —— 不会带上你这次 body 里的任何' +
           '筛选条件（时间窗、状态、关键字等），拿到的行可能根本不符合你要的条件。' +
-          '要用它请自己补 WHERE 条件（`--sql` 更灵活，`--since`/`--until` 只覆盖时间列）。' +
-          '另外表存在不等于已同步或覆盖你要的时间窗 —— 先用 `qiyu db tables` 看行数、' +
-          '`qiyu sync status` 看水位，再决定是否采信本地结果。'
+          '要用它请自己补 WHERE 条件（`--sql` 更灵活，`--since`/`--until` 只覆盖时间列）；' +
+          '水位与覆盖范围用 `qiyu sync status` 看。'
         hint = hint ? `${hint} ${note}` : note
       }
     }
