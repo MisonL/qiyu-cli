@@ -329,9 +329,13 @@ describe('db tables', () => {
     expect(err.length).toBeGreaterThan(0)          // usageFail 双通道：stderr 文本
     expect(() => JSON.parse(out)).not.toThrow()    // stdout JSON
 
+    // G1 起 --pretty 是合法输出开关：成功 + 缩进（原「显式拒绝」断言翻转）。
+    // 本用例此前到不了库（--bogus/--pretty 都在开库前被拦），现在要真的建库。
+    await fresh().then((s) => s.close())
     out = ''; err = ''
-    expect(await dbCommand(['tables', '--db', dbPath(), '--pretty'])).toBe(2)
-    expect(err).toMatch(/--pretty/)
+    expect(await dbCommand(['tables', '--db', dbPath(), '--pretty'])).toBe(0)
+    expect(err).toBe('')
+    expect(out.startsWith('{\n  "ok": true,'), 'db tables --pretty 必须缩进').toBe(true)
 
     out = ''; err = ''
     expect(await dbCommand(['tables', '--db'])).toBe(2)   // 值位守卫
@@ -506,8 +510,9 @@ describe('db describe', () => {
     expect(await dbCommand(['describe', 'sessions', '--bogus', '--db', dbPath()])).toBe(2)
     expect(err).toMatch(/未知参数：--bogus/)
     out = ''; err = ''
-    expect(await dbCommand(['describe', 'sessions', '--pretty', '--db', dbPath()])).toBe(2)
-    expect(err).toMatch(/--pretty/)
+    // G1 起 describe --pretty 同样合法成功且缩进
+    expect(await dbCommand(['describe', 'sessions', '--pretty', '--db', dbPath()])).toBe(0)
+    expect(out.startsWith('{\n  "ok": true,'), 'db describe --pretty 必须缩进').toBe(true)
   })
 
   it('实际列集与 TABLES 不一致 → meta.warnings 点名多列/少列；列清单仍以声明为权威', async () => {

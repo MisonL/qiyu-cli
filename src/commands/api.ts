@@ -10,10 +10,10 @@ import type { ValidationOverride } from '../core/registry/validation-overrides.j
 import { loadValidationOverrides } from '../core/registry/validation-overrides.js'
 import { loadParams } from '../core/registry/params.js'
 import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/validate.js'
-import { ok, fail, usageFail, describeArgs, EXIT } from '../output.js'
+import { ok, fail, usageFail, describeArgs, setPretty, EXIT } from '../output.js'
 import { sanitizeMessage } from '../core/sanitize.js'
 import { localFallbackFor } from './local-fallback.js'
-import { GLOBAL_FLAGS, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
+import { GLOBAL_FLAGS, prettyAfterSubcommand, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /** `api list` 的业务 flag（`flags` 里还要再并上全局 flag）。 */
@@ -97,6 +97,7 @@ const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 `
 
 export async function apiCommand(argv: string[]): Promise<number> {
+  setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub] = argv
   // ⚠️ 子命令层的 --help 必须走 stdout + 退出码 0，与顶层一致。
   // 否则 `qiyu api --help` 会得到「用法：qiyu api <list|call|schema>」+ 退出码 2 ——
@@ -119,21 +120,20 @@ export async function apiCommand(argv: string[]): Promise<number> {
     process.stdout.write(API_USAGE)
     return EXIT.OK
   }
-  // ⚠️ 分派层的 `--pretty` 与叶子层同答（2026-10-08 统一）：次序 **未知/位置 → help
-  // → `--pretty`**。此前它落到「未知子命令：--pretty」—— 把承诺过、未实现的合法 flag
-  // 说成"未知子命令"，与 ㉖ 在叶子层修的是同一类事实错误。
+  // ⚠️ 分派层的 `--pretty`（G1 起已实现，原"未实现"话术退役）：它必须写在具体
+  // 子命令之后（`api list --pretty`）。次序保持 **未知/位置 → help → pretty 指引**。
   if (sub === '--pretty') {
     const unknown = argv.slice(1).filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
     const positional = argv.slice(1).filter((a) => !a.startsWith('-'))
     const extra = [...unknown, ...positional]
     if (extra.length > 0) {
-      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 尚未实现，不接受额外参数`)
+      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 不接受额外参数`)
     }
     if (argv.includes('--help') || argv.includes('-h')) {
       process.stdout.write(API_USAGE)
       return EXIT.OK
     }
-    return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+    return usageFail(prettyAfterSubcommand('api'))
   }
   if (sub === 'list') return list(argv.slice(1))
   if (sub === 'schema') return await schema(argv.slice(1))
@@ -202,14 +202,8 @@ function list(argv: string[]): number {
     process.stdout.write(API_USAGE)
     return EXIT.OK
   }
-  // ⚠️ `--pretty` 在全局约束里承诺过，但本计划没实现（见「已知缺口」）。
-  // 静默忽略会让 Agent 以为格式化生效了，然后去解析一个它没拿到的格式。
-  // 显式拒绝，比无声无息好 —— 这是"契约诚实性"而不是"功能完整性"。
-  if (argv.includes('--pretty')) {
-    // ⚠️ message 里**不能**写「见计划的「已知缺口」」（2026-10-06 修）——
-    // 那是计划文档的章节标题，Agent 手里只有这个 CLI。
-    return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
-  }
+  // G1：--pretty 已实现 —— 原拒绝点开启缩进输出（次序不变：未知/位置 → help → 这里）。
+  if (argv.includes('--pretty')) setPretty(true)
 
   const all = argv.includes('--all')
   const rows = allEndpoints()
@@ -349,7 +343,7 @@ function list(argv: string[]): number {
   })
 }
 
-const SCHEMA_USAGE = `用法：qiyu api schema <接口id> [--pretty]\n\n  查看某接口的请求参数表（params）与响应形状（response_shape）。\n\n--pretty  尚未实现（无参数替代它）。当前只输出紧凑 JSON。\n`
+const SCHEMA_USAGE = `用法：qiyu api schema <接口id> [--pretty]\n\n  查看某接口的请求参数表（params）与响应形状（response_shape）。\n\n--pretty  输出缩进 JSON（人类可读；Agent 解析不需要它，默认紧凑输出已是合法 JSON）\n`
 
 async function schema(argv: string[]): Promise<number> {
   const unknown = argv.filter((a) => a.startsWith('-') && !SCHEMA_KNOWN.has(a))
@@ -365,7 +359,8 @@ async function schema(argv: string[]): Promise<number> {
     return EXIT.OK
   }
   if (positional.length > 1) return usageFail(`未知参数：${describeArgs(positional.slice(1))}。api schema 只接受一个接口 id`)
-  if (argv.includes('--pretty')) return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
+  // G1：--pretty 已实现 —— 原拒绝点开启缩进输出。
+  if (argv.includes('--pretty')) setPretty(true)
   if (positional.length === 0) return usageFail('用法：qiyu api schema <接口id>')
   const id = positional[0]
   try {
@@ -492,9 +487,11 @@ async function callOne(argv: string[]): Promise<number> {
   // 能走到那里的值位置 token 必已通过 `JSON.parse`，而 `--help`/`-h`/`--pretty`
   // 都不是合法 JSON 文本，物理上不可能出现在那个位置。
   // 此前 `--pretty` 的判定排在 body 解析**之前**又用裸 `argv.includes`，两处叠加，
-  // 于是 `api call ticket.search --body --pretty` 报「--pretty 尚未实现」，
+  // 于是 `api call ticket.search --body --pretty` 报「--pretty [未实现]」，
   // 而 `api call ticket.search --body --yes` 报「不是合法 JSON：--yes」：
   // 同一个值位置，两种答案（2026-10-08 修：判定挪到 body 解析之后，与 `list()` 同形）。
+  // ⚠️ 这条规则在 2026-10-24（--pretty 实现）后仍必须保持 —— 值位置优先的判据是
+  // 「token 是否落在 --body 的取值位」，与那个 flag 实不实现无关。
   const isBodyValue = (idx: number) => i >= 0 && idx === i + 1
 
   // ⚠️ `--body` 重复出现必须报错。`--body` 在 KNOWN 集合里，所以第二次出现时
@@ -537,9 +534,9 @@ async function callOne(argv: string[]): Promise<number> {
   //   而同样输入的 `api list --al --pretty` 报「未知参数：--al」——
   //   同一个坏参数（`--al`）在两个子命令上得到两种答案，Agent 学不到统一规则。
   //   根因就是这里把 `--pretty` 分支提到了未知参数检查**之前**。
-  //   `--al` 是**真的拼错**（该报未知参数），`--pretty` 是**真的存在**（该报未实现）——
-  //   两者同时出现时，先报哪个都对，但**三个子命令必须选同一个**，否则又是一族
-  //   "同族错误两种行为"。选"未知参数优先"与 `list()` 一致。
+  //   `--al` 是**真的拼错**（该报未知参数），`--pretty` 是**真的存在**（当时该报未实现，
+  //   G1 起是合法的输出开关）—— 两者同时出现时，先报哪个都对，但**三个子命令必须选同一个**，
+  //   否则又是一族 "同族错误两种行为"。选"未知参数优先"与 `list()` 一致。
   const KNOWN = CALL_KNOWN
   const unknown = argv.filter((a, idx) =>
     a.startsWith('-') && !KNOWN.has(a) && !isBodyValue(idx))
@@ -610,14 +607,9 @@ async function callOne(argv: string[]): Promise<number> {
     process.stdout.write(API_USAGE)
     return EXIT.OK
   }
-  // ⚠️ `--pretty` 在全局约束里承诺过，但本计划没实现（见「已知缺口」）。
-  // 静默忽略会让 Agent 以为格式化生效了，然后去解析一个它没拿到的格式。
-  // 显式拒绝，比无声无息好 —— 这是"契约诚实性"而不是"功能完整性"。
-  if (argv.includes('--pretty')) {
-    // ⚠️ message 里**不能**写「见计划的「已知缺口」」（2026-10-06 修）——
-    // 那是计划文档的章节标题，Agent 手里只有这个 CLI。
-    return usageFail('--pretty 尚未实现（无参数替代它）。当前只输出紧凑 JSON。')
-  }
+  // G1：--pretty 已实现 —— 原拒绝点开启缩进输出（body 解析仍在它之前：
+  // `--body '{坏' --pretty` 报「不是合法 JSON」，那是"命令行不合法"）。
+  if (argv.includes('--pretty')) setPretty(true)
 
   // ⚠️ 命令行已证明合法，现在才谈接口是否存在 / 可调用 / 需确认。
   // 这三者都抛异常，由下方 catch 统一映射退出码（未知 id → usage 2、

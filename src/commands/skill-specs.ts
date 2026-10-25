@@ -64,7 +64,7 @@ export function skillFlagSpecs(sub: SkillLeafPath): { value: string[]; repeat: s
     value: flags.filter((f) => f.kind === 'value').map((f) => f.name),
     repeat: flags.filter((f) => f.kind === 'repeatable').map((f) => f.name),
     // `--pretty` 同时出现在 `GLOBAL_FLAGS`（因而是 bool）与 `REJECTED_FLAGS` 里：
-    // 解析器仍把它当已知 token 收下（它的裁决是「已知但未实现」，不是「未知参数」），
+    // 解析器仍把它当已知 token 收下（G1 起它已是真实输出开关，不是「未知参数」），
     // 与 spec 的建模一致（spec 里也是先 rejected 后 flags）。
     bool: flags.filter((f) => f.kind === 'bool').map((f) => f.name),
   }

@@ -387,10 +387,12 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(await queryCommand(['--help', '--bogus'])).toBe(2)
     expect(err).toMatch(/--help 不接受额外参数/)
 
-    // --pretty 显式拒绝（归 G1）
+    // G1 起 --pretty 已实现：合法调用 + 缩进输出（原「显式拒绝」断言翻转）。
+    // ⚠️ 仍需真实库才能跑 SELECT —— 但「未知参数」这条错误排在开库之前，
+    // 所以先钉次序红线（--sql 缺值优先），再在带库用例里钉缩进行为。
     out = ''; err = ''
-    expect(await queryCommand(['--sql', 'SELECT 1', '--pretty'])).toBe(2)
-    expect(err).toMatch(/--pretty/)
+    expect(await queryCommand(['--sql', '--pretty'])).toBe(2)
+    expect(err).toMatch(/--sql 缺少取值/)
 
     // 未知参数
     expect(await q('--sql', 'SELECT 1', '--bogus')).toBe(2)

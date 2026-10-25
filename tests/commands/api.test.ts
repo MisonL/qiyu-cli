@@ -293,29 +293,27 @@ describe('api list', () => {
     expect(JSON.parse(out).meta.field_notes.max_window_days).toMatch(/精确|86400000/)
   })
 
-  it('--pretty 显式拒绝，而不是静默忽略', async () => {
-    // ⚠️ 全局约束里承诺过 --pretty，但本计划没实现。静默忽略会让 Agent
-    // 以为格式化生效了，然后去解析一个它没拿到的格式。
-    // 断言的是"有明确反馈"，不是"功能存在"。
-    // ⚠️ 必须看 stderr 文本：--pretty 与未知参数都返回 2，
-    // 只断言退出码的话，删掉 --pretty 分支会被未知参数分支接住，测试照样绿。
+  it('--pretty 已实现（G1）：输出缩进 JSON、退出码 0、stderr 为空', async () => {
+    // ⚠️ 2026-10-24 前 `--pretty` 是「承诺过、未实现」，每个命令显式拒绝它；
+    // G1 起它真的输出缩进 JSON。这条从「必须拒绝」翻转为「必须缩进」——
+    // 断言的是**行为**（换行 + 缩进），不是"不再报错"（后者无法区分"实现了"与"静默吞掉"）。
     const code = await apiCommand(['list', '--pretty'])
-    expect(code).toBe(2)
-    // ⚠️ stdout 必须同时是合法 JSON —— 人类读 stderr，Agent 读 stdout。
-    expect(JSON.parse(out).error).toMatchObject({ code: 'usage', kind: 'usage' })
-    expect(err).toContain('--pretty 尚未实现')
-    // ⚠️ **`api call` 与 `auth whoami` 也必须给同一句**（2026-10-07 修）。
-    // 三个子命令此前是两种行为：`list` 说「尚未实现」，另两个报「未知参数」——
-    // 而 `--pretty` 是**承诺过、只是未实现**的 flag，不是拼错的参数。
-    // 报「未知参数」是事实错误，Agent 会去怀疑自己拼错、或以为只有 list 支持它。
-    out = ''; err = ''
-    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).toBe(2)
-    expect(err, 'api call --pretty 必须说「尚未实现」，不是「未知参数」')
-      .toContain('--pretty 尚未实现')
-    expect(err).not.toContain('未知参数')
+    expect(code).toBe(0)
+    expect(err, '--pretty 是合法用法，stderr 必须为空').toBe('')
+    expect(out.startsWith('{\n  "ok": true,')).toBe(true)
+    expect(out.split('\n').length).toBeGreaterThan(10)
+    // 缩进版仍是合法 JSON、内容与紧凑版一致
+    const pretty = JSON.parse(out)
+    out = ''
+    expect(await apiCommand(['list'])).toBe(0)
+    expect(pretty).toEqual(JSON.parse(out))
+    // ⚠️ 同一进程内下一条命令**不带** --pretty 时必须回到紧凑输出 ——
+    // 这条守的是「入口 setPretty(false) 重置」：删掉重置，上一条的开关会泄漏到这里。
+    expect(out.split('\n')[0]).not.toMatch(/^\{ *$/)
+    expect(out).toMatch(/^\{"ok":true,/)
   })
 
-  it('坏参数与 --pretty 同时出现时，三个子命令给同一个答案（2026-10-07 修）', async () => {
+  it('坏参数与 --pretty 同时出现时，三个子命令给同一个答案（2026-10-07 修；G1 起 --pretty 已实现，坏参数仍优先）', async () => {
     // ⚠️ 实测：`api call ticket.search --al --pretty` 此前报「--pretty 尚未实现」，
     // 而同样输入的 `api list --al --pretty` 报「未知参数：--al」——
     // **同一个坏参数在两个子命令上得到两种答案**。根因是 `callOne` 把 `--pretty`
@@ -341,10 +339,19 @@ describe('api list', () => {
       expect(err, `${argv.join(' ')}：不能因为带了 --pretty 就改报未实现`)
         .not.toContain('--pretty 尚未实现')
     }
-    // 反向：只有 --pretty、没有坏参数时，仍必须报「尚未实现」（不能被未知参数吞掉）
+    // 反向：只有 --pretty、没有坏参数时，命令必须**成功且真的缩进**（G1 语义）。
+    // ⚠️ 不能用 `.not.toBe(2)`（2026-10-25 评审发现）：缺凭证会返回 1，那条断言
+    // 照样通过 —— 它证明的是"不是用法错误"，不是"格式化生效了"。必须配齐凭证与
+    // fetch 后断言退出码 0 + 输出首两行是缩进形态。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(
+      JSON.stringify({ code: 200, message: '{"data":[]}' }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))))
     out = ''; err = ''
-    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).toBe(2)
-    expect(err).toContain('--pretty 尚未实现')
+    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).toBe(0)
+    expect(err, '成功路径 stderr 必须为空').toBe('')
+    expect(out.startsWith('{\n  "ok": true,')).toBe(true)
   })
 
   it('面向 Agent 的文案不得引用计划文档的章节 —— Agent 手里只有这个 CLI', async () => {
@@ -370,11 +377,12 @@ describe('api list', () => {
     for (const [k, v] of Object.entries(meta.field_notes)) texts.push([`field_notes.${k}`, String(v)])
     texts.push(['registry_note', String(meta.registry_note)])
     for (const [label, cmd, argv] of [
-      ['api list --pretty', apiCommand, ['list', '--pretty']],
-      ['api call --pretty', apiCommand, ['call', 'ticket.search', '--pretty']],
+      // G1 起 `--pretty` 不再是错误（实现为缩进输出），从本清单移除；
+      // 替入仍然走 usageFail 的路径，出口清单的覆盖面不缩水。
+      ['api 分派层 --pretty 指引', apiCommand, ['--pretty']],
       ['api 未知子命令', apiCommand, ['未知子命令']],
       ['api 缺子命令', apiCommand, []],
-      ['auth whoami --pretty', authCommand, ['whoami', '--pretty']],
+      ['auth 分派层 --pretty 指引', authCommand, ['--pretty']],
       ['auth 未知子命令', authCommand, ['未知子命令']],
       ['auth login', authCommand, ['login']],
     ] as const) {
@@ -687,13 +695,14 @@ describe('api list', () => {
       ['call 不可调用的接口（catch 补写 stderr）', ['call', 'receive.message'], apiCommand, /不可主动调用/],
       ['list 未知参数', ['list', '--al'], apiCommand, /未知参数：--al。可用：--all/],
       ['list 位置参数', ['list', 'extra'], apiCommand, /不接受位置参数/],
-      ['list --pretty 显式拒绝', ['list', '--pretty'], apiCommand, /--pretty 尚未实现/],
+      // G1 起 --pretty 合法（退出码 0），从 markdown 哨兵清单移除；替入仍在 stderr 说话的路径
+      ['list 未知参数', ['list', '--al'], apiCommand, /未知参数/],
       // ⚠️ call / auth 的 --pretty 也是 usageFail 调用点，必须同列（2026-10-07 补）：
       // 此前只列了 `list --pretty`，另两处调用点没进表 —— 而它们正是那次"三子命令统一"
       // 新增的，谁把它们改回「未知参数」这条哨兵都不会红（同样 exit 2、同样写 stderr、
       // 同样无 `**`）—— 与上面「分支锚」要挡的是同一类漏网。
-      ['call --pretty 显式拒绝', ['call', 'ticket.search', '--pretty'], apiCommand, /--pretty 尚未实现/],
-      ['auth whoami --pretty 显式拒绝', ['whoami', '--pretty'], authCommand, /--pretty 尚未实现/],
+      // G1 起 --pretty 合法，call --pretty 从拒绝清单移除
+      // G1 起 --pretty 合法，whoami --pretty 从拒绝清单移除
       ['auth login 未实现', ['login'], authCommand, /auth login 尚未实现/],
       ['auth 无子命令', [], authCommand, /用法：qiyu auth </],
       ['auth 未知子命令', ['未知子命令'], authCommand, /未知子命令：未知子命令/],
@@ -716,10 +725,10 @@ describe('api list', () => {
       // 以 `--pretty` 作首 token 调 run / apiCommand / authCommand。每个分派层
       // 两条分支（裸拒绝 / 带额外参数）各一行，锚逐字取自真实输出。
       // TOP_CASES 里 cli 那两行同因单列（run 与 api/auth 不同源）。
-      ['api 分派层 --pretty 裸拒绝', ['--pretty'], apiCommand, /--pretty 尚未实现（无参数替代它）/],
-      ['api 分派层 --pretty 带额外参数', ['--pretty', '--bod'], apiCommand, /未知参数：--bod。--pretty 尚未实现/],
-      ['auth 分派层 --pretty 裸拒绝', ['--pretty'], authCommand, /--pretty 尚未实现（无参数替代它）/],
-      ['auth 分派层 --pretty 带额外参数', ['--pretty', '--bod'], authCommand, /未知参数：--bod。--pretty 尚未实现/],
+      ['api 分派层 --pretty 裸调用', ['--pretty'], apiCommand, /必须写在具体子命令之后/],
+      ['api 分派层 --pretty 带额外参数', ['--pretty', '--bod'], apiCommand, /未知参数：--bod/],
+      ['auth 分派层 --pretty 裸调用', ['--pretty'], authCommand, /必须写在具体子命令之后/],
+      ['auth 分派层 --pretty 带额外参数', ['--pretty', '--bod'], authCommand, /未知参数：--bod/],
     ]
     for (const [label, argv, fn, anchor] of CASES) {
       out = ''; err = ''
@@ -741,8 +750,9 @@ describe('api list', () => {
       [['--help', '--bod'], /--help 不接受额外参数/],
       [[' '], /未知子命令：' '/],
       // ⚠️ 2026-10-08 补缺口 C：cli 分派层 `--pretty` 的两条分支（与上面同因单列）。
-      [['--pretty'], /--pretty 尚未实现（无参数替代它）/],
-      [['--pretty', '--bod'], /未知参数：--bod。--pretty 尚未实现/],
+      // G1 起 --pretty 已实现：顶层裸调用给出「写在子命令之后」的指引（不再是未实现话术）
+      [['--pretty'], /--pretty 是输出格式开关/],
+      [['--pretty', '--bod'], /未知参数：--bod。--pretty 必须写在具体子命令之后/],
     ]
     for (const [argv, anchor] of TOP_CASES) {
       out = ''; err = ''
@@ -1197,10 +1207,17 @@ describe('api call —— 危险操作门禁', () => {
     out = ''; err = ''
     expect(await apiCommand(['call', 'ticket.search', '--pretty', '--help'])).toBe(0)
     expect(out, 'help 先于 --pretty').toContain('用法：qiyu api')
-    // 反向：只有 `--pretty` 时仍显式拒绝，不能因为次序调整被放过
+    // 反向：只有 `--pretty`（无坏参数）时命令**成功且缩进** —— G1 起它是真实的输出开关。
+    // ⚠️ 不用 `.not.toBe(2)`（2026-10-25 评审发现）：缺凭证返回 1 也能通过，
+    // 证明不了格式化生效。配齐凭证与 fetch 后断言 0 + 缩进。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(
+      JSON.stringify({ code: 200, message: '{"data":[]}' }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))))
     out = ''; err = ''
-    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).toBe(2)
-    expect(err).toContain('--pretty 尚未实现')
+    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).toBe(0)
+    expect(out.startsWith('{\n  "ok": true,')).toBe(true)
   })
 
   it('--body 不是合法 JSON 时按用法错误处理，不发请求', async () => {
@@ -1319,6 +1336,24 @@ describe('api call —— 危险操作门禁', () => {
     expect(e.hint).toMatch(/QIYU_APP_KEY/)
     vi.unstubAllGlobals()
     vi.unstubAllEnvs()
+  })
+
+  it('--pretty 之后的用法错误仍是紧凑 JSON（契约：用法错误永远紧凑）', async () => {
+    // ⚠️ 实测来源（CodeRabbit 2026-10-25）：`api schema --pretty` 缺 id 这类分支在
+    // `setPretty(true)` **之后**才报错，输出的是缩进错误信封，而 README「输出格式」
+    // 与设计稿 §11.2 写着「用法错误（退出码 2）仍是紧凑 JSON」。
+    // 逐条断言命令级出口（不是只在 output.test.ts 测 usageFail）：命令的解析次序
+    // 决定它走哪个分支，那正是当初出问题的地方。
+    for (const [label, argv] of [
+      ['api schema 缺 id', ['schema', '--pretty']],
+      ['api call 缺 id', ['call', '--pretty']],
+      ['api list 位置参数', ['list', 'extra', '--pretty']],
+    ] as const) {
+      out = ''; err = ''
+      expect(await apiCommand([...argv]), label).toBe(2)
+      expect(out, `${label}：缩进错误信封违反「用法错误紧凑」的承诺`).not.toContain('\n  ')
+      expect(JSON.parse(out).error.kind).toBe('usage')
+    }
   })
 
   it('未知参数报用法错误，而不是静默忽略', async () => {
@@ -1577,10 +1612,16 @@ describe('api schema', () => {
     out = ''; err = ''
     expect(await apiCommand(['schema', '--pretty', '--help'])).toBe(0)
     expect(out, 'help 先于 --pretty').toContain('用法：qiyu api schema')
-    // ③ 反向：只有 --pretty、无 help 时仍必须显式拒绝「尚未实现」（不能被次序调整吞掉）
+    // ③ 反向：只有 --pretty、无 help 时命令**成功且缩进**（G1 起它是真实的输出开关；
+    // help 优先的次序不变 —— 上一步已钉）
     out = ''; err = ''
-    expect(await apiCommand(['schema', 'ai.knowledge.search', '--pretty'])).toBe(2)
-    expect(err).toContain('--pretty 尚未实现')
+    expect(await apiCommand(['schema', 'ai.knowledge.search', '--pretty'])).toBe(0)
+    expect(err).toBe('')
+    expect(out.startsWith('{\n  "ok": true,'), '--pretty 必须输出缩进 JSON').toBe(true)
+    // 不带 --pretty 的同一条命令回到紧凑输出（守入口重置不泄漏）
+    out = ''
+    expect(await apiCommand(['schema', 'ai.knowledge.search'])).toBe(0)
+    expect(out.startsWith('{"ok":true,')).toBe(true)
   })
   it('验收 8：schema tag.all → has_body_schema:false、body_kind json', async () => {
     await apiCommand(['schema', 'tag.all'])
