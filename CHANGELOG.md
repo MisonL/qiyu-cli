@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.2.0] - 2026-10-25
 
 ### 新增
 
@@ -209,5 +209,6 @@
 - 响应信封归一化，含畸形 JSON（整数键未加引号）的容错修复
 - 逐接口限频表与 `retry_after` 提示
 
-[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.1.0...HEAD
+[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MisonL/qiyu-cli/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MisonL/qiyu-cli/releases/tag/v0.1.0
