@@ -194,7 +194,10 @@ export async function call(
     throw Object.assign(
       new Error(`接口 ${spec.id} 是 GET 接口，不接受请求体`),
       { code: 'usage', kind: 'usage', retryable: false,
-        hint: 'GET 请求的参数只能走 query 串；请去掉 body / --body' },
+        // ⚠️ 不要写「参数走 query 串」—— 本 CLI 没有 GET 的 query 参数通道（评审发现）。
+        // 写到不存在的通道上，调用方会去找一个没有的 flag。如实说明现状。
+        hint: '本 CLI 目前没有 GET 的 query 参数通道；若该接口需要参数，请去掉 body 后重试' + 
+              '（当前注册表里的 GET 接口都不可主动调用，普通调用走不到这里）' },
     )
   }
   // ⚠️ 经上面的守卫，走到这里时 GET 必然无 body —— `buildBody(undefined)`

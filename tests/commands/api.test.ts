@@ -1647,6 +1647,11 @@ describe('限流 → 本地 fallback 建议（G1）', () => {
     // 省了 Agent 会直接采信一个空表或半个月前的快照。
     expect(e.hint).toMatch(/db tables|sync status/)
     expect(e.hint).toMatch(/不承诺|不等于|未必|先.*确认/)
+    // ⚠️ **fallback 是整表数据源、不是原请求的等价替代**（2026-10-25 评审发现）：
+    // 生成的命令不带原请求 body 的筛选条件，直接用会拿到不符合条件的行。
+    // hint 必须明说这一点 —— 只说「表可能没同步」是不够的（那是另一件事）。
+    expect(e.hint, '必须点破「筛选条件不会被带过去」').toMatch(/筛选条件|整表|WHERE/)
+    expect(e.hint, '必须告诉调用方自己补条件').toMatch(/自己补|重新|--sql|--since/)
   })
 
   it('无映射 → 两个键都不出现（不编一个查不到的命令）', async () => {
@@ -1750,6 +1755,11 @@ describe('assertGetHasNoBody（G1）', () => {
     // 不挂 kind：这是用法错误，走 usage 双通道（与 assertNoValidateStrictConflict 同型）
     try { assertGetHasNoBody(get as never, {}) } catch (e) {
       expect((e as { kind?: string }).kind).toBeUndefined()
+      // ⚠️ **不得承诺「参数走 query 串」**（2026-10-25 评审发现）：
+      // 本 CLI 没有 GET 的 query 参数通道 —— URL 查询串只由 signedQuery 生成
+      // （appKey/time/checksum）。写到不存在的通道上，调用方会去找一个没有的 flag。
+      expect((e as Error).message, '不得指向不存在的 query 参数通道').not.toMatch(/走 query 串/)
+      expect((e as Error).message, '必须如实说明当前没有该通道').toMatch(/没有.*query 参数通道|无法.*带.*参数/)
     }
   })
 })

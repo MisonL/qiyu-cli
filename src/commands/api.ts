@@ -747,8 +747,11 @@ function mapThrownToExit(e: unknown, spec?: EndpointSpec): number {
         fallback = `qiyu query --table ${first}`
         const others = rest.length > 0 ? `（该接口另有本地表：${rest.join('、')}）` : ''
         const note =
-          `可改用本地库查询（${fallback}）${others}。` +
-          '但本地表存在**不等于**已同步或覆盖你要的时间窗 —— 先用 `qiyu db tables` 看行数、' +
+          `本地有对应表：${fallback}${others}。` +
+          '⚠️ 那是**整表数据源，不是这次请求的等价替代** —— 它不会带上你这次 body 里的任何' +
+          '筛选条件（时间窗、状态、关键字等），拿到的行可能根本不符合你要的条件。' +
+          '要用它请自己补 WHERE 条件（`--sql` 更灵活，`--since`/`--until` 只覆盖时间列）。' +
+          '另外表存在不等于已同步或覆盖你要的时间窗 —— 先用 `qiyu db tables` 看行数、' +
           '`qiyu sync status` 看水位，再决定是否采信本地结果。'
         hint = hint ? `${hint} ${note}` : note
       }
@@ -787,11 +790,20 @@ export function assertNoValidateStrictConflict(argv: string[]): void {
  * `callable: false`，`assertCallable` 先一步拦下 —— 所以本守卫在生产上不可达，
  * 由 `api.test.ts` 直测 + `http.test.ts` 的合成 spec 覆盖。如实记录，别读成
  * "GET 路径已线上实测"。`call()` 里还有一道同判据的守卫（防将来新命令绕过本层）。
+ *
+ * ⚠️ **不要在这条消息里承诺"参数走 query 串"**（2026-10-25 修正，评审发现）：
+ * `api call` 与 `call()` **都没有** query 参数的输入通道，URL 的查询串只由
+ * `signedQuery()` 生成（appKey/time/checksum）。对调用方来说那是一个不存在的能力 ——
+ * 它照做会去找一个没有的 flag。所以消息改成如实说明「目前没有该通道」。
+ * 真要支持时，必须同时交付：`api call` 的 query flag + `call()` 的拼装 + 签名口径
+ * 复核（签名只覆盖 body，query 参数不影响 checksum）+ 真实可调用 GET 的实测。
  */
 export function assertGetHasNoBody(spec: EndpointSpec, body: unknown): void {
   if (spec.method === 'GET' && body !== undefined) {
     throw new Error(
-      `接口 ${spec.id} 是 GET 接口，不接受请求体 —— 去掉 --body（GET 的参数只能走 query 串）`,
+      `接口 ${spec.id} 是 GET 接口，不接受请求体 —— 去掉 --body。` +
+        '⚠️ 本 CLI **目前没有 GET 的 query 参数通道**（还没有可主动调用的 GET 接口），' +
+        '所以现在无法给它带任何参数；这道守卫是为了将来出现可调用 GET 时不静默丢弃 body',
     )
   }
 }

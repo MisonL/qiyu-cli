@@ -718,6 +718,10 @@ describe('GET 请求不带 body（G1）', () => {
     const err = await call(GET_SPEC as never, { a: 1 }, { credentials: CREDS }).catch((e) => e)
     expect(err).toMatchObject({ kind: 'usage', retryable: false })
     expect(err.message).toMatch(/GET.*不接受请求体/)
+    // ⚠️ hint 不得指向不存在的通道（2026-10-25 评审发现）：本 CLI 没有 GET 的
+    // query 参数输入路径。承诺它会让调用方去找一个没有的 flag。
+    expect(err.hint ?? '').not.toMatch(/走 query 串/)
+    expect(err.hint ?? '').toMatch(/没有.*query 参数通道|无法.*参数/)
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
