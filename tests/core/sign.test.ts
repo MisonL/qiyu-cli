@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { createHash } from 'node:crypto'
 import { md5Hex, checksum, signedQuery } from '../../src/core/sign.js'
 
 describe('签名', () => {
@@ -64,5 +65,75 @@ describe('签名', () => {
     const cs = checksum('s', '{}', 1700000000)
     expect(cs).toMatch(/^[0-9a-f]{40}$/)
     expect(signedQuery('k', 's', '{}', 1700000000)).toContain(`checksum=${cs}`)
+  })
+})
+
+describe('与七鱼官方 Java 样例对拍（§12 第一条）', () => {
+  /**
+   * 官方文档给的 `QiyuPushCheckSum` 的**逐行移植**（`doc-436971.md`，2026-10-25 抓取）：
+   *
+   * ```java
+   * public static String encode(String appSecret, String nonce, String time) {
+   *   String content = appSecret + nonce + time;
+   *   MessageDigest messageDigest = MessageDigest.getInstance("sha1");
+   *   messageDigest.update(content.getBytes());
+   *   return getFormattedText(messageDigest.digest());
+   * }
+   * // getFormattedText: 每个字节拆成两个**小写** hex 字符，逐字节拼接
+   * ```
+   *
+   * ⚠️ 这是**参考实现**，不是 `src/` 的复制：它只做文档里写的那几步（拼接 → SHA1 →
+   * 小写 hex），刻意不 import `checksum`。用它当 oracle，测的是「我们与文档说的是
+   * 一回事」，而不是「我们的实现与自己的另一份写法一致」（后者是同义反复）。
+   * ⚠️ 移植的两处对齐：
+   *   · `content.getBytes()` 在 Java 里取**平台默认字符集**。文档没说，而 UTF-8 是
+   *     现代 JVM 的默认（JDK18+ 强制 UTF-8），且七鱼线上必须与我们对齐 —— 这里显式
+   *     用 UTF-8，与 `fetch`/`http.ts` 的编码一致；
+   *   · `HEX_DIGITS` 是小写表，等价于 `digest('hex')`。
+   */
+  const javaEncode = (appSecret: string, nonce: string, time: string): string => {
+    const HEX = '0123456789abcdef'
+    const bytes = createHash('sha1').update(appSecret + nonce + time, 'utf8').digest()
+    let out = ''
+    for (const b of bytes) out += HEX[(b >> 4) & 0x0f]! + HEX[b & 0x0f]!
+    return out
+  }
+
+  it('md5Hex 与 oracle 的 md5 一致（官方实现把 md5 作为 nonce 传入）', () => {
+    // 官方签名里 nonce 就是 `MD5(content).toLowerCase()` —— 我们把它拆成 md5Hex 一步。
+    // 若 md5Hex 哪天改成大写或按 latin1 编码，这里的逐字节比对立刻红。
+    for (const body of ['', '{}', '{"a":1}', '{"中文":"值"}', '{"emoji":"🙂"}']) {
+      const nonce = createHash('md5').update(body, 'utf8').digest('hex')
+      expect(md5Hex(body), body).toBe(nonce)
+      expect(checksum('secret', body, 1700000000), body)
+        .toBe(javaEncode('secret', nonce, '1700000000'))
+    }
+  })
+
+  it('固定向量：与官方算法逐字节相同（三个独立输入）', () => {
+    // ⚠️ 这三个值的**来源**是本测试里的 `javaEncode`（官方样例的移植），
+    // 不是 `checksum` 的回填 —— 断言写死只是为了让「实现变了」这件事显式地红，
+    // 而不是让 oracle 跟着实现一起漂。
+    const VECTORS: Array<[string, string, number]> = [
+      ['secret', '{"a":1}', 1700000000],
+      ['s', '{}', 1700000000],
+      ['a+b/c=d&e', '{"x":"中文"}', 1750000000],
+    ]
+    for (const [secret, body, time] of VECTORS) {
+      const expected = javaEncode(secret, md5Hex(body), String(time))
+      expect(checksum(secret, body, time), `${secret} / ${body} / ${time}`).toBe(expected)
+    }
+  })
+
+  it('oracle 与实现不是同一个东西 —— 破坏拼接顺序必须让它红', () => {
+    // ⚠️ 这条守的是「oracle 有独立性」这个前提。若有人把 `javaEncode` 改成调
+    // `checksum`，上面两条会永远绿（同义反复），而这条仍然绿（两边一起错）。
+    // 所以要 **正面验证 oracle 对错误顺序给出不同答案** —— 它证明 oracle 是自己算的。
+    const nonce = md5Hex('{"a":1}')
+    expect(javaEncode('secret', nonce, '1700000000'))
+      .not.toBe(javaEncode(nonce, 'secret', '1700000000'))
+    // 时间用毫秒而不是秒：也必须不同（拼进去的是十进制文本，长度差 3 位）
+    expect(javaEncode('secret', nonce, '1700000000'))
+      .not.toBe(javaEncode('secret', nonce, '1700000000000'))
   })
 })
