@@ -1223,7 +1223,6 @@ describe('api call —— 危险操作门禁', () => {
     out = ''; err = ''
     expect(await apiCommand(['call', 'ticket.search', '--pretty', '--help'])).toBe(0)
     expect(out, 'help 先于 --pretty').toContain('用法：qiyu api')
-    // 反向：只有 `--pretty` 时仍显式拒绝，不能因为次序调整被放过
     // 反向：只有 `--pretty`（无坏参数）时命令**成功且缩进** —— G1 起它是真实的输出开关。
     // ⚠️ 不用 `.not.toBe(2)`（2026-10-25 评审发现）：缺凭证返回 1 也能通过，
     // 证明不了格式化生效。配齐凭证与 fetch 后断言 0 + 缩进。

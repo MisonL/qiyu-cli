@@ -296,7 +296,7 @@ export function usageFail(message: string, hint?: string): number {
   // 此前有多条分支在 `setPretty(true)` **之后**才报用法错误（如 `api schema --pretty`
   // 缺 id、`auth login --pretty` 缺环境变量），那些路径输出的就是缩进错误信封。
   // 现在在唯一的出口处强制收窄 —— 逐个调用点调整次序既脆弱又会随新分支漂移。
-  const prev = prettyOutput
+  const prevPretty = prettyOutput
   prettyOutput = false
   try {
     return fail({
@@ -306,8 +306,8 @@ export function usageFail(message: string, hint?: string): number {
       ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
     })
   } finally {
-    // 还原 —— 用法错误是命令的终点，但还原让"同一个进程里连续两次 run"（测试里常见）
-    // 不会因为这条错误的副作用改变下一条命令的开关状态。
-    prettyOutput = prev
+    // 还原：用法错误是命令的终点，但同进程内连续多次 `run()`（测试里常见）时，
+    // 下一条命令不该因为上一条报了个用法错误就丢掉它的 `--pretty`。
+    prettyOutput = prevPretty
   }
 }

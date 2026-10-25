@@ -534,9 +534,9 @@ async function callOne(argv: string[]): Promise<number> {
   //   而同样输入的 `api list --al --pretty` 报「未知参数：--al」——
   //   同一个坏参数（`--al`）在两个子命令上得到两种答案，Agent 学不到统一规则。
   //   根因就是这里把 `--pretty` 分支提到了未知参数检查**之前**。
-  //   `--al` 是**真的拼错**（该报未知参数），`--pretty` 是**真的存在**（该报未实现）——
-  //   两者同时出现时，先报哪个都对，但**三个子命令必须选同一个**，否则又是一族
-  //   "同族错误两种行为"。选"未知参数优先"与 `list()` 一致。
+  //   `--al` 是**真的拼错**（该报未知参数），`--pretty` 是**真的存在**（当时该报未实现，
+  //   G1 起是合法的输出开关）—— 两者同时出现时，先报哪个都对，但**三个子命令必须选同一个**，
+  //   否则又是一族 "同族错误两种行为"。选"未知参数优先"与 `list()` 一致。
   const KNOWN = CALL_KNOWN
   const unknown = argv.filter((a, idx) =>
     a.startsWith('-') && !KNOWN.has(a) && !isBodyValue(idx))

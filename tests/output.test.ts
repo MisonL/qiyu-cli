@@ -447,8 +447,9 @@ describe('setSkillWarning —— 安装态提示的注入式合并（Task 10）'
 
 describe('--pretty 的边界：只修饰成功输出，用法错误永远紧凑', () => {
   // ⚠️ 实测来源（CodeRabbit 2026-10-25，PR #12）：多条分支在 `setPretty(true)` **之后**
-  // 才报用法错误 —— `api schema --pretty`（缺 id）、`auth login --pretty`（缺环境变量）
-  // 等等，输出的就是**缩进**错误信封，而 README「输出格式」与设计稿 §11.2 逐字写着
+  // 才报用法错误 —— `api schema --pretty`（缺 id）、`db describe --pretty`（缺表名）、
+  // `auth login --pretty`（缺环境变量）等等（两批分支合流后一处不落），
+  // 输出的就是**缩进**错误信封，而 README「输出格式」与设计稿 §11.2 逐字写着
   // 「用法错误（退出码 2）仍是紧凑 JSON」。修在唯一的出口（usageFail）而不是逐个
   // 调用点调整次序：次序调整既脆弱，又会随新分支漂移。
   beforeEach(() => setPretty(false))

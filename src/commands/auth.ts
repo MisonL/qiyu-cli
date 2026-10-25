@@ -69,7 +69,10 @@ export async function authCommand(argv: string[]): Promise<number> {
     process.stdout.write(AUTH_USAGE)
     return EXIT.OK
   }
-  // G1：--pretty 是输出开关，必须写在具体子命令之后（`auth whoami --pretty`）。
+  // ⚠️ 分派层的 `--pretty` 与叶子层同答（2026-10-08 统一）：次序 **未知/位置 → help
+  // → `--pretty`**。此前它落到「未知子命令：--pretty」—— 把承诺过、未实现的合法 flag
+  // 说成"未知子命令"，与 ㉖ 在叶子层修的是同一类事实错误。
+  // G1：--pretty 已实现，但必须写在具体子命令之后（`auth whoami --pretty`）。
   if (sub === '--pretty') {
     const unknown = argv.slice(1).filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
     const positional = argv.slice(1).filter((a) => !a.startsWith('-'))
