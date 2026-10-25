@@ -154,7 +154,7 @@ interface Observed {
 }
 
 async function statsFields(argv: string[]): Promise<number> {
-  // 子命令级次序沿 db.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 位置参数。
+  // 子命令级次序沿 db.ts：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const extra = argv.filter((a) => !KNOWN.has(a))
     if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)

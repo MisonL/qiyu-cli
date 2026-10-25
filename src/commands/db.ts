@@ -257,7 +257,7 @@ export async function openGuardedSession(
 }
 
 async function dbTables(argv: string[]): Promise<number> {
-  // 子命令级次序沿 store.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 未知参数。
+  // 子命令级次序沿 store.ts：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 未知参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const rawRest = argv.filter((a) => !KNOWN.has(a))
     if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
@@ -386,7 +386,7 @@ function describeColumn(c: ColumnDef): {
 }
 
 async function dbDescribe(argv: string[]): Promise<number> {
-  // 子命令级次序沿 dbTables：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 位置参数。
+  // 子命令级次序沿 dbTables：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const rawRest = argv.filter((a) => !KNOWN.has(a))
     if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)

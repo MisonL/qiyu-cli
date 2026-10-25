@@ -1,8 +1,9 @@
 // src/commands/sync.ts —— D-T12：sync 命令骨架；D-T13：run 子命令挂载；
 // D-T14：status / verify / install / uninstall 四子命令。
 // 骨架沿 store.ts：parseStoreFlags → usageFail/fail 双通道 → thrownToExit 扩展。
-// --pretty 统一裁决（T12 遗留 minor，T13 落地）：沿 api.ts 族——承诺过、未实现的
-// flag 一律 usageFail 显式拒绝（退出码 2），顶层/子命令级/run/tasks 同答，无豁免集。
+// --pretty（G1 已实现）：输出缩进开关，写在子命令之后。留在这里的只是历史裁决说明——
+// 当年「承诺过、未实现」时的统一拒绝已退役；现在的规则与 api 族一致：未知/位置参数 →
+// help → --pretty，各层同答。
 //
 // T14 语义（spec §7.6 / 简化裁定）：
 //   · status / verify 以 ro 打开库（spec §6.3：单写者模型下读者走 C1 退避）；

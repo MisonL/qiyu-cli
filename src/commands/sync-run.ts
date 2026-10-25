@@ -10,8 +10,8 @@
 //     staff 表逐客服驱动，缺 dim 首跑必败。
 //   ③ robotId 注入：StoreConfig.options.knowledgeRobotIds（number[]）在配置层透传、
 //      本层传给 categories 任务消费（发现盲区的手工兜底路径）。
-//   ④ --pretty 统一裁决：沿 api.ts 族——承诺过、未实现的 flag 一律 usageFail 显式拒绝，
-//      不进任何子命令的合法集（T12 遗留 minor 的统一：tasks/run 同答）。
+//   ④ --pretty（G1 已实现）：输出缩进开关，写在子命令之后；解析循环收下它
+//      （见 RUN_BOOL_FLAGS 分支的 `|| a === '--pretty'`），开启动作在命令层。
 //   ⑤ 退出码：任一任务 complete/partial（部分成功）→ 0；全部 failed → 1；用法 → 2。
 //   ⑥ 中断裁决：不装 signal handler —— 事务边界是安全点，进程被 kill 时 DuckDB 回滚、
 //      水位不推，下次 run 从水位续跑（红线 3 钉死用例覆盖）。

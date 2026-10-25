@@ -72,9 +72,10 @@ describe('checkSkillDoc', () => {
     }
     const r = checkSkillDoc('`qiyu api list --legacy`', syntheticCtx)
     expect(r.violations[0]).toMatchObject({ rule: 'rejected_flag' })
-    // `--pretty` 现在合法：不再触发任何违规
+    // `--pretty` 现在合法：**零违规**（不是"没有 rejected_flag"——只筛那一条的话，
+    // check 把它误报成 unknown_flag 时本用例照样通过，2026-10-25 评审发现）
     const pretty = checkSkillDoc('`qiyu api list --pretty`', ctx)
-    expect(pretty.violations.filter((v) => v.rule === 'rejected_flag')).toEqual([])
+    expect(pretty.violations).toEqual([])
   })
   it('出现表名 → table_name', () => {
     const r = checkSkillDoc('查 `sessions` 表', ctx)

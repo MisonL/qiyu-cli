@@ -3,15 +3,17 @@
 // `qiyu …` 引用（spec design D4）。
 //
 // 为什么不继续从 usage 散文里正则解析：散文已经与实现漂移了至少三处（顶层 USAGE 漏写
-// `db`/`sync status` 的 store 三件套；`api schema` 写着 `[--pretty]` 却显式拒绝它）。
+// `db`/`sync status` 的 store 三件套；`api schema` 曾写着 `[--pretty]` 却拒绝它——
+// 该 flag 已于 2026-10-24 实现，此处保留这段漂移史作为该建模决定的例证）。
 // 再扫一遍散文只会把「必然失败的命令」判成合法。
 //
 // 三条建模约束（不满足就退化成第二事实源）：
 //   · `CommandSpec.flags` 必须是该命令的**完整接受集**，不是「额外的」flag。只记差异的话，
 //     skill 里写 `` `qiyu api list --no-validate` ``（真实用法错误）会被判通过。
 //   · 「完整」**包含全局 flag**：各命令组装 spec 时写成 `[...GLOBAL_FLAGS, ...业务 flag]`。
-//     校验方只查这一份，不再另行合并（两处各合一次是漂移的来源）。但必须**先查
-//     `rejected` 再查 `flags`**——`--pretty` 同时在两者里，顺序反了会把它判合法。
+//     校验方只查这一份，不再另行合并（两处各合一次是漂移的来源）。若一个 flag 同时
+//     出现在 `rejected` 与 `flags` 里，必须**先查 `rejected`**，否则会把它判合法——
+//     `--pretty` 曾是这种情形（现已实现，不再属于 `rejected`；次序规则保留）。
 //   · `--pretty` 曾建模成 `rejected`（承诺过、未实现）：每个模块都用 `usageFail` 拒绝它，
 //     spec §11.2 E 也明令不要用。**2026-10-24（G1）起它已实现**（缩进 JSON），
 //     `REJECTED_FLAGS` 清空为空数组 —— **机制保留**（`rejected` 字段与 `skill check`

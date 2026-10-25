@@ -338,11 +338,19 @@ describe('api list', () => {
       expect(err, `${argv.join(' ')}：不能因为带了 --pretty 就改报未实现`)
         .not.toContain('--pretty 尚未实现')
     }
-    // 反向：只有 --pretty、没有坏参数时，命令必须**成功**（G1 实现后的语义；
-    // 坏参数优先的次序不变 —— `--al` 仍必须先于 `--pretty` 的效果报出来）
+    // 反向：只有 --pretty、没有坏参数时，命令必须**成功且真的缩进**（G1 语义）。
+    // ⚠️ 不能用 `.not.toBe(2)`（2026-10-25 评审发现）：缺凭证会返回 1，那条断言
+    // 照样通过 —— 它证明的是"不是用法错误"，不是"格式化生效了"。必须配齐凭证与
+    // fetch 后断言退出码 0 + 输出首两行是缩进形态。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(
+      JSON.stringify({ code: 200, message: '{"data":[]}' }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))))
     out = ''; err = ''
-    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).not.toBe(2)
-    expect(err).not.toContain('未知参数')
+    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).toBe(0)
+    expect(err, '成功路径 stderr 必须为空').toBe('')
+    expect(out.startsWith('{\n  "ok": true,')).toBe(true)
   })
 
   it('面向 Agent 的文案不得引用计划文档的章节 —— Agent 手里只有这个 CLI', async () => {
@@ -1199,10 +1207,17 @@ describe('api call —— 危险操作门禁', () => {
     expect(await apiCommand(['call', 'ticket.search', '--pretty', '--help'])).toBe(0)
     expect(out, 'help 先于 --pretty').toContain('用法：qiyu api')
     // 反向：只有 `--pretty` 时仍显式拒绝，不能因为次序调整被放过
-    // 反向：只有 `--pretty`（无坏参数）时命令成功 —— G1 起它是真实的输出开关
+    // 反向：只有 `--pretty`（无坏参数）时命令**成功且缩进** —— G1 起它是真实的输出开关。
+    // ⚠️ 不用 `.not.toBe(2)`（2026-10-25 评审发现）：缺凭证返回 1 也能通过，
+    // 证明不了格式化生效。配齐凭证与 fetch 后断言 0 + 缩进。
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(
+      JSON.stringify({ code: 200, message: '{"data":[]}' }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))))
     out = ''; err = ''
-    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).not.toBe(2)
-    expect(err).not.toContain('未知参数')
+    expect(await apiCommand(['call', 'ticket.search', '--pretty'])).toBe(0)
+    expect(out.startsWith('{\n  "ok": true,')).toBe(true)
   })
 
   it('--body 不是合法 JSON 时按用法错误处理，不发请求', async () => {

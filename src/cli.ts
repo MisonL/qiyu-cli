@@ -139,7 +139,7 @@ export async function run(argv: string[]): Promise<number> {
     // 错误变成了静默成功，与 `api list --al --help` 是同一个坑，分派层这一处漏了。
     // `--help --help` 仍给帮助：`--help`/`-h` 是这条伪命令仅有的合法 token
     // （与 `api list --help --help` 同答 —— 都不算"额外参数"）。
-    // ⚠️ `--pretty` 同样豁免（2026-10-08）：它是**合法 flag**（承诺过、未实现），
+    // ⚠️ `--pretty` 同样豁免（2026-10-08；G1 起已实现为缩进开关）：它是**合法 flag**，
     // 不是"额外参数"—— `qiyu --help --pretty` 给帮助（与 `api list --help --pretty` 同答）。
     const extra = rest.filter((a) => a !== '--help' && a !== '-h' && a !== '--pretty')
     if (extra.length > 0) {
@@ -169,7 +169,7 @@ export async function run(argv: string[]): Promise<number> {
     return ok({ version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION })
   }
   // ⚠️ 分派层的 `--pretty` 必须与叶子层同答（2026-10-08 统一）。此前它落到
-  // 「未知子命令：--pretty」—— 而 `--pretty` 是**承诺过、只是未实现**的合法 flag
+  // 「未知子命令：--pretty」—— 而 `--pretty` 是真实存在的输出开关（G1 已实现）
   // （与 ㉖ 在叶子层修的是同一句话），把合法 flag 说成"未知子命令"是同一类事实错误；
   // 且 `qiyu --pretty --help` 此前被静默吞成 2（而 `qiyu api list --pretty --help` 是 0）。
   // 次序：**未知/位置 → help → version → `--pretty`**（叶子命令没有 --version，

@@ -450,9 +450,11 @@ async function callOne(argv: string[]): Promise<number> {
   // 能走到那里的值位置 token 必已通过 `JSON.parse`，而 `--help`/`-h`/`--pretty`
   // 都不是合法 JSON 文本，物理上不可能出现在那个位置。
   // 此前 `--pretty` 的判定排在 body 解析**之前**又用裸 `argv.includes`，两处叠加，
-  // 于是 `api call ticket.search --body --pretty` 报「--pretty 尚未实现」，
+  // 于是 `api call ticket.search --body --pretty` 报「--pretty [未实现]」，
   // 而 `api call ticket.search --body --yes` 报「不是合法 JSON：--yes」：
   // 同一个值位置，两种答案（2026-10-08 修：判定挪到 body 解析之后，与 `list()` 同形）。
+  // ⚠️ 这条规则在 2026-10-24（--pretty 实现）后仍必须保持 —— 值位置优先的判据是
+  // 「token 是否落在 --body 的取值位」，与那个 flag 实不实现无关。
   const isBodyValue = (idx: number) => i >= 0 && idx === i + 1
 
   // ⚠️ `--body` 重复出现必须报错。`--body` 在 KNOWN 集合里，所以第二次出现时

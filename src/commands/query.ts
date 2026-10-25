@@ -467,7 +467,7 @@ export interface QueryDeps {
 
 export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promise<number> {
   setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
-  // 次序沿 store.ts / db.ts：--help 分流 → --pretty 显式拒绝 → parseStoreFlags → 未知参数。
+  // 次序沿 store.ts / db.ts：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 未知参数。
   // ⚠️ 本文件实际调用的是**自有的** `parseFlags`（语义故意不同：`--sql` 允许取值以 `--`
   // 开头，见文件头）；这一步在整条次序里的位置与 store.ts 的 parseStoreFlags 相同。
   if (argv.includes('--help') || argv.includes('-h')) {
