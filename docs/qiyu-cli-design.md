@@ -740,6 +740,8 @@ qiyu sync verify [task]         # 校验本地与远端一致性
 
 **限频粒度是实测出来的：按路径各自独立**（183 次探测）：同一路径上 30 秒内的连续调用总是返回 `14009`，而**跨不同路径的 7 次连续调用全部成功**。这正是**报表同步策略的关键** —— 应该**按天**轮转（同一天内不同接口背靠背调用），而不是逐个接口串行推进：31 天从约 2.6 小时降到约 16 分钟。见 §6.2。
 
+> **`RateLimit.scope` 的交付状态（2026-10-24，G1）**：限频表每一行都带 `scope` 字段，**27 个非 null 行全部是 `'endpoint'`** —— 上面的 183 次探测只支持「按路径独立」这一种结论，从未观测到跨接口共享配额（`'global'`）。联合类型里保留 `'global'` 只是给「将来真的实测到」留一个显式落点；**出现第二种取值必须同时改 `ratelimit.ts` 的注释、`ratelimit.test.ts` 的逐行断言与 `api schema` 的 `field_notes.rate_limit`**。消费方：`api schema <id>` 的 `data.rate_limit` 三态输出 —— 未登记不输出该键（没测过）、显式 `null`（实测无限频）、对象（含 `limit`/`window_seconds`/`source`/`scope`）。
+
 ### 7.4.1 报表时间跨度上限（逐接口实测，并不统一）
 
 | 上限 | 接口 | 错误 | 来源 |
@@ -1133,6 +1135,12 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 - **退出码**：`0` 成功 · `1` 业务错误 · `2` 用法错误 · `3` 网络错误 · `4` 需要 `--yes`
 - **退出码 4 必须携带** `confirm_required: true` + `confirm_arg: "--yes"` + `risk: "irreversible"` + `target`，以及 `retryable: false`
 
+> **`retry_strategy` / `fallback` 的交付状态（2026-10-24，G1）**：上面示例里这两个字段**已有生产者** —— `api call` 撞限流（`kind: rate_limit`）且该接口**非危险**、有同步任务映射、本地库文件存在时，输出 `retry_strategy: "switch_to_local"` 与 `fallback: "qiyu query --table <表>"`，并在 `hint` 里点名该接口的其余本地表。三处诚实边界：
+> ① **只承诺「有表可查」**，不承诺表非空、更不承诺覆盖调用方要的时间窗 —— hint 要求先 `qiyu db tables` / `qiyu sync status` 确认；
+> ② **危险接口不给**（调用方要的是写操作，一个本地读的表名帮不上忙，反而可能被误读成本地也能执行）；
+> ③ 无映射 / 库文件不存在 / 探测异常 → **两个键都不出现**（不编一个指向不存在表的命令），原始限流错误原样返回。
+> 实现分层：`commands/local-fallback.ts` 是零依赖注入槽（`api.ts` 只 import 它，保住 auth/api 零 store 加载红线），`commands/local-fallback-wiring.ts` 持有映射与探测，由 `cli.ts` 在启动时接线。
+
 ### 9.2 静默失败防护
 
 **0 行是比报错危险得多的失败模式** —— Agent 的错误处理根本不会触发，它会向人类汇报"上周没有满意度数据。"
@@ -1144,7 +1152,9 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 
 ### 9.3 时区
 
-**所有相对时间都在 `Asia/Shanghai` 下解析**（可在 profile 中配置），并且响应回显 `resolved_range`。
+**所有相对时间都在 `Asia/Shanghai` 下解析**，并且响应回显 `resolved_range`。
+
+> **范围收窄（2026-10-24）**：本节早前写的「可在 profile 中配置」**删除** —— 实现是硬编码 `Asia/Shanghai`，没有任何 profile 键能改它；在配置面声明一个不存在的开关正是「声明了但没人读」。若未来出现真实的多时区需求，应作为独立子项目带三时区测试矩阵交付，而不是顺手加一个没人实现的键。
 
 > Agent 常运行在 UTC 容器里，于是 `yesterday` 解析成 UTC 的昨天，而七鱼的报表使用 Asia/Shanghai 的自然日——8 小时前的数据会被归到错误的一天，**而且不会抛出任何错误**。
 
@@ -1163,6 +1173,10 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 - **在 `realname`/`nickname`/`username` 三个字段上，共有 89 个不同字符串映射到不止一个 staffId，单个字符串最多对应 7 个候选。**
 - → **必须以 `username` 作为解析键。** `realname` 和 `nickname` 是展示名，重名是合理现象；用它们解析会频繁命中 `ambiguous`，CLI 必须列出候选而不是随便挑一个。
 - **组名同样有歧义**：33 个组名中有 21 个包含 `/`，所以裸的叶子名可能在多个父节点下撞名 → **组查询必须使用完整的 `/` 分隔路径**，并采用同样的 `ambiguous` 处理。
+
+> **交付状态（2026-10-24 调查结论）**：本节描述的 `--assignee "张三"` 名称解析**尚未实现，且当前无落点**。历史溯源（`git log a800b65` + 2026-09-30 会话记录）：它出自原始设计稿的「阶段 2 语义层」——`qiyu ticket create --assignee "张三"` 这类**工单写命令**。评审裁决「语义层只保留写操作与名称解析」，但工单写命令族**从未进入路线图任何子项目**（A/B/C1/D/E/F 都不含），于是本节成了一个没有宿主的孤立契约。
+> → 处置：设计稿保留本节作为**未来规格**，路线图 G2 标注「依赖 ticket 写命令族，随其交付落地」。skill 正文（`ambiguous` 预告）维持现状不删 —— 它描述的是服务端可能返回的 `kind`，与本地语义层是否实现无关。
+> → 若要做：必须同时交付 `ticket.create` / `ticket.modify` / `ticket.transfer` 这一族写命令（含 `--yes` 门禁）与本节的解析器，并复用 `staff` 表（`username` 为解析键、`realname`/`nickname` 走候选列表）；单独实现解析器没有任何命令会调用它。
 
 ### 9.5 状态码
 
@@ -1802,10 +1816,10 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 ## 12. 测试策略
 
 - **`core/sign`（已交付，2026-10-25）**：与七鱼官方 Java `QiyuPushCheckSum` 样例做**逐字节比对**。样例**已取得** —— 来自 Apifox 文档页 `doc-436971`（`.md` 后缀取全文字段表），存档在 `private/docs/apifox-436971-数据校验.md`（`private/` 已 gitignore，不入公开仓库）。`tests/core/sign.test.ts` 内置该样例的 Node 移植版 `javaEncode` 作对拍 oracle，配固定向量，并附一条**反恒真**断言（oracle 必须与实现给出不同中间结果，否则「两边一致」只是抄了同一份代码）。⚠️ 原始 TCP 抓包验证实际发出的字节 —— **未做**，仍挂账（需要抓包环境，且当前校验和已由签名对拍覆盖）
-- **`core/envelope`（已交付，2026-10-25）**：设计稿 §9.0 记录的 **40 条 key+type 实测签名样本不在仓库里**（会随服务端演化），故 `tests/core/envelope-matrix.test.ts` 改覆盖**形状 × `message` 类型**的语义矩阵（A / B / C / D / D-nf × string / object / integer / boolean / array），每格要么断言解释规则、要么显式标注无实测依据。矩阵附**覆盖度自检**：从 `src/core/envelope.ts` 读 `EnvelopeShape` 的真实定义，要求每个形状都被矩阵写到、且至少两个形状给出不同结论 —— 防止矩阵退化成手抄清单的自比较
+- **`core/envelope`（已交付，2026-10-25）**：设计稿 §9.0 记录的 **40 条 key+type 实测签名样本不在仓库里**（会随服务端演化），故 `tests/core/envelope-matrix.test.ts` 改覆盖**形状 × `message` 类型**的语义矩阵（A / B / C / D / D-nf × string / object / integer / boolean / array），每格要么断言解释规则、要么显式标注无实测依据。矩阵附**覆盖度自检**：从 `src/core/envelope.ts` 读 `EnvelopeShape` 的真实定义，且覆盖判据是**观测式**的（`normalizeIn` 只在真实用例里登记被喂过的形状），双向断言「声明的形状都跑到了 / 跑到的形状都在声明里」，另要求至少两个形状给出不同结论 —— 手抄清单式的自检（清单 vs 类型定义）守不住「加了新形状但没有用例」这个形态
 - `store`：对 DuckDB 和 SQLite 跑同一组用例，断言**类型与 upsert 语义完全一致**（已知差异见 §6.3）。**随 C2（外部后端）交付** —— 当前只有 DuckDB 一个引擎，「两引擎一致」无对照物
 - `store/sandbox`：完整攻击用例集（§8.2 表格的全部 9 行）必须全部被拦截
-- **时区（已交付，2026-10-25）**：`tests/core/time-timezones.test.ts` 在三个时区（`Asia/Shanghai` / `UTC` / `America/New_York`）下跑同一组日期用例，断言结论逐字一致。**两条自检让一致断言有牙**：① 每个时区先探测本机小时数（20 / 12 / 8），切换未生效就响亮失败 —— 否则「三个都一样」只是「根本没切」；② 另有一条断言要求这组用例对时区**敏感**（三时区下本机日历日不全相同），否则用例可能恰好落在三时区同一天的区间里。用例覆盖跨日（上海已是次日、纽约仍是当日）、跨年、纽约夏令时起止日、无偏移 ISO、`yesterday` 与回显形态；已做三次变异验证（`yesterday` 改用本机日期 / 无偏移 ISO 交给 `Date.parse` / 本地零点代替上海零点），三次均转红
+- **时区（已交付，2026-10-25）**：`tests/core/time-timezones.test.ts` 在三个时区（`Asia/Shanghai` / `UTC` / `America/New_York`）下跑同一组日期用例，断言结论逐字一致。**两条自检让一致断言有牙**：① 每个时区先探测本机小时数（20 / 12 / 8），切换未生效就响亮失败 —— 否则「三个都一样」只是「根本没切」；② 另有一条断言要求这组用例对时区**敏感**（三时区下本机日历日不全相同），否则用例可能恰好落在三时区同一天的区间里。用例覆盖跨日（上海已是次日、纽约仍是当日）、跨年、纽约夏令时起止日、无偏移 ISO、`yesterday` 与回显形态。⚠️ **每个时区都重新导入模块**（`vi.resetModules()` + 动态 import）：`Intl.DateTimeFormat` 在构造时就把时区定死，只切 `process.env.TZ` 的写法测不出「formatter 退回默认时区」这类缺陷（实测：构造于上海的 formatter 切到 UTC 后仍返回上海日期）。变异验证四次均转红：`yesterday` 改用本机日期 / 无偏移 ISO 交给 `Date.parse` / 本地零点代替上海零点 / 删掉 formatter 的 `timeZone`
 - `sync`：录制 HTTP fixture；验证幂等性（跑两次结果相同）、可断点续传的同步，以及无缺口的事务
 - `commands`：端到端 mock server；断言 stdout 是纯 JSON 且退出码正确
 - **`sync/knowledge`（新增；必须防采样假象）**：以**一次完整遍历的录制 fixture** 做断言（录制于 2026-09-30，12,778 行 —— **不要在断言里硬编码这个数字**，它会漂移；改为断言下列不变量，并让 fixture 自带行数）—— ① `isEnd` 驱动终止，且累计行数 `==` 声明的 `total`；② **断言全部 5 个 robotId 都出现**（若 fixture 被截断到前 1,000 行，这条断言必须失败 —— 那正是 §13#14 的错误）；③ 每条 `type=10` 行的 `refId` 都能解析到一条 `type=1` 行**且携带相同的 `groupId`**；④ 每行的 `pointId` 都能解析进 `knowledge_points`（4,805 条，全部可解析）；⑤ `COUNT(DISTINCT groupId) == COUNT(type=1)`；⑥ `groupId` 在**每一**行上都存在，且没有 `groupId` 跨越两个 `robotId`
