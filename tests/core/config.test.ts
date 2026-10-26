@@ -265,3 +265,20 @@ describe('fileProfile / fileCredentials（凭证与 robots 的共用出口）', 
     expect(configHasCredentials(loadConfigFile(cfgPath()).file)).toBe(false)
   })
 })
+
+describe('profiles 是 null 原型对象（2026-10-27，原型链绕过守卫）', () => {
+  // 普通 `{}` 上 `profiles['constructor']` 命中的是 `Object.prototype.constructor`，
+  // 「未知 profile 必须拒绝」的判据会被原型链绕过（`--profile constructor` 静默回落默认库）；
+  // 且 `profiles['__proto__'] = block` 会改掉原型而不是建键。
+  it('继承属性名不算 profile，`__proto__` 是普通键名', () => {
+    const f = parseConfig({ profiles: { prod: {} } })
+    expect(Object.hasOwn(f.profiles, 'prod')).toBe(true)
+    expect(f.profiles['constructor']).toBeUndefined()
+    expect(f.profiles['toString']).toBeUndefined()
+
+    const g = parseConfig(JSON.parse('{"profiles":{"__proto__":{"robots":{"1000001":"甲"}}}}'))
+    expect(Object.getPrototypeOf(g.profiles)).toBe(null)
+    expect(Object.keys(g.profiles)).toEqual(['__proto__'])
+    expect(g.profiles['__proto__'].robots).toEqual({ '1000001': '甲' })
+  })
+})

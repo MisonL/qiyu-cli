@@ -370,3 +370,37 @@ describe('store 命令面与 help', () => {
     }
   })
 })
+
+describe('store 命令 —— 未知 profile 必须拒绝（2026-10-27 实测修）', () => {
+  // ⚠️ 端到端钉住「拼错的 profile 不再静默读/建默认库」：此前
+  // `store init --profile prodd` 会在 ~/.qiyu/duckdb/qiyu.duckdb 创建一个
+  // 用户从未配置的库并返回 ok:true；`store status --profile prodd` 则读默认库。
+  // 配置层已有单测（tests/store/config.test.ts），这里钉的是**命令出口**：
+  // 退出码 2（usage：改参数重来）+ 绝不产生文件。
+  const writeConfig = (): void => {
+    const cfgDir = join(dir, '.config', 'qiyu')
+    mkdirSync(cfgDir, { recursive: true })
+    writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
+      defaultProfile: 'prod',
+      profiles: { prod: { store: { path: join(dir, 'prod.duckdb') } } },
+    }))
+  }
+
+  it('store init --profile prodd → 退出码 2 + usage，且不在默认路径建库', async () => {
+    writeConfig()
+    expect(await storeCommand(['init', '--profile', 'prodd'])).toBe(2)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('usage')
+    expect(e.message).toMatch(/没有 profile "prodd"（来自 --profile；现有：prod）/)
+    expect(existsSync(join(dir, '.qiyu', 'duckdb', 'qiyu.duckdb')), '不得创建用户未配置的默认库').toBe(false)
+    expect(existsSync(join(dir, 'prod.duckdb')), '也不得误建别的 profile 的库').toBe(false)
+  })
+
+  it('store status --profile prodd → 退出码 2 + usage（不再静默读默认库）', async () => {
+    writeConfig()
+    expect(await storeCommand(['status', '--profile', 'prodd'])).toBe(2)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('usage')
+    expect(e.message).toMatch(/没有 profile "prodd"/)
+  })
+})

@@ -72,6 +72,78 @@ describe('store 配置 —— profile 选择', () => {
     writeCfg({ profiles: { prod: {} } })
     expect(resolveStoreConfig({ home, flags: { profile: 'prod' } }).config.path).toBe(join(home, '.qiyu', 'duckdb', 'qiyu.duckdb'))
   })
+
+  // ⚠️ 点名的 profile 必须存在（2026-10-27 实测修）：此前 `profiles[profileName] ?? {}`
+  // 把「profile 拼错」和「profile 存在但没配 store」合并成同一个静默回落 ——
+  // `--profile prodd` 读到**默认库**并返回 ok:true 与其中的数据，Agent 看不出自己读错了库；
+  // `store init --profile prodd` 还会在默认路径创建一个用户从未配置的库。
+  // 三条入口（--profile / QIYU_PROFILE / defaultProfile）都必须拒绝，不能只堵一条。
+  const cfgTwo = { defaultProfile: 'prod', profiles: { prod: { store: { path: '/tmp/p.duckdb' } }, staging: { store: { path: '/tmp/s.duckdb' } } } }
+
+  it('--profile 拼错 → 报错点名现有 profile（不再静默读默认库）', () => {
+    writeCfg(cfgTwo)
+    expect(() => resolveStoreConfig({ home, flags: { profile: 'prodd' } }))
+      .toThrow(/没有 profile "prodd"（来自 --profile；现有：prod、staging）/)
+  })
+
+  it('原型链上的名字（constructor/toString/__proto__）同样按「不存在」拒绝', () => {
+    // ⚠️ 2026-10-27 CodeRabbit：`profiles[x] === undefined` 会被原型链绕过 ——
+    // `--profile constructor` 命中 Object.prototype.constructor（非 undefined），
+    // 守卫放行后回落默认库，与拼错 profile 是同一个缺陷。判据必须是 own property。
+    writeCfg(cfgTwo)
+    for (const name of ['constructor', 'toString', 'hasOwnProperty', '__proto__']) {
+      expect(() => resolveStoreConfig({ home, flags: { profile: name } }), name)
+        .toThrow(new RegExp(`没有 profile ${JSON.stringify(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+    }
+  })
+
+  it('QIYU_PROFILE 拼错 → 同样拒绝并点名来源', () => {
+    writeCfg(cfgTwo)
+    expect(() => resolveStoreConfig({ home, env: { QIYU_PROFILE: 'prodd' } }))
+      .toThrow(/没有 profile "prodd"（来自 QIYU_PROFILE；现有：prod、staging）/)
+  })
+
+  it('配置文件里的 defaultProfile 拼错 → 同样拒绝（否则每条命令都静默读默认库）', () => {
+    writeCfg({ defaultProfile: 'prodd', profiles: { prod: { store: { path: '/tmp/p.duckdb' } } } })
+    expect(() => resolveStoreConfig({ home }))
+      .toThrow(/没有 profile "prodd"（来自 defaultProfile；现有：prod）/)
+  })
+
+  it('--profile 空串/纯空白 → usage「--profile 不能为空」（与 auth login 同口径）', () => {
+    writeCfg(cfgTwo)
+    expect(() => resolveStoreConfig({ home, flags: { profile: '' } })).toThrow('--profile 不能为空')
+    expect(() => resolveStoreConfig({ home, flags: { profile: '  ' } })).toThrow('--profile 不能为空')
+    // 无配置文件时同样是 usage 错误（空取值从不是合法的"未设置"）
+    rmSync(join(home, '.config'), { recursive: true, force: true })
+    expect(() => resolveStoreConfig({ home, flags: { profile: '' } })).toThrow('--profile 不能为空')
+  })
+
+  // 以下四条是**刻意保留的回落**，逐一钉住防止将来的"加强校验"把它们误伤：
+  it('回落①：配置文件不存在 → --profile 按默认走（首次运行）', () => {
+    expect(resolveStoreConfig({ home, flags: { profile: 'x' } }).config.path)
+      .toBe(join(home, '.qiyu', 'duckdb', 'qiyu.duckdb'))
+  })
+
+  it('回落②：profiles 为空 → --profile 按默认走（空配置没有可选项）', () => {
+    writeCfg({ profiles: {} })
+    expect(resolveStoreConfig({ home, flags: { profile: 'x' } }).config.path)
+      .toBe(join(home, '.qiyu', 'duckdb', 'qiyu.duckdb'))
+  })
+
+  it('回落③：未点名任何 profile（无 flag/env/defaultProfile）→ 不查，内置 default 即使不在 profiles 里也不报错', () => {
+    // ⚠️ 不能复用 cfgTwo —— 它带 defaultProfile: 'prod'，那就已经"点名"了。
+    writeCfg({ profiles: { prod: { store: { path: '/tmp/p.duckdb' } }, staging: { store: { path: '/tmp/s.duckdb' } } } })
+    expect(resolveStoreConfig({ home }).config.path)
+      .toBe(join(home, '.qiyu', 'duckdb', 'qiyu.duckdb'))
+  })
+
+  it('回落④：QIYU_PROFILE 空串 / defaultProfile 空串 → 当未设置（与 core 的 fileProfile 同口径）', () => {
+    writeCfg({ defaultProfile: '', profiles: { prod: { store: { path: '/tmp/p.duckdb' } } } })
+    expect(resolveStoreConfig({ home }).config.path).toBe(join(home, '.qiyu', 'duckdb', 'qiyu.duckdb'))
+    writeCfg({ profiles: { prod: { store: { path: '/tmp/p.duckdb' } } } })
+    expect(resolveStoreConfig({ home, env: { QIYU_PROFILE: '' } }).config.path)
+      .toBe(join(home, '.qiyu', 'duckdb', 'qiyu.duckdb'))
+  })
 })
 
 describe('store 配置 —— 后端与行为参数', () => {

@@ -136,6 +136,13 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
   上面的示例逐字核对。
 - `credentials` 由 `qiyu auth login` 写入（也可手写）；**`store` 与 `robots` 只能手写** ——
   `auth login` 会保留已有的 `robots` 映射，但不会创建或更新它。
+- **profile 的选择顺序**：`--profile` > `QIYU_PROFILE` > 顶层 `defaultProfile` > 内置 `default`。
+  点名的 profile **必须存在于 `profiles` 里**：`--profile prodd`（拼错）或 `defaultProfile`
+  指向不存在的名字会被拒绝（退出码 2，错误里列出已有的 profile），**不会静默回落到默认库**。
+  刻意保留的回落只有四种：配置文件不存在（首次运行）、`profiles` 为空、profile 存在但没写
+  `store` 块（用内置默认路径）、未点名任何 profile 时直接用内置 `default`（它不在
+  `profiles` 里也不报错）。空串口径：`--profile ''` 是 usage 错误；`QIYU_PROFILE=` 与
+  `"defaultProfile": ""` 视为未设置。
 
 **权限规则**：配置文件**含凭证**且 group/other 可读（如 `0644`）时，**任何读取配置的命令都会
 拒绝读取**（`kind: config_insecure`，退出码 1，hint 点名要执行的 `chmod`）——因为落盘的
