@@ -3,7 +3,7 @@ import { statSync, lstatSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
-import { ok, fail, usageFail, sanitizeControlChars, setPretty } from '../output.js'
+import { ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
@@ -121,7 +121,10 @@ export async function storeCommand(argv: string[]): Promise<number> {
   try {
     resolved = resolveStoreConfig({ flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
       env: currentStoreEnv() })
-  } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
+    // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
+    // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
+    // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
+  } catch (e) { return failFromTagged(e) }
 
   const { config, configPath, configExists } = resolved
 

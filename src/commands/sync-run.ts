@@ -28,7 +28,7 @@ import { readWatermark } from '../sync/state.js'
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
-import { ok, fail, usageFail, describeArgs, setPretty } from '../output.js'
+import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
 import type { Store } from '../store/types.js'
 import { GLOBAL_FLAGS, STORE_FLAGS, renderFlagNames, valueFlagNames } from './spec-types.js'
@@ -312,7 +312,10 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       flags: { db: flags['--db'], profile: flags['--profile'], backend: flags['--backend'] },
       env: currentStoreEnv(),
     })
-  } catch (e) { return usageFail((e as Error).message) }
+    // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
+    // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
+    // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
+  } catch (e) { return failFromTagged(e) }
   let store: Store | undefined
   try {
     try {

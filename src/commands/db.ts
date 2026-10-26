@@ -26,7 +26,7 @@ import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
 import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
-import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
+import { ok, fail, usageFail, failFromTagged, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
 import type { StoreFlags } from './store-flags.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
@@ -218,7 +218,12 @@ export async function openGuardedSession(
       flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
       env: currentStoreEnv(),
     }).config
-  } catch (e) { return { exit: usageFail(sanitizeControlChars((e as Error).message)) } }
+  } catch (e) {
+    // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
+    // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
+    // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
+    return { exit: failFromTagged(e) }
+  }
 
   const guarded = statGuard(config.path)
   if (guarded !== null) return { exit: guarded }

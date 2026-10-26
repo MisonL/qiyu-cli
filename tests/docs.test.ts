@@ -136,6 +136,11 @@ describe('readme.test.ts —— C1 追加断言（防文档说假话）', () => 
     // 「含凭证也照旧只警告」这个安全回退**照样通过**。
     expect(md, '含凭证过宽必须承诺拒绝').toMatch(/拒绝读取|config_insecure/)
     expect(md, '无凭证仍只警告').toMatch(/警告.*不阻断|不阻断.*警告/)
+    // ⚠️ 「所有命令」是错的口径（2026-10-26 实测）：不读配置的命令（--version / api list /
+    // skill where / sync tasks）根本不碰凭证，谈不上拒绝；而 `auth login` 是唯一例外
+    // （重写为 0600 而非拒绝）。只写"所有命令"会让 Agent 以为 `qiyu api list` 也会失败。
+    expect(md, '拒绝范围必须限定为「读取配置的命令」').toMatch(/读取配置的命令/)
+    expect(md, 'auth login 的例外必须写明').toMatch(/auth login`? 是\*\*唯一的例外\*\*|auth login.*例外/)
     // WAL 说明（Q 组 Q-低-2）：.wal 临时文件正常退出后消失，勿手工删除
     expect(md).toMatch(/\.wal/)
   })
