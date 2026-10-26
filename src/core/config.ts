@@ -73,7 +73,12 @@ export function parseConfig(raw: Record<string, unknown>): QiyuConfigFile {
   for (const k of Object.keys(raw)) {
     if (!KNOWN_TOP.has(k)) throw new Error(`配置文件未知键：${k}`)
   }
-  const profiles: Record<string, ProfileBlock> = {}
+  // ⚠️ null 原型（2026-10-27，CodeRabbit 实测复现）：普通 `{}` 上
+  // `profiles['constructor']` 命中的是 `Object.prototype.constructor`（非 undefined）——
+  // 拼错成 `--profile constructor` 会绕过「未知 profile 必须拒绝」的守卫，静默回落默认库；
+  // 而 `profiles['__proto__'] = block` 会**改掉原型**而不是建键。两个入口都由这一行关掉：
+  // 查不到继承属性，`__proto__` 也只是个普通键名。
+  const profiles: Record<string, ProfileBlock> = Object.create(null)
   if (raw.profiles !== undefined) {
     const profObj = assertObject(raw.profiles, 'profiles')
     for (const [name, prof] of Object.entries(profObj)) {

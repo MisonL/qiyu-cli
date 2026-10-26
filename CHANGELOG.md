@@ -49,6 +49,22 @@
   钉成契约）。实测（skill 已装、无提示）`--version`、`store status`、`sync tasks`、
   `skill where` 的成功输出只有 `{ok, data}`。改为如实描述 + 给出可操作的读法
   （读 `meta` 前先判存在），并加一条 `tests/readme.test.ts` 断言防回退。
+- **拼错的 profile 名静默回落到默认库**。`resolveStoreConfig` 此前是
+  `profiles[profileName] ?? {}` —— 把「profile 拼错」和「profile 存在但没配 store」合并成
+  同一个静默回落。实测：配置里只有 `prod`/`staging` 时，`--profile prodd`（少一个字母）
+  让 `store status` 去读 `~/.qiyu/duckdb/qiyu.duckdb`、`query --sql "SELECT ..."` 返回
+  **`ok:true` 与另一个库的数据**（Agent 看不出自己读错了库），`store init --profile prodd`
+  还会在默认路径**创建一个用户从未配置的库**。三条入口（`--profile`、`QIYU_PROFILE`、
+  顶层 `defaultProfile`）都受影响。现在点名的 profile 不存在即拒绝（退出码 2，错误列出
+  已有的 profile 并注明来源），与全仓「未知表/未知任务/未知接口 id/未知后端/未知配置键
+  一律拒绝并给候选」一致。刻意保留的回落只有四种：配置文件不存在、`profiles` 为空、
+  profile 存在但没写 `store` 块、未点名任何 profile 时用内置 `default`（各自都有用例钉住）。
+  空串口径与 `auth login` 对齐：`--profile ''` 是 usage 错误「--profile 不能为空」；
+  `QIYU_PROFILE=` 与 `"defaultProfile": ""` 视为未设置（与 core 的 `fileProfile` 同一判据）。
+  判据必须查 **own property**：`profiles` 早先是普通 `{}`，`--profile constructor`/
+  `toString` 会命中 `Object.prototype` 上的继承属性、绕过守卫后同样回落默认库（CodeRabbit
+  实测指出）；`parseConfig` 改为 null 原型对象（顺带关掉 `profiles["__proto__"] = block`
+  改写原型的写法），守卫侧再用 `Object.hasOwn` 加第二道锁。
 
 ## [0.2.1] - 2026-10-26
 

@@ -114,8 +114,50 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
     }
   }
 
-  const profileName = flags.profile ?? env.QIYU_PROFILE ?? file.defaultProfile ?? 'default'
-  const prof = profiles[profileName] ?? {}
+  // ⚠️ 点名的 profile 必须存在（2026-10-27 实测修）：此前 `profiles[profileName] ?? {}`
+  // 把「profile 拼错」和「profile 存在但没配 store」合并成同一个静默回落 ——
+  // `--profile prodd`（少一个字母）会读到**默认库**并返回 `ok:true` 与其中的数据，
+  // Agent 看不出自己读错了库；`store init --profile prodd` 还会在默认路径上创建
+  // 一个用户从未配置的库。与全仓「未知名字必须拒绝并给候选」一致（未知表/未知任务/
+  // 未知接口 id/未知后端/未知配置键），也与 §3.3「拼错的配置键静默无效等于让用户
+  // 以为设置生效了」同一条理由。
+  //
+  // 边界（刻意保留的回落）：
+  //   · 配置文件不存在 → `loadConfigFile` 给出空 file，`profiles` 为空，
+  //     下面的 `available.length > 0` 直接放行（首次运行）—— 所以不需要再判
+  //     `configExists`（实测删掉该条件全绿：它与长度判据完全冗余，留着是死条件）；
+  //   · 配置文件存在但 `profiles` 为空 → 同上（空配置没有可选项）；
+  //   · profile 存在但缺 store 块 → 走默认（tests/store/config.test.ts 钉着）；
+  //   · 未点名任何 profile（连 defaultProfile 都没有）→ 用内置 `default`，不查。
+  // ⚠️ 空串口径与 auth 侧逐字一致：`--profile ''` 是 usage 错误（`auth login` 的
+  // normalizeProfile 同样报「--profile 不能为空」）；`QIYU_PROFILE=`（变量未设的
+  // 典型形态）与 `defaultProfile: ''` 当未设置 —— 后者与 core 的 `fileProfile`
+  // 同一判据，凭证侧与 store 侧不得对同一份配置给出两种解读。
+  if (flags.profile !== undefined && flags.profile.trim() === '') {
+    throw new Error('--profile 不能为空')
+  }
+  const namedProfile = flags.profile !== undefined
+    ? { name: flags.profile, source: '--profile' }
+    : env.QIYU_PROFILE !== undefined && env.QIYU_PROFILE !== ''
+      ? { name: env.QIYU_PROFILE, source: 'QIYU_PROFILE' }
+      : file.defaultProfile !== undefined && file.defaultProfile !== ''
+        ? { name: file.defaultProfile, source: 'defaultProfile' }
+        : undefined
+  const profileName = namedProfile?.name ?? 'default'
+  if (namedProfile !== undefined) {
+    const available = Object.keys(profiles)
+    // ⚠️ own-property 判据（2026-10-27，CodeRabbit）：`profiles[x] === undefined` 会被
+    // 原型链绕过 —— `--profile constructor` / `toString` 命中 `Object.prototype` 上的
+    // 继承属性，守卫放行后回落默认库。parseConfig 已改用 null 原型对象，这里是第二道锁
+    // （resolveStoreConfig 的 profiles 只来自 parseConfig，但判据本身不该依赖来源）。
+    if (available.length > 0 && !Object.hasOwn(profiles, profileName)) {
+      throw new Error(
+        `配置文件里没有 profile ${JSON.stringify(profileName)}（来自 ${namedProfile.source}；` +
+        `现有：${available.join('、')}）—— 检查拼写，或先在配置文件里加上这个 profile`,
+      )
+    }
+  }
+  const prof = Object.hasOwn(profiles, profileName) ? profiles[profileName] : {}
   const storeBlock = (prof.store ?? {}) as Record<string, unknown>
 
   const rawBackend = flags.backend ?? env.QIYU_STORE_BACKEND ?? (storeBlock.backend as string | undefined) ?? DEFAULTS.backend
