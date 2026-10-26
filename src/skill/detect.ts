@@ -62,6 +62,38 @@ export type SkillState =
   | { kind: 'current' }
   | { kind: 'unknown' }
 
+/** 已安装正文清单里**对外可报**的两个版本号（`skill where` 消费）。 */
+export interface InstalledManifestInfo {
+  /** 安装时那份 CLI 的包版本。 */
+  version: string
+  /** 安装时那份正文的契约版本（设计稿 D6）。 */
+  skillContractVersion: number
+}
+
+/**
+ * 读已安装正文的清单版本信息（`skill where` 用）。
+ *
+ * ⚠️ **为什么需要它**（2026-10-26 实测发现）：`SKILL.md` 教 Agent
+ * 「用 `skill_contract_version` 判断手上的正文能否配这份 CLI」，但此前**没有任何命令
+ * 报出已安装那份的契约号** —— `qiyu --version` 给的是 CLI 自己的，`skill check
+ * --installed` 的 `meta.skill_contract_version` 同样是 CLI 自己的（容易被读成"已安装
+ * 那份的"），`skill where` 完全不报。于是那句承诺是**空的**：Agent 手上没有可比的数。
+ * 实测佐证：把已安装清单的 `skill_contract_version` 改成 99，上面三条命令的输出
+ * 一字不变、`meta.warnings` 也不出现任何提示。
+ *
+ * 返回 `null` 的情形与 `readManifestStrict` 一致（缺失/损坏/字段不全），另外
+ * **读不动**（EACCES 等）也归 `null` —— 本函数是排查命令的辅助，不该因为权限问题
+ * 让整条 `skill where` 失败；调用方据此报 `null`（= 无法判定），不编造。
+ */
+export function readInstalledManifestInfo(entityDir: string): InstalledManifestInfo | null {
+  try {
+    const m = readManifestStrict(entityDir)
+    return m === null ? null : { version: m.version, skillContractVersion: m.skill_contract_version }
+  } catch {
+    return null
+  }
+}
+
 // 进程内判定：同参只探测一次（spec D2.1 的「零成本」）。缓存**不会随文件系统变化自动
 // 失效**，所以凡是「本进程刚改过实体目录」的路径都必须主动调 `resetSkillDetectionCache()`。
 //

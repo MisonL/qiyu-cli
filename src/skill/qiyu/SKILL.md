@@ -40,9 +40,14 @@ qiyu sync status
   含义是本机装的正文与这份 CLI 不配套；更新方式是 `qiyu skill install`——它会写到本机
   的 skill 实体目录与各 Agent 的 skills 目录。**只在人类允许写 home 时执行**，不要自作主张
   改动用户目录；不允许时把这条提示原样转述给人类。
-- **`qiyu --version`**：输出包版本（`data.version`）与 `data.skill_contract_version`。
-  `skill_contract_version` 就是正文与 CLI 的配套约定号——用它判断手上的正文能否配这份
-  CLI，而不是拿包版本号去比。
+- **`qiyu --version`**：输出包版本（`data.version`）与 `data.skill_contract_version`
+  （**这份 CLI** 的正文契约号）。
+- **`qiyu skill where`**：报告实体目录与各 Agent 链接状态，并给出**已安装那份正文**的
+  版本元数据：`data.entity.installed.skill_contract_version`（装的那份的契约号）、
+  `data.cli_contract_version`（本 CLI 的）与 `data.entity.installed.compatible`
+  （两者是否相等）。**判断「手上的正文能否配这份 CLI」就看这一个字段**，不要拿包版本号
+  去比 —— 包版本不同但契约号相同，正文仍然能用。`installed` 为 `null` = 清单缺失/损坏，
+  判定不了，不要当成「兼容」。
 - **`qiyu skill check`**：正文自身的防漂移校验（命令、表名、错误 `kind`、位置参数取值是否
   仍存在于当前 CLI）。默认校验包内那份；`--installed` 校验已安装的那份，`--compare` 比对
   两份并报告差异。有违规时退出码 1。

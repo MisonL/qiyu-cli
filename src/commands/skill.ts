@@ -41,8 +41,8 @@ import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult } from '../skill/check.js'
 import { contentHash, installSkill, planInstall, type InstallPlan } from '../skill/install.js'
 import {
-  entityUndeterminedNote, npmRelativeBase, resetSkillDetectionCache, resolveEntityDirSources,
-  resolveSkillSourceDir,
+  entityUndeterminedNote, npmRelativeBase, readInstalledManifestInfo, resetSkillDetectionCache,
+  resolveEntityDirSources, resolveSkillSourceDir,
   type EntitySource,
 } from '../skill/detect.js'
 import {
@@ -68,7 +68,11 @@ const SKILL_USAGE = `用法：qiyu skill <子命令> [参数]
   skill where   [--dir <path>]
                            报告实体目录与各 agent 链接状态（只读，不修复；
                            实体路径无法判定时 exists=null，链接无法判定时
-                           state=unknown（带 error）——都不是「不存在」）
+                           state=unknown（带 error）——都不是「不存在」）；
+                           并给出已安装正文的版本元数据 entity.installed
+                           {version, skill_contract_version, compatible} 与
+                           CLI 自己的 cli_contract_version —— 判断正文能否配这份
+                           CLI 就看 compatible（清单损坏时 installed=null，不编造）
 
 实体目录定位：--dir > QIYU_SKILL_DIR > npm_config_qiyu_skill_dir（postinstall 的安装
 通道，含大小写/连字符归一）> ~/.agents/skills/qiyu
@@ -922,9 +926,12 @@ async function skillWhere(argv: string[]): Promise<number> {
 
   // 实体状态：只读 stat；ENOENT 是「未安装」，其余异常如实记 unknown。
   let entity: Record<string, unknown>
+  let entityUsable = false
   try {
     const st = statSync(entityDir)
-    entity = { path: entityDir, source, exists: true, state: st.isDirectory() ? 'ok' : 'not_a_directory' }
+    const isDir = st.isDirectory()
+    entity = { path: entityDir, source, exists: true, state: isDir ? 'ok' : 'not_a_directory' }
+    entityUsable = isDir
   } catch (e) {
     if (isErrno(e, 'ENOENT')) {
       entity = { path: entityDir, source, exists: false, state: 'missing' }
@@ -936,10 +943,40 @@ async function skillWhere(argv: string[]): Promise<number> {
     }
   }
 
+  // 已安装那份的**版本元数据**（2026-10-26 补）：`SKILL.md` 教 Agent「用
+  // `skill_contract_version` 判断手上的正文能否配这份 CLI」，而此前没有任何命令报出
+  // **已安装那份**的契约号 —— `--version` 与 `check` 的 meta 报的都是 CLI 自己的。
+  // 那条承诺因此是空的。这里给出安装时的两个版本号 + 与当前 CLI 是否配套的判定。
+  //   · `null` = 清单缺失/损坏/读不动 —— **不编造**（与 detect 的 'unknown' 同一条纪律）；
+  //   · `compatible` = 三方判定的落点：只有契约号相等才算配套。包版本不同不算
+  //     不兼容（正文没变就还能用），这正是 SKILL.md 说「别拿包版本号去比」的原因。
+  if (entityUsable) {
+    const info = readInstalledManifestInfo(entityDir)
+    entity.installed = info === null
+      ? null
+      : {
+          version: info.version,
+          skill_contract_version: info.skillContractVersion,
+          compatible: info.skillContractVersion === SKILL_CONTRACT_VERSION,
+        }
+    if (info !== null && info.skillContractVersion !== SKILL_CONTRACT_VERSION) {
+      warnings.push(
+        `已安装的 skill 契约版本为 ${info.skillContractVersion}，当前 CLI 是 ${SKILL_CONTRACT_VERSION}`
+        + ' —— 正文与 CLI 不配套；运行 `qiyu skill install` 更新正文',
+      )
+    }
+  }
+
   const probed = probeAgentLinks(resolveHome(), entityDir)
   warnings.push(...probed.warnings)
   return ok(
-    { entity, links: probed.links },
+    {
+      entity,
+      links: probed.links,
+      // CLI 自己的契约号：与 `entity.installed.skill_contract_version` 并列，让读者能
+      // 一眼看出「两个数是否相等」，不必再去跑 `--version` 比对。
+      cli_contract_version: SKILL_CONTRACT_VERSION,
+    },
     warnings.length > 0 ? { warnings } : undefined,
   )
 }
