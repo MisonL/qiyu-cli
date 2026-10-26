@@ -13,8 +13,18 @@
 // '0.0.0-dev' 字面量正则替换为 package.json 的 version。源码里永远保持占位值，
 // 靠测试钉住「构建产物非占位」这一契约。
 
-/** skill 正文契约版本：结构性改变才递增（spec D6）。 */
-export const SKILL_CONTRACT_VERSION = 1
+/**
+ * skill 正文契约版本：结构性改变才递增（spec D6）。
+ *
+ * 变更记录：
+ *   · 1 —— F 子项目交付时的初版（六篇正文）。
+ *   · 2 —— 2026-10-26：`SKILL.md` 新增「`qiyu skill where` 报出已安装正文的契约号与
+ *     `compatible`」这一协议段落。**必须递增**：新正文要求 CLI 输出
+ *     `data.entity.installed` 与 `data.cli_contract_version`，而 0.2.0 的 CLI 没有这些
+ *     字段 —— 若不递增，新正文配旧 CLI 会被 `compatible` 判成「配套」，Agent 照着读
+ *     会拿到 `undefined`（正是本字段要防的那种「看起来能用、实际不能用」）。
+ */
+export const SKILL_CONTRACT_VERSION = 2
 
 /** 包版本占位值；构建期被 copy-assets.mjs 替换为 package.json 的 version。 */
 export const PACKAGE_VERSION = '0.0.0-dev'
