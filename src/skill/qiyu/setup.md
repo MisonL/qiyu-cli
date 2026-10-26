@@ -12,10 +12,14 @@
 
 1. **缺失时问人类**。要「机器人编号清单」，不要自己编造、不要按数字区间试探、
    不要把会话里见过的编号当全量。
-2. 人类把编号写进配置文件（两种写法都认）：
-   - `store.options.knowledgeRobotIds`（正整数数组）—— **优先**；
+2. 人类把编号写进配置文件（两种写法都认，都在 `profiles.<name>` 之下）：
+   - `profiles.<name>.store.options.knowledgeRobotIds`（正整数数组）—— **优先**；
    - `profiles.<name>.robots`（`{"1000001":"机器人A"}` 映射，键是编号、值是显示名）——
      `knowledgeRobotIds` 缺席时的兜底。
+
+   ⚠️ **`knowledgeRobotIds` 在 `store` 块的 `options` 里面，比 `robots` 低两层** —— 两处写混
+   （例如把 `knowledgeRobotIds` 直接放在 `profiles.<name>` 下）会被 CLI 以
+   「配置文件未知键」拒绝（退出码 2）。转述给人类时请给**完整路径**，不要只说键名。
 
    `qiyu sync run` 在条目数据集为空（分类树没有可依据的编号来源）时会改用这些编号逐机器人
    拉取分类树；条目数据非空时以条目数据为准。写错（非正整数）会被 CLI 以用法错误拒绝并点名

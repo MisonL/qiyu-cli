@@ -5,6 +5,22 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复
+
+- **配置键路径在文档与提示里写不全，照做会被 CLI 自己的校验拒绝**。配置结构是
+  `profiles.<name>.store.<键>`，而多处只给了简写：`store_locked` 的 hint 说「可经配置文件
+  `readOnlyRetryMs` 调整」（写进顶层或 profile 级 → 「配置文件未知键」退出码 2）、
+  `sync run` 与 `auth whoami` 的文案写 `store.options.knowledgeRobotIds`（同样缺
+  `profiles.<name>` 前缀）、skill 正文 `setup.md` 把 `knowledgeRobotIds` 与 `robots`
+  写在同一个层级（实际前者低两层）。全部改为完整路径，并新增
+  `tests/config-paths.test.ts`：README 的配置示例必须被 `parseConfig` 接受，文档与源码
+  文案里点名的每个配置路径都必须能在白名单里走通（裸键名、层级错、代码标识符误伤
+  三种形态都在自检里钉住）。
+- README 补上**配置文件的完整结构示例** —— 此前全仓没有一处给出它，这正是上面那类
+  简写能长期存在的土壤。
+
 ## [0.2.1] - 2026-10-26
 
 ### 新增

@@ -363,13 +363,13 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     // 此前 `map(Number).filter(...)` 会把 `["abc", -1]` 静默丢成空数组：用户 typo
     // 了 robotId 却毫无反馈（注入面静默失效）。非数组的错误分支保留。
     if (rawIds !== undefined && !Array.isArray(rawIds)) {
-      return usageFail('配置文件 store.options.knowledgeRobotIds 必须是数字数组')
+      return usageFail('配置文件 profiles.<name>.store.options.knowledgeRobotIds 必须是数字数组')
     }
     if (Array.isArray(rawIds)) {
       const bad = rawIds.find((x) => !Number.isInteger(x) || (x as number) <= 0)
       if (bad !== undefined) {
         return usageFail(
-          `配置文件 store.options.knowledgeRobotIds 必须是正整数数组（非法元素：${String(bad)}）`)
+          `配置文件 profiles.<name>.store.options.knowledgeRobotIds 必须是正整数数组（非法元素：${String(bad)}）`)
       }
     }
     const robotIds = rawIds !== undefined

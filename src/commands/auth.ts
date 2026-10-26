@@ -352,7 +352,7 @@ function whoami(): number {
     field_notes: {
       source: 'env = 两个字段都来自环境变量；file = 都来自配置文件；mixed = 各来自一处（合法组合）',
       robots: '来自配置文件的 profiles.<name>.robots 映射（robotId → 显示名），**未校验有效性**、' +
-        '未与本地库比对；sync run 在 store.options.knowledgeRobotIds 缺席时回退使用它',
+        '未与本地库比对；sync run 在 profiles.<name>.store.options.knowledgeRobotIds 缺席时回退使用它',
       configured: 'true 只表示"两个字段都有值"，**不代表**它们有效 —— 拼错的 appKey 同样返回 true',
     },
   })
