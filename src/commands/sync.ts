@@ -137,7 +137,7 @@ const USAGE = `用法：qiyu sync <子命令> [参数]
 CRON 为 5 段（分 时 日 月 周），支持 * / 数字 / a-b / a-b/k / */k / 逗号列表。
 存储定位：--db / --profile / --backend（store 命令同族）。
 install 的平台形态：darwin=launchd plist、linux=systemd unit+timer（crontab 兜底）、
-win32=schtasks。安装前置：库已初始化且**至少成功同步过一次**（sync_state 有
+win32=schtasks。安装前置：库已初始化且至少成功同步过一次（sync_state 有
 range_status=complete 或 last_synced_at 非空的行；全败的 run 只留 pending，不算跑通）。
 `
 

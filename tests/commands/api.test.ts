@@ -27,29 +27,34 @@ beforeEach(() => {
   vi.stubEnv('HOME', home)
   vi.stubEnv('QIYU_PROFILE', '')
   // ⚠️ 令牌桶是 http.ts 的**模块级** Map，同一测试文件内的用例共享它。
-  // 本文件有 24 处 `apiCommand(['call', 'ticket.search', …])`（2026-10-08 三次重测：
-  // 13 → 23 → 24，每次都是增删用例后没人跟着改），其中**恰好 5 处**
-  // 真的发到 `call()`（其余 19 处够不到令牌桶）；另有 1 处走 `message.send`，
-  // 本文件共 **6 次**进 `call()`。
-  // ⚠️ 四个数里只有这两个是**探针实测**的：「5 处」「共 6 次」（2026-10-08 复测，
-  // 在 `call()` 入口插 `appendFileSync` 后 `sort | uniq -c` 得到
-  // 5×ticket.search + 1×message.send）。
-  // 「24 处」是 grep 出现次数、「19 处」是 24 − 5 推出来的 —— 它们随用例增删漂，
-  // **别给它们编子分类**（比如"15 处返回 2 / 4 处走 help"）：真实测试环境里
-  // 各用例的凭证 stub 不同，同一 argv 在探针环境与单测环境里会得到不同的退出码，
-  // 那种子分类要么实测要么不写。数法：在 `call()` 入口临时插一行
+  // **2026-10-26 探针实测（按下面这段自己规定的方法重跑）**：本文件跑一遍，
+  // `call()` 共被进入 **31 次**，按接口 id 分布：
+  //   ticket.search 11 · ai.knowledge.search 4 · ai.knowledge.editKnowledgeNoSimilars 4 ·
+  //   icoutcall.phone.getLineList 4 · message.send 3 · tag.all 3 · kefu.add 1 ·
+  //   merchant.account.login 1
+  // 源码里 `apiCommand(['call', 'ticket.search', …])` 的出现次数是 **27**（grep）。
+  // ⚠️ 这两个数**没有推导关系**：`27 - 11 = 16` 处够不到 `call()`（它们在校验/门禁/
+  // help/参数错误上就返回了），而其余接口的 20 次调用来自别的写法（`['call', '<其它 id>']`）。
+  // 此前这里写「24 处调用点里恰好 5 处发出去、共 6 次」—— **过期且是错的**，
+  // 每次增删用例都没人跟着改（2026-10-08 记的三次重测 13 → 23 → 24 也是同一命运）。
+  // **教训**：这类数字只有**探针实测**才有意义，且测完就该立刻写日期；
+  // 别给它编子分类（"15 处返回 2 / 4 处走 help"），各用例的凭证 stub 不同，
+  // 同一 argv 在探针环境与单测环境里会得到不同的退出码 —— 要么实测要么不写。
+  // 数法：在 `call()` 入口临时插一行
   // `appendFileSync('/tmp/probe.log', spec.id)`，跑一次单文件测试再 `sort | uniq -c`。
-  // **别用读代码数调用点** —— 夹具里 `stubEnv` 配了凭证、`--yes` 又能放行门禁，
-  // "源码里写了几次"与"真的发了几次"不是一回事（24 处调用点里 19 处够不到
-  // `call()`，而其中 5 处 + message.send 那处才发出去）。
   //
   // 当前 ticket.search 不在限频表里、桶不启用，所以不重置也看不出问题 ——
-  // 但这是**脆弱的**：一旦生成脚本给它补上限频行，本文件连续 5 次 `call(ticket.search)`
+  // 但这是**脆弱的**：一旦生成脚本给它补上限频行，本文件连续 11 次 `call(ticket.search)`
   // 会把令牌消耗殆尽。⚠️ **实测过这个反事实**（2026-10-06 初测 3 条，
-  // 2026-10-08 因新用例抢先持桶而变 4 条）：给 ticket.search 补一行
-  // `1 次/180 秒` 并注释掉本行 `__resetBuckets()` → **4 条失败**
-  // （`请求构造失败` 那条**抢先拿到令牌**、不受影响；随后的 `成功但查无此物`、
-  // `正常有数据的成功响应`、`成功响应也带上该接口的 note`、`--yes 重复写` 必被拒），
+  // 2026-10-08 因新用例抢先持桶而变 4 条，**2026-10-26 复测 11 条** —— 增长与
+  // 上面「进 `call()` 的次数」同步，6 → 31）：给 ticket.search 补一行
+  // `1 次/180 秒` 并注释掉本行 `__resetBuckets()` → **12 条失败**，其中
+  // **11 条是令牌耗尽**（`请求构造失败` 那条**抢先拿到令牌**、不受影响；
+  // 随后的 `成功但查无此物`、`正常有数据的成功响应`、`成功响应也带上该接口的 note`、
+  // `--yes 重复写`、B 块那 4 条验收、help/--pretty 次序、fallback 探测抛异常 等必被拒），
+  // 另 **1 条与令牌桶无关** —— 那条实验本身把 ticket.search 变成「已登记」，
+  // 打破了 `RateLimit.scope` 的「未登记限频 → 不输出 rate_limit 键」断言
+  // （只加表行、保留 `__resetBuckets()` 时**恰好只有这一条**失败，据此分开计数）。
   // 是**确定性**的失败（首次之后的每次调用必被拒），不是"随机" —— 别把它当成
   // 偶发 flake 去重跑。与 http.test.ts 一致地重置。
   __resetBuckets()
@@ -651,10 +656,29 @@ describe('api list', () => {
     // 按 ㉔㉕ 的教训，补哨兵要按**通道清单**清点，stderr 就是此前漏掉的那个通道。
     // （⑳ 的教训是另一条：同一条规则的三份实现要按**常量清单**点名。）
     //
-    // ⚠️ 逐行按**写 stderr 的调用点清单**点名（⑳ 的教训），不按"我记得有哪几个"：
-    // 全仓 **30 处** `usageFail(...)` **调用点**（api **16** + auth **9** + cli **5**；
-    // 定义在 output.ts，不计）+ `callOne` catch 里 1 处手工 `process.stderr.write`
-    // （byId / assertCallable 两个来源共用它）。
+    // ⚠️ 逐行按**写 stderr 的调用点清单**点名（⑳ 的教训），不按"我记得有哪几个" ——
+    // **但本表的能力边界到此为止**（Sourcery 2026-10-26 指出，此前注释谎报成"全仓"）：
+    // 它只覆盖 **api / auth / cli 三个文件共 38 处**调用点，而全仓 `usageFail` 有
+    // **117 处**（db 14 + query 11 + skill 11 + stats 10 + store 9 + sync 22 + sync-run 11
+    // 共 79 处不在表内）。为什么不全补进表里：表的每一行是**一次真实调用 + 一个分支锚**，
+    // 给 79 处各写一行意味着每加一个命令都要记得补，而**忘记补不会有任何东西变红** ——
+    // 正是本仓库反复踩的「同一规则多处实现」。
+    // → **全仓的静态扫描另立一处**：`tests/plaintext-channels.test.ts`，它扫全仓源码里
+    //   所有 `usageFail` / `throw new Error` / `process.stderr.write` / `*_USAGE`
+    //   的**字面量**，一处定义全仓生效，新写的调用点自动被覆盖。
+    // 两张网分工不同、都要留：**本表验行为**（真的走到那个分支、stderr 真的非空、
+    // 锚真的来自该分支 —— 这些是静态扫描证明不了的）；**那张网验文本**
+    // （文案里没有星号 —— 这是逐行枚举证明不了的）。
+    // 本表覆盖的 **38 处**：api **18** + auth **14** + cli **6**（定义在 output.ts，不计）
+    // + `callOne` catch 里 1 处手工 `process.stderr.write`（byId / assertCallable 共用）。
+    // ⚠️ **2026-10-26 实测更正**：此前写「30 处（api 16 + auth 9 + cli 5）」—— **过期**，
+    // 而更严重的是**下面这张表当时只覆盖其中 32 个**。用逐点变异实测（把每个调用点的
+    // message 换成 `'**MUT**'` 再跑，看有没有用例红）找出漏网的 6 个：
+    // `api schema` 的四条（未知 flag / help 带位置参数 / 位置参数 > 1 / 缺 id）、
+    // `auth login` 的四条参数分支 + 空 profile 那条、`cli --version` 的额外参数守卫。
+    // 其中 `auth login` 读配置失败那条（`无法读取现有配置文件`）**被**用例走到了，
+    // 但那条用例只断言 message、没断言 stderr 无星号 —— 已在 auth.test.ts 补上。
+    // 现在 38/38 逐点变异全部转红（判据：只注入 `'**'`、不改内容，避免"改坏了别的东西"）。
     // ⚠️ 数调用点要用**代码判据**（匹配点前无同行 `//`），不是 `grep -c`：
     // 本注释自己就多次写到 `usageFail(...)` 这个词，`grep -c` 会把注释一起数进去。
     // ⚠️ **2026-10-07 更正**：此前写「18 处（api 12 + auth 4 + cli 2）」—— **过期**。
@@ -715,6 +739,24 @@ describe('api list', () => {
       // 同样无 `**`）—— 与上面「分支锚」要挡的是同一类漏网。
       // G1 起 --pretty 合法，call --pretty 从拒绝清单移除
       // G1 起 --pretty 合法，whoami --pretty 从拒绝清单移除
+      // ⚠️ **2026-10-26 补 4 行**（逐点变异实测发现，见下方「逐点变异」段）：
+      // 把**每一个** `usageFail(...)` 的 message 换成 `'**MUT**'` 再跑本文件，
+      // 下面这 4 个调用点**从未被任何用例走到** —— 哨兵表声称"按调用点清单逐个点名"，
+      // 实际漏了它们，等于这 4 条文案改动时没有任何东西会红。
+      ['schema --help 不吞额外参数', ['schema', '--help', 'x'], apiCommand, /--help 不接受额外参数/],
+      ['schema 位置参数 > 1', ['schema', 'a.b', 'c.d'], apiCommand, /api schema 只接受一个接口 id/],
+      ['schema 缺接口 id', ['schema'], apiCommand, /用法：qiyu api schema/],
+      // `--profile ''` 不是"缺值"（空串不以 `--` 开头，值位那关放行）—— 它落到
+      // `normalizeProfile` 的空串分支，与 `--profile` 后面缺取值是**两条**分支。
+      ['login --profile 空串（与「缺取值」是两条分支）', ['login', '--profile', ''], authCommand, /--profile 不能为空/],
+      // ⚠️ 同一轮变异又发现 5 个（只注入 `**`、不改内容，全量测试仍全绿）：
+      // `auth login` 的四条参数分支 + `api schema` 的未知 flag 分支。
+      // 这几条此前只在 auth.test.ts 里断言过**退出码**，没人断言它们的 stderr 无星号。
+      ['login 未知 flag', ['login', '--bod'], authCommand, /未知参数：--bod。auth login 只接受 --profile/],
+      ['login --profile 重复', ['login', '--profile', 'a', '--profile', 'b'], authCommand, /--profile 只能出现一次/],
+      ['login --profile 缺取值', ['login', '--profile'], authCommand, /--profile 后面缺少取值/],
+      ['login 位置参数', ['login', 'extra'], authCommand, /未知参数：extra。auth login 不接受位置参数/],
+      ['schema 未知 flag', ['schema', '--bod'], apiCommand, /未知参数：--bod。可用：--pretty/],
       // ⚠️ G1 起 `auth login` **已实现**（旧锚 `/auth login 尚未实现/` 已翻转）：
       // 这条现在走「缺环境变量」分支 —— 它仍在**同一个 usageFail 调用点**上，
       // 只是 message 换了。锚必须跟着换，否则这条退化成"任意 stderr"，
@@ -769,6 +811,8 @@ describe('api list', () => {
       // G1 起 --pretty 已实现：顶层裸调用给出「写在子命令之后」的指引（不再是未实现话术）
       [['--pretty'], /--pretty 是输出格式开关/],
       [['--pretty', '--bod'], /未知参数：--bod。--pretty 必须写在具体子命令之后/],
+      // ⚠️ 2026-10-26 补：`--version` 的额外参数守卫此前零覆盖（逐点变异实测）。
+      [['--version', '--bod'], /--version 不接受额外参数/],
     ]
     for (const [argv, anchor] of TOP_CASES) {
       out = ''; err = ''

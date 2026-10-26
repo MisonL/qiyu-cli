@@ -267,6 +267,14 @@ describe('auth login', () => {
     vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
     expect(await authCommand(['login'])).toBe(2)
     expect(JSON.parse(out).error.message).toMatch(/无法读取现有配置文件/)
+    // ⚠️ 必须同时断言 stderr **非空且**无 Markdown 标记（2026-10-26 逐点变异实测发现）：
+    // 本分支**被**这条用例走到了，但它只断言了 message —— 给该 usageFail 的文案
+    // 注入 `**`，全量测试**仍全绿**（`api.test.ts` 的哨兵表覆盖不到这里：那条表
+    // 的每一行都是一次裸调用，构造不出"配置文件畸形"的前置状态）。
+    // ⚠️ `not.toMatch(/\*\*/)` 单独用**在空串上恒真**（Sourcery 2026-10-26）——
+    // 必须先钉非空：这条路径的承诺是"人能在终端看到原因"，stderr 空着就等于没兑现。
+    expect(err, '这条分支必须把原因写进 stderr（人有 stderr、Agent 有 stdout）').not.toBe('')
+    expect(err).not.toMatch(/\*\*/)
     // 坏文件必须**原样没动**（没有被覆盖成一个"看起来成功"的新文件）
     expect(readFileSync(cfgPath(), 'utf8')).toBe('{ 坏 JSON')
   })
