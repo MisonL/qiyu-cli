@@ -631,9 +631,16 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
     // 实测缺口：maxWindowDays 的消息里写着 `或**整个省略该键**`，终端上就是字面星号。
     //
     // ⚠️ 逐行按 **throw 点清单**点名（⑳ 的教训），不按"我记得有哪几个" ——
-    // `loadSpecs` 共 **17** 个抛错分支（2026-10-24：G1 补 `category` 存在即校验，
-    // 16 → 17），每行附**期望命中的分支特征**：少了它，夹具一旦漂移到别的分支，
+    // `loadSpecs` 共 **19** 个抛错分支（2026-10-24：G1 补 `category` 存在即校验 16 → 17；
+    // 2026-10-26：逐点变异实测发现**表里一直漏着 pageId 的两条**，注释的 17 也是错的，
+    // 17 → 19），每行附**期望命中的分支特征**：少了它，夹具一旦漂移到别的分支，
     // 这一行会拿另一条消息的"无 `**`"结果假通过。
+    // ⚠️ 怎么数出来的：把每个 `throw new Error(` 的参数包一层 `'**' + (…)`，
+    // 跑本文件，看有没有用例红 —— 19 个点逐一验过（此前 2 个绿，即 pageId 那两条）。
+    // **这张表是本规则在全仓的唯一覆盖**：`loadSpecs` 的抛错发生在模块加载期、
+    // 不经 `usageFail`，所以 `tests/plaintext-channels.test.ts` 的静态扫描**扫不到它**
+    // （那里只扫 `throw new Error` 的**字面量**里有没有星号，这里恰好没有；
+    // 但"文案漂移到别的分支"只能靠本表逐条钉）。
     const without = (k: string) => {
       const o: Record<string, unknown> = { ...base }
       delete o[k]
@@ -643,6 +650,13 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
       ['顶层不是数组', {}, /顶层必须是数组/],
       ['id 缺失或为空', [{ ...base, id: '' }], /缺少 id/],
       ['id 重复', [base, { ...base }], /重复 id/],
+      // ⚠️ 2026-10-26 补两条（逐点变异实测）：本文件上面 401/414 行那两条断言用的是
+      // `toThrow(/pageId 非法/)` —— **子串匹配**，给消息前缀注入 `**` 照样命中，
+      // 于是这两个抛错点的「纯文本」规则无人守。只要 Markdown 规则就必须进本表。
+      // ⚠️ `pageId` 是**可选键**：`without('pageId')` 走的是"没给"的合法路径，
+      // 必须显式给一个非法值才到得了这两条分支。
+      ['pageId 非法', [{ ...base, pageId: 'bad-page' }], /pageId 非法/],
+      ['pageId 重复', [{ ...base, id: 'a', pageId: 'api-1' }, { ...base, id: 'b', pageId: 'api-1' }], /重复 pageId/],
       ['缺 dangerous', [without('dangerous')], /dangerous/],
       ['缺 callable', [without('callable')], /callable/],
       ['可调用却没有 path', [{ ...base, path: null }], /缺少 path/],
