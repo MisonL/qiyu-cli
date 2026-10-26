@@ -84,11 +84,20 @@ export interface InstalledManifestInfo {
  * 返回 `null` 的情形与 `readManifestStrict` 一致（缺失/损坏/字段不全），另外
  * **读不动**（EACCES 等）也归 `null` —— 本函数是排查命令的辅助，不该因为权限问题
  * 让整条 `skill where` 失败；调用方据此报 `null`（= 无法判定），不编造。
+ *
+ * 契约号还要求是**非负整数**（2026-10-26 审查）：`readManifestStrict` 只做类型检查
+ * （`typeof === 'number'`），`1.5` / `-3` 都能溜进来。那些值不可能是任何一版安装器
+ * 写出的契约号 —— 是一份**损坏**的清单，正确结论是「判定不了」（null），而不是拿它
+ * 去比出一个 `compatible:false`：后者会让 Agent 以为「正文版本旧了，重装即可」，
+ * 而真实状态是「清单坏了，重装前先确认没别的问题」。0 放行：合法判定归调用方，
+ * 本函数只管「这是不是一个像样的契约号」。
  */
 export function readInstalledManifestInfo(entityDir: string): InstalledManifestInfo | null {
   try {
     const m = readManifestStrict(entityDir)
-    return m === null ? null : { version: m.version, skillContractVersion: m.skill_contract_version }
+    if (m === null) return null
+    if (!Number.isInteger(m.skill_contract_version) || m.skill_contract_version < 0) return null
+    return { version: m.version, skillContractVersion: m.skill_contract_version }
   } catch {
     return null
   }

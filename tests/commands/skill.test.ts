@@ -490,6 +490,10 @@ describe('skill where', () => {
     expect(await skillCommand(['where', '--dir', entity])).toBe(0)
     expect(data().entity).toMatchObject({
       path: entity, source: '--dir', exists: false, state: 'missing',
+      // 键必须**在**，值为 null（2026-10-26 审查）：SKILL.md 把 null 定义为「判定
+      // 不了」，`undefined`（键缺失）是「这个字段不存在」——两种沉默对 Agent 含义不同。
+      // 变异：改回 `if (entityUsable) { … }` 里赋值 → 键消失、本断言红。
+      installed: null,
     })
     // 规格 D2 / 验收 1：「对每个 agent 报出 ok/dangling/foreign/missing 之一」。
     // 一个 agent 目录都没有时也必须逐个报 missing，而不是交一张空表——
@@ -545,7 +549,27 @@ describe('skill where', () => {
     })
     const w = metaWarnings()
     expect(w, '不配套必须说出来，且点名两个号').toContain(`契约版本为 ${SKILL_CONTRACT_VERSION + 1}`)
-    expect(w).toContain('`qiyu skill install`')
+    // ⚠️ 必须是 `--force`（2026-10-26 实测）：正文一改，实体哈希就与包内不同，
+    // `planInstall` 不带 --force 一律 skipped + 零写入 —— 推裸 `qiyu skill install`
+    // 会让用户跑完发现号没变、警告照旧，是条死路。变异：去掉 `--force` → 本断言红。
+    expect(w).toContain('`qiyu skill install --force`')
+  })
+
+  it('清单的契约号不是非负整数（1.5 / -3）→ installed:null，不拿坏值比不兼容', async () => {
+    // 审查（Sourcery，2026-10-26）：readManifestStrict 只查 typeof === 'number'，
+    // 小数/负数能溜进来，然后被当成一个「真实存在但不相等的契约号」报 compatible:false
+    // —— 那是编造：没有任何一版安装器写出过这种号，正确结论是「判定不了」。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const p = join(entity, '.qiyu-skill.json')
+    for (const bad of [1.5, -3]) {
+      const m = JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>
+      m.skill_contract_version = bad
+      writeFileSync(p, JSON.stringify(m, null, 2))
+      out = ''; err = ''
+      expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+      expect(data().entity, `契约号 ${bad} 必须判成清单损坏`).toMatchObject({ installed: null })
+      expect(metaWarnings()).not.toContain('不配套')
+    }
   })
 
   it('清单损坏 → installed:null（判定不了），不编造号也不报不配套', async () => {
@@ -1085,7 +1109,10 @@ describe('D3.4：`skill where` 的 not_a_directory 分支', () => {
     // 变异「state 恒为 'ok'」或「catch 掉 isDirectory 判定」→ 本用例红。
     writeFileSync(entity, '不是目录\n')
     expect(await skillCommand(['where', '--dir', entity])).toBe(0)
-    expect(data().entity).toMatchObject({ path: entity, exists: true, state: 'not_a_directory' })
+    // `installed` 同样必须出现（null = 判定不了）；实体不是目录时清单当然读不到。
+    expect(data().entity).toMatchObject({
+      path: entity, exists: true, state: 'not_a_directory', installed: null,
+    })
     // 实体不是目录时仍逐 agent 报告（链接状态照常），且不是错误信封。
     expect(envelope().ok).toBe(true)
     expect((data().links as unknown[]).length).toBe(2)

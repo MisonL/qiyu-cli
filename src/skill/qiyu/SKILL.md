@@ -37,7 +37,7 @@ qiyu sync status
 
 - **`meta.warnings` 里的 skill 提示**：任何一条成功输出都可能带一句「skill 未安装」或
   「skill 已过期」。它只提示、不改退出码、不改 `data`，也**没有自动改过任何文件**。
-  含义是本机装的正文与这份 CLI 不配套；更新方式是 `qiyu skill install`——它会写到本机
+  含义是本机装的正文与这份 CLI 不配套；更新方式是 `qiyu skill install --force`——它会写到本机
   的 skill 实体目录与各 Agent 的 skills 目录。**只在人类允许写 home 时执行**，不要自作主张
   改动用户目录；不允许时把这条提示原样转述给人类。
 - **`qiyu --version`**：输出包版本（`data.version`）与 `data.skill_contract_version`
@@ -46,8 +46,8 @@ qiyu sync status
   版本元数据：`data.entity.installed.skill_contract_version`（装的那份的契约号）、
   `data.cli_contract_version`（本 CLI 的）与 `data.entity.installed.compatible`
   （两者是否相等）。**判断「手上的正文能否配这份 CLI」就看这一个字段**，不要拿包版本号
-  去比 —— 包版本不同但契约号相同，正文仍然能用。`installed` 为 `null` = 清单缺失/损坏，
-  判定不了，不要当成「兼容」。
+  去比 —— 包版本不同但契约号相同，正文仍然能用。`installed` 为 `null` = 实体不可用，
+  或清单缺失/损坏，判定不了，不要当成「兼容」。
 - **`qiyu skill check`**：正文自身的防漂移校验（命令、表名、错误 `kind`、位置参数取值是否
   仍存在于当前 CLI）。默认校验包内那份；`--installed` 校验已安装的那份，`--compare` 比对
   两份并报告差异。有违规时退出码 1。
