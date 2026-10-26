@@ -796,7 +796,7 @@ export function assertGetHasNoBody(spec: EndpointSpec, body: unknown): void {
   if (spec.method === 'GET' && body !== undefined) {
     throw new Error(
       `接口 ${spec.id} 是 GET 接口，不接受请求体 —— 去掉 --body。` +
-        '⚠️ 本 CLI **目前没有 GET 的 query 参数通道**（还没有可主动调用的 GET 接口），' +
+        '⚠️ 本 CLI 目前没有 GET 的 query 参数通道（还没有可主动调用的 GET 接口），' +
         '所以现在无法给它带任何参数；这道守卫是为了将来出现可调用 GET 时不静默丢弃 body',
     )
   }
