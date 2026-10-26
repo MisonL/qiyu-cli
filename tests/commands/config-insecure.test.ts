@@ -67,7 +67,13 @@ afterEach(() => {
 
 const errorOf = (): Record<string, unknown> => JSON.parse(out).error
 
-describe('含凭证且权限过宽（0644）→ 六条命令同一种行为', () => {
+// ⚠️ Windows 上 `checkPermissions` 直接返回 `{ok: true}`（POSIX 权限位在 Windows 上没有
+// 对应语义，`chmodSync` 也不生效）——这两组用例在 Windows 上必然全红，而它们测的是
+// POSIX 权限裁决本身。仓库既有约定：`tests/skill/detect.test.ts` 等 13 处用
+// `process.platform === 'win32'` 跳过同类用例。
+const posixOnly = describe.skipIf(process.platform === 'win32')
+
+posixOnly('含凭证且权限过宽（0644）→ 六条命令同一种行为', () => {
   // 每条命令给一个**最小可跑**的 argv：它必须真的走到配置解析那一步。
   // 带不带 `--db` 都走到同一处（resolveStoreConfig 无条件查权限），两种都收一条。
   const cases: Array<[string, () => Promise<number>]> = [
@@ -125,7 +131,7 @@ describe('含凭证且权限过宽（0644）→ 六条命令同一种行为', ()
   })
 })
 
-describe('父目录可写且含凭证 → 同样如实透出（hint 点名 chmod 700）', () => {
+posixOnly('父目录可写且含凭证 → 同样如实透出（hint 点名 chmod 700）', () => {
   it('db tables：config_insecure + 目录 chmod', async () => {
     // ⚠️ 文件必须 0600 —— 否则命中的是**文件**那一条（`checkPermissions` 先查文件位），
     // hint 会是 chmod 600，本用例就测不到目录分支了。
@@ -136,5 +142,54 @@ describe('父目录可写且含凭证 → 同样如实透出（hint 点名 chmod
     const e = errorOf()
     expect(e.kind).toBe('config_insecure')
     expect(String(e.hint)).toMatch(/chmod 700 /)
+  })
+})
+
+posixOnly('hint 里的路径必须可直接粘贴执行（含空格的 HOME）', () => {
+  // ⚠️ 实测来源（CodeRabbit 2026-10-26）：配置路径来自 HOME，而 HOME 可以含空格
+  //（如 `/Users/John Doe`）。不引号时 `chmod 600 /Users/John Doe/...` 会被 shell
+  // 拆成多个参数 —— 用户照着 hint 抄反而得到 `chmod: 无法访问 'Doe/...'`，
+  // 而这条 hint 的全部价值就是"照着执行就能修好"。
+  it('HOME 含空格 → hint 里的路径被双引号包住', async () => {
+    // 换一个带空格的 home 目录：beforeEach 的 home 是 mkdtemp 产物（无空格）。
+    const spaced = join(home, 'with space')
+    mkdirSync(join(spaced, '.config', 'qiyu'), { recursive: true })
+    const p = join(spaced, '.config', 'qiyu', 'config.json')
+    writeFileSync(p, JSON.stringify({
+      profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } },
+    }, null, 2))
+    chmodSync(p, 0o644)
+    vi.stubEnv('HOME', spaced)
+    __resetPermissionWarnings()
+    expect(await storeCommand(['status'])).toBe(1)
+    const hint = String(errorOf().hint)
+    expect(hint).toContain(`chmod 600 "${p}"`)
+    // 反证：不引号的话这条 hint 在 shell 里是坏的 —— 断言"路径整体在一个引号内"
+    expect(hint).not.toMatch(/chmod 600 \/.* with space\//)
+  })
+
+  it('不含空格的路径不加引号（不让每条 hint 都变吵）', async () => {
+    writeWideConfig()
+    expect(await storeCommand(['status'])).toBe(1)
+    const hint = String(errorOf().hint)
+    expect(hint).toMatch(/chmod 600 \/[^"]*config\.json$/)
+  })
+
+  it('auth login 写后自检的 hint 同样引号（与 core 的构造点同源）', async () => {
+    // ⚠️ `auth login` 是唯一不走 `insecureConfigError` 的权限 hint（消息不同：
+    // 凭证已经写进去了）。两处引号规则必须一致 —— 否则同一个 chmod 在一处可执行、
+    // 在另一处不可执行。
+    const spaced = join(home, 'with space')
+    const dir = join(spaced, '.config', 'qiyu')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({
+      profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } },
+    }, null, 2))
+    chmodSync(join(dir, 'config.json'), 0o600)
+    chmodSync(dir, 0o777)   // 目录过宽 → 写后自检拒绝
+    vi.stubEnv('HOME', spaced)
+    expect(await authCommand(['login'])).toBe(1)
+    const hint = String(errorOf().hint)
+    expect(hint).toContain(`chmod 700 "${dir}"`)
   })
 })

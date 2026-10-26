@@ -34,6 +34,13 @@
   出口缺失的终端控制字符净化（调用方从 `usageFail` 换过来时，那层净化会静默消失）。
   新增 `tests/commands/config-insecure.test.ts`：九条调用绑在**同一张表**上逐条断言
   退出码/kind/retryable/hint —— 分文件写就复现不了"同一判据在不同命令上分叉"这个形态。
+  该文件在 Windows 上跳过（`checkPermissions` 在 win32 直接返回 ok，POSIX 权限位没有
+  对应语义；沿仓库既有的 `process.platform === 'win32'` 跳过约定）。
+- `config_insecure` 的 hint 里路径**加 shell 引号**：配置路径来自 `HOME`，而 `HOME`
+  可以含空格（`/Users/John Doe`）。不引号时 hint 里的 `chmod 600 /Users/John Doe/...`
+  会被 shell 拆成多个参数，用户照着抄得到 `chmod: 无法访问 'Doe/...'` —— 这条 hint 的
+  全部价值就是"照着执行就能修好"。`core/config.ts` 与 `auth login` 的写后自检两处同源
+  （`shellPath`），不含空格的路径不加引号。
 - README 的权限规则段补上**例外与边界**：不读配置的命令（`--version`、`api list`、
   `skill where`、`sync tasks`）不受影响；`auth login` 是唯一例外，它把已有文件重写为
   `0600` 而非拒绝（马上要写入新 secret，拒绝没有意义），写完自检不合格才报。

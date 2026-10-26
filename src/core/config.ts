@@ -124,6 +124,22 @@ export function loadConfigFile(configPath: string): { file: QiyuConfigFile; exis
 }
 
 /**
+ * 把路径渲染成**可直接粘贴进 shell** 的形态（含空白或 shell 特殊字符时加双引号）。
+ *
+ * ⚠️ 为什么 hint 里要引号（CodeRabbit 2026-10-26）：配置路径来自 `HOME`，而 `HOME`
+ * 可以含空格（如 `/Users/John Doe`）。不引号时 hint 里的 `chmod 600 /Users/John Doe/...`
+ * 会被 shell 拆成多个参数 —— 用户照着抄反而得到一条 `chmod: 无法访问 'Doe/...'`，
+ * 而这条 hint 的全部价值就是"照着执行就能修好"。
+ *
+ * ⚠️ 导出给 `commands/auth.ts` 的写后自检用：那是**唯一**不走 `insecureConfigError`
+ * 的权限 hint（消息不同：凭证已经写进去了），引号规则必须同源，否则同一个 chmod
+ * 在一处可执行、在另一处不可执行。
+ */
+export function shellPath(p: string): string {
+  return /[\s"'`$\\]/.test(p) ? `"${p.replace(/[\\"`$]/g, '\\$&')}"` : p
+}
+
+/**
  * 权限拒绝的**唯一构造点**（两个配置解析入口共用同一句话）。
  *
  * ⚠️ 为什么必须共用（2026-10-26 实测）：此前 `loadConfigChecked`（auth/api 走）抛带
@@ -139,7 +155,7 @@ export function insecureConfigError(configPath: string, reason: 'file' | 'dir'):
   const what = reason === 'file'
     ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 可访问，其他用户可读到 appSecret）`
     : `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
-  const fix = reason === 'file' ? `chmod 600 ${configPath}` : `chmod 700 ${dir}`
+  const fix = reason === 'file' ? `chmod 600 ${shellPath(configPath)}` : `chmod 700 ${shellPath(dir)}`
   return Object.assign(
     new Error(`${what}，已拒绝读取`),
     {
