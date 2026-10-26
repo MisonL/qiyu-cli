@@ -652,9 +652,17 @@ describe('api list', () => {
     // （⑳ 的教训是另一条：同一条规则的三份实现要按**常量清单**点名。）
     //
     // ⚠️ 逐行按**写 stderr 的调用点清单**点名（⑳ 的教训），不按"我记得有哪几个"：
-    // 全仓 **30 处** `usageFail(...)` **调用点**（api **16** + auth **9** + cli **5**；
+    // 全仓 **38 处** `usageFail(...)` **调用点**（api **18** + auth **14** + cli **6**；
     // 定义在 output.ts，不计）+ `callOne` catch 里 1 处手工 `process.stderr.write`
     // （byId / assertCallable 两个来源共用它）。
+    // ⚠️ **2026-10-26 实测更正**：此前写「30 处（api 16 + auth 9 + cli 5）」—— **过期**，
+    // 而更严重的是**下面这张表当时只覆盖其中 32 个**。用逐点变异实测（把每个调用点的
+    // message 换成 `'**MUT**'` 再跑，看有没有用例红）找出漏网的 6 个：
+    // `api schema` 的四条（未知 flag / help 带位置参数 / 位置参数 > 1 / 缺 id）、
+    // `auth login` 的四条参数分支 + 空 profile 那条、`cli --version` 的额外参数守卫。
+    // 其中 `auth login` 读配置失败那条（`无法读取现有配置文件`）**被**用例走到了，
+    // 但那条用例只断言 message、没断言 stderr 无星号 —— 已在 auth.test.ts 补上。
+    // 现在 38/38 逐点变异全部转红（判据：只注入 `'**'`、不改内容，避免"改坏了别的东西"）。
     // ⚠️ 数调用点要用**代码判据**（匹配点前无同行 `//`），不是 `grep -c`：
     // 本注释自己就多次写到 `usageFail(...)` 这个词，`grep -c` 会把注释一起数进去。
     // ⚠️ **2026-10-07 更正**：此前写「18 处（api 12 + auth 4 + cli 2）」—— **过期**。
@@ -715,6 +723,24 @@ describe('api list', () => {
       // 同样无 `**`）—— 与上面「分支锚」要挡的是同一类漏网。
       // G1 起 --pretty 合法，call --pretty 从拒绝清单移除
       // G1 起 --pretty 合法，whoami --pretty 从拒绝清单移除
+      // ⚠️ **2026-10-26 补 4 行**（逐点变异实测发现，见下方「逐点变异」段）：
+      // 把**每一个** `usageFail(...)` 的 message 换成 `'**MUT**'` 再跑本文件，
+      // 下面这 4 个调用点**从未被任何用例走到** —— 哨兵表声称"按调用点清单逐个点名"，
+      // 实际漏了它们，等于这 4 条文案改动时没有任何东西会红。
+      ['schema --help 不吞额外参数', ['schema', '--help', 'x'], apiCommand, /--help 不接受额外参数/],
+      ['schema 位置参数 > 1', ['schema', 'a.b', 'c.d'], apiCommand, /api schema 只接受一个接口 id/],
+      ['schema 缺接口 id', ['schema'], apiCommand, /用法：qiyu api schema/],
+      // `--profile ''` 不是"缺值"（空串不以 `--` 开头，值位那关放行）—— 它落到
+      // `normalizeProfile` 的空串分支，与 `--profile` 后面缺取值是**两条**分支。
+      ['login --profile 空串（与「缺取值」是两条分支）', ['login', '--profile', ''], authCommand, /--profile 不能为空/],
+      // ⚠️ 同一轮变异又发现 5 个（只注入 `**`、不改内容，全量测试仍全绿）：
+      // `auth login` 的四条参数分支 + `api schema` 的未知 flag 分支。
+      // 这几条此前只在 auth.test.ts 里断言过**退出码**，没人断言它们的 stderr 无星号。
+      ['login 未知 flag', ['login', '--bod'], authCommand, /未知参数：--bod。auth login 只接受 --profile/],
+      ['login --profile 重复', ['login', '--profile', 'a', '--profile', 'b'], authCommand, /--profile 只能出现一次/],
+      ['login --profile 缺取值', ['login', '--profile'], authCommand, /--profile 后面缺少取值/],
+      ['login 位置参数', ['login', 'extra'], authCommand, /未知参数：extra。auth login 不接受位置参数/],
+      ['schema 未知 flag', ['schema', '--bod'], apiCommand, /未知参数：--bod。可用：--pretty/],
       // ⚠️ G1 起 `auth login` **已实现**（旧锚 `/auth login 尚未实现/` 已翻转）：
       // 这条现在走「缺环境变量」分支 —— 它仍在**同一个 usageFail 调用点**上，
       // 只是 message 换了。锚必须跟着换，否则这条退化成"任意 stderr"，
@@ -769,6 +795,8 @@ describe('api list', () => {
       // G1 起 --pretty 已实现：顶层裸调用给出「写在子命令之后」的指引（不再是未实现话术）
       [['--pretty'], /--pretty 是输出格式开关/],
       [['--pretty', '--bod'], /未知参数：--bod。--pretty 必须写在具体子命令之后/],
+      // ⚠️ 2026-10-26 补：`--version` 的额外参数守卫此前零覆盖（逐点变异实测）。
+      [['--version', '--bod'], /--version 不接受额外参数/],
     ]
     for (const [argv, anchor] of TOP_CASES) {
       out = ''; err = ''
