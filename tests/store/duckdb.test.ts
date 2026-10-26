@@ -403,7 +403,9 @@ describe('duckdb —— init 与关闭', () => {
             kind: 'store_locked',
             retryable: true,
             // hint 逐字（P 组 P-M2 改：前半句复述 message 已删，给第二动作）
-            hint: '请稍后重试；等待上限可经配置文件 readOnlyRetryMs（默认 30000 毫秒）调整，或用 --db 指向其他数据库文件',
+            // 2026-10-26 改：键路径补全为 `profiles.<name>.store.readOnlyRetryMs` —— 裸键名
+            // 按字面写进顶层/profile 级都会撞「配置文件未知键」，照 hint 做反而更糟。
+            hint: '请稍后重试；等待上限可经配置文件 profiles.<name>.store.readOnlyRetryMs（默认 30000 毫秒）调整，或用 --db 指向其他数据库文件',
             message: expect.stringMatching(/被写进程占用/),
           })
           expect(t).toBeGreaterThan(0)   // 读者确实走了退避（与写者「不退避」分形）

@@ -172,7 +172,10 @@ function lockedError(cfg: StoreConfig): SandboxError {
     `数据库被写进程占用（等待 ${cfg.readOnlyRetryMs}ms 后超时）：${cfg.path}`,
     {
       retryable: true,
-      hint: '请稍后重试；等待上限可经配置文件 readOnlyRetryMs（默认 30000 毫秒）调整，或用 --db 指向其他数据库文件',
+      // ⚠️ 必须给**完整路径**（2026-10-26 实测）：此前只写裸键名（不带 profiles/store
+      // 前缀），而配置里它只能放在 `profiles.<name>.store.` 之下 —— 用户按字面写进
+      // 顶层或 profile 级都会被「配置文件未知键」拒绝（退出码 2），照 hint 做反而更糟。
+      hint: '请稍后重试；等待上限可经配置文件 profiles.<name>.store.readOnlyRetryMs（默认 30000 毫秒）调整，或用 --db 指向其他数据库文件',
     },
   )
 }

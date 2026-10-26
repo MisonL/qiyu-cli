@@ -106,6 +106,33 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 此时 `auth whoami` 的 `source` 报 `mixed`。
 
 存储配置仍是**手工编辑** `~/.config/qiyu/config.json`；也可用 `--db`/`QIYU_DB_PATH` 直接指定库路径。
+
+配置文件的完整结构（**键名写错会被拒绝，退出码 2**；未知键一律 fail-closed）：
+
+```json
+{
+  "defaultProfile": "default",
+  "profiles": {
+    "default": {
+      "store": {
+        "path": "~/.qiyu/duckdb/qiyu.duckdb",
+        "backend": "duckdb",
+        "readOnlyRetryMs": 30000,
+        "batchSize": 1000,
+        "options": { "knowledgeRobotIds": [1000001] }
+      },
+      "credentials": { "appKey": "…", "appSecret": "…" },
+      "robots": { "1000001": "机器人A" }
+    }
+  }
+}
+```
+
+- 顶层只认 `defaultProfile` 与 `profiles`；profile 内只认 `store`/`credentials`/`robots`；
+  `store` 内只认上面那五个键。**没有 `store` 这一层之外的简写** —— 例如
+  `knowledgeRobotIds` 必须在 `profiles.<name>.store.options` 里，放到 `profiles.<name>` 下会被拒绝。
+- `credentials` 与 `robots` 由 `qiyu auth login` 维护（也可手写）；`store` 块目前只能手写。
+
 **权限规则**：配置文件**含凭证**且 group/other 可读（如 `0644`）时，所有命令都会**拒绝读取**
 （`kind: config_insecure`，退出码 1，hint 点名要执行的 `chmod`）——因为落盘的 appSecret 对同机
 其他用户可读。不含凭证的文件维持「只在 stderr 警告、不阻断」。父目录 group/other **可写**
@@ -116,8 +143,8 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 > `configured: true`。第一次真实调用才是唯一的验证。
 >
 > `whoami` 输出的 `robots` 来自配置里的 `profiles.<name>.robots`（`{"1000001":"机器人A"}` 形态），
-> 同样**未校验有效性**。它是 `sync run` 的兜底来源：`store.options.knowledgeRobotIds` 缺席时，
-> 知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。
+> 同样**未校验有效性**。它是 `sync run` 的兜底来源：`profiles.<name>.store.options.knowledgeRobotIds`
+> 缺席时，知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。
 
 ## 使用
 

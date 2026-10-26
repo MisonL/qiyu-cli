@@ -90,7 +90,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         const err = new Error(`数据库被写进程占用（等待 ${cfg.readOnlyRetryMs}ms 后超时）：${cfg.path}`)
         ;(err as { kind?: string }).kind = 'store_locked'
         ;(err as { retryable?: boolean }).retryable = true
-        ;(err as { hint?: string }).hint = '请稍后重试；等待上限可经配置文件 readOnlyRetryMs（默认 30000 毫秒）调整，或用 --db 指向其他数据库文件'
+        ;(err as { hint?: string }).hint = '请稍后重试；等待上限可经配置文件 profiles.<name>.store.readOnlyRetryMs（默认 30000 毫秒）调整，或用 --db 指向其他数据库文件'
         throw err
       }
       throw e
