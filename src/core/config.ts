@@ -124,6 +124,48 @@ export function loadConfigFile(configPath: string): { file: QiyuConfigFile; exis
 }
 
 /**
+ * 把路径渲染成**可直接粘贴进 shell** 的形态（含空白或 shell 特殊字符时加双引号）。
+ *
+ * ⚠️ 为什么 hint 里要引号（CodeRabbit 2026-10-26）：配置路径来自 `HOME`，而 `HOME`
+ * 可以含空格（如 `/Users/John Doe`）。不引号时 hint 里的 `chmod 600 /Users/John Doe/...`
+ * 会被 shell 拆成多个参数 —— 用户照着抄反而得到一条 `chmod: 无法访问 'Doe/...'`，
+ * 而这条 hint 的全部价值就是"照着执行就能修好"。
+ *
+ * ⚠️ 导出给 `commands/auth.ts` 的写后自检用：那是**唯一**不走 `insecureConfigError`
+ * 的权限 hint（消息不同：凭证已经写进去了），引号规则必须同源，否则同一个 chmod
+ * 在一处可执行、在另一处不可执行。
+ */
+export function shellPath(p: string): string {
+  return /[\s"'`$\\]/.test(p) ? `"${p.replace(/[\\"`$]/g, '\\$&')}"` : p
+}
+
+/**
+ * 权限拒绝的**唯一构造点**（两个配置解析入口共用同一句话）。
+ *
+ * ⚠️ 为什么必须共用（2026-10-26 实测）：此前 `loadConfigChecked`（auth/api 走）抛带
+ * `kind: config_insecure` 的错误，而 `store/config.ts`（store/db/query/stats/sync 走）
+ * 抛**无 kind** 的普通 Error，各命令 catch 又一律 `usageFail(...)` —— 同一个危险状态
+ * 因此有两种行为：`auth whoami` 是退出码 1 + `kind: config_insecure` + `chmod` hint；
+ * 其余六条命令是退出码 2 + `kind: usage`（语义是"改参数重来"）且 hint 丢失。
+ * Agent 会照退出码去改参数，而这件事只能由人去 chmod —— 设计稿 §3.4 与 README
+ * 写的都是前者，所以 store 那条路径是缺陷，不是另一种口径。
+ */
+export function insecureConfigError(configPath: string, reason: 'file' | 'dir'): Error {
+  const dir = dirname(configPath)
+  const what = reason === 'file'
+    ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 可访问，其他用户可读到 appSecret）`
+    : `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
+  const fix = reason === 'file' ? `chmod 600 ${shellPath(configPath)}` : `chmod 700 ${shellPath(dir)}`
+  return Object.assign(
+    new Error(`${what}，已拒绝读取`),
+    {
+      code: 'config_insecure', kind: 'config_insecure', retryable: false,
+      hint: `这是配置文件的权限问题，重试无用 —— 请执行：${fix}`,
+    },
+  )
+}
+
+/**
  * 读 + 解析 + **权限裁决**（含凭证且过宽 → 抛带 kind 的错误）。
  *
  * ⚠️ 这是所有「按配置取凭证」的入口（auth/api/sync/store）应走的函数 ——
@@ -141,18 +183,7 @@ export function loadConfigChecked(configPath: string): { file: QiyuConfigFile; e
     hasCredentials: configHasCredentials(loaded.file),
     onWarn: (m) => process.stderr.write(`${m}\n`),
   })
-  if (!perm.ok) {
-    const dir = dirname(configPath)
-    const what = perm.reason === 'file' ? `配置文件 ${configPath}` : `配置目录 ${dir}`
-    const fix = perm.reason === 'file' ? `chmod 600 ${configPath}` : `chmod 700 ${dir}`
-    throw Object.assign(
-      new Error(`${what} 含凭证但权限过宽（group/other 可访问，其他用户可读到 appSecret），已拒绝读取`),
-      {
-        code: 'config_insecure', kind: 'config_insecure', retryable: false,
-        hint: `这是配置文件的权限问题，重试无用 —— 请执行：${fix}`,
-      },
-    )
-  }
+  if (!perm.ok) throw insecureConfigError(configPath, perm.reason)
   return loaded
 }
 

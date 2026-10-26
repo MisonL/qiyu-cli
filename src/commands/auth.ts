@@ -1,8 +1,9 @@
 // src/commands/auth.ts
+import { dirname } from 'node:path'
 import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty, EXIT } from '../output.js'
 import {
-  configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions,
+  configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions, shellPath,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS } from './spec-types.js'
@@ -273,7 +274,9 @@ async function login(argv: string[]): Promise<number> {
       return fail({
         code: 'config_insecure', kind: 'config_insecure', retryable: false,
         message: `凭证已写入 ${configPath}，但落盘权限不合格（${perm.reason === 'file' ? '文件' : '目录'}过宽）`,
-        hint: `请执行 chmod ${perm.reason === 'file' ? '600 ' + configPath : '700 ' + configPath.split('/').slice(0, -1).join('/')}`,
+        // ⚠️ 路径必须走 shellPath 引号（CodeRabbit 2026-10-26）：HOME 可含空格，
+        // 不引号的 chmod 在那种 HOME 下照着抄是坏的。与 core 的 insecureConfigError 同源。
+        hint: `请执行 chmod ${perm.reason === 'file' ? `600 ${shellPath(configPath)}` : `700 ${shellPath(dirname(configPath))}`}`,
       })
     }
   } catch { /* 自检失败不影响"已写入"这一事实；下一次任何命令都会再查一次 */ }

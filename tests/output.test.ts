@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { ok, fail, usageFail, describeArgs, sanitizeControlChars, setSkillWarning, setPretty } from '../src/output.js'
+import { ok, fail, usageFail, failFromTagged, describeArgs, sanitizeControlChars, setSkillWarning, setPretty } from '../src/output.js'
 
 let out: string
 // ⚠️ 用法错误现在**双通道**（stderr 给人、stdout 给 Agent），所以 err 也要捕获。
@@ -56,7 +56,8 @@ describe('成功输出', () => {
     // ⚠️ 实测 robot.transfer.config 返回空壳 {code:200}，它的 payload 是 undefined。
     // 若 ok() 直接写 { ok:true, data }，JSON.stringify 会丢掉值为 undefined 的键，
     // 产出 {"ok":true} —— Agent 无法区分"这个接口没有载荷"与"解析出错"。
-    // 设计稿 §9.1 的成功形态是 {ok, data, meta}，三个键都在。
+    // 设计稿 §9.1 的成功形态是 {ok, data, meta}；`data` 恒在，`meta` 是条件键
+    // （见上一条「未提供 meta 时不输出该键」）。
     ok(undefined, { endpoint: 'robot.transfer.config' })
     const parsed = JSON.parse(out)
     expect(parsed).toHaveProperty('data')
@@ -483,5 +484,54 @@ describe('--pretty 的边界：只修饰成功输出，用法错误永远紧凑'
     setPretty(true)
     fail({ code: 'auth_missing', kind: 'auth_missing', retryable: false, message: 'm' })
     expect(out).toContain('\n  ')
+  })
+})
+
+describe('failFromTagged —— 带 kind 的错误如实透传，且同样在出口净化', () => {
+  // ⚠️ 这条出口是 G1 加的（原设计是各命令 catch 一律 usageFail）。它的两个分支各有一种
+  // 退化方式，都必须钉住：
+  //   · 带 kind 的错误被包成 usageFail → Agent 照退出码 2 去改参数，而真相只能由人 chmod；
+  //   · 无 kind 的错误走 fail()（退出码 1）→ "改参数重来"的信号丢失。
+  it('带 kind → 原样透传 kind/code/retryable/hint，退出码按 kind 分派', () => {
+    const code = failFromTagged(Object.assign(new Error('配置含凭证但权限过宽'), {
+      code: 'config_insecure', kind: 'config_insecure', retryable: false,
+      hint: '请执行：chmod 600 /tmp/x',
+    }))
+    expect(code).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e).toMatchObject({
+      code: 'config_insecure', kind: 'config_insecure', retryable: false,
+      message: '配置含凭证但权限过宽', hint: '请执行：chmod 600 /tmp/x',
+    })
+    // 带 kind 的不是用法错误：stderr 不该有 usageFail 那份副本（它是给人读用法提示的）。
+    expect(err).toBe('')
+  })
+
+  it('无 kind → 降级成用法错误（双通道、退出码 2）', () => {
+    expect(failFromTagged(new Error('未知键：profiles.default.store.foo'))).toBe(2)
+    expect(err).toContain('未知键')
+    expect(JSON.parse(out).error).toMatchObject({ code: 'usage', kind: 'usage' })
+  })
+
+  it('带 kind 的 message/hint 同样在出口净化终端控制字符（与 usageFail 同一约定）', () => {
+    // 实测来源：这条分支最初直接透传 message —— 调用方从 usageFail 改成 failFromTagged 后，
+    // usageFail 里那层净化就静默消失了（同一个出口两种行为）。
+    failFromTagged(Object.assign(new Error('路径 \u001b[31m红色\u001b[0m 不可读'), {
+      code: 'config_insecure', kind: 'config_insecure', retryable: false,
+      hint: '执行 \u0007chmod',
+    }))
+    const e = JSON.parse(out).error
+    expect(e.message).not.toContain('\u001b')
+    expect(e.message).toContain('·')
+    expect(e.hint).not.toContain('\u0007')
+  })
+
+  it('换行结构保留（多行 hint 的可读性不被净化毁掉）', () => {
+    failFromTagged(Object.assign(new Error('第一行\n第二行'), {
+      code: 'store_locked', kind: 'store_locked', retryable: true,
+    }))
+    const e = JSON.parse(out).error
+    expect(e.message).toBe('第一行\n第二行')
+    expect(e.retryable).toBe(true)
   })
 })

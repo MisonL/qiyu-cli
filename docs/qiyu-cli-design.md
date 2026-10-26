@@ -153,6 +153,16 @@ qiyu auth whoami               # 校验凭证并显示当前 profile（+ source 
 凭证两个来源都生效，优先级不变。**权限规则分两级**：含凭证的文件 group/other 可读时
 **拒绝读取**（`kind: config_insecure`，退出码 1）；不含凭证时维持「警告不阻断」。
 
+> **⚠️ 拒绝必须是「七条命令一种行为」（2026-10-26 修）**：拒绝错误在 core 层**只构造一处**
+> （`insecureConfigError`），`loadConfigChecked` 与 `store/config.ts` 两个入口共用，
+> 各命令的 catch 一律走 `failFromTagged`（带 `kind` 就如实透出、含 `hint`）。
+> 此前 store 那条路径抛的是无 `kind` 的普通 Error，被 `usageFail` 降级成退出码 2 +
+> `kind: usage` 且 hint 丢失 —— 同一份配置在 `auth whoami` 与 `db tables` 上给出互相
+> 矛盾的指引（"去 chmod" vs "改参数重来"）。`errors.md` 对 `config_insecure` 的描述
+> （重试无用、按 hint 执行 chmod）在修复前只对 auth/api 成立。
+> **不读配置的命令**（`--version`、`api list`、`skill where`、`sync tasks`）不受影响；
+> `auth login` 是唯一例外（重写为 0600 而非拒绝，因为它马上要写入新的 secret）。
+
 凭证从哪里来：七鱼管理后台 → “系统” → “扩展与集成” → 开发者 ID（`appSecret` 首次必须点击“重置”生成）。
 
 **凭证绝不能出现在 stdout / 日志中。** 这是 CLI 层的输出过滤，而不是 skill 里的一句提醒。
@@ -1117,7 +1127,7 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 ### 9.1 输出
 
 ```jsonc
-// 成功
+// 成功（`meta` 是条件键：有元数据要报时才出现，没有就是 `{ok, data}` 两个键）
 {"ok": true, "data": {...}, "meta": {
   "rows": 42, "truncated": false, "limit_applied": 1000,
   "resolved_range": ["2026-09-23T00:00:00+08:00", "2026-09-29T23:59:59+08:00"],

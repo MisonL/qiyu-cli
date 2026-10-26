@@ -108,7 +108,10 @@ import { sanitizeMessage } from './core/sanitize.js'
 
 export function ok(data: unknown, meta?: unknown): number {
   // ⚠️ `data` 必须**始终存在**，即便值是 undefined 也写成 null。
-  // 设计稿 §9.1 的成功形态是 `{ok, data, meta}` —— 三个键都在。
+  // 设计稿 §9.1 的成功形态是 `{ok, data, meta}` —— 但只有 `ok`/`data` 恒在：
+  // `meta` 是**条件键**（有内容才出现，见下方两个分支与 `tests/output.test.ts`
+  // 「未提供 meta 时不输出该键」）。这条注释早前写的是「三个键都在」，与实现相反，
+  // 还经 README 传成了对 Agent 的承诺（2026-10-26 修正）。
   // 若直接 `{ ok: true, data }`，JS 的 JSON.stringify 会把值为 undefined 的键**整个丢掉**，
   // 于是 `ok(undefined)` 产出 `{"ok":true}`，Agent 无法区分
   // "这个接口没有载荷"（robot.transfer.config 实测就是这样）与"我解析错了"。
@@ -273,9 +276,13 @@ export function fail(error: ErrorInput): number {
 export function failFromTagged(e: unknown): number {
   const err = e as { code?: string; kind?: string; retryable?: boolean; message?: string; hint?: string }
   if (err.kind) {
+    // ⚠️ 净化必须在出口做（与 usageFail 同一约定）：带 kind 的错误也会拼进路径/服务端原文，
+    // 此前这条分支直接透传 —— 而调用方换成 failFromTagged 后，原本 usageFail 里的净化就
+    // 消失了。sanitizeMessage 保留换行结构，正常文案一字不变。
     return fail({
       code: err.code ?? 'unknown', kind: err.kind, retryable: err.retryable ?? false,
-      message: err.message ?? String(e), hint: err.hint,
+      message: sanitizeMessage(err.message ?? String(e)),
+      ...(err.hint !== undefined ? { hint: sanitizeMessage(err.hint) } : {}),
     })
   }
   return usageFail(sanitizeMessage(err.message ?? String(e)))

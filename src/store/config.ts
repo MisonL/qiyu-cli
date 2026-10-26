@@ -9,9 +9,9 @@
 // 是同一句话，不会出现两套口径。
 
 import { homedir } from 'node:os'
-import { dirname, join, isAbsolute } from 'node:path'
+import { join, isAbsolute } from 'node:path'
 import type { BackendName, StoreConfig } from './types.js'
-import { configPathFor, loadConfigFile, checkPermissions, configHasCredentials } from '../core/config.js'
+import { configPathFor, loadConfigFile, checkPermissions, configHasCredentials, insecureConfigError } from '../core/config.js'
 import type { ProfileBlock } from '../core/config.js'
 
 export interface StoreEnv { QIYU_DB_PATH?: string; QIYU_STORE_BACKEND?: string; QIYU_PROFILE?: string }
@@ -92,14 +92,12 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
       onWarn: (m) => process.stderr.write(`${m}\n`),
     })
     if (!perm.ok) {
-      // 拒绝路径抛普通 Error（无 kind）→ 调用方按用法错误处理。
-      // ⚠️ 文案必须点名**要执行的动作**，否则用户只知道自己错了。
-      const dir = dirname(configPath)
-      throw new Error(
-        perm.reason === 'file'
-          ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 可访问），已拒绝读取 —— 请执行 chmod 600 ${configPath}`
-          : `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证，已拒绝读取 —— 请执行 chmod 700 ${dir}`,
-      )
+      // ⚠️ 必须抛**带 kind** 的错误（2026-10-26 实测修）：这里此前抛普通 Error，而各命令
+      // catch 一律 `usageFail(...)` —— 于是「配置含凭证且权限过宽」在 store/db/query/stats/
+      // sync 上被降级成退出码 2 + `kind: usage`（"改参数重来"）且 hint 丢失，只有
+      // auth/api 那条路径如实给出退出码 1 + `kind: config_insecure`。同一个危险状态两种
+      // 行为，Agent 会去改参数而真正的动作是 chmod。统一由 core 的构造点产出。
+      throw insecureConfigError(configPath, perm.reason)
     }
   }
 

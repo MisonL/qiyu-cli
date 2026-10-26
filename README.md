@@ -137,11 +137,14 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 - `credentials` 由 `qiyu auth login` 写入（也可手写）；**`store` 与 `robots` 只能手写** ——
   `auth login` 会保留已有的 `robots` 映射，但不会创建或更新它。
 
-**权限规则**：配置文件**含凭证**且 group/other 可读（如 `0644`）时，所有命令都会**拒绝读取**
-（`kind: config_insecure`，退出码 1，hint 点名要执行的 `chmod`）——因为落盘的 appSecret 对同机
-其他用户可读。不含凭证的文件维持「只在 stderr 警告、不阻断」。父目录 group/other **可写**
-（文件可被整体替换）时同样拒绝。`auth login` 自己会把权限收紧为 `0600`，所以这条只会出现在
-用户手工放宽之后。Windows 上跳过这些检查。数据库正常关闭后 `.wal` 临时文件会自动消失，请勿手工删除。
+**权限规则**：配置文件**含凭证**且 group/other 可读（如 `0644`）时，**任何读取配置的命令都会
+拒绝读取**（`kind: config_insecure`，退出码 1，hint 点名要执行的 `chmod`）——因为落盘的
+appSecret 对同机其他用户可读。不读配置的命令（`--version`、`api list`、`skill where`、
+`sync tasks` 等）不受影响，它们不碰凭证。不含凭证的文件维持「只在 stderr 警告、不阻断」。
+父目录 group/other **可写**（文件可被整体替换）时同样拒绝。`auth login` 是**唯一的例外**：
+它不拒绝，而是把已有文件重写为 `0600`（马上要写入新的 secret，拒绝没有意义），写完自检
+不合格才报 `config_insecure`。Windows 上跳过这些检查。数据库正常关闭后 `.wal` 临时文件会
+自动消失，请勿手工删除。
 
 > ⚠️ `whoami` **只检查凭证是否存在**，不校验它是否有效——一个拼错的 AppKey 同样返回
 > `configured: true`。第一次真实调用才是唯一的验证。
@@ -210,11 +213,16 @@ qiyu --version                       包版本 + skill_contract_version
 ### 成功
 
 ```json
-{"ok":true,"data":<接口载荷>,"meta":{...}}
+{"ok":true,"data":<接口载荷>}
 ```
 
-三个键恒在。`data` 即使为空也写成 `null`（不会整个消失），这样 Agent 能区分
-"接口无载荷"与"我解析错了"。
+`ok` 与 `data` 两个键恒在：`data` 即使为空也写成 `null`（不会整个消失），这样 Agent 能区分
+"接口无载荷"与"我解析错了"。`meta` **不是恒在的**——只在命令有元数据要报时才出现
+（`query` 的 `rows`/`resolved_range`、`db tables` 的 `notice` 等），或 skill 安装态
+有待提醒时经 `meta.warnings` 进来。没有任何可报内容的成功输出就只有 `{ok, data}`
+两个键（如无 skill 提示时的 `--version`、`store status`、`sync tasks`）——
+**读 `meta` 前先判存在**，键不出现 = 没有这项信息（与下方
+失败信封的可选键同一纪律），不是 `null`、更不是解析失败。
 
 ### 失败
 

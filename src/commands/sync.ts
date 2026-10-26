@@ -34,7 +34,7 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
 import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
-import { ok, fail, usageFail, setPretty } from '../output.js'
+import { ok, fail, usageFail, failFromTagged, setPretty } from '../output.js'
 import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
 import {
@@ -291,7 +291,10 @@ async function syncStatus(argv: string[]): Promise<number> {
   let resolved
   try {
     resolved = resolveConfig({ db: parsed.values['--db'], profile: parsed.values['--profile'], backend: parsed.values['--backend'] })
-  } catch (e) { return usageFail((e as Error).message) }
+    // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
+    // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
+    // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
+  } catch (e) { return failFromTagged(e) }
   const guarded = statGuard(resolved.path)
   if (guarded !== null) return guarded
   const opened = await openRo(resolved.config)
@@ -369,7 +372,10 @@ async function syncVerify(argv: string[]): Promise<number> {
   let resolved
   try {
     resolved = resolveConfig({ db: parsed.values['--db'], profile: parsed.values['--profile'], backend: parsed.values['--backend'] })
-  } catch (e) { return usageFail((e as Error).message) }
+    // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
+    // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
+    // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
+  } catch (e) { return failFromTagged(e) }
   const guarded = statGuard(resolved.path)
   if (guarded !== null) return guarded
   const opened = await openRo(resolved.config)
@@ -549,7 +555,8 @@ async function syncInstall(argv: string[]): Promise<number> {
   try {
     const r = resolveConfig({ db: parsed.values['--db'], profile: parsed.values['--profile'], backend: parsed.values['--backend'] })
     config = r.config; path = r.path; backend = r.backend
-  } catch (e) { return usageFail((e as Error).message) }
+    // ⚠️ 同 syncStatus：带 kind 的错误（config_insecure）必须如实透出。
+  } catch (e) { return failFromTagged(e) }
   const probe = await probeSynced(config, path)
   if (probe !== null) return probe
 

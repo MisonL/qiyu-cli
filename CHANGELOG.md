@@ -20,6 +20,35 @@
   三种形态都在自检里钉住）。
 - README 补上**配置文件的完整结构示例** —— 此前全仓没有一处给出它，这正是上面那类
   简写能长期存在的土壤。
+- **同一个危险状态，两条路径两种行为：含凭证且权限过宽的配置只被其中一条如实报告**。
+  配置含凭证且 group/other 可读（`0644`）时，`loadConfigChecked`（`auth`/`api` 走）抛出
+  带 `kind: config_insecure` 的错误，而 `store/config.ts`（`store`/`db`/`query`/`stats`/
+  `sync` 走）抛的是**无 kind** 的普通 Error，各命令 catch 又一律 `usageFail(...)` ——
+  于是同一份配置：`auth whoami` 得到退出码 1 + `kind: config_insecure` + 可执行的
+  `chmod 600 <路径>` hint；另外九条调用（`store status`/`store init`/`db tables`/
+  `db describe`/`query`/`stats fields`/`sync status`/`sync verify`/`sync install`/
+  `sync run`）得到退出码 2 + `kind: usage`（语义是"改参数重来"）且 **hint 丢失**。
+  设计稿 §3.4 与 README 承诺的都是前者——Agent 会照退出码去改参数，而这件事与参数无关。
+  修法：权限拒绝的错误**只在 core 层构造一处**（`insecureConfigError`，两个入口共用
+  同一句话），各命令的 catch 改为如实透传的 `failFromTagged`。顺带补上 `failFromTagged`
+  出口缺失的终端控制字符净化（调用方从 `usageFail` 换过来时，那层净化会静默消失）。
+  新增 `tests/commands/config-insecure.test.ts`：九条调用绑在**同一张表**上逐条断言
+  退出码/kind/retryable/hint —— 分文件写就复现不了"同一判据在不同命令上分叉"这个形态。
+  该文件在 Windows 上跳过（`checkPermissions` 在 win32 直接返回 ok，POSIX 权限位没有
+  对应语义；沿仓库既有的 `process.platform === 'win32'` 跳过约定）。
+- `config_insecure` 的 hint 里路径**加 shell 引号**：配置路径来自 `HOME`，而 `HOME`
+  可以含空格（`/Users/John Doe`）。不引号时 hint 里的 `chmod 600 /Users/John Doe/...`
+  会被 shell 拆成多个参数，用户照着抄得到 `chmod: 无法访问 'Doe/...'` —— 这条 hint 的
+  全部价值就是"照着执行就能修好"。`core/config.ts` 与 `auth login` 的写后自检两处同源
+  （`shellPath`），不含空格的路径不加引号。
+- README 的权限规则段补上**例外与边界**：不读配置的命令（`--version`、`api list`、
+  `skill where`、`sync tasks`）不受影响；`auth login` 是唯一例外，它把已有文件重写为
+  `0600` 而非拒绝（马上要写入新 secret，拒绝没有意义），写完自检不合格才报。
+- README 成功信封段原写「**三个键恒在**」（`ok`/`data`/`meta`），与实现相反：`ok()` 在
+  没有元数据时**故意不输出 `meta`**（`tests/output.test.ts` 把"未提供 meta 时不输出该键"
+  钉成契约）。实测（skill 已装、无提示）`--version`、`store status`、`sync tasks`、
+  `skill where` 的成功输出只有 `{ok, data}`。改为如实描述 + 给出可操作的读法
+  （读 `meta` 前先判存在），并加一条 `tests/readme.test.ts` 断言防回退。
 
 ## [0.2.1] - 2026-10-26
 
