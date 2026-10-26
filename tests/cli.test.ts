@@ -8,7 +8,7 @@ import { run } from '../src/cli.js'
 // 与实现的字面量各抄一份、改一处忘另一处。⚠️ 它**不**保护构建期覆写
 // （Task 13 只改 `dist/core/edition.js`，而测试导入的是 `src/core/edition.ts`）；
 // 「构建产物非占位」由 Task 13 的产物级测试钉住。
-import { PACKAGE_VERSION } from '../src/core/edition.js'
+import { PACKAGE_VERSION, SKILL_CONTRACT_VERSION } from '../src/core/edition.js'
 import { resetSkillDetectionCache } from '../src/skill/detect.js'
 import { setSkillWarning } from '../src/output.js'
 
@@ -360,12 +360,16 @@ describe('qiyu --version（Task 12，spec D6）', () => {
     const parsed = JSON.parse(out)
     expect(parsed.ok).toBe(true)
     // 键名逐字钉住（Agent 契约的一部分）：改名等于把能力对 Agent 关掉。
+    // ⚠️ 契约号用**常量**而不是字面量（2026-10-26 改）：此前写死 `1`，于是每次按 D6
+    // 正当递增都要顺手改三处测试 —— 而「忘了改」的失败信息是「契约号不对」，会把
+    // 一个刻意的版本升级显示成回归。本条真正要钉的是**键名**（改名等于对 Agent 关掉
+    // 能力），值的正确性由 `edition.ts` 的常量与 CHANGELOG 负责。
     expect(parsed.data).toEqual({
       version: PACKAGE_VERSION,
-      skill_contract_version: 1,
+      skill_contract_version: SKILL_CONTRACT_VERSION,
     })
     expect(typeof parsed.data.version).toBe('string')
-    expect(parsed.data.skill_contract_version).toBe(1)
+    expect(Number.isInteger(parsed.data.skill_contract_version)).toBe(true)
     // 版本查询是成功输出，不该在 stderr 留任何东西。
     expect(err).toBe('')
   })
@@ -385,7 +389,7 @@ describe('qiyu --version（Task 12，spec D6）', () => {
     expect(await run(['--version', '--help'])).toBe(0)
     const parsed = JSON.parse(out) // 不抛即「合法 JSON」
     expect(parsed.ok).toBe(true)
-    expect(parsed.data.skill_contract_version).toBe(1)
+    expect(parsed.data.skill_contract_version).toBe(SKILL_CONTRACT_VERSION)
   })
 
   it('-v 不是 --version 的短别名（保持「未知子命令」退出码 2）', async () => {
@@ -441,7 +445,7 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     const parsed = JSON.parse(out)
     // 提示只加在 meta 上：data 的形状与内容一个字都不能变（Task 10 的「只提示、
     // 绝不改退出码、绝不改 data」不变量）。
-    expect(parsed.data).toEqual({ version: PACKAGE_VERSION, skill_contract_version: 1 })
+    expect(parsed.data).toEqual({ version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION })
     expect(parsed.meta.warnings[0]).toContain('未安装')
     expect(err).toBe('')
   })
@@ -477,7 +481,7 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     vi.stubEnv('QIYU_SKILL_DIR', '')
     expect(await run(['--version'])).toBe(0)
     const parsed = JSON.parse(out)
-    expect(parsed.data).toEqual({ version: PACKAGE_VERSION, skill_contract_version: 1 })
+    expect(parsed.data).toEqual({ version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION })
     expect(parsed.meta.warnings.join('\n')).toContain('QIYU_DISABLE_SKILL_PROBE')
   })
 

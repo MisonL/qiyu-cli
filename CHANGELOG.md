@@ -5,6 +5,45 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-10-26
+
+### 新增
+
+- `qiyu skill where` 输出补**已安装正文**的版本元数据：
+  `data.entity.installed = {version, skill_contract_version, compatible}` 与
+  `data.cli_contract_version`；不配套时进 `meta.warnings` 并点名两个号。
+  **为什么必须有**：正文一直教 Agent「用 `skill_contract_version` 判断手上的正文能否配
+  这份 CLI」，但此前没有任何命令报出**已安装那份**的号（`--version` 与 `skill check`
+  的 meta 报的都是 CLI 自己的）—— 实测把清单里的号改成 99，三条命令的输出一字不变、
+  `meta.warnings` 为空，那句承诺是空的。实体不可用或清单缺失/损坏时 `installed` 恒为
+  `null`（判定不了），不编造兼容结论；清单里的契约号不是非负整数（`1.5`、`-3`）同样
+  按清单损坏处理，不拿坏值去比出一个 `compatible:false`。
+- `skill_contract_version` 递增到 **2**：`SKILL.md` 新增了「用 `skill where` 判断配套」
+  这一整段协议，且新正文**依赖**上述 `skill where` 新字段 —— 0.2.0 的 CLI 没有这些字段，
+  契约号不动的话新旧组合会被判成「配套」（spec D6：正文结构性改变才递增）。
+
+### 修复
+
+- `qiyu sync --help` 曾把 `**至少成功同步过一次**` 原样打到终端（help 是纯文本，不是
+  渲染后的文档）；`api call` 的 GET 守卫抛错文案同样含 `**`，经 catch 进 stderr。
+- 用法错误与抛错文案的「无 Markdown 标记」规则此前只被 api/auth/cli 三个文件的哨兵表
+  覆盖（全仓 `usageFail` 调用点有 117 处），新增全仓静态扫描
+  （`tests/plaintext-channels.test.ts`，覆盖 `usageFail` / `throw new Error` /
+  `process.stderr.write` / `*_USAGE` 的字面量，含跨行 `throw Object.assign(` 形态）。
+- 补上 6 个此前**零覆盖**的用法错误分支（`api schema` 四条、`auth login` 的参数分支、
+  `cli --version` 的额外参数守卫），以及注册表 `pageId` 的两条抛错分支
+  （它们原来的断言是子串匹配，加星号照样通过）。
+- 不配套警告曾建议 `qiyu skill install` —— 实测跑完是 `skipped` + 零写入，正文与警告
+  都不变（正文一改，实体哈希就与包内不同，不带 `--force` 一律跳过）。改为
+  `qiyu skill install --force`，SKILL.md 同步。
+- `skill where` 的 `entity.installed` 键此前在实体不可用（缺失/非目录/检查失败）时
+  整个消失，调用方拿到 `undefined` —— 与 SKILL.md 定义的 `null`（判定不了）是两种
+  不同的沉默。改为恒出现，判定不了就是 `null`。
+- 契约号与正文的绑定此前只靠测试从 `SKILL_CONTRACT_VERSION` 推导期望值 —— 改了正文
+  忘了递增契约号，测试照样绿。新增 `tests/skill/documents.test.ts` 的标记表：正文里
+  每条结构性标记对应一次契约递增，两个方向脱节都会红（诚实边界：「算不算结构性」
+  仍是人为判断，测试保证的是判定之后两处记录必须同时动）。
+
 ## [0.2.0] - 2026-10-25
 
 ### 新增
@@ -209,6 +248,7 @@
 - 响应信封归一化，含畸形 JSON（整数键未加引号）的容错修复
 - 逐接口限频表与 `retry_after` 提示
 
-[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.2.0...HEAD
+[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/MisonL/qiyu-cli/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/MisonL/qiyu-cli/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MisonL/qiyu-cli/releases/tag/v0.1.0

@@ -6,6 +6,17 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (p: string): string => readFileSync(join(root, p), 'utf8')
 
 /**
+ * CHANGELOG 的**版本区**（所有 `## [x]` 段，到文件末尾的链接引用块为止）。
+ *
+ * ⚠️ 为什么从「当前版本段」放宽到「全部版本段」（2026-10-26）：下面这些断言守的是
+ * 「C1/D/E/修复批 的交付条目**在 CHANGELOG 里写着**」——防止发版整理时把条目悄悄删掉。
+ * 此前它们钉的是「`[未发布]` ∪ 当前版本号段」，在 `[未发布]` 一直累积时成立；一旦
+ * 正常发版（0.2.1 切段），0.2.0 的条目就落到"当前段"之外，6 条测试集体变红 ——
+ * 而它们真正要防的「条目被删掉」并没有发生。钉死"当前段"等于每次发版都要改 6 条测试，
+ * 这种维护成本会让人下次直接放宽断言（那才是真正的失守）。
+ * 现在按**版本区**找：条目被删 → 仍然红；条目被移进历史版本段 → 绿（那是发版的正常形态）。
+ */
+/**
  * 当前版本的 CHANGELOG 段：`[未发布]` 段与 `package.json` 版本号段的**并集**。
  *
  * ⚠️ 此前这些断言逐字写 `/## \[未发布\].../`，7 条都钉着那个标题字面量 ——
@@ -26,6 +37,18 @@ function currentChangelogSection(md: string): string {
   const section = (heading: string): string =>
     new RegExp(`## \\[${heading}\\][\\s\\S]*?(?=\\n## |$)`).exec(md)?.[0] ?? ''
   return [section('未发布'), section(escaped)].filter((x) => x !== '').join('\n')
+}
+
+/**
+ * 全部版本段（`## [` 开头到文件末尾的 `[x]: https://…` 链接引用块之前）。
+ * 用途见上方 `currentChangelogSection` 文档里的 2026-10-26 说明。
+ */
+function allVersionSections(md: string): string {
+  const start = md.search(/^## \[/m)
+  if (start === -1) return ''
+  // 链接引用块的第一行形如 `[未发布]: https://…` / `[0.2.0]: https://…`
+  const linkBlock = md.search(/^\[[^\]]+\]:\s+https?:/m)
+  return md.slice(start, linkBlock === -1 ? undefined : linkBlock)
 }
 
 /**
@@ -71,10 +94,10 @@ describe('联动文案 —— C1 交付后不得说假话', () => {
   it('README 零运行时依赖表述已分述', () => {
     expect(read('README.md')).toMatch(/核心命令.*零运行时依赖|零运行时依赖.*核心命令/s)
   })
-  it('CHANGELOG [未发布] 段内含 store 条目（断言限定在该段 + 收紧锚，O 组 O-13）', () => {
+  it('CHANGELOG 版本区含 store 条目（收紧锚，O 组 O-13）', () => {
     const md = read('CHANGELOG.md')
-    const unreleased = currentChangelogSection(md)
-    expect(unreleased.length).toBeGreaterThan(0)   // [未发布] 段必须存在
+    const unreleased = allVersionSections(md)
+    expect(unreleased.length).toBeGreaterThan(0)   // 版本区必须存在
     expect(unreleased).toMatch(/`store (init|status)`/)   // 反引号命令形态，防「存储」等误命中
   })
   it('路线图 §四.C 标注 C1 已交付、C2 未关闭', () => {
@@ -201,9 +224,9 @@ describe('D 同步引擎交付联动 —— 不得说假话（D-T15）', () => {
     // 旧口径（「唯一引入常规依赖」）不得残留 —— 声明与实际依赖位置必须一致
     expect(md).not.toMatch(/唯一引入常规依赖/)
   })
-  it('CHANGELOG [未发布] 段内含 sync 命令与 fflate 条目（反引号命令形态，防误命中）', () => {
+  it('CHANGELOG 版本区含 sync 命令与 fflate 条目（反引号命令形态，防误命中）', () => {
     const md = read('CHANGELOG.md')
-    const unreleased = currentChangelogSection(md)
+    const unreleased = allVersionSections(md)
     expect(unreleased).toMatch(/`sync (run|verify|install)`/)
     expect(unreleased).toMatch(/fflate/)
     expect(unreleased).toMatch(/开发依赖/)
@@ -286,9 +309,9 @@ describe('修复批 2 文档联动 —— 契约诚实性收口（锚内容不�
     expect(md).not.toMatch(/启用\/停用任务/)
   })
 
-  it('CHANGELOG [未发布]：批 2 条目（v9 迁移 + sensitive_columns + resolved_range）在段内', () => {
+  it('CHANGELOG 版本区含批 2 条目（v9 迁移 + sensitive_columns + resolved_range）', () => {
     const md = read('CHANGELOG.md')
-    const unreleased = currentChangelogSection(md)
+    const unreleased = allVersionSections(md)
     expect(unreleased).toMatch(/迁移 v9/)
     expect(unreleased).toMatch(/sensitive_columns/)
     expect(unreleased).toMatch(/resolved_range/)
@@ -331,9 +354,9 @@ describe('修复批 4 文档联动 —— 按天切片与代价写在明处（�
     expect(md).toMatch(/`--since\/--until` 限定区间|--since 30d/)
   })
 
-  it('CHANGELOG [未发布]：批 4 的修复条目在段内（按天切片 / 删除上界 / 超时 / 中央目录）', () => {
+  it('CHANGELOG 版本区含批 4 的修复条目（按天切片 / 删除上界 / 超时 / 中央目录）', () => {
     const md = read('CHANGELOG.md')
-    const unreleased = currentChangelogSection(md)
+    const unreleased = allVersionSections(md)
     expect(unreleased).toMatch(/### 修复/)
     expect(unreleased).toMatch(/聚合报表按天切片/)
     expect(unreleased).toMatch(/删除上界越界一天/)
@@ -495,10 +518,10 @@ describe('CI 工作流 —— 承诺的检查必须真的接在 npm 脚本上', 
     expect(ci).toContain(`'${floor}'`)
   })
 
-  it('README 开发节与 CHANGELOG [未发布] 写明 CI（文档不说假话）', () => {
+  it('README 开发节与 CHANGELOG 版本区写明 CI（文档不说假话）', () => {
     expect(read('README.md')).toMatch(/\.github\/workflows\/ci\.yml/)
     const md = read('CHANGELOG.md')
-    const unreleased = currentChangelogSection(md)
+    const unreleased = allVersionSections(md)
     expect(unreleased).toMatch(/CI（`\.github\/workflows\/ci\.yml`）/)
   })
 })
@@ -527,9 +550,9 @@ describe('E 查询与沙箱交付联动 —— 不得说假话（E-T12）', () =
     }
     expect(md).toMatch(/0 行不等于没有数据|0 行.{0,10}不等于.{0,10}没有数据/)
   })
-  it('CHANGELOG [未发布] 段内含查询命令、三层沙箱与 query_timeout（反引号命令形态）', () => {
+  it('CHANGELOG 版本区含查询命令、三层沙箱与 query_timeout（反引号命令形态）', () => {
     const md = read('CHANGELOG.md')
-    const unreleased = currentChangelogSection(md)
+    const unreleased = allVersionSections(md)
     expect(unreleased).toMatch(/`db tables`/)
     expect(unreleased).toMatch(/`query --sql`/)
     expect(unreleased).toMatch(/`query --table`/)

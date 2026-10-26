@@ -72,7 +72,8 @@ const SKILL_USAGE = `用法：qiyu skill <子命令> [参数]
                            并给出已安装正文的版本元数据 entity.installed
                            {version, skill_contract_version, compatible} 与
                            CLI 自己的 cli_contract_version —— 判断正文能否配这份
-                           CLI 就看 compatible（清单损坏时 installed=null，不编造）
+                           CLI 就看 compatible（实体不可用或清单缺失/损坏时
+                           installed=null（判定不了），不编造）
 
 实体目录定位：--dir > QIYU_SKILL_DIR > npm_config_qiyu_skill_dir（postinstall 的安装
 通道，含大小写/连字符归一）> ~/.agents/skills/qiyu
@@ -947,22 +948,32 @@ async function skillWhere(argv: string[]): Promise<number> {
   // `skill_contract_version` 判断手上的正文能否配这份 CLI」，而此前没有任何命令报出
   // **已安装那份**的契约号 —— `--version` 与 `check` 的 meta 报的都是 CLI 自己的。
   // 那条承诺因此是空的。这里给出安装时的两个版本号 + 与当前 CLI 是否配套的判定。
-  //   · `null` = 清单缺失/损坏/读不动 —— **不编造**（与 detect 的 'unknown' 同一条纪律）；
+  //   · `null` = 清单缺失/损坏/读不动/实体本身不可用 —— **不编造**（与 detect 的
+  //     'unknown' 同一条纪律）。**键必须始终出现**（2026-10-26 审查）：此前只有
+  //     实体可用时才设这个键，实体缺失/非目录/检查失败时输出里根本没有它，调用方
+  //     拿到的是 undefined —— 而 SKILL.md 把 `null` 定义为「判定不了」，`undefined`
+  //     则是「这个字段不存在」，两种沉默对 Agent 含义不同，不能混。
   //   · `compatible` = 三方判定的落点：只有契约号相等才算配套。包版本不同不算
   //     不兼容（正文没变就还能用），这正是 SKILL.md 说「别拿包版本号去比」的原因。
+  entity.installed = null
   if (entityUsable) {
     const info = readInstalledManifestInfo(entityDir)
-    entity.installed = info === null
-      ? null
-      : {
-          version: info.version,
-          skill_contract_version: info.skillContractVersion,
-          compatible: info.skillContractVersion === SKILL_CONTRACT_VERSION,
-        }
+    if (info !== null) {
+      entity.installed = {
+        version: info.version,
+        skill_contract_version: info.skillContractVersion,
+        compatible: info.skillContractVersion === SKILL_CONTRACT_VERSION,
+      }
+    }
     if (info !== null && info.skillContractVersion !== SKILL_CONTRACT_VERSION) {
+      // ⚠️ 必须推 `--force`（2026-10-26 实测）：正文一改，实体内容哈希就与包内不同，
+      // `planInstall` 此时**不带 --force 一律 skipped + 零写入**——照旧文案推
+      // `qiyu skill install`，用户跑完契约号仍是旧值、警告照旧，等于指了条死路。
+      // `--force` 是两种形态都收敛的动词：正文确实不同 → 覆盖；正文恰好一致但清单
+      // 落后 → 走 rewrite-manifest（该分支排在 force 判断之前），同样把号补正。
       warnings.push(
         `已安装的 skill 契约版本为 ${info.skillContractVersion}，当前 CLI 是 ${SKILL_CONTRACT_VERSION}`
-        + ' —— 正文与 CLI 不配套；运行 `qiyu skill install` 更新正文',
+        + ' —— 正文与 CLI 不配套；运行 `qiyu skill install --force` 更新正文',
       )
     }
   }
