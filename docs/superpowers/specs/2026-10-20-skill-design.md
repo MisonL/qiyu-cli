@@ -252,7 +252,13 @@ description: <一句话说明何时用，含关键词>
 
 - skill 正文的**结构性改变**（增删某类协议段落）→ 递增
 - 命令/flag 变化但 skill 未受影响 → **不**递增
-- 输出位置：`qiyu --version` 与 `qiyu skill check` 的 `meta.skill_contract_version`
+- 输出位置：`qiyu --version` 与 `qiyu skill check` 的 `meta.skill_contract_version`（**都是 CLI 自己的**）
+- **2026-10-26 补**：`qiyu skill where` 的 `data.entity.installed.skill_contract_version`
+  是**已安装那份**的契约号，`data.cli_contract_version` 是 CLI 的，`compatible` 是两者
+  是否相等的判定；不配套时进 `meta.warnings`。**为什么必须补**：正文教 Agent
+  「用这个号判断手上的正文能否配这份 CLI」，而此前没有任何命令报出已安装那份的号 ——
+  实测把清单里的号改成 99，`--version` / `check` / `where` 的输出一字不变、无任何提示，
+  那句承诺是空的。判据只认契约号相等、**不看包版本**（包版本不同而契约号相同 → 正文仍可用）
 
 ⚠️ `qiyu --version` 目前**完全不存在**（§11.4 承诺过，路线图 G1 未列）。
 

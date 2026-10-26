@@ -513,6 +513,51 @@ describe('skill where', () => {
     expect(linkOf('codex')).toMatchObject({ state: 'missing' })
   })
 
+  // —— 契约版本可见性（2026-10-26 补）——
+  // `SKILL.md` 教 Agent「用 skill_contract_version 判断手上的正文能否配这份 CLI」，
+  // 而此前没有任何命令报出**已安装那份**的契约号：`--version` 与 `check` 的 meta 报的
+  // 都是 CLI 自己的。实测把清单里的号改成 99，三条命令的输出一字不变、warnings 为空。
+  // 下面三条钉住新的落点（`entity.installed` + `cli_contract_version` + 不配套警告）。
+  it('已安装 → 报出安装那份的契约号与兼容判定，且与 CLI 的号并列', async () => {
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({
+      installed: { version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION, compatible: true },
+    })
+    expect(data().cli_contract_version).toBe(SKILL_CONTRACT_VERSION)
+    // 配套时不该出现「不配套」的警告（测试进程另有一条「实体目录未确定」的提示，
+    // 那是启动探测门的既有行为，与本条无关 —— 只断言本条的否定）。
+    expect(metaWarnings()).not.toContain('不配套')
+  })
+
+  it('已安装那份的契约号与 CLI 不同 → compatible:false + 一条点名的警告', async () => {
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    // 直接改清单：模拟「这份正文是别的契约版本装的」
+    const p = join(entity, '.qiyu-skill.json')
+    const m = JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>
+    m.skill_contract_version = SKILL_CONTRACT_VERSION + 1
+    writeFileSync(p, JSON.stringify(m, null, 2))
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({
+      installed: { skill_contract_version: SKILL_CONTRACT_VERSION + 1, compatible: false },
+    })
+    const w = metaWarnings()
+    expect(w, '不配套必须说出来，且点名两个号').toContain(`契约版本为 ${SKILL_CONTRACT_VERSION + 1}`)
+    expect(w).toContain('`qiyu skill install`')
+  })
+
+  it('清单损坏 → installed:null（判定不了），不编造号也不报不配套', async () => {
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    writeFileSync(join(entity, '.qiyu-skill.json'), '{ 坏 JSON')
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    // 「清单坏了」≠「不兼容」——后者是一句需要证据的判断，这里没有证据。
+    expect(data().entity).toMatchObject({ installed: null })
+    expect(metaWarnings()).not.toContain('不配套')
+  })
+
   it('自指循环链接（ELOOP）不崩：该 agent 记 unknown 并进 warnings，其余照常', async () => {
     mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
     mkdirSync(join(home, '.codex', 'skills'), { recursive: true })
