@@ -62,12 +62,22 @@ function pathExists(path: string): boolean {
     if (!PROFILE_KEYS.includes(segs[2] ?? '')) return false
     if (segs[2] === 'store') {
       if (segs.length === 3) return true
-      return STORE_KEYS.includes((segs[3] ?? '') as typeof STORE_KEYS[number])
+      const key = segs[3] ?? ''
+      if (!(STORE_KEYS as readonly string[]).includes(key)) return false
+      // ⚠️ 标量键**必须到此为止**（2026-10-26 CodeRabbit 审查）：
+      // `profiles.<name>.store.readOnlyRetryMs.extra` 在真实配置里会被
+      // 「必须是正整数」拒绝（实测），本函数若只看第 4 段就会判它存在 ——
+      // 文档便可通过一条实际不可用的路径。
+      // `options` 是**透传不校验**的容器（StoreConfig.options 的内容由消费方
+      // 自行解释，写错键名 CLI 不会拒绝），所以它允许更深的段。
+      return key === 'options' ? segs.length >= 4 : segs.length === 4
     }
     // credentials / robots 之下没有更深的白名单层（其内容是自由形态）
     return segs.length === 3
   }
-  return TOP_KEYS.includes(segs[0] ?? '')
+  // 顶层只有 `defaultProfile` / `profiles`，且都是标量 —— 不存在更深的段
+  // （`defaultProfile.x` 这种同样会被 CLI 拒绝，实测）。
+  return segs.length === 1 && TOP_KEYS.includes(segs[0] ?? '')
 }
 
 describe('配置文件的完整结构示例可被执行（README）', () => {
@@ -231,6 +241,13 @@ describe('文档点名的配置键路径真实存在', () => {
     expect(pathExists('profiles.<name>.knowledgeRobotIds')).toBe(false)  // 层级错
     expect(pathExists('store.options.knowledgeRobotIds')).toBe(false)     // 缺 profiles 层
     expect(pathExists('readOnlyRetryMs')).toBe(false)                     // 裸键名
+    // 标量键后面不许再挂段（2026-10-26 CodeRabbit 审查；真实配置会拒绝这种形态）。
+    expect(pathExists('profiles.<name>.store.readOnlyRetryMs.extra')).toBe(false)
+    expect(pathExists('defaultProfile.extra')).toBe(false)
+    expect(pathExists('profiles.<name>.store.path.x')).toBe(false)
+    // options 是透传容器，允许更深（写错内层键 CLI 不拒绝，只静默不生效）。
+    expect(pathExists('profiles.<name>.store.options.knowledgeRobotIds')).toBe(true)
+    expect(pathExists('profiles.<name>.store.options.anything')).toBe(true)
 
     // 判据本身必须能抓到三种形态（否则上面的 offender 列表恒空）。
     expect(offendersIn('p', '等待上限可经配置文件 readOnlyRetryMs 调整'))

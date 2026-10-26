@@ -107,7 +107,7 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 
 存储配置仍是**手工编辑** `~/.config/qiyu/config.json`；也可用 `--db`/`QIYU_DB_PATH` 直接指定库路径。
 
-配置文件的完整结构（**键名写错会被拒绝，退出码 2**；未知键一律 fail-closed）：
+配置文件的完整结构（**顶层 / profile / store 三层的键名写错会被拒绝，退出码 2**）：
 
 ```json
 {
@@ -131,7 +131,11 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 - 顶层只认 `defaultProfile` 与 `profiles`；profile 内只认 `store`/`credentials`/`robots`；
   `store` 内只认上面那五个键。**没有 `store` 这一层之外的简写** —— 例如
   `knowledgeRobotIds` 必须在 `profiles.<name>.store.options` 里，放到 `profiles.<name>` 下会被拒绝。
-- `credentials` 与 `robots` 由 `qiyu auth login` 维护（也可手写）；`store` 块目前只能手写。
+- ⚠️ `profiles.<name>.store.options` 的内层键**不做未知键校验**（内容由消费方解释）：在它里面把
+  `knowledgeRobotIds` 拼成 `knowledgeRobotId` 不会被拒绝，只会静默不生效。改这一块时请对照
+  上面的示例逐字核对。
+- `credentials` 由 `qiyu auth login` 写入（也可手写）；**`store` 与 `robots` 只能手写** ——
+  `auth login` 会保留已有的 `robots` 映射，但不会创建或更新它。
 
 **权限规则**：配置文件**含凭证**且 group/other 可读（如 `0644`）时，所有命令都会**拒绝读取**
 （`kind: config_insecure`，退出码 1，hint 点名要执行的 `chmod`）——因为落盘的 appSecret 对同机
