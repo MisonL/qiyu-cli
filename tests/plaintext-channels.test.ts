@@ -164,7 +164,14 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     //   ② 未捕获时 Node 默认打印器把 message 与**堆栈**一起打到终端（注册表加载期）。
     // 实测来源：`assertGetHasNoBody` 的文案曾含 `**目前没有 GET 的 query 参数通道**`，
     // 全仓没有任何测试能发现它 —— 本文件就是那次实测补上的。
-    const hits = scanCallArgs(/\bthrow\b[^;\n]{0,60}?new\s+Error\s*\(/g)
+    //
+    // ⚠️ **必须允许跨行**（CodeRabbit 2026-10-26 实测发现）：真实的
+    // `throw Object.assign(` + `new Error(...)` 是**分行**写的（`http.ts:194`、`:210`），
+    // 而初版正则用了 `[^;\n]{0,60}` —— `\n` 把匹配掐死在 `Object.assign(` 之后，
+    // 于是这条规则对那两个真实调用点**完全不生效**。变异验证：给 `http.ts:195` 的
+    // message 注入 `**`，初版扫描器全绿。
+    // 改成 `[^;]`（允许换行、仍以分号封顶防止跨语句跑飞），并把行宽上限提到 200。
+    const hits = scanCallArgs(/\bthrow\b[^;]{0,200}?new\s+Error\s*\(/g)
     expect(hits.map(fmt), `这些 throw 的文案里含 Markdown 标记：\n${hits.map(fmt).join('\n')}`)
       .toEqual([])
   })
@@ -209,18 +216,28 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     const fake = [
       "usageFail('错误：**不要这样**')",
       "throw new Error('崩溃：**别**')",
+      // ⚠️ 跨行形态必须有样例（CodeRabbit 2026-10-26）：真实代码里
+      // `throw Object.assign(` 与 `new Error(...)` 就是分行的，只用单行样例
+      // 会让「允许跨行」这个修复本身无人守。
+      "throw Object.assign(\n  new Error('跨行：**也别**'),\n  { code: 'usage' })",
       "process.stderr.write('警告：**注意**')",
       'const X_USAGE = `用法：**粗体**`',
     ].join('\n')
     const blanked = blankComments(fake)
     expect(blanked.includes('**')).toBe(true)
-    for (const re of [/\busageFail\s*\(/g, /\bthrow\b[^;\n]{0,60}?new\s+Error\s*\(/g,
+    for (const re of [/\busageFail\s*\(/g, /\bthrow\b[^;]{0,200}?new\s+Error\s*\(/g,
       /process\.stderr\.write\s*\(/g]) {
       const m = re.exec(blanked)!
       expect(m, `合成样例未被 ${re} 命中`).not.toBeNull()
       const [s, e] = argRange(blanked, m.index + m[0].length)
       expect(blanked.slice(s, e)).toContain('**')
     }
+    // 跨行那条要单独钉：正则若退回 `[^;\n]`，上面循环只会命中**第一行**那个
+    // 单行样例、仍然全绿 —— 必须显式证明跨行样例被匹配到。
+    const multiline = /\bthrow\b[^;]{0,200}?new\s+Error\s*\(/g
+    const all = [...blanked.matchAll(multiline)]
+    expect(all.length, '跨行 Object.assign 样例没有被匹配到（正则退回了 [^;\\n]？）')
+      .toBeGreaterThanOrEqual(2)
     // 注释里的 `**` 必须**不**被算作违规（本仓库注释大量使用 Markdown 强调）
     expect(blankComments("// **这是注释**\nconst a = 1").includes('**')).toBe(false)
   })
