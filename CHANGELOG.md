@@ -80,6 +80,12 @@
   键改名 → 测试红。同时把 `RANGE_STATUS_NOTES` 的 `satisfies` 目标从字面量改为
   `RangeStatusValue | 'null'`（与 `RUN_STATUS_NOTES` 同款）：给枚举加值而不写图例现在
   **编译期**就失败。
+  ⑯ `tasks[].status` 的 `failed` 一度写成「连窗口循环都没进（目前只有快照任务被本地限频
+  闸门拦下这一条路径）」—— 引擎里快照有**三条** `failed` 出口（限频闸门 / 上游取数失败 /
+  落库失败或行数核对不符），只提闸门会让 Agent 把「取数失败」误读成 `partial`。改成逐条
+  点名，并补一句「windowed 任务不会给出 `failed` —— 全窗失败也是 `partial`」（窗口循环
+  只有这两个出口）。新增真库用例同时钉住两侧边界；变异：图例回退 → 断言红，把快照的
+  `failed` 改成 `partial` → 真库用例红。
 
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
   这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`

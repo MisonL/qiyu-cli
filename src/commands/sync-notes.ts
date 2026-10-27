@@ -65,7 +65,9 @@ export const RUN_STATUS_NOTES = {
     + '不要按这个字面判断结果。两个字段分开读：windows.succeeded = 成功窗数'
     + '（空窗也算成功，所以它大于 0 不代表有行）。rows.written = 真正落库的行数'
     + '（为 0 也可能是「窗口都成功、只是上游没数据」）',
-  failed: '连窗口循环都没进（目前只有快照任务被本地限频闸门拦下这一条路径）',
+  failed: '快照任务的失败路径（快照没有窗口循环，所以不会出现 partial）：本地限频闸门拦截、'
+    + '上游取数失败、落库失败或行数核对不符。windowed 任务不会给出 failed —— 全窗失败也是'
+    + ' partial（见上一条）',
 } satisfies Record<RunStatus, string>
 
 /** `sync run` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */

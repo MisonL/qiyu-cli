@@ -238,6 +238,16 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
       .toContain('不保证「全部窗口都跑了」')
     expect(runFieldNotes()['tasks[].status'], 'complete 必须指向 windows.skipped')
       .toContain('windows.skipped')
+    // 自查（2026-10-27）：`failed` 一度被写成「只有快照任务被本地限频闸门拦下这一条路径」——
+    // 引擎里快照有**三条**失败路径（限频闸门 / 上游取数失败 / 落库失败或行数核对不符，
+    // engine.ts 的 673 / 691 / 717），`tests/sync/engine.test.ts`「快照失败记 gap」钉着
+    // fetch 失败也给 `failed`。只提闸门会让 Agent 把「取数失败」误读成 partial。
+    expect(runFieldNotes()['tasks[].status'], 'failed 必须覆盖取数失败，不能只说限频闸门')
+      .toContain('上游取数失败')
+    expect(runFieldNotes()['tasks[].status'], 'failed 必须覆盖落库失败/行数核对不符')
+      .toContain('行数核对不符')
+    expect(runFieldNotes()['tasks[].status'], 'failed 必须说明 windowed 不会给出它')
+      .toContain('windowed 任务不会给出 failed')
     // CodeRabbit（2026-10-27）：日对齐任务的首残段可能被跳过，resolved_range.start
     // 前缀不会自动前移 —— 说「本轮实际覆盖到的区间」是过度承诺。
     expect(runFieldNotes()['tasks[].resolved_range'], 'start 不是覆盖保证')
@@ -431,6 +441,28 @@ describe('两条反直觉事实的真库实测（图例的字面结论靠它成�
     const tk = tasks()[0]!
     expect(tk.state_windows_consistent).toBe(true)
     expect(meta().field_notes, 'verify 必须解释「一致 ≠ 数据完整」').toBeDefined()
+  })
+
+  it('快照取数失败 → status=failed；windowed 全窗失败 → 只能是 partial（failed 是快照专属）', async () => {
+    // 自查（2026-10-27）：图例一度把 `failed` 说成「只有快照任务被本地限频闸门拦下这一条
+    // 路径」。引擎里快照有三条 failed 出口（engine.ts 673 闸门 / 691 取数 / 717 落库），
+    // 而 windowed 的窗口循环只有 complete/partial 两种出口。这条把两侧边界同时钉住。
+    const store = await fresh()
+    const snap: SyncTask = {
+      id: 'dim.staff', table: 'tags', kind: 'snapshot', maxWindowDays: 31, overlapDays: 0,
+      primaryKey: ['id'], watermark: { field: 'stat_date', initial: null },
+      fetch: async () => { throw new Error('上游全量炸了') },
+      write: { kind: 'upsertRows' },
+    }
+    const r1 = await runTask(snap, ctx(store, 0, 3 * DAY))
+    expect(r1.status, '快照取数失败 → failed（不是 partial）').toBe('failed')
+    expect(r1.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })
+
+    const win = threeWindowTask(async () => { throw new Error('每窗都炸') })
+    const r2 = await runTask(win, ctx(store, 0, 3 * DAY))
+    expect(r2.status, 'windowed 全窗失败仍是 partial —— failed 是快照专属').toBe('partial')
+    expect(r2.windows).toEqual({ total: 3, succeeded: 0, failed: 3, skipped: 0 })
+    await store.close()
   })
 
   it('从未同步过的任务 → range_status 是 null（与 pending 不同：连行都没有）', async () => {
