@@ -39,7 +39,7 @@ import { SYNC_TASKS } from '../sync/registry.js'
 import { COMMAND_TREE } from './tree.js'
 import { prettyAfterSubcommand } from './spec-types.js'
 import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
-import { checkSkillDir, type CheckContext, type CheckResult } from '../skill/check.js'
+import { checkSkillDir, type CheckContext, type CheckResult, type ViolationRule } from '../skill/check.js'
 import { contentHash, installSkill, planInstall, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
 import {
   ENTITY_SOURCES, entityUndeterminedNote, npmRelativeBase, readInstalledManifestInfo,
@@ -455,6 +455,83 @@ export function installFieldNotes(mode: 'dry-run' | 'real'): Record<string, stri
     : { status: renderStateNotes(SKILL_STATE_NOTES.installStatus), ...common }
 }
 
+/**
+ * `skill check` 的违规规则释义（10 值闭集）。
+ *
+ * ⚠️ 为什么逐值写：`violations[].rule` 是 Agent 要按值分支的机器值 ——
+ * 「命令拼错」「flag 位置错」「正文里写了不存在的表名」对应完全不同的修法。
+ * `Record<ViolationRule, string>` 让 `check.ts` 加一条规则而不在这里补释义时**编译失败**。
+ */
+export const CHECK_RULE_NOTES: Record<ViolationRule, string> = {
+  unknown_command: '命令不在本 CLI 的命令树里（拼错，或该命令尚未实现）',
+  unknown_flag: 'flag 没登记在该命令的参数表上',
+  unknown_positional: '位置参数的取值不在允许集合里（如未知的 agent 名）',
+  rejected_flag: '用了该命令显式拒绝的 flag',
+  flag_before_subcommand: 'flag 写在子命令之前（如 qiyu --db x store init）',
+  flag_before_positional: 'flag 写在位置参数之前（如 qiyu api call --body … <id>）',
+  flag_missing_value: 'flag 后面缺少取值',
+  table_name: '正文里出现了不存在的表名',
+  sql_sequence: '正文里出现了危险 SQL 片段（如 DROP TABLE）',
+  unknown_kind: '正文里的 kind: x 不在 ERROR_KINDS 里',
+}
+
+/**
+ * `skill check` 三种形态的 `meta.field_notes`（导出供测试核对真实渲染路径）。
+ * ⚠️ 按形态分开：单基准有 `baseline`，compare 有 `entity_source` / `package` /
+ * `installed` / `differences` —— 一份图例解释另一形态不存在的键，就是「声明了但没人读」
+ * 的反向形态。
+ */
+export function checkFieldNotes(mode: 'package' | 'installed' | 'compare'): Record<string, string> {
+  const ruleCell = renderStateNotes(CHECK_RULE_NOTES)
+  const common: Record<string, string> = {
+    mode: renderStateNotes({
+      package: '只查包内正文（CI 可跑）',
+      installed: '只查已安装的正文',
+      compare: '两份都查并列出差异',
+    }),
+    skill_contract_version: 'CLI 自己的正文契约号 —— 检查的是正文对这份 CLI 契约的符合度，'
+      + '不是已安装那份的契约号',
+    warnings: '无法静态判定的条目详情（与 unverifiable 同源）。没有时不出现',
+  }
+  /** 违规 / 无法判定条目的元素释义（`prefix` 是它们在输出里的真实路径）。 */
+  const elementDocs = (prefix: string): Record<string, string> => {
+    const p = prefix === '' ? '' : `${prefix}.`
+    return {
+      [`${p}violations[].line`]: '违规所在行号（1 起算）',
+      [`${p}violations[].rule`]: ruleCell,
+      [`${p}violations[].detail`]: '给人读的说明（含该行原文片段）',
+      [`${p}unverifiable[].line`]: '无法静态判定的条目所在行号',
+      [`${p}unverifiable[].detail`]: '无法静态判定的原因。⚠️ 它不是违规，不改变退出码'
+        + '（详情同时进 meta.warnings）',
+    }
+  }
+  if (mode !== 'compare') {
+    // 单基准：violations / unverifiable 在顶层
+    return {
+      ...common,
+      baseline: mode === 'package'
+        ? '被检查的包内正文目录'
+        : '被检查的已安装实体目录（--dir 可改）',
+      ...elementDocs(''),
+    }
+  }
+  // compare：violations / unverifiable 分别在 package 与 installed 之下 —— 图例键必须
+  // 是真实路径（`violations[].x` 在 compare 输出里不存在）。
+  return {
+    ...common,
+    entity_source: `已安装目录的来源：${ENTITY_SOURCES.join(' > ')}（优先级即顺序）`,
+    'package.dir': '包内正文目录',
+    ...elementDocs('package'),
+    'installed.dir': '已安装实体目录',
+    'installed.present': 'true = 读到了 SKILL.md 并完成检查。false = 没读到（原因见 installed.error），'
+      + '此时 installed.violations / installed.unverifiable 不出现',
+    'installed.error': 'installed.present=false 的原因（目录不存在 / 不可读 / 缺 SKILL.md / 读取失败）',
+    ...elementDocs('installed'),
+    differences: '两份的差异清单（人类可读字符串）。空数组 = 没发现差异。'
+      + '⚠️ 非空时退出码必为 1（每条差异都对应失败成因或违规）',
+  }
+}
+
 interface PlannedLink {
   agent: string
   path: string
@@ -774,7 +851,7 @@ function reportSingle(
 ): number {
   const code = ok(
     { mode, baseline: dir, violations: result.violations, unverifiable: result.warnings },
-    checkMeta(result.warnings.map((w) => w.detail)),
+    { ...checkMeta(result.warnings.map((w) => w.detail)), field_notes: checkFieldNotes(mode) },
   )
   return result.violations.length > 0 ? 1 : code
 }
@@ -887,6 +964,9 @@ async function skillCheck(argv: string[]): Promise<number> {
   const probe = probeDir(entityDir)
   if (!probe.exists) {
     differences.push(`已安装目录不存在：${entityDir}`)
+    // 与其余三种 present=false 成因保持一致：原因必须机器可读地给出，
+    // 不能只藏在中文 differences 字符串里（图例承诺了「原因见 installed.error」）。
+    installedData.error = '目录不存在'
     installedFailed = true
   } else if (probe.error !== undefined || !probe.isDir) {
     const why = probe.error ?? '不是目录'
@@ -958,7 +1038,7 @@ async function skillCheck(argv: string[]): Promise<number> {
       installed: installedData,
       differences,
     },
-    checkMeta(warnings),
+    { ...checkMeta(warnings), field_notes: checkFieldNotes('compare') },
   )
   const bad = installedFailed
     || pkgOutcome.result.violations.length > 0
