@@ -197,6 +197,12 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     // windows.succeeded 回答 —— 必须同时点名 rows.written。
     expect(runFieldNotes()['tasks[].status'], '必须区分「成功窗数」与「落库行数」')
       .toContain('rows.written')
+    // CodeRabbit 第三轮：`complete` 只表示「没有失败窗」，skipped>0 时也成立 ——
+    // 说成「全部窗口成功」会让 Agent 漏掉被跳过的区间。
+    expect(runFieldNotes()['tasks[].status'], 'complete 不得说成「全部窗口成功」')
+      .toContain('不保证「全部窗口都跑了」')
+    expect(runFieldNotes()['tasks[].status'], 'complete 必须指向 windows.skipped')
+      .toContain('windows.skipped')
     // CodeRabbit（2026-10-27）：日对齐任务的首残段可能被跳过，resolved_range.start
     // 前缀不会自动前移 —— 说「本轮实际覆盖到的区间」是过度承诺。
     expect(runFieldNotes()['tasks[].resolved_range'], 'start 不是覆盖保证')

@@ -54,6 +54,9 @@
   Agent 找不到）——测试里接受错误路径的 `TOP_KEYS` 一并收窄；⑦ 「按 range 对照判新鲜度」
   仍不成立：换边界重跑后数据可能已补齐，而旧缺口的 range 仍与新评估区间**重叠**——
   range 只能说明「相关」，没有一次覆盖核对就不能确认新鲜度。四条各补一条变异验证。
+  **第三轮一条**：⑧ `tasks[].status` 的 `complete` 说成「全部窗口成功」仍不准确 ——
+  `windows.skipped > 0` 且 `failed = 0` 时同样是 `complete`（被跳过的残段窗没跑也没写），
+  照「正常」行事会漏掉那段区间。改成「没有失败窗口」+ 指向 `windows.skipped`。
 
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
   这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`

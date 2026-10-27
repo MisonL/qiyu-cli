@@ -49,7 +49,8 @@ export const RANGE_STATUS_NOTES = {
  * 全窗失败 → status=partial、windows.succeeded=0、退出码 1。
  */
 export const RUN_STATUS_NOTES = {
-  complete: '全部窗口成功（failed=0）',
+  complete: '没有失败窗口（windows.failed = 0）。⚠️ 它不保证「全部窗口都跑了」：'
+    + 'windows.skipped 可能大于 0（残段窗被跳过）。判实际覆盖要看 skipped，见该字段的说明',
   partial: '至少一个窗口失败。⚠️ 它也覆盖「一行都没落」的全窗失败（succeeded=0）——'
     + '不要按这个字面判断结果。两个字段分开读：windows.succeeded = 成功窗数'
     + '（空窗也算成功，所以它大于 0 不代表有行）。rows.written = 真正落库的行数'

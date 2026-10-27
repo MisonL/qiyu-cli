@@ -300,7 +300,7 @@ qiyu --version                       包版本 + skill_contract_version
 
 | status | 含义 | 该做什么 |
 |---|---|---|
-| `complete` | 全部窗口成功（`windows.failed = 0`） | 正常 |
+| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗被跳过），判实际覆盖要看 `windows.skipped` |
 | `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 才是落库行数（为 0 也可能是「窗口都成功、只是上游没数据」） |
 | `failed` | 连窗口循环都没进 | 目前只有快照任务被本地限频闸门拦下这一条路径 |
 
