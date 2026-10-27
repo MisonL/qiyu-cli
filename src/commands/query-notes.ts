@@ -29,10 +29,12 @@ export function queryFieldNotes(): Record<string, string> {
       + '⚠️ true 不代表「有值被改写」——那要看 masked_columns',
     masked_columns: '本次实际被改写的列（至少一行的值在脱敏前后不同）。'
       + '⚠️ 为空不代表「没有敏感列」：只说明本次结果里没有需要改写的值'
-      + '（全 null、全空串、或敏感列没被查出来）',
-    mask_warnings: '脱敏缺口警告（声明为敏感、却因列不在表定义内或值形态无法归属而没脱敏）。'
+      + '（全 null、全空串、敏感列没被查出来，或本次 --no-mask 根本没脱敏）',
+    mask_warnings: '脱敏缺口警告：声明为敏感、却没能被脱敏的数据——表定义之外的列、'
+      + 'SQL 里被别名或表达式改名的敏感列、payload 里的 JSON 内 PII。'
       + '⚠️ --no-mask 时恒为空数组——空不等于脱敏完整，那是「根本没脱敏」，风险警告在 warnings 里',
-    warnings: '非空必须逐条读：0 行成因、截断、窗口内部缺口、库漂移缺列、--no-mask 风险都在这里。'
+    warnings: '非空必须逐条读——0 行成因、截断、窗口内部缺口、库漂移缺列、--no-mask 风险、'
+      + 'skill 安装提示都可能出现在这里（本键不是「只装查询警告」的专用通道）。'
       + '忽略它们的 Agent 会把残缺数据当事实汇报',
     resolved_range: '实际生效的时间过滤边界（+08:00 ISO）。⚠️ 它是过滤边界不是「有数据的范围」，'
       + '后者看 data_coverage。null 有四种成因：--sql 通道不判定区间、没给 --since/--until、'
@@ -40,8 +42,11 @@ export function queryFieldNotes(): Record<string, string> {
     data_coverage: '时间列在过滤范围内的 MIN/MAX（+08:00 ISO，没有时间过滤时是全表的）。'
       + '独立于 --limit 计算，不受截断影响。'
       + '⚠️ 结构上只有首尾两点，看不见内部缺口：7 天里只有第 1、7 天有数据时它照样报满区间。'
-      + 'iso-day 表另有 warnings 兜底（「区间内应有 N 个自然日，实际只有 M 个有数据」），'
-      + 'iso-instant 与 epoch-ms 表没有任何兜底，必须另想办法核对（例如按自然日 GROUP BY 数行）。'
-      + 'null 有三种成因：--sql 通道、表没有时间列、过滤范围内 0 行',
+      + '⚠️ iso-day 表在给了 --since/--until 时另有 warnings 兜底（「区间内应有 N 个自然日，'
+      + '实际只有 M 个有数据」），没有时间过滤时这条兜底不触发。iso-instant 与 epoch-ms 表'
+      + '任何情况下都没有兜底，必须自己按自然日 GROUP BY 数行。'
+      + 'null 有三种成因：--sql 通道、表没有时间列、范围内没有一行的时间值能过形态谓词'
+      + '（空表、过滤后 0 行、时间列全是脏值或 NULL）。第三种最隐蔽：rows 可能大于 0'
+      + '（无过滤时脏值行照常返回）而 data_coverage 为 null，且不保证有警告',
   }
 }

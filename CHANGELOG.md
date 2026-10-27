@@ -19,16 +19,19 @@
     「脱敏不完整」可言），风险警告在 `warnings` 里。Agent 拿空数组当「脱敏没问题」会
     把原始 PII 当已脱敏数据汇报；
   · **`data_coverage` 只有首尾两点，看不见内部缺口**——实测 iso-day 表 7 天窗口里只有
-    第 1、2、7 天有数据时，它照样报满区间。iso-day 表另有 `warnings` 兜底
-    （「区间内应有 N 个自然日，实际只有 M 个有数据」），而 `iso-instant` 与 `epoch-ms`
-    表**没有任何兜底**（实测 epoch-ms 的 `sessions` 中间空 6 天，`data_coverage` 报满
-    首尾且 `warnings: []`）。skill 正文当时把 `data_coverage` 说成「本地数据的实际覆盖
-    范围」——正是这条没有兜底的字段，属于过度承诺。
+    第 1、2、7 天有数据时，它照样报满区间。iso-day 表在**给了 `--since`/`--until` 时**
+    另有 `warnings` 兜底（「区间内应有 N 个自然日，实际只有 M 个有数据」），
+    **没有时间过滤时这条兜底不触发**（实测：无过滤 + 中间空 4 天 → `warnings: []`）；
+    `iso-instant` 与 `epoch-ms` 表任何情况下都没有兜底（实测 epoch-ms 的 `sessions`
+    中间空 6 天，`data_coverage` 报满首尾且 `warnings: []`）。skill 正文当时把
+    `data_coverage` 说成「本地数据的实际覆盖范围」——正是这条没有兜底的字段，属于过度承诺。
   同轮把两个字段的 `null` 成因也数清了（此前只说「恒为 null」）：`resolved_range` 有
   **四种**（`--sql` 通道 / 没给 `--since`/`--until` / 表没有时间列 / 只给 `--until` 而
-  该列无可用值），`data_coverage` 有**三种**（`--sql` 通道 / 表没有时间列 / 过滤范围内
-  0 行）——两个字段的 `null` **不同源**，只写「恒为 null」会让 Agent 把「没有过滤」
-  与「范围内没有数据」混为一谈。
+  该列无可用值），`data_coverage` 有**三种**（`--sql` 通道 / 表没有时间列 / 范围内没有
+  一行的时间值能过形态谓词——空表、过滤后 0 行、时间列全是脏值或 NULL 都归这条）——
+  两个字段的 `null` **不同源**，只写「恒为 null」会让 Agent 把「没有过滤」与「范围内
+  没有数据」混为一谈。第三种最隐蔽：脏值行在无过滤时照常返回，于是 `rows > 0` 而
+  `data_coverage` 为 `null`，且不保证有任何警告（实测）。
   修法：新增 `src/commands/query-notes.ts`，两个通道（`--table` / `--sql`）挂**同一份**
   `meta.field_notes`（分叉写两份必然漂移）；README 补 `data_coverage` 的内部缺口盲区与
   `masked` / `mask_warnings` 两个字面陷阱；skill `protocols.md` §1 去掉过度承诺并点名
@@ -41,6 +44,13 @@
   **无过滤**查询，此时 `resolvedRange` 为 null、缺口警告块根本进不去，把
   `NULL AS days` 改成常量 days 的变异仍然全绿——补一条带过滤的用例后才红。
   另同步 `tests/commands/query.test.ts` 两处「meta 九键」的形状钉子（现为十键）。
+  CodeRabbit 两条（全部核实成立并修）：① **Major** —— 「iso-day 表另有 warnings 兜底」
+  没写触发条件，而缺口检查块要求 `resolvedRange` 非 null（给了时间过滤）；无过滤时
+  `data_coverage` 照样报满区间而**没有任何警告**。图例、README、skill 三处一并加上条件，
+  并补一条「无过滤 → 兜底不触发」的真库用例。② **Minor** —— `data_coverage` 的 null
+  成因把「空表且无过滤」漏了：它既不是「过滤范围内 0 行」（根本没有过滤范围），也不在
+  我列的三条里。三条成因合并成同一机制（没有一行能过形态谓词）并把三条子路径逐一点名。
+  两条各补变异验证。
 
 - **`sync status` 的 `range_status` 两个取值字面与事实相反，且四个命令的状态位全仓无释义**。
   这条命令是 skill 协议指定的「看水位与缺口」入口，而它输出的 `range_status`

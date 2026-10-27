@@ -18,9 +18,10 @@
   `warnings` 里。
 - `resolved_range` / `data_coverage`：前者是**过滤边界**（不是有数据的范围），后者是
   时间列在过滤范围内的 **MIN/MAX**。⚠️ `data_coverage` 只有首尾两点、**看不见内部缺口**
-  ——7 天里只有第 1、7 天有数据时它照样报满区间。`iso-day` 表另有 `warnings` 兜底
-  （「区间内应有 N 个自然日，实际只有 M 个有数据」），`iso-instant` 与 `epoch-ms` 表
-  **没有任何兜底**，要核对内部覆盖得自己按自然日 `GROUP BY` 数行。
+  ——7 天里只有第 1、7 天有数据时它照样报满区间。`iso-day` 表在**给了 `--since`/`--until`
+  时**另有 `warnings` 兜底（「区间内应有 N 个自然日，实际只有 M 个有数据」），**没有时间
+  过滤时这条兜底不触发**；`iso-instant` 与 `epoch-ms` 表任何情况下都没有兜底，要核对内部
+  覆盖得自己按自然日 `GROUP BY` 数行。
   报告结论时带上这两个区间，让人类知道你算的是哪段数据。逐键释义见输出的 `meta.field_notes`。
 - `--sql` 通道不判定区间与覆盖：`resolved_range` 与 `data_coverage` **恒为 null**——实际
   区间以你写的 SQL 过滤为准，报告时自己写清。

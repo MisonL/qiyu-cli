@@ -430,10 +430,11 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   所以要按它判断覆盖了哪几天。`--sql` 通道恒为 `null`（任意 SQL 无法通用判定）。
 - `data_coverage`：该表时间列在**过滤范围内**的 MIN/MAX（`+08:00` ISO）；`--sql` 通道恒为 `null`。
   它有三种 `null` 成因，用 `resolved_range` 与 `warnings` 区分：`--sql` 通道 / 该表无时间列 /
-  有过滤范围但范围内一行都没有。
+  范围内没有一行的时间值能过形态谓词（空表、过滤后 0 行、时间列全是脏值或 NULL）。
   ⚠️ **它只有首尾两点，看不见内部缺口**——7 天里只有第 1、7 天有数据时照样报满区间。
-  `iso-day` 表另有 `warnings` 兜底（「区间内应有 N 个自然日，实际只有 M 个有数据」），
-  `iso-instant` 与 `epoch-ms` 表**没有任何兜底**，要核对内部覆盖得自己按自然日 `GROUP BY` 数行。
+  `iso-day` 表在**给了 `--since`/`--until` 时**另有 `warnings` 兜底（「区间内应有 N 个自然日，
+  实际只有 M 个有数据」），**没有时间过滤时这条兜底不触发**；`iso-instant` 与 `epoch-ms` 表
+  任何情况下都没有兜底，要核对内部覆盖得自己按自然日 `GROUP BY` 数行。
 - `masked` / `mask_warnings` 的两个字面陷阱：`masked: true` 只表示脱敏开关开着，**不代表有值被
   改写**（那看 `masked_columns`，为空是常态）；`mask_warnings: []` 在 `--no-mask` 时**恒为空**，
   空**不等于**脱敏完整——那是「根本没脱敏」，风险警告在 `warnings` 里。

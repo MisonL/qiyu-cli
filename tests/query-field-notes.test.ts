@@ -85,6 +85,10 @@ async function seed(): Promise<void> {
         userCrmInfo: null, synchronized_at: null },
     ])
     await s.upsert('tags', [{ id: 't1', name: 'A', color: '#111111' }])
+    // 时间列全是脏值：主查询（无过滤）照常返回该行，但形态谓词把它排除在覆盖统计之外
+    await s.upsert('staff_quality', [
+      { stat_date: 'not-a-date', staff_id: 'x', payload: '{}', synchronized_at: null },
+    ])
   } finally {
     await s.close()
   }
@@ -121,8 +125,9 @@ describe('图例本身：键集、形态与「不撒谎」的措辞', () => {
     expect(n.mask_warnings, 'mask_warnings 必须说明 --no-mask 时恒为空').toContain('--no-mask 时恒为空数组')
     expect(n.mask_warnings, '空 ≠ 脱敏完整').toContain('空不等于脱敏完整')
     expect(n.data_coverage, 'data_coverage 必须说明看不见内部缺口').toContain('看不见内部缺口')
-    expect(n.data_coverage, '必须点名只有 iso-day 有兜底').toContain('iso-day 表另有 warnings 兜底')
-    expect(n.data_coverage, '必须点名其余类型没有兜底').toContain('没有任何兜底')
+    expect(n.data_coverage, '必须点名只有 iso-day 有兜底').toContain('iso-day 表在给了 --since/--until 时另有 warnings 兜底')
+    expect(n.data_coverage, '兜底必须带条件：无过滤时不触发').toContain('没有时间过滤时这条兜底不触发')
+    expect(n.data_coverage, '必须点名其余类型没有兜底').toContain('任何情况下都没有兜底')
     expect(n.resolved_range, 'resolved_range 是过滤边界不是数据范围').toContain('过滤边界')
   })
 
@@ -182,12 +187,29 @@ describe('resolved_range 的四种 null 成因（逐成因真库实测）', () =
 })
 
 describe('data_coverage 的三种 null 成因', () => {
-  it('图例必须把三种成因都写出来', () => {
+  it('图例必须把三种成因都写出来，并把第三种的三条子路径点名', () => {
     const n = queryFieldNotes().data_coverage
     expect(n).toContain('--sql 通道')
     expect(n).toContain('表没有时间列')
-    expect(n).toContain('过滤范围内 0 行')
+    // ⚠️ 第三种一开始只写成「过滤范围内 0 行」，漏了「空表无过滤」与「时间列全是脏值」
+    // 两条 —— CodeRabbit 与自查各抓到一条。三者都是同一个机制：没有一行能过形态谓词。
+    expect(n, '第三种必须点名「能过形态谓词」这个机制').toContain('能过形态谓词')
+    expect(n, '子路径：空表').toContain('空表')
+    expect(n, '子路径：过滤后 0 行').toContain('过滤后 0 行')
+    expect(n, '子路径：脏值或全 NULL').toContain('脏值或 NULL')
     expect(n, '必须写明「三种」').toContain('三种成因')
+  })
+
+  it('iso-day 的缺口兜底**只在给了时间过滤时**触发（无过滤时没有任何警告）', async () => {
+    // ⚠️ CodeRabbit 抓到的过度承诺：图例一度写「iso-day 表另有 warnings 兜底」而不带条件。
+    // 实测：无过滤时 resolvedRange 为 null，缺口检查块根本进不去。
+    await seed()
+    await q('--table', 'daily_overview') // 中间 4 天缺失，但没有过滤
+    expect(meta().resolved_range).toBeNull()
+    expect(meta().warnings, '无过滤 → 兜底不触发').toEqual([])
+    expect(meta().data_coverage, '而它照样报满区间').toEqual({
+      min: '2026-10-01T00:00:00+08:00', max: '2026-10-07T00:00:00+08:00',
+    })
   })
 
   it('③ 过滤范围内 0 行：null（区间仍回显 —— 两个字段的 null 不同源）', async () => {
@@ -197,6 +219,14 @@ describe('data_coverage 的三种 null 成因', () => {
     expect(meta().resolved_range, '但过滤边界是已知的').toEqual([
       '2026-11-01T00:00:00+08:00', '2026-11-02T00:00:00+08:00',
     ])
+  })
+
+  it('③c 有行但时间列全是脏值：null 且没有任何警告（三条子路径里最隐蔽的）', async () => {
+    await seed()
+    await q('--table', 'staff_quality')
+    expect(meta().rows, '主查询（无过滤）照常返回该行 —— 与 data_coverage 为 null 并存').toBe(1)
+    expect(meta().data_coverage, '形态谓词把脏值排除 → 没有 MIN/MAX 可报').toBeNull()
+    expect(meta().warnings, '这一种不会触发任何警告，Agent 只能靠图例知道它存在').toEqual([])
   })
 })
 
