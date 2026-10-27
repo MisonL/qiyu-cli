@@ -50,6 +50,7 @@ beforeEach(() => {
   vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
   vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
   vi.stubEnv('HOME', home)   // 隔离真实 ~，且让 configPathFor() 指到临时目录
+  vi.stubEnv('USERPROFILE', home)
   // ⚠️ 环境变量给上完整凭证（2026-10-26）：否则 `sync run` / `api` 会**先**在凭证层
   // 撞上同一个 config_insecure（`resolveCredentialsUsingFile` 也读这份文件），
   // 于是用例覆盖的是那条路径、`sync-run.ts` 自己的 `resolveStoreConfig` catch
@@ -160,6 +161,7 @@ posixOnly('hint 里的路径必须可直接粘贴执行（含空格的 HOME）',
     }, null, 2))
     chmodSync(p, 0o644)
     vi.stubEnv('HOME', spaced)
+    vi.stubEnv('USERPROFILE', spaced)
     __resetPermissionWarnings()
     expect(await storeCommand(['status'])).toBe(1)
     const hint = String(errorOf().hint)
@@ -188,6 +190,7 @@ posixOnly('hint 里的路径必须可直接粘贴执行（含空格的 HOME）',
     chmodSync(join(dir, 'config.json'), 0o600)
     chmodSync(dir, 0o777)   // 目录过宽 → 写后自检拒绝
     vi.stubEnv('HOME', spaced)
+    vi.stubEnv('USERPROFILE', spaced)
     expect(await authCommand(['login'])).toBe(1)
     const hint = String(errorOf().hint)
     expect(hint).toContain(`chmod 700 "${dir}"`)

@@ -28,6 +28,7 @@ beforeEach(() => {
   // 不隔离就会读开发机真实的配置文件，测试结果取决于本机环境。
   home = mkdtempSync(join(tmpdir(), 'qiyu-auth-'))
   vi.stubEnv('HOME', home)
+  vi.stubEnv('USERPROFILE', home)
   vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
   vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
 })

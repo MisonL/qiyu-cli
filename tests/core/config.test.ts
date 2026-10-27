@@ -30,6 +30,7 @@ function writeCfg(obj: unknown, mode = 0o600): void {
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'qiyu-corecfg-'))
   vi.stubEnv('HOME', home)
+  vi.stubEnv('USERPROFILE', home)
   vi.stubEnv('QIYU_PROFILE', '')
 })
 afterEach(() => {

@@ -25,6 +25,7 @@ beforeEach(() => {
   err = ''
   home = mkdtempSync(join(tmpdir(), 'qiyu-api-'))
   vi.stubEnv('HOME', home)
+  vi.stubEnv('USERPROFILE', home)
   vi.stubEnv('QIYU_PROFILE', '')
   // ⚠️ 令牌桶是 http.ts 的**模块级** Map，同一测试文件内的用例共享它。
   // **2026-10-26 探针实测（按下面这段自己规定的方法重跑）**：本文件跑一遍，

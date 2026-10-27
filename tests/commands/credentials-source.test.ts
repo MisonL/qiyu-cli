@@ -26,6 +26,7 @@ const FILE_OK = { profiles: { default: { credentials: { appKey: 'fk', appSecret:
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'qiyu-credsrc-'))
   vi.stubEnv('HOME', home)
+  vi.stubEnv('USERPROFILE', home)
   vi.stubEnv('QIYU_PROFILE', '')
 })
 afterEach(() => { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) })

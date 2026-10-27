@@ -41,6 +41,7 @@ beforeEach(() => {
   vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += String(s); return true })
   vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（默认库路径与配置文件都走 HOME）
+  vi.stubEnv('USERPROFILE', dir)
 })
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs()
