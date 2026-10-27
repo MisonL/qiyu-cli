@@ -256,15 +256,17 @@ export function skillWarning(
       // 纪律：提示里的动词必须覆盖该状态的**所有**成因，所以两个动词连同各自的成立条件
       // 一起给出 —— 只推裸 install 就是让漂移那一半用户白跑一趟。
       //
-      // 「清单可写」也是条件之一，且它**同时挡住两个动词**：清单路径被符号链接/目录
-      // 占用时，planInstall 只返回 skipped + 一条点名占用路径的 warning
-      // （`writeTargetWarning`）——2026-10-27 实测：悬空符号链接 + 正文一致，裸 install
-      // 与 --force 都是 skipped，实体一个字节没变。两个动词的前提必须都给全，
-      // 只给裸 install 加前提会让人以为 --force 能救那种情况。
+      // 「清单可写」也是条件之一（`writeTargetWarning`）。注意它**不是**两个动词同样
+      // 挡住的：2026-10-27 实测（悬空符号链接占住清单路径）——
+      //   · 正文一致：裸 install 与 --force 都 skipped，实体零变化；
+      //   · 正文漂移：--force 报 status=updated 且**正文已被换掉**，但清单写不进去，
+      //     探测仍报 stale、提示不会消失（CodeRabbit 指出的部分写入）。
+      // 所以文案不能说「两个命令都不会覆盖」——那只对清单成立，对正文不成立。
       return '无法确认已安装 skill 的版本（安装清单缺失或损坏）；运行 `qiyu skill install` 补写清单'
         + '——正文与包内一致时即收敛；正文被手工改过时它会跳过不覆盖、提示不会消失，'
         + '那种情况用 `qiyu skill install --force` 覆盖。'
-        + '若清单路径被非普通文件占用，两个命令都不会覆盖，install 的 warnings 会点名该路径'
+        + '若清单路径被非普通文件（符号链接/目录）占用，清单写不进去、提示不会消失：'
+        + '`--force` 只会覆盖正文（状态报 updated），先清理该占用再跑'
     }
     if (ctx?.currentVersion !== undefined && state.installedVersion === ctx.currentVersion) {
       return `已安装的 skill 内容与包内当前版本不一致（版本 ${state.installedVersion}）；运行 \`qiyu skill install --force\` 更新`

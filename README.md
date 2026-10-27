@@ -63,8 +63,9 @@ npm 无法确认可信版本、也就无法 pin 版本，`--allow-scripts` 同�
 所以**不要指望 postinstall：直接运行 `qiyu skill install`**。
 
 安装是幂等的：正文一致时不动正文（清单缺失或损坏时会补写 `.qiyu-skill.json`）；要覆盖
-你改过的正文得加 `--force`。⚠️ 清单路径若被非普通文件（符号链接/目录）占用，裸 install 与
-`--force` **都不会覆盖**，`meta.warnings` 会点名该路径。其他子命令：
+你改过的正文得加 `--force`。⚠️ 清单路径若被非普通文件（符号链接/目录）占用，清单本身写不
+进去：裸 install 与 `--force` 都不改它；正文被改过时 `--force` 仍会覆盖正文（状态 `updated`）
+但提示不会消失——先清理该占用再跑。其他子命令：
 `qiyu skill where` 报告实体目录与各 Agent 的链接状态（只读，不修复），并给出**已安装那份
 正文**的契约号与兼容判定（`data.entity.installed.compatible`，与 `data.cli_contract_version`
 比较；判定不了时为 `null`，不是 `false`）；`qiyu skill check`
