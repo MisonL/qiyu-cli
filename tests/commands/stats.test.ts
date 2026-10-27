@@ -146,6 +146,22 @@ describe('stats fields', () => {
     for (const o of data().observed as Observed[]) expect(declared[o.field], o.field).toBeDefined()
   })
 
+  it('meta.field_notes 随真实输出下发：declared 的值域与观测语义都有释义（2026-10-27）', async () => {
+    // 这条钉「图例真的进了 Agent 拿到的那个 JSON」——`statsFieldNotes()` 单测绿不代表
+    // 命令层把它挂上了 meta（漏挂时单测全绿、Agent 依旧读不到）。
+    await seed()
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+    const notes = meta().field_notes as Record<string, string>
+    expect(notes, 'meta.field_notes 缺失').toBeDefined()
+    expect(notes['declared[].unit']).toContain('ratio = ')
+    expect(notes['declared[].unit']).toContain('不是 0–100 的百分数')
+    expect(notes['declared[].source']).toContain('name-suffix = ')
+    expect(notes['declared[].higher_is_better']).toContain('恒为 null')
+    expect(notes['observed[].minus_one']).toContain('不是负数比率')
+    // warnings 与 field_notes 同时在 meta 里，互不覆盖
+    expect(meta().warnings).toBeDefined()
+  })
+
   it('payload 键名不受信：名为 __proto__ 的键不得从 declared 里静默消失', async () => {
     const s = await fresh()
     try {

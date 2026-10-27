@@ -12,7 +12,7 @@
 //     sentinel 恒在，且 min/max 一律排除 -1（否则 Agent 会报出 -100%）。
 import { thrownToQueryExit, suggestNames } from '../query/errors.js'
 import { METRIC_CATALOG, REPORT_TABLES, declareMetric } from '../query/metric-catalog.js'
-import type { MetricDecl } from '../query/metric-catalog.js'
+import type { MetricDecl, MetricSource, MetricUnit } from '../query/metric-catalog.js'
 import { TABLES } from '../store/schema.js'
 import { openGuardedSession } from './db.js'
 import { parseStoreFlags } from './store-flags.js'
@@ -125,6 +125,67 @@ function extremeOf(v: unknown): number | null {
   if (v === null || v === undefined) return null
   const n = Number(v)
   return Number.isFinite(n) ? n : null
+}
+
+/**
+ * `declared.<字段>.unit` 的四个取值 —— 图例的**唯一构造点**（`satisfies` 让新增取值
+ * 漏写释义直接编译失败）。
+ *
+ * ⚠️ 为什么必须逐值写出来：`stats fields` 的全部意义就是让 Agent **不猜单位**
+ * （设计稿 §9.2「单位不确定 → 查 stats fields 的 unit；绝不要猜百分比还是绝对值」）。
+ * 只输出 `ratio`/`count`/`ms`/`unknown` 四个英文词，等于把「猜」从字段名挪到了枚举值上：
+ * `ratio` 是 0–1 还是 0–100？`ms` 是毫秒还是别的？不写清，Agent 照样会把 0.987
+ * 报成「0.987%」或把毫秒当秒。
+ *
+ * 诚实边界（写进图例，不藏着）：`ratio` 的量纲只有 `assignedRatio` 一个字段被设计稿
+ * §6.2 实测过（0.987 = 98.7%）；其余 ratio 字段是**按名字推断**的（见 source），
+ * 量纲未逐一实测 —— 所以图例要指 Agent 去看 `observed` 的实际分布，而不是把推断当实测。
+ */
+export const UNIT_NOTES = {
+  ratio: '比率（实测样本 assignedRatio=0.987，即 0–1 的小数、不是 0–100 的百分数）。'
+    + '⚠️ 只有该字段经设计稿实测，其余 ratio 字段是命名推断（见 source）——报告百分比前'
+    + '先用 observed 的 min/max 核对量纲',
+  count: '计数（整数）',
+  ms: '毫秒（实测样本 loginDuration 天粒度 = 86400024，即 86400000 + 24）',
+  unknown: '判不出单位（目录未收录、字段名后缀也推不出）—— 不是「没有单位」：'
+    + '报告时如实写「单位未知」，不要猜。这些字段同时列在 unknown_fields',
+} satisfies Record<MetricUnit, string>
+
+/** `declared.<字段>.source` 的两个取值：标明声明是实测还是命名推断。 */
+export const SOURCE_NOTES = {
+  'design-doc': '设计稿实测明说（可信度最高，该条 note 通常给出出处）',
+  'name-suffix': '按字段名后缀推断（*Ratio/*Radio→ratio、*Count/sessions→count、'
+    + '*Duration/*Time→ms）—— 是命名推断，不是实测。后缀推不出的记 unknown',
+} satisfies Record<MetricSource, string>
+
+/** 渲染成 `a = 释义；b = 释义` —— field_notes 的单元格形态（与 api list / skill where 同款）。 */
+function renderNotes(notes: Record<string, string>): string {
+  return Object.entries(notes).map(([k, v]) => `${k} = ${v}`).join('；')
+}
+
+/**
+ * `stats fields` 的 `meta.field_notes`（导出供测试核对真实渲染路径 —— 测试若自写一份
+ * 渲染副本，生产漏渲染某个值时它照样全绿）。
+ */
+export function statsFieldNotes(): Record<string, string> {
+  return {
+    'declared[].unit': renderNotes(UNIT_NOTES),
+    'declared[].source': renderNotes(SOURCE_NOTES),
+    'declared[].higher_is_better':
+      '恒为 null —— 设计稿与本 CLI 都没有任何「指标越大越好还是越小越好」的上游依据，'
+      + '不猜（设计稿 §9.2）。不要把 null 读成「本字段恰好没测到」，也不要把 null 当 false；'
+      + '要判断趋势好坏只能由人给口径',
+    'declared[].note': '该条声明的依据（通常只有 source=design-doc 的条目有）。null = 无出处注记',
+    unknown_fields: 'unit 为 unknown 的观测字段（判据是「判不出单位」，不是「目录未收录」——'
+      + '后缀能派生的字段即使不在目录里也不算）',
+    'observed[].minus_one': '值为 -1 的行数。-1 是「该窗口或筛选条件没有匹配到数据」的哨兵'
+      + '（厂商未文档化），不是负数比率。等于 rows_present 说明该字段本次全是哨兵',
+    'observed[].min': '排除 -1 哨兵后的最小值；全为哨兵或非数值时为 null（不是 0）——'
+      + 'null 时看 minus_one',
+    'observed[].max': '排除 -1 哨兵后的最大值；全为哨兵或非数值时为 null（不是 0）',
+    'observed[].rows_present': 'payload 中出现该键的行数（缺键、payload 为 NULL/空对象/非对象的行不计）',
+    'observed[].nulls': '该键值为 JSON null 的行数',
+  }
 }
 
 /** 输出形态：note 缺省写成显式 null（spec §9.2 的声明形态四个键恒在）。 */
@@ -291,7 +352,7 @@ async function statsFields(argv: string[]): Promise<number> {
 
     return ok(
       { table, sentinel: SENTINEL, declared: Object.fromEntries(declared), observed, unknown_fields: unknownFields },
-      { warnings })
+      { field_notes: statsFieldNotes(), warnings })
   } catch (e) {
     return thrownToQueryExit(e, TABLES)
   } finally {

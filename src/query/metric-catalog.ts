@@ -14,11 +14,20 @@
 //
 // 分层约束（spec §5.1）：本文件是纯数据 + 纯函数，不 import 任何模块。
 
-/** 指标单位（闭集；'unknown' = 目录与后缀都判不出）。 */
-export type MetricUnit = 'ratio' | 'count' | 'ms' | 'unknown'
+/**
+ * 指标单位（闭集；'unknown' = 目录与后缀都判不出）。
+ *
+ * ⚠️ 运行时数组 + `typeof ARR[number]` 而不是裸联合类型：这是**输出数据里的机器值**
+ * （`stats fields` 的 `declared.<字段>.unit`），Agent 要按它分支（比率要不要乘 100、
+ * 毫秒要不要换算）。值域必须能在运行时导出，`meta.field_notes` 的图例与测试才能
+ * 双向核对「枚举 ⊆ 图例、图例 ⊆ 枚举」—— 裸联合类型编译后就没了，谁加了值都不会红。
+ */
+export const METRIC_UNITS = ['ratio', 'count', 'ms', 'unknown'] as const
+export type MetricUnit = typeof METRIC_UNITS[number]
 
-/** 声明出处：设计稿实测 / 命名后缀推断。 */
-export type MetricSource = 'design-doc' | 'name-suffix'
+/** 声明出处：设计稿实测 / 命名后缀推断（同上：运行时可导出）。 */
+export const METRIC_SOURCES = ['design-doc', 'name-suffix'] as const
+export type MetricSource = typeof METRIC_SOURCES[number]
 
 export interface MetricDecl {
   unit: MetricUnit
