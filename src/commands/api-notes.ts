@@ -18,7 +18,9 @@ export function callFieldNotes(): Record<string, string> {
     warnings: 'body 校验的软告警（缺省字段、别名归一、取值可疑）。没有软告警时这个键不出现，'
       + '--no-validate 时恒不出现。⚠️ 不出现 ≠ body 正确（--no-validate 根本没校验）。'
       + '它是本 CLI 的校验提示，不是上游的业务告警',
-    not_found: 'true = 上游返回结构上为空（data 键缺失 / {} / []）。'
+    not_found: 'true = 解包后的载荷为空。判据作用在解包后的 payload 上：'
+      + 'data / result 形状下是 {} / []，或整条 200 响应没有载荷键（仅已实测信封，'
+      + 'envelope 为 null 的接口不断言）。staffInfo 形状恒不置位。'
       + '⚠️ 只覆盖结构性为空：业务为空（如 ticket.search 查到 0 条返回 {total:0,tickets:[]}）'
       + '不会置位 —— 没有 not_found 不等于有数据',
     warning: '与 not_found 同时出现的一句话说明（固定文案）',

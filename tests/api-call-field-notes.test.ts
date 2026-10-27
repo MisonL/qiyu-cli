@@ -28,7 +28,11 @@ beforeEach(() => {
   vi.stubEnv('QIYU_APP_SECRET', 's-test')
 })
 afterEach(() => {
-  vi.restoreAllMocks(); vi.unstubAllEnvs()
+  vi.restoreAllMocks()
+  // 与 tests/commands/api.test.ts 同款：stubBody 装的 fetch 是**全局**替身，
+  // restoreAllMocks 不管它 —— 不显式清掉会漏给同 worker 的后续用例。
+  vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -79,6 +83,7 @@ describe('api call 的图例与真实输出', () => {
     expect(meta().not_found).toBe(true)
     expect(meta().warning).toBeTruthy()
     expect(notes().not_found, '必须点明业务为空不置位').toContain('没有 not_found 不等于有数据')
+    expect(notes().not_found, '判据必须说清作用在解包后的 payload 上').toContain('判据作用在解包后的 payload 上')
     expect(notes().not_found).toContain('业务为空')
   })
 

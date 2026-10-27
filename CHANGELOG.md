@@ -16,8 +16,9 @@
     命令真的输出无 `meta` 的成功信封（`ok()` 的条件键行为仍在，但当前无命令触发）。
   · `data` 是**上游载荷**（按信封形状取 `data` / `result` / `staffInfo`），不是 CLI 的
     契约 —— 不点破，Agent 会按 `qiyu db tables` 的形状去读 `ticket.search` 的返回。
-  · `not_found` 只覆盖**结构性为空**（`data` 键缺失 / `{}` / `[]`）：业务为空（如
-    `ticket.search` 查到 0 条返回 `{total:0,tickets:[]}`）**不会置位** —— 没有
+  · `not_found` 只覆盖**结构性为空**（判据作用在解包后的 payload 上：`data` / `result`
+    形状下是 `{}` / `[]`，或整条 200 响应没有载荷键；`staffInfo` 恒不置位）：业务为空
+    （如 `ticket.search` 查到 0 条返回 `{total:0,tickets:[]}`）**不会置位** —— 没有
     `not_found` 不等于有数据。
   · `warnings` 没有软告警时不出现，`--no-validate` 时恒不出现；`note` 是注册表里的
     **静态说明**，不是本次调用的结果。
