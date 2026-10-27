@@ -147,6 +147,13 @@ describe('图例本身：键集、形态与「不撒谎」的措辞', () => {
     expect(p, 'skill 不得再把 data_coverage 说成「实际覆盖范围」而不加限定')
       .not.toContain('本地数据的实际覆盖范围')
     expect(p, 'skill 必须点明 MIN/MAX 看不见内部缺口').toContain('看不见内部缺口')
+    // ⚠️ skill 正文按行宽折行，短语会被换行切开 —— 先压掉空白再比，否则断言会因为
+    // 「没有时间\n过滤时」这种折行而假绿/假红（本条初版就漏了这个条件）。
+    const flat = p.replace(/\s+/g, '')
+    expect(flat, 'skill 也必须带兜底的触发条件（无过滤时不触发）')
+      .toContain('没有时间过滤时这条兜底不触发')
+    expect(md.replace(/\s+/g, ''), 'README 同样必须带触发条件')
+      .toContain('没有时间过滤时这条兜底不触发')
   })
 })
 
