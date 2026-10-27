@@ -27,6 +27,9 @@ beforeEach(() => {
   vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
   vi.spyOn(process.stderr, 'write').mockImplementation((x) => { out += 'ERR:' + x; return true })
   vi.stubEnv('HOME', dir) // 隔离真实 ~
+  // ⚠️ Windows 的 os.homedir() 读 USERPROFILE，不读 HOME（同 tests/commands/skill.test.ts
+  // 记过的病根）：只 stub HOME 的话，Windows 上 install 会把条目写进开发者的真实用户目录。
+  vi.stubEnv('USERPROFILE', dir)
   __setPlatform(() => 'darwin')
   __setRun(runMock)
   runMock.mockReset()
