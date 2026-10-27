@@ -405,7 +405,25 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 `stats fields <报表>` 的输出把**声明**与**观测**分开：`declared`（每条带 `source`：
 `design-doc` 实测 / `name-suffix` 命名推断）、`observed`（`rows_present` / `minus_one` /
 `nulls` / `min` / `max`）、`unknown_fields`（判不出单位的字段）、`sentinel`
-（`-1` = 该窗口或筛选条件没有匹配到数据，**不是负数比率**）。`-1` 是厂商未文档化的哨兵值，
+（`-1` = 该窗口或筛选条件没有匹配到数据，**不是负数比率**）。
+
+**`declared` 的取值**（Agent 按值分支；每个值都带释义与动作，见 `meta.field_notes`；
+本图例与源码枚举由 `tests/stats-field-notes.test.ts` 双向核对）：
+
+`declared.<字段>.unit` —— `ratio` 比率（实测样本 `assignedRatio=0.987` 是 0–1 的小数、
+**不是** 0–100 的百分数；但只有该字段经实测，其余 `ratio` 是命名推断，而 `observed` 的
+min/max **只能核对一致性、不是量纲证据** —— 量纲不明确时报告原值并标注不确定，不要自行
+换算成百分比）/ `count` 计数 / `ms` 毫秒（实测 `loginDuration` 天粒度 = 86400024）/
+`unknown` 判不出单位 —— **不是「没有单位」**，如实写「单位未知」、不要猜，这些字段同时
+列在 `unknown_fields`。
+
+`declared.<字段>.source` —— `design-doc` 设计稿实测明说（可信度最高）/ `name-suffix`
+按字段名后缀推断（`*Ratio`/`*Radio`→`ratio`、`*Count`/`sessions`→`count`、
+`*Duration`/`*Time`→`ms`）—— **是命名推断，不是实测**。
+
+`declared.<字段>.higher_is_better` —— **恒为 `null`**：设计稿与本 CLI 都没有
+「越大越好还是越小越好」的上游依据，不猜；不要把 `null` 读成「本字段恰好没测到」或
+把它当 `false`，判断趋势好坏只能由人给口径。`-1` 是厂商未文档化的哨兵值，
 `observed.minus_one` 与 `rows_present` 相等时说明该字段本次全是哨兵。
 ⚠️ 这是**聚合观测，不是逐行取值**：`rows_present` 为 1 时 `min` 与 `max` 都等于那一行的原值
 （例：薪资明细表只有一行时，极值就是该行金额）；`min`/`max` **排除 `-1` 哨兵**，因此某字段

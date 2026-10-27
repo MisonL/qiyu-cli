@@ -9,6 +9,35 @@
 
 ### 修复
 
+- **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
+  这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`
+  的 `unit`；绝不要猜百分比还是绝对值」），可它输出的 `declared.<字段>.unit` 四个取值
+  （`ratio`/`count`/`ms`/`unknown`）在 README 与 skill 正文里**一个释义都没有** ——
+  被告知「别猜」的 Agent 拿到 `unit: "ratio"` 之后，仍然得猜是 0–1 还是 0–100。
+  实测（2026-10-27）：`meta` 只有 `warnings` 一个键。修法：三组枚举改 `as const` 数组
+  （`METRIC_UNITS`/`METRIC_SOURCES`，类型由 `typeof ARR[number]` 派生）+ `satisfies
+  Record<枚举, string>` 的释义表 + `meta.field_notes` 逐值给出释义与动作
+  （`ratio` = 0–1 小数、实测样本 `assignedRatio=0.987`，**不是** 0–100 的百分数，且只有
+  该字段经实测、其余是命名推断；`ms` = 毫秒；`unknown` = 判不出单位，**不是「没有单位」**）。
+  新增 `tests/stats-field-notes.test.ts` 双向核对（枚举 ⊆ 图例、图例 ⊆ 枚举）+ README 图例，
+  断言取生产渲染路径 `statsFieldNotes()`；`tests/commands/stats.test.ts` 加行为用例钉住
+  「图例真的挂上了 `meta`」（单测绿不代表命令层挂上了）。变异 4 条全红。
+  skill `protocols.md` 同步指向 `meta.field_notes`，并**限定成立条件**：0–1 量纲只有
+  `assignedRatio` 经实测，其余 `ratio` 是命名推断；而 `observed` 的 min/max 只能核对
+  **一致性、不是量纲证据**（全落在 0–1 与「数值恰好都 <1% 的百分数」同样相容），量纲
+  不明确时报告原值并标注不确定，不要自行换算成百分比（CodeRabbit 两轮 —
+  第一次我只写了「先看 observed 核对」，仍然是把一致性当证据）。图例键的**路径形态**
+  也钉进测试：`declared` 是按字段名分组的对象（`declared.<字段>.unit`），`observed`
+  才是数组（`observed[].min`）—— 写成 `declared[].unit` 指的是一个不存在的路径
+  （CodeRabbit 抓到我最初就写错了）。
+
+- **`declared.higher_is_better` 恒为 `null` 却没有任何出处**。`src/` 里零个非 null 生产者
+  （设计稿从未给出「越大越好/越小越好」的依据，裁定不猜），但设计稿 §8 把它当作本命令的
+  卖点列出，输出里也从不解释 —— 第 2 种形态（声明了但没人读）：Agent 会一直等它变成
+  true/false，或把 `null` 当 `false`。修法：`meta.field_notes` 明写「恒为 null」+ 为什么
+  （设计稿 §9.2），并在测试里把这句话与**代码事实**绑住 —— 若未来某条声明填了非 null，
+  该用例会红、逼着图例同步改，而不是让「恒为 null」留在输出里骗 Agent。
+
 - **「清单缺失/损坏」的 skill 提示只推荐了一条只在半数成因下收敛的动词**。版本未知这一支
   （`.qiyu-skill.json` 没了或损坏）判不出**正文是否被手工改过**——探测刻意不读正文
   （设计稿 D2.1 的「零成本」）。此前文案只有「运行 `qiyu skill install` 更新」，实测
