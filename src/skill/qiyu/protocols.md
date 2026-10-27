@@ -38,7 +38,8 @@
      值），所以也**不是**「从未同步过」；更**不是**「正在同步」。判数据完整不要只看
      `range_status`，也不要只看 `gaps`——
      **空 `gaps` 不等于完整**（`windows.skipped > 0` 时可能没有缺口记录、但请求区间仍有
-     未覆盖段）。要同时看覆盖范围（`resolved_range` / `windows.skipped`）与历史缺口的新鲜度。
+     未覆盖段）。要同时看覆盖范围（`sync status` 的 `resolved_range`、以及 `sync run` 的
+     `windows.skipped` —— status 与 verify 都不输出后者）与历史缺口的新鲜度。
    - ⚠️ **`gaps` 是历史记录，不等于「当前仍缺」**：旧记录与新记录的 `reason` 相同，按
      `reason` 分不出新旧；`range` 也只能说明「相关」——换边界重跑后数据可能已补齐，而旧
      缺口的 `range` 仍与你评估的区间重叠。**没有一次覆盖核对就不能确认新鲜度**：写
