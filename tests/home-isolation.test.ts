@@ -39,7 +39,9 @@ function offendersIn(file: string): string[] {
   const check = (re: RegExp, want: RegExp, label: string, window: (i: number) => string[]): void => {
     lines.forEach((l, i) => {
       if (!isCode(l) || !re.test(l)) return
-      if (!want.test(window(i).join('\n'))) out.push(`${relative(ROOT, file)}:${i + 1} ${label}`)
+      // 配对搜索也要滤掉注释行 —— 否则把相邻的 USERPROFILE **注释掉**，
+      // 它仍会被 want 匹配到，守卫假绿（CodeRabbit 2026-10-28）。
+      if (!want.test(window(i).filter(isCode).join('\n'))) out.push(`${relative(ROOT, file)}:${i + 1} ${label}`)
     })
   }
   // HOME 的配对通常写在其后（可能隔一两行注释）；USERPROFILE 的配对写在其前。
