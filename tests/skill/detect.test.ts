@@ -15,8 +15,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
-  chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync,
-  writeFileSync,
+  chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
+  symlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { homedir } from 'node:os'
@@ -26,7 +26,7 @@ import {
   resetSkillDetectionCache, detectSkillState, entityUndeterminedNote, npmRelativeBase,
   resolveEntityDirSources, resolveSkillSourceDir, skillWarning,
 } from '../../src/skill/detect.js'
-import { contentHash, MANIFEST } from '../../src/skill/install.js'
+import { contentHash, installSkill, MANIFEST } from '../../src/skill/install.js'
 import { defaultEntityDir } from '../../src/skill/paths.js'
 import { setSkillWarning } from '../../src/output.js'
 import { run } from '../../src/cli.js'
@@ -87,6 +87,26 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true })
   resetSkillDetectionCache()
 })
+
+/**
+ * 本机能否建符号链接。非提权、未开 Developer Mode 的 Windows 上 `symlinkSync`
+ * 会抛 EPERM（CodeRabbit 2026-10-27）——两处「清单路径被非普通文件占用」的用例
+ * 用它当夹具，建不了就跳过，而不是让整份测试在该平台挂掉。
+ *
+ * 不用「目录当占用物」替代：目录会让 `readManifestStrict` 撞 EISDIR（非 ENOENT）
+ * → probe 收敛成 unknown → **根本不发这条提示**，测的就不是同一件事了（实测）。
+ * 不用 file symlink：Windows 上同为提权要求。
+ */
+function canSymlink(): boolean {
+  const probeDir = join(home, '.symlink-probe')
+  mkdirSync(probeDir, { recursive: true })
+  try {
+    symlinkSync(join(probeDir, 'target'), join(probeDir, 'link'))
+    return true
+  } catch {
+    return false
+  }
+}
 
 /** 写文件（自动建父目录）。 */
 function write(dir: string, rel: string, content: string): void {
@@ -531,17 +551,96 @@ describe('skillWarning —— 只在需要时给出一条可执行的提示', ()
     expect(msg).not.toContain('与当前 CLI 版本不一致')
   })
 
-  it('stale 且安装版本未知：不编造版本号，用「无法确认版本」措辞，且不推 --force（brief D7）', () => {
+  it('stale 且安装版本未知：不编造版本号，且两个动词都要给出（清单没了就判不出正文是否漂移）', () => {
     const msg = skillWarning({ kind: 'stale', installedVersion: 'unknown' }, { currentVersion: '1.0.0' })
     expect(msg).toBeDefined()
     expect(msg).toContain('无法确认已安装 skill 的版本')
     expect(msg).toContain('安装清单缺失或损坏')
     expect(msg).not.toContain('安装于 unknown')
-    // 清单缺失/损坏、正文与包内一致 → planInstall 返回 rewrite-manifest：
-    // 不带 --force 的 `qiyu skill install` 只补写清单、不动正文字节。
-    // 推 --force 会让用户误以为要覆盖正文（另两支才需要，见上面两条用例）。
+    // ⚠️ 2026-10-27 实测修：这一支判不出正文是否被手工改过（探测不读正文，D2.1 零成本），
+    // 而裸 `qiyu skill install` 只在「正文与包内一致」时收敛（rewrite-manifest）；
+    // 正文漂移时它是 skipped + 零写入、提示原样还在 —— 实测跑了一轮才收敛到 --force。
+    // 所以两个动词都要给、各自注明条件（记忆：提示里的动词必须覆盖该状态的所有成因）。
     expect(msg).toContain('`qiyu skill install`')
-    expect(msg).not.toContain('--force')
+    expect(msg).toContain('`qiyu skill install --force`')
+    expect(msg).toContain('正文与包内一致')
+    expect(msg).toContain('跳过不覆盖')
+    // 清单被占用时**两个**动词都失效 —— 前提必须说全（2026-10-27 实测，见下一个用例）
+    expect(msg).toContain('非普通文件')
+    // 清单被占用时清单写不进去；但 --force 仍会覆盖正文 —— 不能笼统说「都不会覆盖」
+    expect(msg).toContain('清单写不进去')
+    expect(msg).toContain('先清理该占用')
+  })
+
+  it('提示里的动词必须收敛：清单损坏 + 正文漂移时，照裸 install 跑完提示原样还在（实测）', async () => {
+    // ⚠️ 2026-10-27 实测：清单没了 → 探测判不出正文是否被手工改过（D2.1 不读正文）。
+    // 此前这一支只推裸 `qiyu skill install`，而它在「正文漂移」这一半成因上是
+    // skipped + 零写入 —— 用户照做，提示原样还在（第 5 种形态：指向一条走不通的路）。
+    // 本用例真的把两个动词各跑一遍，钉住「裸 install 不收敛、--force 收敛」这个事实，
+    // 从而钉住文案必须两个都给出。
+    const src = makeSource()
+    const entity = join(home, 'entity')
+    write(entity, 'SKILL.md', '# qiyu\n')
+    write(entity, MANIFEST, '{ 残缺的 JSON')
+    writeFileSync(join(entity, 'SKILL.md'), '# 用户改过的正文\n')  // 正文漂移
+
+    const warn = skillWarning(detectSkillState(entity, src, '1.0.0'), { currentVersion: '1.0.0' })
+    expect(warn).toContain('`qiyu skill install --force`')
+
+    const opts = { home, entityDir: entity, sourceDir: src, version: '1.0.0', noLink: true }
+    // 裸 install：skipped、零写入、状态仍是 stale（提示不会消失）
+    const bare = await installSkill({ ...opts, force: false })
+    expect(bare.status).toBe('skipped')
+    resetSkillDetectionCache()  // 探测有缓存：不重置就会读到安装前那次的结果
+    expect(detectSkillState(entity, src, '1.0.0').kind).toBe('stale')
+
+    // --force：收敛（状态回到 current，提示消失）
+    const forced = await installSkill({ ...opts, force: true })
+    expect(forced.status).toBe('updated')
+    resetSkillDetectionCache()
+    expect(detectSkillState(entity, src, '1.0.0').kind).toBe('current')
+  })
+
+  it('清单路径被非普通文件占用 + 正文一致：两个动词都零写入，提示不会消失', async () => {
+    // 实测（2026-10-27）：清单是个悬空符号链接、正文与包内一致 → 裸 install 与
+    // --force 都返回 skipped，实体一个字节没变、提示原样还在。只给裸 install 加
+    // 「正文一致即收敛」的前提，会让人以为 --force 能救这种情况。
+    const src = makeSource()
+    const entity = join(home, 'entity')
+    write(entity, 'SKILL.md', '# qiyu\n')
+    write(entity, 'protocols.md', '协议正文\n')
+    if (!canSymlink()) return // 非提权的 Windows 建不了符号链接（CodeRabbit）
+    symlinkSync(join(entity, 'nowhere.json'), join(entity, MANIFEST))
+
+    expect(detectSkillState(entity, src, '1.0.0').kind).toBe('stale')
+    const opts = { home, entityDir: entity, sourceDir: src, version: '1.0.0', noLink: true }
+    const bare = await installSkill({ ...opts, force: false })
+    const forced = await installSkill({ ...opts, force: true })
+    expect(bare.status, '裸 install 不覆盖被占用的清单').toBe('skipped')
+    expect(forced.status, '--force 同样不覆盖').toBe('skipped')
+    expect(bare.warnings.join('\n'), 'warning 必须点名被占用的路径').toContain(MANIFEST)
+    resetSkillDetectionCache()
+    expect(detectSkillState(entity, src, '1.0.0').kind, '提示不会消失').toBe('stale')
+  })
+
+  it('清单路径被占用 + 正文漂移：--force 只覆盖正文，清单仍写不进去、提示不会消失（CodeRabbit）', async () => {
+    // 部分写入：`--force` 的写盘路径先换正文、再写清单；清单路径被占时前半成功、
+    // 后半进 warnings —— 结果是 status=updated 但探测仍报 stale。
+    // 所以提示里**不能**说「两个命令都不会覆盖」（那只对清单成立）。
+    const src = makeSource()
+    const entity = join(home, 'entity')
+    write(entity, 'SKILL.md', '# 用户改过的正文\n')
+    write(entity, 'protocols.md', '协议正文\n')
+    if (!canSymlink()) return // 同上
+    symlinkSync(join(entity, 'nowhere.json'), join(entity, MANIFEST))
+
+    const opts = { home, entityDir: entity, sourceDir: src, version: '1.0.0', noLink: true }
+    const forced = await installSkill({ ...opts, force: true })
+    expect(forced.status, '正文被换掉了，状态如实报 updated').toBe('updated')
+    expect(forced.warnings.join('\n'), '清单写不进去必须进 warnings').toContain(MANIFEST)
+    expect(readFileSync(join(entity, 'SKILL.md'), 'utf8'), '正文确实被覆盖').toBe('# qiyu\n')
+    resetSkillDetectionCache()
+    expect(detectSkillState(entity, src, '1.0.0').kind, '清单没写成 → 仍 stale').toBe('stale')
   })
 
   it('current / unknown：不提示', () => {
