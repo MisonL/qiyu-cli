@@ -164,7 +164,14 @@ function realpathOrSelf(p: string): string {
   }
 }
 
-export type LinkState = 'ok' | 'dangling' | 'foreign' | 'missing'
+/**
+ * `skill where` 的 `links[].state` 与 `entity.state` 的全部取值 —— Agent 按值分支，
+ * 所以每个值都必须在 `meta.field_notes`（README 同步）有释义与动作
+ * （`tests/skill-field-notes.test.ts` 双向核对）。
+ * 命令层还会追加 `'unknown'`（无法判定 ≠ 不存在，见 `commands/skill.ts`）。
+ */
+export const LINK_STATES = ['ok', 'dangling', 'foreign', 'missing'] as const
+export type LinkState = typeof LINK_STATES[number]
 
 /**
  * 判定 `linkPath` 相对 `entityDir` 的状态。

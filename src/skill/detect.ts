@@ -267,7 +267,9 @@ export function skillWarning(
  * 安装通道（spec C5），命令层与探测层都必须认识它——否则「装到自定义目录」之后每条命令
  * 都误报「未安装」并建议再装一份（终审 I2）。
  */
-export type EntitySource = '--dir' | 'QIYU_SKILL_DIR' | 'npm_config_qiyu_skill_dir' | 'default'
+/** 实体目录来源（优先级即数组顺序）—— 输出里的 `entity.source`/`entity_source` 取值。 */
+export const ENTITY_SOURCES = ['--dir', 'QIYU_SKILL_DIR', 'npm_config_qiyu_skill_dir', 'default'] as const
+export type EntitySource = typeof ENTITY_SOURCES[number]
 
 /** 实体目录「没有确定」的原因——`skill where` 据此如实解释，而不是让下游静默。 */
 export type EntityUndeterminedReason = 'env' | 'node-test'

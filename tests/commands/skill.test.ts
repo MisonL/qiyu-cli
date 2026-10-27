@@ -133,6 +133,24 @@ describe('skill install', () => {
     expect(existsSync(join(home, '.codex'))).toBe(false)
   })
 
+  it('内容一致但链接缺失 → status=skipped，链接仍会被重建（「零写入」只针对实体正文）', async () => {
+    // ⚠️ 2026-10-27 CodeRabbit 实测指出：`linkAgents` 在 `!noLink` 时**总是**执行，
+    // 与 plan 是否 skipped 无关。所以「skipped = 零写入」这句话如果不说范围，
+    // Agent 会以为链接也没动、不去看 links[]。本用例把真实行为钉住。
+    mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    expect(data().status).toBe('installed')
+    const linkPath = join(home, '.claude', 'skills', 'qiyu')
+    expect(existsSync(linkPath)).toBe(true)
+    // 删掉链接，正文与清单保持最新 → 计划 skipped，但链接必须被重新建出来
+    rmSync(linkPath)
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    expect(data().status, '实体正文一致 → skipped').toBe('skipped')
+    expect(existsSync(linkPath), '链接仍被重建').toBe(true)
+    expect(linkOf('claude-code')).toMatchObject({ state: 'ok' })
+  })
+
   it('再跑一次 → 0，幂等跳过，meta.warnings 提到已存在', async () => {
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
     out = ''; err = ''
