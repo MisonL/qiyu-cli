@@ -13,6 +13,7 @@ beforeEach(() => {
   vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
   vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
   vi.stubEnv('HOME', dir)   // 隔离真实 ~
+  vi.stubEnv('USERPROFILE', dir)
 })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }) })
 const data = (): Record<string, unknown> => JSON.parse(out).data
@@ -92,6 +93,7 @@ describe('store init', () => {
 
   it('不创建配置文件（验收 45：文件系统事实，非字段自洽）', async () => {
     vi.stubEnv('HOME', dir)
+    vi.stubEnv('USERPROFILE', dir)
     await storeCommand(['init', '--db', dbPath()])
     expect(data().config_exists).toBe(false)
     // 直接断言文件系统：配置文件不存在（若实现误创建则此处必红）
@@ -192,6 +194,7 @@ describe('store 命令面与 help', () => {
 
   it('配置层 usage 错误端到端 → 退出码 2（验收 8/9/11/40 的命令级链路，I 组 M1）', async () => {
     vi.stubEnv('HOME', dir)
+    vi.stubEnv('USERPROFILE', dir)
     // ① 配置含未知键 → resolveStoreConfig 抛 → usageFail（验收 8）
     const cfgDir = join(dir, '.config', 'qiyu')
     mkdirSync(cfgDir, { recursive: true })

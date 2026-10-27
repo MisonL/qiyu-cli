@@ -30,6 +30,7 @@ beforeEach(() => {
   vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
   vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（store 配置与默认库路径都走 HOME）
+  vi.stubEnv('USERPROFILE', dir)
   vi.stubEnv('QIYU_APP_KEY', 'test-key')
   vi.stubEnv('QIYU_APP_SECRET', 'test-secret')
   __resetPermissionWarnings()   // 模块级警告去重表：用例之间必须互不污染
@@ -1197,6 +1198,7 @@ describe('sync install', () => {
     out = ''
     // 两者都没给：不追加（默认值固化会引入漂移 —— 批 4 的既定裁定，env 缺席时不改）
     vi.stubEnv('HOME', dir)   // unstubAllEnvs 会清掉 HOME，重装
+    vi.stubEnv('USERPROFILE', dir)
     await fresh().then((s) => s.close())
     const cfgDir = join(dir, '.config', 'qiyu')
     mkdirSync(cfgDir, { recursive: true })

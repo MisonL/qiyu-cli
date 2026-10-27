@@ -167,6 +167,7 @@ describe('COMMAND_TREE', () => {
     // 不会写盘。`--link` 取真实 agent 名，避免「未知 agent」先于未知参数检测失败。
     const FAKE_HOME = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-tree-')))
     vi.stubEnv('HOME', FAKE_HOME)
+    vi.stubEnv('USERPROFILE', FAKE_HOME)
     try {
     for (const s of COMMAND_TREE) {
       const key = s.path.join(' ')

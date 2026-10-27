@@ -87,6 +87,7 @@ describe('默认提供者：endpoint → 本地表映射', () => {
   it('库文件不存在 → 不给建议（映射存在还不够）', () => {
     pointConfigAt(join(home, 'nope.duckdb'))
     vi.stubEnv('HOME', home)
+    vi.stubEnv('USERPROFILE', home)
     expect(localFallbackProvider('ticket.search')).toBeUndefined()
   })
 
@@ -95,6 +96,7 @@ describe('默认提供者：endpoint → 本地表映射', () => {
     mkdirSync(dirPath)
     pointConfigAt(dirPath)
     vi.stubEnv('HOME', home)
+    vi.stubEnv('USERPROFILE', home)
     expect(localFallbackProvider('ticket.search')).toBeUndefined()
   })
 
@@ -103,6 +105,7 @@ describe('默认提供者：endpoint → 本地表映射', () => {
     writeFileSync(dbPath, '')
     pointConfigAt(dbPath)
     vi.stubEnv('HOME', home)
+    vi.stubEnv('USERPROFILE', home)
     expect(localFallbackProvider('ticket.search')).toEqual({ tables: ['tickets', 'ticket_logs'] })
   })
 
@@ -113,6 +116,7 @@ describe('默认提供者：endpoint → 本地表映射', () => {
     writeFileSync(p, '{不是 JSON')
     chmodSync(p, 0o600)
     vi.stubEnv('HOME', home)
+    vi.stubEnv('USERPROFILE', home)
     // ⚠️ 配置文件坏了是**另一条**错误路径的全部问题；这里只要求它不污染限流错误。
     expect(() => localFallbackProvider('ticket.search')).not.toThrow()
     expect(localFallbackProvider('ticket.search')).toBeUndefined()
@@ -123,6 +127,7 @@ describe('默认提供者：endpoint → 本地表映射', () => {
     writeFileSync(dbPath, '')
     pointConfigAt(dbPath)
     vi.stubEnv('HOME', home)
+    vi.stubEnv('USERPROFILE', home)
     expect(localFallbackProvider('message.send')).toBeUndefined()
   })
 })
