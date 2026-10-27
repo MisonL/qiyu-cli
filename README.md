@@ -368,8 +368,8 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 `range_status=complete` 只说明水位推进过（见上表）——2026-10-27 实测：3 窗中窗失败的库，
 `verify` 直接给出 `drift: []` + 退出码 0，而 `sync_gaps` 里那条 `fetch_failed` 仍在。
 （快照任务另有上游行数核对，见上 `expected_from_api`。）windowed 的完整性要另行核对
-`sync status` 的 `gaps`（能否确认新鲜度见该段说明）与 `resolved_range` /
-`windows.skipped` 的覆盖范围。
+两处：`sync status` 的 `gaps` 与 `resolved_range`（能否确认新鲜度见该段说明），以及
+`sync run` 的 `windows.skipped`（本命令与 `sync status` 都不输出它）。
 
 **聚合报表按天切片（窗口 1 天）**：九个报表接口返回的是**窗口聚合值**（`overview` 一行
 全局汇总、`staffworklod` 每客服一行、`transferHuman` 恒 1 行），响应里的 `date` 原文是

@@ -114,10 +114,12 @@ export function verifyFieldNotes(): Record<string, string> {
     state_windows_consistent: 'true = sync_state 记录为「水位已推进且 range_status=complete」。'
       + '⚠️ 这不代表数据完整；drift 为空 / 退出码 0 同样不能当完整性证据 —— '
       + '对 windowed 任务本命令只核对同步状态记录（实测中窗失败的库同样给 drift: [] 且'
-      + '退出码 0），快照任务则另有上游行数核对。windowed 的完整性要另行核对 sync status 的 '
-      + 'gaps（能否确认新鲜度见该字段的说明）与 resolved_range/windows.skipped 的覆盖范围',
-    expected_from_api: 'null 有两种成因，用 kind 区分：windowed 任务不做上游全量重拉'
-      + '（成本高，恒为 null），或快照任务的上游取数失败（此时 drift 里有 fetch_failed）',
+      + '退出码 0），快照任务则另有上游行数核对。windowed 的完整性要另行核对两处：'
+      + 'sync status 的 gaps 与 resolved_range（能否确认新鲜度见该字段的说明），'
+      + '以及 sync run 的 windows.skipped（本命令与 status 都不输出它）',
+    expected_from_api: 'null 有两种成因，看 drift 里有没有 fetch_failed 区分：'
+      + 'windowed 任务不做上游全量重拉（成本高，恒为 null）；快照任务则是上游取数失败'
+      + '（此时 drift 里有 kind=fetch_failed 的条目）',
     'drift[].kind': '取值与动作见 README 的 drift 图例',
     'drift[].detail': '给人读的中文说明；程序判断请用 kind',
   }
@@ -132,7 +134,8 @@ export function tasksFieldNotes(): Record<string, string> {
     unsupported: '明确不做同步的数据集及原因（不是遗漏）。目前唯一取值 realtime = '
       + '实时快照，数据随推随逝、不可回放——这类数据只能走 api call 实时取，别去 sync run 里找',
     'tasks[].watermark.initial': '恒为 null —— 全部 21 个任务都没有声明初始水位'
-      + '（首跑从 0 / --since 起）。看到非 null 才需要按它解释续跑起点',
+      + '（首跑从 0 或 --since 起；声明了 windowStartFloorDays 的任务还会被抬到'
+      + ' now − N 天，因为接口物理上给不出更早的数据）。看到非 null 才需要按它解释续跑起点',
     'tasks[].sensitive_columns': '该表标注为敏感的 PII 列清单（来自 schema 的声明闭集）。'
       + '查询这些列会默认脱敏；不要 SELECT *',
   }

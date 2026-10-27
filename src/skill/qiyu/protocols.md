@@ -47,7 +47,8 @@
      读——`windows.succeeded` 是成功窗数（空窗也算成功），`rows.written` 才是落库行数。
    - ⚠️ **`sync verify` 的 `drift` 为空 / 退出码 0 不能当完整性证据**：对 windowed 任务
      它只核对同步状态记录（实测中窗失败的库同样给 `drift: []` + 退出码 0），快照任务另有
-     上游行数核对。windowed 的完整性要另行核对 `gaps` 与 `resolved_range`/`windows.skipped`。
+     上游行数核对。windowed 的完整性要另行核对两处：`sync status` 的 `gaps` 与
+     `resolved_range`，以及 `sync run` 的 `windows.skipped`（status/verify 都不输出它）。
    - ⚠️ `locked: true` 是**残留的写者章**（上一轮被强杀），不是「正在同步中」——真持锁的
      写者会让 `sync status` 先退避等待，等到后读到的是那一轮的结果。重跑 `sync run` 即可。
 3. **真的没有数据**。

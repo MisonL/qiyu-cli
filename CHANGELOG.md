@@ -69,6 +69,11 @@
   首窗失败」会回到 `pending` 而 `watermark` **保留上一轮的值**；改成「最近一次运行没有
   成功推进水位」并列出三种误读。两条各补变异验证，另加一条**分隔符守卫**（枚举释义正文
   不得含 `；`，否则 `renderNotes` 的反向解析会产生幽灵取值 —— 这个坑本轮踩了两次）。
+  **自查补三处**（CodeRabbit 配额用尽期间自己复审）：⑫ verify 的替代路径把
+  `windows.skipped` 说成 `sync status` 里有的 —— status 与 verify 都不输出它，必须点名去
+  `sync run` 找；⑬ `expected_from_api` 的「用 kind 区分」含糊（kind 是 drift 条目的字段），
+  改成「看 drift 里有没有 fetch_failed」；⑭ `watermark.initial` 的「首跑从 0 起」漏了
+  `windowStartFloorDays` 的抬升（接口物理上给不出更早的数据）。⑫ 补变异验证。
 
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
   这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`

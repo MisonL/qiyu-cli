@@ -263,6 +263,9 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     expect(verifyNotes, '必须限定到 windowed，不能否认快照任务的远端核对')
       .toContain('对 windowed 任务')
     expect(verifyNotes, '快照任务的核对路径必须保留').toContain('快照任务则另有上游行数核对')
+    // 自查（2026-10-27）：verify 的替代路径一度把 windows.skipped 说成 status 里有的 ——
+    // status 与 verify 都不输出它，必须点名去 sync run 找。
+    expect(verifyNotes, 'windows.skipped 必须指向 sync run').toContain('sync run 的 windows.skipped')
     // 会话里给 Agent 的主入口（skill 正文）也必须带这两条，不能只在 README
     const p = read('src/skill/qiyu/protocols.md')
     expect(p).toContain('两个取值字面都在撒谎')
