@@ -46,6 +46,26 @@ export type WriteStrategy =
   }
   | { kind: 'upsertRows' }
 
+/**
+ * 任务层 `gapHint.reason` 的**全部取值**（业务提示类缺口）。
+ *
+ * ⚠️ 与引擎侧四个失败原因（`ENGINE_GAP_REASONS`，见 engine.ts）共同构成
+ * `sync_gaps.reason` / `sync status` 的 `gaps[].reason` / `sync run` 的 `gaps[].reason`
+ * 的完整值域 —— 消费方（Agent）按值分支，所以这里的每个值都必须在 README 图例里有
+ * 释义与动作（`tests/sync-enums.test.ts` 钉住两个方向：枚举 ⊆ 图例、图例 ⊆ 枚举）。
+ *
+ * 与失败类缺口的区别：这些是**成功窗上的提示** —— 窗口数据照常提交，`gaps` 非空
+ * 不等于同步失败。此前类型是 `string`、引擎用 `as WindowGapReason` 强转，把
+ * 「类型只声明四个」的谎报压了下去（2026-10-27 修）。
+ */
+export const TASK_GAP_REASONS = [
+  'knowledge_row_malformed',    // 快照映射时缺键列的行被丢弃（响应形态漂移）
+  'filter_matched_no_staff',    // 报表筛选条件未命中任何客服（本窗按 0 行记）
+  'export_fixture_unreported',  // 导出流未上报窗口声明行（空窗可能真空也可能被截断）
+  'export_window_mismatch',     // 导出声明的窗口宽于请求（重叠行幂等吸收）
+] as const
+export type TaskGapReason = typeof TASK_GAP_REASONS[number]
+
 /** fetch 结果：rows 是未 enrich 的原始行；apiCount 是 API 侧声称的行数（配对核对基准）。 */
 export interface FetchResult {
   rows: Record<string, unknown>[]
@@ -53,7 +73,7 @@ export interface FetchResult {
   apiCount?: number
   /** 引擎可在此窗口记一条 gap（如 order_performance 的 orders:null 筛选失败，spec §5.2）。 */
   gapHint?: {
-    reason: string
+    reason: TaskGapReason
     detail: string
     /**
      * 会话导出尾部标记行原文（C-8）：`startTime=…,endTime=…`，**导出自己的窗口声明**，

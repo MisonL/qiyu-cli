@@ -25,7 +25,12 @@
 1. **窗口写错**：相对时间按上海时区解析，而 Agent 常跑在 UTC 容器里——「昨天」可能不是
    人类说的昨天，且不会报任何错。
 2. **本地还没同步到这段**：用 `qiyu sync status` 看水位与缺口；`qiyu sync verify` 可以核对
-   本地与远端的一致性（发现漂移时以非零退出码明示）。
+   本地与远端的一致性——但**只有快照任务**与远端行数核对（`expected_from_api`），windowed
+   任务不请求远端、只核对本地行数与同步状态记录，**drift 为空不代表与远端一致**（发现
+   漂移时以非零退出码明示）。缺口先看 `gaps[].reason`：
+   `rate_limit_local` 等到 `detail` 里的时刻再重跑，`fetch_failed`/`write_failed`/
+   `count_mismatch` 重跑 `sync run` 覆盖该区间；`knowledge_row_malformed`/
+   `filter_matched_no_staff`/`export_*` 是**成功窗上的提示**（数据未必缺，按 `detail` 判断）。
 3. **真的没有数据**。
 
 报告 0 行时写「查询窗口 X 到 Y 内 0 行」，并说明排除了哪几种成因；不要写「系统里没有」。

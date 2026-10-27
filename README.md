@@ -303,6 +303,29 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区�
 `payload` 列在列内，它是整行 PII 的完整副本，不要 `SELECT *`）。本阶段**没有**任务的
 启用/停用机制：注册表里的任务总是全部执行（选定任务靠命令行显式列出）。
 
+**`gaps[].reason` 的全部取值**（Agent 按值分支；`sync run` 的 `gaps` 条目不含
+`recorded_at`，是本轮即时产出）：
+
+| reason | 含义 | 该做什么 |
+|---|---|---|
+| `rate_limit_local` | 本地限频冷却未到点（持久化冷却，跨进程有效） | 等到 `detail` 里的时刻再重跑覆盖该区间；提前重跑必然再失败 |
+| `fetch_failed` | 取数失败（有界重试后仍失败，本窗未写入） | 稍后重跑覆盖该区间 |
+| `write_failed` | 落库失败（事务已回滚，本窗未写入） | 检查本地库（锁/磁盘）后重跑 |
+| `count_mismatch` | 写入意图行数 ≠ API 声明行数（事务已回滚） | 重跑；持续不符报告人类 |
+| `knowledge_row_malformed` | 快照映射时缺键列的行被丢弃（响应形态漂移） | 报告人类核对接口形态；快照全删重插下这些行已消失 |
+| `filter_matched_no_staff` | 报表筛选条件未命中任何客服（本窗按 0 行记） | 结合筛选条件判断——它不是「没有数据」的证据 |
+| `export_fixture_unreported` | 导出流未上报窗口声明行，空窗可能真空也可能被截断 | 抽查该窗行数，必要时重跑 |
+| `export_window_mismatch` | 导出声明的窗口宽于请求（重叠行由幂等 upsert 吸收） | 数据不受损，知悉即可 |
+
+⚠️ 后四个是**成功窗上的业务提示**（窗口数据照常提交）：`gaps` 非空不等于同步失败，
+按 reason 区分「失败缺口」与「提示」。新增 reason 必须同时更新本表与源码枚举
+（`tests/sync-enums.test.ts` 双向核对）。
+
+**`drift[].kind` 的全部取值**（`sync verify`）：`not_synced`（从未同步 → 先 `sync run`）、
+`state_pending`（上次运行未完成或中断 → 重跑 `sync run` 补全后再 verify）、
+`count_mismatch`（本地行数 ≠ 上游行数，仅快照任务 → 重跑覆盖，持续不符报告人类）、
+`fetch_failed`（上游取数失败，**无法核对 ≠ 一致** → 稍后重试 verify）。
+
 **聚合报表按天切片（窗口 1 天）**：九个报表接口返回的是**窗口聚合值**（`overview` 一行
 全局汇总、`staffworklod` 每客服一行、`transferHuman` 恒 1 行），响应里的 `date` 原文是
 "this date has no specific meaning, it only indicates the start time of the current query"

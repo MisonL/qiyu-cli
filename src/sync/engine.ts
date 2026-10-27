@@ -39,7 +39,7 @@ import { isLockError } from '../store/retry.js'
 import { clampGateWait } from './rate-gate.js'
 import { shanghaiDayIso, shanghaiDayStart, shanghaiYesterdayStart } from './day.js'
 import type {
-  SyncTask, RunCtx, TaskRunResult, GapInfo, WindowRef, FetchCtx, FetchResult,
+  SyncTask, RunCtx, TaskRunResult, GapInfo, WindowRef, FetchCtx, FetchResult, TaskGapReason,
 } from './types.js'
 
 const DAY = 86_400_000
@@ -47,8 +47,23 @@ const DAY = 86_400_000
 /** 回看毫秒数：水位续跑的起点回退量（overlapDays 天；0 = 不回看）。 */
 const overlapDaysOf = (task: SyncTask): number => (task.overlapDays ?? 0) * DAY
 
-/** 窗口级 gap 的 reason（sync_gaps.reason 的引擎侧取值 + 任务 gapHint 的业务 reason）。 */
-type WindowGapReason = 'count_mismatch' | 'fetch_failed' | 'write_failed' | 'rate_limit_local'
+/**
+ * 窗口级 gap 的 reason —— **完整值域 = 引擎侧失败原因 ∪ 任务层业务提示**
+ * （`sync_gaps.reason` / `gaps[].reason` 的取值都来自这两组）。
+ *
+ * ⚠️ 2026-10-27 修：此前 `WindowGapReason` 只声明引擎侧四个，任务 `gapHint.reason`
+ * 是 `string` 且落库处用 `as WindowGapReason` 强转 —— 类型对运行时谎报（业务 reason
+ * 真实存在于库里），且 8 个值全仓无图例。现在两组都是 `as const` 数组（可导出、
+ * 可被测试逐项核对），README 图例由 `tests/sync-enums.test.ts` 双向钉住。
+ */
+export const ENGINE_GAP_REASONS = [
+  'count_mismatch',     // 写入意图行数 ≠ API 声明行数（事务已回滚）
+  'fetch_failed',       // 取数失败（有界重试后仍失败，本窗未写入）
+  'write_failed',       // 落库失败（事务已回滚，本窗未写入）
+  'rate_limit_local',   // 本地限频冷却未到点（持久化冷却）
+] as const
+export type EngineGapReason = typeof ENGINE_GAP_REASONS[number]
+export type WindowGapReason = EngineGapReason | TaskGapReason
 
 /** 盖在 sync_state.locked_by 上的进程标识（E 中-1：status 的 locked 字段据此为真）。 */
 const lockOwner = (): string => `pid ${process.pid}`
@@ -594,7 +609,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       // T5 裁定（T7 接线）：透传 hint 的原始 reason（filter_matched_no_staff 等），
       // 不压成统一 fetch_failed——缺口原因在 sync_gaps 里必须可分派。
       if (fetchRes.gapHint) {
-        await storeGap(ctx, task, w, fetchRes.gapHint.reason as WindowGapReason,
+        await storeGap(ctx, task, w, fetchRes.gapHint.reason,
           gapHintDetail(fetchRes.gapHint), gaps)
       }
 
@@ -706,7 +721,7 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     // T5 裁定（T7 接线）：透传 hint 的原始 reason，不压成统一 fetch_failed ——
     // 缺口原因在 sync_gaps 里必须可分派（与 runWindowed 的 gapHint 路径同口径）。
     if (fetchRes.gapHint) {
-      await storeGap(ctx, task, resolvedRange, fetchRes.gapHint.reason as WindowGapReason,
+      await storeGap(ctx, task, resolvedRange, fetchRes.gapHint.reason,
         gapHintDetail(fetchRes.gapHint), gaps)
     }
     progress(`[${task.id}] 快照完成：拉取 ${fetchRes.rows.length} 行，写入 ${written} 行`)
@@ -906,7 +921,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
           continue
         }
         if (fetchRes.gapHint) {
-          await storeGap(ctx, task, w, fetchRes.gapHint.reason as WindowGapReason,
+          await storeGap(ctx, task, w, fetchRes.gapHint.reason,
             gapHintDetail(fetchRes.gapHint), plan.gaps)
         }
         progress(`[${task.id}] 轮转 round ${round + 1}/${maxRounds} 完成：拉取 ${fetchRes.rows.length} 行，写入 ${kept.length} 行`)
