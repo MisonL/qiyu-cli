@@ -99,7 +99,7 @@ describe('图例本身：键集、形态与「不撒谎」的措辞', () => {
     await seed()
     await q('--table', 'daily_overview')
     // ⚠️ 必须显式断言 field_notes 存在：把它从键集里过滤掉再比较，等于没断言它被挂上
-    //（本文件初版就犯了这个错，删掉 --table 的 field_notes 时 17 条全绿）。
+    //（本文件初版就犯了这个错，删掉 --table 的 field_notes 时当时 17 条全绿）。
     expect(meta().field_notes, '--table 通道必须带 field_notes').toBeDefined()
     // ⚠️ 还要比对**实际发出**的图例键集：只断言「存在」的话，某个通道只发
     // `{resolved_range: …}` 也能过（CodeRabbit 抓到的第二个假护栏）。
