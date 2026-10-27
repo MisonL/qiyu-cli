@@ -28,7 +28,8 @@ function renderNotes(notes: Record<string, string>): string {
  *  · `pending` ≠ 「一行都没写」：首窗失败时 watermarkRange 为 null，后续成功窗
  *    照常落库但不推水位 → pending 而表里有数据。它只说明「水位没动过」。
  *  · `null` = 该任务在 sync_state 里**没有行**（从未跑过，或只跑过被跳过的残段窗）。
- * 所以判「这段数据完整吗」只能看 `gaps`，不能看 `range_status`。
+ * 所以判「这段数据完整吗」不能看 `range_status`：要看 `gaps` 与覆盖范围，
+ * 且 `gaps` 是历史记录、需另行确认新鲜度（见 `statusFieldNotes()` 的 gaps 说明）。
  */
 export const RANGE_STATUS_NOTES = {
   pending: '水位没动过（该任务尚未成功推进过水位）。⚠️ 不代表库里没有数据：'
