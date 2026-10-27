@@ -9,6 +9,23 @@
 
 ### 修复
 
+- **`sync install` / `sync uninstall` 的四种输出都没有图例，且 `commands[].ok` 是三值**。
+  2026-10-28 实测：
+  · `commands[].ok` 是 `null`（dry-run 未执行）/ `true` / `false` 三值 —— Agent 按布尔值
+    读会把「没执行」当成「失败」。`dry_run` 才是「装没装」的判据，退出码不是：真实安装
+    即便某条调度命令失败（退出码 1），条目文件也已经写进去了。
+  · `entries[]` / `remove[]` 是**对象数组**（`{path, content}` / `{path, exists}`），不是
+    路径字符串；`remove[].exists` 是**计划生成那一刻的探测快照**，不是承诺。
+  · `uninstall` 的 `absent` 是**条件键**：为空时整个键不出现。
+  · `uninstall --yes` 在从未安装时 `commands` 是空数组 —— 那是没有可停的调度器，不是
+    执行失败；`notes` 会说原因。
+  · 顺带修正一条自己写错的释义：`platform` 原写「其他平台直接报不支持」，而 **win32 是
+    支持的**（schtasks），只有 darwin/linux/win32 之外的平台才报错。
+  修法：`sync-notes.ts` 新增 `SYNC_INSTALL_MODES` + `syncInstallFieldNotes(mode)`，四个
+  分支（install/uninstall × dry-run/--yes）各挂一份只解释**该输出里真实存在**的键。
+  新增 `tests/sync-install-notes.test.ts`（11 条，含真实 DuckDB 与真实文件写入/删除）。
+  测试的**反向兜底下沉到元素层**：只查顶层键时，同一数组里删掉一个元素键（还有别的键
+  顶着）两个方向都查不到 —— 变异 M5 就是这么活下来的。变异 9 条全红。
 - **最后三处无图例的输出：`skill where` 的 `cli_contract_version`、`--version`、`auth login`**。
   2026-10-28 实测：
   · **`skill where` 输出 `cli_contract_version`，图例里却没有它** —— 既有图例测试只查了

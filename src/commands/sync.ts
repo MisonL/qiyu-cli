@@ -30,7 +30,7 @@ import { dirname } from 'node:path'
 import { SYNC_TASKS, taskById, UNSUPPORTED_DATASETS } from '../sync/registry.js'
 import { listGaps, listWatermarks } from '../sync/state.js'
 import type { SyncTask } from '../sync/types.js'
-import { statusFieldNotes, tasksFieldNotes, verifyFieldNotes } from './sync-notes.js'
+import { statusFieldNotes, syncInstallFieldNotes, tasksFieldNotes, verifyFieldNotes } from './sync-notes.js'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
@@ -599,7 +599,7 @@ async function syncInstall(argv: string[]): Promise<number> {
       entries: plan.entries,
       commands: plan.commands.map((c) => ({ command: commandText(c), executed: false, ok: null, error: null })),
       notes: [...plan.notes, envNote, '这是 dry-run：未写入任何文件、未执行任何命令。加 --yes 实际安装。'],
-    })
+    }, { field_notes: syncInstallFieldNotes('install-dry') })
   }
 
   // --yes：写文件 + 执行命令（逐条记结果，失败不中断、退出码如实报 1）
@@ -621,7 +621,7 @@ async function syncInstall(argv: string[]): Promise<number> {
   const code = ok({
     platform, schedule, dry_run: false,
     installed, commands: cmdResults, notes: [...plan.notes, envNote],
-  })
+  }, { field_notes: syncInstallFieldNotes('install-real') })
   return cmdResults.some((c) => !c.ok) ? 1 : code
 }
 
@@ -650,7 +650,7 @@ async function syncUninstall(argv: string[]): Promise<number> {
       remove: plan.remove,
       commands: plan.commands.map((c) => ({ command: commandText(c), executed: false, ok: null, error: null })),
       notes: [...plan.notes, '这是 dry-run：未删除任何文件、未执行任何命令。加 --yes 实际卸载。'],
-    })
+    }, { field_notes: syncInstallFieldNotes('uninstall-dry') })
   }
 
   const anyInstalled = plan.remove.some((r) => r.exists)
@@ -677,7 +677,7 @@ async function syncUninstall(argv: string[]): Promise<number> {
     platform, dry_run: false, removed,
     absent: absent.length > 0 ? absent : undefined,
     commands: cmdResults, notes: anyInstalled ? plan.notes : ['未安装（无条目文件）：未执行任何命令。'],
-  })
+  }, { field_notes: syncInstallFieldNotes('uninstall-real') })
   return cmdResults.some((c) => !c.ok) ? 1 : code
 }
 

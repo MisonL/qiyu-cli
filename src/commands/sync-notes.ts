@@ -143,3 +143,74 @@ export function tasksFieldNotes(): Record<string, string> {
       + '查询这些列会默认脱敏；不要 SELECT *',
   }
 }
+
+/**
+ * `sync install` / `sync uninstall` 的四种输出形态。
+ *
+ * ⚠️ 为什么按模式分开（与 `skill install` 的 `installFieldNotes(mode)` 同款）：
+ * 四个分支的键集**各不相同** —— dry-run 有 `entries`/`remove` 而没有 `installed`/`removed`，
+ * 真实安装有 `installed` 而没有 `entries`。一份图例解释四个不存在的键，就是「声明了但
+ * 没人读」的反向形态。
+ */
+export const SYNC_INSTALL_MODES = ['install-dry', 'install-real', 'uninstall-dry', 'uninstall-real'] as const
+export type SyncInstallMode = typeof SYNC_INSTALL_MODES[number]
+
+/** 四个分支共用的命令条目释义（`commands[]` 的每一项）。 */
+const SYNC_COMMAND_NOTES: Record<string, string> = {
+  'commands[].command': '将要执行（dry-run）或已执行（--yes）的命令原文',
+  'commands[].executed': '是否真的执行了这条命令。dry-run 恒为 false。--yes 下每条被列出的都执行了'
+    + '（uninstall 在「从未安装」时整条 commands 为空数组 —— 那是没有可停的调度器，不是执行失败）',
+  'commands[].ok': '三值：null = 未执行（dry-run），true = 执行成功，false = 执行失败。'
+    + '⚠️ null 既不是成功也不是失败，别按布尔值用',
+  'commands[].error': '失败原因。未执行或成功时为 null',
+}
+
+const INSTALL_ENV_NOTE = '给人读的说明。恒含一条「调度条目不继承 shell 环境」——'
+  + '凭证走 QIYU_APP_KEY / QIYU_APP_SECRET 时要确认调度上下文能拿到，本条目不写入任何凭证'
+
+/** `sync install` / `sync uninstall` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
+export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, string> {
+  const base: Record<string, string> = {
+    platform: '调度平台：darwin = launchd，linux = systemd，win32 = schtasks。'
+      + '其他平台在命令入口直接报不支持（退出码 2），不会有本输出',
+    dry_run: 'true = 只打印计划，零文件写入、零命令执行。false = 真的执行了。'
+      + '⚠️ 判断「装没装」看这个字段，不要只看退出码',
+    ...SYNC_COMMAND_NOTES,
+  }
+  switch (mode) {
+    case 'install-dry':
+      return {
+        ...base,
+        schedule: '回显的 cron 表达式（原样）',
+        'entries[].path': '将要写入的条目文件路径（dry-run 下文件尚未创建）',
+        'entries[].content': '将要写入的完整文件内容（dry-run 只回显，没有写盘）',
+        notes: INSTALL_ENV_NOTE,
+      }
+    case 'install-real':
+      return {
+        ...base,
+        schedule: '回显的 cron 表达式（原样）',
+        installed: '已写入的条目文件路径。文件在命令执行之前写入，所以即便随后某条命令失败'
+          + '（退出码 1），这些文件也已经写进去了。⚠️ 写入成功不等于调度已生效（launchd 需 load，'
+          + 'systemd 需 enable，见 commands[] 的结果）',
+        notes: INSTALL_ENV_NOTE,
+      }
+    case 'uninstall-dry':
+      return {
+        ...base,
+        'remove[].path': '计划要删除的条目文件路径（dry-run 下文件尚未删除）',
+        'remove[].exists': '计划生成那一刻探测到的存在性（true = 当时文件在）。'
+          + '这是探测快照不是承诺：真正删不删由 --yes 时的同一份快照决定',
+        notes: '给人读的说明。darwin/linux 含卸载次序（先停调度器，再删文件），win32 说明 schtasks 的行为',
+      }
+    case 'uninstall-real':
+      return {
+        ...base,
+        removed: '计划探测时存在、且删除调用未报错的文件路径',
+        absent: '计划探测时就不存在、因此没删的文件路径。⚠️ 这是条件键：为空时整个键不出现，'
+          + '不出现 ≠ 没有这类路径',
+        notes: '给人读的说明。从未安装（探测不到任何条目文件）时只有一条'
+          + '「未安装（无条目文件）：未执行任何命令」，此时 commands 为空数组',
+      }
+  }
+}
