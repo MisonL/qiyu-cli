@@ -176,7 +176,8 @@ describe('图例本身：键集、形态与枚举双向', () => {
 
   it('README 点明「声明 ≠ 实况」这条核心事实', () => {
     const md = read('README.md')
-    expect(md, 'README 必须点明 columns 等是声明').toContain('声明')
+    expect(md, 'README 必须点明五件套是声明').toContain('`primary_key` 是声明')
+    expect(md, 'README 必须点明 row_count / time_range 是实测').toContain('则是**实测**')
     expect(md, 'README 必须点明 db tables 不含缺失表').toMatch(/不在这里|不出现在 `tables` 中/)
     const sk = read('src/skill/qiyu/SKILL.md')
     expect(sk, 'SKILL.md 必须区分声明与实测').toContain('要分清**声明**与**实测**')
