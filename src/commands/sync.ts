@@ -345,7 +345,20 @@ async function syncStatus(argv: string[]): Promise<number> {
 
 // —— sync verify ——
 
-interface DriftEntry { kind: string; detail: string }
+/**
+ * `sync verify` 的 `drift[].kind` 全部取值 —— Agent 按值分支，所以每个值都必须在
+ * README 图例里有释义与动作（`tests/sync-enums.test.ts` 双向钉住：枚举 ⊆ 图例、
+ * 图例 ⊆ 枚举）。
+ */
+export const DRIFT_KINDS = [
+  'not_synced',     // sync_state 无该任务记录（从未同步）
+  'state_pending',  // 上次运行未完成/中断（range_status 非 complete）
+  'count_mismatch', // 本地行数 ≠ 上游行数（仅快照任务做上游核对）
+  'fetch_failed',   // 上游取数失败 —— 无法核对 ≠ 一致
+] as const
+export type DriftKind = typeof DRIFT_KINDS[number]
+
+interface DriftEntry { kind: DriftKind; detail: string }
 
 async function syncVerify(argv: string[]): Promise<number> {
   const help = subHelp(argv)

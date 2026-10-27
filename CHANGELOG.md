@@ -9,6 +9,20 @@
 
 ### 修复
 
+- **`gaps[].reason` 与 `drift[].kind` 的取值全仓无图例**。`sync status`/`sync run` 的
+  `gaps[].reason` 真实值域是 **8 个**：引擎侧 4 个（`rate_limit_local`/`fetch_failed`/
+  `write_failed`/`count_mismatch`）+ 任务 `gapHint` 写入的 4 个业务提示
+  （`knowledge_row_malformed`/`filter_matched_no_staff`/`export_fixture_unreported`/
+  `export_window_mismatch`）—— 而类型只声明了前 4 个，落库处用 `as WindowGapReason`
+  强转把谎报压住；`sync verify` 的 `drift[].kind`（4 值）同样无出处。README 只列字段名，
+  skill 协议只让 Agent「看缺口」——按值分支的 Agent 没有值表可查，也分不清
+  「失败缺口」与「成功窗上的业务提示」（`gaps` 非空 ≠ 同步失败）。修法：三组枚举改为
+  `as const` 数组（`ENGINE_GAP_REASONS`/`TASK_GAP_REASONS`/`DRIFT_KINDS`），
+  `gapHint.reason` 收窄为 `TaskGapReason`（删掉三处 `as` 强转，退回 `string` 会编译失败）；
+  README 补带动作的图例表，skill `protocols.md` 补分支动作；新增
+  `tests/sync-enums.test.ts` **双向核对**（枚举 ⊆ 图例、图例 ⊆ 枚举）——加值不写图例、
+  或图例写了源码不存在的值，都会红。
+
 - **配置键路径在文档与提示里写不全，照做会被 CLI 自己的校验拒绝**。配置结构是
   `profiles.<name>.store.<键>`，而多处只给了简写：`store_locked` 的 hint 说「可经配置文件
   `readOnlyRetryMs` 调整」（写进顶层或 profile 级 → 「配置文件未知键」退出码 2）、
