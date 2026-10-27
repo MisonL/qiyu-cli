@@ -12,6 +12,7 @@
 // 取值的字面与事实相反（详见 RANGE_STATUS_NOTES / RUN_STATUS_NOTES 的注释）。
 // 只输出英文词不解释 = 把猜测从字段名挪到了枚举值上。
 import type { RunStatus } from '../sync/types.js'
+import type { RangeStatusValue } from '../sync/state.js'
 
 /** 渲染成 `a = 释义；b = 释义` —— field_notes 的单元格形态（与 api list / skill where 同款）。 */
 function renderNotes(notes: Record<string, string>): string {
@@ -47,7 +48,7 @@ export const RANGE_STATUS_NOTES = {
     + '空 gaps 的真实含义（skipped > 0 时可能 gaps 为空但仍有未覆盖段）。',
   'null': '该任务在 sync_state 里没有行（从未运行过，或只跑过被跳过的残段窗）。'
     + '与 pending 不同：pending 至少有 markPending 写过行',
-} satisfies Record<'pending' | 'complete' | 'null', string>
+} satisfies Record<RangeStatusValue | 'null', string>
 
 /**
  * `sync run` 的 `status` 三个取值的释义。
