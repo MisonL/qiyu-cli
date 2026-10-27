@@ -35,9 +35,12 @@ function renderNotes(notes: Record<string, string>): string {
  *   3. 空 gaps 是否意味着完整？→ 不一定！若 skipped > 0 或有其他未完成路径，仍是残缺。
  */
 export const RANGE_STATUS_NOTES = {
-  pending: '水位没动过（该任务尚未成功推进过水位）。⚠️ 不代表库里没有数据：'
-    + '首窗失败时后续成功窗照常落库、只是不推水位（实测 3 窗首窗失败 → pending 且表里有 2 行）。'
-    + '也不代表「正在同步」——运行中的写者会让本命令先退避等待、等到后读到的是那一轮的结果',
+  pending: '最近一次运行没有成功推进水位（引擎每轮开跑就把状态置 pending，只有成功窗才推回'
+    + ' complete）。⚠️ 三种误读都要避免。① 不代表库里没有数据：首窗失败时后续成功窗照常落库、'
+    + '只是不推水位（实测 3 窗首窗失败 → pending 且表里有 2 行）。② 不代表「从未同步过」：'
+    + '先成功一轮、再跑一轮首窗失败，同样回到 pending 而 watermark 保留着上一轮的值'
+    + '（实测 watermark 仍是上一轮的 1970-01-04）。③ 不代表「正在同步」：运行中的写者会让'
+    + '本命令先退避等待、等到后读到的是那一轮的结果',
   complete: '水位推进过。⚠️ 不代表「全窗口成功」：引擎每个成功窗都写 complete，'
     + '中窗失败时 run 报 partial 而这里仍是 complete（实测）。判定数据完整要综合三个判据：'
     + '覆盖范围（resolved_range / windows.skipped）、历史缺口新鲜度（按 range 对照）与'
@@ -98,7 +101,10 @@ export function statusFieldNotes(): Record<string, string> {
     'gaps[].reason': '取值与动作见 README 的 gaps 图例（与 sync run 的 gaps[].reason 同一组值）',
     'gaps[].range': '原样回显 sync_gaps 的存储值（epoch 毫秒字符串），不是 run 输出的'
       + ' +08:00 ISO 形态 —— 要比较请先按同一形态解析',
-    resolved_range: '上次成功推进覆盖的区间；null = 尚无成功推进（或 v9 之前的旧记录）',
+    resolved_range: '上次成功推进的水位区间。⚠️ start 是水位起点语义、含可能被跳过的首残段'
+      + '前缀（实测：日对齐任务从非日界起点跑 → skipped=2 而 start 仍等于请求起点），'
+      + '所以它不是「已覆盖」的保证；本命令不输出 windows.skipped，判实际覆盖要看 '
+      + 'sync run 的 windows.skipped。null = 尚无成功推进（或 v9 之前的旧记录）',
   }
 }
 

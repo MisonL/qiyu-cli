@@ -305,8 +305,10 @@ qiyu --version                       包版本 + skill_contract_version
 | `failed` | 连窗口循环都没进 | 目前只有快照任务被本地限频闸门拦下这一条路径 |
 
 `sync status` 每任务输出 `{task, watermark, range_status, last_synced_at, resolved_range,
-gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区间（形态同 run 的
-`resolved_range`），`gaps` 是历史缺口逐条 `{range, reason, detail, recorded_at}`。
+gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区间（形态同 run 的
+`resolved_range`，但 ⚠️ `start` 是**水位起点语义**、含可能被跳过的首残段前缀 ——
+本命令不输出 `windows.skipped`，判实际覆盖要看 `sync run` 的 `windows.skipped`），
+`gaps` 是历史缺口逐条 `{range, reason, detail, recorded_at}`。
 
 **`range_status` 的取值**（逐值动作见 `meta.field_notes`）——⚠️ **两个取值的字面都与
 事实不符，别按字面用**（2026-10-27 实测）：
@@ -314,7 +316,7 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区�
 | range_status | 真实含义 | 常见误读 |
 |---|---|---|
 | `complete` | **水位推进过**（引擎每个成功窗都写它） | ❌ 不是「全窗口成功」：3 窗中窗失败 → run 报 `partial` 而这里仍是 `complete`。判数据完整要综合三个判据：**覆盖范围**（`resolved_range` / `windows.skipped`）、**历史缺口新鲜度**（按 `range` 对照，见下）、**空 `gaps` 不等于完整**（`skipped > 0` 时可能 `gaps` 为空但仍有未覆盖段） |
-| `pending` | **水位没动过** | ❌ 不是「库里没数据」：首窗失败时后续成功窗照常落库、只是不推水位（实测 pending 且表里有 2 行）；❌ 也不是「正在同步」——并发写者会让本命令退避等待，等到后读到的是那一轮的结果 |
+| `pending` | **最近一次运行没推进水位**（每轮开跑就置 pending，成功窗才推回 complete） | 三种误读都要避免：❌ 不是「库里没数据」（首窗失败时后续成功窗照常落库、只是不推水位，实测 pending 且表里有 2 行）；❌ 不是「从未同步过」（先成功一轮、再跑一轮首窗失败同样回到 pending，而 `watermark` 保留上一轮的值）；❌ 也不是「正在同步」（并发写者会让本命令退避等待，等到后读到的是那一轮的结果） |
 | `null` | 该任务在 `sync_state` 里**没有行** | ❌ 不是「同步失败」：从未跑过，或只跑过被跳过的残段窗 |
 
 `locked:true` 表示 `sync_state` 里有**残留**的写者章（上一轮运行被强杀）——它同样是

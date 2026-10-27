@@ -19,9 +19,9 @@ import { fileURLToPath } from 'node:url'
 import { createDuckDbStore } from '../src/store/duckdb.js'
 import { runTask } from '../src/sync/engine.js'
 import { RateGate } from '../src/sync/rate-gate.js'
-import { RANGE_STATUSES } from '../src/sync/state.js'
+import { RANGE_STATUSES, readWatermark } from '../src/sync/state.js'
 import { RUN_STATUSES } from '../src/sync/types.js'
-import { runFieldNotes, statusFieldNotes, tasksFieldNotes, verifyFieldNotes } from '../src/commands/sync-notes.js'
+import { RANGE_STATUS_NOTES, RUN_STATUS_NOTES, runFieldNotes, statusFieldNotes, tasksFieldNotes, verifyFieldNotes } from '../src/commands/sync-notes.js'
 import { syncCommand } from '../src/commands/sync.js'
 import type { SyncTask, RunCtx } from '../src/sync/types.js'
 import type { Store, StoreConfig } from '../src/store/types.js'
@@ -115,6 +115,18 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     for (const v of RUN_STATUSES) expect(runLegend, `README 缺 run status ${v}`).toContain(`\`${v}\``)
   })
 
+  it('枚举释义的**取值**里不得出现分隔符 `；`（否则反向解析产生幽灵取值）', () => {
+    // ⚠️ 这条被咬过两次（stats 的 ratio、本文件的 pending）：renderNotes 用 `；` 拼
+    // `a = 释义；b = 释义`，释义正文里再出现 `；` 就会把一句话劈成两个「取值」。
+    // 只查枚举释义（它们的正文才是取值集合的来源）；其它 field_notes 是单值说明，不受影响。
+    for (const [name, notes] of [
+      ['RANGE_STATUS_NOTES', RANGE_STATUS_NOTES], ['RUN_STATUS_NOTES', RUN_STATUS_NOTES]] as const) {
+      for (const [k, v] of Object.entries(notes)) {
+        expect(v, `${name}.${k} 含分隔符 ；—— 会让反向解析多出一个幽灵取值`).not.toContain('；')
+      }
+    }
+  })
+
   it('field_notes 不带 Markdown 加粗（stdout JSON 给 Agent，`**` 是噪声）', () => {
     for (const notes of [runFieldNotes(), statusFieldNotes(), verifyFieldNotes(), tasksFieldNotes()]) {
       for (const [k, v] of Object.entries(notes)) expect(v, k).not.toContain('**')
@@ -196,6 +208,19 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     expect(rangeNotes, 'complete 不得只指向 gaps').toContain('windows.skipped')
     expect(rangeNotes, '必须点明「空 gaps 不等于完整」').toContain('空 gaps')
     expect(rangeNotes, '必须给覆盖范围的判据').toContain('resolved_range')
+    // CodeRabbit 第五轮：`pending` 一度被写成「尚未成功推进过水位」—— 而 markPending
+    // 每轮开跑都置 pending，「pending + 旧 watermark」可达。这条钉住措辞。
+    // 钉**定义句**本身：写成「尚未成功推进过水位」就是错的（上一轮的值还在）。
+    expect(rangeNotes, 'pending 的定义必须限定为「最近一次运行」').toContain('最近一次运行没有成功推进水位')
+    expect(rangeNotes, 'pending 不得说成「从未同步过」').toContain('不代表「从未同步过」')
+    expect(rangeNotes, 'pending 的三种误读都要点名').toContain('三种误读')
+    // 同一轮：status 的 resolved_range.start 不是覆盖起点（含被跳过的残段前缀）
+    expect(statusFieldNotes().resolved_range, 'status 的 resolved_range 不得说成「覆盖的区间」')
+      .toContain('水位区间')
+    expect(statusFieldNotes().resolved_range, '必须点明 start 含被跳过的前缀')
+      .toContain('首残段')
+    expect(statusFieldNotes().resolved_range, '必须指向 sync run 的 windows.skipped')
+      .toContain('windows.skipped')
     expect(runFieldNotes()['tasks[].status'], 'partial 的误读必须写出来')
       .toContain('一行都没落')
     // CodeRabbit（2026-10-27）：空窗也算成功窗，所以「有没有拿到数据」不能用
@@ -313,8 +338,14 @@ describe('两条反直觉事实的真库实测（图例的字面结论靠它成�
     const tk = tasks()[0]!
     expect(tk.range_status).toBe('complete')
     expect(tk.gaps_count, 'gaps 确实为空').toBe(0)
-    // resolved_range 只到日界，首尾两个残段不在里面 —— 这就是「空 gaps 不等于完整」
-    expect(tk.resolved_range, 'resolved_range 应存在').not.toBeNull()
+    // ⚠️ CodeRabbit 第五轮：resolved_range.start **不是**「已覆盖」的起点 ——
+    // 实测它等于**请求起点**（含被跳过的首残段前缀），而首个整日窗其实从 16:00Z 才开始。
+    // 精确断言（不是 not.toBeNull）—— 这条断言是 status 图例那句「start 是水位起点语义」
+    // 的唯一证据。
+    const rr = tk.resolved_range as [string, string]
+    expect(new Date(rr[0]).getTime(), 'resolved_range.start = 请求起点（含被跳过的前缀）')
+      .toBe(reqStart)
+    expect(new Date(rr[1]).getTime(), 'resolved_range.end = 最后成功推进处').toBe(144000000)
   })
 
   it('首窗失败、后两窗成功 → range_status 是 pending，但表里确实有数据', async () => {
@@ -338,6 +369,37 @@ describe('两条反直觉事实的真库实测（图例的字面结论靠它成�
     expect(tk.watermark).toBeNull()
     // 同一次输出里既有 pending 又有 1 条 gap —— 与「表里有数据」并存
     expect(tk.gaps_count).toBe(1)
+  })
+
+  it('成功一轮后再跑、首窗失败 → range_status 回到 pending 而 watermark 保留上一轮的值', async () => {
+    // ⚠️ CodeRabbit 第五轮：`pending` 一度被写成「尚未成功推进过水位」—— 但这个状态
+    // 说明它不成立：markPending 每轮开跑就置 pending，所以「pending + 旧 watermark」可达。
+    const store = await fresh()
+    let n = 0
+    const t1 = threeWindowTask(async () => { n++; return row(String(n)) })
+    const r1 = await runTask(t1, ctx(store, 0, 3 * DAY))
+    expect(r1.status).toBe('complete')
+    const afterFirst = await readWatermark(store, 'reports.overview')
+    expect(afterFirst.rangeStatus).toBe('complete')
+    expect(afterFirst.watermark).toBe('1970-01-04T00:00:00.000Z')
+
+    // 第二轮：换一段区间、首窗失败
+    let m = 0
+    const t2 = threeWindowTask(async () => {
+      m++
+      if (m === 1) throw new Error('首窗炸')
+      return row('z' + m)
+    })
+    await runTask(t2, ctx(store, 3 * DAY, 6 * DAY))
+    await store.close()
+
+    out = ''
+    expect(await syncCommand(['status', 'reports.overview', '--db', db])).toBe(0)
+    const tk = tasks()[0]!
+    expect(tk.range_status, '新一轮没有成功窗 → 回到 pending').toBe('pending')
+    expect(tk.watermark, '但 watermark 保留上一轮的值 —— 所以 pending ≠ 从未同步过')
+      .toBe('1970-01-04T00:00:00.000Z')
+    expect(tk.last_synced_at, 'last_synced_at 同样保留').not.toBeNull()
   })
 
   it('残留写者章 → locked:true，而 verify 仍报一致（「不是正在同步中」的实证）', async () => {
