@@ -12,7 +12,8 @@
 //                `--installed` 校验已安装那份；`--compare` 两份都校验并报告差异。
 //                有违规 → `ok(...)` 之后返回 1（与 `sync verify` 同一写法）。
 //   · where   —— 纯只读：报告实体路径与各 agent 链接状态，**只报告、不修复、不删除**
-//                （spec D2）。要修复就让用户重跑 `qiyu skill install`。
+//                （spec D2）。要修复就让用户重跑 `qiyu skill install`（正文漂移时
+//                裸 install 是 skipped 零写入，得用 `--force`）。
 //
 // 实体定位统一为 `--dir` > `QIYU_SKILL_DIR` > `npm_config_qiyu_skill_dir` > `defaultEntityDir(resolveHome())`
 // （唯一实现在 `skill/detect.ts` 的 `resolveEntityDirSources`，G3 审查 C3）；

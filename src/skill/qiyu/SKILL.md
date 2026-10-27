@@ -40,6 +40,8 @@ qiyu sync status
   含义是本机装的正文与这份 CLI 不配套；更新方式是 `qiyu skill install --force`——它会写到本机
   的 skill 实体目录与各 Agent 的 skills 目录。**只在人类允许写 home 时执行**，不要自作主张
   改动用户目录；不允许时把这条提示原样转述给人类。
+  提示文案里若提到别的动词（如清单缺失/损坏时的裸 `qiyu skill install`），**照它给的条件判断
+  该用哪个**：清单没了就看不出正文有没有被手工改过，两个动词各自只在一种成因下收敛。
 - **`qiyu --version`**：输出包版本（`data.version`）与 `data.skill_contract_version`
   （**这份 CLI** 的正文契约号）。
 - **`qiyu skill where`**：报告实体目录与各 Agent 链接状态，并给出**已安装那份正文**的

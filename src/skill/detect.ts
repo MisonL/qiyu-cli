@@ -11,8 +11,10 @@
 //               版本相同仅内容漂移 → 「内容与包内当前版本不一致（版本 <v>）」；
 //               版本未知 → 「无法确认已安装 skill 的版本（安装清单缺失或损坏）」；
 //               前两支以「运行 `qiyu skill install --force` 更新」收尾——内容与包内
-//               不同，不带 `--force` 只会跳过；第三支推**不带 `--force`** 的
-//               `qiyu skill install`（正文与包内一致时它只补写清单）；
+//               不同，不带 `--force` 只会跳过；第三支**两个动词都给出**并各自注明条件
+//               （清单没了就判不出正文是否漂移：一致时裸 install 补写清单即收敛，
+//               漂移时只有 `--force` 收敛 —— 2026-10-27 实测，此前只推裸 install，
+//               漂移那一半用户跑完提示原样还在）；
 //   · current / unknown → 不提示（unknown = 判定不了，宁可闭嘴也不打扰）。
 //
 // **只提示、绝不改退出码、绝不改 data、绝不自动改文件**——自动覆盖用户可能改过的
@@ -245,10 +247,24 @@ export function skillWarning(
     //   · 版本相同、仅内容哈希漂移 → 版本号相同，说「版本不一致」自相矛盾；
     //   · 版本不同 → 说清「安装于 X，当前 Y」。
     if (state.installedVersion === 'unknown') {
-      // 清单缺失/损坏但正文与包内一致 → `planInstall` 返回 rewrite-manifest：不带
-      // `--force` 的 `qiyu skill install` 就只补写清单、一个正文字节不动（brief D7）。
-      // 推 `--force` 会让用户以为要覆盖正文——那是另一支（内容漂移/版本不一致）才需要。
-      return '无法确认已安装 skill 的版本（安装清单缺失或损坏）；运行 `qiyu skill install` 更新'
+      // ⚠️ 这一支**判不出正文是否被手工改过**（清单没了，而探测刻意不读正文，D2.1 的
+      // 「零成本」），于是裸 `qiyu skill install` 只覆盖其中一种成因：
+      //   · 正文与包内一致（且清单路径可写）→ planInstall 走 rewrite-manifest，只补写
+      //     清单，收敛；
+      //   · 正文被手工改过 → 「内容不同且无 --force」→ skipped + 零写入，**提示原样还在**。
+      // 2026-10-27 实测（清单损坏 + 正文改过 → 跑裸 install → 提示不消失；跑 --force → 消失）。
+      // 纪律：提示里的动词必须覆盖该状态的**所有**成因，所以两个动词连同各自的成立条件
+      // 一起给出 —— 只推裸 install 就是让漂移那一半用户白跑一趟。
+      //
+      // 「清单可写」也是条件之一，且它**同时挡住两个动词**：清单路径被符号链接/目录
+      // 占用时，planInstall 只返回 skipped + 一条点名占用路径的 warning
+      // （`writeTargetWarning`）——2026-10-27 实测：悬空符号链接 + 正文一致，裸 install
+      // 与 --force 都是 skipped，实体一个字节没变。两个动词的前提必须都给全，
+      // 只给裸 install 加前提会让人以为 --force 能救那种情况。
+      return '无法确认已安装 skill 的版本（安装清单缺失或损坏）；运行 `qiyu skill install` 补写清单'
+        + '——正文与包内一致时即收敛；正文被手工改过时它会跳过不覆盖、提示不会消失，'
+        + '那种情况用 `qiyu skill install --force` 覆盖。'
+        + '若清单路径被非普通文件占用，两个命令都不会覆盖，install 的 warnings 会点名该路径'
     }
     if (ctx?.currentVersion !== undefined && state.installedVersion === ctx.currentVersion) {
       return `已安装的 skill 内容与包内当前版本不一致（版本 ${state.installedVersion}）；运行 \`qiyu skill install --force\` 更新`
