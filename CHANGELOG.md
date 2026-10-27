@@ -9,6 +9,23 @@
 
 ### 修复
 
+- **`skill check` 三种形态都没有图例，`violations[].rule` 是 10 值闭集**。
+  2026-10-28 实测：
+  · `violations[].rule`（`unknown_command` / `flag_before_subcommand` / `table_name` /
+    `sql_sequence` … 共 10 个）是 Agent 要按值分支的机器值 ——「改命令行」与「改正文」
+    是完全不同的修法，不解释只能猜。
+  · `unverifiable` 不是违规、**不改变退出码**（详情另进 `meta.warnings`）。
+  · compare 形态：`installed.present=false` 时 `installed.violations` /
+    `installed.unverifiable` **不出现**；`differences` 非空时退出码必为 1。
+  · 连带修一个真缺陷：compare 的「已安装目录不存在」分支**不设 `installed.error`**，
+    present=false 的四种成因里唯独它没有机器可读原因（图例承诺「原因见 installed.error」
+    就会是假话）。现在四种成因都有 `error`。
+  修法：`skill.ts` 新增 `CHECK_RULE_NOTES`（`Record<ViolationRule, string>`，加规则不补
+  释义即编译失败）+ `checkFieldNotes(mode)`（单基准 / compare 两套路径形态），接入
+  `reportSingle` 与 compare 的 `ok()`。
+  测试：新增 `tests/skill-check-field-notes.test.ts`（7 条，递归路径双向核对 + 行为学断言
+  「unverifiable 不改变退出码」）。变异 7 条全红，其中 M6（图例键变成前导点
+  `.violations[].line`）正是实现过程中真实犯过的错 —— 被测试的路径解析当场抓住。
 - **`api call` 是最后一条没有图例的成功命令；README 还把它当成「只有 `{ok,data}`」的例子**。
   2026-10-28 实测：
   · `api call` **恒带 `meta.endpoint`**，而 README 原写「没有任何可报内容的成功输出就只有
