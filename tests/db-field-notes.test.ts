@@ -163,6 +163,8 @@ describe('图例本身：键集、形态与枚举双向', () => {
       .toContain('query --sql 不走列白名单')
     // CodeRabbit 第二轮：--no-mask 连 --table 通道的脱敏也会关掉，三处都要写明。
     expect(d['columns[].sensitive'], '必须点明 --no-mask 能关闭脱敏').toContain('--no-mask 可关闭')
+    // 不能写成「脱敏只对 --table 成立」—— --sql 也有列名级与值级兜底，只是不可靠。
+    expect(d['columns[].sensitive'], '必须限定为「可靠的按列脱敏」').toContain('可靠的按列脱敏')
     expect(d.pii_columns, '必须点明 --no-mask 能关闭脱敏').toContain('--no-mask 可关闭')
     expect(tablesFieldNotes()['tables[].pii_columns'], '必须点明 --no-mask 能关闭脱敏')
       .toContain('--no-mask 可关闭')
