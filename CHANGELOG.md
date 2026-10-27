@@ -9,6 +9,36 @@
 
 ### 修复
 
+- **`sync status` 的 `range_status` 两个取值字面与事实相反，且四个命令的状态位全仓无释义**。
+  这条命令是 skill 协议指定的「看水位与缺口」入口，而它输出的 `range_status`
+  （`pending`/`complete`/`null`）此前**一个释义都没有**。逐格实测（2026-10-27，真库）：
+  · 3 窗中第 2 窗失败 → run 报 `status: "partial"`、`windows.failed=1`，而 `range_status`
+    仍是 **`complete`** —— 引擎在每个成功窗的同一事务里调 `advanceWatermark`，它无条件写
+    complete（设计稿 §6.1 的原话是「全窗口成功」，实现比它弱）。按字面读 `complete` 会
+    得出「这段数据完整」，而缺口就在同一次输出的 `gaps` 里；
+  · 3 窗中首窗失败 → `range_status: "pending"`、`watermark: null`，但表里**有 2 行数据**
+    （首窗失败时 `watermarkRange` 为 null，后续成功窗照常落库、只是不推水位）。按字面读
+    `pending` 会得出「库里没数据」。
+  同轮还核实：`sync run` 的 `status: "partial"` **也覆盖「一行都没落」的全窗失败**
+  （`succeeded: 0`，`failed` 只留给快照任务被限频闸门拦下）；`sync status` 的
+  `locked: true` 是**残留章**而不是「正在同步中」（并发写者实测会让本命令退避等待 7.4 秒
+  后正常返回，等不到才报 `store_locked`）；`sync verify` 的
+  `state_windows_consistent: true` 同样**不代表数据完整**（中窗失败的库实测给出
+  `drift: []` + 退出码 0）。修法：`RANGE_STATUSES`/`RUN_STATUSES` 改 `as const` 数组
+  （运行时可导出，双向核对才有对象）+ `satisfies Record<枚举, string>` 的释义表 +
+  四个命令的 `meta.field_notes`（`sync run`/`status`/`verify`/`tasks` 各一套，
+  集中在新模块 `src/commands/sync-notes.ts` —— 放 `sync.ts` 会让 `sync-run.ts` 反向
+  import 成环）。图例不只写「不代表 X」，还写**机制**（为什么 pending 时表里有数据、
+  为什么 complete 时可能仍有缺口）。
+  新增 `tests/sync-state-legends.test.ts`：枚举 ⊆ 图例、图例 ⊆ 枚举、README 图例覆盖、
+  路径形态（`gaps[]` 是数组、`drift[]` 是数组）、无 `**`、无幽灵键，**外加四条真库行为
+  用例把图例的字面结论钉在引擎事实上**（中窗失败 → complete；首窗失败 → pending 但有数据；
+  残留章 → locked:true 且 verify 仍报一致；从未同步 → null）。变异 9 条全红，其中两条
+  最初是绿的（只断言了「不代表」三个字，没钉机制），补强后才红 —— 连同一条引擎变异
+  （`advanceWatermark` 改回写 pending）验证「真库用例钉的是引擎事实，不是图例自说自话」。
+  README 补两张图例表（`range_status` / `tasks[].status`）+ `locked` 与 `verify` 的边界
+  说明；skill `protocols.md` §2 补三条 Agent 侧警告。
+
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
   这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`
   的 `unit`；绝不要猜百分比还是绝对值」），可它输出的 `declared.<字段>.unit` 四个取值

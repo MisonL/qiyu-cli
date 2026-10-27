@@ -231,7 +231,7 @@ qiyu --version                       包版本 + skill_contract_version
 "接口无载荷"与"我解析错了"。`meta` **不是恒在的**——只在命令有元数据要报时才出现
 （`query` 的 `rows`/`resolved_range`、`db tables` 的 `notice` 等），或 skill 安装态
 有待提醒时经 `meta.warnings` 进来。没有任何可报内容的成功输出就只有 `{ok, data}`
-两个键（如无 skill 提示时的 `--version`、`store status`、`sync tasks`）——
+两个键（如无 skill 提示时的 `--version`、`store status`）——
 **读 `meta` 前先判存在**，键不出现 = 没有这项信息（与下方
 失败信封的可选键同一纪律），不是 `null`、更不是解析失败。
 
@@ -296,9 +296,37 @@ qiyu --version                       包版本 + skill_contract_version
 判据**。全失败（退出码 1）与 `sync verify` 的 drift 非空（退出码 1）时 stdout 仍是
 `{ok:true,data:...}`——缺口/漂移就是它要报告的内容。请先看退出码，再看 `data`。
 
+**`tasks[].status` 的三个取值**（`sync run`；逐值动作见输出的 `meta.field_notes`）：
+
+| status | 含义 | 该做什么 |
+|---|---|---|
+| `complete` | 全部窗口成功（`windows.failed = 0`） | 正常 |
+| `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。判有没有拿到数据看 `windows.succeeded`，不要看这个字面 |
+| `failed` | 连窗口循环都没进 | 目前只有快照任务被本地限频闸门拦下这一条路径 |
+
 `sync status` 每任务输出 `{task, watermark, range_status, last_synced_at, resolved_range,
 gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区间（形态同 run 的
 `resolved_range`），`gaps` 是历史缺口逐条 `{range, reason, detail, recorded_at}`。
+
+**`range_status` 的取值**（逐值动作见 `meta.field_notes`）——⚠️ **两个取值的字面都与
+事实不符，别按字面用**（2026-10-27 实测）：
+
+| range_status | 真实含义 | 常见误读 |
+|---|---|---|
+| `complete` | **水位推进过**（引擎每个成功窗都写它） | ❌ 不是「全窗口成功」：3 窗中窗失败 → run 报 `partial` 而这里仍是 `complete`。判数据完整只能看 `gaps` |
+| `pending` | **水位没动过** | ❌ 不是「库里没数据」：首窗失败时后续成功窗照常落库、只是不推水位（实测 pending 且表里有 2 行）；❌ 也不是「正在同步」——并发写者会让本命令退避等待，等到后读到的是那一轮的结果 |
+| `null` | 该任务在 `sync_state` 里**没有行** | ❌ 不是「同步失败」：从未跑过，或只跑过被跳过的残段窗 |
+
+`locked:true` 表示 `sync_state` 里有**残留**的写者章（上一轮运行被强杀）——它同样是
+「不是正在同步中」：真正持锁的进程会让本命令退避等待（`readOnlyRetryMs`，默认 30 秒），
+等到说明那一轮已结束（返回 `false`），等不到才报 `store_locked`。看到 `true` 说明写锁
+当前是空的、章是残留的，重跑 `sync run` 即可。
+
+`gaps` 是 `sync_gaps` 里的**历史**缺口，含已不再适用的旧记录（成功窗只清它自己那个
+起点的缺口；换了窗口边界重跑不会清掉旧起点的记录）——`gaps` 非空 ≠ 当前数据有问题，
+按 `reason` 判断。⚠️ 注意 `status` 的 `gaps[].range` 是 epoch 毫秒字符串（原样回显存储
+值），与 `sync run` 的 `+08:00` ISO 形态**不同**，比较前先统一形态。
+
 `sync verify` 输出 `{task, local_rows, expected_from_api, state_windows_consistent, drift}`：
 **`expected_from_api` 只对快照任务有意义**（上游 fetch 的行数）；windowed 任务不做上游
 全量重拉，该字段恒为 `null`，核对方式是「本地行数 ↔ sync_state 成功状态」的一致性
@@ -329,6 +357,11 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区�
 `state_pending`（上次运行未完成或中断 → 重跑 `sync run` 补全后再 verify）、
 `count_mismatch`（本地行数 ≠ 上游行数，仅快照任务 → 重跑覆盖，持续不符报告人类）、
 `fetch_failed`（上游取数失败，**无法核对 ≠ 一致** → 稍后重试 verify）。
+
+⚠️ `sync verify` 的 `state_windows_consistent: true` **不等于「数据完整」**：它只表示
+`sync_state` 记着「水位已推进且 `range_status=complete`」，而 `complete` 只说明水位推进过
+（见上表）。2026-10-27 实测：3 窗中窗失败的库，`verify` 直接给出 `drift: []` + 退出码 0，
+而 `sync_gaps` 里那条 `fetch_failed` 仍在 —— 判完整性以 `sync status` 的 `gaps` 为准。
 
 **聚合报表按天切片（窗口 1 天）**：九个报表接口返回的是**窗口聚合值**（`overview` 一行
 全局汇总、`staffworklod` 每客服一行、`transferHuman` 恒 1 行），响应里的 `date` 原文是

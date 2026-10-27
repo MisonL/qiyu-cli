@@ -30,6 +30,7 @@ import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
+import { runFieldNotes } from './sync-notes.js'
 import type { Store } from '../store/types.js'
 import { GLOBAL_FLAGS, STORE_FLAGS, renderFlagNames, valueFlagNames } from './spec-types.js'
 import type { FlagSpec } from './spec-types.js'
@@ -450,7 +451,7 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     // 的任务与 status='failed' 并列计入退出码 1。
     const allFailed = results.every((r) =>
       r.status === 'failed' || (r.windows.succeeded === 0 && r.windows.failed > 0))
-    const code = ok({ tasks: tasksOut, truncated: false })
+    const code = ok({ tasks: tasksOut, truncated: false }, { field_notes: runFieldNotes() })
     // stderr 汇总（spec §二：核对不符等在 run 结束的 stderr 汇总中列出；下界裁剪的
     // notes 同样进 stderr——--quiet 时只看 stdout 的 tasks[].notes）。
     if (flags['--quiet'] === undefined) {

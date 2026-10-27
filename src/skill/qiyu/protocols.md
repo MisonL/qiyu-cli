@@ -31,6 +31,14 @@
    `rate_limit_local` 等到 `detail` 里的时刻再重跑，`fetch_failed`/`write_failed`/
    `count_mismatch` 重跑 `sync run` 覆盖该区间；`knowledge_row_malformed`/
    `filter_matched_no_staff`/`export_*` 是**成功窗上的提示**（数据未必缺，按 `detail` 判断）。
+   - ⚠️ **`range_status` 的两个取值字面都在撒谎**（逐值释义见输出的 `meta.field_notes`）：
+     `complete` 只表示「水位推进过」——中窗失败时它照样是 `complete`，**不是**「全窗口成功」；
+     `pending` 只表示「水位没动过」——首窗失败时后续成功窗照常落库，**不是**「库里没数据」，
+     也**不是**「正在同步」。判数据完整只看 `gaps`，不要看 `range_status`。
+   - ⚠️ `sync run` 的 `status: "partial"` **也覆盖「一行都没落」的全窗失败**：判有没有拿到
+     数据看 `windows.succeeded`，不要看这个字面。
+   - ⚠️ `locked: true` 是**残留的写者章**（上一轮被强杀），不是「正在同步中」——真持锁的
+     写者会让 `sync status` 先退避等待，等到后读到的是那一轮的结果。重跑 `sync run` 即可。
 3. **真的没有数据**。
 
 报告 0 行时写「查询窗口 X 到 Y 内 0 行」，并说明排除了哪几种成因；不要写「系统里没有」。
