@@ -264,7 +264,7 @@ describe('三处字面陷阱的真库实证', () => {
     expect((meta().warnings as string[])).toContain(NO_MASK_WARNING)
   })
 
-  it('data_coverage 看不见内部缺口：iso-day 表有 warnings 兜底', async () => {
+  it('data_coverage 看不见内部缺口：iso-day 表在给了时间过滤时才有 warnings 兜底', async () => {
     await seed()
     await q('--table', 'daily_overview', '--since', '2026-10-01', '--until', '2026-10-07')
     expect(meta().data_coverage, '首尾有数据 → 报满区间，中间 4 天缺失看不见').toEqual({
