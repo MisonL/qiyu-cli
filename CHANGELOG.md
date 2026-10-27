@@ -26,7 +26,11 @@
   新增 `tests/command-legends-complete.test.ts`（3 条）做**反向兜底**：对每条有图例的
   命令跑真实输出，断言 data 里的每个字段都被图例覆盖（`k` / `k.` / `k[]` 三种前缀）
   或在自明清单里 —— 这正是 `cli_contract_version` 当初漏掉的那类检查。
-  变异 6 条全红。
+  变异 8 条全红。CodeRabbit 两条（全部核实成立并修）：① `configured` 的释义推荐用
+  `auth whoami` 验证有效性 —— 而 whoami 也只查「有没有配」，拼错的 appKey 同样返回
+  true；改成「要验证只能发一次真实请求」。② `profile` 的释义说「缺省 default」——
+  实际选择顺序是 `--profile` > `QIYU_PROFILE` > `defaultProfile` > `default`，
+  只写 default 会把写入目标指错。两条各补变异验证。
 
 - **`store init` / `store status` 无图例，且 README 把两者的 `tables` 形状说成同一个**。
   逐格真库实测（2026-10-28）：

@@ -83,5 +83,9 @@ describe('每条有图例的命令：输出字段必须被图例覆盖（反向�
     // 「写进文件」不等于「下次从文件读」。
     expect(notes().source, 'source 必须点破「不等于下次从文件读」').toContain('不表示「下次会从文件读」')
     expect(notes().configured, 'configured 必须说明不代表有效').toContain('不代表它们有效')
+    // CodeRabbit：不能把 auth whoami 当成「验证有效性」的手段 —— 它也只查存在性。
+    expect(notes().configured, '必须点明 whoami 也不能验证有效性').toContain('不能验证有效性')
+    expect(notes().profile, 'profile 必须给出完整选择顺序').toContain('QIYU_PROFILE')
+    expect(notes().profile, 'profile 不能只说「缺省 default」').toContain('不要假定是 default')
   })
 })
