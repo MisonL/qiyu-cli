@@ -200,7 +200,8 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
         ...base,
         'remove[].path': '计划要删除的条目文件路径（dry-run 下文件尚未删除）',
         'remove[].exists': '计划生成那一刻探测到的存在性（true = 当时文件在）。'
-          + '这是探测快照不是承诺：真正删不删由 --yes 时的同一份快照决定',
+          + '这是探测快照不是承诺：--yes 会重新探测一次，删除动作对所有条目都执行'
+          + '（rmSync force，不存在也不报错），removed 与 absent 按那一次探测的 exists 划分',
         notes: '给人读的说明。darwin/linux 含卸载次序（先停调度器，再删文件），win32 说明 schtasks 的行为',
       }
     case 'uninstall-real':
