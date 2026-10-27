@@ -9,6 +9,29 @@
 
 ### 修复
 
+- **`store init` / `store status` 无图例，且 README 把两者的 `tables` 形状说成同一个**。
+  逐格真库实测（2026-10-28）：
+  · **`schema_version` 是一个裸数字**，没有对照基准就没有意义 —— 它要跟当前 CLI 的
+    `LATEST_VERSION` 比，才知道库是不是旧版建的（`store init` 只补建缺失的迁移，
+    已应用的不会重放，所以它修不了「表被删」这类损坏）；
+  · **`tables` 的形状随命令不同**：`store init` 给表名数组 `["a","b"]`，`store status`
+    给 `[{name, rows}]`。而 README 原文写「`store init` 与 `store status` … 其中 `tables`
+    是 `[{name, rows}]` 数组」—— 对 `init` 是假话，Agent 按 `tables[0].name` 取值会拿到
+    `undefined`。本轮**不改行为**（有测试钉着 init 的字符串数组形状），改文档与图例；
+  · `tables` 来自全库 `information_schema`，**含内部表** `schema_version` / `sync_state` /
+    `sync_gaps`（`db tables` 列的是同一组表，两边数量应当一致）；
+  · `config_exists: false` 不代表存储不可用 —— `--db` / 环境变量 / 默认路径照样工作，
+    `store init` 也不写配置文件。
+  修法：新增 `src/commands/store-notes.ts`，两个命令各挂一套 `meta.field_notes`；
+  README 的 store 段改正 `tables` 形状并点明内部表与版本对照；README 里「无 meta 的成功
+  输出」例子把 `store status` 换成 `auth login`（`store status` 现在恒带 `field_notes`）。
+  新增 `tests/store-field-notes.test.ts`（9 条）：图例键集 ↔ data 键集双向、两个命令形状
+  一致、无 `**`、无 `；`，外加真库用例（版本对照、两边同一组表、`config_exists: false`
+  仍可用、`rows` 真实、两个命令的 `tables` 形状确实不同）。变异 8 条全红。
+  过程里被测试抓住一处**我自己写错的「事实」**：我原以为 `db tables` 只列业务表、
+  两边数量不同 —— 实际 `TABLES` 闭集里就含内部表，两边是同一组 25 张。图例与 README
+  已按实测改正。
+
 - **`db describe` / `db tables` 把「声明」与「实况」混在同一层输出里，字段名不区分**。
   逐格真库实测（2026-10-28）：
   · **`columns` / `pii_columns` / `time_column` 全是声明**（来自本 CLI 的表定义），

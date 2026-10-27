@@ -5,6 +5,7 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
+import { storeFieldNotes } from './store-notes.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
@@ -182,7 +183,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
       return ok({ path: config.path, backend: config.backend, config_path: configPath,
         config_exists: configExists,
         schema_version: Number(sv.rows[0]?.v ?? 0),
-        tables })
+        tables }, { field_notes: storeFieldNotes() })
     } catch (e) { return thrownToExit(e) } finally { await store.close() }
   }
 
@@ -225,6 +226,6 @@ export async function storeCommand(argv: string[]): Promise<number> {
     const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
     return ok({ path: config.path, backend: config.backend, config_path: configPath,
       config_exists: configExists,
-      schema_version: Number(sv.rows[0]?.v ?? 0), tables })
+      schema_version: Number(sv.rows[0]?.v ?? 0), tables }, { field_notes: storeFieldNotes() })
   } catch (e) { return thrownToExit(e) } finally { await store.close() }
 }
