@@ -23,6 +23,7 @@ import { RANGE_STATUSES, readWatermark } from '../src/sync/state.js'
 import { RUN_STATUSES } from '../src/sync/types.js'
 import { RANGE_STATUS_NOTES, RUN_STATUS_NOTES, runFieldNotes, statusFieldNotes, tasksFieldNotes, verifyFieldNotes } from '../src/commands/sync-notes.js'
 import { syncCommand } from '../src/commands/sync.js'
+import { taskOut } from '../src/commands/sync-run.js'
 import type { SyncTask, RunCtx } from '../src/sync/types.js'
 import type { Store, StoreConfig } from '../src/store/types.js'
 
@@ -134,10 +135,14 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
   })
 
   it('只解释该输出里真实存在的字段（反向：解释不存在的键 = 让 Agent 去找读不到的字段）', () => {
-    // run 输出：{tasks:[…], truncated} —— 任务条目键集来自 taskOut()，比照抄在下面；
-    // 改 taskOut 删键时这条会红，逼着图例一起改。
-    const TASK_KEYS = ['task', 'status', 'windows', 'rows', 'resolved_range', 'watermark',
-      'last_synced_at', 'gaps', 'notes']
+    // run 输出：{tasks:[…], truncated}。任务条目的键集**从生产构造函数 `taskOut()` 推导**，
+    // 不手抄 —— 手抄清单是假护栏：删掉 taskOut 里的键，手抄的清单不会跟着红（本项目已经
+    // 在 TOP_KEYS 上踩过一次）。`windows` 是嵌套对象，`tasks[].windows.skipped` 的第一段
+    // 仍是 `windows`，所以只比第一段就够。
+    const TASK_KEYS = Object.keys(taskOut(
+      { taskId: 't', status: 'complete', windows: { total: 1, succeeded: 1, failed: 0, skipped: 0 },
+        rows: { fetched: 0, written: 0 }, resolvedRange: { start: 0, end: 0 }, gaps: [] },
+      null, null))
     for (const k of Object.keys(runFieldNotes())) {
       if (!k.startsWith('tasks[].')) {
         expect(['truncated'], `run 图例键 ${k} 不在 run 输出里`).toContain(k)

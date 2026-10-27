@@ -186,8 +186,12 @@ function robotsFromConfig(configPath: string, profileFlag: string | undefined): 
   }
 }
 
-/** 任务条目 → 输出形态（spec §七字段名）。 */
-function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: string | null,
+/** 任务条目 → 输出形态（spec §七字段名）。
+ *
+ * 导出供测试**推导**真实键集：`runFieldNotes()` 的 `tasks[].x` 路径必须都落在
+ * 这里的返回对象上，否则 Agent 会照图例去找一个不存在的字段。键集手抄在测试里
+ * 就是假护栏 —— 删掉这里的键，手抄的清单不会跟着红。 */
+export function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: string | null,
   notes: string[] = []) {
   return {
     task: r.taskId,
