@@ -77,13 +77,24 @@ describe('图例本身：键集、形态与枚举双向', () => {
     expect(meta().field_notes, 'describe 必须带 field_notes').toBeDefined()
     expect(Object.keys(notes()).sort(), '发出的图例键集必须与 describeFieldNotes() 一致')
       .toEqual(Object.keys(describeFieldNotes()).sort())
-    const realKeys = Object.keys(meta()).filter((k) => k !== 'field_notes').sort()
-    expect(['field_notes', ...Object.keys(describeFieldNotes())].sort(),
-      '图例只能解释真实存在的字段').not.toEqual(realKeys) // describe 还有 notice/warnings
-    // 图例键去掉路径前缀后，第一段必须在 data 里存在
+    // 双向：图例 ⊆ 真实字段（下面这轮）且 真实字段 ⊆ 图例 ∪ 自明键（再下面那轮）。
+    // ⚠️ 只做单向会漏「新增了字段却没有释义」——那正是本 PR 要防的缺陷。
     const dataKeys = Object.keys(data())
     for (const k of Object.keys(describeFieldNotes())) {
       expect(dataKeys, `describe 图例键 ${k} 的第一段不在 data 里`).toContain(k.split(/[.[]/)[0])
+    }
+    const selfEvident = ['table', 'grain', 'primary_key'] // 名字即含义，不另写图例
+    for (const k of dataKeys) {
+      if (selfEvident.includes(k)) continue
+      expect(Object.keys(describeFieldNotes()), `data 字段 ${k} 没有释义`).toContain(k)
+    }
+    // 嵌套层同样要覆盖：`columns[]` 条目的每个字段都得有 `columns[].x` 释义。
+    // ⚠️ 只查顶层会漏 —— 删掉 `columns[].note` 的释义时本文件曾全绿。
+    const col = (data().columns as Array<Record<string, unknown>>)[0]!
+    for (const k of Object.keys(col)) {
+      if (k === 'name') continue
+      expect(Object.keys(describeFieldNotes()), `columns 条目字段 ${k} 没有释义`)
+        .toContain(`columns[].${k}`)
     }
   })
 
@@ -98,6 +109,12 @@ describe('图例本身：键集、形态与枚举双向', () => {
       if (head === 'tables') continue
       const sub = k.slice('tables[].'.length)
       expect(Object.keys(item), `tables 图例键 ${k} 不在条目里`).toContain(sub)
+    }
+    // 反向：条目里的每个字段都要么有释义、要么自明
+    for (const k of Object.keys(item)) {
+      if (k === 'name') continue
+      expect(Object.keys(tablesFieldNotes()), `tables 条目字段 ${k} 没有释义`)
+        .toContain(`tables[].${k}`)
     }
   })
 
