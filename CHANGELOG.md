@@ -74,6 +74,12 @@
   `sync run` 找；⑬ `expected_from_api` 的「用 kind 区分」含糊（kind 是 drift 条目的字段），
   改成「看 drift 里有没有 fetch_failed」；⑭ `watermark.initial` 的「首跑从 0 起」漏了
   `windowStartFloorDays` 的抬升（接口物理上给不出更早的数据）。⑫ 补变异验证。
+  ⑮ 「图例键必须在真实输出里存在」那条测试原本**手抄**了一份任务条目键清单，注释却声称
+  「改 `taskOut` 删键时这条会红」—— 手抄清单不会跟着红（本项目已在 `TOP_KEYS` 上踩过一次）。
+  改成导出 `taskOut()` 并从它的返回对象**推导**键集；变异验证：把 `taskOut` 的 `status`
+  键改名 → 测试红。同时把 `RANGE_STATUS_NOTES` 的 `satisfies` 目标从字面量改为
+  `RangeStatusValue | 'null'`（与 `RUN_STATUS_NOTES` 同款）：给枚举加值而不写图例现在
+  **编译期**就失败。
 
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
   这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`
