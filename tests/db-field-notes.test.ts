@@ -161,6 +161,11 @@ describe('图例本身：键集、形态与枚举双向', () => {
     expect(d.pii_columns, 'pii_columns 的承诺必须限定').toContain('query --sql 不走列白名单')
     expect(tablesFieldNotes()['tables[].pii_columns'], 'tables 侧同样要限定')
       .toContain('query --sql 不走列白名单')
+    // CodeRabbit 第二轮：--no-mask 连 --table 通道的脱敏也会关掉，三处都要写明。
+    expect(d['columns[].sensitive'], '必须点明 --no-mask 能关闭脱敏').toContain('--no-mask 可关闭')
+    expect(d.pii_columns, '必须点明 --no-mask 能关闭脱敏').toContain('--no-mask 可关闭')
+    expect(tablesFieldNotes()['tables[].pii_columns'], '必须点明 --no-mask 能关闭脱敏')
+      .toContain('--no-mask 可关闭')
   })
 
   it('grain / primary_key 也是声明，必须有释义', () => {
@@ -174,7 +179,8 @@ describe('图例本身：键集、形态与枚举双向', () => {
     expect(md, 'README 必须点明 columns 等是声明').toContain('声明')
     expect(md, 'README 必须点明 db tables 不含缺失表').toMatch(/不在这里|不出现在 `tables` 中/)
     const sk = read('src/skill/qiyu/SKILL.md')
-    expect(sk, 'SKILL.md 必须点明三件套是声明').toContain('是**声明**、不是库里的实况')
+    expect(sk, 'SKILL.md 必须区分声明与实测').toContain('要分清**声明**与**实测**')
+    expect(sk, 'SKILL.md 必须点名 row_count / time_range 是实测').toContain('则是**实测**')
     expect(sk, 'SKILL.md 必须点明清单只含真实存在的表').toContain('只含')
   })
 })
