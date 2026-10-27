@@ -25,15 +25,24 @@
   修法：新增 `src/commands/db-notes.ts`，给 `db describe` 与 `db tables` 各挂一套
   `meta.field_notes`（与 `notice` / `warnings` 并列）；README 与 skill `SKILL.md`
   补「声明 ≠ 实况」与「清单只含真实存在的表」。
-  新增 `tests/db-field-notes.test.ts`（15 条）：图例键集 ↔ 真实 meta 键集（含
+  新增 `tests/db-field-notes.test.ts`（17 条）：图例键集 ↔ 真实 meta 键集（含
   `field_notes` 必须存在且键集一致）、`time_column.kind` 枚举双向、无 `**`、
   非枚举单元格不含 `；`，外加**七条真库用例**把每条事实钉住（表被删 / 时间列被删 /
   多出列 / 空表 / 全脏值 / 无时间列 / `db tables` 不含缺失表）。
-  变异 10 条全红。两处过程教训：① `time_column` 的单元格初版把「它也是声明」这句前缀
+  变异 13 条全红。两处过程教训：① `time_column` 的单元格初版把「它也是声明」这句前缀
   混进了枚举单元格，反向解析因此少一个取值 —— 与 PR #26/#27 的 `；` 陷阱同源，已改成
   纯枚举并把那句挪进 `columns` 的释义；② 键集测试初版只做单向（图例 ⊆ 字段），删掉
   `columns[].note` 的释义时**全绿** —— 补上反向（字段 ⊆ 图例 ∪ 自明键，含 `columns[]`
   嵌套层）后才红。
+  CodeRabbit 四条（全部核实成立并修）：① **Major** —— 释义写「查询这些列默认脱敏」，
+  而 `query --sql` 不走列白名单、只有列名级与值级兜底，Agent 会把 `--sql` 的原始 PII
+  当已脱敏数据。三处（`columns[].sensitive` / `pii_columns` / `tables[].pii_columns`）
+  全部限定到 `query --table`。② `tablesFieldNotes` 的键集断言里
+  `k.split(/[.[]/)[0] === 'tables'` 把**每一个** `tables[].x` 都跳过了（第一段都是
+  `tables`）—— 等于没断言，改成只跳过顶层键。③ `grain` 与 `primary_key` 同样是声明
+  却没有释义，补上。④ SKILL.md 写「两者的 `columns` / `pii_columns` / `time_column`」，
+  而 `db tables` 并不输出 `columns` / `time_column`，改成按命令分开点名。
+  四条各补变异验证。
 
 - **`query` 的 9 个 meta 键全仓无释义，其中三处的字面与事实不符**。`query` 是 skill 协议
   指定的主查询入口，而它的 `meta` 此前**一条释义都没有**（README 有散文，但 Agent 读的是

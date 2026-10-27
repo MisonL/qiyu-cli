@@ -83,7 +83,7 @@ describe('图例本身：键集、形态与枚举双向', () => {
     for (const k of Object.keys(describeFieldNotes())) {
       expect(dataKeys, `describe 图例键 ${k} 的第一段不在 data 里`).toContain(k.split(/[.[]/)[0])
     }
-    const selfEvident = ['table', 'grain', 'primary_key'] // 名字即含义，不另写图例
+    const selfEvident = ['table'] // 表名即含义，不另写图例（grain / primary_key 已补释义）
     for (const k of dataKeys) {
       if (selfEvident.includes(k)) continue
       expect(Object.keys(describeFieldNotes()), `data 字段 ${k} 没有释义`).toContain(k)
@@ -105,8 +105,10 @@ describe('图例本身：键集、形态与枚举双向', () => {
     expect(Object.keys(notes()).sort()).toEqual(Object.keys(tablesFieldNotes()).sort())
     const item = (data().tables as Array<Record<string, unknown>>)[0]!
     for (const k of Object.keys(tablesFieldNotes())) {
-      const head = k.split(/[.[]/)[0]!
-      if (head === 'tables') continue
+      // ⚠️ 只跳过顶层 `tables` 这一个键。初版写成 `k.split(/[.[]/)[0] === 'tables'`，
+      // 而**每个** `tables[].x` 的第一段都是 `tables` —— 于是全部被跳过，等于没断言
+      //（CodeRabbit 抓到）。`tables[].rows`.split(/[.[]/) 是 ['tables','','rows']。
+      if (k === 'tables') continue
       const sub = k.slice('tables[].'.length)
       expect(Object.keys(item), `tables 图例键 ${k} 不在条目里`).toContain(sub)
     }
@@ -149,6 +151,22 @@ describe('图例本身：键集、形态与枚举双向', () => {
     expect(d.time_range, 'time_range 必须写明四种成因').toContain('四种成因')
     expect(tablesFieldNotes().tables, 'db tables 必须点明缺失表不在这里').toContain('不在这里')
     expect(tablesFieldNotes()['tables[].time_range'], 'tables 侧是三种成因').toContain('三种成因')
+  })
+
+  it('脱敏承诺必须限定到 --table 通道（--sql 不走列白名单）', () => {
+    // CodeRabbit（2026-10-28）：原措辞「查询这些列默认脱敏」会被 Agent 读成
+    // 「--sql 的输出也是脱敏的」——而 --sql 只做列名级 + 值级兜底。
+    const d = describeFieldNotes()
+    expect(d['columns[].sensitive'], 'sensitive 的承诺必须限定').toContain('query --sql 不走列白名单')
+    expect(d.pii_columns, 'pii_columns 的承诺必须限定').toContain('query --sql 不走列白名单')
+    expect(tablesFieldNotes()['tables[].pii_columns'], 'tables 侧同样要限定')
+      .toContain('query --sql 不走列白名单')
+  })
+
+  it('grain / primary_key 也是声明，必须有释义', () => {
+    const d = describeFieldNotes()
+    expect(d.grain, 'grain 必须点明是声明').toContain('声明')
+    expect(d.primary_key, 'primary_key 必须点明是声明').toContain('声明')
   })
 
   it('README 点明「声明 ≠ 实况」这条核心事实', () => {
