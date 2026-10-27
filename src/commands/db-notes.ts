@@ -47,7 +47,7 @@ export function describeFieldNotes(): Record<string, string> {
     'columns[].type': '声明里的列类型（VARCHAR 等）。同样是声明，不是从库里读出来的',
     'columns[].nullable': '声明里的可空性。null 值是否真的允许由库决定，这里不反映实况',
     'columns[].sensitive': 'true = 声明为敏感 PII。声明值，不是库里的实况。'
-      + '⚠️ 脱敏只对 query --table 默认成立（按列精确脱敏，--no-mask 可关闭，'
+      + '⚠️ 可靠的按列脱敏只对 query --table 默认成立（--no-mask 可关闭，'
       + '关闭后输出就是原始 PII）。query --sql 不走列白名单，只有列名级与值级兜底，'
       + '别把 --sql 的输出当成已脱敏',
     'columns[].unit': '声明里的单位或形态说明（自由文本）。null = 该列没有声明单位，'
@@ -84,7 +84,7 @@ export function tablesFieldNotes(): Record<string, string> {
       + 'null 有三种成因：表没有声明时间列、时间列被删（warnings 点名）、'
       + '没有一行的时间值能过形态谓词（空表，或全是脏值/NULL —— 脏值另有 warning 报数量）。'
       + '注意这里没有「表不在库中」这一种：那种表根本不会出现在 tables 里',
-    'tables[].pii_columns': '敏感列的名单（声明）。⚠️ 脱敏只对 query --table 默认成立'
+    'tables[].pii_columns': '敏感列的名单（声明）。⚠️ 按列精确脱敏只对 query --table 默认成立'
       + '（--no-mask 可关闭，关闭后就是原始 PII），query --sql 不走列白名单，'
       + '别把它的输出当成已脱敏',
   }
