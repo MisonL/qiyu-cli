@@ -160,7 +160,9 @@ export type SyncInstallMode = typeof SYNC_INSTALL_MODES[number]
 const SYNC_COMMAND_NOTES: Record<string, string> = {
   'commands[].command': '将要执行（dry-run）或已执行（--yes）的命令原文',
   'commands[].executed': '是否真的执行了这条命令。dry-run 恒为 false。--yes 下每条被列出的都执行了'
-    + '（uninstall 在「从未安装」时整条 commands 为空数组 —— 那是没有可停的调度器，不是执行失败）',
+    + '（uninstall 在 darwin/linux「从未安装」时整条 commands 为空数组 —— 没有可停的调度器，'
+    + '不是执行失败。win32 没有文件条目可探测，卸载命令总是执行：任务不存在时 schtasks 自己报错，'
+    + '落进 ok=false）',
   'commands[].ok': '三值：null = 未执行（dry-run），true = 执行成功，false = 执行失败。'
     + '⚠️ null 既不是成功也不是失败，别按布尔值用',
   'commands[].error': '失败原因。未执行或成功时为 null',
@@ -214,8 +216,9 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
         removed: '计划探测时存在、且删除调用未报错的文件路径',
         absent: '计划探测时就不存在、因此没删的文件路径。⚠️ 这是条件键：为空时整个键不出现 ——'
           + '不出现就是「没有这类路径」，不是字段缺失（win32 无文件条目，恒不出现）',
-        notes: '给人读的说明。从未安装（探测不到任何条目文件）时只有一条'
-          + '「未安装（无条目文件）：未执行任何命令」，此时 commands 为空数组',
+        notes: '给人读的说明。darwin/linux 从未安装（探测不到条目文件）时只有一条'
+          + '「未安装（无条目文件）：未执行任何命令」，此时 commands 为空数组。'
+          + 'win32 没有文件条目可探测，无法在卸载前判断装没装，notes 恒为计划里的说明',
       }
   }
 }

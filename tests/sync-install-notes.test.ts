@@ -158,6 +158,23 @@ describe('四种模式的图例与真实输出一一对应', () => {
     expect(data().dry_run).toBe(false)
     expect((data().notes as string[]).join('')).toContain('未安装')
   })
+
+  it('win32：uninstall --yes 必须真的执行 schtasks /Delete（没有文件条目可探测）', async () => {
+    // 回归：win32 的 plan.remove 恒为空，旧实现用 anyInstalled 当闸门 → schtasks /Delete
+    // 从不执行，已安装的任务永远删不掉，还被误报成「未安装」。CodeRabbit 2026-10-28 抓到。
+    __setPlatform(() => 'win32')
+    expect(await syncCommand(['uninstall', '--yes']), out.slice(0, 300)).toBe(0)
+    expect(runMock, 'win32 卸载命令必须执行').toHaveBeenCalledTimes(1)
+    const argv = runMock.mock.calls[0]![0] as string[]
+    expect(argv[0]).toBe('schtasks')
+    expect(argv).toContain('/Delete')
+    assertLegendMatches('uninstall-real', ['absent']) // remove 为空 → absent 不出现
+    const cmds = data().commands as Array<{ executed: boolean; ok: boolean }>
+    expect(cmds).toHaveLength(1)
+    expect(cmds[0]!.executed).toBe(true)
+    expect(cmds[0]!.ok).toBe(true)
+    expect((data().notes as string[]).join('')).not.toContain('未安装')
+  })
 })
 
 describe('三值 ok 与 dry_run 的措辞', () => {
@@ -193,6 +210,16 @@ describe('三值 ok 与 dry_run 的措辞', () => {
       expect(n, `${mode} 的 platform 释义漏了 win32`).toContain('win32')
       expect(n, `${mode} 的 platform 释义漏了 schtasks`).toContain('schtasks')
     }
+  })
+
+  it('commands[].executed 与 uninstall-real.notes 必须按平台限定「未安装」的适用面', () => {
+    for (const mode of SYNC_INSTALL_MODES) {
+      expect(syncInstallFieldNotes(mode)['commands[].executed']!, `${mode}`)
+        .toContain('win32 没有文件条目可探测')
+    }
+    const n = syncInstallFieldNotes('uninstall-real').notes!
+    expect(n).toContain('darwin/linux')
+    expect(n).toContain('win32 没有文件条目可探测')
   })
 
   it('field_notes 不带 `**`、正文不含分隔符 `；`', () => {

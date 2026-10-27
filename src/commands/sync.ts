@@ -653,9 +653,14 @@ async function syncUninstall(argv: string[]): Promise<number> {
     }, { field_notes: syncInstallFieldNotes('uninstall-dry') })
   }
 
+  // 「装没装」的判据：darwin/linux 看条目文件是否存在；win32 没有文件条目可探测
+  // （plan.remove 恒为空），任务是否存在只能由 schtasks /Delete 本身回答 —— 不存在时
+  // 它报错、落进 commands[].ok=false。所以 win32 一律执行卸载命令，否则已安装的任务
+  // 永远删不掉，还会被误报成「未安装」。
   const anyInstalled = plan.remove.some((r) => r.exists)
+  const willRun = anyInstalled || platform === 'win32'
   const cmdResults: Array<{ command: string; executed: boolean; ok: boolean; error: string | null }> = []
-  if (anyInstalled) {
+  if (willRun) {
     // 卸载次序：先停调度器（unload/disable），再删文件
     for (const c of plan.commands) {
       try {
@@ -676,7 +681,7 @@ async function syncUninstall(argv: string[]): Promise<number> {
   const code = ok({
     platform, dry_run: false, removed,
     absent: absent.length > 0 ? absent : undefined,
-    commands: cmdResults, notes: anyInstalled ? plan.notes : ['未安装（无条目文件）：未执行任何命令。'],
+    commands: cmdResults, notes: willRun ? plan.notes : ['未安装（无条目文件）：未执行任何命令。'],
   }, { field_notes: syncInstallFieldNotes('uninstall-real') })
   return cmdResults.some((c) => !c.ok) ? 1 : code
 }

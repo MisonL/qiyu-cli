@@ -30,6 +30,14 @@
   CodeRabbit 两条（核实成立并修）：① `absent` 原写「不出现 ≠ 没有这类路径」—— 省略规则
   恰恰是「为空即不出现」，说反了；② `dry_run` 原写「判断装没装看这个字段」—— 它只是执行
   模式，回答不了安装状态（见上）。
+- **`sync uninstall --yes` 在 Windows 上什么都不做，还报告「未安装」（写图例时发现的真 bug）**。
+  `syncUninstall` 用 `plan.remove.some(r => r.exists)` 当「装没装」的闸门，而 **win32 的
+  `plan.remove` 恒为空**（Windows 的调度任务不是文件，是 schtasks 条目）—— 于是已安装的
+  Windows 任务永远删不掉：`schtasks /Delete` 从不执行，输出 `commands: []` +
+  `notes: ['未安装（无条目文件）…']`，退出码 0。darwin/linux 不受影响（有条目文件可探测）。
+  修法：闸门改为 `anyInstalled || platform === 'win32'` —— win32 无法在卸载前探测，就让
+  `schtasks /Delete` 本身回答（任务不存在时它报错，如实落进 `commands[].ok=false`、退出码 1）。
+  新增 win32 用例（注入平台 + 断言 `schtasks /Delete` 真被执行），变异回退即红。
 - **最后三处无图例的输出：`skill where` 的 `cli_contract_version`、`--version`、`auth login`**。
   2026-10-28 实测：
   · **`skill where` 输出 `cli_contract_version`，图例里却没有它** —— 既有图例测试只查了
