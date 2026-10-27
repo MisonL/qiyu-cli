@@ -101,9 +101,17 @@ describe('图例本身：键集、形态与「不撒谎」的措辞', () => {
     // ⚠️ 必须显式断言 field_notes 存在：把它从键集里过滤掉再比较，等于没断言它被挂上
     //（本文件初版就犯了这个错，删掉 --table 的 field_notes 时 17 条全绿）。
     expect(meta().field_notes, '--table 通道必须带 field_notes').toBeDefined()
+    // ⚠️ 还要比对**实际发出**的图例键集：只断言「存在」的话，某个通道只发
+    // `{resolved_range: …}` 也能过（CodeRabbit 抓到的第二个假护栏）。
+    expect(Object.keys(meta().field_notes as object).sort(),
+      '--table 通道发出的图例键集必须与 queryFieldNotes() 一致')
+      .toEqual(Object.keys(queryFieldNotes()).sort())
     const tableKeys = Object.keys(meta()).sort()
     await q('--sql', 'SELECT * FROM daily_overview')
     expect(meta().field_notes, '--sql 通道必须带 field_notes').toBeDefined()
+    expect(Object.keys(meta().field_notes as object).sort(),
+      '--sql 通道发出的图例键集必须与 queryFieldNotes() 一致')
+      .toEqual(Object.keys(queryFieldNotes()).sort())
     const sqlKeys = Object.keys(meta()).sort()
     expect(sqlKeys, '两个通道的 meta 键集必须相同（图例只有一份）').toEqual(tableKeys)
     expect(['field_notes', ...Object.keys(queryFieldNotes())].sort(),
