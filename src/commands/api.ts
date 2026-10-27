@@ -13,6 +13,7 @@ import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/val
 import { ok, fail, usageFail, describeArgs, setPretty, EXIT } from '../output.js'
 import { sanitizeMessage } from '../core/sanitize.js'
 import { localFallbackFor } from './local-fallback.js'
+import { callFieldNotes } from './api-notes.js'
 import { GLOBAL_FLAGS, prettyAfterSubcommand, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -672,6 +673,7 @@ async function callOne(argv: string[]): Promise<number> {
     // 该接口的 note 恰恰逐字写明了这个坑，而它就在注册表里，只差没被读。
     // 只给有 note 的接口输出（`api list` 已是这个口径），保持两处一致。
     return ok(r.payload, {
+      field_notes: callFieldNotes(),
       endpoint: spec.id,
       ...(warnings.length ? { warnings } : {}),
       ...(r.notFound ? { not_found: true, warning: '接口返回成功但无数据' } : {}),
