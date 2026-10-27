@@ -231,7 +231,7 @@ qiyu --version                       包版本 + skill_contract_version
 "接口无载荷"与"我解析错了"。`meta` **不是恒在的**——只在命令有元数据要报时才出现
 （`query` 的 `rows`/`resolved_range`、`db tables` 的 `notice` 等），或 skill 安装态
 有待提醒时经 `meta.warnings` 进来。没有任何可报内容的成功输出就只有 `{ok, data}`
-两个键（如无 skill 提示时的 `--version`、`auth login`）——
+两个键（如无提示时的 `api call`）——
 **读 `meta` 前先判存在**，键不出现 = 没有这项信息（与下方
 失败信封的可选键同一纪律），不是 `null`、更不是解析失败。
 

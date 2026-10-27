@@ -22,6 +22,23 @@ import { skillCommand } from './commands/skill.js'
 // 本文件 re-export 只是兼容入口（计划原文写的是 `cli.ts` 汇总），免得调用方改路径。
 export { COMMAND_TREE } from './commands/tree.js'
 
+/**
+ * `--version` 的 `meta.field_notes`。
+ *
+ * ⚠️ 为什么需要：`skill_contract_version` 是 CLI **自己**的正文契约号，而 SKILL.md 教
+ * Agent「用它判断手上的正文能否配这份 CLI」—— 手上有两个同名的数（CLI 的、已安装那份的），
+ * 不点名就会拿错（2026-10-28 实测：两者可以不等，且 `--version` 不报已安装那份）。
+ */
+export function versionFieldNotes(): Record<string, string> {
+  return {
+    version: 'CLI 包版本（npm 包的语义版本号）',
+    skill_contract_version: 'CLI 自己的正文契约号 —— 不是已安装那份的。'
+      + '要判断手上的 skill 正文能否配这份 CLI，拿它与 `skill where` 的 '
+      + 'entity.installed.skill_contract_version 比，相等才配（后者缺失或损坏时为 null，'
+      + '不能当 0 处理）',
+  }
+}
+
 // —— 限流 fallback 接线（G1 契约小件）——
 // `api call` 的限流错误要附「改用本地查询」建议（retry_strategy/fallback），
 // 而该建议需要 sync 任务注册表与本地库探测；`commands/api.ts` 按分层红线
@@ -174,7 +191,8 @@ export async function run(argv: string[]): Promise<number> {
     }
     // G1：--version --pretty → 缩进的版本 JSON（帮助/版本检查是例外：--pretty 有可修饰的对象）
     if (rest.includes('--pretty')) setPretty(true)
-    return ok({ version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION })
+    return ok({ version: PACKAGE_VERSION, skill_contract_version: SKILL_CONTRACT_VERSION },
+      { field_notes: versionFieldNotes() })
   }
   // ⚠️ 分派层的 `--pretty` 必须与叶子层同答（2026-10-08 统一）。此前它落到
   // 「未知子命令：--pretty」—— 而 `--pretty` 是真实存在的输出开关（G1 已实现）

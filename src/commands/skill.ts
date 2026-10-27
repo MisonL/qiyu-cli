@@ -425,6 +425,9 @@ export function whereFieldNotes(): Record<string, string> {
     'entity.exists': 'true/false = 是否存在；null = 无法判定（与 state=unknown 配套）—— 不是「不存在」',
     'entity.state': renderStateNotes(SKILL_STATE_NOTES.entityState),
     'entity.installed': '已安装那份正文的版本元数据；null = 判定不了（实体不可用或清单缺失/损坏），不是「兼容」',
+    cli_contract_version: '本 CLI 自己的正文契约号。⚠️ 与 entity.installed.skill_contract_version'
+      + '（已安装那份的）是两个数：两者相等才说明手上的正文配得上这份 CLI。'
+      + '这里报的是 CLI 的，不要当成「已安装版本」',
     'links[].state': renderStateNotes(SKILL_STATE_NOTES.linkState),
   }
 }
