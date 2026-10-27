@@ -176,8 +176,9 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
       + '其他平台在命令入口直接报不支持（退出码 2），不会有本输出',
     dry_run: '执行模式：true = 只打印计划，零写入、零执行。false = 真的执行了（写/删文件、跑 commands[]）。'
       + '⚠️ 它不回答「现在装没装」—— dry-run 什么都不改（已装过也一样只出计划），'
-      + 'uninstall --yes 在从未安装时同样是 false。false 时本次操作做了什么看 installed / removed / absent'
-      + ' 与 commands[]。退出码只取决于 commands[] 是否全部成功',
+      + 'uninstall --yes 在从未安装时同样是 false。false 时本次操作做了什么，看操作结果字段'
+      + '（install 是 installed，uninstall 是 removed / absent）与 commands[]。'
+      + '退出码只取决于 commands[] 是否全部成功',
     ...SYNC_COMMAND_NOTES,
   }
   switch (mode) {
