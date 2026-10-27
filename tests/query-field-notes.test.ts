@@ -17,9 +17,7 @@ import { fileURLToPath } from 'node:url'
 import { queryCommand } from '../src/commands/query.js'
 import { createDuckDbStore } from '../src/store/duckdb.js'
 import { NO_MASK_WARNING } from '../src/query/mask.js'
-import {
-  queryFieldNotes,
-} from '../src/commands/query-notes.js'
+import { queryFieldNotes } from '../src/commands/query-notes.js'
 import type { Store } from '../src/store/types.js'
 
 const read = (rel: string): string => readFileSync(fileURLToPath(new URL(`../${rel}`, import.meta.url)), 'utf8')
