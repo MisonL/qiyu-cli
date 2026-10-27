@@ -143,9 +143,10 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(m.resolved_range).toBeNull()
     expect(m.data_coverage).toBeNull()
     // meta 形状钉死：多一个键 / 少一个键都是契约变更，必须显式改这里
+    // 2026-10-27 起多一个 field_notes（9 个键的逐条释义，见 query-notes.ts）
     expect(Object.keys(m).sort()).toEqual([
-      'data_coverage', 'limit_applied', 'mask_warnings', 'masked', 'masked_columns',
-      'resolved_range', 'rows', 'truncated', 'warnings',
+      'data_coverage', 'field_notes', 'limit_applied', 'mask_warnings', 'masked',
+      'masked_columns', 'resolved_range', 'rows', 'truncated', 'warnings',
     ])
   })
 
@@ -492,7 +493,7 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
 })
 
 describe('query --table · 成功路径（spec §六/§十）', () => {
-  it('精确脱敏：sensitive 列全脱敏、session_type 原样；meta 仍是九键（形状钉死）', async () => {
+  it('精确脱敏：sensitive 列全脱敏、session_type 原样；meta 十键（形状钉死）', async () => {
     await seed()
     expect(await qAt('--table', 'sessions')).toBe(0)
     expect(err).toBe('')
@@ -520,9 +521,10 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(m.data_coverage).toEqual({
       min: '2026-10-14T00:00:00+08:00', max: '2026-10-14T00:00:00+08:00',
     })
+    // 2026-10-27 起多一个 field_notes（9 个键的逐条释义，见 query-notes.ts）
     expect(Object.keys(m).sort()).toEqual([
-      'data_coverage', 'limit_applied', 'mask_warnings', 'masked', 'masked_columns',
-      'resolved_range', 'rows', 'truncated', 'warnings',
+      'data_coverage', 'field_notes', 'limit_applied', 'mask_warnings', 'masked',
+      'masked_columns', 'resolved_range', 'rows', 'truncated', 'warnings',
     ])
   })
 

@@ -419,6 +419,8 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 `rows`（截断后的实际行数）/ `truncated`（是否被 `--limit` 截断）/ `limit_applied`（生效上限）/
 `masked`（本次是否脱敏）/ `masked_columns`（**实际被改写**的列名，全 null 的列不算）/
 `mask_warnings`（脱敏缺口警告）/ `resolved_range` / `data_coverage` / `warnings`。
+**每个键的逐条释义与动作见输出的 `meta.field_notes`**（两个通道同一份，不必回头查本段）；
+下面几条是人读版的重点。
 
 - `--table` 通道的输出顺序是**确定的**：无 `--group-by` 时，**有时间列的表**按时间列降序、
   再按主键升序（`--limit` 截到的因此是**最新**的那些行）；**无时间列的表**只能按主键升序。
@@ -429,6 +431,12 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 - `data_coverage`：该表时间列在**过滤范围内**的 MIN/MAX（`+08:00` ISO）；`--sql` 通道恒为 `null`。
   它有三种 `null` 成因，用 `resolved_range` 与 `warnings` 区分：`--sql` 通道 / 该表无时间列 /
   有过滤范围但范围内一行都没有。
+  ⚠️ **它只有首尾两点，看不见内部缺口**——7 天里只有第 1、7 天有数据时照样报满区间。
+  `iso-day` 表另有 `warnings` 兜底（「区间内应有 N 个自然日，实际只有 M 个有数据」），
+  `iso-instant` 与 `epoch-ms` 表**没有任何兜底**，要核对内部覆盖得自己按自然日 `GROUP BY` 数行。
+- `masked` / `mask_warnings` 的两个字面陷阱：`masked: true` 只表示脱敏开关开着，**不代表有值被
+  改写**（那看 `masked_columns`，为空是常态）；`mask_warnings: []` 在 `--no-mask` 时**恒为空**，
+  空**不等于**脱敏完整——那是「根本没脱敏」，风险警告在 `warnings` 里。
 - **`--sql` 通道的数值是 JSON 安全形态的字符串**：`COUNT(*)` / `SUM` / `BIGINT` / `HUGEINT` /
   `DECIMAL` 一律输出字符串（如 `"n":"12"`、`"d":"1.50"`），这是驱动为避免精度丢失的取舍。
   做算术或比较前先转数字（`Number(x)`）；`--table --group-by` 的 `count`、`db describe` 的

@@ -27,6 +27,7 @@ import {
 } from '../query/table-query.js'
 import type { BuiltTableQuery } from '../query/table-query.js'
 import { openGuardedSession } from './db.js'
+import { queryFieldNotes } from './query-notes.js'
 import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
@@ -456,6 +457,8 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
         ? null
         : [shanghaiIso(plan.resolvedRange[0]), shanghaiIso(plan.resolvedRange[1])],
       data_coverage: dataCoverage,
+      // 图例：9 个键逐条释义（两个通道共用一份，分叉写必然漂移）。
+      field_notes: queryFieldNotes(),
     },
   )
 }
@@ -619,6 +622,8 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
         // --sql 通道无法通用判定请求区间与数据覆盖（spec §十）：恒 null，不猜。
         resolved_range: null,
         data_coverage: null,
+        // 与 --table 通道同一份图例（键集相同，见 query-notes.ts）。
+        field_notes: queryFieldNotes(),
       },
     )
   } catch (e) {

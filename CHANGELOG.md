@@ -9,6 +9,39 @@
 
 ### 修复
 
+- **`query` 的 9 个 meta 键全仓无释义，其中三处的字面与事实不符**。`query` 是 skill 协议
+  指定的主查询入口，而它的 `meta` 此前**一条释义都没有**（README 有散文，但 Agent 读的是
+  stdout）。逐格真库实测（2026-10-27）：
+  · **`masked: true` ≠ 「有值被改写」**——它只表示脱敏开关开着。实测：查 `daily_overview`
+    （无敏感列）时 `masked: true` 而 `masked_columns: []` 是常态，只有查到 `userPhone`
+    这类敏感列才有改写记录；
+  · **`mask_warnings: []` ≠ 「脱敏完整」**——`--no-mask` 时它**恒为空数组**（没脱敏就没有
+    「脱敏不完整」可言），风险警告在 `warnings` 里。Agent 拿空数组当「脱敏没问题」会
+    把原始 PII 当已脱敏数据汇报；
+  · **`data_coverage` 只有首尾两点，看不见内部缺口**——实测 iso-day 表 7 天窗口里只有
+    第 1、2、7 天有数据时，它照样报满区间。iso-day 表另有 `warnings` 兜底
+    （「区间内应有 N 个自然日，实际只有 M 个有数据」），而 `iso-instant` 与 `epoch-ms`
+    表**没有任何兜底**（实测 epoch-ms 的 `sessions` 中间空 6 天，`data_coverage` 报满
+    首尾且 `warnings: []`）。skill 正文当时把 `data_coverage` 说成「本地数据的实际覆盖
+    范围」——正是这条没有兜底的字段，属于过度承诺。
+  同轮把两个字段的 `null` 成因也数清了（此前只说「恒为 null」）：`resolved_range` 有
+  **四种**（`--sql` 通道 / 没给 `--since`/`--until` / 表没有时间列 / 只给 `--until` 而
+  该列无可用值），`data_coverage` 有**三种**（`--sql` 通道 / 表没有时间列 / 过滤范围内
+  0 行）——两个字段的 `null` **不同源**，只写「恒为 null」会让 Agent 把「没有过滤」
+  与「范围内没有数据」混为一谈。
+  修法：新增 `src/commands/query-notes.ts`，两个通道（`--table` / `--sql`）挂**同一份**
+  `meta.field_notes`（分叉写两份必然漂移）；README 补 `data_coverage` 的内部缺口盲区与
+  `masked` / `mask_warnings` 两个字面陷阱；skill `protocols.md` §1 去掉过度承诺并点名
+  「要核对内部覆盖得自己按自然日 GROUP BY 数行」。
+  新增 `tests/query-field-notes.test.ts`（17 条）：图例键集 ↔ 真实 meta 键集（含
+  `field_notes` 本身必须存在）、无 `**`、正文不含分隔符 `；`、四种/三种 null 成因各配
+  一条真库用例、三处字面陷阱各配真库实证（含 `--limit` 不影响 `data_coverage`）。
+  变异 10 条全红，其中**两条最初是绿的**：① 键集测试把 `field_notes` 过滤掉再比较，
+  删掉某通道的图例时 17 条全绿——改成显式断言其存在后才红；② epoch-ms 那条只跑了
+  **无过滤**查询，此时 `resolvedRange` 为 null、缺口警告块根本进不去，把
+  `NULL AS days` 改成常量 days 的变异仍然全绿——补一条带过滤的用例后才红。
+  另同步 `tests/commands/query.test.ts` 两处「meta 九键」的形状钉子（现为十键）。
+
 - **`sync status` 的 `range_status` 两个取值字面与事实相反，且四个命令的状态位全仓无释义**。
   这条命令是 skill 协议指定的「看水位与缺口」入口，而它输出的 `range_status`
   （`pending`/`complete`/`null`）此前**一个释义都没有**。逐格实测（2026-10-27，真库）：
