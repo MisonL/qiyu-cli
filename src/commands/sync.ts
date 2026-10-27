@@ -30,6 +30,7 @@ import { dirname } from 'node:path'
 import { SYNC_TASKS, taskById, UNSUPPORTED_DATASETS } from '../sync/registry.js'
 import { listGaps, listWatermarks } from '../sync/state.js'
 import type { SyncTask } from '../sync/types.js'
+import { statusFieldNotes, tasksFieldNotes, verifyFieldNotes } from './sync-notes.js'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
@@ -335,7 +336,7 @@ async function syncStatus(argv: string[]): Promise<number> {
         locked: (st?.lockedBy ?? null) !== null,
       }
     })
-    return ok({ tasks: tasksOut })
+    return ok({ tasks: tasksOut }, { field_notes: statusFieldNotes() })
   } catch (e) {
     return thrownToExit(e)
   } finally {
@@ -446,7 +447,7 @@ async function syncVerify(argv: string[]): Promise<number> {
         drift,
       })
     }
-    const code = ok({ tasks: tasksOut })
+    const code = ok({ tasks: tasksOut }, { field_notes: verifyFieldNotes() })
     const hasDrift = tasksOut.some((t) => (t.drift as DriftEntry[]).length > 0)
     return hasDrift ? 1 : code
   } catch (e) {
@@ -742,7 +743,7 @@ export async function syncCommand(argv: string[]): Promise<number> {
       .filter((c) => c.sensitive === true).map((c) => c.name),
   }))
   const unsupported = UNSUPPORTED_DATASETS.map((u) => ({ id: u.id, unsupported: u.reason }))
-  return ok({ tasks, unsupported })
+  return ok({ tasks, unsupported }, { field_notes: tasksFieldNotes() })
 }
 
 export { SYNC_RUN_USAGE }

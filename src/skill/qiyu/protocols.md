@@ -31,6 +31,27 @@
    `rate_limit_local` 等到 `detail` 里的时刻再重跑，`fetch_failed`/`write_failed`/
    `count_mismatch` 重跑 `sync run` 覆盖该区间；`knowledge_row_malformed`/
    `filter_matched_no_staff`/`export_*` 是**成功窗上的提示**（数据未必缺，按 `detail` 判断）。
+   - ⚠️ **`range_status` 的两个取值字面都在撒谎**（逐值释义见输出的 `meta.field_notes`）：
+     `complete` 只表示「水位推进过」——中窗失败时它照样是 `complete`，**不是**「全窗口成功」；
+     `pending` 只表示「最近一次运行没推进水位」——首窗失败时后续成功窗照常落库，**不是**
+     「库里没数据」；先成功一轮再跑一轮首窗失败同样回到 `pending`（watermark 保留上一轮的
+     值），所以也**不是**「从未同步过」；更**不是**「正在同步」。判数据完整不要只看
+     `range_status`，也不要只看 `gaps`——
+     **空 `gaps` 不等于完整**（`windows.skipped > 0` 时可能没有缺口记录、但请求区间仍有
+     未覆盖段）。要同时看覆盖范围（`sync status` 的 `resolved_range`、以及 `sync run` 的
+     `windows.skipped` —— status 与 verify 都不输出后者）与历史缺口的新鲜度。
+   - ⚠️ **`gaps` 是历史记录，不等于「当前仍缺」**：旧记录与新记录的 `reason` 相同，按
+     `reason` 分不出新旧；`range` 也只能说明「相关」——换边界重跑后数据可能已补齐，而旧
+     缺口的 `range` 仍与你评估的区间重叠。**没有一次覆盖核对就不能确认新鲜度**：写
+     「该区间有历史缺口记录，新鲜度未确认」，不要直接报成当前故障。
+   - ⚠️ `sync run` 的 `status: "partial"` **也覆盖「一行都没落」的全窗失败**：两个字段分开
+     读——`windows.succeeded` 是成功窗数（空窗也算成功），`rows.written` 才是落库行数。
+   - ⚠️ **`sync verify` 的 `drift` 为空 / 退出码 0 不能当完整性证据**：对 windowed 任务
+     它只核对同步状态记录（实测中窗失败的库同样给 `drift: []` + 退出码 0），快照任务另有
+     上游行数核对。windowed 的完整性要另行核对两处：`sync status` 的 `gaps` 与
+     `resolved_range`，以及 `sync run` 的 `windows.skipped`（status/verify 都不输出它）。
+   - ⚠️ `locked: true` 是**残留的写者章**（上一轮被强杀），不是「正在同步中」——真持锁的
+     写者会让 `sync status` 先退避等待，等到后读到的是那一轮的结果。重跑 `sync run` 即可。
 3. **真的没有数据**。
 
 报告 0 行时写「查询窗口 X 到 Y 内 0 行」，并说明排除了哪几种成因；不要写「系统里没有」。

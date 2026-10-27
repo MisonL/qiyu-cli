@@ -5,7 +5,28 @@
 // 本文件的常量 SELECT 调用点共 4 处，不在 duckdb.ts 的 9 处基线计数内。
 import type { Store, WriteTx } from '../store/types.js'
 
-export type RangeStatus = 'pending' | 'complete' | null
+/**
+ * `sync_state.range_status` 的取值（闭集；`null` = 从未运行过）。
+ *
+ * ⚠️ 运行时数组 + `typeof ARR[number]` 而不是裸联合类型：这是**输出数据里的机器值**
+ * （`sync status` 的 `range_status`），Agent 要按它分支。值域必须能在运行时导出，
+ * `meta.field_notes` 的图例与测试才能双向核对「枚举 ⊆ 图例、图例 ⊆ 枚举」。
+ *
+ * ⚠️⚠️ **`complete` 的真实语义不是「全窗口成功」**（设计稿 §6.1 的原话），而是
+ * 「水位推进过」——引擎在**每个成功窗**的同一事务里调 `advanceWatermark`，它无条件写
+ * `complete`。2026-10-27 实测（3 窗、中窗失败）：run 报 `status: partial`、
+ * `windows: {succeeded: 2, failed: 1}`，而 `range_status` 仍是 `complete`。
+ * 所以 `complete` **不能**用来判定「这段数据完整」；缺口要看 `gaps` / `sync_gaps`。
+ *
+ * 反过来 `pending` 也**不代表「一行都没写」**：首窗失败时 `contiguousEnd` 为 null，
+ * 后续成功窗的 `commitWindow` 拿到的 `watermarkRange` 是 null → 不调 `advanceWatermark`，
+ * 数据照常落库而状态停在 `markPending` 写的 `pending`。2026-10-27 实测：3 窗中首窗失败、
+ * 后两窗成功 → `range_status: pending`、`watermark: null`，但表里**有 2 行数据**。
+ * 所以 `pending` 只说明「水位没动过」，不说明「库里没数据」。
+ */
+export const RANGE_STATUSES = ['pending', 'complete'] as const
+export type RangeStatusValue = typeof RANGE_STATUSES[number]
+export type RangeStatus = RangeStatusValue | null
 
 export interface WatermarkState extends ResolvedRangeState {
   watermark: string | null

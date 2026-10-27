@@ -9,6 +9,84 @@
 
 ### 修复
 
+- **`sync status` 的 `range_status` 两个取值字面与事实相反，且四个命令的状态位全仓无释义**。
+  这条命令是 skill 协议指定的「看水位与缺口」入口，而它输出的 `range_status`
+  （`pending`/`complete`/`null`）此前**一个释义都没有**。逐格实测（2026-10-27，真库）：
+  · 3 窗中第 2 窗失败 → run 报 `status: "partial"`、`windows.failed=1`，而 `range_status`
+    仍是 **`complete`** —— 引擎在每个成功窗的同一事务里调 `advanceWatermark`，它无条件写
+    complete（设计稿 §6.1 的原话是「全窗口成功」，实现比它弱）。按字面读 `complete` 会
+    得出「这段数据完整」，而缺口就在同一次输出的 `gaps` 里；
+  · 3 窗中首窗失败 → `range_status: "pending"`、`watermark: null`，但表里**有 2 行数据**
+    （首窗失败时 `watermarkRange` 为 null，后续成功窗照常落库、只是不推水位）。按字面读
+    `pending` 会得出「库里没数据」。
+  同轮还核实：`sync run` 的 `status: "partial"` **也覆盖「一行都没落」的全窗失败**
+  （`succeeded: 0`，`failed` 只留给快照任务被限频闸门拦下）；`sync status` 的
+  `locked: true` 是**残留章**而不是「正在同步中」（并发写者实测会让本命令退避等待 7.4 秒
+  后正常返回，等不到才报 `store_locked`）；`sync verify` 的
+  `state_windows_consistent: true` 同样**不代表数据完整**（中窗失败的库实测给出
+  `drift: []` + 退出码 0）。修法：`RANGE_STATUSES`/`RUN_STATUSES` 改 `as const` 数组
+  （运行时可导出，双向核对才有对象）+ `satisfies Record<枚举, string>` 的释义表 +
+  四个命令的 `meta.field_notes`（`sync run`/`status`/`verify`/`tasks` 各一套，
+  集中在新模块 `src/commands/sync-notes.ts` —— 放 `sync.ts` 会让 `sync-run.ts` 反向
+  import 成环）。图例不只写「不代表 X」，还写**机制**（为什么 pending 时表里有数据、
+  为什么 complete 时可能仍有缺口）。
+  新增 `tests/sync-state-legends.test.ts`：枚举 ⊆ 图例、图例 ⊆ 枚举、README 图例覆盖、
+  路径形态（`gaps[]` 是数组、`drift[]` 是数组）、无 `**`、无幽灵键，**外加四条真库行为
+  用例把图例的字面结论钉在引擎事实上**（中窗失败 → complete；首窗失败 → pending 但有数据；
+  残留章 → locked:true 且 verify 仍报一致；从未同步 → null）。变异 9 条全红，其中两条
+  最初是绿的（只断言了「不代表」三个字，没钉机制），补强后才红 —— 连同一条引擎变异
+  （`advanceWatermark` 改回写 pending）验证「真库用例钉的是引擎事实，不是图例自说自话」。
+  README 补两张图例表（`range_status` / `tasks[].status`）+ `locked` 与 `verify` 的边界
+  说明；skill `protocols.md` §2 补四条 Agent 侧警告。
+  CodeRabbit 四条（全部核实成立并修，`src/commands/sync-notes.ts` 与 README/skill 同步）：
+  ① **Major** —— `verify` 的图例一度写「要判完整性看 drift 与本命令退出码」，而本 PR 自己
+  的用例正证明中窗失败的库给 `drift: []` + 退出码 0：图例在自相矛盾，改成「drift 为空 /
+  退出码 0 同样不能当完整性证据」+ 正确的替代路径；② `resolved_range` 说成「本轮**实际
+  覆盖**到的区间」是过度承诺 —— 日对齐任务的首残段会被跳过、`start` 前缀不会自动前移，
+  改成「请求的水位区间 + 不是已覆盖的保证」并指向 `windows.skipped`；③ 判「有没有拿到
+  数据」不能用 `windows.succeeded`（**空窗也算成功窗**，`tests/sync/engine.test.ts`
+  「两次都空 → 判空推进」钉着），必须同时点名 `rows.written`；④ `gaps` 说「按 reason 判断
+  是否仍缺」是错的 —— 旧记录的 reason 与新记录**相同**，区分不出新旧，改成按 `range`
+  对照 + 说不清就写「新鲜度未确认」。四条各补一条变异验证（回退措辞即红）。
+  **第二轮三条**（同样核实成立）：⑤ verify 那句「本命令只核对同步状态」会把**快照任务**
+  一起否认掉——快照任务有上游行数核对，必须限定为「对 windowed 任务」；⑥ `tasksFieldNotes`
+  的 `kind`/`sensitive_columns` 写成**裸键**，而它们在 `tasks[]` 条目里（路径写错 =
+  Agent 找不到）——测试里接受错误路径的 `TOP_KEYS` 一并收窄；⑦ 「按 range 对照判新鲜度」
+  仍不成立：换边界重跑后数据可能已补齐，而旧缺口的 range 仍与新评估区间**重叠**——
+  range 只能说明「相关」，没有一次覆盖核对就不能确认新鲜度。四条各补一条变异验证。
+  **第三轮一条**：⑧ `tasks[].status` 的 `complete` 说成「全部窗口成功」仍不准确 ——
+  `windows.skipped > 0` 且 `failed = 0` 时同样是 `complete`（被跳过的残段窗没跑也没写），
+  照「正常」行事会漏掉那段区间。改成「没有失败窗口」+ 指向 `windows.skipped`。
+  **第四轮一条（Major）**：⑨ `complete` 的图例仍写「判定数据完整只能看 `gaps`」——
+  实测反例（真库）：日对齐任务 + 非日界起点的显式区间 → `skipped: 2`、`gaps: []`、
+  `status: complete`，而请求区间只有中间一段被拉取。改成综合三个判据（覆盖范围 /
+  历史缺口新鲜度 / 空 gaps 不等于完整），并把这个反例钉成真库用例。
+  **第五轮两条**：⑩ `sync status` 的 `resolved_range` 说成「上次成功推进**覆盖**的区间」
+  同样过度承诺 —— 实测 `start` 等于**请求起点**（含被跳过的首残段前缀，而首个整日窗
+  其实从 16:00Z 才开始），且本命令不输出 `windows.skipped`；改成「水位区间 + 判实际
+  覆盖要看 `sync run` 的 `windows.skipped`」。⑪ `pending` 的图例写「该任务尚未成功
+  推进过水位」不成立 —— `markPending` 每轮开跑就置 pending，实测「先成功一轮、再跑一轮
+  首窗失败」会回到 `pending` 而 `watermark` **保留上一轮的值**；改成「最近一次运行没有
+  成功推进水位」并列出三种误读。两条各补变异验证，另加一条**分隔符守卫**（枚举释义正文
+  不得含 `；`，否则 `renderNotes` 的反向解析会产生幽灵取值 —— 这个坑本轮踩了两次）。
+  **自查补三处**（CodeRabbit 配额用尽期间自己复审）：⑫ verify 的替代路径把
+  `windows.skipped` 说成 `sync status` 里有的 —— status 与 verify 都不输出它，必须点名去
+  `sync run` 找；⑬ `expected_from_api` 的「用 kind 区分」含糊（kind 是 drift 条目的字段），
+  改成「看 drift 里有没有 fetch_failed」；⑭ `watermark.initial` 的「首跑从 0 起」漏了
+  `windowStartFloorDays` 的抬升（接口物理上给不出更早的数据）。⑫ 补变异验证。
+  ⑮ 「图例键必须在真实输出里存在」那条测试原本**手抄**了一份任务条目键清单，注释却声称
+  「改 `taskOut` 删键时这条会红」—— 手抄清单不会跟着红（本项目已在 `TOP_KEYS` 上踩过一次）。
+  改成导出 `taskOut()` 并从它的返回对象**推导**键集；变异验证：把 `taskOut` 的 `status`
+  键改名 → 测试红。同时把 `RANGE_STATUS_NOTES` 的 `satisfies` 目标从字面量改为
+  `RangeStatusValue | 'null'`（与 `RUN_STATUS_NOTES` 同款）：给枚举加值而不写图例现在
+  **编译期**就失败。
+  ⑯ `tasks[].status` 的 `failed` 一度写成「连窗口循环都没进（目前只有快照任务被本地限频
+  闸门拦下这一条路径）」—— 引擎里快照有**三条** `failed` 出口（限频闸门 / 上游取数失败 /
+  落库失败或行数核对不符），只提闸门会让 Agent 把「取数失败」误读成 `partial`。改成逐条
+  点名，并补一句「windowed 任务不会给出 `failed` —— 全窗失败也是 `partial`」（窗口循环
+  只有这两个出口）。新增真库用例同时钉住两侧边界；变异：图例回退 → 断言红，把快照的
+  `failed` 改成 `partial` → 真库用例红。
+
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
   这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`
   的 `unit`；绝不要猜百分比还是绝对值」），可它输出的 `declared.<字段>.unit` 四个取值

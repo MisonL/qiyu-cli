@@ -9,9 +9,11 @@ describe('联动文案（B 上线后不得与事实相反）', () => {
     const md = read('README.md')
     // 旧声明「三个键恒在」与实现相反：`ok()` 在没有任何元数据时**故意不输出 meta**
     // （`tests/output.test.ts`「未提供 meta 时不输出该键」把它钉成契约）。
-    // 实测（skill 已装、无提示）：`--version`、`store init/status`、`sync tasks/status/run`、
-    // `skill where` 的成功输出只有 `{ok,data}`；`query`/`db`/`api`/`stats`/`skill check`
-    // 才带 meta。`SKILL.md` 早就写对了（「部分命令附带 `"meta"`」），README 是唯一说反的地方。
+    // 实测（skill 已装、无提示）：`--version`、`store init/status`、`skill where` 的成功
+    // 输出只有 `{ok,data}`；`query`/`db`/`api`/`stats`/`skill check` 才带 meta。
+    // 2026-10-27 起 `sync tasks/status/run/verify` 也带 `meta.field_notes`（状态位图例），
+    // 因此不再是无 meta 的例子。`SKILL.md` 早就写对了（「部分命令附带 `"meta"`」），
+    // README 是唯一说反的地方。
     // 若要恢复「恒在」，必须先让 `ok()` 恒输出 meta 并同步那条 output.test.ts 的钉子 ——
     // 否则这句承诺会让 Agent 对每条成功输出都去读一个可能不存在的键。
     expect(md, '「三个键恒在」与实现相反；meta 只在有内容时出现').not.toMatch(/三个键恒在/)

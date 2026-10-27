@@ -10,6 +10,22 @@ import type { Store } from '../store/types.js'
 /** 事务内写落库视图：引擎的写路径只拿这些原语（不暴露 query/init/close）。 */
 export type WriteOps = Pick<Store, 'delete' | 'upsert'>
 
+/**
+ * `sync run` 每任务的 `status` 取值（闭集）。
+ *
+ * ⚠️ 运行时数组而不是裸联合类型：这是**输出数据里的机器值**，Agent 要按它分支
+ * （重跑 / 报告人类 / 放弃）。值域必须能在运行时导出，图例与测试才能双向核对。
+ *
+ * ⚠️⚠️ **`partial` 的字面语义是「部分成功」，但它同样覆盖「一行都没落」**：
+ * windowed 任务的引擎对「全部窗口都失败」也产出 `partial`（`succeeded: 0,
+ * failed: N`）——`failed` 只留给连窗口循环都进不去的异常路径（快照任务的限频闸门拦截）。
+ * 2026-10-27 实测：`tickets.search --since 1d` 全窗失败 → `status: "partial"`、
+ * `windows: {succeeded: 0, failed: 1}`、退出码 1。所以判「这次到底有没有拿到数据」
+ * 要看 `windows.succeeded` 或退出码，**不要**看 `status` 的字面。
+ */
+export const RUN_STATUSES = ['complete', 'partial', 'failed'] as const
+export type RunStatus = typeof RUN_STATUSES[number]
+
 /** runTask 的结果（spec §七 sync run 输出的任务条目形态）。 */
 export interface TaskRunResult {
   taskId: string
@@ -26,7 +42,7 @@ export interface TaskRunResult {
   rows: { fetched: number; written: number }
   resolvedRange: Range
   gaps: GapInfo[]
-  status: 'complete' | 'partial' | 'failed'
+  status: RunStatus
 }
 
 export type { Range }

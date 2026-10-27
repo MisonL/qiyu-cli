@@ -30,6 +30,7 @@ import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
+import { runFieldNotes } from './sync-notes.js'
 import type { Store } from '../store/types.js'
 import { GLOBAL_FLAGS, STORE_FLAGS, renderFlagNames, valueFlagNames } from './spec-types.js'
 import type { FlagSpec } from './spec-types.js'
@@ -185,8 +186,12 @@ function robotsFromConfig(configPath: string, profileFlag: string | undefined): 
   }
 }
 
-/** 任务条目 → 输出形态（spec §七字段名）。 */
-function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: string | null,
+/** 任务条目 → 输出形态（spec §七字段名）。
+ *
+ * 导出供测试**推导**真实键集：`runFieldNotes()` 的 `tasks[].x` 路径必须都落在
+ * 这里的返回对象上，否则 Agent 会照图例去找一个不存在的字段。键集手抄在测试里
+ * 就是假护栏 —— 删掉这里的键，手抄的清单不会跟着红。 */
+export function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt: string | null,
   notes: string[] = []) {
   return {
     task: r.taskId,
@@ -450,7 +455,7 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     // 的任务与 status='failed' 并列计入退出码 1。
     const allFailed = results.every((r) =>
       r.status === 'failed' || (r.windows.succeeded === 0 && r.windows.failed > 0))
-    const code = ok({ tasks: tasksOut, truncated: false })
+    const code = ok({ tasks: tasksOut, truncated: false }, { field_notes: runFieldNotes() })
     // stderr 汇总（spec §二：核对不符等在 run 结束的 stderr 汇总中列出；下界裁剪的
     // notes 同样进 stderr——--quiet 时只看 stdout 的 tasks[].notes）。
     if (flags['--quiet'] === undefined) {
