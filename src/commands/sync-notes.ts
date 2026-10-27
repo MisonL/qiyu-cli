@@ -1,7 +1,8 @@
 // src/commands/sync-notes.ts
 //
 // `sync run` / `sync status` / `sync verify` 的 `meta.field_notes` 图例 —— 三个命令
-// **共用同一个构造点**。
+// **共用同一个构造点**；`sync install` / `sync uninstall` 的四形态图例
+// （`syncInstallFieldNotes`）也在本模块末尾。
 //
 // ⚠️ 为什么单独一个模块而不是放在 sync.ts：`sync.ts` import `sync-run.ts`
 // （`runSyncRun`），把 `runFieldNotes` 放进 sync.ts 会让 sync-run.ts 反向 import，
@@ -165,7 +166,7 @@ const SYNC_COMMAND_NOTES: Record<string, string> = {
   'commands[].error': '失败原因。未执行或成功时为 null',
 }
 
-const INSTALL_ENV_NOTE = '给人读的说明。恒含一条「调度条目不继承 shell 环境」——'
+const INSTALL_ENV_NOTE = '给人读的说明。恒含一条「调度条目不继承你的 shell 环境」——'
   + '凭证走 QIYU_APP_KEY / QIYU_APP_SECRET 时要确认调度上下文能拿到，本条目不写入任何凭证'
 
 /** `sync install` / `sync uninstall` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
