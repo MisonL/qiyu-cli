@@ -69,6 +69,9 @@ describe('每条有图例的命令：输出字段必须被图例覆盖（反向�
     expect(Object.keys(notes()).sort()).toEqual(Object.keys(versionFieldNotes()).sort())
     assertAllCovered('--version')
     expect(notes().skill_contract_version, '必须点明不是已安装那份的').toContain('不是已安装那份的')
+    // CodeRabbit：null 的是整个 entity.installed，不是它下面的字段 —— 得先说清怎么判。
+    expect(notes().skill_contract_version, '必须点明是 entity.installed 整体为 null')
+      .toContain('整个 entity.installed 是 null')
   })
 
   it('auth login：四个键都有释义，且 source 的误导被点破', async () => {

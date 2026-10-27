@@ -31,6 +31,10 @@
   true；改成「要验证只能发一次真实请求」。② `profile` 的释义说「缺省 default」——
   实际选择顺序是 `--profile` > `QIYU_PROFILE` > `defaultProfile` > `default`，
   只写 default 会把写入目标指错。两条各补变异验证。
+  **第二轮一条（Minor）**：`--version` 的释义写「后者缺失或损坏时为 null」——
+  而返回 null 的是**整个 `entity.installed`**，不是它下面的字段；Agent 照字面写
+  `entity.installed.skill_contract_version === null` 会在 `entity.installed` 为 null 时崩。
+  改成「先判 `entity.installed` 非 null 再读」。补变异验证。
 
 - **`store init` / `store status` 无图例，且 README 把两者的 `tables` 形状说成同一个**。
   逐格真库实测（2026-10-28）：

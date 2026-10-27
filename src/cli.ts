@@ -34,8 +34,9 @@ export function versionFieldNotes(): Record<string, string> {
     version: 'CLI 包版本（npm 包的语义版本号）',
     skill_contract_version: 'CLI 自己的正文契约号 —— 不是已安装那份的。'
       + '要判断手上的 skill 正文能否配这份 CLI，拿它与 `skill where` 的 '
-      + 'entity.installed.skill_contract_version 比，相等才配（后者缺失或损坏时为 null，'
-      + '不能当 0 处理）',
+      + 'entity.installed.skill_contract_version 比，相等才配。'
+      + '⚠️ 清单缺失或损坏时整个 entity.installed 是 null（不是它下面某个字段为 null）——'
+      + '先判 entity.installed 非 null 再读，也不要把 null 当 0',
   }
 }
 
