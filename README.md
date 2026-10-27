@@ -452,6 +452,11 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   声明与实况不一致（缺表/缺列/多列/时间列脏值）逐条进 `meta.warnings`，不静默——`db tables` 做表级
   与列集核对，`db describe` 给出该表的逐列差异细节。时间列里不符合约定形态的值**不进**
   `time_range`（否则 `not-a-date` 会在字典序上赢下 MAX），并由 warning 点名数量。
+  ⚠️ **`columns` / `pii_columns` / `time_column` / `grain` / `primary_key` 是声明，不是库里
+  的实况**：表被删、列被删或多出列时它们照旧原样输出，差异只在 `warnings` 里。
+  `row_count` 与 `time_range` 则是**实测**（真去库里查）。`db tables` 的 `tables` 数组同理
+  **只含库中真实存在的表**——声明有而库中无的表不在这里，只在 `warnings` 里点名。
+  逐键释义见输出的 `meta.field_notes`。
 
 `stats fields <报表>` 的输出把**声明**与**观测**分开：`declared`（每条带 `source`：
 `design-doc` 实测 / `name-suffix` 命名推断）、`observed`（`rows_present` / `minus_one` /

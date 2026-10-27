@@ -24,6 +24,12 @@ qiyu sync status
 
 - 有哪些表、行数、粒度、时间范围、PII 标注：`qiyu db tables`
 - 单表的列定义：`qiyu db describe <表>`
+  （⚠️ 要分清**声明**与**实测**：`columns` / `pii_columns` / `time_column` / `grain` /
+  `primary_key` 来自本 CLI 的表定义，是声明——表被删或列被删时照旧输出，差异只在
+  `meta.warnings` 里。`row_count` 与 `time_range` 则是**实测**（真去库里查）。另外
+  `db describe` 有列级字段，`db tables` 只有表级字段（`grain` / `time_range` /
+  `pii_columns`）——别去后者找列清单。`db tables` 的清单也只含库里真实存在的表。
+  逐键释义见输出的 `meta.field_notes`。）
 - 报表指标的单位、本地观测分布、哨兵值：`qiyu stats fields <报表表>`
 - 接口清单与参数表：`qiyu api list`、`qiyu api schema <接口id>`
 - 同步任务清单：`qiyu sync tasks`
