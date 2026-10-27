@@ -28,15 +28,20 @@ function renderNotes(notes: Record<string, string>): string {
  *  · `pending` ≠ 「一行都没写」：首窗失败时 watermarkRange 为 null，后续成功窗
  *    照常落库但不推水位 → pending 而表里有数据。它只说明「水位没动过」。
  *  · `null` = 该任务在 sync_state 里**没有行**（从未跑过，或只跑过被跳过的残段窗）。
- * 所以判「这段数据完整吗」不能看 `range_status`：要看 `gaps` 与覆盖范围，
- * 且 `gaps` 是历史记录、需另行确认新鲜度（见 `statusFieldNotes()` 的 gaps 说明）。
+ * 所以判「这段数据完整吗」不能只看 `gaps`：`windows.skipped > 0` 时可能 gaps 为空，
+ * 但请求区间仍有未覆盖段。必须综合三个判据：
+ *   1. 覆盖是否完整？→ `resolved_range.end >= 请求 end` 且 `windows.skipped = 0`
+ *   2. 历史缺口是否还成立？→ 把每条 gap 的 range 与请求区间对照；对不上或说不清就写「新鲜度未确认」
+ *   3. 空 gaps 是否意味着完整？→ 不一定！若 skipped > 0 或有其他未完成路径，仍是残缺。
  */
 export const RANGE_STATUS_NOTES = {
   pending: '水位没动过（该任务尚未成功推进过水位）。⚠️ 不代表库里没有数据：'
     + '首窗失败时后续成功窗照常落库、只是不推水位（实测 3 窗首窗失败 → pending 且表里有 2 行）。'
     + '也不代表「正在同步」——运行中的写者会让本命令先退避等待、等到后读到的是那一轮的结果',
   complete: '水位推进过。⚠️ 不代表「全窗口成功」：引擎每个成功窗都写 complete，'
-    + '中窗失败时 run 报 partial 而这里仍是 complete（实测）。判定数据是否完整只能看 gaps',
+    + '中窗失败时 run 报 partial 而这里仍是 complete（实测）。判定数据完整要综合三个判据：'
+    + '覆盖范围（resolved_range / windows.skipped）、历史缺口新鲜度（按 range 对照）与'
+    + '空 gaps 的真实含义（skipped > 0 时可能 gaps 为空但仍有未覆盖段）。',
   'null': '该任务在 sync_state 里没有行（从未运行过，或只跑过被跳过的残段窗）。'
     + '与 pending 不同：pending 至少有 markPending 写过行',
 } satisfies Record<'pending' | 'complete' | 'null', string>

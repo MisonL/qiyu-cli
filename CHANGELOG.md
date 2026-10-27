@@ -57,6 +57,10 @@
   **第三轮一条**：⑧ `tasks[].status` 的 `complete` 说成「全部窗口成功」仍不准确 ——
   `windows.skipped > 0` 且 `failed = 0` 时同样是 `complete`（被跳过的残段窗没跑也没写），
   照「正常」行事会漏掉那段区间。改成「没有失败窗口」+ 指向 `windows.skipped`。
+  **第四轮一条（Major）**：⑨ `complete` 的图例仍写「判定数据完整只能看 `gaps`」——
+  实测反例（真库）：日对齐任务 + 非日界起点的显式区间 → `skipped: 2`、`gaps: []`、
+  `status: complete`，而请求区间只有中间一段被拉取。改成综合三个判据（覆盖范围 /
+  历史缺口新鲜度 / 空 gaps 不等于完整），并把这个反例钉成真库用例。
 
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
   这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`

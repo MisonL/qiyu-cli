@@ -191,6 +191,11 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     expect(rangeNotes, 'pending 的机制必须写出来（数据照常落库、只是不推水位）')
       .toContain('照常落库')
     expect(rangeNotes, 'pending 的机制必须写出来（水位没动）').toContain('不推水位')
+    // CodeRabbit 第四轮：`complete` 那段一度写「判定完整性只能看 gaps」—— 而 skipped > 0
+    // 时可能 gaps 为空但仍有未覆盖段。必须要求综合三个判据。
+    expect(rangeNotes, 'complete 不得只指向 gaps').toContain('windows.skipped')
+    expect(rangeNotes, '必须点明「空 gaps 不等于完整」').toContain('空 gaps')
+    expect(rangeNotes, '必须给覆盖范围的判据').toContain('resolved_range')
     expect(runFieldNotes()['tasks[].status'], 'partial 的误读必须写出来')
       .toContain('一行都没落')
     // CodeRabbit（2026-10-27）：空窗也算成功窗，所以「有没有拿到数据」不能用
@@ -240,6 +245,7 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     // CodeRabbit 第二轮：skill 正文同样不能把 verify 说成「只核对状态」而不限 windowed
     expect(p).toContain('对 windowed 任务')
     expect(p).toContain('没有一次覆盖核对就不能确认新鲜度')
+    expect(p, 'skill 正文也必须点明空 gaps 不等于完整').toContain('空 `gaps` 不等于完整')
   })
 
   it('源码注释里的「实测」锚点与真跑出来的输出一致（判据不靠人肉记忆）', () => {
@@ -274,6 +280,41 @@ describe('两条反直觉事实的真库实测（图例的字面结论靠它成�
     expect((tk.gaps as Array<Record<string, unknown>>)[0]!.reason).toBe('fetch_failed')
     // 而图例必须告诉 Agent：判完整性看 gaps，不是 range_status
     expect(meta().field_notes).toBeDefined()
+  })
+
+  it('日对齐任务 + 残段窗跳过 → skipped > 0 / gaps=[] / status=complete，请求区间仍不全', async () => {
+    // CodeRabbit 第四轮：`skipped > 0` 时可能 gaps 为空但仍有未覆盖段 —— 所以「判完整性
+    // 只能看 gaps」是错的。这条把那个反例钉在真库上。
+    const store = await fresh()
+    const reqStart = 12 * 3600_000       // 上海时间中午起点（非日界）
+    const reqEnd = reqStart + 2 * DAY
+    let n = 0
+    const t: SyncTask = {
+      id: 'reports.overview', table: 'tags', kind: 'windowed', maxWindowDays: 1,
+      overlapDays: 0, windowAlign: 'shanghaiDay',
+      primaryKey: ['id'], watermark: { field: 'stat_date', initial: null },
+      fetch: async () => { n++; return { rows: [{ id: String(n), name: 'A', color: '#111111' }], apiCount: 1 } },
+      write: { kind: 'upsertRows' },
+    }
+    const ctx: RunCtx = { store, credentials: { appKey: 'k', appSecret: 's' },
+      gate: new RateGate(store, () => 0), clock: () => 1_700_000_000_000,
+      rangeOverride: { start: reqStart, end: reqEnd } }
+    const r = await runTask(t, ctx)
+    await store.close()
+
+    // 引擎层：两个残段窗被跳过、只有中间那个整日窗成功
+    expect(r.windows).toEqual({ total: 3, succeeded: 1, failed: 0, skipped: 2 })
+    expect(r.gaps, '没有失败缺口 —— 这正是「gaps 为空」的来源').toEqual([])
+    expect(r.status, '没有失败窗 → complete，尽管一半的窗根本没跑').toBe('complete')
+
+    // 命令层：sync status 看到 gaps=0 且 range_status=complete，但请求区间没被覆盖完
+    out = ''
+    expect(await syncCommand(['status', 'reports.overview', '--db', db])).toBe(0)
+    const tk = tasks()[0]!
+    expect(tk.range_status).toBe('complete')
+    expect(tk.gaps_count, 'gaps 确实为空').toBe(0)
+    // resolved_range 只到日界，首尾两个残段不在里面 —— 这就是「空 gaps 不等于完整」
+    expect(tk.resolved_range, 'resolved_range 应存在').not.toBeNull()
   })
 
   it('首窗失败、后两窗成功 → range_status 是 pending，但表里确实有数据', async () => {
