@@ -42,8 +42,10 @@
 - **`declared.<字段>.unit` 的每个取值怎么用，看输出的 `meta.field_notes`**（那里逐值给了
   释义与动作）：`ms` 是毫秒；`unknown` 是「判不出单位」而不是「没有单位」（如实写
   「单位未知」，不要猜）。`ratio` 的 0–1 量纲**只有 `assignedRatio` 经设计稿实测**——
-  其余 `ratio` 是按名字推断的（`source: name-suffix`，**推断不是实测**），换算百分比前
-  必须先看 `observed` 的 `min`/`max` 核对量纲，别把 0–100 的值当 0–1 报出去。
+  其余 `ratio` 是按名字推断的（`source: name-suffix`，**推断不是实测**）。`observed` 的
+  `min`/`max` 只能核对一致性、**不是量纲证据**：全都落在 0–1 时，它与「0–1 小数」和
+  「数值恰好都 <1% 的百分数」都相容。量纲不明确就**报告原值并标注不确定**，不要自行
+  换算成百分比。
   `source` 就告诉你这条声明是实测（`design-doc`）还是命名推断。
 - `declared.<字段>.higher_is_better` **恒为 null**——没有任何上游依据，不要据此判断指标
   好坏方向，也不要一直等它变成 true/false。

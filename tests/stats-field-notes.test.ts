@@ -80,6 +80,10 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     expect(UNIT_NOTES.ratio).toContain('0–1')
     expect(UNIT_NOTES.ratio).toContain('不是 0–100 的百分数')
     expect(UNIT_NOTES.ratio, '必须点明哪些是实测、哪些是推断').toContain('命名推断')
+    // 量纲不明确时的动作必须是「报原值 + 标注不确定」，不能是「照 0–1 换算」
+    // （CodeRabbit：observed 落在 0–1 与「数值恰好都 <1% 的百分数」同样相容，不是证据）
+    expect(UNIT_NOTES.ratio).toContain('不是量纲证据')
+    expect(UNIT_NOTES.ratio).toContain('报告原值并标注不确定')
     expect(UNIT_NOTES.unknown).toContain('不是「没有单位」')
     expect(UNIT_NOTES.unknown).toContain('unknown_fields')
     expect(UNIT_NOTES.ms).toContain('毫秒')
