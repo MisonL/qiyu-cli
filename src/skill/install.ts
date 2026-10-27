@@ -163,13 +163,22 @@ export interface Manifest {
   file_hashes?: Record<string, string>
 }
 
+/**
+ * 安装结果的 `status` 全部取值（真实安装的 `status` 与 dry-run 的 `planned_status` 同源）。
+ * Agent 按值分支（skip = 零写入），所以每个值都必须在 README 图例里有释义
+ * （`tests/skill-field-notes.test.ts` 双向核对）。
+ */
+export const INSTALL_STATUSES = ['installed', 'updated', 'skipped'] as const
+export type InstallStatus = typeof INSTALL_STATUSES[number]
+
 export interface InstallResult {
   entityDir: string
   /**
    * **实际**写盘结果（审查 B2）：与 `plannedStatus` 不一致时以这里为准。
    * 计划要写、实际一个文件都没写进去 → 这里退为 `'skipped'`，绝不报 updated。
    */
-  status: 'installed' | 'skipped' | 'updated'
+  /** 取值域与 `commands/skill.ts` 的 `INSTALL_STATUSES` 相同（dry-run 的 planned_status 同源）。 */
+  status: InstallStatus
   /** `planInstall` 当初给出的计划态（dry-run 的 planned_status 是同一个值）。 */
   plannedStatus: 'installed' | 'skipped' | 'updated'
   links: { agent: string; path: string; state: LinkState }[]

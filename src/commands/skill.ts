@@ -39,15 +39,15 @@ import { COMMAND_TREE } from './tree.js'
 import { prettyAfterSubcommand } from './spec-types.js'
 import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult } from '../skill/check.js'
-import { contentHash, installSkill, planInstall, type InstallPlan } from '../skill/install.js'
+import { contentHash, installSkill, planInstall, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
 import {
-  entityUndeterminedNote, npmRelativeBase, readInstalledManifestInfo, resetSkillDetectionCache,
-  resolveEntityDirSources, resolveSkillSourceDir,
+  ENTITY_SOURCES, entityUndeterminedNote, npmRelativeBase, readInstalledManifestInfo,
+  resetSkillDetectionCache, resolveEntityDirSources, resolveSkillSourceDir,
   type EntitySource,
 } from '../skill/detect.js'
 import {
-  AGENT_SKILL_SUBDIRS, agentSkillDirs, agentSkillSubdir, LINK_NAME, linkState,
-  type AgentDir, type LinkState,
+  AGENT_SKILL_SUBDIRS, agentSkillDirs, agentSkillSubdir, LINK_NAME, LINK_STATES, linkState,
+  type AgentDir,
 } from '../skill/paths.js'
 
 /**
@@ -349,16 +349,118 @@ function checkFailed(entityDir: string, detail: string): number {
 
 // —— skill install ——
 
+// ⚠️ 下面五组枚举都是 `skill where` / `skill install` 输出里 Agent 要按值分支的机器值，
+// 此前全仓无释义（README 只写了链接四态的名字，`entity.state` 的 `not_a_directory`、
+// install 的 `action`/`status` 连名字都没有）。`foreign` 尤其危险：它意味着**路径上是
+// 别人的东西**，猜成「坏了要修」就会误删。
+//
+// 图例走**输出自带的 `meta.field_notes`**（与 `api list` 同一形态）而不是只写 README：
+// 安装后的 Agent 手里只有六篇正文、没有 README（包内 `files` 只有 `dist`），
+// SKILL.md 指向 README 会是一条走不通的路。README 同步保留人读版图例；
+// `tests/skill-field-notes.test.ts` 三方核对（枚举 ↔ field_notes ↔ README）。
+/** `entity.state`（`skill where` 的 `data.entity.state`）。 */
+export const ENTITY_STATES = ['ok', 'missing', 'not_a_directory', 'unknown'] as const
+export type EntityState = typeof ENTITY_STATES[number]
+/** `links[].state`（`skill where` 与 `skill install` 的 `data.links[].state`）。 */
+export const LINK_REPORT_STATES = [...LINK_STATES, 'unknown'] as const
+export type LinkReportState = typeof LINK_REPORT_STATES[number]
+/** `links[].action`（仅 `skill install --dry-run` 的计划）。 */
+export const LINK_PLAN_ACTIONS = ['keep', 'create', 'rebuild', 'skip', 'unknown'] as const
+export type LinkPlanAction = typeof LINK_PLAN_ACTIONS[number]
+/** `skill install --dry-run` 的 `action`。 */
+export const INSTALL_ACTIONS = ['install', 'update', 'skip'] as const
+
+/**
+ * 状态枚举的图例文本 —— **唯一构造点**：`skill where`/`skill install` 的
+ * `meta.field_notes` 直接用它，README 的人读版由测试核对同一组取值。
+ * 每加一个枚举值，这里必须同时加一句释义（`Record<枚举, string>` 让漏写编译失败）。
+ */
+export const SKILL_STATE_NOTES = {
+  entityState: {
+    ok: '实体目录可用',
+    missing: '实体目录不存在（= 未安装）',
+    not_a_directory: '路径存在但不是目录 —— install 不会写它，需先由人处理该路径',
+    unknown: '无法判定（见 error 字段）—— 不是「不存在」，不要据此重装或删除',
+  } satisfies Record<EntityState, string>,
+  linkState: {
+    ok: '链接已正确指向本实体，无需动作',
+    missing: '链接不存在。install 只在该 Agent 的 skills 目录已存在时创建链接'
+      + '（从不创建目录）：目录不存在时 install 在 meta.warnings 里说明、links 里也没有'
+      + '这个 Agent 的条目 —— 装好 Agent 后重跑 install 才会建链',
+    dangling: '链接存在但目标已不在（install 会重建）',
+    foreign: '路径上是别人的东西（不是指向本实体的符号链接）—— install 一律跳过，不要删、不要覆盖',
+    unknown: '无法判定（见 error 字段）—— 不是「不存在」，不要据此重装或删除',
+  } satisfies Record<LinkReportState, string>,
+  linkAction: {
+    keep: '已正确指向，计划不做动作',
+    create: '计划创建链接（对应 state=missing）',
+    rebuild: '计划重建链接（对应 state=dangling）',
+    skip: '计划跳过（对应 state=foreign：别人的东西，不动）',
+    unknown: '无法判定，计划不做动作',
+  } satisfies Record<LinkPlanAction, string>,
+  installAction: {
+    install: '首次安装（写入正文与清单）',
+    update: '覆盖正文（--force）或只重写落后的清单',
+    skip: '实体内容零写入：内容与包内一致且清单新鲜，或内容不同但没带 --force'
+      + '（原因见 meta.warnings）。⚠️ 链接仍会照常建立/修复 —— 零写入只针对实体正文，'
+      + '看 links[] 判断链接发生了什么',
+  } satisfies Record<(typeof INSTALL_ACTIONS)[number], string>,
+  installStatus: {
+    installed: '已安装（首次）',
+    updated: '已更新（覆盖正文或重写清单）',
+    skipped: '实体内容零写入（语义同 action=skip）；链接仍会照常建立/修复，看 links[]',
+  } satisfies Record<InstallStatus, string>,
+} as const
+
+/** 渲染成 `a = 释义；b = 释义` —— field_notes 的单元格形态（与 `api list` 同款）。 */
+function renderStateNotes(notes: Record<string, string>): string {
+  return Object.entries(notes).map(([k, v]) => `${k} = ${v}`).join('；')
+}
+
+/** `skill where` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
+export function whereFieldNotes(): Record<string, string> {
+  return {
+    'entity.source': `实体目录来源：${ENTITY_SOURCES.join(' > ')}（优先级即顺序）`,
+    'entity.exists': 'true/false = 是否存在；null = 无法判定（与 state=unknown 配套）—— 不是「不存在」',
+    'entity.state': renderStateNotes(SKILL_STATE_NOTES.entityState),
+    'entity.installed': '已安装那份正文的版本元数据；null = 判定不了（实体不可用或清单缺失/损坏），不是「兼容」',
+    'links[].state': renderStateNotes(SKILL_STATE_NOTES.linkState),
+  }
+}
+
+/**
+ * `skill install` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。
+ * ⚠️ 按输出形态分开：dry-run 没有 `status`、真实安装没有 `action`/`planned_status` ——
+ * 图例只解释**该输出里真实存在**的字段（否则就是「声明了但没人读」的反向形态：
+ * 解释一个不存在的键）。
+ */
+export function installFieldNotes(mode: 'dry-run' | 'real'): Record<string, string> {
+  const common = {
+    entity_source: `实体目录来源：${ENTITY_SOURCES.join(' > ')}（优先级即顺序）`,
+    'links[].state': renderStateNotes(SKILL_STATE_NOTES.linkState),
+  }
+  return mode === 'dry-run'
+    ? {
+      action: renderStateNotes(SKILL_STATE_NOTES.installAction),
+      planned_status: renderStateNotes(SKILL_STATE_NOTES.installStatus),
+      // `links[].action` 只在 dry-run 的计划里存在：真实安装的 links 条目只有 state
+      // 与可选 error（`InstallResult['links']` 的类型如此）——免得解释一个读不到的键。
+      'links[].action': renderStateNotes(SKILL_STATE_NOTES.linkAction),
+      ...common,
+    }
+    : { status: renderStateNotes(SKILL_STATE_NOTES.installStatus), ...common }
+}
+
 interface PlannedLink {
   agent: string
   path: string
-  state: LinkState | 'unknown'
-  action: 'keep' | 'create' | 'rebuild' | 'skip' | 'unknown'
+  state: LinkReportState
+  action: LinkPlanAction
   error?: string
 }
 
 /** 链接四态 → 安装会采取的动作（dry-run 输出用；与 install.ts 的分派表一致）。 */
-function linkAction(state: LinkState | 'unknown'): PlannedLink['action'] {
+function linkAction(state: LinkReportState): PlannedLink['action'] {
   switch (state) {
     case 'ok': return 'keep'
     case 'missing': return 'create'
@@ -370,8 +472,8 @@ function linkAction(state: LinkState | 'unknown'): PlannedLink['action'] {
 
 /** 安装计划 → dry-run 的 action/planned_status（与真实 install 的 status 一一对应）。 */
 function planOutcome(plan: InstallPlan): {
-  action: 'install' | 'update' | 'skip'
-  status: 'installed' | 'updated' | 'skipped'
+  action: (typeof INSTALL_ACTIONS)[number]
+  status: InstallStatus
 } {
   switch (plan.action) {
     case 'write':
@@ -518,7 +620,7 @@ async function skillInstall(argv: string[]): Promise<number> {
         no_link: noLink,
         links: planned.links,
       },
-      warnings.length > 0 ? { warnings } : undefined,
+      { field_notes: installFieldNotes('dry-run'), ...(warnings.length > 0 ? { warnings } : {}) },
     )
   }
 
@@ -588,7 +690,7 @@ async function skillInstall(argv: string[]): Promise<number> {
       status: result.status,
       links,
     },
-    allWarnings.length > 0 ? { warnings: allWarnings } : undefined,
+    { field_notes: installFieldNotes('real'), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) },
   )
 }
 
@@ -865,7 +967,7 @@ async function skillCheck(argv: string[]): Promise<number> {
 interface LinkReport {
   agent: string
   path: string
-  state: LinkState | 'unknown'
+  state: LinkReportState
   error?: string
 }
 
@@ -926,7 +1028,12 @@ async function skillWhere(argv: string[]): Promise<number> {
   if (probe.note !== undefined) warnings.push(probe.note)
 
   // 实体状态：只读 stat；ENOENT 是「未安装」，其余异常如实记 unknown。
-  let entity: Record<string, unknown>
+  // ⚠️ 显式标注 `EntityState`（不是 `Record<string, unknown>`）：state 的取值域由类型把关，
+  // 新增一个值而不进 `ENTITY_STATES` 会编译失败 —— 图例（README）与新值的漏写才会被测试抓到。
+  let entity: {
+    path: string; source: EntitySource; exists: boolean | null
+    state: EntityState; error?: string; installed?: unknown
+  }
   let entityUsable = false
   try {
     const st = statSync(entityDir)
@@ -988,7 +1095,7 @@ async function skillWhere(argv: string[]): Promise<number> {
       // 一眼看出「两个数是否相等」，不必再去跑 `--version` 比对。
       cli_contract_version: SKILL_CONTRACT_VERSION,
     },
-    warnings.length > 0 ? { warnings } : undefined,
+    { field_notes: whereFieldNotes(), ...(warnings.length > 0 ? { warnings } : {}) },
   )
 }
 

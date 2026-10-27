@@ -456,9 +456,31 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 Skill 化——`skill install`（复制正文 + 建 Agent 链接，幂等，`--dry-run` 只算计划）/
 `skill check`（校验正文引用的命令、表名、错误 `kind` 与位置参数取值是否仍存在；
 `--installed`/`--compare` 改基准；有违规退出码 1，`--compare` 下内容不一致也算失败）/
-`skill where`（只读报告实体目录与各 Agent 链接四态：
-`ok`/`missing`/`dangling`/`foreign`，无法判定时报 `unknown` 而非「不存在」），
+`skill where`（只读报告实体目录与各 Agent 链接状态），
 外加 `qiyu --version`（输出包版本与 `skill_contract_version`）。
+
+**`skill` 输出的状态取值**（Agent 按值分支；命令输出里每个值都带释义与动作，见
+`meta.field_notes`；本图例与源码枚举由 `tests/skill-field-notes.test.ts` 三方核对）：
+
+`data.entity.state`（`skill where`）——`ok` 实体目录可用 / `missing` 不存在（= 未安装）/
+`not_a_directory` 路径存在但不是目录（install 不会写它，需人先处理）/
+`unknown` 无法判定（带 `error`，此时 `exists` 为 `null`）—— **`unknown` 不是「不存在」**。
+
+`data.links[].state`（`skill where` 与 `skill install`）——`ok` 正确指向本实体 /
+`missing` 链接不存在（**install 只在该 Agent 的 skills 目录已存在时**创建链接，从不创建
+目录；目录不存在时 install 在 `meta.warnings` 里说明，且 `links` 里没有这个 Agent 的条目）/
+`dangling` 链接存在但目标已不在（install 会重建）/
+`foreign` **路径上是别人的东西**（不是指向本实体的符号链接，install 一律跳过，**不要删**）/
+`unknown` 无法判定（带 `error`）——同样**不是「不存在」**。
+
+`skill install --dry-run` 的 `data.action` / `data.planned_status`——`install`/`installed`
+首次安装；`update`/`updated` 覆盖正文（`--force`）或只重写落后的清单；`skip`/`skipped`
+**实体正文零写入**（内容一致且清单新鲜，或内容不同但没带 `--force`，原因在 `meta.warnings`）。
+⚠️ 零写入只针对**实体正文**：链接仍会照常建立/修复 —— 实测「删掉链接后重装」返回
+`status: skipped` 且 `links[].state` 回到 `ok`。判断链接发生了什么要看 `links[]`。
+真实安装用 `data.status`（`installed`/`updated`/`skipped`，语义同上）；`links[].action`
+是**计划动作**（`keep`/`create`/`rebuild`/`skip`/`unknown`，与 `links[].state` 一一对应），
+只在 `--dry-run` 的输出里存在 —— 真实安装的 `links[]` 条目只有 `state` 与可选 `error`。
 
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。

@@ -9,6 +9,29 @@
 
 ### 修复
 
+- **`skill where` / `skill install` 的状态取值全仓无释义**。五组枚举都是 Agent 要按值
+  分支的机器值，此前 README 只给了链接四态的**名字**：`entity.state` 的
+  `not_a_directory`、install 的 `action`（`install`/`update`/`skip`）与
+  `status`/`planned_status`、`links[].action`（`keep`/`create`/`rebuild`/`skip`）连名字
+  都没出现过。**`foreign` 尤其危险** —— 它意味着「那个路径上是别人的东西」，被猜成
+  「坏了该修」就会误删用户的文件。修法：五组枚举改 `as const` 数组
+  （`ENTITY_STATES`/`LINK_REPORT_STATES`/`LINK_PLAN_ACTIONS`/`INSTALL_ACTIONS`/
+  `INSTALL_STATUSES`，`entity.state` 的类型从 `Record<string, unknown>` 收窄），
+  释义走**输出自带的 `meta.field_notes`**（与 `api list` 同形态）—— 安装后的 skill
+  目录只有六篇正文、没有 README，只写 README 等于 Agent 读不到；且 dry-run 与真实安装
+  各只解释**该输出里真实存在**的字段（dry-run 无 `status`、真实安装无 `action`，
+  真实安装的 `links[]` 条目也没有 `action`）。**`skip`/`skipped` 的「零写入」限定为
+  实体正文**：实测「删掉链接后重装」返回 `status: skipped` 而链接仍被重建
+  （`linkAgents` 与计划态无关）—— 不加范围会让 Agent 以为链接也没动、不去看 `links[]`；
+  `tests/commands/skill.test.ts` 新增该行为用例（把建链改成 skipped 时跳过，用例会红）。
+  `missing` 同理：install 只在该 Agent 的 skills 目录**已存在**时建链、从不创建目录，
+  目录不存在时 `links` 里根本没有这个 Agent 的条目（实测）—— 只说「install 会创建」
+  会让 Agent 以为装完就修好了。
+  README 保留人读版图例。新增 `tests/skill-field-notes.test.ts` 三方核对
+  （枚举 ↔ field_notes ↔ README），断言取**生产渲染路径**而非测试自写副本 —— 实测
+  自写副本会让「渲染时漏掉 foreign」全绿；`Record<枚举, 释义>` 让新增值漏写释义
+  直接编译失败。SKILL.md 同步点明 `foreign` 不要删、`unknown` 不是「不存在」。
+
 - **`gaps[].reason` 与 `drift[].kind` 的取值全仓无图例**。`sync status`/`sync run` 的
   `gaps[].reason` 真实值域是 **8 个**：引擎侧 4 个（`rate_limit_local`/`fetch_failed`/
   `write_failed`/`count_mismatch`）+ 任务 `gapHint` 写入的 4 个业务提示
