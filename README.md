@@ -228,12 +228,10 @@ qiyu --version                       包版本 + skill_contract_version
 ```
 
 `ok` 与 `data` 两个键恒在：`data` 即使为空也写成 `null`（不会整个消失），这样 Agent 能区分
-"接口无载荷"与"我解析错了"。`meta` **不是恒在的**——只在命令有元数据要报时才出现
-（`query` 的 `rows`/`resolved_range`、`db tables` 的 `notice` 等），或 skill 安装态
-有待提醒时经 `meta.warnings` 进来。没有任何可报内容的成功输出就只有 `{ok, data}`
-两个键（如无提示时的 `api call`）——
-**读 `meta` 前先判存在**，键不出现 = 没有这项信息（与下方
-失败信封的可选键同一纪律），不是 `null`、更不是解析失败。
+"接口无载荷"与"我解析错了"。`meta` 是**条件键**：没有元数据时不出现。当前每条成功命令
+都至少带 `meta`（多为 `field_notes`，`api call` 至少带 `endpoint`），但**读 `meta` 前仍要
+先判存在** —— 键不出现 = 没有这项信息（与下方失败信封的可选键同一纪律），不是 `null`、
+更不是解析失败。
 
 ### 失败
 

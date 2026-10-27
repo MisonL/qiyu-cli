@@ -9,16 +9,18 @@ describe('联动文案（B 上线后不得与事实相反）', () => {
     const md = read('README.md')
     // 旧声明「三个键恒在」与实现相反：`ok()` 在没有任何元数据时**故意不输出 meta**
     // （`tests/output.test.ts`「未提供 meta 时不输出该键」把它钉成契约）。
-    // 实测（skill 已装、无提示）：`api call` 在没有 warnings/note/not_found 时只有
-    // `{ok,data}`。2026-10-27 起 `sync tasks/status/run/verify` 带 `meta.field_notes`；
-    // 2026-10-28 起 `db describe/tables`、`store init/status`、`--version`、`auth login`
-    // 同理，因此都不再是无 meta 的例子。`SKILL.md` 早就写对了（「部分命令附带 `"meta"`」），
-    // README 是唯一说反的地方。
+    // ⚠️ 2026-10-28 再修正：README 曾拿 `api call` 当「只有 {ok,data}」的例子 —— 而它
+    // **恒带 `meta.endpoint`**，全仓也没有任何命令真的输出无 meta 的成功信封。现在的
+    // 说法是「实现上每条成功命令都至少带 meta，但读之前仍要判存在」—— 前半句是实况、
+    // 后半句是契约（`ok()` 的条件键行为没变，将来可能有命令不带）。
     // 若要恢复「恒在」，必须先让 `ok()` 恒输出 meta 并同步那条 output.test.ts 的钉子 ——
     // 否则这句承诺会让 Agent 对每条成功输出都去读一个可能不存在的键。
     expect(md, '「三个键恒在」与实现相反；meta 只在有内容时出现').not.toMatch(/三个键恒在/)
-    expect(md).toMatch(/`meta` \*\*不是恒在的\*\*/)
-    expect(md, '必须给出可操作的读法，而不是只删掉旧句').toMatch(/读 `meta` 前先判存在/)
+    // README 按行宽折行 —— 短语断言先压空白（本仓库踩过两次的坑）。
+    const flat = md.replace(/\s+/g, '')
+    expect(flat, '必须点明 meta 是条件键').toContain('`meta`是**条件键**')
+    expect(flat, '必须给出可操作的读法，而不是只删掉旧句').toContain('读`meta`前仍要先判存在')
+    expect(md, '不得再把 api call 说成无 meta 的例子').not.toMatch(/无提示时的 `api call`/)
   })
   it('验收 23：README 含新事实、不含旧表述、保留「响应体不做校验」', () => {
     const md = read('README.md')

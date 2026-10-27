@@ -9,6 +9,22 @@
 
 ### 修复
 
+- **`api call` 是最后一条没有图例的成功命令；README 还把它当成「只有 `{ok,data}`」的例子**。
+  2026-10-28 实测：
+  · `api call` **恒带 `meta.endpoint`**，而 README 原写「没有任何可报内容的成功输出就只有
+    `{ok, data}` 两个键（如无提示时的 `api call`）」—— 字面与事实相反；全仓也没有任何
+    命令真的输出无 `meta` 的成功信封（`ok()` 的条件键行为仍在，但当前无命令触发）。
+  · `data` 是**上游载荷**（按信封形状取 `data` / `result` / `staffInfo`），不是 CLI 的
+    契约 —— 不点破，Agent 会按 `qiyu db tables` 的形状去读 `ticket.search` 的返回。
+  · `not_found` 只覆盖**结构性为空**（`data` 键缺失 / `{}` / `[]`）：业务为空（如
+    `ticket.search` 查到 0 条返回 `{total:0,tickets:[]}`）**不会置位** —— 没有
+    `not_found` 不等于有数据。
+  · `warnings` 没有软告警时不出现，`--no-validate` 时恒不出现；`note` 是注册表里的
+    **静态说明**，不是本次调用的结果。
+  修法：新增 `src/commands/api-notes.ts` 的 `callFieldNotes()`（六键），接入 `api call`；
+  README 改为「`meta` 是条件键，当前每条成功命令都至少带 `meta`，读之前仍要先判存在」。
+  测试：新增 `tests/api-call-field-notes.test.ts`（6 条，含信封 C 的 message-JSON 载荷与
+  信封 B 的 result 形状）。变异 7 条全红。
 - **`sync install` / `sync uninstall` 的四种输出都没有图例，且 `commands[].ok` 是三值**。
   2026-10-28 实测：
   · `commands[].ok` 是 `null`（dry-run 未执行）/ `true` / `false` 三值 —— Agent 按布尔值
