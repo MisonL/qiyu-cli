@@ -231,7 +231,7 @@ qiyu --version                       包版本 + skill_contract_version
 "接口无载荷"与"我解析错了"。`meta` **不是恒在的**——只在命令有元数据要报时才出现
 （`query` 的 `rows`/`resolved_range`、`db tables` 的 `notice` 等），或 skill 安装态
 有待提醒时经 `meta.warnings` 进来。没有任何可报内容的成功输出就只有 `{ok, data}`
-两个键（如无 skill 提示时的 `--version`、`store status`）——
+两个键（如无 skill 提示时的 `--version`、`auth login`）——
 **读 `meta` 前先判存在**，键不出现 = 没有这项信息（与下方
 失败信封的可选键同一纪律），不是 `null`、更不是解析失败。
 
@@ -278,9 +278,15 @@ qiyu --version                       包版本 + skill_contract_version
 ### store 命令的输出
 
 `store init` 与 `store status` 成功时输出六字段：`path` / `backend` / `config_path` /
-`config_exists` / `schema_version` / `tables`。其中 `tables` 是 `[{name, rows}]` 数组——
-每张表的名字与行数。`store status` 的每次调用都要对各表做全表 `COUNT`（行数无缓存），
-轮询代价与数据量成正比，Agent 不应把它当作高频健康检查来用。
+`config_exists` / `schema_version` / `tables`，外加 `meta.field_notes`（逐键释义）。
+其中 `tables` 是表清单，但**形状随命令不同**：`store status` 给 `[{name, rows}]`（行数是
+真实 `COUNT(*)`），`store init` 给表名数组 `["a","b"]`。
+⚠️ 另外两点容易误读：`tables` 来自**全库** `information_schema`，**含内部表**
+`schema_version` / `sync_state` / `sync_gaps`（`db tables` 列的是同一组表，两边数量应当
+一致）；`schema_version` 要跟当前 CLI 的版本（`LATEST_VERSION`）比才有意义，小于它就是
+旧版 CLI 建的库，`store init` 只补建缺失的迁移、不重放已应用的。`store status` 的每次调用都要对
+各表做全表 `COUNT`（行数无缓存），轮询代价与数据量成正比，Agent 不应把它当作高频健康
+检查来用。
 
 ### sync 命令的输出
 
