@@ -170,11 +170,21 @@ describe('三值 ok 与 dry_run 的措辞', () => {
     }
   })
 
-  it('dry_run 必须点明「判断装没装看它，不要只看退出码」', () => {
+  it('dry_run 只描述执行模式，不冒充「装没装」的判据（CodeRabbit 2026-10-28）', () => {
     for (const mode of SYNC_INSTALL_MODES) {
       const n = syncInstallFieldNotes(mode).dry_run!
-      expect(n).toContain('不要只看退出码')
+      // dry-run 的 install 在已安装时照样只出计划；uninstall --yes 从未安装时也是 false ——
+      // 所以这个字段回答不了「现在装没装」。
+      expect(n, '必须点明它不回答「现在装没装」').toContain('不回答「现在装没装」')
+      expect(n, '必须把退出码的含义限定到 commands[]').toContain('退出码只取决于 commands[]')
+      expect(n, '不能声称它是安装状态的判据').not.toContain('判断「装没装」')
     }
+  })
+
+  it('absent 必须说明「不出现 = 没有这类路径」（CodeRabbit 2026-10-28）', () => {
+    const n = syncInstallFieldNotes('uninstall-real').absent!
+    expect(n, '必须直说省略规则').toContain('不出现就是「没有这类路径」')
+    expect(n, '不能写成相反的意思').not.toContain('不出现 ≠ 没有这类路径')
   })
 
   it('platform 释义必须列全三个受支持平台（win32 也支持，schtasks）', () => {

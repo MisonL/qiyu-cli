@@ -174,8 +174,10 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
   const base: Record<string, string> = {
     platform: '调度平台：darwin = launchd，linux = systemd，win32 = schtasks。'
       + '其他平台在命令入口直接报不支持（退出码 2），不会有本输出',
-    dry_run: 'true = 只打印计划，零文件写入、零命令执行。false = 真的执行了。'
-      + '⚠️ 判断「装没装」看这个字段，不要只看退出码',
+    dry_run: '执行模式：true = 只打印计划，零写入、零执行。false = 真的执行了（写/删文件、跑 commands[]）。'
+      + '⚠️ 它不回答「现在装没装」—— dry-run 什么都不改（已装过也一样只出计划），'
+      + 'uninstall --yes 在从未安装时同样是 false。本次操作做了什么看 installed / removed / absent'
+      + ' 与 commands[]。退出码只取决于 commands[] 是否全部成功',
     ...SYNC_COMMAND_NOTES,
   }
   switch (mode) {
@@ -209,8 +211,8 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
       return {
         ...base,
         removed: '计划探测时存在、且删除调用未报错的文件路径',
-        absent: '计划探测时就不存在、因此没删的文件路径。⚠️ 这是条件键：为空时整个键不出现，'
-          + '不出现 ≠ 没有这类路径',
+        absent: '计划探测时就不存在、因此没删的文件路径。⚠️ 这是条件键：为空时整个键不出现 ——'
+          + '不出现就是「没有这类路径」，不是字段缺失（win32 无文件条目，恒不出现）',
         notes: '给人读的说明。从未安装（探测不到任何条目文件）时只有一条'
           + '「未安装（无条目文件）：未执行任何命令」，此时 commands 为空数组',
       }

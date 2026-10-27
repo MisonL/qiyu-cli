@@ -12,11 +12,12 @@
 - **`sync install` / `sync uninstall` 的四种输出都没有图例，且 `commands[].ok` 是三值**。
   2026-10-28 实测：
   · `commands[].ok` 是 `null`（dry-run 未执行）/ `true` / `false` 三值 —— Agent 按布尔值
-    读会把「没执行」当成「失败」。`dry_run` 才是「装没装」的判据，退出码不是：真实安装
-    即便某条调度命令失败（退出码 1），条目文件也已经写进去了。
+    读会把「没执行」当成「失败」。`dry_run` 只描述**执行模式**、不回答「现在装没装」：
+    install 的 dry-run 在已安装时照样只出计划，`uninstall --yes` 在从未安装时也是 `false`；
+    真实安装即便某条调度命令失败（退出码 1），条目文件也已经写进去了。
   · `entries[]` / `remove[]` 是**对象数组**（`{path, content}` / `{path, exists}`），不是
     路径字符串；`remove[].exists` 是**计划生成那一刻的探测快照**，不是承诺。
-  · `uninstall` 的 `absent` 是**条件键**：为空时整个键不出现。
+  · `uninstall` 的 `absent` 是**条件键**：为空时整个键不出现 —— 不出现就是「没有这类路径」。
   · `uninstall --yes` 在从未安装时 `commands` 是空数组 —— 那是没有可停的调度器，不是
     执行失败；`notes` 会说原因。
   · 顺带修正一条自己写错的释义：`platform` 原写「其他平台直接报不支持」，而 **win32 是
@@ -26,6 +27,9 @@
   新增 `tests/sync-install-notes.test.ts`（11 条，含真实 DuckDB 与真实文件写入/删除）。
   测试的**反向兜底下沉到元素层**：只查顶层键时，同一数组里删掉一个元素键（还有别的键
   顶着）两个方向都查不到 —— 变异 M5 就是这么活下来的。变异 9 条全红。
+  CodeRabbit 两条（核实成立并修）：① `absent` 原写「不出现 ≠ 没有这类路径」—— 省略规则
+  恰恰是「为空即不出现」，说反了；② `dry_run` 原写「判断装没装看这个字段」—— 它只是执行
+  模式，回答不了安装状态（见上）。
 - **最后三处无图例的输出：`skill where` 的 `cli_contract_version`、`--version`、`auth login`**。
   2026-10-28 实测：
   · **`skill where` 输出 `cli_contract_version`，图例里却没有它** —— 既有图例测试只查了
