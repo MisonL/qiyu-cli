@@ -345,8 +345,9 @@ describe('D5：同进程 install 后探测缓存失效', () => {
     out = ''; err = ''
     expect(await run(['--version'])).toBe(0)
     expect(out).not.toContain('未安装')
-    // 装的是本进程这份源码的包内正文 → 探测结论是 current，完全不该有 meta。
-    expect('meta' in JSON.parse(out)).toBe(false)
+    // 装的是本进程这份源码的包内正文 → 探测结论是 current，完全不该有 meta.warnings。
+    // ⚠️ 不能断言「没有 meta 键」：`--version` 自 2026-10-28 起恒带 meta.field_notes。
+    expect(JSON.parse(out).meta?.warnings).toBeUndefined()
   })
 
   it('反例：不清缓存时同一条命令确实会残留提示（证明上一条靠的是失效而非巧合）', async () => {
@@ -1186,7 +1187,7 @@ describe('D3.12：cli.run() 探测被门挡掉时，上一条命令的 skillWarn
     vi.stubEnv('QIYU_SKILL_DIR', '')
     expect(await run(['--version'])).toBe(0)
     expect(out).not.toContain('哨兵')
-    expect('meta' in JSON.parse(out)).toBe(false)
+    expect(JSON.parse(out).meta?.warnings).toBeUndefined()
   })
 
   it('显式关闭开关时替换为可解释文案（不是残留的旧提示）', async () => {

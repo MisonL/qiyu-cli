@@ -460,7 +460,9 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     expect(await run(['--version'])).toBe(0)
     const parsed = JSON.parse(out)
     expect(parsed.ok).toBe(true)
-    expect('meta' in parsed, '宿主 npm_config 不得泄进测试进程').toBe(false)
+    // 2026-10-28 起 `--version` 恒带 `meta.field_notes`（两个键的释义），所以判据从
+    // 「没有 meta 键」改成「没有 meta.warnings」—— 后者才是「skill 探测没吭声」。
+    expect(parsed.meta?.warnings, '宿主 npm_config 不得泄进测试进程').toBeUndefined()
     expect(out).not.toContain('host-npm-entity')
   })
 
@@ -471,7 +473,7 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     vi.stubEnv('QIYU_SKILL_DIR', '')
     vi.stubEnv('npm_config_qiyu_skill_dir', join(home, 'host-npm-entity'))
     expect(await run(['--version'])).toBe(0)
-    expect('meta' in JSON.parse(out)).toBe(false)
+    expect(JSON.parse(out).meta?.warnings).toBeUndefined()
   })
 
   it('[57] QIYU_DISABLE_SKILL_PROBE 显式关闭 → 不静默，meta.warnings 说明原因', async () => {
@@ -485,7 +487,7 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     expect(parsed.meta.warnings.join('\n')).toContain('QIYU_DISABLE_SKILL_PROBE')
   })
 
-  it('已安装且与包内一致（current）→ 0，无 meta 键', async () => {
+  it('已安装且与包内一致（current）→ 0，无 meta.warnings', async () => {
     vi.stubEnv('QIYU_SKILL_DIR', entity)
     // 用真实安装命令铺出 current 态（清单的版本与内容哈希都与包内一致）。
     expect(await run(['skill', 'install', '--dir', entity, '--no-link'])).toBe(0)
@@ -493,8 +495,9 @@ describe('qiyu --version 的 skill 安装态提示通道（Task 12 审查 I1）'
     // 安装前那次探测已按同一组参数缓存了 absent —— 不清缓存这里会读到旧结论。
     resetSkillDetectionCache()
     expect(await run(['--version'])).toBe(0)
-    // current 不提示：没有 meta 键（而不是 meta:{warnings:[]}）。
-    expect('meta' in JSON.parse(out)).toBe(false)
+    // current 不提示：没有 meta.warnings（而不是 meta:{warnings:[]}）。
+    // ⚠️ 不能断言「没有 meta 键」—— `--version` 自 2026-10-28 起恒带 meta.field_notes。
+    expect(JSON.parse(out).meta?.warnings).toBeUndefined()
     expect(err).toBe('')
   })
 })

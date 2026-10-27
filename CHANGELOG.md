@@ -9,6 +9,33 @@
 
 ### 修复
 
+- **最后三处无图例的输出：`skill where` 的 `cli_contract_version`、`--version`、`auth login`**。
+  2026-10-28 实测：
+  · **`skill where` 输出 `cli_contract_version`，图例里却没有它** —— 既有图例测试只查了
+    单向（图例里的键必须真实存在），反方向「输出里有字段、图例没解释」没人查，于是它
+    一直裸奔。这个键恰恰是 SKILL.md 教 Agent 用的那个：`--version` 与
+    `entity.installed` 报的是**两个不同的契约号**，不点名就会拿错。
+  · `--version` 完全没有 `field_notes`：`skill_contract_version` 是 **CLI 自己**的契约号，
+    不是已安装那份的（实测两者可以不等，且 `--version` 不报已安装那份）。
+  · `auth login` 的 `source: 'file'` 是**本次写入目标**，不是「下次实际读取来源」——
+    实测：login 报 `source: "file"`，而环境变量 `QIYU_APP_KEY` / `QIYU_APP_SECRET` 仍在时，
+    下一次 `auth whoami` 报的是 `source: "env"`，login 写的文件只是兜底。
+  修法：`whereFieldNotes()` 补 `cli_contract_version`；`cli.ts` 新增
+  `versionFieldNotes()` 并挂到 `--version`；`auth login` 挂四个键的图例。
+  README 的「无 meta 的成功输出」例子再收窄到 `api call`（无 warnings/note 时）。
+  新增 `tests/command-legends-complete.test.ts`（3 条）做**反向兜底**：对每条有图例的
+  命令跑真实输出，断言 data 里的每个字段都被图例覆盖（`k` / `k.` / `k[]` 三种前缀）
+  或在自明清单里 —— 这正是 `cli_contract_version` 当初漏掉的那类检查。
+  变异 8 条全红。CodeRabbit 两条（全部核实成立并修）：① `configured` 的释义推荐用
+  `auth whoami` 验证有效性 —— 而 whoami 也只查「有没有配」，拼错的 appKey 同样返回
+  true；改成「要验证只能发一次真实请求」。② `profile` 的释义说「缺省 default」——
+  实际选择顺序是 `--profile` > `QIYU_PROFILE` > `defaultProfile` > `default`，
+  只写 default 会把写入目标指错。两条各补变异验证。
+  **第二轮一条（Minor）**：`--version` 的释义写「后者缺失或损坏时为 null」——
+  而返回 null 的是**整个 `entity.installed`**，不是它下面的字段；Agent 照字面写
+  `entity.installed.skill_contract_version === null` 会在 `entity.installed` 为 null 时崩。
+  改成「先判 `entity.installed` 非 null 再读」。补变异验证。
+
 - **`store init` / `store status` 无图例，且 README 把两者的 `tables` 形状说成同一个**。
   逐格真库实测（2026-10-28）：
   · **`schema_version` 是一个裸数字**，没有对照基准就没有意义 —— 它要跟当前 CLI 的

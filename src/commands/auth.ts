@@ -282,7 +282,19 @@ async function login(argv: string[]): Promise<number> {
   } catch { /* 自检失败不影响"已写入"这一事实；下一次任何命令都会再查一次 */ }
 
   // ⚠️ 绝不回显 appKey/appSecret —— 连末四位都不（与 whoami 同一条约束）。
-  return ok({ configured: true, profile: name, config_path: configPath, source: 'file' })
+  return ok({ configured: true, profile: name, config_path: configPath, source: 'file' }, {
+    field_notes: {
+      configured: 'true 只表示两个字段都已写入配置文件，不代表它们有效'
+        + '（拼错的 appKey 同样返回 true）。⚠️ auth whoami 也只查「有没有配」，'
+        + '不能验证有效性 —— 要验证只能发一次真实请求',
+      profile: '写入的配置档名。选择顺序：--profile > 环境变量 QIYU_PROFILE > '
+        + '配置文件里声明的默认档名 > default。⚠️ 不要假定是 default',
+      config_path: '写入的配置文件路径',
+      source: '恒为 file —— 表示本次把凭据写进了文件。'
+        + '⚠️ 它不表示「下次会从文件读」：环境变量 QIYU_APP_KEY / QIYU_APP_SECRET 仍在时，'
+        + '后续命令优先用环境变量（auth whoami 会报 env），login 写的文件只是兜底',
+    },
+  })
 }
 
 function whoami(): number {
