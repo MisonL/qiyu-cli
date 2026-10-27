@@ -22,7 +22,11 @@
   新增 `tests/stats-field-notes.test.ts` 双向核对（枚举 ⊆ 图例、图例 ⊆ 枚举）+ README 图例，
   断言取生产渲染路径 `statsFieldNotes()`；`tests/commands/stats.test.ts` 加行为用例钉住
   「图例真的挂上了 `meta`」（单测绿不代表命令层挂上了）。变异 4 条全红。
-  skill `protocols.md` 同步指向 `meta.field_notes`。
+  skill `protocols.md` 同步指向 `meta.field_notes`，并**限定成立条件**：0–1 量纲只有
+  `assignedRatio` 经实测，其余 `ratio` 是命名推断，换算百分比前必须先看 `observed` 的
+  min/max（CodeRabbit）。图例键的**路径形态**也钉进测试：`declared` 是按字段名分组的
+  对象（`declared.<字段>.unit`），`observed` 才是数组（`observed[].min`）—— 写成
+  `declared[].unit` 指的是一个不存在的路径（CodeRabbit 抓到我最初就写错了）。
 
 - **`declared.higher_is_better` 恒为 `null` 却没有任何出处**。`src/` 里零个非 null 生产者
   （设计稿从未给出「越大越好/越小越好」的依据，裁定不猜），但设计稿 §8 把它当作本命令的

@@ -169,13 +169,16 @@ function renderNotes(notes: Record<string, string>): string {
  */
 export function statsFieldNotes(): Record<string, string> {
   return {
-    'declared[].unit': renderNotes(UNIT_NOTES),
-    'declared[].source': renderNotes(SOURCE_NOTES),
-    'declared[].higher_is_better':
+    // ⚠️ 图例键的路径形态即契约：`declared` 是**按字段名分组的对象**（不是数组），
+    // `observed` 才是数组。写成 `declared[].unit` 指的是一个不存在的路径
+    // （CodeRabbit 2026-10-27 抓到；测试里有一条钉住这个形态）。
+    'declared.<字段>.unit': renderNotes(UNIT_NOTES),
+    'declared.<字段>.source': renderNotes(SOURCE_NOTES),
+    'declared.<字段>.higher_is_better':
       '恒为 null —— 设计稿与本 CLI 都没有任何「指标越大越好还是越小越好」的上游依据，'
       + '不猜（设计稿 §9.2）。不要把 null 读成「本字段恰好没测到」，也不要把 null 当 false；'
       + '要判断趋势好坏只能由人给口径',
-    'declared[].note': '该条声明的依据（通常只有 source=design-doc 的条目有）。null = 无出处注记',
+    'declared.<字段>.note': '该条声明的依据（通常只有 source=design-doc 的条目有）。null = 无出处注记',
     unknown_fields: 'unit 为 unknown 的观测字段（判据是「判不出单位」，不是「目录未收录」——'
       + '后缀能派生的字段即使不在目录里也不算）',
     'observed[].minus_one': '值为 -1 的行数。-1 是「该窗口或筛选条件没有匹配到数据」的哨兵'

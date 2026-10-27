@@ -54,17 +54,17 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
   })
 
   it.each(METRIC_UNITS)('unit「%s」在图例里有释义（枚举 ⊆ 图例）', (v) => {
-    expect(NOTES['declared[].unit']).toContain(`${v} = `)
+    expect(NOTES['declared.<字段>.unit']).toContain(`${v} = `)
   })
 
   it.each(METRIC_SOURCES)('source「%s」在图例里有释义（枚举 ⊆ 图例）', (v) => {
-    expect(NOTES['declared[].source']).toContain(`${v} = `)
+    expect(NOTES['declared.<字段>.source']).toContain(`${v} = `)
   })
 
   it('图例里没有枚举之外的值（图例 ⊆ 枚举）', () => {
     // 反向：加值不写文档会红（上面两条），删值忘删文档同样要红（这条）。
-    expect(renderedKeys(NOTES['declared[].unit']!).sort()).toEqual([...METRIC_UNITS].sort())
-    expect(renderedKeys(NOTES['declared[].source']!).sort()).toEqual([...METRIC_SOURCES].sort())
+    expect(renderedKeys(NOTES['declared.<字段>.unit']!).sort()).toEqual([...METRIC_UNITS].sort())
+    expect(renderedKeys(NOTES['declared.<字段>.source']!).sort()).toEqual([...METRIC_SOURCES].sort())
   })
 
   it('README 的图例段也覆盖全部取值（人读版与输出同一组值）', () => {
@@ -90,8 +90,8 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     // 图例说「恒为 null」是一句**可证伪的承诺**：这条把它与代码事实绑在一起。
     // 若未来真有了实测依据、某条声明填了 true/false，这条会红 —— 那时必须同步改图例，
     // 而不是让「恒为 null」留在输出里骗 Agent。
-    expect(NOTES['declared[].higher_is_better']).toContain('恒为 null')
-    expect(NOTES['declared[].higher_is_better']).toContain('false')
+    expect(NOTES['declared.<字段>.higher_is_better']).toContain('恒为 null')
+    expect(NOTES['declared.<字段>.higher_is_better']).toContain('false')
     for (const [table, decls] of Object.entries(METRIC_CATALOG)) {
       for (const [field, d] of Object.entries(decls)) {
         expect(d.higher_is_better, `${table}.${field}`).toBeNull()
@@ -101,6 +101,18 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     for (const f of ['anyRatio', 'anyCount', 'anyDuration', 'carrier']) {
       expect(declareMetric('daily_overview', f).higher_is_better, f).toBeNull()
     }
+  })
+
+  it('图例键的路径形态与实际输出一致：declared 是对象、observed 是数组（CodeRabbit）', () => {
+    // 反向形态的一种：路径写错 = 指一个 Agent 永远读不到的字段。最初我把 declared 的
+    // 四个键写成 `declared[].unit`，而 `declared` 是 `Object.fromEntries(...)` 出来的
+    // **按字段名分组的对象** —— `declared[]` 这个路径根本不存在。
+    const declaredKeys = Object.keys(NOTES).filter((k) => k.startsWith('declared'))
+    expect(declaredKeys.length).toBe(4)
+    for (const k of declaredKeys) expect(k, k).toMatch(/^declared\.<字段>\.[a-z_]+$/)
+    const observedKeys = Object.keys(NOTES).filter((k) => k.startsWith('observed'))
+    expect(observedKeys.length).toBeGreaterThan(0)
+    for (const k of observedKeys) expect(k, k).toMatch(/^observed\[\]\.[a-z_]+$/)
   })
 
   it('field_notes 不带 Markdown 加粗（stdout JSON 给 Agent，`**` 是噪声）', () => {
@@ -115,10 +127,14 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     const OBSERVED_KEYS = ['rows_present', 'minus_one', 'nulls', 'min', 'max']
     const TOP_KEYS = ['unknown_fields']
     for (const k of Object.keys(NOTES)) {
-      const top = k.split('[')[0]!
-      if (top === 'declared') {
-        expect(DECLARED_KEYS, `图例键 ${k} 不在 DeclOut 里`).toContain(k.slice('declared[].'.length))
-      } else if (top === 'observed') {
+      if (k.startsWith('declared.')) {
+        // ⚠️ `declared` 是**按字段名分组的对象**（`Object.fromEntries`），不是数组 ——
+        // 路径必须写 `declared.<字段>.unit`。写成 `declared[].unit` 就是**指一个不存在的
+        // 路径**（CodeRabbit 2026-10-27 抓到，我最初正是这么写的）：Agent 照着找会一无所获。
+        const rest = k.slice('declared.<字段>.'.length)
+        expect(k, `图例键 ${k} 的路径形态不对：declared 是对象不是数组`).toMatch(/^declared\.<字段>\./)
+        expect(DECLARED_KEYS, `图例键 ${k} 不在 DeclOut 里`).toContain(rest)
+      } else if (k.startsWith('observed[]')) {
         expect(OBSERVED_KEYS, `图例键 ${k} 不在 Observed 里`).toContain(k.slice('observed[].'.length))
       } else {
         expect(TOP_KEYS, `图例键 ${k} 不在 stats fields 的输出里`).toContain(k)

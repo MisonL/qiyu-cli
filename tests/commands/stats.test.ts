@@ -153,10 +153,11 @@ describe('stats fields', () => {
     expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
     const notes = meta().field_notes as Record<string, string>
     expect(notes, 'meta.field_notes 缺失').toBeDefined()
-    expect(notes['declared[].unit']).toContain('ratio = ')
-    expect(notes['declared[].unit']).toContain('不是 0–100 的百分数')
-    expect(notes['declared[].source']).toContain('name-suffix = ')
-    expect(notes['declared[].higher_is_better']).toContain('恒为 null')
+    // ⚠️ 键名即路径契约：`declared` 是按字段名分组的**对象**，`observed` 才是数组。
+    expect(notes['declared.<字段>.unit']).toContain('ratio = ')
+    expect(notes['declared.<字段>.unit']).toContain('不是 0–100 的百分数')
+    expect(notes['declared.<字段>.source']).toContain('name-suffix = ')
+    expect(notes['declared.<字段>.higher_is_better']).toContain('恒为 null')
     expect(notes['observed[].minus_one']).toContain('不是负数比率')
     // warnings 与 field_notes 同时在 meta 里，互不覆盖
     expect(meta().warnings).toBeDefined()
