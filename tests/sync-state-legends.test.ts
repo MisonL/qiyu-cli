@@ -192,10 +192,34 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     expect(rangeNotes, 'pending 的机制必须写出来（水位没动）').toContain('不推水位')
     expect(runFieldNotes()['tasks[].status'], 'partial 的误读必须写出来')
       .toContain('一行都没落')
+    // CodeRabbit（2026-10-27）：空窗也算成功窗，所以「有没有拿到数据」不能用
+    // windows.succeeded 回答 —— 必须同时点名 rows.written。
+    expect(runFieldNotes()['tasks[].status'], '必须区分「成功窗数」与「落库行数」')
+      .toContain('rows.written')
+    // CodeRabbit（2026-10-27）：日对齐任务的首残段可能被跳过，resolved_range.start
+    // 前缀不会自动前移 —— 说「本轮实际覆盖到的区间」是过度承诺。
+    expect(runFieldNotes()['tasks[].resolved_range'], 'start 不是覆盖保证')
+      .toContain('不是「已覆盖」的保证')
+    expect(runFieldNotes()['tasks[].resolved_range'], '必须指向 windows.skipped')
+      .toContain('windows.skipped')
+    // CodeRabbit（2026-10-27）：gaps 是历史记录，旧记录的 reason 与新记录相同 ——
+    // 「按 reason 判断是否仍缺」是错的，必须改成按 range 对照 + 新鲜度未确认。
+    expect(statusFieldNotes().gaps, 'gaps 图例必须说明 reason 区分不出新旧')
+      .toContain('区分不出新旧')
+    expect(statusFieldNotes().gaps, '必须给出正确的判断路径（按 range 对照）')
+      .toContain('range')
     expect(statusFieldNotes().locked, 'locked 不是「正在同步中」必须写出来')
       .toContain('不是「正在同步中」')
     expect(statusFieldNotes().locked, 'locked 的机制必须写出来（退避等待 vs store_locked）')
       .toContain('退避等待')
+    // CodeRabbit（2026-10-27）：verify 的图例一度写「要判完整性看 drift 与退出码」——
+    // 而本文件另一条用例正证明中窗失败的库给 drift: [] + 退出码 0。图例必须自相矛盾地
+    // 说「不能用它们当完整性证据」，否则 Agent 会拿本命令的绿灯当数据完整的证明。
+    const verifyNotes = verifyFieldNotes().state_windows_consistent!
+    expect(verifyNotes, 'verify 的图例不得把 drift/退出码当完整性证据')
+      .toContain('不能当完整性证据')
+    expect(verifyNotes, '必须给出正确的替代路径（另行核对 gaps 与覆盖范围）')
+      .toContain('另行核对')
     // 会话里给 Agent 的主入口（skill 正文）也必须带这两条，不能只在 README
     const p = read('src/skill/qiyu/protocols.md')
     expect(p).toContain('两个取值字面都在撒谎')

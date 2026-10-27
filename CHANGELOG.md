@@ -37,7 +37,17 @@
   最初是绿的（只断言了「不代表」三个字，没钉机制），补强后才红 —— 连同一条引擎变异
   （`advanceWatermark` 改回写 pending）验证「真库用例钉的是引擎事实，不是图例自说自话」。
   README 补两张图例表（`range_status` / `tasks[].status`）+ `locked` 与 `verify` 的边界
-  说明；skill `protocols.md` §2 补三条 Agent 侧警告。
+  说明；skill `protocols.md` §2 补四条 Agent 侧警告。
+  CodeRabbit 四条（全部核实成立并修，`src/commands/sync-notes.ts` 与 README/skill 同步）：
+  ① **Major** —— `verify` 的图例一度写「要判完整性看 drift 与本命令退出码」，而本 PR 自己
+  的用例正证明中窗失败的库给 `drift: []` + 退出码 0：图例在自相矛盾，改成「drift 为空 /
+  退出码 0 同样不能当完整性证据」+ 正确的替代路径；② `resolved_range` 说成「本轮**实际
+  覆盖**到的区间」是过度承诺 —— 日对齐任务的首残段会被跳过、`start` 前缀不会自动前移，
+  改成「请求的水位区间 + 不是已覆盖的保证」并指向 `windows.skipped`；③ 判「有没有拿到
+  数据」不能用 `windows.succeeded`（**空窗也算成功窗**，`tests/sync/engine.test.ts`
+  「两次都空 → 判空推进」钉着），必须同时点名 `rows.written`；④ `gaps` 说「按 reason 判断
+  是否仍缺」是错的 —— 旧记录的 reason 与新记录**相同**，区分不出新旧，改成按 `range`
+  对照 + 说不清就写「新鲜度未确认」。四条各补一条变异验证（回退措辞即红）。
 
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
   这条命令的整个意义就是让 Agent **不猜单位**（设计稿 §9.2：「单位不确定 → 查 `stats fields`

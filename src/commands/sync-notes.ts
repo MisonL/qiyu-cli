@@ -50,8 +50,10 @@ export const RANGE_STATUS_NOTES = {
  */
 export const RUN_STATUS_NOTES = {
   complete: '全部窗口成功（failed=0）',
-  partial: '至少一个窗口失败。⚠️ 它也覆盖「一行都没落」的全窗失败——'
-    + '判有没有拿到数据看 windows.succeeded，不要看这个字面',
+  partial: '至少一个窗口失败。⚠️ 它也覆盖「一行都没落」的全窗失败（succeeded=0）——'
+    + '不要按这个字面判断结果。两个字段分开读：windows.succeeded = 成功窗数'
+    + '（空窗也算成功，所以它大于 0 不代表有行）。rows.written = 真正落库的行数'
+    + '（为 0 也可能是「窗口都成功、只是上游没数据」）',
   failed: '连窗口循环都没进（目前只有快照任务被本地限频闸门拦下这一条路径）',
 } satisfies Record<RunStatus, string>
 
@@ -61,8 +63,10 @@ export function runFieldNotes(): Record<string, string> {
     'tasks[].status': renderNotes(RUN_STATUS_NOTES),
     'tasks[].windows.skipped': '残段窗数（日对齐任务被显式区间钳出的非日界首/末段）：'
       + '引擎跳过不 fetch、不写库、不推水位，但计入 total（total = succeeded + failed + skipped）',
-    'tasks[].resolved_range': '本轮实际覆盖到的区间。末端与水位同源：出现失败窗后水位冻结在'
-      + '连续成功末端，因此它可能早于你请求的 end —— 那正是「没覆盖完」的证据',
+    'tasks[].resolved_range': '本轮请求的水位区间（start = 水位/请求起点语义，'
+      + '日对齐任务的首残段可能被跳过、start 前缀不会自动前移，所以它不是「已覆盖」的保证）。'
+      + '末端与水位同源：出现失败窗后水位冻结在连续成功末端，因此它可能早于你请求的 end。'
+      + '评估真实覆盖要看 end 与 windows.skipped，不要只看 start',
     'tasks[].gaps': '本轮失败/提示的缺口逐条记录（reason 取值见 README 图例）。'
       + 'gaps 非空不等于同步失败：后四个 reason 是成功窗上的业务提示',
     truncated: '恒为 false —— sync run 不按 --limit 截断任务列表（这是与 query 的同名字段'
@@ -79,8 +83,10 @@ export function statusFieldNotes(): Record<string, string> {
       + '（readOnlyRetryMs，默认 30 秒）——等到了说明那一轮已结束、章也清了（返回 false），'
       + '等不到才报 store_locked。所以看到 true 说明写锁当前是空的、章是残留的，'
       + '重跑 sync run 即可（引擎会重新盖章）',
-    gaps: 'sync_gaps 里的历史缺口（含已不再适用的旧记录：成功窗只清它自己那个起点的缺口，'
-      + '换了窗口边界重跑不会清掉旧起点的记录）。gaps 非空 ≠ 当前数据有问题，按 reason 判断',
+    gaps: 'sync_gaps 里的历史缺口。⚠️ 它是历史记录、不等于当前仍缺：成功窗只清它自己那个'
+      + '起点的缺口，换窗口边界重跑不会清掉旧起点的记录——而旧记录的 reason 与新记录相同，'
+      + '所以按 reason 区分不出新旧。要判某条缺口是否还成立，把它的 range 与你要评估的区间'
+      + '对照；对不上或说不清就当「新鲜度未确认」，不要直接报成当前故障',
     'gaps[].reason': '取值与动作见 README 的 gaps 图例（与 sync run 的 gaps[].reason 同一组值）',
     'gaps[].range': '原样回显 sync_gaps 的存储值（epoch 毫秒字符串），不是 run 输出的'
       + ' +08:00 ISO 形态 —— 要比较请先按同一形态解析',
@@ -92,8 +98,10 @@ export function statusFieldNotes(): Record<string, string> {
 export function verifyFieldNotes(): Record<string, string> {
   return {
     state_windows_consistent: 'true = sync_state 记录为「水位已推进且 range_status=complete」。'
-      + '⚠️ 这不代表数据完整：range_status 的 complete 只说明「水位推进过」，'
-      + '中窗失败的 run 同样是 complete。要判完整性看 drift 与本命令退出码',
+      + '⚠️ 这不代表数据完整；drift 为空 / 退出码 0 同样不能当完整性证据：'
+      + '本命令只核对 sync_state 记下的状态，实测中窗失败的库同样给 drift: [] 且退出码 0。'
+      + '完整性要另行核对 sync status 的 gaps（按 range 判断是否仍成立）与 '
+      + 'resolved_range/windows.skipped 的覆盖范围',
     expected_from_api: 'null 有两种成因，用 kind 区分：windowed 任务不做上游全量重拉'
       + '（成本高，恒为 null），或快照任务的上游取数失败（此时 drift 里有 fetch_failed）',
     'drift[].kind': '取值与动作见 README 的 drift 图例',

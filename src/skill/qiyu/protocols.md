@@ -34,9 +34,15 @@
    - ⚠️ **`range_status` 的两个取值字面都在撒谎**（逐值释义见输出的 `meta.field_notes`）：
      `complete` 只表示「水位推进过」——中窗失败时它照样是 `complete`，**不是**「全窗口成功」；
      `pending` 只表示「水位没动过」——首窗失败时后续成功窗照常落库，**不是**「库里没数据」，
-     也**不是**「正在同步」。判数据完整只看 `gaps`，不要看 `range_status`。
-   - ⚠️ `sync run` 的 `status: "partial"` **也覆盖「一行都没落」的全窗失败**：判有没有拿到
-     数据看 `windows.succeeded`，不要看这个字面。
+     也**不是**「正在同步」。判数据完整要看 `gaps` 与覆盖范围，不要看 `range_status`。
+   - ⚠️ **`gaps` 是历史记录，不等于「当前仍缺」**：旧记录与新记录的 `reason` 相同，按
+     `reason` 分不出新旧。要判某条缺口是否还成立，把它的 `range` 与你要评估的区间对照；
+     对不上或说不清就写「新鲜度未确认」，不要直接报成当前故障。
+   - ⚠️ `sync run` 的 `status: "partial"` **也覆盖「一行都没落」的全窗失败**：两个字段分开
+     读——`windows.succeeded` 是成功窗数（空窗也算成功），`rows.written` 才是落库行数。
+   - ⚠️ **`sync verify` 的 `drift` 为空 / 退出码 0 不能当完整性证据**：它只核对同步状态
+     记录，实测中窗失败的库同样给 `drift: []` + 退出码 0。完整性要另行核对 `gaps`
+     与 `resolved_range`/`windows.skipped`。
    - ⚠️ `locked: true` 是**残留的写者章**（上一轮被强杀），不是「正在同步中」——真持锁的
      写者会让 `sync status` 先退避等待，等到后读到的是那一轮的结果。重跑 `sync run` 即可。
 3. **真的没有数据**。
