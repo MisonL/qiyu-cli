@@ -180,7 +180,7 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
       + '⚠️ 它不回答「现在装没装」—— dry-run 什么都不改（已装过也一样只出计划），'
       + 'uninstall --yes 在从未安装时同样是 false。false 时本次操作做了什么，看操作结果字段'
       + '（install 是 installed，uninstall 是 removed / absent）与 commands[]。'
-      + '退出码只取决于 commands[] 是否全部成功',
+      + '退出码 1 只表示 commands[] 里至少一条执行失败（dry-run 恒 0）',
     ...SYNC_COMMAND_NOTES,
   }
   switch (mode) {

@@ -196,7 +196,8 @@ describe('三值 ok 与 dry_run 的措辞', () => {
       // dry-run 的 install 在已安装时照样只出计划；uninstall --yes 从未安装时也是 false ——
       // 所以这个字段回答不了「现在装没装」。
       expect(n, '必须点明它不回答「现在装没装」').toContain('不回答「现在装没装」')
-      expect(n, '必须把退出码的含义限定到 commands[]').toContain('退出码只取决于 commands[]')
+      expect(n, '必须把退出码的含义限定到 commands[]，并点明 dry-run 恒 0')
+        .toContain('退出码 1 只表示 commands[] 里至少一条执行失败（dry-run 恒 0）')
       expect(n, '不能声称它是安装状态的判据').not.toContain('判断「装没装」')
     }
   })
