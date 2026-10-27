@@ -23,7 +23,7 @@
     另有 `warnings` 兜底（「区间内应有 N 个自然日，实际只有 M 个有数据」），
     **没有时间过滤时这条兜底不触发**（实测：无过滤 + 中间空 4 天 → `warnings: []`）；
     `iso-instant` 与 `epoch-ms` 表任何情况下都没有兜底（实测 epoch-ms 的 `sessions`
-    中间空 6 天，`data_coverage` 报满首尾且 `warnings: []`）。skill 正文当时把
+    中间空 5 天（09-02..09-06），`data_coverage` 报满首尾且 `warnings: []`）。skill 正文当时把
     `data_coverage` 说成「本地数据的实际覆盖范围」——正是这条没有兜底的字段，属于过度承诺。
   同轮把两个字段的 `null` 成因也数清了（此前只说「恒为 null」）：`resolved_range` 有
   **四种**（`--sql` 通道 / 没给 `--since`/`--until` / 表没有时间列 / 只给 `--until` 而

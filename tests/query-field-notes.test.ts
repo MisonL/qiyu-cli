@@ -6,7 +6,7 @@
 //   · `masked: true` ≠ 「有值被改写」—— 脱敏开着而 `masked_columns: []` 是常态；
 //   · `mask_warnings: []` ≠ 「脱敏完整」—— `--no-mask` 时恒为空，风险警告在 `warnings` 里；
 //   · `data_coverage` 只有首尾两点，看不见内部缺口 —— 且只有 iso-day 表有 warnings 兜底，
-//     iso-instant / epoch-ms 表没有任何提示（实测 epoch-ms 空 6 天仍报满区间、warnings: []）。
+//     iso-instant / epoch-ms 表没有任何提示（实测 epoch-ms 空 5 天仍报满区间、warnings: []）。
 //
 // 本文件把**图例**、**真实输出键集**与**四种/三种 null 成因**都钉在真跑出来的结果上。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
@@ -59,7 +59,7 @@ const dayIso = (day: number): string => new Date(Date.UTC(2026, 9, day) - 8 * 36
 /**
  * 合成库：
  *  · daily_overview（iso-day）：10-01 / 10-02 / 10-07 —— 中间 10-03..06 是空洞
- *  · sessions（epoch-ms）：09-01 与 09-07 —— 中间 6 天空洞
+ *  · sessions（epoch-ms）：09-01 与 09-07 —— 中间 5 天空洞（09-02..09-06）
  *  · tags（无时间列）：1 行
  *  · staff_workload（iso-day）：**空表**（「只给 --until 而时间列无可用值」用）
  */

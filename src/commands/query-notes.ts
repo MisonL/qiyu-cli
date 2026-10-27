@@ -39,7 +39,8 @@ export function queryFieldNotes(): Record<string, string> {
     resolved_range: '实际生效的时间过滤边界（+08:00 ISO）。⚠️ 它是过滤边界不是「有数据的范围」，'
       + '后者看 data_coverage。null 有四种成因：--sql 通道不判定区间、没给 --since/--until、'
       + '表没有时间列、只给 --until 而该表时间列无可用值（下界解析不出，此时 warnings 里有说明）',
-    data_coverage: '时间列在过滤范围内的 MIN/MAX（+08:00 ISO，没有时间过滤时是全表的）。'
+    data_coverage: '时间列在过滤范围内的 MIN/MAX（+08:00 ISO。没有时间过滤时是全表，'
+      + '但只算时间值形态合法的行）。'
       + '独立于 --limit 计算，不受截断影响。'
       + '⚠️ 结构上只有首尾两点，看不见内部缺口：7 天里只有第 1、7 天有数据时它照样报满区间。'
       + '⚠️ iso-day 表在给了 --since/--until 时另有 warnings 兜底（「区间内应有 N 个自然日，'
