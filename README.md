@@ -324,9 +324,10 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区�
 
 `gaps` 是 `sync_gaps` 里的**历史**缺口，含已不再适用的旧记录（成功窗只清它自己那个
 起点的缺口；换了窗口边界重跑不会清掉旧起点的记录）——`gaps` 非空 ≠ 当前数据有问题。
-⚠️ 旧记录与新记录的 `reason` **相同**，按 `reason` 区分不出新旧：要判某条缺口是否还成立，
-把它的 `range` 与你要评估的区间对照；对不上或说不清就当「新鲜度未确认」，不要直接报成
-当前故障。⚠️ `gaps[].range` 是 epoch 毫秒字符串（原样回显存储值），与 `sync run` 的
+⚠️ 旧记录与新记录的 `reason` **相同**，按 `reason` 区分不出新旧；`range` 也只能说明
+「相关」——换边界重跑后数据可能已补齐，而旧缺口的 `range` 仍与你评估的区间重叠。
+**没有一次覆盖核对就不能确认新鲜度**：报「该区间有历史缺口记录，新鲜度未确认」，
+不要直接报成当前故障。⚠️ `gaps[].range` 是 epoch 毫秒字符串（原样回显存储值），与 `sync run` 的
 `+08:00` ISO 形态**不同**，比较前先统一形态。
 
 `sync verify` 输出 `{task, local_rows, expected_from_api, state_windows_consistent, drift}`：
@@ -361,11 +362,12 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进覆盖的区�
 `fetch_failed`（上游取数失败，**无法核对 ≠ 一致** → 稍后重试 verify）。
 
 ⚠️ `sync verify` 的 `state_windows_consistent: true` **不等于「数据完整」**，`drift` 为空
-或退出码 0 **同样不能当完整性证据**：它只核对 `sync_state` 记下的状态，而
-`range_status=complete` 只说明水位推进过（见上表）。2026-10-27 实测：3 窗中窗失败的库，
-`verify` 直接给出 `drift: []` + 退出码 0，而 `sync_gaps` 里那条 `fetch_failed` 仍在 ——
-完整性要另行核对 `sync status` 的 `gaps`（按 `range` 判断是否仍成立）与
-`resolved_range` / `windows.skipped` 的覆盖范围。
+或退出码 0 **同样不能当完整性证据**。对 **windowed 任务**，本命令只核对同步状态记录，而
+`range_status=complete` 只说明水位推进过（见上表）——2026-10-27 实测：3 窗中窗失败的库，
+`verify` 直接给出 `drift: []` + 退出码 0，而 `sync_gaps` 里那条 `fetch_failed` 仍在。
+（快照任务另有上游行数核对，见上 `expected_from_api`。）windowed 的完整性要另行核对
+`sync status` 的 `gaps`（能否确认新鲜度见该段说明）与 `resolved_range` /
+`windows.skipped` 的覆盖范围。
 
 **聚合报表按天切片（窗口 1 天）**：九个报表接口返回的是**窗口聚合值**（`overview` 一行
 全局汇总、`staffworklod` 每客服一行、`transferHuman` 恒 1 行），响应里的 `date` 原文是

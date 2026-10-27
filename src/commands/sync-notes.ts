@@ -84,9 +84,10 @@ export function statusFieldNotes(): Record<string, string> {
       + '等不到才报 store_locked。所以看到 true 说明写锁当前是空的、章是残留的，'
       + '重跑 sync run 即可（引擎会重新盖章）',
     gaps: 'sync_gaps 里的历史缺口。⚠️ 它是历史记录、不等于当前仍缺：成功窗只清它自己那个'
-      + '起点的缺口，换窗口边界重跑不会清掉旧起点的记录——而旧记录的 reason 与新记录相同，'
-      + '所以按 reason 区分不出新旧。要判某条缺口是否还成立，把它的 range 与你要评估的区间'
-      + '对照；对不上或说不清就当「新鲜度未确认」，不要直接报成当前故障',
+      + '起点的缺口，换窗口边界重跑不会清掉旧起点的记录——旧记录的 reason 与新记录相同，'
+      + '按 reason 区分不出新旧。range 也只能说明「相关」：换边界重跑后数据可能已补齐，'
+      + '而旧缺口的 range 仍与你要评估的区间重叠。所以没有一次覆盖核对就不能确认新鲜度——'
+      + '报「该区间有历史缺口记录，新鲜度未确认」，不要直接报成当前故障',
     'gaps[].reason': '取值与动作见 README 的 gaps 图例（与 sync run 的 gaps[].reason 同一组值）',
     'gaps[].range': '原样回显 sync_gaps 的存储值（epoch 毫秒字符串），不是 run 输出的'
       + ' +08:00 ISO 形态 —— 要比较请先按同一形态解析',
@@ -98,10 +99,10 @@ export function statusFieldNotes(): Record<string, string> {
 export function verifyFieldNotes(): Record<string, string> {
   return {
     state_windows_consistent: 'true = sync_state 记录为「水位已推进且 range_status=complete」。'
-      + '⚠️ 这不代表数据完整；drift 为空 / 退出码 0 同样不能当完整性证据：'
-      + '本命令只核对 sync_state 记下的状态，实测中窗失败的库同样给 drift: [] 且退出码 0。'
-      + '完整性要另行核对 sync status 的 gaps（按 range 判断是否仍成立）与 '
-      + 'resolved_range/windows.skipped 的覆盖范围',
+      + '⚠️ 这不代表数据完整；drift 为空 / 退出码 0 同样不能当完整性证据 —— '
+      + '对 windowed 任务本命令只核对同步状态记录（实测中窗失败的库同样给 drift: [] 且'
+      + '退出码 0），快照任务则另有上游行数核对。windowed 的完整性要另行核对 sync status 的 '
+      + 'gaps（能否确认新鲜度见该字段的说明）与 resolved_range/windows.skipped 的覆盖范围',
     expected_from_api: 'null 有两种成因，用 kind 区分：windowed 任务不做上游全量重拉'
       + '（成本高，恒为 null），或快照任务的上游取数失败（此时 drift 里有 fetch_failed）',
     'drift[].kind': '取值与动作见 README 的 drift 图例',
@@ -112,14 +113,14 @@ export function verifyFieldNotes(): Record<string, string> {
 /** `sync tasks` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
 export function tasksFieldNotes(): Record<string, string> {
   return {
-    kind: 'windowed = 窗口型：按时间切片增量拉，有水位；'
+    'tasks[].kind': 'windowed = 窗口型：按时间切片增量拉，有水位；'
       + 'snapshot = 快照型：全量拉取、全删重插（幂等）。'
       + '⚠️ 读 verify 的输出前必须先看它：只有 snapshot 的 expected_from_api 有意义',
     unsupported: '明确不做同步的数据集及原因（不是遗漏）。目前唯一取值 realtime = '
       + '实时快照，数据随推随逝、不可回放——这类数据只能走 api call 实时取，别去 sync run 里找',
     'tasks[].watermark.initial': '恒为 null —— 全部 21 个任务都没有声明初始水位'
       + '（首跑从 0 / --since 起）。看到非 null 才需要按它解释续跑起点',
-    sensitive_columns: '该表标注为敏感的 PII 列清单（来自 schema 的声明闭集）。'
+    'tasks[].sensitive_columns': '该表标注为敏感的 PII 列清单（来自 schema 的声明闭集）。'
       + '查询这些列会默认脱敏；不要 SELECT *',
   }
 }

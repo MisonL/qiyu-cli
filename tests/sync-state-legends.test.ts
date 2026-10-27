@@ -161,8 +161,9 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     // overlapDays, primaryKey, sensitive_columns}], unsupported:[{id, unsupported}]}
     const TASK_ITEM_KEYS = ['id', 'table', 'kind', 'watermark', 'maxWindowDays',
       'overlapDays', 'primaryKey', 'sensitive_columns']
-    // 顶层图例键（`tasks[].` 前缀之外的）：kind / unsupported / sensitive_columns
-    const TOP_KEYS = ['kind', 'unsupported', 'sensitive_columns']
+    // 顶层图例键（`tasks[].` 前缀之外的）：只有 `unsupported` 是顶层数组
+    // （`kind`/`sensitive_columns` 在任务条目里 → 必须写 `tasks[].` 前缀）
+    const TOP_KEYS = ['unsupported']
     for (const k of Object.keys(tasksFieldNotes())) {
       if (!k.startsWith('tasks[].')) {
         expect(TOP_KEYS, `tasks 图例键 ${k} 不在输出里`).toContain(k)
@@ -206,8 +207,10 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     // 「按 reason 判断是否仍缺」是错的，必须改成按 range 对照 + 新鲜度未确认。
     expect(statusFieldNotes().gaps, 'gaps 图例必须说明 reason 区分不出新旧')
       .toContain('区分不出新旧')
-    expect(statusFieldNotes().gaps, '必须给出正确的判断路径（按 range 对照）')
-      .toContain('range')
+    expect(statusFieldNotes().gaps, 'range 只能说明相关，不能确认新鲜度')
+      .toContain('只能说明「相关」')
+    expect(statusFieldNotes().gaps, '必须点明「没有覆盖核对就不能确认新鲜度」')
+      .toContain('不能确认新鲜度')
     expect(statusFieldNotes().locked, 'locked 不是「正在同步中」必须写出来')
       .toContain('不是「正在同步中」')
     expect(statusFieldNotes().locked, 'locked 的机制必须写出来（退避等待 vs store_locked）')
@@ -220,10 +223,17 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
       .toContain('不能当完整性证据')
     expect(verifyNotes, '必须给出正确的替代路径（另行核对 gaps 与覆盖范围）')
       .toContain('另行核对')
+    // CodeRabbit 第二轮：这句话不能把快照任务也一起否认掉 —— 快照任务有上游行数核对。
+    expect(verifyNotes, '必须限定到 windowed，不能否认快照任务的远端核对')
+      .toContain('对 windowed 任务')
+    expect(verifyNotes, '快照任务的核对路径必须保留').toContain('快照任务则另有上游行数核对')
     // 会话里给 Agent 的主入口（skill 正文）也必须带这两条，不能只在 README
     const p = read('src/skill/qiyu/protocols.md')
     expect(p).toContain('两个取值字面都在撒谎')
     expect(p).toContain('windows.succeeded')
+    // CodeRabbit 第二轮：skill 正文同样不能把 verify 说成「只核对状态」而不限 windowed
+    expect(p).toContain('对 windowed 任务')
+    expect(p).toContain('没有一次覆盖核对就不能确认新鲜度')
   })
 
   it('源码注释里的「实测」锚点与真跑出来的输出一致（判据不靠人肉记忆）', () => {
