@@ -43,7 +43,8 @@ qiyu sync status
   提示里同时给出裸 `qiyu skill install` 与 `--force` 时（清单缺失/损坏），按这个次序做：
   **先跑裸 `qiyu skill install`**；返回 `status: "skipped"` 且 `meta.warnings` 说「内容与包内不同」
   就说明正文被手工改过——此时**先问人类**，得到允许再用 `--force` 覆盖（那会丢掉手工改动）。
-  提示里只有 `--force` 时（版本不一致 / 正文漂移）直接用它。
+  提示里只有 `--force` 时（版本不一致 / 正文漂移）：**正文可能被手工改过**，`--force`
+  会丢掉那些改动——先问人类是否允许覆盖，得到允许再执行。
   若 install 的 `meta.warnings` 说清单路径被非普通文件占用，**先清理那个占用**（那是人该做的事）：
   两个动词都写不进清单，`--force` 还会只覆盖正文、留下「状态 updated 但提示仍在」的半截结果。
 - **`qiyu --version`**：输出包版本（`data.version`）与 `data.skill_contract_version`

@@ -88,6 +88,26 @@ afterEach(() => {
   resetSkillDetectionCache()
 })
 
+/**
+ * 本机能否建符号链接。非提权、未开 Developer Mode 的 Windows 上 `symlinkSync`
+ * 会抛 EPERM（CodeRabbit 2026-10-27）——两处「清单路径被非普通文件占用」的用例
+ * 用它当夹具，建不了就跳过，而不是让整份测试在该平台挂掉。
+ *
+ * 不用「目录当占用物」替代：目录会让 `readManifestStrict` 撞 EISDIR（非 ENOENT）
+ * → probe 收敛成 unknown → **根本不发这条提示**，测的就不是同一件事了（实测）。
+ * 不用 file symlink：Windows 上同为提权要求。
+ */
+function canSymlink(): boolean {
+  const probeDir = join(home, '.symlink-probe')
+  mkdirSync(probeDir, { recursive: true })
+  try {
+    symlinkSync(join(probeDir, 'target'), join(probeDir, 'link'))
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** 写文件（自动建父目录）。 */
 function write(dir: string, rel: string, content: string): void {
   const p = join(dir, rel)
@@ -589,6 +609,7 @@ describe('skillWarning —— 只在需要时给出一条可执行的提示', ()
     const entity = join(home, 'entity')
     write(entity, 'SKILL.md', '# qiyu\n')
     write(entity, 'protocols.md', '协议正文\n')
+    if (!canSymlink()) return // 非提权的 Windows 建不了符号链接（CodeRabbit）
     symlinkSync(join(entity, 'nowhere.json'), join(entity, MANIFEST))
 
     expect(detectSkillState(entity, src, '1.0.0').kind).toBe('stale')
@@ -610,6 +631,7 @@ describe('skillWarning —— 只在需要时给出一条可执行的提示', ()
     const entity = join(home, 'entity')
     write(entity, 'SKILL.md', '# 用户改过的正文\n')
     write(entity, 'protocols.md', '协议正文\n')
+    if (!canSymlink()) return // 同上
     symlinkSync(join(entity, 'nowhere.json'), join(entity, MANIFEST))
 
     const opts = { home, entityDir: entity, sourceDir: src, version: '1.0.0', noLink: true }
