@@ -462,7 +462,7 @@ describe('db describe', () => {
     expect(meta().warnings).toEqual([])
   })
 
-  it('无时间列 → time_column/time_range 均 null；meta 恒有 notice 与 warnings', async () => {
+  it('无时间列 → time_column/time_range 均 null；meta 恒有 notice / warnings / field_notes', async () => {
     await seed()
     expect(await dbCommand(['describe', 'schema_version', '--db', dbPath()])).toBe(0)
 
@@ -473,7 +473,8 @@ describe('db describe', () => {
     expect(d.pii_columns).toEqual([])
 
     const m = meta()
-    expect(Object.keys(m).sort()).toEqual(['notice', 'warnings'])
+    // 2026-10-28 起多一个 field_notes（逐键释义，见 db-notes.ts）
+    expect(Object.keys(m).sort()).toEqual(['field_notes', 'notice', 'warnings'])
     expect(m.notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
     expect(m.warnings).toEqual([])
   })

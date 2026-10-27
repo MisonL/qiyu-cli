@@ -28,6 +28,7 @@ import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
 import { ok, fail, usageFail, failFromTagged, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
+import { describeFieldNotes, tablesFieldNotes } from './db-notes.js'
 import type { StoreFlags } from './store-flags.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
@@ -366,7 +367,7 @@ async function dbTables(argv: string[]): Promise<number> {
       })
     }
 
-    return ok({ tables }, { notice: PII_NOTICE, warnings })
+    return ok({ tables }, { notice: PII_NOTICE, warnings, field_notes: tablesFieldNotes() })
   } catch (e) {
     return thrownToQueryExit(e, TABLES)
   } finally {
@@ -484,7 +485,7 @@ async function dbDescribe(argv: string[]): Promise<number> {
       time_range: timeRange,
       columns: table.columns.map(describeColumn),
       pii_columns: piiColumnsOf(table),
-    }, { notice: PII_NOTICE, warnings })
+    }, { notice: PII_NOTICE, warnings, field_notes: describeFieldNotes() })
   } catch (e) {
     return thrownToQueryExit(e, TABLES)
   } finally {

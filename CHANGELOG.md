@@ -9,6 +9,30 @@
 
 ### 修复
 
+- **`db describe` / `db tables` 把「声明」与「实况」混在同一层输出里，字段名不区分**。
+  逐格真库实测（2026-10-28）：
+  · **`columns` / `pii_columns` / `time_column` 全是声明**（来自本 CLI 的表定义），
+    表被删、列被删、多出列时**照旧原样输出**。实测：`DROP TABLE robot_summary` 后
+    `db describe robot_summary` 仍给出 3 个声明列与 `time_column: {stat_date, iso-day}`，
+    只有 `warnings` 说表不在库中；`ALTER TABLE … DROP COLUMN startTime` 后
+    `time_column` 同样照旧输出。Agent 把 `columns` 当实况会得出「库里有这些列」。
+  · **`row_count: null` 只有一个成因**（表不在库中），而 **`time_range: null` 有四种**
+    （表没有声明时间列 / 表不在库中 / 时间列被删 / 没有一行的时间值能过形态谓词——
+    空表或全是脏值/NULL）。只看 null 分不出该修什么。
+  · **`db tables` 的 `tables` 数组只含库中真实存在的表**：声明有而库中无的表**不在清单里**，
+    只在 `warnings` 里点名。所以「清单里没有某张表」不等于「这张表不存在」。
+  · `time_column.kind` 的三个取值（`iso-day` / `iso-instant` / `epoch-ms`）此前全仓零释义。
+  修法：新增 `src/commands/db-notes.ts`，给 `db describe` 与 `db tables` 各挂一套
+  `meta.field_notes`（与 `notice` / `warnings` 并列）；README 与 skill `SKILL.md`
+  补「声明 ≠ 实况」与「清单只含真实存在的表」。
+  新增 `tests/db-field-notes.test.ts`（15 条）：图例键集 ↔ 真实 meta 键集（含
+  `field_notes` 必须存在且键集一致）、`time_column.kind` 枚举双向、无 `**`、
+  非枚举单元格不含 `；`，外加**七条真库用例**把每条事实钉住（表被删 / 时间列被删 /
+  多出列 / 空表 / 全脏值 / 无时间列 / `db tables` 不含缺失表）。
+  变异 8 条全红。其中 `time_column` 的单元格初版把「它也是声明」这句前缀混进了枚举
+  单元格，反向解析因此少一个取值 —— 与 PR #26/#27 的 `；` 陷阱同源，已改成纯枚举并把
+  那句挪进 `columns` 的释义。
+
 - **`query` 的 9 个 meta 键全仓无释义，其中三处的字面与事实不符**。`query` 是 skill 协议
   指定的主查询入口，而它的 `meta` 此前**一条释义都没有**（README 有散文，但 Agent 读的是
   stdout）。逐格真库实测（2026-10-27）：
