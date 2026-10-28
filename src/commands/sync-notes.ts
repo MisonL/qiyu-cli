@@ -88,44 +88,56 @@ export function runFieldNotes(): Record<string, string> {
   }
 }
 
-/** `sync status` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
+/**
+ * `sync status` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。
+ *
+ * ⚠️ 图例键是**指向输出的路径**，不是字段名：`sync status` 的 data 是 `{tasks:[...]}`，
+ * 所有字段都挂在任务条目上，所以必须写 `tasks[].x`。早前这里写的是裸字段名
+ * （`range_status` / `locked` / `gaps` …）—— 按该路径去 data 里找什么也找不到，
+ * 图例等于没有。2026-10-28 修正（同型缺陷：stats 的 `declared[].unit`）。
+ */
 export function statusFieldNotes(): Record<string, string> {
   return {
-    range_status: renderNotes(RANGE_STATUS_NOTES),
-    locked: 'true = sync_state 里有残留的写者章（上一轮运行被强杀，来不及清）。'
+    'tasks[].range_status': renderNotes(RANGE_STATUS_NOTES),
+    'tasks[].locked': 'true = sync_state 里有残留的写者章（上一轮运行被强杀，来不及清）。'
       + '⚠️ 这不是「正在同步中」：真正持有写锁的进程会让本命令先退避等待'
       + '（readOnlyRetryMs，默认 30 秒）——等到了说明那一轮已结束、章也清了（返回 false），'
       + '等不到才报 store_locked。所以看到 true 说明写锁当前是空的、章是残留的，'
       + '重跑 sync run 即可（引擎会重新盖章）',
-    gaps: 'sync_gaps 里的历史缺口。⚠️ 它是历史记录、不等于当前仍缺：成功窗只清它自己那个'
+    'tasks[].gaps': 'sync_gaps 里的历史缺口。⚠️ 它是历史记录、不等于当前仍缺：成功窗只清它自己那个'
       + '起点的缺口，换窗口边界重跑不会清掉旧起点的记录——旧记录的 reason 与新记录相同，'
       + '按 reason 区分不出新旧。range 也只能说明「相关」：换边界重跑后数据可能已补齐，'
       + '而旧缺口的 range 仍与你要评估的区间重叠。所以没有一次覆盖核对就不能确认新鲜度——'
       + '报「该区间有历史缺口记录，新鲜度未确认」，不要直接报成当前故障',
-    'gaps[].reason': '取值与动作见 README 的 gaps 图例（与 sync run 的 gaps[].reason 同一组值）',
-    'gaps[].range': '原样回显 sync_gaps 的存储值（epoch 毫秒字符串），不是 run 输出的'
+    'tasks[].gaps[].reason': '取值与动作见 README 的 gaps 图例（与 sync run 的 gaps[].reason 同一组值）',
+    'tasks[].gaps[].range': '原样回显 sync_gaps 的存储值（epoch 毫秒字符串），不是 run 输出的'
       + ' +08:00 ISO 形态 —— 要比较请先按同一形态解析',
-    resolved_range: '上次成功推进的水位区间。⚠️ start 是水位起点语义、含可能被跳过的首残段'
+    'tasks[].resolved_range': '上次成功推进的水位区间。⚠️ start 是水位起点语义、含可能被跳过的首残段'
       + '前缀（实测：日对齐任务从非日界起点跑 → skipped=2 而 start 仍等于请求起点），'
       + '所以它不是「已覆盖」的保证；本命令不输出 windows.skipped，判实际覆盖要看 '
       + 'sync run 的 windows.skipped。null = 尚无成功推进（或 v9 之前的旧记录）',
   }
 }
 
-/** `sync verify` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
+/**
+ * `sync verify` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。
+ *
+ * ⚠️ 图例键是**指向输出的路径**：`sync verify` 的 data 也是 `{tasks:[...]}`，所有字段都挂在任务条目上。
+ * 早前写的是裸字段名 (`state_windows_consistent` / `expected_from_api` …) —— 按该路径什么也找不到。
+ */
 export function verifyFieldNotes(): Record<string, string> {
   return {
-    state_windows_consistent: 'true = sync_state 记录为「水位已推进且 range_status=complete」。'
+    'tasks[].state_windows_consistent': 'true = sync_state 记录为「水位已推进且 range_status=complete」。'
       + '⚠️ 这不代表数据完整；drift 为空 / 退出码 0 同样不能当完整性证据 —— '
       + '对 windowed 任务本命令只核对同步状态记录（实测中窗失败的库同样给 drift: [] 且'
       + '退出码 0），快照任务则另有上游行数核对。windowed 的完整性要另行核对两处：'
       + 'sync status 的 gaps 与 resolved_range（能否确认新鲜度见该字段的说明），'
       + '以及 sync run 的 windows.skipped（本命令与 status 都不输出它）',
-    expected_from_api: 'null 有两种成因，看 drift 里有没有 fetch_failed 区分：'
+    'tasks[].expected_from_api': 'null 有两种成因，看 drift 里有没有 fetch_failed 区分：'
       + 'windowed 任务不做上游全量重拉（成本高，恒为 null）；快照任务则是上游取数失败'
       + '（此时 drift 里有 kind=fetch_failed 的条目）',
-    'drift[].kind': '取值与动作见 README 的 drift 图例',
-    'drift[].detail': '给人读的中文说明；程序判断请用 kind',
+    'tasks[].drift[].kind': '取值与动作见 README 的 drift 图例',
+    'tasks[].drift[].detail': '给人读的中文说明；程序判断请用 kind',
   }
 }
 

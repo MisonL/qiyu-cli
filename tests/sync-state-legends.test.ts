@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url'
 import { createDuckDbStore } from '../src/store/duckdb.js'
 import { runTask } from '../src/sync/engine.js'
 import { RateGate } from '../src/sync/rate-gate.js'
-import { RANGE_STATUSES, readWatermark } from '../src/sync/state.js'
+import { RANGE_STATUSES, advanceWatermark, markPending, readWatermark, recordGap } from '../src/sync/state.js'
 import { RUN_STATUSES } from '../src/sync/types.js'
 import { RANGE_STATUS_NOTES, RUN_STATUS_NOTES, runFieldNotes, statusFieldNotes, tasksFieldNotes, verifyFieldNotes } from '../src/commands/sync-notes.js'
 import { syncCommand } from '../src/commands/sync.js'
@@ -44,8 +44,10 @@ beforeEach(() => {
   cfg = { backend: 'duckdb', path: db, readOnlyRetryMs: 500, batchSize: 1000 }
   out = ''
   vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
+  vi.stubEnv('HOME', dir) // 隔离真实 ~（store 配置解析在 --db 之外仍会读它）
+  vi.stubEnv('USERPROFILE', dir) // Windows 的 os.homedir() 读它
 })
-afterEach(() => { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }) })
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }) })
 
 const parsed = (): Record<string, unknown> => JSON.parse(out) as Record<string, unknown>
 const data = (): Record<string, unknown> => parsed().data as Record<string, unknown>
@@ -88,7 +90,7 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
   it('每个取值在它出现的那条命令的 field_notes 里都有释义（枚举 ⊆ 图例）', () => {
     const run = runFieldNotes()['tasks[].status']!
     for (const v of RUN_STATUSES) expect(run, `run status 缺 ${v}`).toContain(`${v} = `)
-    const st = statusFieldNotes().range_status!
+    const st = statusFieldNotes()['tasks[].range_status']!
     for (const v of RANGE_STATUSES) expect(st, `range_status 缺 ${v}`).toContain(`${v} = `)
     // `null` 是第三种真实取值（从未运行），必须也被解释 —— 它不在 RANGE_STATUSES 里
     expect(st, 'range_status 的 null 也必须释义').toContain('null = ')
@@ -98,7 +100,7 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     // 反向解析：`a = 释义；b = 释义` 拆回取值集合（与生产渲染同一分隔约定）。
     const keys = (cell: string): string[] => cell.split('；').map((seg) => seg.split(' = ')[0]!.trim())
     expect(keys(runFieldNotes()['tasks[].status']!).sort()).toEqual([...RUN_STATUSES].sort())
-    expect(keys(statusFieldNotes().range_status!).sort())
+    expect(keys(statusFieldNotes()['tasks[].range_status']!).sort())
       .toEqual([...RANGE_STATUSES, 'null'].sort())
   })
 
@@ -152,28 +154,11 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
       // windows 是嵌套对象：`tasks[].windows.skipped` 的 rest 是 `windows.skipped`
       expect(TASK_KEYS, `run 图例键 ${k} 不在任务条目里`).toContain(rest.split('.')[0])
     }
-    // status 输出：{task, watermark, range_status, last_synced_at, resolved_range, gaps,
-    // gaps_count, locked}（gaps 元素的键另算）
-    const STATUS_KEYS = ['task', 'watermark', 'range_status', 'last_synced_at', 'resolved_range',
-      'gaps', 'gaps_count', 'locked']
-    const GAP_KEYS = ['range', 'reason', 'detail', 'recorded_at']
-    for (const k of Object.keys(statusFieldNotes())) {
-      // 数组元素的路径形态是 `gaps[]`（`gaps` 是数组）；写成 `gaps.` 指的是对象形态。
-      const [head, sub] = k.split('.')
-      if (sub !== undefined) {
-        expect(head, `status 图例键 ${k} 的父字段不在输出里`).toBe('gaps[]')
-        expect(GAP_KEYS, `status 图例键 ${k} 不在 gap 条目里`).toContain(sub)
-      } else {
-        expect(STATUS_KEYS, `status 图例键 ${k} 不在输出里`).toContain(head)
-      }
-    }
-    // verify 输出：{task, local_rows, expected_from_api, state_windows_consistent, drift}
-    // （`drift` 是数组 → 元素路径形态是 `drift[]`）
-    const VERIFY_KEYS = ['task', 'local_rows', 'expected_from_api', 'state_windows_consistent',
-      'drift', 'drift[]']
-    for (const k of Object.keys(verifyFieldNotes())) {
-      expect(VERIFY_KEYS, `verify 图例键 ${k} 不在输出里`).toContain(k.split('.')[0])
-    }
+    // status / verify 不在这里核对 —— 这两个命令的 data 是 `{tasks:[…]}`，图例键是
+    // 指向输出的**路径**（`tasks[].x`），必须拿**真跑出来的输出**逐条解析（下面的
+    // 「图例键在真跑出来的输出上逐条可解析」用例）。手抄字段清单是假护栏：它镜像图例
+    // 而不是镜像输出，2026-10-28 之前图例键写成裸字段名（`range_status` / `locked` …）
+    // 它照样绿。
     // tasks 输出：{tasks:[{id, table, kind, watermark{field,initial}, maxWindowDays,
     // overlapDays, primaryKey, sensitive_columns}], unsupported:[{id, unsupported}]}
     const TASK_ITEM_KEYS = ['id', 'table', 'kind', 'watermark', 'maxWindowDays',
@@ -195,12 +180,62 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     }
   })
 
+  it('status / verify 的图例键在真跑出来的输出上逐条可解析（真库，2026-10-28）', async () => {
+    // 缺陷实证：这两个命令的 data 是 `{tasks:[…]}`，而图例键此前是裸字段名
+    // （`range_status` / `locked` / `gaps[].reason` / `state_windows_consistent` /
+    // `drift[].kind` …）—— 按图例路径去 data 里找什么也找不到，图例等于没有。
+    // 上面的手抄清单护栏放过了它（它镜像图例而不是镜像输出），所以这条用
+    // **真库 + 真命令** 把「图例 ⊆ 输出」钉死：每个键必须能作为路径解析到真实字段。
+    const s = await fresh()
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', 'w1', { start: 0, end: 1 }, 't1')
+      await markPending(tx, 'reports.overview')
+      await recordGap(tx, 'reports.overview', '100', '200', 'fetch_failed', '网络抖动', { now: () => 0 })
+    })
+    await s.close()
+
+    // 路径解析器：`a.b` 逐段下钻；`x[]` 段要求该键是数组并对**任一元素**继续
+    //（任务多、缺口/漂移挂在个别任务上，首元素不一定带数据 —— 用 some 才是「路径真实存在」）。
+    const hasPath = (root: unknown, path: string): boolean => {
+      const segs = path.split('.')
+      const walk = (cur: unknown, i: number): boolean => {
+        if (i === segs.length) return true
+        if (cur === null || typeof cur !== 'object') return false
+        const tok = segs[i]!
+        const isArr = tok.endsWith('[]')
+        const key = isArr ? tok.slice(0, -2) : tok
+        if (!(key in (cur as object))) return false
+        const next = (cur as Record<string, unknown>)[key]
+        if (isArr) {
+          if (!Array.isArray(next)) return false
+          return next.some((el) => walk(el, i + 1))
+        }
+        return walk(next, i + 1)
+      }
+      return walk(root, 0)
+    }
+
+    // —— status：dim.staff 已推进（complete），reports.overview 带一条 gap（元素键可核对）
+    out = ''
+    expect(await syncCommand(['status', '--db', db])).toBe(0)
+    for (const k of Object.keys(statusFieldNotes())) {
+      expect(hasPath(data(), k), `status 图例键 ${k} 在真实输出上不可解析（输出 data 键：${Object.keys(data()).join('、')}）`).toBe(true)
+    }
+
+    // —— verify：reports.overview 是 pending → drift 非空（state_pending），元素键可核对
+    out = ''
+    expect(await syncCommand(['verify', 'reports.overview', '--db', db]), 'pending 任务 → drift 非空 → 退出码 1').toBe(1)
+    for (const k of Object.keys(verifyFieldNotes())) {
+      expect(hasPath(data(), k), `verify 图例键 ${k} 在真实输出上不可解析`).toBe(true)
+    }
+  })
+
   it('图例的「字面与事实相反」警告真的写出来了（这是本轮缺陷的核心）', () => {
     // ⚠️ 只钉「不代表 XX」是不够的 —— 那句话可以是空话。必须钉住**机制**：
     // 为什么 pending 时表里有数据（后续成功窗照常落库、只是不推水位）、
     // 为什么 complete 时可能仍有缺口（每个成功窗都写 complete）。
     // 变异验证：把机制句删掉、只留「不代表库里没有数据」时，这条必须红。
-    const rangeNotes = statusFieldNotes().range_status!
+    const rangeNotes = statusFieldNotes()['tasks[].range_status']!
     expect(rangeNotes, 'complete 的误读方向必须写出来').toContain('不代表「全窗口成功」')
     expect(rangeNotes, 'complete 的机制必须写出来（每个成功窗都写 complete）')
       .toContain('每个成功窗')
@@ -220,11 +255,11 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     expect(rangeNotes, 'pending 不得说成「从未同步过」').toContain('不代表「从未同步过」')
     expect(rangeNotes, 'pending 的三种误读都要点名').toContain('三种误读')
     // 同一轮：status 的 resolved_range.start 不是覆盖起点（含被跳过的残段前缀）
-    expect(statusFieldNotes().resolved_range, 'status 的 resolved_range 不得说成「覆盖的区间」')
+    expect(statusFieldNotes()['tasks[].resolved_range'], 'status 的 resolved_range 不得说成「覆盖的区间」')
       .toContain('水位区间')
-    expect(statusFieldNotes().resolved_range, '必须点明 start 含被跳过的前缀')
+    expect(statusFieldNotes()['tasks[].resolved_range'], '必须点明 start 含被跳过的前缀')
       .toContain('首残段')
-    expect(statusFieldNotes().resolved_range, '必须指向 sync run 的 windows.skipped')
+    expect(statusFieldNotes()['tasks[].resolved_range'], '必须指向 sync run 的 windows.skipped')
       .toContain('windows.skipped')
     expect(runFieldNotes()['tasks[].status'], 'partial 的误读必须写出来')
       .toContain('一行都没落')
@@ -256,20 +291,20 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
       .toContain('windows.skipped')
     // CodeRabbit（2026-10-27）：gaps 是历史记录，旧记录的 reason 与新记录相同 ——
     // 「按 reason 判断是否仍缺」是错的，必须改成按 range 对照 + 新鲜度未确认。
-    expect(statusFieldNotes().gaps, 'gaps 图例必须说明 reason 区分不出新旧')
+    expect(statusFieldNotes()['tasks[].gaps'], 'gaps 图例必须说明 reason 区分不出新旧')
       .toContain('区分不出新旧')
-    expect(statusFieldNotes().gaps, 'range 只能说明相关，不能确认新鲜度')
+    expect(statusFieldNotes()['tasks[].gaps'], 'range 只能说明相关，不能确认新鲜度')
       .toContain('只能说明「相关」')
-    expect(statusFieldNotes().gaps, '必须点明「没有覆盖核对就不能确认新鲜度」')
+    expect(statusFieldNotes()['tasks[].gaps'], '必须点明「没有覆盖核对就不能确认新鲜度」')
       .toContain('不能确认新鲜度')
-    expect(statusFieldNotes().locked, 'locked 不是「正在同步中」必须写出来')
+    expect(statusFieldNotes()['tasks[].locked'], 'locked 不是「正在同步中」必须写出来')
       .toContain('不是「正在同步中」')
-    expect(statusFieldNotes().locked, 'locked 的机制必须写出来（退避等待 vs store_locked）')
+    expect(statusFieldNotes()['tasks[].locked'], 'locked 的机制必须写出来（退避等待 vs store_locked）')
       .toContain('退避等待')
     // CodeRabbit（2026-10-27）：verify 的图例一度写「要判完整性看 drift 与退出码」——
     // 而本文件另一条用例正证明中窗失败的库给 drift: [] + 退出码 0。图例必须自相矛盾地
     // 说「不能用它们当完整性证据」，否则 Agent 会拿本命令的绿灯当数据完整的证明。
-    const verifyNotes = verifyFieldNotes().state_windows_consistent!
+    const verifyNotes = verifyFieldNotes()['tasks[].state_windows_consistent']!
     expect(verifyNotes, 'verify 的图例不得把 drift/退出码当完整性证据')
       .toContain('不能当完整性证据')
     expect(verifyNotes, '必须给出正确的替代路径（另行核对 gaps 与覆盖范围）')

@@ -308,7 +308,8 @@ qiyu --version                       包版本 + skill_contract_version
 | `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 才是落库行数（为 0 也可能是「窗口都成功、只是上游没数据」） |
 | `failed` | 快照任务的失败（本地限频闸门拦截 / 上游取数失败 / 落库失败或行数核对不符） | 快照没有窗口循环，所以不会出现 `partial`；反过来 windowed 任务也**不会**给出 `failed` —— 全窗失败同样是 `partial` |
 
-`sync status` 每任务输出 `{task, watermark, range_status, last_synced_at, resolved_range,
+`sync status` 的 `data` 是 `{tasks:[…]}`（图例键即该路径下的字段，如 `tasks[].range_status`），
+每任务输出 `{task, watermark, range_status, last_synced_at, resolved_range,
 gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区间（形态同 run 的
 `resolved_range`，但 ⚠️ `start` 是**水位起点语义**、含可能被跳过的首残段前缀 ——
 本命令不输出 `windows.skipped`，判实际覆盖要看 `sync run` 的 `windows.skipped`），
@@ -336,7 +337,7 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 不要直接报成当前故障。⚠️ `gaps[].range` 是 epoch 毫秒字符串（原样回显存储值），与 `sync run` 的
 `+08:00` ISO 形态**不同**，比较前先统一形态。
 
-`sync verify` 输出 `{task, local_rows, expected_from_api, state_windows_consistent, drift}`：
+`sync verify` 输出 `{tasks:[…]}`，每任务 `{task, local_rows, expected_from_api, state_windows_consistent, drift}`：
 **`expected_from_api` 只对快照任务有意义**（上游 fetch 的行数）；windowed 任务不做上游
 全量重拉，该字段恒为 `null`，核对方式是「本地行数 ↔ sync_state 成功状态」的一致性
 （`state_windows_consistent`）——两种任务的核对方式不同，读 drift 前先看任务 kind。
