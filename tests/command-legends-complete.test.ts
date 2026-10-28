@@ -75,6 +75,19 @@ describe('每条有图例的命令：输出字段必须被图例覆盖（反向�
       .toContain('整个 entity.installed 是 null')
   })
 
+  it('auth whoami：四个键都有释义（profile 此前裸奔）', async () => {
+    // ⚠️ 2026-10-29 实测：whoami 输出 `{configured, source, profile, robots}`，而
+    // field_notes 只有三个键 —— `profile` 从引入起就没有释义。它是 Agent 判断
+    // 「我写/读的是哪个档」的唯一依据，且**不保证该档存在**（env 拼错时照样回显）。
+    vi.stubEnv('QIYU_APP_KEY', 'k-test')
+    vi.stubEnv('QIYU_APP_SECRET', 's-test')
+    out = ''
+    expect(await authCommand(['whoami'])).toBe(0)
+    assertAllCovered('auth whoami')
+    expect(notes().profile, 'profile 必须给出完整选择顺序').toContain('QIYU_PROFILE')
+    expect(notes().profile, 'profile 必须点明不保证该档存在').toContain('不保证该档在配置文件里存在')
+  })
+
   it('auth login：四个键都有释义，且 source 的误导被点破', async () => {
     vi.stubEnv('QIYU_APP_KEY', 'k-test')
     vi.stubEnv('QIYU_APP_SECRET', 's-test')

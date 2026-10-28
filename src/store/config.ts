@@ -11,7 +11,7 @@
 import { homedir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
 import type { BackendName, StoreConfig } from './types.js'
-import { configPathFor, loadConfigFile, checkPermissions, configHasCredentials, insecureConfigError } from '../core/config.js'
+import { configPathFor, loadConfigFile, checkPermissions, configHasCredentials, insecureConfigError, resolveProfileName } from '../core/config.js'
 import type { ProfileBlock } from '../core/config.js'
 
 export interface StoreEnv { QIYU_DB_PATH?: string; QIYU_STORE_BACKEND?: string; QIYU_PROFILE?: string }
@@ -131,20 +131,16 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
   //   · 未点名任何 profile（连 defaultProfile 都没有）→ 用内置 `default`，不查。
   // ⚠️ 空串口径与 auth 侧逐字一致：`--profile ''` 是 usage 错误（`auth login` 的
   // normalizeProfile 同样报「--profile 不能为空」）；`QIYU_PROFILE=`（变量未设的
-  // 典型形态）与 `defaultProfile: ''` 当未设置 —— 后者与 core 的 `fileProfile`
-  // 同一判据，凭证侧与 store 侧不得对同一份配置给出两种解读。
+  // 典型形态）与 `defaultProfile: ''` 当未设置 —— 档名解析走 core 的
+  // `resolveProfileName`（唯一实现），凭证侧与 store 侧不得对同一份配置给出两种解读。
   if (flags.profile !== undefined && flags.profile.trim() === '') {
     throw new Error('--profile 不能为空')
   }
-  const namedProfile = flags.profile !== undefined
-    ? { name: flags.profile, source: '--profile' }
-    : env.QIYU_PROFILE !== undefined && env.QIYU_PROFILE !== ''
-      ? { name: env.QIYU_PROFILE, source: 'QIYU_PROFILE' }
-      : file.defaultProfile !== undefined && file.defaultProfile !== ''
-        ? { name: file.defaultProfile, source: 'defaultProfile' }
-        : undefined
-  const profileName = namedProfile?.name ?? 'default'
-  if (namedProfile !== undefined) {
+  const namedProfile = resolveProfileName({
+    flag: flags.profile, envProfile: env.QIYU_PROFILE, defaultProfile: file.defaultProfile,
+  })
+  const profileName = namedProfile.name
+  if (namedProfile.source !== undefined) {
     const available = Object.keys(profiles)
     // ⚠️ own-property 判据（2026-10-27，CodeRabbit）：`profiles[x] === undefined` 会被
     // 原型链绕过 —— `--profile constructor` / `toString` 命中 `Object.prototype` 上的

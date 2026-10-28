@@ -9,6 +9,32 @@
 
 ### 修复
 
+- **空串档名：写凭证的命令与读凭证的命令解出两个不同的 profile**。`auth whoami` 与
+  `auth login` 各自用 `??` 链解析档名，而 `''` 不是 null/undefined、`??` 会把它放行。
+  2026-10-29 真库实测两条后果：
+  ① `"defaultProfile": ""`（JSON 里清空字段）时 `auth login` 把凭证写进 `profiles[""]`，
+  而 `api call` / `store` / `sync` 按内置 `default` 读 —— `login` 与 `whoami` 都报
+  `configured: true`，`api call` 却报「缺少 appKey」：**凭证写进了没人读的档**；
+  ② `QIYU_PROFILE=`（变量没填的典型形态）时 `whoami` 选中空串档报 `auth_missing`，
+  而 `api call` 照样从 `defaultProfile` 的档读到凭证并发出请求 —— 同一台机器上两个命令
+  给出相反的「凭证有没有配」。
+  修法：新增 `resolveProfileName()`（`core/config.ts`）作为档名的**唯一解析点**
+  （`--profile` > `QIYU_PROFILE` > `defaultProfile` > 内置 `default`，空串一律视为未设置），
+  四个调用点（`fileProfile` / `resolveStoreConfig` / `whoami` / `login`）共用它，
+  不得再各自写 `??` 链。
+  同轮两处相邻缺口：`whoami` 的 `profile` 字段此前**没有释义**（图例只有三个键），
+  补上「这是本命令会去读的档名，不保证该档存在」—— env 拼错时 `whoami` 照样报
+  `configured`，而**只要配置文件里已有其它档**，`store`/`db`/`sync`/`query` 对同一个
+  名字就以退出码 2 拒绝（`profiles` 为空时它们按内置默认路径照常工作，不报错）；
+  `robots` 的释义补上「空数组的第二种成因是该档根本不存在」。
+  另修一处调度缺陷：`sync install` 把 `QIYU_PROFILE=` 固化成 `--profile <空>` 烘进
+  plist/unit —— 安装期（dry-run 与 `--yes`）一律成功，装完之后**每次调度执行**都因
+  「--profile 不能为空」退出码 2 永久失败，且只在调度日志里可见。
+  测试：`resolveProfileName` 三条单测；`tests/commands/auth.test.ts` 新增三例真库用例
+  （whoami 与 `fileCredentials` 解出同一档 / login 不创建空档名 / 图例点破「档名不保证存在」）；
+  `tests/commands/sync.test.ts` 新增调度固化用例；`tests/command-legends-complete.test.ts`
+  补 `auth whoami` 的反向覆盖。变异 6 条全红（先确认变异已应用）。
+
 - **`sync run` / `sync status` 的 `watermark` / `last_synced_at` 没有释义，而它们是 UTC `Z`
   形态、与同一行里的 `resolved_range`（`+08:00`）写法不同**。2026-10-28 真库实测：同一任务
   条目里 `watermark: "2025-10-09T08:53:20.000Z"` 与

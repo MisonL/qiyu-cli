@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path'
 import {
   __resetPermissionWarnings, checkPermissions, configHasCredentials, configPathFor,
   fileCredentials, fileProfile, loadConfigChecked, loadConfigFile, parseConfig,
-  serializeConfig, writeConfigFile,
+  resolveProfileName, serializeConfig, writeConfigFile,
 } from '../../src/core/config.js'
 
 let home = ''
@@ -264,6 +264,37 @@ describe('fileProfile / fileCredentials（凭证与 robots 的共用出口）', 
     expect(configHasCredentials(loadConfigFile(cfgPath()).file)).toBe(true)
     writeCfg({ profiles: { a: { store: {} } } })
     expect(configHasCredentials(loadConfigFile(cfgPath()).file)).toBe(false)
+  })
+})
+
+describe('resolveProfileName —— profile 名的唯一解析点（2026-10-29）', () => {
+  // ⚠️ 为什么值得单测：whoami / login / fileProfile / resolveStoreConfig 四处共用它。
+  // 空串口径（`QIYU_PROFILE=` 与 `"defaultProfile": ""` 视为未设置）此前在
+  // whoami / login 里各用一条 `??` 链重写过，而 `''` 不是 null/undefined ——
+  // 同一份配置在「写凭证的命令」与「读凭证的命令」上解出两个档名。
+  it('优先级：--profile > QIYU_PROFILE > defaultProfile > 内置 default', () => {
+    expect(resolveProfileName({ flag: 'f', envProfile: 'e', defaultProfile: 'd' }))
+      .toEqual({ name: 'f', source: '--profile' })
+    expect(resolveProfileName({ envProfile: 'e', defaultProfile: 'd' }))
+      .toEqual({ name: 'e', source: 'QIYU_PROFILE' })
+    expect(resolveProfileName({ defaultProfile: 'd' }))
+      .toEqual({ name: 'd', source: 'defaultProfile' })
+    expect(resolveProfileName({})).toEqual({ name: 'default' })
+  })
+
+  it('空串一律当未设置（三层各自成立）—— 不得选中一个名叫空串的档', () => {
+    expect(resolveProfileName({ envProfile: '' }), 'QIYU_PROFILE=').toEqual({ name: 'default' })
+    expect(resolveProfileName({ defaultProfile: '' }), '"defaultProfile": ""').toEqual({ name: 'default' })
+    expect(resolveProfileName({ envProfile: '', defaultProfile: 'prod' }))
+      .toEqual({ name: 'prod', source: 'defaultProfile' })
+    // `--profile ''` 在调用方就是 usage 错误；即使漏到这一层，也不得变成空串档名
+    expect(resolveProfileName({ flag: '', envProfile: 'e' }))
+      .toEqual({ name: 'e', source: 'QIYU_PROFILE' })
+  })
+
+  it('无人点名时 source 为 undefined（调用方据此决定要不要查「档是否存在」）', () => {
+    expect(resolveProfileName({}).source).toBeUndefined()
+    expect(resolveProfileName({ defaultProfile: 'd' }).source).toBe('defaultProfile')
   })
 })
 

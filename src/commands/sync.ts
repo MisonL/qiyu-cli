@@ -496,7 +496,13 @@ function storeArgsFor(parsed: ParsedFlags, resolved: { path: string; backend: st
     // 调度任务的 cwd 与 HOME 都可能不同，相对路径会指向别处。
     push('--db', resolved.path)
   }
-  if (parsed.values['--profile'] === undefined && process.env.QIYU_PROFILE !== undefined) {
+  // ⚠️ 空串视为未设置（2026-10-29 实测修）：`export QIYU_PROFILE=` 是 shell 里"变量没填"
+  // 的典型形态。此前只判 `!== undefined`，于是 `--profile` **带一个空取值**被烘进调度命令：
+  //   sync run --profile "" → 每次调度执行都报「--profile 不能为空」退出码 2，
+  //   而安装时（dry-run 与 --yes 都一样）不报任何错 —— 装完才开始永久失败。
+  // 判据与 `resolveProfileName` 的空串口径同源（core/config.ts）。
+  if (parsed.values['--profile'] === undefined
+      && process.env.QIYU_PROFILE !== undefined && process.env.QIYU_PROFILE !== '') {
     push('--profile', process.env.QIYU_PROFILE)
   }
   if (parsed.values['--backend'] === undefined && process.env.QIYU_STORE_BACKEND !== undefined) {

@@ -160,9 +160,17 @@ appSecret 对同机其他用户可读。不读配置的命令（`--version`、`a
 > ⚠️ `whoami` **只检查凭证是否存在**，不校验它是否有效——一个拼错的 AppKey 同样返回
 > `configured: true`。第一次真实调用才是唯一的验证。
 >
+> `whoami` 输出的 `profile` 是**本次解析出的档名**（顺序同上：`QIYU_PROFILE` > `defaultProfile` >
+> 内置 `default`，空串一律视为未设置）。⚠️ 它**不保证该档在配置文件里存在**：环境变量给了一个
+> 配置文件里没有的名字（拼错）时，`whoami` 照样按 env 凭证报 `configured: true`；而只要配置文件里
+> **已有其它档**，`store` / `db` / `sync` / `query` 对同一个名字会以退出码 2 拒绝（它们要读该档的
+> `store` 块）—— 这几条命令才是「档名拼错」的权威判据（配置文件 `profiles` 为空时它们按内置
+> 默认路径照常工作，不报错）。
+>
 > `whoami` 输出的 `robots` 来自配置里的 `profiles.<name>.robots`（`{"1000001":"机器人A"}` 形态），
 > 同样**未校验有效性**。它是 `sync run` 的兜底来源：`profiles.<name>.store.options.knowledgeRobotIds`
-> 缺席时，知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。
+> 缺席时，知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。空数组有两种成因：
+> 该档没配 robots，或该档根本不存在。
 
 ## 使用
 
@@ -418,7 +426,9 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 **`sync install` 与调度环境**：调度条目不继承你的 shell 环境——launchd 的用户域不含
 shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，install 会把**解析出的绝对
 路径/名称固化为调度命令的 `--db/--profile/--backend` 参数**（显式 flag 优先；只走配置
-文件或默认值时不固化，调度任务自己读得到 HOME 下的配置文件）。若凭证走
+文件或默认值时不固化，调度任务自己读得到 HOME 下的配置文件）。⚠️ 空串视为未设置
+（`export QIYU_PROFILE=` 是"变量没填"的典型形态，不会被固化成 `--profile <空>`——
+那会让每次调度执行都报「--profile 不能为空」）。若凭证走
 `QIYU_APP_KEY`/`QIYU_APP_SECRET`，请确认其对该调度上下文可用——调度条目**不写入任何
 凭证**（秘密进 plist/unit 文件是安全红线）。
 

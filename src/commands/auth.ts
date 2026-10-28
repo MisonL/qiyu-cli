@@ -4,6 +4,7 @@ import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty, EXIT } from '../output.js'
 import {
   configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions, shellPath,
+  resolveProfileName,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS } from './spec-types.js'
@@ -237,12 +238,17 @@ async function login(argv: string[]): Promise<number> {
     // 那会静默丢掉用户手写的其它配置。如实报错，让人先修。
     return usageFail(`无法读取现有配置文件：${(e as Error).message}`)
   }
-  // ⚠️ 与全局优先级一致（spec §3.2：命令行 > 环境变量 > 配置文件 > 默认）——
-  // 此前写成 defaultProfile 优先于 QIYU_PROFILE，同一台机器上 export 过
-  // QIYU_PROFILE 的用户会发现自己写进了别的 profile。
-  const name = profile
-    ?? (process.env.QIYU_PROFILE !== undefined && process.env.QIYU_PROFILE !== '' ? process.env.QIYU_PROFILE : undefined)
-    ?? file.defaultProfile ?? 'default'
+  // ⚠️ 档名走**共用解析点**（2026-10-29 实测）：此前这里是 `profile ?? envProfile ?? defaultProfile ?? 'default'`
+  // 的手写链，而 `??` 会放行空串 —— `"defaultProfile": ""`（JSON 里清空字段）时
+  // login 把凭证写进 `profiles[""]`，而 store / api / sync 按内置 `default` 读：
+  // login 与 whoami 都报 `configured: true`，第一次真实调用却报「缺少 appKey」——
+  // 凭证写进了**没人读的档**。共用的口径与 README 一致：空串视为未设置。
+  // 顺序也与 spec §3.2 一致（命令行 > 环境变量 > 配置文件 > 默认）——此前曾写成
+  // defaultProfile 优先于 QIYU_PROFILE，同一台机器上 export 过的用户会发现自己
+  // 写进了别的 profile；`resolveProfileName` 把这条顺序固化成唯一实现。
+  const name = resolveProfileName({
+    flag: profile, envProfile: process.env.QIYU_PROFILE, defaultProfile: file.defaultProfile,
+  }).name
   const existing: ProfileBlock = file.profiles[name] ?? {}
   const next: QiyuConfigFile = {
     ...(file.defaultProfile !== undefined ? { defaultProfile: file.defaultProfile } : {}),
@@ -316,7 +322,13 @@ function whoami(): number {
   const envKey = process.env.QIYU_APP_KEY
   const envSecret = process.env.QIYU_APP_SECRET
   const envProfile = process.env.QIYU_PROFILE
-  const profileName = envProfile ?? file?.defaultProfile ?? 'default'
+  // ⚠️ 档名解析**必须走共用点**（2026-10-29 实测）：此前这里是 `envProfile ?? defaultProfile ?? 'default'`，
+  // 而 `''` 不是 null/undefined、`??` 会把它放行 —— `QIYU_PROFILE=`（变量未设的典型形态）
+  // 于是选中一个名叫空串的档，报 `auth_missing`，而同一台机器上的 `api call` 按
+  // `defaultProfile` 读到凭证并发出请求：两个命令给出相反的"凭证有没有配"。
+  const profileName = resolveProfileName({
+    envProfile, defaultProfile: file?.defaultProfile,
+  }).name
   const profBlock = file?.profiles[profileName]
   const fileKey = profBlock?.credentials?.appKey
   const fileSecret = profBlock?.credentials?.appSecret
@@ -366,8 +378,16 @@ function whoami(): number {
   }, {
     field_notes: {
       source: 'env = 两个字段都来自环境变量；file = 都来自配置文件；mixed = 各来自一处（合法组合）',
+      profile: '本次解析出的配置档名。选择顺序：环境变量 QIYU_PROFILE > 配置文件里声明的默认档名 > '
+        + '内置 default（空串一律视为未设置）。'
+        + '⚠️ 它只表示「本命令会去读哪个档」，**不保证该档在配置文件里存在** —— 环境变量给了一个'
+        + '配置文件里没有的名字（拼错）时，本命令照样按 env 凭证报 configured，但这时 robots 必为空，'
+        + '且只要配置文件里**已有其它档**，store / db / sync / query 对同一个名字就会以退出码 2 拒绝'
+        + '（它们要读该档的 store 块）。注意后者的成立条件是「已有其它档」：配置文件的 profiles 为空时'
+        + '它们按内置默认路径照常工作，不报错',
       robots: '来自配置文件的 profiles.<name>.robots 映射（robotId → 显示名），**未校验有效性**、' +
-        '未与本地库比对；sync run 在 profiles.<name>.store.options.knowledgeRobotIds 缺席时回退使用它',
+        '未与本地库比对；sync run 在 profiles.<name>.store.options.knowledgeRobotIds 缺席时回退使用它。'
+        + '⚠️ 空数组有两种成因：该档没配 robots，或该档在配置文件里根本不存在（见 profile 的说明）',
       configured: 'true 只表示"两个字段都有值"，**不代表**它们有效 —— 拼错的 appKey 同样返回 true',
     },
   })

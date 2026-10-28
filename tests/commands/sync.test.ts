@@ -1235,6 +1235,28 @@ describe('sync install', () => {
     }
   })
 
+  it('空串 env 不得烘进调度命令：QIYU_PROFILE= → 不加 --profile（否则每次调度都报「--profile 不能为空」）', async () => {
+    // ⚠️ 2026-10-29 实测缺陷：`storeArgsFor` 只判 `!== undefined`，于是
+    // `export QIYU_PROFILE=`（"变量没填"的典型形态）被固化成 `sync run --profile <空>`
+    // 写进 plist/unit —— 安装期（dry-run 与 --yes）一律成功，装完之后每次调度执行
+    // 都因「--profile 不能为空」退出码 2 永久失败，且只在调度日志里可见。
+    await seedSynced()
+    vi.stubEnv('QIYU_DB_PATH', dbPath())
+    vi.stubEnv('QIYU_PROFILE', '')
+    try {
+      const code = await syncCommand(['install', '--schedule', '*/30 * * * *'])
+      expect(code).toBe(0)
+      const content = (data().entries as Array<{ content: string }>)[0]!.content
+      expect(content, '空串 QIYU_PROFILE 不得变成 --profile 的取值').not.toMatch(/<string>--profile<\/string>/)
+      // --db 照常固化（空串判据只针对 profile，不误伤同一条路径上的其它 env）
+      expect(content).toMatch(new RegExp(`<string>--db</string><string>${dbPath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`))
+      // 烘进去的 argv 真的能跑：把条目里的 sync run 参数原样喂回 CLI，不得报用法错误
+      expect(content).toMatch(/<string>sync<\/string><string>run<\/string>/)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   /** 在任意路径建库并留下成功证据（前置探测要求「库已初始化 + 跑通过」）。 */
   async function seedAt(path: string): Promise<void> {
     mkdirSync(dirname(path), { recursive: true })
