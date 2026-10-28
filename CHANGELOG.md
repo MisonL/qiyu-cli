@@ -9,6 +9,23 @@
 
 ### 修复
 
+- **`sync status` / `sync verify` 的图例键全是裸字段名，按图例路径在输出里什么也找不到**。
+  2026-10-28 真库实测：这两个命令的 `data` 是 `{tasks:[…]}`，所有字段都挂在任务条目上；
+  而 `statusFieldNotes()` / `verifyFieldNotes()` 给出的键是 `range_status` / `locked` /
+  `gaps` / `gaps[].reason` / `gaps[].range` / `resolved_range` 与
+  `state_windows_consistent` / `expected_from_api` / `drift[].kind` / `drift[].detail`
+  —— **都不带 `tasks[].` 前缀**。图例的键是**路径**：路径写错 = 指一个 Agent 永远读不到的
+  字段，等于没有图例（同型缺陷：stats 的 `declared[].unit`）。实证：`qiyu sync status`
+  输出 `data` 的键集是 `['tasks']`，图例键 `range_status` 在 `data` 上解析为 `undefined`。
+  旧护栏放过它的原因值得记下来 —— `tests/sync-state-legends.test.ts` 里有一条「只解释该输出
+  里真实存在的字段」，但它比的是**手抄的字段清单**，清单镜像的是图例而不是真实输出，所以
+  图例键写成裸字段名它照样绿。
+  修法：键改成 `tasks[].x` / `tasks[].gaps[].reason` / `tasks[].drift[].kind` 等路径形态。
+  测试：删掉那段手抄清单护栏，新增「status / verify 的图例键在真跑出来的输出上逐条可解析」
+  —— 真库预置（`advanceWatermark` + `markPending` + `recordGap`）、真跑两个命令、对每个
+  图例键做**点路径解析**（`x[]` 段要求该键是数组并对任一元素继续，因为缺口/漂移只挂在个别
+  任务上）。变异 3 条（status 顶层键 / gaps 元素键 / verify drift 元素键改回裸名）全红。
+
 - **`store --help` 声称「CLI 不会自动创建配置文件」，而 `auth login` 会创建它**。
   2026-10-28 实测：HOME 为空目录时 `auth login` 建出 `~/.config/qiyu/config.json`
   （目录 0700、文件 0600，只含 `credentials`），`store init` 确实不建（`config_exists: false`）。
