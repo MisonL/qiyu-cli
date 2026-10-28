@@ -568,6 +568,9 @@ Skill 化——`skill install`（复制正文 + 建 Agent 链接，幂等，`--d
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
 参数表见 `qiyu api schema <id>`（`data.params`、`data.response_shape`）。
+`data.params[]` 的元素字段是 `in`（`query` / `body` / `path` / `header`）、`required`、
+`type`、`description`、`example`，以及条件出现的 `auto`（**只挂在这个数组的元素上**，
+不是 `data` 的顶层键）。
 只依据文档生成的参数表，不构成对服务端行为的保证；**响应体不做校验**；
 校验只对 `body_kind: json` 且有 body 参数表的接口生效，其余原样透传。
 `--strict` 只做本地参数表闭集一致性检查（「严格」≠「正确严格」），误拒时**不要删字段重试**。
