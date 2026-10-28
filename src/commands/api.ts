@@ -414,7 +414,7 @@ async function schema(argv: string[]): Promise<number> {
           '「撞上限流后该等多久」，不承诺 CLI 会替你排队',
         has_body_schema: 'true = 本接口有可比对的 body 参数表（body_kind 为 json 且 body 参数数 > 0）；不代表本次请求已校验，也不代表其余 bodyKind。本次校验结果见 api call 的 meta.warnings',
         body_kind: '只有 json 会被 api call 比对字段，其余（none/xml/multipart/text/form）原样透传不校验',
-        auto: 'true = 仅对 callable 且 auth 为 checksum 的接口，CLI 自填鉴权 query 参数（appKey/time/checksum）；入站/eventType 接口由回调方提供，不标 auto，调用方不要也不能通过 --body 传',
+        'params[].auto': 'true = 仅对 callable 且 auth 为 checksum 的接口，CLI 自填鉴权 query 参数（appKey/time/checksum）；入站/eventType 接口由回调方提供，不标 auto，调用方不要也不能通过 --body 传',
         dangerous: 'true = 危险操作，调用时需 --yes，否则退出码 4。必须由人类确认，不要自动追加 --yes',
         callable: 'false = 结构上不可主动调用（如 inbound 推送）；Agent 只能查、不能调',
         path: 'null = 路径未收录（数据缺口）；"/" = 入站占位符。两者都不可据此拼 URL',

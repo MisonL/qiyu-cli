@@ -576,7 +576,10 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 写在**具体子命令之后**（如 `qiyu api list --pretty`）。Agent 不需要它：默认输出已是合法 JSON，
 缩进只是给人看的。用法错误（退出码 2）仍是紧凑 JSON —— 先修参数，再看格式。
 
-`api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
+`api list` 输出的 `data` 是**行数组**（`[{id, title, …}, …]`，不是 `{rows:[…]}` 对象）——
+`meta.field_notes` 的键是**行字段名**（`verified` / `dangerous` / `direction` …），
+唯一的例外是 `request_schema`：它不是字段，而是一条「本 meta 不含参数表，去
+`api schema` 查」的否定声明。`meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
 ## 浏览器 / 文档
 
