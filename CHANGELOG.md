@@ -9,6 +9,13 @@
 
 ### 修复
 
+- **`store --help` 声称「CLI 不会自动创建配置文件」，而 `auth login` 会创建它**。
+  2026-10-28 实测：HOME 为空目录时 `auth login` 建出 `~/.config/qiyu/config.json`
+  （目录 0700、文件 0600，只含 `credentials`），`store init` 确实不建（`config_exists: false`）。
+  旧文案把「store 命令不写配置」说成了「CLI 不会创建文件」—— Agent 会据此认为该文件
+  不可能存在、排查配置来源时直接跳过。新文案点明谁可能创建了它、创建出来的文件不含
+  `store` 段。新增 `store --help` 文案用例，变异回退即红。
+
 - **`skill check` 三种形态都没有图例，`violations[].rule` 是 10 值闭集**。
   2026-10-28 实测：
   · `violations[].rule`（`unknown_command` / `flag_before_subcommand` / `table_name` /
