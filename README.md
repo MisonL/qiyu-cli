@@ -568,6 +568,9 @@ Skill 化——`skill install`（复制正文 + 建 Agent 链接，幂等，`--d
 body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
 未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
 参数表见 `qiyu api schema <id>`（`data.params`、`data.response_shape`）。
+`data.params[]` 的元素字段是 `in`（`query` / `body` / `path` / `header`）、`required`、
+`type`、`description`、`example`，以及条件出现的 `auto`（**只挂在这个数组的元素上**，
+不是 `data` 的顶层键）。
 只依据文档生成的参数表，不构成对服务端行为的保证；**响应体不做校验**；
 校验只对 `body_kind: json` 且有 body 参数表的接口生效，其余原样透传。
 `--strict` 只做本地参数表闭集一致性检查（「严格」≠「正确严格」），误拒时**不要删字段重试**。
@@ -576,7 +579,10 @@ body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺
 写在**具体子命令之后**（如 `qiyu api list --pretty`）。Agent 不需要它：默认输出已是合法 JSON，
 缩进只是给人看的。用法错误（退出码 2）仍是紧凑 JSON —— 先修参数，再看格式。
 
-`api list` 输出的 `meta.registry_complete` 会如实反映注册表是否已收录全部接口。
+`api list` 输出的 `data` 是**行数组**（`[{id, title, …}, …]`，不是 `{rows:[…]}` 对象）——
+`meta.field_notes` 的键是**行字段名**（`verified` / `dangerous` / `direction` …），
+唯一的例外是 `request_schema`：它不是字段，而是一条「本 meta 不含参数表，去
+`api schema` 查」的否定声明。`meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
 ## 浏览器 / 文档
 

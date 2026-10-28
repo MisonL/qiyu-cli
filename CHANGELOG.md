@@ -9,6 +9,20 @@
 
 ### 修复
 
+- **`api schema` 的图例键 `auto` 指向一个不存在的顶层字段（真实字段在 `params[].auto`）**。
+  2026-10-28 实测：`qiyu api schema ticket.search` 的 `data.auto` 是 `undefined`，
+  而 `data.params[0].auto === true`。图例的键是**路径**：写成顶层裸名 = 指一个 Agent
+  永远读不到的字段（同型缺陷：`sync status`/`sync verify` 漏 `tasks[].` 前缀、
+  stats 的 `declared[].unit`）。同一条图例里其余键（`dangerous` / `callable` / `path` /
+  `body_kind` …）都是 data 的顶层字段，只有 `auto` 混进了一个元素级字段。
+  修法：键改成 `params[].auto`。
+  测试：新增 `tests/api-legend-paths.test.ts` —— 真跑 `api schema` 三个接口，
+  对每个非条件图例键做点路径解析（`x[]` 段要求数组里**任一元素**走得通）；
+  条件键（`rate_limit` / `one_of`）由输出自身确认存在时才要求可解析。
+  另反向钉住 `api list`：它的 `data` 是**根数组**，图例键只能是行字段名
+  （逐行核对），唯一例外 `request_schema` 是「本 meta 不含参数表」的否定声明。
+  变异 2 条全红（`auto` 改回裸名 / `dangerous` 改成元素级）。
+
 - **`sync status` / `sync verify` 的图例键全是裸字段名，按图例路径在输出里什么也找不到**。
   2026-10-28 真库实测：这两个命令的 `data` 是 `{tasks:[…]}`，所有字段都挂在任务条目上；
   而 `statusFieldNotes()` / `verifyFieldNotes()` 给出的键是 `range_status` / `locked` /
