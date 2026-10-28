@@ -48,7 +48,10 @@ function parseTable(): Entry[] {
       if (!/^[a-z][a-z-]*$/.test(t)) break
       path.push(t)
     }
-    const flags = tokens.slice(1 + path.length).filter((t) => /^-{1,2}[a-z]/.test(t))
+    // ⚠️ 收「所有以 - 开头的 token」而不是 `--[a-z]+`：`---compare` / `--Compare` 这类
+    // 畸形 flag 若被过滤掉，断言就会放行一个读者根本用不了的参数（CodeRabbit 2026-10-28）。
+    // 它们不在接受集里，必然变红。
+    const flags = tokens.slice(1 + path.length).filter((t) => t.startsWith('-'))
     out.push({ path, flags, raw: cmdPart, line: n + 1 })
   }
   return out
