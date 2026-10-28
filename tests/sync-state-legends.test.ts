@@ -160,7 +160,8 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
       }
       const rest = k.slice('tasks[].'.length)
       // windows 是嵌套对象：`tasks[].windows.skipped` 的 rest 是 `windows.skipped`
-      expect(TASK_KEYS, `run 图例键 ${k} 不在任务条目里`).toContain(rest.split('.')[0])
+      // 数组元素级路径（`tasks[].gaps[].range`）的第一段带 `[]`，先剥掉再比
+      expect(TASK_KEYS, `run 图例键 ${k} 不在任务条目里`).toContain(rest.split('.')[0]!.replace(/\[\]$/, ''))
     }
     // status / verify 不在这里核对 —— 这两个命令的 data 是 `{tasks:[…]}`，图例键是
     // 指向输出的**路径**（`tasks[].x`），必须拿**真跑出来的输出**逐条解析（下面的
@@ -236,6 +237,58 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     for (const k of Object.keys(verifyFieldNotes())) {
       expect(hasPath(data(), k), `verify 图例键 ${k} 在真实输出上不可解析`).toBe(true)
     }
+  })
+
+  it('watermark 与 resolved_range 是同一时刻的两种写法 —— 图例必须点破，字符串比较是错的', async () => {
+    // 2026-10-28 实测（真库）：同一任务条目里
+    //   watermark      = "2025-10-09T08:53:20.000Z"      （UTC Z，引擎写库原样）
+    //   resolved_range = ["2025-10-07T16:00:00+08:00", "2025-10-09T16:53:20+08:00"]
+    // 两者末端是同一瞬间，但字符串比较给出 "08:53…Z" < "16:53…+08:00" —— 相反结论。
+    const s = await fresh()
+    const end = Date.UTC(2025, 9, 9, 8, 53, 20)
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', new Date(end).toISOString(),
+        { start: end - 2 * DAY, end }, new Date(end + 300_000).toISOString())
+    })
+    await s.close()
+    out = ''
+    expect(await syncCommand(['status', 'dim.staff', '--db', db])).toBe(0)
+    const t = tasks()[0]!
+    // 事实：两种写法、同一时刻
+    expect(t.watermark, 'watermark 是 UTC Z 形态').toBe('2025-10-09T08:53:20.000Z')
+    const rr = t.resolved_range as [string, string]
+    expect(rr[1], 'resolved_range 末端是 +08:00 形态').toBe('2025-10-09T16:53:20+08:00')
+    expect(new Date(t.watermark as string).getTime(), '两者是同一时刻')
+      .toBe(new Date(rr[1]).getTime())
+    expect((t.watermark as string) < rr[1], '字符串比较会给出错误结论（这正是图例要警告的）').toBe(true)
+    // 图例必须写出来：形态不同 + 不要按字符串比较
+    const note = statusFieldNotes()['tasks[].watermark']!
+    expect(note, '必须点明 watermark 是 UTC Z 形态').toContain('UTC `Z`')
+    expect(note, '必须点明与 resolved_range 写法不同').toContain('写法不同')
+    expect(note, '必须警告字符串比较会得相反结论').toContain('字符串比较')
+    // last_synced_at 同样要说清与 watermark 是两个量
+    const lsNote = statusFieldNotes()['tasks[].last_synced_at']!
+    expect(lsNote, 'last_synced_at 必须与 watermark 区分').toContain('两个不同的量')
+    // ⚠️ 2026-10-28 真库实测推翻了早前的「失败轮不更新它」：中窗失败（1、3 成，2 败）
+    // → run status=partial 而 last_synced_at 已是本轮时钟值（引擎按成功窗推进写它）。
+    expect(lsNote, 'last_synced_at 必须说明 partial 轮照样更新').toContain('partial')
+    expect(lsNote, '不得再声称「失败轮不更新」—— 对 partial 轮是错的').not.toContain('失败轮不更新')
+    // watermark 的共用释义只许点名 resolved_range（两命令同为 +08:00）；
+    // gaps[].range 两命令形态不同，由各命令自己的图例承担（CodeRabbit 2026-10-28）。
+    expect(note, 'watermark 的共用释义不得声称 gaps[].range 是 +08:00').not.toContain('gaps[].range')
+    expect(runFieldNotes()['tasks[].gaps[].range']!, 'run 的缺口区间必须自称 +08:00').toContain('+08:00')
+    expect(statusFieldNotes()['tasks[].gaps[].range']!, 'status 的缺口区间必须自称 epoch 毫秒').toContain('epoch 毫秒')
+    // run 与 status 共用同一段释义（同一份 sync_state 列，形态必然相同）
+    expect(runFieldNotes()['tasks[].watermark'], 'run 与 status 的 watermark 释义同源')
+      .toBe(note)
+    // sync tasks 的 watermark 是对象（另一个命令里的同名字段形状不同）
+    expect(tasksFieldNotes()['tasks[].watermark.field'], '必须点明同名不同形')
+      .toContain('形状随命令不同')
+    // ⚠️ CodeRabbit 2026-10-28 复核：run/status 的 watermark **可以是 null**（从未成功
+    // 推进），描述成「是字符串」会让消费者直接对它做字符串操作。两处都要写明。
+    expect(tasksFieldNotes()['tasks[].watermark.field']!, '必须写明 run/status 侧可为 null')
+      .toContain('字符串或 null')
+    expect(note, 'WATERMARK_NOTE 必须写明 null 的含义').toContain('null = ')
   })
 
   it('图例的「字面与事实相反」警告真的写出来了（这是本轮缺陷的核心）', () => {
@@ -461,6 +514,92 @@ describe('两条反直觉事实的真库实测（图例的字面结论靠它成�
     expect(tk.watermark, '但 watermark 保留上一轮的值 —— 所以 pending ≠ 从未同步过')
       .toBe('1970-01-04T00:00:00.000Z')
     expect(tk.last_synced_at, 'last_synced_at 同样保留').not.toBeNull()
+  })
+
+  it('中窗失败的 partial 轮照样写 last_synced_at —— 图例的「失败轮不更新」是错的（2026-10-28 实测）', async () => {
+    // CodeRabbit 2026-10-28 指出：一轮里某个窗口成功推了水位、另一个窗口失败，
+    // 整轮报 partial —— 那一轮**已经更新**了 last_synced_at。图例早前写的是
+    // 「失败轮不更新它」，与引擎事实相反（engine.ts commitWindow 在每个带水位写入的
+    // 成功窗里调 advanceWatermark，写入的就是 now）。
+    // 这条同时钉住第二个细节：last_synced_at 是**末个成功窗**的提交时刻，可能晚于
+    // 水位实际前进的时刻（断链后水位冻结在首窗末端，但后续成功窗仍刷新它）。
+    const store = await fresh()
+    let tick = 1_700_000_000_000
+    let n = 0
+    const t = threeWindowTask(async () => {
+      n++
+      tick += 100_000 // 每次 fetch 推进时钟，三个窗的提交时刻各不相同
+      if (n === 2) throw new Error('中窗炸')
+      return row(String(n))
+    })
+    const runCtx: RunCtx = { store, credentials: { appKey: 'k', appSecret: 's' },
+      gate: new RateGate(store, () => 0), clock: () => tick, rangeOverride: { start: 0, end: 3 * DAY } }
+    const r = await runTask(t, runCtx)
+    const st = await readWatermark(store, 'reports.overview')
+    await store.close()
+
+    expect(r.status, '整轮报 partial').toBe('partial')
+    expect(r.windows.succeeded).toBe(2)
+    // 水位冻结在首窗末端（DAY）—— 失败窗之后的成功窗不推进水位
+    expect(st.watermark, '断链水位冻结在首窗末端').toBe('1970-01-02T00:00:00.000Z')
+    // 但 last_synced_at 是末窗（第 3 窗）的提交时刻：第 1 窗 22:15:00Z、第 3 窗 22:18:20Z
+    expect(st.lastSyncedAt, 'partial 轮也写了 last_synced_at，且取末个成功窗的时刻')
+      .toBe('2023-11-14T22:18:20.000Z')
+    expect(new Date(st.lastSyncedAt!).getTime(), '实证：它晚于水位实际前进的时刻')
+      .toBeGreaterThan(new Date(st.watermark!).getTime())
+    expect(st.rangeStatus, '成功窗把 range_status 也写成 complete').toBe('complete')
+    // 图例必须与这条实测一致：不能说「失败轮不更新」，且要点破「可能晚于水位前进」
+    const lsNote = statusFieldNotes()['tasks[].last_synced_at']!
+    expect(lsNote, '必须点明 partial 轮照样更新').toContain('partial')
+    expect(lsNote, '不得再声称「失败轮不更新」').not.toContain('失败轮不更新')
+    expect(lsNote, '必须点破「可能晚于水位实际前进的时刻」').toContain('晚于水位实际前进')
+  })
+
+  it('gaps[].range 的形态随命令不同：run 是 +08:00 ISO、status 是 epoch 毫秒原样（图例分开说）', async () => {
+    // CodeRabbit 2026-10-28：共用释义一度声称「resolved_range / gaps[].range 都是 +08:00」，
+    // 而 status 的 gaps[].range 原样回显 sync_gaps 的存储值（毫秒字符串）。这条把
+    // 两个命令的真实形态都钉住，防止共用一段话说谎。
+    // —— run 侧：生产构造函数 taskOut 把引擎的毫秒串格式化成 +08:00
+    const runOut = taskOut({
+      taskId: 'reports.overview', status: 'partial',
+      windows: { total: 1, succeeded: 0, failed: 1, skipped: 0 },
+      rows: { fetched: 0, written: 0 }, resolvedRange: { start: 0, end: DAY },
+      gaps: [{ rangeStart: '0', rangeEnd: String(DAY), reason: 'fetch_failed', detail: 'x' }],
+    }, null, null)
+    const runGap = (runOut.gaps as unknown as Array<{ range: [string, string] }>)[0]!
+    expect(runGap.range, 'run 的缺口区间已格式化')
+      .toEqual(['1970-01-01T08:00:00+08:00', '1970-01-02T08:00:00+08:00'])
+
+    // —— status 侧：原样回显存储值
+    const store = await fresh()
+    await store.transaction(async (tx) => {
+      await markPending(tx, 'reports.overview')
+      await recordGap(tx, 'reports.overview', '0', String(DAY), 'fetch_failed', 'x', { now: () => 0 })
+    })
+    await store.close()
+    out = ''
+    expect(await syncCommand(['status', 'reports.overview', '--db', db])).toBe(0)
+    const g = (tasks()[0]!.gaps as Array<{ range: [string, string] }>)[0]!
+    expect(g.range, 'status 的缺口区间是 epoch 毫秒原样').toEqual(['0', String(DAY)])
+
+    // 图例必须各说各的形态，且共用段不得声称 gaps 是 +08:00
+    expect(runFieldNotes()['tasks[].gaps[].range']!, 'run 图例自称 +08:00').toContain('+08:00')
+    expect(runFieldNotes()['tasks[].gaps[].range']!, 'run 图例必须点破 status 的同名字段不同形态')
+      .toContain('sync status')
+    expect(statusFieldNotes()['tasks[].gaps[].range']!, 'status 图例自称 epoch 毫秒').toContain('epoch 毫秒')
+    expect(statusFieldNotes()['tasks[].watermark']!, '共用段不得声称 gaps[].range 是 +08:00')
+      .not.toContain('gaps[].range')
+    // README 的同一段也必须改过来（人读版与图例同一事实；CodeRabbit 2026-10-28 指的正是它）
+    const md = read('README.md')
+    const paraStart = md.indexOf('`watermark` / `last_synced_at` 是 UTC `Z` 形态')
+    expect(paraStart, 'README 缺 watermark / last_synced_at 形态段').toBeGreaterThan(-1)
+    const paraEnd = md.indexOf('\n\n', paraStart)
+    expect(paraEnd, '段落结束边界').toBeGreaterThan(paraStart)
+    const para = md.slice(paraStart, paraEnd)
+    expect(para, 'README 不得再声称「失败轮不更新」').not.toContain('失败轮不更新')
+    expect(para, 'README 必须点明 partial 轮照样更新').toContain('partial')
+    expect(para, 'README 必须点破「可能晚于水位实际前进的时刻」').toContain('晚于水位实际前进')
+    expect(para, 'README 必须点破 status 的 gaps[].range 形态不同').toContain('gaps[].range')
   })
 
   it('残留写者章 → locked:true，而 verify 仍报一致（「不是正在同步中」的实证）', async () => {
