@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, r
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { authCommand } from '../../src/commands/auth.js'
+import { fileCredentials } from '../../src/core/config.js'
 
 let out = ''
 // ⚠️ stderr 也统一捕获（2026-10-05 加）—— 与 api/cli 两个测试文件一致。
@@ -11,6 +12,15 @@ let out = ''
 let err = ''
 let home = ''
 const cfgPath = (): string => join(home, '.config', 'qiyu', 'config.json')
+
+/**
+ * API 侧解出的档名（`fileCredentials` 与 api/sync 的凭证路径同源）。
+ * 用来断言「写凭证的命令」与「读凭证的命令」对同一份配置解出同一个档。
+ */
+const fileCredentialsForTest = (): { profileName: string; hasCreds: boolean } => {
+  const r = fileCredentials(cfgPath())
+  return { profileName: r.profileName, hasCreds: r.creds !== undefined }
+}
 
 /** 写配置文件并把权限收紧到 0600（含凭证的文件权限过宽会被拒绝，见 checkPermissions）。 */
 function writeCfg(obj: unknown, mode = 0o600): string {
@@ -344,6 +354,58 @@ describe('auth login', () => {
     expect(JSON.parse(out).error.message).toMatch(/QIYU_APP_KEY/)
     // 什么都没写出去
     expect(existsSync(cfgPath())).toBe(false)
+  })
+})
+
+describe('空串档名：读写两个方向必须解出同一个档（2026-10-29 实测缺陷）', () => {
+  // ⚠️ 缺陷实证：`whoami` 与 `login` 各自用 `??` 链解档名，而 `''` 不是 null/undefined、
+  // `??` 会把它放行。后果（两条都在真库上复现过）：
+  //   ① `"defaultProfile": ""`（JSON 里清空字段）→ `login` 把凭证写进 `profiles[""]`，
+  //      而 store / api / sync 按内置 `default` 读：login 与 whoami 都报 configured: true，
+  //      第一次真实调用却报「缺少 appKey」—— 凭证写进了**没人读的档**；
+  //   ② `QIYU_PROFILE=`（变量未设的典型形态）→ `whoami` 选中空串档报 auth_missing，
+  //      而 `api call` 照样从 `defaultProfile` 的档读到凭证并发出请求 ——
+  //      同一台机器上两个命令给出相反的「凭证有没有配」。
+  it('QIYU_PROFILE= 时 whoami 的档名与 fileCredentials 一致（env 空串视为未设置）', async () => {
+    writeCfg({ defaultProfile: 'prod', profiles: {
+      prod: { credentials: { appKey: 'fk', appSecret: 'fs' }, robots: { '7': '丙' } },
+      '': { credentials: { appKey: 'ek', appSecret: 'es' } },
+    } })
+    vi.stubEnv('QIYU_PROFILE', '')
+    expect(await authCommand(['whoami'])).toBe(0)
+    const d = JSON.parse(out).data
+    // 修复前这里报 auth_missing（选中了 '' 档）或报 profile: ''
+    expect(d.profile, '空串当未设置 → 落到 defaultProfile 的 prod').toBe('prod')
+    // 与 API 侧（fileCredentials）解出的档名必须一致
+    expect(fileCredentialsForTest().profileName).toBe('prod')
+    // robots 也来自同一档（'' 档没有 robots，选错档会得到空数组）
+    expect(d.robots).toEqual([{ id: 7, name: '丙' }])
+  })
+
+  it('"defaultProfile": "" 时 login 写进内置 default，而不是一个名叫空串的档', async () => {
+    writeCfg({ defaultProfile: '', profiles: { prod: { store: { batchSize: 250 } } } })
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    expect(await authCommand(['login'])).toBe(0)
+    expect(JSON.parse(out).data.profile, '空串当未设置 → 内置 default').toBe('default')
+    const written = JSON.parse(readFileSync(cfgPath(), 'utf8'))
+    expect(Object.keys(written.profiles).sort(), '不得创建空的档名').toEqual(['default', 'prod'])
+    // 别的命令按 default 读得到它 —— 写与读解出同一个档
+    expect(written.profiles.default.credentials).toEqual({ appKey: 'k', appSecret: 's' })
+    expect(fileCredentialsForTest().profileName).toBe('default')
+  })
+
+  it('whoami 的 field_notes.profile 点破「档名不保证存在」与 robots 空数组的第二种成因', async () => {
+    // ⚠️ env 给了一个配置文件里没有的名字时：whoami 照样报 configured（env 凭证齐备），
+    // 而 store/db/sync/query 对同一个名字以退出码 2 拒绝（它们要读该档的 store 块）。
+    // 图例必须点破这条路，否则 Agent 会把 whoami 的 profile 当成「档存在」的证据。
+    writeCfg({ profiles: { prod: {} } })
+    vi.stubEnv('QIYU_PROFILE', 'typo')
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    expect(await authCommand(['whoami'])).toBe(0)
+    const notes = JSON.parse(out).meta.field_notes
+    expect(notes.profile, 'profile 必须点明不保证存在').toContain('不保证该档在配置文件里存在')
+    expect(notes.profile, 'profile 必须给出完整选择顺序').toContain('QIYU_PROFILE')
+    expect(notes.robots, 'robots 必须点出空数组的第二种成因').toContain('根本不存在')
   })
 })
 

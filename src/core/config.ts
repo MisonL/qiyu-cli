@@ -261,6 +261,47 @@ export interface FileProfileResult {
   warn?: string
 }
 
+/** `resolveProfileName` 的结果：生效的档名 + 是谁点名的（无人点名时 `source` 为 undefined）。 */
+export interface ProfileNameChoice {
+  name: string
+  source?: '--profile' | 'QIYU_PROFILE' | 'defaultProfile'
+}
+
+/**
+ * profile 名的**唯一解析点**：`--profile` > `QIYU_PROFILE` > `defaultProfile` > 内置 `default`。
+ *
+ * ⚠️ 空串一律当**未设置**：`export QIYU_PROFILE=`（变量未设的典型形态）与
+ * `"defaultProfile": ""`（JSON 里清空字段）都不该选中一个名叫空串的档。
+ *
+ * ⚠️ **为什么必须只有一处**（2026-10-29 真库实测）：`auth whoami` 与 `auth login` 曾各自
+ * 用 `??` 链重写了一遍，而 `''` 不是 null/undefined、`??` 会把它放行 —— 于是同一份配置
+ * 在不同命令上解出两个档名：
+ *   · `"defaultProfile": ""` 时 `auth login` 把凭证写进 `profiles[""]`，而 `api call` /
+ *     `store` / `sync` 按 `default` 读 —— login 报 `configured: true`、whoami 也报
+ *     `configured: true`，可第一次真实调用报 `缺少 appKey`（凭证写进了没人读的档）；
+ *   · `QIYU_PROFILE=` 时 `auth whoami` 选中空串档 → 报 `auth_missing`，而 `api call`
+ *     照样从 `defaultProfile` 的档里读到凭证并发出请求 —— 同一台机器上两个命令给出
+ *     相反的"凭证有没有配"。
+ * README「配置文件」一节的空串口径（`QIYU_PROFILE=` 与 `"defaultProfile": ""` 视为未设置）
+ * 就是本函数的规格；四个调用点（fileProfile / resolveStoreConfig / whoami / login）共用它，
+ * 不得再各自写 `??` 链。
+ */
+export function resolveProfileName(opts: {
+  flag?: string | undefined
+  envProfile?: string | undefined
+  defaultProfile?: string | undefined
+} = {}): ProfileNameChoice {
+  const nonEmpty = (v: string | undefined): string | undefined =>
+    v !== undefined && v !== '' ? v : undefined
+  const flag = nonEmpty(opts.flag)
+  if (flag !== undefined) return { name: flag, source: '--profile' }
+  const env = nonEmpty(opts.envProfile)
+  if (env !== undefined) return { name: env, source: 'QIYU_PROFILE' }
+  const def = nonEmpty(opts.defaultProfile)
+  if (def !== undefined) return { name: def, source: 'defaultProfile' }
+  return { name: 'default' }
+}
+
 /**
  * 读配置里某个 profile 的块（G1：凭证与 robots 都从这里取）。
  *
@@ -278,17 +319,14 @@ export function fileProfile(
   try {
     file = loadConfigChecked(configPath).file
   } catch (e) {
-    // ⚠️ 空串当未设置：`export QIYU_PROFILE=`（变量未设的典型形态）不该选中
-    // 一个名叫 '' 的 profile —— 与凭证侧「空串视为缺失」同一口径。
-    const name = envProfile !== undefined && envProfile !== '' ? envProfile : 'default'
+    // 配置读不出来时只能按 env 判档名（defaultProfile 也读不到）—— 空串口径与下面同源。
+    const name = resolveProfileName({ envProfile }).name
     // 权限拒绝带 kind（`config_insecure`）→ 致命；畸形配置无 kind → 非致命。
     return (e as { kind?: string }).kind !== undefined
       ? { profileName: name, fatal: e }
       : { profileName: name, warn: (e as Error).message }
   }
-  const profileName = envProfile !== undefined && envProfile !== '' ? envProfile
-    : file.defaultProfile !== undefined && file.defaultProfile !== '' ? file.defaultProfile
-    : 'default'
+  const profileName = resolveProfileName({ envProfile, defaultProfile: file.defaultProfile }).name
   const profile = file.profiles[profileName]
   return profile === undefined ? { profileName } : { profileName, profile }
 }
