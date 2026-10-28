@@ -238,6 +238,45 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     }
   })
 
+  it('watermark 与 resolved_range 是同一时刻的两种写法 —— 图例必须点破，字符串比较是错的', async () => {
+    // 2026-10-28 实测（真库）：同一任务条目里
+    //   watermark      = "2025-10-09T08:53:20.000Z"      （UTC Z，引擎写库原样）
+    //   resolved_range = ["2025-10-07T16:00:00+08:00", "2025-10-09T16:53:20+08:00"]
+    // 两者末端是同一瞬间，但字符串比较给出 "08:53…Z" < "16:53…+08:00" —— 相反结论。
+    const s = await fresh()
+    const end = Date.UTC(2025, 9, 9, 8, 53, 20)
+    await s.transaction(async (tx) => {
+      await advanceWatermark(tx, 'dim.staff', new Date(end).toISOString(),
+        { start: end - 2 * DAY, end }, new Date(end + 300_000).toISOString())
+    })
+    await s.close()
+    out = ''
+    expect(await syncCommand(['status', 'dim.staff', '--db', db])).toBe(0)
+    const t = tasks()[0]!
+    // 事实：两种写法、同一时刻
+    expect(t.watermark, 'watermark 是 UTC Z 形态').toBe('2025-10-09T08:53:20.000Z')
+    const rr = t.resolved_range as [string, string]
+    expect(rr[1], 'resolved_range 末端是 +08:00 形态').toBe('2025-10-09T16:53:20+08:00')
+    expect(new Date(t.watermark as string).getTime(), '两者是同一时刻')
+      .toBe(new Date(rr[1]).getTime())
+    expect((t.watermark as string) < rr[1], '字符串比较会给出错误结论（这正是图例要警告的）').toBe(true)
+    // 图例必须写出来：形态不同 + 不要按字符串比较
+    const note = statusFieldNotes()['tasks[].watermark']!
+    expect(note, '必须点明 watermark 是 UTC Z 形态').toContain('UTC `Z`')
+    expect(note, '必须点明与 resolved_range 写法不同').toContain('写法不同')
+    expect(note, '必须警告字符串比较会得相反结论').toContain('字符串比较')
+    // last_synced_at 同样要说清与 watermark 是两个量
+    const lsNote = statusFieldNotes()['tasks[].last_synced_at']!
+    expect(lsNote, 'last_synced_at 必须与 watermark 区分').toContain('两个不同的量')
+    expect(lsNote, 'last_synced_at 必须说明失败轮不更新').toContain('失败轮不更新')
+    // run 与 status 共用同一段释义（同一份 sync_state 列，形态必然相同）
+    expect(runFieldNotes()['tasks[].watermark'], 'run 与 status 的 watermark 释义同源')
+      .toBe(note)
+    // sync tasks 的 watermark 是对象（另一个命令里的同名字段形状不同）
+    expect(tasksFieldNotes()['tasks[].watermark.field'], '必须点明同名不同形')
+      .toContain('形状随命令不同')
+  })
+
   it('图例的「字面与事实相反」警告真的写出来了（这是本轮缺陷的核心）', () => {
     // ⚠️ 只钉「不代表 XX」是不够的 —— 那句话可以是空话。必须钉住**机制**：
     // 为什么 pending 时表里有数据（后续成功窗照常落库、只是不推水位）、

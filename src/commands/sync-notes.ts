@@ -71,6 +71,25 @@ export const RUN_STATUS_NOTES = {
     + ' partial（见上一条）',
 } satisfies Record<RunStatus, string>
 
+/**
+ * `watermark` / `last_synced_at` 的释义（run 与 status 共用 —— 两个命令的这两列
+ * 直接取自 `sync_state`，形态完全相同）。
+ *
+ * ⚠️ 必须点名**时间形态与相邻字段不一致**（2026-10-28 实测）：同一任务条目里
+ * `resolved_range` / `gaps[].range` 是 `+08:00` 形态，而 `watermark` 与
+ * `last_synced_at` 是引擎写库时的 **UTC `Z`** 形态。两者可以表示**同一时刻**：
+ * 实测 `watermark: "2025-10-09T08:53:20.000Z"` 与
+ * `resolved_range[1]: "2025-10-09T16:53:20+08:00"` 是同一瞬间。
+ * 按字符串比较会得出相反结论（`"08:…Z" < "16:…+08:00"`），必须先解析成时刻再比。
+ */
+const WATERMARK_NOTE = '上次成功推进到的时间点（引擎写库的原样字符串，UTC `Z` 形态）。'
+  + '⚠️ 与同一行里的 resolved_range / gaps[].range（`+08:00` 形态）写法不同：'
+  + '两者可以是同一时刻，直接按字符串比较会得出相反结论 —— 先解析成时刻再比。'
+  + 'null = 从未成功推进（或 v9 之前的旧记录）'
+const LAST_SYNCED_AT_NOTE = '上次成功推进的运行时刻（UTC `Z` 形态）。'
+  + '⚠️ 与 watermark 是两个不同的量：watermark 是「数据覆盖到哪」，它是「那轮什么时候跑的」。'
+  + '失败轮不更新它（保留上一轮成功的值）；与 resolved_range 一样是 `Z` / `+08:00` 两种写法并存'
+
 /** `sync run` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
 export function runFieldNotes(): Record<string, string> {
   return {
@@ -83,6 +102,8 @@ export function runFieldNotes(): Record<string, string> {
       + '评估真实覆盖要看 end 与 windows.skipped，不要只看 start',
     'tasks[].gaps': '本轮失败/提示的缺口逐条记录（reason 取值见 README 图例）。'
       + 'gaps 非空不等于同步失败：后四个 reason 是成功窗上的业务提示',
+    'tasks[].watermark': WATERMARK_NOTE,
+    'tasks[].last_synced_at': LAST_SYNCED_AT_NOTE,
     truncated: '恒为 false —— sync run 不按 --limit 截断任务列表（这是与 query 的同名字段'
       + '语义不同之处，那边才是「只拿到截断样本」）',
   }
@@ -98,7 +119,10 @@ export function runFieldNotes(): Record<string, string> {
  */
 export function statusFieldNotes(): Record<string, string> {
   return {
+    'tasks[].task': '任务 id（与 `sync tasks` 的 id 同源，用它对上任务）',
     'tasks[].range_status': renderNotes(RANGE_STATUS_NOTES),
+    'tasks[].watermark': WATERMARK_NOTE,
+    'tasks[].last_synced_at': LAST_SYNCED_AT_NOTE,
     'tasks[].locked': 'true = sync_state 里有残留的写者章（上一轮运行被强杀，来不及清）。'
       + '⚠️ 这不是「正在同步中」：真正持有写锁的进程会让本命令先退避等待'
       + '（readOnlyRetryMs，默认 30 秒）——等到了说明那一轮已结束、章也清了（返回 false），'
@@ -112,6 +136,8 @@ export function statusFieldNotes(): Record<string, string> {
     'tasks[].gaps[].reason': '取值与动作见 README 的 gaps 图例（与 sync run 的 gaps[].reason 同一组值）',
     'tasks[].gaps[].range': '原样回显 sync_gaps 的存储值（epoch 毫秒字符串），不是 run 输出的'
       + ' +08:00 ISO 形态 —— 要比较请先按同一形态解析',
+    'tasks[].gaps_count': '`gaps` 数组的长度快照（既有消费者用）。与 `gaps` 恒等 —— '
+      + '不确定就用 `gaps.length`，不要把它当成「当前仍缺的条数」',
     'tasks[].resolved_range': '上次成功推进的水位区间。⚠️ start 是水位起点语义、含可能被跳过的首残段'
       + '前缀（实测：日对齐任务从非日界起点跑 → skipped=2 而 start 仍等于请求起点），'
       + '所以它不是「已覆盖」的保证；本命令不输出 windows.skipped，判实际覆盖要看 '
@@ -127,6 +153,9 @@ export function statusFieldNotes(): Record<string, string> {
  */
 export function verifyFieldNotes(): Record<string, string> {
   return {
+    'tasks[].task': '任务 id（与 `sync tasks` 的 id 同源）',
+    'tasks[].local_rows': '本地表的行数（COUNT(*)。与 run/status 都不同 —— 那两个命令不报本地行数）。'
+      + '⚠️ 它是当前行数：与上游不符只说明数量对不上，不说明哪几行错了（row-level 差异不做）',
     'tasks[].state_windows_consistent': 'true = sync_state 记录为「水位已推进且 range_status=complete」。'
       + '⚠️ 这不代表数据完整；drift 为空 / 退出码 0 同样不能当完整性证据 —— '
       + '对 windowed 任务本命令只核对同步状态记录（实测中窗失败的库同样给 drift: [] 且'
@@ -149,6 +178,10 @@ export function tasksFieldNotes(): Record<string, string> {
       + '⚠️ 读 verify 的输出前必须先看它：只有 snapshot 的 expected_from_api 有意义',
     unsupported: '明确不做同步的数据集及原因（不是遗漏）。目前唯一取值 realtime = '
       + '实时快照，数据随推随逝、不可回放——这类数据只能走 api call 实时取，别去 sync run 里找',
+    'tasks[].watermark.field': '水位取自哪一列（任务声明的时间列名）。'
+      + '⚠️ 本命令的 `watermark` 是对象 `{field, initial}`，而 `sync run` / `sync status` 的'
+      + ' `tasks[].watermark` 是字符串（上次推进到的时刻，UTC `Z`）—— 同名字段形状随命令不同，'
+      + '不要把这里的对象当成水位值',
     'tasks[].watermark.initial': '恒为 null —— 全部 21 个任务都没有声明初始水位'
       + '（首跑从 0 或 --since 起；声明了 windowStartFloorDays 的任务还会被抬到'
       + ' now − N 天，因为接口物理上给不出更早的数据）。看到非 null 才需要按它解释续跑起点',

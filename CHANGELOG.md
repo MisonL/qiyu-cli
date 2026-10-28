@@ -9,6 +9,21 @@
 
 ### 修复
 
+- **`sync run` / `sync status` 的 `watermark` / `last_synced_at` 没有释义，而它们是 UTC `Z`
+  形态、与同一行里的 `resolved_range`（`+08:00`）写法不同**。2026-10-28 真库实测：同一任务
+  条目里 `watermark: "2025-10-09T08:53:20.000Z"` 与
+  `resolved_range[1]: "2025-10-09T16:53:20+08:00"` 是**同一瞬间**，而字符串比较给出
+  `"08:53…Z" < "16:53…+08:00"` —— 相反结论。Agent 拿它判「同步到哪了」会判错方向。
+  同轮补齐的还有：`sync status` 的 `tasks[].task` / `tasks[].gaps_count`、
+  `sync verify` 的 `tasks[].task` / `tasks[].local_rows`（后者的「当前行数」语义与
+  run/status 都不同）、`sync tasks` 的 `tasks[].watermark.field`（同一字段在三个命令里
+  形状不同：这里是 `{field, initial}` 对象，run/status 是字符串）。
+  修法：`WATERMARK_NOTE` / `LAST_SYNCED_AT_NOTE` 两个常量由 run 与 status 共用（同一份
+  `sync_state` 列，形态必然相同）。
+  测试：`tests/sync-state-legends.test.ts` 新增一条真库用例 —— 断言两种写法确实是同一时刻、
+  断言字符串比较确实是错的（把图例的警告钉在实测事实而非措辞上），并钉住 run 与 status
+  的释义同源、`sync tasks` 的同名字段形状不同。变异 6 条全红。
+
 - **`api schema` 的图例键 `auto` 指向一个不存在的顶层字段（真实字段在 `params[].auto`）**。
   2026-10-28 实测：`qiyu api schema ticket.search` 的 `data.auto` 是 `undefined`，
   而 `data.params[0].auto === true`。图例的键是**路径**：写成顶层裸名 = 指一个 Agent
