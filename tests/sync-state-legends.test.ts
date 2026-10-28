@@ -114,7 +114,15 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     expect(legend).toContain('`null`')
     const runStart = md.indexOf('**`tasks[].status` 的三个取值**')
     expect(runStart, 'README 缺 tasks[].status 图例段').toBeGreaterThan(-1)
-    const runLegend = md.slice(runStart, md.indexOf('`sync status` 每任务输出', runStart))
+    // ⚠️ 结束边界必须是**稳的**锚，且找到与否要显式断言（CodeRabbit 2026-10-28）：
+    // 此前锚在上文那句「`sync status` 每任务输出」上，而同一 PR 把该句改成了
+    // 「`sync status` 的 `data` 是 `{tasks:[…]}`」—— `indexOf` 返回 -1，
+    // `slice(runStart, -1)` 把 README 剩下的全文都吞进来，于是 run 表删掉一行
+    // 也照样能找到取值（range_status 的表在后面顶着）。锚在下一个**小节标题**上，
+    // 并断言 end > runStart，才不会再出现「找不到边界 → 悄悄放宽」。
+    const runEnd = md.indexOf('**`range_status` 的取值**', runStart)
+    expect(runEnd, 'README 缺 range_status 小节（run 图例的结束边界）').toBeGreaterThan(runStart)
+    const runLegend = md.slice(runStart, runEnd)
     for (const v of RUN_STATUSES) expect(runLegend, `README 缺 run status ${v}`).toContain(`\`${v}\``)
   })
 
