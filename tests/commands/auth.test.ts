@@ -407,6 +407,27 @@ describe('空串档名：读写两个方向必须解出同一个档（2026-10-29
     expect(notes.profile, 'profile 必须给出完整选择顺序').toContain('QIYU_PROFILE')
     expect(notes.robots, 'robots 必须点出空数组的第二种成因').toContain('根本不存在')
   })
+
+  it('图例里那条「store/db/sync/query 会退出码 2 拒绝」带成立条件（profiles 非空才拒）', async () => {
+    // ⚠️ CodeRabbit 2026-10-29：`resolveStoreConfig` 只在 `profiles` **非空**时校验
+    // 「点名的档必须存在」（profiles 为空 = 首次运行，按内置默认路径照常工作）。
+    // 图例写成无条件的「会以退出码 2 拒绝」就是谎报 —— 这里把条件的两个方向都钉住：
+    // 同一份 QIYU_PROFILE=typo，profiles 非空时被拒、为空时不被拒。
+    writeCfg({ profiles: { prod: {} } })
+    vi.stubEnv('QIYU_PROFILE', 'typo')
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    expect(await authCommand(['whoami'])).toBe(0)
+    const notes = JSON.parse(out).meta.field_notes
+    expect(notes.profile, '必须写出「已有其它档」这个成立条件').toContain('已有其它档')
+    expect(notes.profile, '必须写出 profiles 为空时的相反行为').toContain('profiles 为空')
+    // 事实侧：同一档名，profiles 非空 → store 命令拒绝；profiles 为空 → 不拒绝
+    const { resolveStoreConfig } = await import('../../src/store/config.js')
+    expect(() => resolveStoreConfig({ home, env: { QIYU_PROFILE: 'typo', QIYU_DB_PATH: join(home, 'a.db') } }),
+      'profiles 非空时点名的档必须存在').toThrow(/没有 profile/)
+    writeCfg({ profiles: {} })
+    expect(() => resolveStoreConfig({ home, env: { QIYU_PROFILE: 'typo', QIYU_DB_PATH: join(home, 'a.db') } }),
+      'profiles 为空时不校验（首次运行回落）').not.toThrow()
+  })
 })
 
 describe('auth 已挂载到入口', () => {

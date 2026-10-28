@@ -162,9 +162,10 @@ appSecret 对同机其他用户可读。不读配置的命令（`--version`、`a
 >
 > `whoami` 输出的 `profile` 是**本次解析出的档名**（顺序同上：`QIYU_PROFILE` > `defaultProfile` >
 > 内置 `default`，空串一律视为未设置）。⚠️ 它**不保证该档在配置文件里存在**：环境变量给了一个
-> 配置文件里没有的名字（拼错）时，`whoami` 照样按 env 凭证报 `configured: true`，但 `store` /
-> `db` / `sync` / `query` 对同一个名字会以退出码 2 拒绝（它们要读该档的 `store` 块）——
-> 这几条命令才是「档名拼错」的权威判据。
+> 配置文件里没有的名字（拼错）时，`whoami` 照样按 env 凭证报 `configured: true`；而只要配置文件里
+> **已有其它档**，`store` / `db` / `sync` / `query` 对同一个名字会以退出码 2 拒绝（它们要读该档的
+> `store` 块）—— 这几条命令才是「档名拼错」的权威判据（配置文件 `profiles` 为空时它们按内置
+> 默认路径照常工作，不报错）。
 >
 > `whoami` 输出的 `robots` 来自配置里的 `profiles.<name>.robots`（`{"1000001":"机器人A"}` 形态），
 > 同样**未校验有效性**。它是 `sync run` 的兜底来源：`profiles.<name>.store.options.knowledgeRobotIds`

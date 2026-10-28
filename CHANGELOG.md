@@ -23,8 +23,9 @@
   四个调用点（`fileProfile` / `resolveStoreConfig` / `whoami` / `login`）共用它，
   不得再各自写 `??` 链。
   同轮两处相邻缺口：`whoami` 的 `profile` 字段此前**没有释义**（图例只有三个键），
-  补上「这是本命令会去读的档名，不保证该档存在」——env 拼错时 `whoami` 照样报
-  `configured`，而 `store`/`db`/`sync`/`query` 对同一个名字以退出码 2 拒绝；
+  补上「这是本命令会去读的档名，不保证该档存在」—— env 拼错时 `whoami` 照样报
+  `configured`，而**只要配置文件里已有其它档**，`store`/`db`/`sync`/`query` 对同一个
+  名字就以退出码 2 拒绝（`profiles` 为空时它们按内置默认路径照常工作，不报错）；
   `robots` 的释义补上「空数组的第二种成因是该档根本不存在」。
   另修一处调度缺陷：`sync install` 把 `QIYU_PROFILE=` 固化成 `--profile <空>` 烘进
   plist/unit —— 安装期（dry-run 与 `--yes`）一律成功，装完之后**每次调度执行**都因

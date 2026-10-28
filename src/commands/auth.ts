@@ -382,7 +382,9 @@ function whoami(): number {
         + '内置 default（空串一律视为未设置）。'
         + '⚠️ 它只表示「本命令会去读哪个档」，**不保证该档在配置文件里存在** —— 环境变量给了一个'
         + '配置文件里没有的名字（拼错）时，本命令照样按 env 凭证报 configured，但这时 robots 必为空，'
-        + '且 store / db / sync / query 对同一个名字会以退出码 2 拒绝（它们要读该档的 store 块）',
+        + '且只要配置文件里**已有其它档**，store / db / sync / query 对同一个名字就会以退出码 2 拒绝'
+        + '（它们要读该档的 store 块）。注意后者的成立条件是「已有其它档」：配置文件的 profiles 为空时'
+        + '它们按内置默认路径照常工作，不报错',
       robots: '来自配置文件的 profiles.<name>.robots 映射（robotId → 显示名），**未校验有效性**、' +
         '未与本地库比对；sync run 在 profiles.<name>.store.options.knowledgeRobotIds 缺席时回退使用它。'
         + '⚠️ 空数组有两种成因：该档没配 robots，或该档在配置文件里根本不存在（见 profile 的说明）',
