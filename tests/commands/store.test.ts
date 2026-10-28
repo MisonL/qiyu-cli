@@ -162,6 +162,16 @@ describe('store 命令面与 help', () => {
     expect(out).toMatch(/store init/)
   })
 
+  it('--help 不得声称「CLI 不会自动创建配置文件」—— auth login 会创建它（2026-10-28 实测）', async () => {
+    // 旧文案：「存储配置需手工编辑 ~/.config/qiyu/config.json（CLI 不会自动创建）」。
+    // G1 起 `auth login` 就会创建这个文件（目录 0700、文件 0600，只含 credentials）——
+    // 「CLI 不会创建」已是假话，Agent 会据此以为文件不可能存在、跳过排查。
+    expect(await storeCommand(['--help'])).toBe(0)
+    expect(out, '不能再说 CLI 不会创建配置文件').not.toMatch(/CLI 不会自动创建/)
+    expect(out, '必须点明谁可能创建了它').toMatch(/auth login/)
+    expect(out, '必须说明创建出来的文件不含 store 段').toMatch(/不含 store 段/)
+  })
+
   it('未知参数优先于 help（store --bogus --help → 2）', async () => {
     expect(await storeCommand(['--bogus', '--help'])).toBe(2)
   })

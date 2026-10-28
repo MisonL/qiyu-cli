@@ -36,8 +36,8 @@ const USAGE = `用法：qiyu store <子命令> [参数]
   store status [--db <path>] [--profile <name>] [--backend <name>]
                            查看数据库状态与各表行数
 
-⚠️ 存储配置需手工编辑 ~/.config/qiyu/config.json（CLI 不会自动创建）。
-   也可用 --db / QIYU_DB_PATH 直接指定库路径。
+⚠️ 存储配置仍需手工编辑 ~/.config/qiyu/config.json（store 命令本身不写配置；配置文件可能已
+由 auth login 创建，但只含 credentials 键，不含 store 段）。也可用 --db / QIYU_DB_PATH 直接指定库路径。
 `
 
 const KNOWN = new Set(GLOBAL_FLAG_NAMES)
