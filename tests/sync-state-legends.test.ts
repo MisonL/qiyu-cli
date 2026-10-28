@@ -284,6 +284,11 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     // sync tasks 的 watermark 是对象（另一个命令里的同名字段形状不同）
     expect(tasksFieldNotes()['tasks[].watermark.field'], '必须点明同名不同形')
       .toContain('形状随命令不同')
+    // ⚠️ CodeRabbit 2026-10-28 复核：run/status 的 watermark **可以是 null**（从未成功
+    // 推进），描述成「是字符串」会让消费者直接对它做字符串操作。两处都要写明。
+    expect(tasksFieldNotes()['tasks[].watermark.field']!, '必须写明 run/status 侧可为 null')
+      .toContain('字符串或 null')
+    expect(note, 'WATERMARK_NOTE 必须写明 null 的含义').toContain('null = ')
   })
 
   it('图例的「字面与事实相反」警告真的写出来了（这是本轮缺陷的核心）', () => {

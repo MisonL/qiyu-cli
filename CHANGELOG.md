@@ -33,9 +33,12 @@
   `last_synced_at` 确实被更新且取末个成功窗的时刻（推进时钟，同时断言它晚于水位）、
   两个命令的 `gaps[].range` 形态确实不同（run 侧走生产构造函数 `taskOut`、status 侧真跑
   命令），并钉住 run 与 status 的释义同源、`sync tasks` 的同名字段形状不同。
-  本轮新增/改写的 7 条断言全部做过变异验证（共用释义加回 `gaps[].range` / 恢复
+  本轮新增/改写的 8 条断言全部做过变异验证（共用释义加回 `gaps[].range` / 恢复
   「失败轮不更新」/ run 图例去掉跨命令警告 / README 恢复旧措辞 / status 图例改称
-  `+08:00` / 图例与 README 分别去掉「晚于水位实际前进」，逐一变红）。
+  `+08:00` / 图例与 README 分别去掉「晚于水位实际前进」/ run-status 侧 watermark 的
+  可空性改回「是字符串」，逐一变红）。
+  另有一处同源修正：`sync tasks` 的 `tasks[].watermark.field` 图例把 run/status 侧说成
+  「是字符串」，而它**可以是 `null`**（从未成功推进）—— 改成「字符串或 null」。
 
 - **`api schema` 的图例键 `auto` 指向一个不存在的顶层字段（真实字段在 `params[].auto`）**。
   2026-10-28 实测：`qiyu api schema ticket.search` 的 `data.auto` 是 `undefined`，

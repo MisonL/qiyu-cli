@@ -209,7 +209,8 @@ export function tasksFieldNotes(): Record<string, string> {
       + '实时快照，数据随推随逝、不可回放——这类数据只能走 api call 实时取，别去 sync run 里找',
     'tasks[].watermark.field': '水位取自哪一列（任务声明的时间列名）。'
       + '⚠️ 本命令的 `watermark` 是对象 `{field, initial}`，而 `sync run` / `sync status` 的'
-      + ' `tasks[].watermark` 是字符串（上次推进到的时刻，UTC `Z`）—— 同名字段形状随命令不同，'
+      + ' `tasks[].watermark` 是字符串或 null（上次成功推进到的时刻，UTC `Z`；'
+      + 'null = 从未成功推进）—— 同名字段形状随命令不同，'
       + '不要把这里的对象当成水位值',
     'tasks[].watermark.initial': '恒为 null —— 全部 21 个任务都没有声明初始水位'
       + '（首跑从 0 或 --since 起；声明了 windowStartFloorDays 的任务还会被抬到'
