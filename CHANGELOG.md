@@ -19,10 +19,23 @@
   run/status 都不同）、`sync tasks` 的 `tasks[].watermark.field`（同一字段在三个命令里
   形状不同：这里是 `{field, initial}` 对象，run/status 是字符串）。
   修法：`WATERMARK_NOTE` / `LAST_SYNCED_AT_NOTE` 两个常量由 run 与 status 共用（同一份
-  `sync_state` 列，形态必然相同）。
-  测试：`tests/sync-state-legends.test.ts` 新增一条真库用例 —— 断言两种写法确实是同一时刻、
-  断言字符串比较确实是错的（把图例的警告钉在实测事实而非措辞上），并钉住 run 与 status
-  的释义同源、`sync tasks` 的同名字段形状不同。变异 6 条全红。
+  `sync_state` 列，形态必然相同）。共用释义只点名 `resolved_range`（两个命令里都是
+  `+08:00`）；`gaps[].range` 的形态**随命令不同**（run 格式化成 `+08:00`、status 原样回显
+  epoch 毫秒字符串），由各命令自己的图例承担（CodeRabbit 2026-10-28）。
+  同日真库实测又推翻了一处措辞：`last_synced_at` 早前被写成「失败轮不更新它」，但引擎在
+  每个带水位写入的成功窗里就写它 —— 一轮里部分窗口失败（`status: partial`）时它照样已是
+  末个成功窗的提交时刻。图例改为「按成功窗更新、不按轮」，只有整轮没有任何带水位写入的
+  成功提交才保留上一轮的值。同轮还实测到第二层：断链后的成功窗仍刷新它、而水位冻结在
+  连续成功末端，所以它**可能晚于水位实际前进的时刻**（推进时钟实测同一轮里相差数分钟）——
+  图例与 README 都点破了这一条。
+  测试：`tests/sync-state-legends.test.ts` 新增真库用例 —— 断言两种写法确实是同一时刻、
+  断言字符串比较确实是错的（把图例的警告钉在实测事实而非措辞上），钉住 partial 轮的
+  `last_synced_at` 确实被更新且取末个成功窗的时刻（推进时钟，同时断言它晚于水位）、
+  两个命令的 `gaps[].range` 形态确实不同（run 侧走生产构造函数 `taskOut`、status 侧真跑
+  命令），并钉住 run 与 status 的释义同源、`sync tasks` 的同名字段形状不同。
+  本轮新增/改写的 7 条断言全部做过变异验证（共用释义加回 `gaps[].range` / 恢复
+  「失败轮不更新」/ run 图例去掉跨命令警告 / README 恢复旧措辞 / status 图例改称
+  `+08:00` / 图例与 README 分别去掉「晚于水位实际前进」，逐一变红）。
 
 - **`api schema` 的图例键 `auto` 指向一个不存在的顶层字段（真实字段在 `params[].auto`）**。
   2026-10-28 实测：`qiyu api schema ticket.search` 的 `data.auto` 是 `undefined`，

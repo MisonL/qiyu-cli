@@ -72,23 +72,49 @@ export const RUN_STATUS_NOTES = {
 } satisfies Record<RunStatus, string>
 
 /**
- * `watermark` / `last_synced_at` 的释义（run 与 status 共用 —— 两个命令的这两列
- * 直接取自 `sync_state`，形态完全相同）。
+ * `watermark` 的释义（run 与 status 共用 —— 两个命令的这两列直接取自 `sync_state`，
+ * 形态完全相同）。
  *
  * ⚠️ 必须点名**时间形态与相邻字段不一致**（2026-10-28 实测）：同一任务条目里
- * `resolved_range` / `gaps[].range` 是 `+08:00` 形态，而 `watermark` 与
- * `last_synced_at` 是引擎写库时的 **UTC `Z`** 形态。两者可以表示**同一时刻**：
+ * `resolved_range` 是 `+08:00` 形态，而 `watermark` 与 `last_synced_at` 是
+ * 引擎写库时的 **UTC `Z`** 形态。两者可以表示**同一时刻**：
  * 实测 `watermark: "2025-10-09T08:53:20.000Z"` 与
  * `resolved_range[1]: "2025-10-09T16:53:20+08:00"` 是同一瞬间。
  * 按字符串比较会得出相反结论（`"08:…Z" < "16:…+08:00"`），必须先解析成时刻再比。
+ *
+ * ⚠️ 只点名 `resolved_range`（两个命令里都是 `+08:00`）。**不写 `gaps[].range`**：
+ * 它两个命令形态不同 —— run 格式化成 `+08:00`（sync-run.ts 的 taskOut），status
+ * 原样回显 `sync_gaps` 的 epoch 毫秒字符串（sync.ts 的 gap 组装）。共用一段话就会
+ * 对其中一个说谎（CodeRabbit 2026-10-28）。那半边由各命令自己的
+ * `tasks[].gaps[].range` 图例承担。
  */
 const WATERMARK_NOTE = '上次成功推进到的时间点（引擎写库的原样字符串，UTC `Z` 形态）。'
-  + '⚠️ 与同一行里的 resolved_range / gaps[].range（`+08:00` 形态）写法不同：'
+  + '⚠️ 与同一行里的 resolved_range（`+08:00` 形态）写法不同：'
   + '两者可以是同一时刻，直接按字符串比较会得出相反结论 —— 先解析成时刻再比。'
   + 'null = 从未成功推进（或 v9 之前的旧记录）'
-const LAST_SYNCED_AT_NOTE = '上次成功推进的运行时刻（UTC `Z` 形态）。'
-  + '⚠️ 与 watermark 是两个不同的量：watermark 是「数据覆盖到哪」，它是「那轮什么时候跑的」。'
-  + '失败轮不更新它（保留上一轮成功的值）；与 resolved_range 一样是 `Z` / `+08:00` 两种写法并存'
+/**
+ * `last_synced_at` 的释义（run 与 status 共用 —— 同一份 `sync_state` 列）。
+ *
+ * ⚠️ 三点必须说清（2026-10-28 真库实测 + CodeRabbit 复核）：
+ * 1) 它与 watermark 不是同一个量：watermark 是「数据覆盖到哪」（数据面的位置），
+ *    它是「那次成功提交发生在什么时候」（运行面的时间）。
+ * 2) 它按**成功窗**更新、不按轮：引擎在每个带水位写入的成功窗提交事务里写它
+ *    （engine.ts 的 commitWindow → advanceWatermark）。所以一轮里有部分窗口失败
+ *    （status=partial）时它照样被更新 —— 实测中窗失败（1、3 成，2 败）→
+ *    status=partial 而它已是末个成功窗的提交时刻。
+ * 3) 它也**不严格等于「水位值上次前进的时刻」**：断链后的成功窗仍刷新它，而水位
+ *    冻结在连续成功末端 —— 实测同一轮里 watermark 停在首窗末端（1970-01-02）、
+ *    last_synced_at 却是末窗提交时刻（晚 3 分多）。所以它可能晚于水位实际前进的时刻。
+ * 「整轮没有任何带水位写入的成功提交」才不动它：首窗即失败（后续成功窗不再写水位）、
+ * 全窗失败、快照失败、窗口全是被跳过的残段窗 —— 保留上一轮的值（从未推进过则 null）。
+ * 早前这里写的是「失败轮不更新它」，对 partial 轮是错的。
+ */
+const LAST_SYNCED_AT_NOTE = '上次成功提交同步事务的时刻（UTC `Z` 形态 —— 引擎在每个带水位写入的成功窗里写它，不是整轮跑完才写）。'
+  + '⚠️ 与 watermark 是两个不同的量：watermark 是「数据覆盖到哪」，它是「那次提交发生在什么时候」。'
+  + '⚠️ 一轮里有部分窗口失败（status=partial）时它照样会被更新（实测：中窗失败 → partial 而它已是末个成功窗的提交时刻）。'
+  + '⚠️ 它也可能晚于水位实际前进的时刻：断链后的成功窗仍刷新它，而水位冻结在连续成功末端（实测同一轮里两者相差数分钟）'
+  + '只有整轮没有任何带水位写入的成功提交（首窗即失败 / 全窗失败 / 快照失败 / 窗口全是被跳过的残段窗）'
+  + '才保留上一轮的值（从未推进过则 null）'
 
 /** `sync run` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
 export function runFieldNotes(): Record<string, string> {
@@ -102,6 +128,9 @@ export function runFieldNotes(): Record<string, string> {
       + '评估真实覆盖要看 end 与 windows.skipped，不要只看 start',
     'tasks[].gaps': '本轮失败/提示的缺口逐条记录（reason 取值见 README 图例）。'
       + 'gaps 非空不等于同步失败：后四个 reason 是成功窗上的业务提示',
+    'tasks[].gaps[].range': '本命令的缺口区间已格式化成 `+08:00` ISO（与 resolved_range 同一套时间解析）。'
+      + '⚠️ `sync status` 的同名字段不是这个形态：那边原样回显 `sync_gaps` 的 epoch 毫秒字符串'
+      + '（引擎落库的存储值）—— 跨命令比较缺口区间前先统一形态',
     'tasks[].watermark': WATERMARK_NOTE,
     'tasks[].last_synced_at': LAST_SYNCED_AT_NOTE,
     truncated: '恒为 false —— sync run 不按 --limit 截断任务列表（这是与 query 的同名字段'
