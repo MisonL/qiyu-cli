@@ -293,15 +293,41 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       taskIds.push(a)
     }
   }
-  if (flags['--full'] && (flags['--since'] || flags['--until'])) {
+  // ⚠️ 值位 flag 的**空白取值**是用法错误，不是「没给」（2026-10-29 实测修）。
+  // `flags['--since']` 此前按**真值**判（`||` / `? :`），而 `''` 是假值 —— 于是
+  // `sync run --since ''` 与 `sync run --until ''` 被静默当成「没给区间」：
+  //   · `--full --since ''` 直接**绕过互斥守卫**（判据 `flags['--full'] && flags['--since']`），
+  //     用户以为「--full 与区间同传会报错」，实际拿到一次全量重刷、退出码 0；
+  //   · 单独 `--since ''` 落到水位续跑分支，形态与不带该 flag 逐字相同。
+  // 同一个输入 `query --table X --since ''` 是 usage（resolveTimeFlag 走 `!== undefined`），
+  // 两个命令对同一份参数给出相反结论 —— 与 README 的空串口径（env 空串=未设置、
+  // **显式** flag 空串=用法错误）一致的是 query 那一侧，故本命令对齐它。
+  // 空白串（`'   '`）同样拒绝：它不是「未设置」，也不是合法时间。
+  // 渲染走 describeArgs（`''` / `'   '`），否则消息会是「无法解析：。」冒号后空白。
+  for (const f of ['--since', '--until'] as const) {
+    const v = flags[f]
+    if (v !== undefined && v.trim() === '') {
+      return usageFail(`${f} 的取值不能是空串或纯空白（收到 ${describeArgs([v])}）。`
+        + '要「不给区间」就别传这个 flag —— 空白取值不是合法时间，也不会被当成未设置')
+    }
+  }
+  // ⚠️ 互斥/分支判据一律用 `!== undefined`（「给了没给」）而非真值（「值是否非空」）。
+  // **边界（实测）：有了上面的空白守卫，这两个判据在本函数里已经等价** —— 空白取值
+  // 在到达它们之前就被拦成 usage，`flags['--full']` 又恒是 flag 名字符串（真值即存在）。
+  // 保留存在性写法是**防御性**的：日后有人挪走或收窄上面的守卫，真值判据会立刻重新
+  // 分叉出「静默当成没给」分支（本轮缺陷正是这么来的）。变异验证如实记录：
+  // 把这两处改回真值，全部用例**仍然绿**（等价变异，不是覆盖缺口）。
+  if (flags['--full'] !== undefined && (flags['--since'] !== undefined || flags['--until'] !== undefined)) {
     return usageFail('--full 与 --since/--until 互斥：全量重刷不叠加区间参数')
   }
 
   // —— 任务 id 校验（usage：未知 id 是参数错误）——
   const unknown = taskIds.filter((id) => taskById(id) === undefined)
   if (unknown.length > 0) {
+    // ⚠️ describeArgs 渲染取值（空串 → `''`）：`sync run ''` 此前报「未知任务：」冒号后空白，
+    // Agent 读不出自己传了什么（与 query 的 `未知表：''` 同族，2026-10-29 一并修）。
     return usageFail(
-      `未知任务：${unknown.join('、')}\n可用任务：${SYNC_TASKS.map((t) => t.id).join('、')}`)
+      `未知任务：${describeArgs(unknown)}\n可用任务：${SYNC_TASKS.map((t) => t.id).join('、')}`)
   }
 
   // —— 凭证前置（api.ts 同族：缺凭证是环境问题 → auth_missing 退出码 1）——
@@ -332,21 +358,21 @@ export async function runSyncRun(argv: string[]): Promise<number> {
 
     // —— 区间合成（时钟注入点：parseTimeArg 接受 clock；Nd/yesterday 已带区间，
     //     YYYY-MM-DD/ISO 只给起点 → end=clock 当前或配对的另一端）——
+    // ⚠️ 判据用 `!== undefined`（「给了」）而非真值：上面已把空白取值拦成 usage，
+    // 两边用同一种判据才不会在日后又分叉出一个静默分支。
     let rangeOverride: { start: number; end: number } | undefined
-    if (flags['--full']) {
+    const sinceRaw = flags['--since']
+    const untilRaw = flags['--until']
+    if (flags['--full'] !== undefined) {
       rangeOverride = { start: 0, end: clock() }
-    } else if (flags['--since'] || flags['--until']) {
-      const untilMs = flags['--until']
-        ? parseTimeArg(flags['--until'], clock, '--until')
-        : null
-      if (flags['--until'] && untilMs === null) {
-        return usageFail(`--until 无法解析：${flags['--until']}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601`)
+    } else if (sinceRaw !== undefined || untilRaw !== undefined) {
+      const untilMs = untilRaw !== undefined ? parseTimeArg(untilRaw, clock, '--until') : null
+      if (untilRaw !== undefined && untilMs === null) {
+        return usageFail(`--until 无法解析：${describeArgs([untilRaw])}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601`)
       }
-      const sinceMs = flags['--since']
-        ? parseTimeArg(flags['--since'], clock, '--since')
-        : null
-      if (flags['--since'] && sinceMs === null) {
-        return usageFail(`--since 无法解析：${flags['--since']}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601`)
+      const sinceMs = sinceRaw !== undefined ? parseTimeArg(sinceRaw, clock, '--since') : null
+      if (sinceRaw !== undefined && sinceMs === null) {
+        return usageFail(`--since 无法解析：${describeArgs([sinceRaw])}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601`)
       }
       // 归一：Nd/yesterday 返回完整区间（起点优先）；日期/ISO 返回时刻。
       // 单 --until（分段回补）：start=0、end=until 时刻；单 --since：start=since 时刻、

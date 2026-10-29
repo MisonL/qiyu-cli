@@ -48,6 +48,13 @@ describe('parseCron', () => {
     expect(() => parseCron('10-5 * * * *')).toThrow(/minute/)
     expect(() => parseCron('*/0 * * * *')).toThrow(/minute/)
   })
+
+  it('空/空白表达式：消息把取值渲染成可见形式（此前冒号后空白）', () => {
+    // ⚠️ 2026-10-29：`sync install --schedule ''` 此前报「…实际 1 段：」冒号后什么都没有，
+    // Agent 看不出「表达式是空串」还是「消息渲染坏了」。describeArgs 把空串渲染成 `''`。
+    expect(() => parseCron('')).toThrow(/实际 1 段：''/)
+    expect(() => parseCron('   ')).toThrow(/实际 1 段：'   '/)
+  })
 })
 
 describe('planInstall darwin —— launchd plist', () => {
