@@ -90,6 +90,17 @@ export function currentStoreEnv(): StoreEnv {
  */
 export function resolveStoreConfig(opts: ResolveOpts = {}): {
   config: StoreConfig; configPath: string; configExists: boolean
+  /**
+   * 本次**有显式来源**的档名（`--profile` / `QIYU_PROFILE` / 配置文件 `defaultProfile`）；
+   * 无人点名（走内置 `default`）时为 undefined。2026-10-30 新增：恢复命令 hint 必须
+   * 回显它 —— `--db` 只固定库文件，而 `sync run` 还从**解析出的档**读
+   * `store.options.knowledgeRobotIds` 与 `profiles.<name>.robots`（robotId 注入面），
+   * 不带档名的恢复命令会静默用错 robot 集合（真库实测：带 `--profile alpha` 解析出
+   * `[1000001]`，不带则空）。
+   * ⚠️ 内置 default **不导出**：显式 `--profile default` 会触发下方「点名档必须存在」
+   * 守卫，在 profiles 非空且无 default 档时反而让恢复命令失败。
+   */
+  profileFlag?: string
 } {
   const home = opts.home ?? homedir()
   const configPath = opts.configPath ?? configPathFor(home)
@@ -228,5 +239,6 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
     },
     configPath,
     configExists,
+    ...(namedProfile.source !== undefined ? { profileFlag: profileName } : {}),
   }
 }

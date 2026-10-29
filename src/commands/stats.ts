@@ -288,7 +288,7 @@ async function statsFields(argv: string[]): Promise<number> {
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库中缺表：${table}（${opened.dbPath}）`,
-        hint: missingTableCauses(opened.dbPath),
+        hint: missingTableCauses(opened.dbPath, opened.profileFlag),
       })
     }
 
@@ -340,7 +340,7 @@ async function statsFields(argv: string[]): Promise<number> {
     if (observed.length === 0) {
       const n = Number(shape.total)
       if (n === 0) {
-        warnings.push('该表无数据；先运行 `' + syncRunCommand(opened.dbPath) + '`')
+        warnings.push('该表无数据；先运行 `' + syncRunCommand(opened.dbPath, opened.profileFlag) + '`')
       } else {
         warnings.push(`该表有 ${n} 行，但 payload 均无可观测字段（payload 为 NULL / 空对象 / 非对象）。`
           + '字段自描述需要 payload 内的 JSON 键；请确认同步写入的是报表原始 JSON')

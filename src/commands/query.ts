@@ -298,8 +298,9 @@ function zeroRowWarning(
 
 interface TableRunInput {
   table: TableDef
-  /** 本次解析出的库路径（空表 warning 的 sync run 建议必须指回它，见 output.ts）。 */
+  /** 本次解析出的库路径与档名（空表 warning 的 sync run 建议必须指回它们，见 output.ts）。 */
   dbPath: string
+  profileFlag?: string
   since?: number
   until?: number
   groupBy: string[]
@@ -396,7 +397,7 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     // 只有「库中缺列」漂移（plan.warnings 只在给了时间过滤时非空，那走上一分支）——
     // 缺列说的是 schema、空表说的是数据，两件独立事实都该说；压掉后者 Agent 会把
     // 「0 行」误读成缺列的副作用。
-    warnings.push('该表无数据；先运行 `' + syncRunCommand(input.dbPath) + '`')
+    warnings.push('该表无数据；先运行 `' + syncRunCommand(input.dbPath, input.profileFlag) + '`')
   }
 
   // 窗口内部空洞（端到端场景 F4）：iso-day 表 + 完整区间时，比较「区间应覆盖的自然日数」
@@ -569,14 +570,14 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
         return fail({
           code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
           message: `数据库中缺表：${tableDef.name}（本表在 CLI 的表定义中存在，库里没有）`,
-          hint: missingTableCauses(opened.dbPath) + '。用 `qiyu db tables` 查看库中实际有数据的表',
+          hint: missingTableCauses(opened.dbPath, opened.profileFlag) + '。用 `qiyu db tables` 查看库中实际有数据的表',
         })
       }
     }
 
     if (tableDef !== undefined) {
       return await runTableQuery(session, {
-        table: tableDef, dbPath: opened.dbPath,
+        table: tableDef, dbPath: opened.dbPath, profileFlag: opened.profileFlag,
         since: sinceMs, until: untilMs, groupBy: flags.groupBy,
         limit, timeoutMs, noMask: flags.noMask, now: nowMs,
       })

@@ -216,13 +216,16 @@ function dirtyTimeWarning(table: string, column: string, n: number): string {
  */
 export async function openGuardedSession(
   flags: StoreFlags,
-): Promise<{ session: SandboxSession; dbPath: string } | { exit: number }> {
+): Promise<{ session: SandboxSession; dbPath: string; profileFlag?: string } | { exit: number }> {
   let config: StoreConfig
+  let profileFlag: string | undefined
   try {
-    config = resolveStoreConfig({
+    const resolved = resolveStoreConfig({
       flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
       env: currentStoreEnv(),
-    }).config
+    })
+    config = resolved.config
+    profileFlag = resolved.profileFlag
   } catch (e) {
     // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
     // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
@@ -263,7 +266,7 @@ export async function openGuardedSession(
     await session.close()
     return { exit: thrownToQueryExit(e, TABLES) }
   }
-  return { session, dbPath: config.path }
+  return { session, dbPath: config.path, ...(profileFlag !== undefined ? { profileFlag } : {}) }
 }
 
 async function dbTables(argv: string[]): Promise<number> {
@@ -300,7 +303,7 @@ async function dbTables(argv: string[]): Promise<number> {
       // 重建（迁移已跳过，返回 ok 而表仍缺）——那是「成功但无效」的修复。
       // 成因与对策的唯一实现见 missingTableCauses()（四个出口共用）。
       warnings.push(`声明有而库中无：${declaredMissing.join('、')}。`
-        + '这些表不出现在 tables 中。' + missingTableCauses(opened.dbPath))
+        + '这些表不出现在 tables 中。' + missingTableCauses(opened.dbPath, opened.profileFlag))
     }
     const undeclared = actualNames.filter((n) => !declaredSet.has(n)).sort()
     if (undeclared.length > 0) {
@@ -447,7 +450,7 @@ async function dbDescribe(argv: string[]): Promise<number> {
       // 这个分支：未同步的库 25 张声明表全在、库文件缺失/零表早在 openGuardedSession 里
       // 报 store_not_initialized）。与 db tables/query/stats 共用 missingTableCauses()。
       warnings.push(`表 ${table.name} 在库中不存在（声明有而库中无）；以下为声明元数据`
-        + '（row_count/time_range 无法得知，置 null）。' + missingTableCauses(opened.dbPath))
+        + '（row_count/time_range 无法得知，置 null）。' + missingTableCauses(opened.dbPath, opened.profileFlag))
     } else {
       const r = await session.run(`SELECT COUNT(*) AS n FROM "${table.name}"`)
       // ⚠️ COUNT 是 BIGINT，经 getRowObjectsJson() 是**字符串** —— 必须 Number() 收敛。

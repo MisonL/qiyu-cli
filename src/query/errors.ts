@@ -190,11 +190,11 @@ const COLUMN_NAME_RE = /Binder Error: Referenced column "([^"]+)" (?:was )?not f
  * `--db <自定义路径>` 的输出里，裸 `qiyu store init` 会建**默认库**、原命令仍缺表。
  * 渲染走 `storeInitCommand(path)` / `syncRunCommand(path)`（output.ts 的唯一实现）。
  */
-export function missingTableCauses(path: string): string {
+export function missingTableCauses(path: string, profileFlag?: string): string {
   return '若为建库未完成（迁移未跑完），运行 ' + storeInitCommand(path) + ' 可补建缺失的迁移；'
     + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
     + '——需重建库：先备份库文件，再删除并重新 ' + storeInitCommand(path) + '、'
-    + syncRunCommand(path)
+    + syncRunCommand(path, profileFlag)
     + '（未声明表与超出 API 回补窗口的本地历史无法靠重建恢复，删除前先确认）'
 }
 

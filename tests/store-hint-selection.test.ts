@@ -15,7 +15,7 @@
 //   ② 漂移层（源码文本）：恢复命令 hint 不得再以裸命令出现（必须经共享渲染），
 //      附自检（事故原文必须红、修复后的拼接形态必须放过）。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -128,6 +128,53 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     const w2 = (meta().warnings ?? []) as string[]
     expect(w2.some((x) => x.includes(syncRunCommand(db))), w2.join('\n')).toBe(true)
     expect(w2.some((x) => x.includes('--db ' + db)), w2.join('\n')).toBe(true)
+  })
+
+  it('路径含空白 / shell 元字符 → 恢复命令用单引号包裹（复制进 shell 不注入）', async () => {
+    // 空目录里放一个空库；路径同时含空格与 `; touch` 注入载荷
+    const weird = join(dir, 'a b; touch PWNED; #.duckdb')
+    await emptyDb(weird)
+
+    out = ''
+    expect(await dbCommand(['tables', '--db', weird])).toBe(1)
+    const hint = String(errorOf().hint)
+    // 单引号包裹后是**一个**参数：`; touch` 不会被 shell 拆成命令
+    expect(hint).toContain("--db '" + weird + "'")
+    expect(hint).toContain(storeInitCommand(weird))
+    // shellArg 自检：安全集内裸渲染、含单引号正确转义
+    expect(storeInitCommand('/tmp/q.db')).toContain('--db /tmp/q.db')
+    expect(storeInitCommand("/tmp/it's q.db")).toContain("--db '/tmp/it'\\''s q.db'")
+  })
+
+  it('--profile 选中的档名随恢复命令回显（sync run 的 robotId 注入面按档读）', async () => {
+    // 非默认档 alpha：store.options.knowledgeRobotIds 与 robots 只在 alpha 下可见
+    mkdirSync(join(dir, '.config', 'qiyu'), { recursive: true, mode: 0o700 })
+    const cfg = join(dir, '.config', 'qiyu', 'config.json')
+    writeFileSync(cfg, JSON.stringify({
+      profiles: { alpha: { robots: { 2000002: 'B' }, store: { options: { knowledgeRobotIds: [1000001] } } } },
+    }))
+    const db = dbPath('pf.duckdb')
+    out = ''
+    expect(await storeCommand(['init', '--profile', 'alpha', '--db', db])).toBe(0)
+
+    // sync install 的 sync_not_run hint：必须回显 --profile alpha
+    out = ''
+    expect(await syncCommand(['install', '--schedule', '0 2 * * *', '--profile', 'alpha', '--db', db])).toBe(1)
+    const hint = String(errorOf().hint)
+    expect(hint).toContain(syncRunCommand(db, 'alpha'))
+    expect(hint).toContain('--profile alpha')
+
+    // 空表 warning 同源
+    out = ''
+    expect(await queryCommand(['--table', 'sessions', '--profile', 'alpha', '--db', db])).toBe(0)
+    const w = (meta().warnings ?? []) as string[]
+    expect(w.some((x) => x.includes('--profile alpha')), w.join('\n')).toBe(true)
+
+    // 反向：未点名档（无 flag/env/defaultProfile）→ 不回显内置 default
+    //（显式 --profile default 会触发「点名档必须存在」守卫，profiles 非空且无 default 时反而失败）
+    out = ''
+    expect(await syncCommand(['install', '--schedule', '0 2 * * *', '--db', db])).toBe(1)
+    expect(String(errorOf().hint)).not.toContain('--profile')
   })
 
   it('sync verify 的 state_pending detail 也带 --db（重跑建议同样不能打偏库）', async () => {

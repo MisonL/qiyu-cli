@@ -205,12 +205,17 @@ function selectTasks(ids: string[]): SyncTask[] | number {
 
 interface StoreFlags { db?: string; profile?: string; backend?: string }
 
-function resolveConfig(flags: StoreFlags): { path: string; backend: string; config: Parameters<typeof openStore>[0] } {
+function resolveConfig(flags: StoreFlags): {
+  path: string; backend: string; config: Parameters<typeof openStore>[0]; profileFlag?: string
+} {
   const resolved = resolveStoreConfig({
     flags,
     env: currentStoreEnv(),
   })
-  return { path: resolved.config.path, backend: resolved.config.backend, config: resolved.config }
+  return {
+    path: resolved.config.path, backend: resolved.config.backend, config: resolved.config,
+    ...(resolved.profileFlag !== undefined ? { profileFlag: resolved.profileFlag } : {}),
+  }
 }
 
 /** 只读命令的库前置检查（statSync 分流沿 store status；hint 统一指 store init，spec §九）。 */
@@ -413,7 +418,8 @@ async function syncVerify(argv: string[]): Promise<number> {
       if (st === undefined) {
         drift.push({
           kind: 'not_synced',
-          detail: 'sync_state 无该任务记录（从未同步）。请先运行：' + syncRunCommand(resolved.path),
+          detail: 'sync_state 无该任务记录（从未同步）。请先运行：'
+            + syncRunCommand(resolved.path, resolved.profileFlag),
         })
       } else if (!stateConsistent) {
         drift.push({
@@ -421,7 +427,7 @@ async function syncVerify(argv: string[]): Promise<number> {
           detail: `sync_state.range_status=${st.rangeStatus ?? 'null'}（最后一次运行未完成或中断）。`
             + (t.kind === 'windowed'
               ? 'windowed 任务不做上游全量重拉（成本高）：核对方式为本地行数与 sync_state 成功状态一致性——重跑 '
-                + syncRunCommand(resolved.path) + ' 补全后再 verify。'
+                + syncRunCommand(resolved.path, resolved.profileFlag) + ' 补全后再 verify。'
               : '快照任务将以上游取数核对本地行数。'),
         })
       }
@@ -533,7 +539,9 @@ function storeArgsFor(parsed: ParsedFlags, resolved: { path: string; backend: st
  * 同步过的库上，探测名不副实（且 hint 会劝用户「先跑通一次」却已经被放行）。
  * 冷却行（`__ratelimit__:` 前缀）本就不是任务行，按前缀排除。
  */
-async function probeSynced(config: Parameters<typeof openStore>[0], path: string): Promise<number | null> {
+async function probeSynced(
+  config: Parameters<typeof openStore>[0], path: string, profileFlag?: string,
+): Promise<number | null> {
   const guarded = statGuard(path)
   if (guarded !== null) return guarded
   const opened = await openRo(config)
@@ -548,7 +556,7 @@ async function probeSynced(config: Parameters<typeof openStore>[0], path: string
       return fail({
         code: 'sync_not_run', kind: 'sync_not_run', retryable: false,
         message: '尚未成功同步过任何任务（sync_state 无 range_status=complete 且无 last_synced_at 的记录）',
-        hint: '安装调度前请先跑通一次同步：' + syncRunCommand(path),
+        hint: '安装调度前请先跑通一次同步：' + syncRunCommand(path, profileFlag),
       })
     }
     return null
@@ -594,12 +602,13 @@ async function syncInstall(argv: string[]): Promise<number> {
   let config: Parameters<typeof openStore>[0]
   let path: string
   let backend: string
+  let profileFlag: string | undefined
   try {
     const r = resolveConfig({ db: parsed.values['--db'], profile: parsed.values['--profile'], backend: parsed.values['--backend'] })
-    config = r.config; path = r.path; backend = r.backend
+    config = r.config; path = r.path; backend = r.backend; profileFlag = r.profileFlag
     // ⚠️ 同 syncStatus：带 kind 的错误（config_insecure）必须如实透出。
   } catch (e) { return failFromTagged(e) }
-  const probe = await probeSynced(config, path)
+  const probe = await probeSynced(config, path, profileFlag)
   if (probe !== null) return probe
 
   // 计划生成（cron 解析 / 平台映射失败 → usage）

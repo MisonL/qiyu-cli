@@ -115,19 +115,44 @@ export function describeArgs(args: readonly string[]): string {
  * 而 `--db` 的优先级高于两者 —— 解析后的路径在任何来源下都精确复现本次目标，
  * 且是绝对路径，换工作目录也成立。
  *
- * ⚠️ 路径按仓库既有风格裸渲染（不引号）。含空白的路径被 shell 拆开时会**响亮地**
- * 失败（未知参数/文件不存在），不会静默作用到另一个库。
- * ⚠️ 边界（本轮未覆盖）：只读诊断提示（`qiyu db tables` / `qiyu db describe` /
- * `qiyu query --sql`）仍是无选择的裸命令 —— 它们大多在 query/ 纯层产生、拿不到
- * 存储位置，跟在错误选择后面**读**错库同样会误导，留待后续单独处理。
+ * `syncRunCommand` 还要回显**档名**（CodeRabbit 2026-10-30 major）：`--db` 只固定库文件，
+ * 而 `sync run` 还从**解析出的档**读 `store.options.knowledgeRobotIds` 与
+ * `profiles.<name>.robots`（robotId 注入面）。实测：同一份 config 下带 `--profile alpha`
+ * 解析出 `options={"knowledgeRobotIds":[1000001]}`、robots `["2000002"]`，不带则两者皆空 ——
+ * 只回显 `--db` 的 hint 会让知识库任务用错 robot 集合。`store init` 不读 options/robots
+ *（只跑迁移），故 `storeInitCommand` 不回显档名。
+ *
+ * ⚠️ 参数值经 `shellArg` 渲染（Python `shlex.quote` 同一安全集）：路径/档名含空白或
+ * shell 元字符时用单引号包裹（`'` → `'\''`），否则裸渲染保持可读。**为什么必须引号**：
+ * hint 是给 Agent 复制执行的命令 —— 未引号的 `--db /tmp/x; touch /tmp/marker; #`
+ * 粘进 shell 会真的执行 `touch`（CodeRabbit 2026-10-30 major）。引号按 **POSIX shell**
+ * 语义（bash/sh，也是本项目 crontab 兜底行的目标）；win32 下 PowerShell 的单引号同为
+ * 字面串、可直接用，cmd.exe 不识别单引号（该平台请手工改写）—— 边界如实记录。
  */
 export function storeInitCommand(path: string): string {
-  return `qiyu store init --db ${path}`
+  return `qiyu store init --db ${shellArg(path)}`
 }
 
-/** `qiyu sync run` 恢复命令，指向本次解析出的库（口径见 `storeInitCommand`）。 */
-export function syncRunCommand(path: string): string {
-  return `qiyu sync run --db ${path}`
+/**
+ * `qiyu sync run` 恢复命令，指向本次解析出的库与档（口径见 `storeInitCommand`）。
+ * `profileFlag`：本次**有显式来源**的档名（flag / QIYU_PROFILE / defaultProfile，
+ * 由 `resolveStoreConfig().profileFlag` 给出）；内置 default 不传 —— 显式
+ * `--profile default` 会触发「点名档必须存在」守卫，在 profiles 非空且无 default 档时
+ * 反而让恢复命令失败。
+ */
+export function syncRunCommand(path: string, profileFlag?: string): string {
+  return `qiyu sync run --db ${shellArg(path)}`
+    + (profileFlag === undefined ? '' : ` --profile ${shellArg(profileFlag)}`)
+}
+
+/**
+ * 单个参数值的 shell 渲染（POSIX）：安全集内裸渲染，其余单引号包裹。
+ * 安全集取自 Python `shlex.quote`（`[A-Za-z0-9_@%+=:,./-]`）—— 含 `$` / 反引号 /
+ * 空白 / `;` / `&` / `|` 等一律引号化。单引号内一切字面，`'` 自身以 `'\''` 转义。
+ * ⚠️ 解析出的路径恒为绝对路径，不含 `~`，故无「引号会阻止波浪号展开」的问题。
+ */
+function shellArg(v: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`
 }
 
 /** 把不受信文本（调用方 body 的字段名等）中的终端控制字符抹成占位，防止 stderr 注入 ANSI/OSC 序列。 */
