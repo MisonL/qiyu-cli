@@ -9,6 +9,35 @@
 
 ### 修复
 
+- **`sync run --since ''` / `--until ''` 被静默当成「没给区间」，`--full --since ''`
+  因此绕过互斥守卫跑了一次全量重刷**。2026-10-29 真库实测：判据此前是**真值**
+  （`flags['--since'] || flags['--until']`），而 `''` 是假值 —— 于是显式给出的空白取值
+  整个消失：
+  ① `sync run --full --since ''` 拿到一次全量重刷、退出码 0（而 `--full --since 30d`
+  是用法错误「互斥」）—— 用户以为「同传会报错」，实际跑了最贵的那个分支；
+  ② 单独 `--since ''` 落进水位续跑，与不带这个 flag 逐字相同；
+  ③ 同一个输入 `query --table X --since ''` 一直是 usage（`--since 无法解析：''`）——
+  两个命令对同一份参数给出相反结论。
+  修法：空白取值（`''` 与纯空白）是**用法错误**、不是「未设置」（README 的空串口径
+  管的是 **env**；**显式 flag** 的空白取值是用法错误，与 `--db ''` / `--profile ''`
+  同一条规则）。取值一律用 `describeArgs` 渲染（`''` / `'   '`），否则消息是
+  「无法解析：。」冒号后空白。互斥/分支判据同步改用存在性（`!== undefined`）——
+  **如实记录：改回真值全部用例仍绿（等价变异）**，保留存在性写法是防御性的，防止
+  日后挪走空值守卫又分叉出静默分支。
+  同轮三处相邻缺口（同一族：空白取值渲染成隐形 / 参数错误被环境错误遮住）：
+  `sync run` 与 `sync status` 的 `未知任务：` 用 `describeArgs` 渲染任务名
+  （`sync run ''` 此前冒号后空白）；`sync install --schedule ''` 的 cron 错误消息
+  同样渲染取值；`sync install` 的 cron 解析**前移到存储前置探测之前** —— 未同步过的库上
+  `--schedule '不是 cron'` 此前报 `sync_not_run`（退出码 1，「先去跑一次同步」），
+  Agent 会照 hint 白跑一轮全量同步才看到真正的参数错误（query 的 `--table` 早已是
+  「闭集校验先于一切 I/O」）。
+  测试：`tests/commands/sync.test.ts` 三例（空/空白 `--since`/`--until` 四个组合逐一断言
+  usage + 可见渲染 + `--full` 不再绕过；非空合法取值回归护栏；空白任务名 `run`/`status`
+  两命令 + 两取值；cron 前置校验在未同步库上先报参数错误、合法 cron 不被误伤）；
+  `tests/sync/install.test.ts` 补 `parseCron('')` 的可见渲染；`tests/docs.test.ts`
+  钉住 README 的三条实质主张。变异 8 条红 / 2 条如实记录为等价变异（M15/M16）。
+  全量 4 分片 2107 用例全绿。
+
 - **空串存储环境变量：`QIYU_DB_PATH=` 让配好的 `store.path` 失效，且报错谎称它也是空的**。
   2026-10-29 真库实测：配置文件里 `store.path` 明明有值，`export QIYU_DB_PATH=`（变量没填的
   典型形态）时 `store`/`db`/`query`/`sync` 一律以退出码 2 失败，文案是

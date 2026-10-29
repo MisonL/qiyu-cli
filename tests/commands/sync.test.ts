@@ -413,10 +413,54 @@ describe('sync run —— 区间参数（--full/--since/--until）', () => {
     expect(JSON.parse(out).error.kind).toBe('usage')
   })
 
+  it('空/空白 --since / --until 是用法错误，不是「没给」（2026-10-29 实测缺陷）', async () => {
+    // ⚠️ 真库实测：此前判据是**真值**（`flags['--since'] || flags['--until']`），而 `''`
+    // 是假值 —— `sync run --full --since ''` 直接**绕过互斥守卫**、拿到一次全量重刷
+    // 且退出码 0；单独 `--since ''` 则静默落进水位续跑，与不带这个 flag 逐字相同。
+    // 同一个输入 `query --table X --since ''` 是 usage（`--since 无法解析：''`）——
+    // 两个命令对同一份参数给出相反结论。README 的空串口径管的是 **env**（未设置）；
+    // **显式** flag 的空白取值是用法错误。
+    // 用未知任务当探针：空值判据在任务校验之前，零网络零库。
+    for (const f of ['--since', '--until']) {
+      for (const v of ['', '   ']) {
+        out = ''; err = ''
+        expect(await syncCommand(['run', 'nope', '--db', dbPath(), f, v]),
+          `${f} ${JSON.stringify(v)} 必须是用法错误`).toBe(2)
+        const e = JSON.parse(out).error
+        expect(e.kind, `${f} ${JSON.stringify(v)}`).toBe('usage')
+        expect(e.message, '必须点名叫哪个 flag').toContain(f)
+        expect(e.message, '必须把空白取值渲染成可见形式').toContain(`'${v}'`)
+      }
+    }
+    // 互斥守卫同样按存在性判：`--full --since ''` 现在命中空值错误（先于互斥检查），
+    // 而 `--full --since 30d` 命中互斥 —— 两条都是用法错误，都不再跑全量。
+    out = ''
+    expect(await syncCommand(['run', 'nope', '--db', dbPath(), '--full', '--since', ''])).toBe(2)
+    expect(JSON.parse(out).error.message).toContain('--since')
+    expect(JSON.parse(out).error.message).not.toMatch(/互斥/)
+  })
+
+  it('非空但是合法取值的 --since/--until 行为不变（回归护栏）', async () => {
+    // 空值判据只拦「空白」，不误伤正常取值：非法格式仍走进「无法解析」分支。
+    out = ''
+    expect(await syncCommand(['run', 'dim.staff', '--db', dbPath(), '--since', 'abc'])).toBe(2)
+    expect(JSON.parse(out).error.message).toMatch(/--since 无法解析：abc/)
+  })
+
   it('未知任务 id → usage、可用任务名在消息里', async () => {
     expect(await syncCommand(['run', 'nope.nope', '--db', dbPath()])).toBe(2)
     expect(JSON.parse(out).error.message).toMatch(/nope\.nope/)
     expect(JSON.parse(out).error.message).toMatch(/dim\.staff/)
+  })
+
+  it('空白任务名渲染成可见形式 `\'\'`（此前冒号后空白，Agent 读不出传了什么）', async () => {
+    for (const v of ['', '   ']) {
+      for (const sub of ['run', 'status']) {
+        out = ''
+        expect(await syncCommand([sub, v, '--db', dbPath()]), `${sub} ${JSON.stringify(v)}`).toBe(2)
+        expect(JSON.parse(out).error.message, `${sub} ${JSON.stringify(v)}`).toContain(`未知任务：'${v}'`)
+      }
+    }
   })
 })
 
@@ -1098,6 +1142,27 @@ describe('sync install', () => {
     out = ''
     expect(await syncCommand(['install', '--schedule', '不是 cron', '--db', dbPath()])).toBe(2)
     expect(JSON.parse(out).error.kind).toBe('usage')
+  })
+
+  it('非法 cron 先于存储前置探测报出（2026-10-29 实测缺陷：未同步的库上曾报 sync_not_run）', async () => {
+    // ⚠️ 真库实测：cron 解析此前排在 probeSynced **之后** —— 未同步过的库上
+    // `sync install --schedule '不是 cron'` 报 `sync_not_run`（退出码 1，「先去跑一次
+    // 同步」）。Agent 会照 hint 跑一轮全量同步，回来才看到真正的参数错误：
+    // 第一次的报错指向了错误的动作。query 的 `--table` 早已是「闭集校验先于一切 I/O」。
+    await fresh().then((s) => s.close())   // 已建库、零同步记录（probeSynced 必拒）
+    for (const [v, why] of [['不是 cron', '2 段'], ['', "实际 1 段：''"]] as const) {
+      out = ''; err = ''
+      expect(await syncCommand(['install', '--schedule', v, '--db', dbPath()]),
+        JSON.stringify(v)).toBe(2)
+      const e = JSON.parse(out).error
+      expect(e.kind, JSON.stringify(v)).toBe('usage')
+      expect(e.message, JSON.stringify(v)).toContain(why)
+      expect(e.message, '不得是 sync_not_run 的「先去跑同步」').not.toMatch(/尚未成功同步过/)
+    }
+    // 合法 cron 仍然走到前置探测（不被新守卫误伤）
+    out = ''
+    expect(await syncCommand(['install', '--schedule', '*/30 * * * *', '--db', dbPath()])).toBe(1)
+    expect(JSON.parse(out).error.kind).toBe('sync_not_run')
   })
 
   it('库未初始化 → 1 + store_not_initialized + hint 指 store init；有库但无成功证据 → 1 + sync_not_run + hint', async () => {

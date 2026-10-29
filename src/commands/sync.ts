@@ -35,11 +35,11 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
 import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
-import { ok, fail, usageFail, failFromTagged, setPretty } from '../output.js'
+import { ok, fail, usageFail, failFromTagged, setPretty, describeArgs } from '../output.js'
 import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
 import {
-  currentPlatform, runScheduleCommand, planInstall, planUninstall,
+  currentPlatform, parseCron, runScheduleCommand, planInstall, planUninstall,
 } from '../schedule/install.js'
 import type { Platform } from '../schedule/install.js'
 import type { Store } from '../store/types.js'
@@ -192,8 +192,10 @@ function subHelp(argv: string[]): number | null {
 function selectTasks(ids: string[]): SyncTask[] | number {
   const unknown = ids.filter((id) => taskById(id) === undefined)
   if (unknown.length > 0) {
+    // describeArgs 渲染取值（空串 → `''`）：`sync status ''` 此前冒号后空白，
+    // Agent 读不出自己传了什么（sync-run.ts 同款，2026-10-29）。
     return usageFail(
-      `未知任务：${unknown.join('、')}\n可用任务：${SYNC_TASKS.map((t) => t.id).join('、')}`)
+      `未知任务：${describeArgs(unknown)}\n可用任务：${SYNC_TASKS.map((t) => t.id).join('、')}`)
   }
   return ids.length > 0 ? ids.map((id) => taskById(id)!) : SYNC_TASKS
 }
@@ -568,6 +570,15 @@ async function syncInstall(argv: string[]): Promise<number> {
   if (schedule === undefined) {
     return usageFail('缺少 --schedule CRON（5 段：分 时 日 月 周）', '例如：qiyu sync install --schedule "*/30 * * * *"')
   }
+  // ⚠️ cron 解析必须**先于一切 I/O**（2026-10-29 实测修）：闭集（`--schedule` 的语法）
+  // 校验写在 probeSynced 之后时，未同步过的库上 `sync install --schedule '不是 cron'`
+  // 报的是 `sync_not_run`（退出码 1，「先去跑一次同步」）—— 而真正错的是参数，Agent 会
+  // 照 hint 去跑一次全量同步、再回来才看到 cron 错误（白跑一轮，且第一次的报错指向
+  // 了错误的动作）。query 的 `--table` 早已是同款次序（「闭集校验先于一切 I/O」）。
+  // 渲染走 describeArgs：`--schedule ''` 否则是「实际 1 段：」冒号后空白。
+  try {
+    parseCron(schedule)
+  } catch (e) { return usageFail((e as Error).message) }
   const yes = parsed.flags.has('--yes')
 
   let platform: Platform

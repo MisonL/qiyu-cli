@@ -490,6 +490,19 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
     // 允许作为历史引注出现（本段就在解释它错在哪），所以判据是「引用之外不出现」。
     expect(md.match(/均为空/g)?.length ?? 0, '「均为空」只允许作为历史引注出现一次').toBeLessThanOrEqual(1)
   })
+
+  it('2026-10-29 显式 flag 空白取值：README 写明 sync 侧对齐 query、且 cron 解析先于探测', () => {
+    // ⚠️ 这一段的每句都对应一条真库实测缺陷：
+    // ① `sync run --since ''` 被真值判据当成「没给」（query 一直是 usage）；
+    // ② `--full --since ''` 因此**绕过互斥守卫**跑了一次全量重刷、退出码 0；
+    // ③ cron 解析排在 probeSynced 之后 —— 未同步的库上报 sync_not_run，
+    //    Agent 会照 hint 先跑一轮全量同步再回来看到真正的参数错误。
+    const md = read('README.md')
+    expect(md, '必须点明显式 flag 空白取值在 sync 侧是用法错误')
+      .toMatch(/显式 flag\*\* 的空白取值是用法错误、不是「没给」/)
+    expect(md, '必须点明 --full --since \'\' 曾绕过互斥守卫').toMatch(/绕过互斥守卫/)
+    expect(md, '必须点明 cron 解析先于存储前置探测').toMatch(/cron[\s\S]{0,30}解析也排在存储前置探测\*\*之前\*\*/)
+  })
 })
 
 describe('CI 工作流 —— 承诺的检查必须真的接在 npm 脚本上', () => {

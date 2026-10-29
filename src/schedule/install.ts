@@ -12,6 +12,7 @@
 //      子集外显式失败并指引手工创建。
 import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { describeArgs } from '../output.js'
 
 export type Platform = 'darwin' | 'linux' | 'win32'
 
@@ -120,7 +121,9 @@ function parseField(src: string, def: FieldDef): CronField {
 export function parseCron(expr: string): CronSpec {
   const parts = expr.trim().split(/\s+/)
   if (parts.length !== 5) {
-    throw usageError(`无法解析的 cron 表达式：必须是 5 段（分 时 日 月 周），实际 ${parts.length} 段：${expr}`)
+    // ⚠️ describeArgs 渲染取值：`--schedule ''` 此前报「实际 1 段：」冒号后空白，
+    // 看不出表达式到底是什么（2026-10-29，与 sync run 的取值渲染同族）。
+    throw usageError(`无法解析的 cron 表达式：必须是 5 段（分 时 日 月 周），实际 ${parts.length} 段：${describeArgs([expr])}`)
   }
   const [minute, hour, day, month, weekday] = parts.map((p, i) => parseField(p, FIELDS[i]!))
   return { minute: minute!, hour: hour!, day: day!, month: month!, weekday: weekday! }
