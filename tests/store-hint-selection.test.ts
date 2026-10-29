@@ -153,6 +153,19 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     const payload = "/tmp/x'; touch /tmp/pwned2; #'"
     expect(shellArg(payload, 'darwin')).toBe("'/tmp/x'\\''; touch /tmp/pwned2; #'\\'''")
     expect(shellArg(payload, 'win32')).toBe("'/tmp/x''; touch /tmp/pwned2; #'''")
+    // PowerShell 还把 4 个弯引号当单引号定界符（pwsh 实测：只翻倍 ASCII ' 会漏）
+    for (const q of ['\u2018', '\u2019', '\u201A', '\u201B']) {
+      const v = `/tmp/a${q}; touch /tmp/pwned3; #`
+      expect(shellArg(v, 'win32'), q).toBe(`'/tmp/a${q}${q}; touch /tmp/pwned3; #'`)
+      // POSIX 侧它们只是普通字符（不是定界符），仍按 ' 处理——这里没有 ASCII '，故无转义
+      expect(shellArg(v, 'darwin'), q).toBe(`'/tmp/a${q}; touch /tmp/pwned3; #'`)
+    }
+    // win32 的安全集更窄：裸 `a,b` 在 PowerShell 里是 Object[]、前导 @ 是 splatting、% 是别名
+    expect(shellArg('a,b', 'win32')).toBe("'a,b'")
+    expect(shellArg('a,b', 'darwin')).toBe('a,b')
+    expect(shellArg('@x', 'win32')).toBe("'@x'")
+    expect(shellArg('%x', 'win32')).toBe("'%x'")
+    expect(shellArg('@x', 'darwin')).toBe('@x')
     // 两种方言都必须包在一个单引号串里（无双引号、无未转义的顶层引号）
     for (const p of ['darwin', 'win32']) {
       const out = shellArg(payload, p)
