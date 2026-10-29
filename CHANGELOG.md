@@ -28,8 +28,11 @@
   `missingTableCauses` 回显它；`store init` 不读 options/robots，故不回显。
   ② 路径/档名按 POSIX shell 语义引号化（Python `shlex.quote` 同一安全集）：未引号的
   `--db /tmp/x; touch /tmp/marker; #` 被 Agent 复制进 shell 会真的执行 `touch`。
-  单引号包裹、`'` → `'\''`；安全集内裸渲染保持可读。边界：cmd.exe 不识别单引号
-  （PowerShell 单引号同为字面串，可用）。
+  单引号包裹；安全集内裸渲染保持可读。第三轮复审（major）再修正：引号方言必须按平台
+  区分 —— **PowerShell 的反斜杠不是转义符**，POSIX 的 `'\''` 写法会提前闭合引号、
+  让载荷里的 `; touch …` 真的执行（pwsh 实测复现：argc=3 且注入执行）；win32 改用
+  PowerShell 方言（内嵌 `'` 翻倍为 `''`，实测 argc=1、字面完整、未执行）。
+  win32 的 hint 面向 PowerShell；cmd.exe 不识别单引号，不要原样粘贴（边界如实记录）。
   修法：`output.ts` 新增 `storeInitCommand(path)` / `syncRunCommand(path)` 唯一实现，
   一律渲染成带**本次解析出的绝对路径**的 `--db <path>` —— `--db` 优先级高于环境变量与
   配置文件、绝对路径不受工作目录影响，任何来源的存储选择都能被精确复现；
@@ -41,10 +44,10 @@
   拿不到存储位置），跟随错误选择**读**错库同样误导，留待后续单独处理。
   测试：新增 `tests/store-hint-selection.test.ts` —— 空库六出口 / 缺库 / 空表 /
   verify 的 not_synced 与 state_pending / install / 含空白与 `;` 注入载荷的路径 /
-  `--profile alpha` 回显与「内置 default 不回显」共 7 条真库用例（空库与缺库端到端
-  验证「照 hint 做 → 原命令收敛、默认库不被创建」），加静态漂移守卫（裸恢复命令 hint
-  指纹 + 自检：5 条事故原文必红、4 条修复形态放过）。变异 11 条：10 条红，1 条
-  （storeInitFail 缺省分支）如实记录为行为层不可达、仅静态守卫红。
+  `--profile alpha` 回显与「内置 default 不回显」/ win32 方言共 8 条真库用例（空库与
+  缺库端到端验证「照 hint 做 → 原命令收敛、默认库不被创建」），加静态漂移守卫
+  （裸恢复命令 hint 指纹 + 自检：5 条事故原文必红、4 条修复形态放过）。变异 12 条：
+  11 条红，1 条（storeInitFail 缺省分支）如实记录为行为层不可达、仅静态守卫红。
 
 - **`db describe` 缺表时给的成因是错的：`表 X 在库中不存在（未同步或未建库）`——
   两个成因都到不了这个分支**。2026-10-29 真库实测：

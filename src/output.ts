@@ -123,11 +123,15 @@ export function describeArgs(args: readonly string[]): string {
  *（只跑迁移），故 `storeInitCommand` 不回显档名。
  *
  * ⚠️ 参数值经 `shellArg` 渲染（Python `shlex.quote` 同一安全集）：路径/档名含空白或
- * shell 元字符时用单引号包裹（`'` → `'\''`），否则裸渲染保持可读。**为什么必须引号**：
- * hint 是给 Agent 复制执行的命令 —— 未引号的 `--db /tmp/x; touch /tmp/marker; #`
- * 粘进 shell 会真的执行 `touch`（CodeRabbit 2026-10-30 major）。引号按 **POSIX shell**
- * 语义（bash/sh，也是本项目 crontab 兜底行的目标）；win32 下 PowerShell 的单引号同为
- * 字面串、可直接用，cmd.exe 不识别单引号（该平台请手工改写）—— 边界如实记录。
+ * shell 元字符时用单引号包裹，否则裸渲染保持可读。**为什么必须引号**：hint 是给 Agent
+ * 复制执行的命令 —— 未引号的 `--db /tmp/x; touch /tmp/marker; #` 粘进 shell 会真的
+ * 执行 `touch`（CodeRabbit 2026-10-30 major）。
+ * ⚠️ 引号方言按平台选择（CodeRabbit 2026-10-30 第二条 major，pwsh 实测复现注入）：
+ * POSIX shell 里单引号内的 `'` 转义为 `'\''`；**PowerShell 的反斜杠不是转义符**，
+ * 同一串会让引号提前闭合、后面的 `; touch …` 真的执行 —— win32 改用 PowerShell 方言
+ *（`''` 转义内嵌单引号）。win32 的 hint 面向 PowerShell（Windows 现代默认 shell）；
+ * cmd.exe 不识别单引号、`&` 在引号外仍会切命令，**不要把 win32 的 hint 原样粘进
+ * cmd.exe**。这两个边界都如实记录，不假装一种引号能通吃所有 shell。
  */
 export function storeInitCommand(path: string): string {
   return `qiyu store init --db ${shellArg(path)}`
@@ -146,13 +150,18 @@ export function syncRunCommand(path: string, profileFlag?: string): string {
 }
 
 /**
- * 单个参数值的 shell 渲染（POSIX）：安全集内裸渲染，其余单引号包裹。
+ * 单个参数值的 shell 渲染：安全集内裸渲染，其余单引号包裹。
  * 安全集取自 Python `shlex.quote`（`[A-Za-z0-9_@%+=:,./-]`）—— 含 `$` / 反引号 /
- * 空白 / `;` / `&` / `|` 等一律引号化。单引号内一切字面，`'` 自身以 `'\''` 转义。
+ * 空白 / `;` / `&` / `|` 等一律引号化。单引号串内一切字面，转义内嵌 `'` 的**方言按
+ * 平台区分**：POSIX 用 `'\''`（关引号→转义单引号→重开引号）；PowerShell 用 `''`
+ * （反斜杠不是转义符，POSIX 写法会被 pwsh 解析成「提前闭合引号 + `;` 切命令」，
+ * 2026-10-30 pwsh 实测能执行注入载荷）。
  * ⚠️ 解析出的路径恒为绝对路径，不含 `~`，故无「引号会阻止波浪号展开」的问题。
  */
-function shellArg(v: string): string {
-  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`
+export function shellArg(v: string, platform: string = process.platform): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(v)) return v
+  const escaped = v.replace(/'/g, platform === 'win32' ? `''` : `'\\''`)
+  return `'${escaped}'`
 }
 
 /** 把不受信文本（调用方 body 的字段名等）中的终端控制字符抹成占位，防止 stderr 注入 ANSI/OSC 序列。 */

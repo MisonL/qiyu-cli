@@ -24,7 +24,7 @@ import { queryCommand } from '../src/commands/query.js'
 import { statsCommand } from '../src/commands/stats.js'
 import { storeCommand } from '../src/commands/store.js'
 import { syncCommand } from '../src/commands/sync.js'
-import { storeInitCommand, syncRunCommand } from '../src/output.js'
+import { storeInitCommand, syncRunCommand, shellArg } from '../src/output.js'
 import { createDuckDbStore } from '../src/store/duckdb.js'
 import { markPending } from '../src/sync/state.js'
 
@@ -141,9 +141,25 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     // 单引号包裹后是**一个**参数：`; touch` 不会被 shell 拆成命令
     expect(hint).toContain("--db '" + weird + "'")
     expect(hint).toContain(storeInitCommand(weird))
-    // shellArg 自检：安全集内裸渲染、含单引号正确转义
+    // shellArg 自检：安全集内裸渲染、含单引号按 POSIX 方言转义
     expect(storeInitCommand('/tmp/q.db')).toContain('--db /tmp/q.db')
-    expect(storeInitCommand("/tmp/it's q.db")).toContain("--db '/tmp/it'\\''s q.db'")
+    expect(shellArg("/tmp/it's q.db", 'darwin')).toBe("'/tmp/it'\\''s q.db'")
+  })
+
+  it('win32 用 PowerShell 方言（单引号翻倍）—— POSIX 写法在 pwsh 里会真的执行注入载荷', () => {
+    // 2026-10-30 实测（pwsh 在 PATH 上）：同一份载荷
+    //   POSIX 方言 '/tmp/x'''; touch /tmp/pwned; #''''  → pwsh argc=3，注入**执行**
+    //   PowerShell 方言 '/tmp/x''; touch /tmp/pwned; #'''  → pwsh argc=2、参数字面完整、未执行
+    const payload = "/tmp/x'; touch /tmp/pwned2; #'"
+    expect(shellArg(payload, 'darwin')).toBe("'/tmp/x'\\''; touch /tmp/pwned2; #'\\'''")
+    expect(shellArg(payload, 'win32')).toBe("'/tmp/x''; touch /tmp/pwned2; #'''")
+    // 两种方言都必须包在一个单引号串里（无双引号、无未转义的顶层引号）
+    for (const p of ['darwin', 'win32']) {
+      const out = shellArg(payload, p)
+      expect(out.startsWith("'") && out.endsWith("'"), p).toBe(true)
+    }
+    // shellArg 是可注入平台的纯函数，与命令渲染器共用同一实现
+    expect(storeInitCommand('/tmp/q.db')).toBe('qiyu store init --db /tmp/q.db')
   })
 
   it('--profile 选中的档名随恢复命令回显（sync run 的 robotId 注入面按档读）', async () => {
