@@ -40,13 +40,20 @@ const ENV_READ = String.raw`(?:process\.env|env)\.QIYU_[A-Z_]+`
 /**
  * 三种手写空串判据的指纹（都精确到**同一行**）：
  *   ① `env.X !== ''` —— 自己实现空串判据；
- *   ② `?? env.X` —— 裸 `??` 链读 env（`''` 会被当有效值放行）；
+ *   ② `??` 链读 env —— 裸 `??`（`''` 会被当有效值放行）。**两侧都要抓**：
+ *      `flags.db ?? env.QIYU_DB_PATH`（env 在右）与 `env.QIYU_DB_PATH ?? storeBlock.path`
+ *      （env 在左）是同一个缺陷 —— 后者的空串**遮蔽**右侧的配置文件值，正是本轮修的
+ *      那条链的原始写法（CodeRabbit 2026-10-29：只抓 `?? env.X` 会漏掉左操作数形态）。
  *   ③ `env.X !== undefined` —— 只判存在、不看空串（遮蔽缺陷的本体）。
  * ②③ 与 ① 会同时对一行命中，这里按行去重（一行只算一处违规）。
+ *
+ * ⚠️ 已归一的值不算违规：`nonEmptyValue(env.QIYU_X)` 后面跟 `??` 是合法的
+ * （先判空再回落），因此左操作数形态要求 `??` **紧跟**变量名（中间出现 `)` 即不匹配）。
  */
 const FINGERPRINTS: Array<[string, RegExp]> = [
   ['手写空串判据（!== \'\'）', new RegExp(String.raw`${ENV_READ}\s*!==\s*''`)],
-  ['裸 ?? 链读环境变量', new RegExp(String.raw`\?\?\s*${ENV_READ}`)],
+  ['裸 ?? 链读环境变量（env 在右）', new RegExp(String.raw`\?\?\s*${ENV_READ}`)],
+  ['裸 ?? 链读环境变量（env 在左）', new RegExp(String.raw`${ENV_READ}\s*\?\?`)],
   ['只判存在（!== undefined）', new RegExp(String.raw`${ENV_READ}\s*!==\s*undefined`)],
 ]
 
@@ -112,12 +119,17 @@ describe('环境变量的空串判据必须只有一处实现（nonEmptyValue）
       // 变量，下一行才手写判据。只扫「同一行」会漏掉它，所以扫描器带变量追踪。
       ['旧 login 间接', "  const envKey = process.env.QIYU_APP_KEY\n  const k = envKey !== undefined && envKey !== '' ? envKey : undefined", 1],
       ['旧 login 直读', "  const k = process.env.QIYU_APP_KEY !== '' ? process.env.QIYU_APP_KEY : undefined", 1],
-      // 事故 2：resolveStoreConfig 的 ?? 链（本轮）
+      // 事故 2：resolveStoreConfig 的 ?? 链（本轮）—— env 在**右**侧
       ['旧 store 链', "  const rawPath = flags.db ?? env.QIYU_DB_PATH ?? (storeBlock.path as string | undefined)", 1],
+      // 同一缺陷的另一面（CodeRabbit 2026-10-29）：env 在**左**侧时，它的空串会遮蔽
+      // 右侧的配置文件值 —— 只抓 `?? env.X` 会把这一形态漏掉。
+      ['旧遮蔽链（env 在左）', "  const rawPath = env.QIYU_DB_PATH ?? storeBlock.path ?? DEFAULTS.relPath", 1],
       // 事故 3：storeArgsFor 只判存在（本轮）
       ['旧 sync 判据', "  if (parsed.values['--db'] === undefined && process.env.QIYU_DB_PATH !== undefined) {", 1],
       // 合法：唯一实现的调用方
       ['合法 nonEmptyValue', "  const p = nonEmptyValue(process.env.QIYU_DB_PATH)", 0],
+      // 合法：先归一再用 ?? 回落（`??` 的左操作数已不是裸 env 读取）
+      ['合法 归一后回落', "  const p = nonEmptyValue(process.env.QIYU_DB_PATH) ?? DEFAULTS.relPath", 0],
       // 合法：把 env 值原样传下去（归一化在 resolveStoreConfig 里做）
       ['合法透传', "    QIYU_DB_PATH: process.env.QIYU_DB_PATH,", 0],
       // 合法：非 QIYU_ 的变量不归这条规则管（npm 的 INIT_CWD 有自己的 trim 口径）
