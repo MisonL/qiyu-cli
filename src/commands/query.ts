@@ -17,7 +17,7 @@
 // `--table` 的 SQL 构造在 `query/table-query.ts`（纯函数，单测不加载 CLI/引擎）：
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import type { SandboxSession } from '../query/sandbox.js'
-import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure } from '../query/errors.js'
+import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, MISSING_TABLE_CAUSES } from '../query/errors.js'
 import { maskQueryRows } from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
@@ -567,10 +567,7 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
         return fail({
           code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
           message: `数据库中缺表：${tableDef.name}（本表在 CLI 的表定义中存在，库里没有）`,
-          hint: '若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
-            + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
-            + '——需重建库（删除库文件后重新 qiyu store init 并重新同步）。'
-            + '用 `qiyu db tables` 查看库中实际有数据的表',
+          hint: MISSING_TABLE_CAUSES + '。用 `qiyu db tables` 查看库中实际有数据的表',
         })
       }
     }
