@@ -15,7 +15,7 @@
 
 import { resolveCredentials } from '../core/credentials.js'
 import type { Credentials } from '../core/credentials.js'
-import { fileCredentials } from '../core/config.js'
+import { fileCredentials, nonEmptyValue } from '../core/config.js'
 
 export interface CredEnv { appKey?: string; appSecret?: string }
 
@@ -35,8 +35,8 @@ export interface ErrorEnvelope {
 
 export type CredOutcome = { ok: true; creds: Credentials } | { ok: false; error: ErrorEnvelope }
 
-/** env 里该字段是否有**非空**值（空串视为未设置 —— shell 里变量未设的典型形态）。 */
-const has = (v: string | undefined): boolean => v !== undefined && v !== ''
+/** env 里该字段是否有**非空**值（空串视为未设置 —— 判据的唯一实现在 core/config.ts）。 */
+const has = (v: string | undefined): boolean => nonEmptyValue(v) !== undefined
 
 export function resolveCredentialsUsingFile(
   env: CredEnv = currentCredentialEnv(),

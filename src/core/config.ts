@@ -268,6 +268,27 @@ export interface ProfileNameChoice {
 }
 
 /**
+ * 「环境变量里的空串 = 未设置」的**唯一实现**（2026-10-29）。
+ *
+ * `export QIYU_DB_PATH=` 是 shell 里「变量没填」的典型形态，不是「把值设成空串」。
+ * `''` 不是 null/undefined，`??` 链会把它当有效值放行 —— 于是它**遮蔽**下一层的真实值：
+ *   · 档名：`QIYU_PROFILE=` 让 `auth login` 把凭证写进 `profiles[""]`（没人读的档）；
+ *   · 库路径：`QIYU_DB_PATH=` 遮蔽配置文件里配好的 `store.path`，命令以「路径不能为空」
+ *     失败，而报错还声称 `store.path` 也是空的（真库实测）。
+ *
+ * 调用方：`resolveProfileName` / `resolveStoreConfig` / `storeArgsFor`（sync install）/
+ * `credentials-source` / `auth login`。新增环境变量读取一律用它，不要手写
+ * `x !== undefined && x !== ''`（`tests/empty-string-single-source.test.ts` 会红）。
+ *
+ * ⚠️ 只有**恰好**空串算未设置；空白串（`'   '`）仍是非法值，由各调用方按自己的规则拒绝。
+ * ⚠️ **显式 flag**（`--db ''`）不走这里：把用户明确给出的空值悄悄换成另一份资源，
+ * 是「静默回落」缺陷本体，不是修复。
+ */
+export function nonEmptyValue(v: string | undefined): string | undefined {
+  return v !== undefined && v !== '' ? v : undefined
+}
+
+/**
  * profile 名的**唯一解析点**：`--profile` > `QIYU_PROFILE` > `defaultProfile` > 内置 `default`。
  *
  * ⚠️ 空串一律当**未设置**：`export QIYU_PROFILE=`（变量未设的典型形态）与
@@ -291,13 +312,11 @@ export function resolveProfileName(opts: {
   envProfile?: string | undefined
   defaultProfile?: string | undefined
 } = {}): ProfileNameChoice {
-  const nonEmpty = (v: string | undefined): string | undefined =>
-    v !== undefined && v !== '' ? v : undefined
-  const flag = nonEmpty(opts.flag)
+  const flag = nonEmptyValue(opts.flag)
   if (flag !== undefined) return { name: flag, source: '--profile' }
-  const env = nonEmpty(opts.envProfile)
+  const env = nonEmptyValue(opts.envProfile)
   if (env !== undefined) return { name: env, source: 'QIYU_PROFILE' }
-  const def = nonEmpty(opts.defaultProfile)
+  const def = nonEmptyValue(opts.defaultProfile)
   if (def !== undefined) return { name: def, source: 'defaultProfile' }
   return { name: 'default' }
 }

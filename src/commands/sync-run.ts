@@ -17,7 +17,7 @@
 //      水位不推，下次 run 从水位续跑（红线 3 钉死用例覆盖）。
 import { openStore } from '../store/index.js'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
-import { fileProfile } from '../core/config.js'
+import { fileProfile, nonEmptyValue } from '../core/config.js'
 import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
 import { RateGate } from '../sync/rate-gate.js'
 import { runTask, runRotated } from '../sync/engine.js'
@@ -177,7 +177,9 @@ function wireCategories(task: SyncTask, robotIds: number[], clock: () => number)
  */
 function robotsFromConfig(configPath: string, profileFlag: string | undefined): number[] {
   try {
-    const r = fileProfile(configPath, profileFlag ?? process.env.QIYU_PROFILE)
+    // 空串口径与 resolveStoreConfig 同源（core/config.ts 的 nonEmptyValue 是唯一实现）：
+    // `--profile`/`QIYU_PROFILE` 的显式空取值不得变成一个名叫空串的档。
+    const r = fileProfile(configPath, nonEmptyValue(profileFlag) ?? nonEmptyValue(process.env.QIYU_PROFILE))
     return Object.keys(r.profile?.robots ?? {})
       .map((k) => Number(k))
       .filter((n) => Number.isInteger(n) && n > 0)

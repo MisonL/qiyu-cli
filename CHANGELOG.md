@@ -9,6 +9,34 @@
 
 ### 修复
 
+- **空串存储环境变量：`QIYU_DB_PATH=` 让配好的 `store.path` 失效，且报错谎称它也是空的**。
+  2026-10-29 真库实测：配置文件里 `store.path` 明明有值，`export QIYU_DB_PATH=`（变量没填的
+  典型形态）时 `store`/`db`/`query`/`sync` 一律以退出码 2 失败，文案是
+  「数据库路径不能为空（--db / QIYU_DB_PATH / store.path 均为空）」—— 三层一起指控，
+  而真正空的只有环境变量那一层；同一个库把变量去掉就工作正常。`QIYU_STORE_BACKEND=`
+  同理：`??` 链把 `''` 当有效值放行，遮蔽配置文件里的 `backend`，报「未知后端：。」
+  （空值渲染成隐形）。修法：环境变量层的空串**一律视为未设置**（与 `QIYU_PROFILE=`、
+  凭证侧的 `has()` 同一口径），照常回落到配置文件 / 内置默认；**显式** `--db ''` /
+  `--backend ''` 仍是用法错误 —— 把用户明确给出的空值悄悄换成另一份资源是静默改道。
+  报错文案改为点名**真正给了空白值的那一层**（`--db` / `QIYU_DB_PATH` / 配置键路径），
+  空白值用 `JSON.stringify` 渲染成可见形态。顺带补上 `store.backend` 的类型守卫
+  （配置写 `123` / `{}` 此前只得到「未知后端：[object Object]」，不点名键路径）。
+  `sync install` 的 `storeArgsFor` 同步修：空串 `QIYU_DB_PATH` / `QIYU_STORE_BACKEND`
+  不再把**回落后的**解析结果固化成 `--db`/`--backend` 烘进 plist/unit ——
+  那等于把「安装当时读到的配置文件值」悄悄升级成显式 flag，之后改配置文件对已装的
+  调度任务永远不生效。
+  测试：`tests/store/config.test.ts` 五例（回落两个方向 / 空白串仍拒绝 / backend 类型守卫 /
+  文案不再谎称三层都空）；`tests/commands/sync.test.ts` 新增调度固化用例（含非空 env
+  仍照常固化的反向断言）；`tests/docs.test.ts` 钉住 README 的实质主张。变异 6 条全红
+  （先确认变异已应用）。
+  同轮把这条口径收敛成**唯一实现** `nonEmptyValue()`（`core/config.ts`）——
+  `resolveProfileName` / `resolveStoreConfig` / `storeArgsFor` / `credentials-source` /
+  `auth login` / `sync-run` 的 robots 兜底 / `skill` 的 `QIYU_SKILL_DIR` 七处共用它，
+  不再各自手写 `x !== undefined && x !== ''`。新增静态漂移守卫
+  `tests/empty-string-single-source.test.ts`：除定义处外，全仓不得对 `QIYU_*` 环境变量
+  手写空串/存在判据（含「先存局部变量再判」的间接形态，那正是 PR #41 的原样事故）。
+  守卫自检双向（三个真实事故的原样文本必须红、合法调用与注释必须放过）。
+
 - **空串档名：写凭证的命令与读凭证的命令解出两个不同的 profile**。`auth whoami` 与
   `auth login` 各自用 `??` 链解析档名，而 `''` 不是 null/undefined、`??` 会把它放行。
   2026-10-29 真库实测两条后果：

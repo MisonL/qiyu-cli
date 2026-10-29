@@ -110,6 +110,11 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 此时 `auth whoami` 的 `source` 报 `mixed`。
 
 存储配置仍是**手工编辑** `~/.config/qiyu/config.json`；也可用 `--db`/`QIYU_DB_PATH` 直接指定库路径。
+⚠️ 空串口径与 profile 一致：`QIYU_DB_PATH=` / `QIYU_STORE_BACKEND=`（`export X=`，即"变量没填"）
+视为**未设置**，照常回落到配置文件里的 `profiles.<name>.store.path` / `profiles.<name>.store.backend`；
+而**显式** `--db ''` / `--backend ''` 是用法错误——把明确给出的空值悄悄换成另一份资源不是回落，是静默改道。
+空白串（`--db '   '`）不是空串，两者都拒绝，且报错点名**真正给了空白值的那一层**
+（旧文案把三个来源一起指控为「均为空」，明明配了值的 `profiles.<name>.store.path` 也在其列）。
 
 配置文件的完整结构（**顶层 / profile / store 三层的键名写错会被拒绝，退出码 2**）：
 
@@ -428,7 +433,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
 路径/名称固化为调度命令的 `--db/--profile/--backend` 参数**（显式 flag 优先；只走配置
 文件或默认值时不固化，调度任务自己读得到 HOME 下的配置文件）。⚠️ 空串视为未设置
 （`export QIYU_PROFILE=` 是"变量没填"的典型形态，不会被固化成 `--profile <空>`——
-那会让每次调度执行都报「--profile 不能为空」）。若凭证走
+那会让每次调度执行都报「--profile 不能为空」）。`QIYU_DB_PATH=` / `QIYU_STORE_BACKEND=`
+同理：**解析结果不固化**——否则等于把"当时读到的配置文件值"悄悄升级成一个显式 flag，
+之后改配置文件对已装的调度任务永远不生效。若凭证走
 `QIYU_APP_KEY`/`QIYU_APP_SECRET`，请确认其对该调度上下文可用——调度条目**不写入任何
 凭证**（秘密进 plist/unit 文件是安全红线）。
 

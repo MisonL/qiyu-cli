@@ -47,6 +47,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { contentHash, MANIFEST, type Manifest } from './install.js'
 import { defaultEntityDir, readEnvByNormalizedKey } from './paths.js'
+import { nonEmptyValue } from '../core/config.js'
 
 /**
  * 安装态四态（brief 接口）：
@@ -409,8 +410,10 @@ export function resolveEntityDirSources(opts: EntityDirOptions): EntityDirResolu
   })
   const flagDir = opts.flagDir?.trim()
   if (flagDir !== undefined && flagDir !== '') return resolve(flagDir, '--dir')
-  const explicit = opts.env.QIYU_SKILL_DIR?.trim()
-  if (explicit !== undefined && explicit !== '') return resolve(explicit, 'QIYU_SKILL_DIR')
+  // 空串口径与全仓同源（core/config.ts 的 nonEmptyValue 是唯一实现）；本处额外先 trim
+  // —— `QIYU_SKILL_DIR='   '` 也是「没填」，而路径不能是空白串。
+  const explicit = nonEmptyValue(opts.env.QIYU_SKILL_DIR?.trim())
+  if (explicit !== undefined) return resolve(explicit, 'QIYU_SKILL_DIR')
   if (opts.testGate !== false) {
     if (readEnvByNormalizedKey(opts.env, DISABLE_PROBE_ENV) !== undefined) {
       return { dir: undefined, source: undefined, decided: false, reason: 'env' }
