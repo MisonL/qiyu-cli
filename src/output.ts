@@ -101,6 +101,78 @@ export function describeArgs(args: readonly string[]): string {
   return args.map((a) => (a.trim() === '' ? `'${a}'` : a)).join('、')
 }
 
+/**
+ * 渲染「恢复命令必须指向**本次使用的库**」的完整命令（唯一实现，2026-10-30）。
+ *
+ * 背景（真库实测）：hint 里写「请先运行：qiyu store init」时，若本次是用 `--db`/
+ * `--profile`/环境变量选了非默认库，逐字执行会作用在**默认库**上：
+ *   · `db describe tickets --db <空库>` → 照 hint 跑 `qiyu store init` → 建出
+ *     `~/.qiyu/duckdb/qiyu.duckdb`，原命令再跑仍报同一句（死循环，实测）；
+ *   · `sync install --db <未同步库>` → 照 hint 跑 `qiyu sync run` → 同步默认库，
+ *     install 仍报 `sync_not_run`。
+ * 修法：点名的命令一律带**本次解析出的绝对路径** `--db <path>`。为什么用解析后的
+ * 路径而不是回显用户给的 flag：选择可能来自配置文件或环境变量（没有 flag 可回显），
+ * 而 `--db` 的优先级高于两者 —— 解析后的路径在任何来源下都精确复现本次目标，
+ * 且是绝对路径，换工作目录也成立。
+ *
+ * `syncRunCommand` 还要回显**档名**（CodeRabbit 2026-10-30 major）：`--db` 只固定库文件，
+ * 而 `sync run` 还从**解析出的档**读 `store.options.knowledgeRobotIds` 与
+ * `profiles.<name>.robots`（robotId 注入面）。实测：同一份 config 下带 `--profile alpha`
+ * 解析出 `options={"knowledgeRobotIds":[1000001]}`、robots `["2000002"]`，不带则两者皆空 ——
+ * 只回显 `--db` 的 hint 会让知识库任务用错 robot 集合。`store init` 不读 options/robots
+ *（只跑迁移），故 `storeInitCommand` 不回显档名。
+ *
+ * ⚠️ 参数值经 `shellArg` 渲染（Python `shlex.quote` 同一安全集）：路径/档名含空白或
+ * shell 元字符时用单引号包裹，否则裸渲染保持可读。**为什么必须引号**：hint 是给 Agent
+ * 复制执行的命令 —— 未引号的 `--db /tmp/x; touch /tmp/marker; #` 粘进 shell 会真的
+ * 执行 `touch`（CodeRabbit 2026-10-30 major）。
+ * ⚠️ 引号方言按平台选择（CodeRabbit 2026-10-30 第二条 major，pwsh 实测复现注入）：
+ * POSIX shell 里单引号内的 `'` 转义为 `'\''`；**PowerShell 的反斜杠不是转义符**，
+ * 同一串会让引号提前闭合、后面的 `; touch …` 真的执行 —— win32 改用 PowerShell 方言
+ *（`''` 转义内嵌单引号）。win32 的 hint 面向 PowerShell（Windows 现代默认 shell）；
+ * cmd.exe 不识别单引号、`&` 在引号外仍会切命令，**不要把 win32 的 hint 原样粘进
+ * cmd.exe**。这两个边界都如实记录，不假装一种引号能通吃所有 shell。
+ */
+export function storeInitCommand(path: string): string {
+  return `qiyu store init --db ${shellArg(path)}`
+}
+
+/**
+ * `qiyu sync run` 恢复命令，指向本次解析出的库与档（口径见 `storeInitCommand`）。
+ * `profileFlag`：本次**有显式来源**的档名（flag / QIYU_PROFILE / defaultProfile，
+ * 由 `resolveStoreConfig().profileFlag` 给出）；内置 default 不传 —— 显式
+ * `--profile default` 会触发「点名档必须存在」守卫，在 profiles 非空且无 default 档时
+ * 反而让恢复命令失败。
+ */
+export function syncRunCommand(path: string, profileFlag?: string): string {
+  return `qiyu sync run --db ${shellArg(path)}`
+    + (profileFlag === undefined ? '' : ` --profile ${shellArg(profileFlag)}`)
+}
+
+/**
+ * 单个参数值的 shell 渲染：安全集内裸渲染，其余单引号包裹。
+ * POSIX 安全集取自 Python `shlex.quote`（`[A-Za-z0-9_@%+=:,./-]`）；**win32 安全集更窄**
+ *（去掉 `@` `%` `,`）—— PowerShell 下裸 `a,b` 会变成 `Object[]`、前导 `@` 是 splatting、
+ * `%` 是 ForEach-Object 别名（pwsh 实测：`--profile a,b` → argc=2 且 arg 是数组）。
+ * 引号内的转义**方言按平台区分**：
+ *   · POSIX 用 `'\''`（关引号→转义单引号→重开引号）；
+ *   · PowerShell 用 `''`（反斜杠不是转义符，POSIX 写法会被 pwsh 解析成「提前闭合引号 +
+ *     `;` 切命令」，2026-10-30 pwsh 实测能执行注入载荷）。
+ * ⚠️ PowerShell 还把 **4 个弯引号 `‘ ’ ‚ ‛`（U+2018/2019/201A/201B）当作单引号定界符**
+ *（pwsh 实测：`'/tmp/a’; echo X; #'` 提前闭合并执行 echo）—— win32 分支同样翻倍它们，
+ * 只处理 ASCII `'` 会漏（CodeRabbit 2026-10-30 minor，已实测复现）。
+ * ⚠️ 解析出的路径恒为绝对路径，不含 `~`，故无「引号会阻止波浪号展开」的问题。
+ */
+export function shellArg(v: string, platform: string = process.platform): string {
+  const win = platform === 'win32'
+  const safe = win ? /^[A-Za-z0-9_+=:./-]+$/ : /^[A-Za-z0-9_@%+=:,./-]+$/
+  if (safe.test(v)) return v
+  const escaped = win
+    ? v.replace(/['‘’‚‛]/g, (c) => c + c)
+    : v.replace(/'/g, `'\\''`)
+  return `'${escaped}'`
+}
+
 /** 把不受信文本（调用方 body 的字段名等）中的终端控制字符抹成占位，防止 stderr 注入 ANSI/OSC 序列。 */
 export { sanitizeControlChars, sanitizeMessage, stripSqlEcho } from './core/sanitize.js'
 // usageFail 的出口净化要用（re-export 不建立本地绑定）。

@@ -10,13 +10,13 @@
 //     每条带 source；`observed` 是本地 payload 的数据分布，不是语义；
 //   · `-1` 是「该窗口没有匹配到数据」的哨兵（设计稿实测，厂商未文档化）——
 //     sentinel 恒在，且 min/max 一律排除 -1（否则 Agent 会报出 -100%）。
-import { thrownToQueryExit, suggestNames, MISSING_TABLE_CAUSES } from '../query/errors.js'
+import { thrownToQueryExit, suggestNames, missingTableCauses } from '../query/errors.js'
 import { METRIC_CATALOG, REPORT_TABLES, declareMetric } from '../query/metric-catalog.js'
 import type { MetricDecl, MetricSource, MetricUnit } from '../query/metric-catalog.js'
 import { TABLES } from '../store/schema.js'
 import { openGuardedSession } from './db.js'
 import { parseStoreFlags } from './store-flags.js'
-import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
+import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand } from '../output.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
@@ -288,7 +288,7 @@ async function statsFields(argv: string[]): Promise<number> {
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库中缺表：${table}（${opened.dbPath}）`,
-        hint: MISSING_TABLE_CAUSES,
+        hint: missingTableCauses(opened.dbPath, opened.profileFlag),
       })
     }
 
@@ -340,7 +340,7 @@ async function statsFields(argv: string[]): Promise<number> {
     if (observed.length === 0) {
       const n = Number(shape.total)
       if (n === 0) {
-        warnings.push('该表无数据；先运行 `qiyu sync run`')
+        warnings.push('该表无数据；先运行 `' + syncRunCommand(opened.dbPath, opened.profileFlag) + '`')
       } else {
         warnings.push(`该表有 ${n} 行，但 payload 均无可观测字段（payload 为 NULL / 空对象 / 非对象）。`
           + '字段自描述需要 payload 内的 JSON 键；请确认同步写入的是报表原始 JSON')

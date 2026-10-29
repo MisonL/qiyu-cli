@@ -25,7 +25,7 @@ import { dbCommand } from '../src/commands/db.js'
 import { queryCommand } from '../src/commands/query.js'
 import { statsCommand } from '../src/commands/stats.js'
 import { createDuckDbStore } from '../src/store/duckdb.js'
-import { MISSING_TABLE_CAUSES } from '../src/query/errors.js'
+import { missingTableCauses } from '../src/query/errors.js'
 import type { Store } from '../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/db.test.ts 同款放宽）。
@@ -98,7 +98,7 @@ describe('缺表成因的行为口径（真 DuckDB）', () => {
 
     for (const [where, text] of texts) {
       // 四个出口必须逐字共用同一份成因与对策（拷贝漂移在这里暴露）
-      expect(text, `${where} 未使用共享的 MISSING_TABLE_CAUSES`).toContain(MISSING_TABLE_CAUSES)
+      expect(text, `${where} 未使用共享的 missingTableCauses`).toContain(missingTableCauses(dbPath()))
       // 错误成因不得复活：删表与「未同步」无关，Agent 不该被指去跑同步。
       // 用宽判据（只要出现「未同步」就红），防止把「未同步或未建库」改写成
       // 「可能未同步」这类同义复活。
@@ -108,9 +108,9 @@ describe('缺表成因的行为口径（真 DuckDB）', () => {
       expect(text, `${where} 缺少「store init 不会重建」的对策`).toContain('store init 不会重建该表')
       expect(text, `${where} 缺少「需重建库」的修复路径`).toContain('需重建库')
       expect(text, `${where} 未要求重建前先备份`).toContain('先备份库文件')
-      // 恢复命令必须沿用本次的存储选择：hint 会出现在 `--db <自定义路径>` 的输出里，
+      // 恢复命令必须指向本次的库：hint 会出现在 `--db <自定义路径>` 的输出里，
       // 只说「运行 qiyu store init」会让 Agent 初始化默认库，选中的库依然缺失
-      expect(text, `${where} 未要求沿用本次的 --db/--profile/--backend`).toContain('与本次相同的 --db')
+      expect(text, `${where} 的恢复命令未带本次的 --db`).toContain('--db ' + dbPath())
     }
   })
 })

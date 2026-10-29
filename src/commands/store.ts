@@ -3,7 +3,9 @@ import { statSync, lstatSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
-import { ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty } from '../output.js'
+import {
+  ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty, storeInitCommand,
+} from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
 import { storeFieldNotes } from './store-notes.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
@@ -195,7 +197,8 @@ export async function storeCommand(argv: string[]): Promise<number> {
     const code = (e as { code?: string }).code
     if (code === 'ENOENT') {
       return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库文件不存在：${config.path}`, hint: '数据库尚未初始化。请先运行：qiyu store init' })
+        message: `数据库文件不存在：${config.path}`,
+        hint: '数据库尚未初始化。请先运行：' + storeInitCommand(config.path) })
       // ⚠️ 修复批 2 裁定：D 交付后本 hint **不改指** `qiyu sync run`（设计稿 §9.5 的
       // 「D 交付后改指 sync run」不再采纳）——「初始化存储」的最小命令是 store init，
       // 且 sync status/verify 是只读命令，指它们跑一次写操作并非必要。
@@ -219,7 +222,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     if (!names.includes('schema_version')) {
       return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: names.length > 0 ? '目标数据库不是本 CLI 创建的，请换 --db 路径' : '请运行：qiyu store init' })
+        hint: names.length > 0 ? '目标数据库不是本 CLI 创建的，请换 --db 路径' : '请运行：' + storeInitCommand(config.path) })
     }
     const tables: Array<{ name: string; rows: number }> = []
     for (const n of names) tables.push({ name: n, rows: await store.count(n) })

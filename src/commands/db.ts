@@ -16,18 +16,21 @@
 //   · `db describe` 的列清单同样以 `TABLES` 为权威；声明有而库中无的表**仍输出声明
 //     元数据**（`row_count`/`time_range` 为 null + warning，裁决 R5）——Agent 需要知道
 //     该表应该有什么列，以便核对列漂移。缺表的成因不是「未同步或未建库」（实测两个都
-//     到不了该分支），唯一口径见 `MISSING_TABLE_CAUSES`。
+//     到不了该分支），唯一口径见 `missingTableCauses()`。
 import { statSync } from 'node:fs'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
-import { suggestNames, thrownToQueryExit, MISSING_TABLE_CAUSES } from '../query/errors.js'
+import { suggestNames, thrownToQueryExit, missingTableCauses } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
 import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
-import { ok, fail, usageFail, failFromTagged, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
+import {
+  ok, fail, usageFail, failFromTagged, sanitizeControlChars, describeArgs, setPretty,
+  storeInitCommand,
+} from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
 import { describeFieldNotes, tablesFieldNotes } from './db-notes.js'
 import type { StoreFlags } from './store-flags.js'
@@ -84,7 +87,7 @@ export function statGuard(path: string): number | null {
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库文件不存在：${path}`,
-        hint: '数据库尚未初始化。请先运行：qiyu store init',
+        hint: '数据库尚未初始化。请先运行：' + storeInitCommand(path),
       })
     }
     return fail({
@@ -213,13 +216,16 @@ function dirtyTimeWarning(table: string, column: string, n: number): string {
  */
 export async function openGuardedSession(
   flags: StoreFlags,
-): Promise<{ session: SandboxSession; dbPath: string } | { exit: number }> {
+): Promise<{ session: SandboxSession; dbPath: string; profileFlag?: string } | { exit: number }> {
   let config: StoreConfig
+  let profileFlag: string | undefined
   try {
-    config = resolveStoreConfig({
+    const resolved = resolveStoreConfig({
       flags: { db: flags.db, profile: flags.profile, backend: flags.backend },
       env: currentStoreEnv(),
-    }).config
+    })
+    config = resolved.config
+    profileFlag = resolved.profileFlag
   } catch (e) {
     // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
     // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
@@ -252,7 +258,7 @@ export async function openGuardedSession(
           message: `数据库结构不完整（缺表）：${config.path}`,
           hint: names.length > 0
             ? '目标数据库不是本 CLI 创建的，请换 --db 路径'
-            : '空库（无任何表）。请先运行：qiyu store init',
+            : '空库（无任何表）。请先运行：' + storeInitCommand(config.path),
         }),
       }
     }
@@ -260,7 +266,7 @@ export async function openGuardedSession(
     await session.close()
     return { exit: thrownToQueryExit(e, TABLES) }
   }
-  return { session, dbPath: config.path }
+  return { session, dbPath: config.path, ...(profileFlag !== undefined ? { profileFlag } : {}) }
 }
 
 async function dbTables(argv: string[]): Promise<number> {
@@ -295,9 +301,9 @@ async function dbTables(argv: string[]): Promise<number> {
       // ⚠️ 不得承诺 store init 一定能修（审查 Important #1）：init 只重放
       // `version > MAX(version)` 的迁移，已迁移到最新版后被 DROP 的表**不会**被
       // 重建（迁移已跳过，返回 ok 而表仍缺）——那是「成功但无效」的修复。
-      // 成因与对策的唯一实现见 MISSING_TABLE_CAUSES（四个出口共用）。
+      // 成因与对策的唯一实现见 missingTableCauses()（四个出口共用）。
       warnings.push(`声明有而库中无：${declaredMissing.join('、')}。`
-        + '这些表不出现在 tables 中。' + MISSING_TABLE_CAUSES)
+        + '这些表不出现在 tables 中。' + missingTableCauses(opened.dbPath, opened.profileFlag))
     }
     const undeclared = actualNames.filter((n) => !declaredSet.has(n)).sort()
     if (undeclared.length > 0) {
@@ -442,9 +448,9 @@ async function dbDescribe(argv: string[]): Promise<number> {
       // 才能核对是不是列漂移）。此时 row_count/time_range 无从得知，置 null。
       // ⚠️ 成因文案**不得**再写「未同步或未建库」（2026-10-29 实测修正，两个成因都到不了
       // 这个分支：未同步的库 25 张声明表全在、库文件缺失/零表早在 openGuardedSession 里
-      // 报 store_not_initialized）。与 db tables/query/stats 共用 MISSING_TABLE_CAUSES。
+      // 报 store_not_initialized）。与 db tables/query/stats 共用 missingTableCauses()。
       warnings.push(`表 ${table.name} 在库中不存在（声明有而库中无）；以下为声明元数据`
-        + '（row_count/time_range 无法得知，置 null）。' + MISSING_TABLE_CAUSES)
+        + '（row_count/time_range 无法得知，置 null）。' + missingTableCauses(opened.dbPath, opened.profileFlag))
     } else {
       const r = await session.run(`SELECT COUNT(*) AS n FROM "${table.name}"`)
       // ⚠️ COUNT 是 BIGINT，经 getRowObjectsJson() 是**字符串** —— 必须 Number() 收敛。

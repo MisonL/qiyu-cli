@@ -17,7 +17,7 @@
 //
 // ⚠️ 分层约束（spec §5.1）：不 import `sync/`、`commands/`。`output.ts` 是 CLI 输出层
 // （信封与退出码），不是命令层，可以 import。
-import { fail, sanitizeMessage, stripSqlEcho } from '../output.js'
+import { fail, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand } from '../output.js'
 import type { TableDef } from '../store/schema.js'
 
 export interface QueryFailure {
@@ -186,16 +186,17 @@ const COLUMN_NAME_RE = /Binder Error: Referenced column "([^"]+)" (?:was )?not f
  * ⚠️ 「重建库」是**破坏性**动作（CodeRabbit 2026-10-29 major）：库中可能有 `db tables`
  * 警告过的「未声明表」，也可能有超出 API 回补窗口的本地历史——删除库文件后，重建 +
  * 重新同步都拿不回来。文案必须要求先备份再删除。
- * ⚠️ 所有恢复命令必须**沿用本次的存储选择**（CodeRabbit 2026-10-29 major）：hint 出现在
- * `query --table --db <自定义路径>` 等命令的输出里，若只说「运行 qiyu store init」，
- * Agent 会初始化**默认库**，选中的库依然缺失。
+ * ⚠️ 命令必须**指向本次的库**（2026-10-30 真库实测）：这些 hint 出现在
+ * `--db <自定义路径>` 的输出里，裸 `qiyu store init` 会建**默认库**、原命令仍缺表。
+ * 渲染走 `storeInitCommand(path)` / `syncRunCommand(path)`（output.ts 的唯一实现）。
  */
-export const MISSING_TABLE_CAUSES =
-  '若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
-  + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
-  + '——需重建库：先备份库文件，再删除并重新 qiyu store init、重新同步'
-  + '（以上命令都要带与本次相同的 --db/--profile/--backend 选择；'
-  + '未声明表与超出 API 回补窗口的本地历史无法靠重建恢复，删除前先确认）'
+export function missingTableCauses(path: string, profileFlag?: string): string {
+  return '若为建库未完成（迁移未跑完），运行 ' + storeInitCommand(path) + ' 可补建缺失的迁移；'
+    + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
+    + '——需重建库：先备份库文件，再删除并重新 ' + storeInitCommand(path) + '、'
+    + syncRunCommand(path, profileFlag)
+    + '（未声明表与超出 API 回补窗口的本地历史无法靠重建恢复，删除前先确认）'
+}
 
 /** 表不存在的中文消息 + 候选 hint（原生分支与 cause 补算分支共用，裁决 R9）。 */
 function tableNotFound(name: string, msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
