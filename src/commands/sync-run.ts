@@ -28,7 +28,7 @@ import { readWatermark } from '../sync/state.js'
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
-import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty } from '../output.js'
+import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty, storeInitCommand } from '../output.js'
 import { thrownToExit } from './store.js'
 import { runFieldNotes } from './sync-notes.js'
 import type { Store } from '../store/types.js'
@@ -225,7 +225,7 @@ export function taskOut(r: TaskRunResult, watermark: string | null, lastSyncedAt
  * `sync run → store init → sync run` 死循环，且与 `store status`/`db tables` 对同一失败
  * 给出的 hint 互相矛盾。现在只在**没有**底层 hint 时补缺省建议。
  */
-function storeInitFail(e: unknown): number {
+function storeInitFail(e: unknown, path: string): number {
   const err = e as { kind?: string; message?: string; retryable?: boolean; hint?: string }
   const msg = err.message ?? String(e)
   if (err.kind === 'store_not_initialized' || /not a valid DuckDB database/i.test(msg)) {
@@ -234,7 +234,7 @@ function storeInitFail(e: unknown): number {
     const hint = err.hint
       ?? (/not a valid DuckDB database/i.test(msg)
         ? '该路径已存在且不是 DuckDB 数据库，请换 --db 路径'
-        : '数据库尚未初始化。请先运行：qiyu store init')
+        : '数据库尚未初始化。请先运行：' + storeInitCommand(path))
     return fail({
       code: 'store_not_initialized', kind: 'store_not_initialized',
       retryable: false,
@@ -354,7 +354,7 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     try {
       store = await openStore(resolved.config, 'rw')
       await store.init()
-    } catch (e) { return storeInitFail(e) }
+    } catch (e) { return storeInitFail(e, resolved.config.path) }
 
     // —— 区间合成（时钟注入点：parseTimeArg 接受 clock；Nd/yesterday 已带区间，
     //     YYYY-MM-DD/ISO 只给起点 → end=clock 当前或配对的另一端）——

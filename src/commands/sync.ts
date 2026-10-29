@@ -35,7 +35,10 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import { tableByName } from '../store/schema.js'
 import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
-import { ok, fail, usageFail, failFromTagged, setPretty, describeArgs } from '../output.js'
+import {
+  ok, fail, usageFail, failFromTagged, setPretty, describeArgs,
+  storeInitCommand, syncRunCommand,
+} from '../output.js'
 import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
 import {
@@ -218,7 +221,7 @@ function statGuard(path: string): number | null {
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库文件不存在：${path}`,
-        hint: '数据库尚未初始化。请先运行：qiyu store init',
+        hint: '数据库尚未初始化。请先运行：' + storeInitCommand(path),
       })
     }
     return fail({
@@ -255,7 +258,7 @@ async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?
         message: `数据库结构不完整（缺表）：${config.path}`,
         hint: names.length > 0
           ? '目标数据库不是本 CLI 创建的，请换 --db 路径'
-          : '空库（无任何表）。请先运行：qiyu store init',
+          : '空库（无任何表）。请先运行：' + storeInitCommand(config.path),
       }) }
     }
     return { store }
@@ -410,14 +413,15 @@ async function syncVerify(argv: string[]): Promise<number> {
       if (st === undefined) {
         drift.push({
           kind: 'not_synced',
-          detail: 'sync_state 无该任务记录（从未同步）。请先运行：qiyu sync run',
+          detail: 'sync_state 无该任务记录（从未同步）。请先运行：' + syncRunCommand(resolved.path),
         })
       } else if (!stateConsistent) {
         drift.push({
           kind: 'state_pending',
           detail: `sync_state.range_status=${st.rangeStatus ?? 'null'}（最后一次运行未完成或中断）。`
             + (t.kind === 'windowed'
-              ? 'windowed 任务不做上游全量重拉（成本高）：核对方式为本地行数与 sync_state 成功状态一致性——重跑 qiyu sync run 补全后再 verify。'
+              ? 'windowed 任务不做上游全量重拉（成本高）：核对方式为本地行数与 sync_state 成功状态一致性——重跑 '
+                + syncRunCommand(resolved.path) + ' 补全后再 verify。'
               : '快照任务将以上游取数核对本地行数。'),
         })
       }
@@ -544,7 +548,7 @@ async function probeSynced(config: Parameters<typeof openStore>[0], path: string
       return fail({
         code: 'sync_not_run', kind: 'sync_not_run', retryable: false,
         message: '尚未成功同步过任何任务（sync_state 无 range_status=complete 且无 last_synced_at 的记录）',
-        hint: '安装调度前请先跑通一次同步：qiyu sync run',
+        hint: '安装调度前请先跑通一次同步：' + syncRunCommand(path),
       })
     }
     return null

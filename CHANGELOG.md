@@ -9,6 +9,32 @@
 
 ### 修复
 
+- **恢复命令的 hint 不带存储选择：照做会在默认库上建库/同步，原问题原样保留**。
+  2026-10-30 真库实测：`db describe tickets --db <空库>` 的 hint 是「请先运行：
+  qiyu store init」—— 逐字执行会在 `~/.qiyu/duckdb/qiyu.duckdb` 建出**默认库**，
+  原命令重跑仍报同一句（死循环）；`sync install --db <未同步库>` 的 hint
+  「请先运行：qiyu sync run」同理：同步的是默认库，install 仍报 `sync_not_run`。
+  这与上一条 CodeRabbit 指出的 `MISSING_TABLE_CAUSES` 是同一缺陷族 —— 上一条只修了
+  `db describe` 路径的文案，其余出口仍是裸命令。
+  涉及 12 处出口：`store init` 七处（db 的 statGuard/openGuardedSession、sync 的
+  statGuard/openRo、store status 两处、sync run 的 storeInitFail）、`sync run` 建议五处
+  （query/stats 空表警告、sync verify 的 not_synced 与 state_pending、sync install 前置探测），
+  以及 `missingTableCauses` 的四处。
+  修法：`output.ts` 新增 `storeInitCommand(path)` / `syncRunCommand(path)` 唯一实现，
+  一律渲染成带**本次解析出的绝对路径**的 `--db <path>` —— `--db` 优先级高于环境变量与
+  配置文件、绝对路径不受工作目录影响，任何来源的存储选择都能被精确复现；
+  `MISSING_TABLE_CAUSES` 常量同步改为 `missingTableCauses(path)` 函数。
+  ⚠️ 边界（如实记录）：① `sync run` 的 storeInitFail 缺省分支在当前错误源下**不可达**
+  （duckdb 的 `store_not_initialized` 都带 hint，其余失败落到「不是 DuckDB 文件」分支）——
+  给它带路径是防御性的，变异只有静态守卫会红；② 只读诊断提示（`qiyu db tables` /
+  `qiyu db describe` / `qiyu query --sql`）仍是无选择的裸命令（多在 query/ 纯层产生、
+  拿不到存储位置），跟随错误选择**读**错库同样误导，留待后续单独处理。
+  测试：新增 `tests/store-hint-selection.test.ts` —— 空库六出口 / 缺库 / 空表 /
+  verify 的 not_synced 与 state_pending / install 共 5 条真库用例（空库与缺库端到端
+  验证「照 hint 做 → 原命令收敛、默认库不被创建」），加静态漂移守卫（裸恢复命令 hint
+  指纹 + 自检：5 条事故原文必红、4 条修复形态放过）。变异 8 条：7 条红，1 条
+  （storeInitFail 缺省分支）如实记录为行为层不可达、仅静态守卫红。
+
 - **`db describe` 缺表时给的成因是错的：`表 X 在库中不存在（未同步或未建库）`——
   两个成因都到不了这个分支**。2026-10-29 真库实测：
   ① 「未同步」不产生缺表 —— `store init` 的迁移一次建全部 25 张声明表，从未同步过的库

@@ -101,6 +101,35 @@ export function describeArgs(args: readonly string[]): string {
   return args.map((a) => (a.trim() === '' ? `'${a}'` : a)).join('、')
 }
 
+/**
+ * 渲染「恢复命令必须指向**本次使用的库**」的完整命令（唯一实现，2026-10-30）。
+ *
+ * 背景（真库实测）：hint 里写「请先运行：qiyu store init」时，若本次是用 `--db`/
+ * `--profile`/环境变量选了非默认库，逐字执行会作用在**默认库**上：
+ *   · `db describe tickets --db <空库>` → 照 hint 跑 `qiyu store init` → 建出
+ *     `~/.qiyu/duckdb/qiyu.duckdb`，原命令再跑仍报同一句（死循环，实测）；
+ *   · `sync install --db <未同步库>` → 照 hint 跑 `qiyu sync run` → 同步默认库，
+ *     install 仍报 `sync_not_run`。
+ * 修法：点名的命令一律带**本次解析出的绝对路径** `--db <path>`。为什么用解析后的
+ * 路径而不是回显用户给的 flag：选择可能来自配置文件或环境变量（没有 flag 可回显），
+ * 而 `--db` 的优先级高于两者 —— 解析后的路径在任何来源下都精确复现本次目标，
+ * 且是绝对路径，换工作目录也成立。
+ *
+ * ⚠️ 路径按仓库既有风格裸渲染（不引号）。含空白的路径被 shell 拆开时会**响亮地**
+ * 失败（未知参数/文件不存在），不会静默作用到另一个库。
+ * ⚠️ 边界（本轮未覆盖）：只读诊断提示（`qiyu db tables` / `qiyu db describe` /
+ * `qiyu query --sql`）仍是无选择的裸命令 —— 它们大多在 query/ 纯层产生、拿不到
+ * 存储位置，跟在错误选择后面**读**错库同样会误导，留待后续单独处理。
+ */
+export function storeInitCommand(path: string): string {
+  return `qiyu store init --db ${path}`
+}
+
+/** `qiyu sync run` 恢复命令，指向本次解析出的库（口径见 `storeInitCommand`）。 */
+export function syncRunCommand(path: string): string {
+  return `qiyu sync run --db ${path}`
+}
+
 /** 把不受信文本（调用方 body 的字段名等）中的终端控制字符抹成占位，防止 stderr 注入 ANSI/OSC 序列。 */
 export { sanitizeControlChars, sanitizeMessage, stripSqlEcho } from './core/sanitize.js'
 // usageFail 的出口净化要用（re-export 不建立本地绑定）。

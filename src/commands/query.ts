@@ -17,7 +17,7 @@
 // `--table` 的 SQL 构造在 `query/table-query.ts`（纯函数，单测不加载 CLI/引擎）：
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import type { SandboxSession } from '../query/sandbox.js'
-import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, MISSING_TABLE_CAUSES } from '../query/errors.js'
+import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, missingTableCauses } from '../query/errors.js'
 import { maskQueryRows } from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
@@ -28,7 +28,7 @@ import {
 import type { BuiltTableQuery } from '../query/table-query.js'
 import { openGuardedSession } from './db.js'
 import { queryFieldNotes } from './query-notes.js'
-import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty } from '../output.js'
+import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand } from '../output.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -298,6 +298,8 @@ function zeroRowWarning(
 
 interface TableRunInput {
   table: TableDef
+  /** 本次解析出的库路径（空表 warning 的 sync run 建议必须指回它，见 output.ts）。 */
+  dbPath: string
   since?: number
   until?: number
   groupBy: string[]
@@ -394,7 +396,7 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     // 只有「库中缺列」漂移（plan.warnings 只在给了时间过滤时非空，那走上一分支）——
     // 缺列说的是 schema、空表说的是数据，两件独立事实都该说；压掉后者 Agent 会把
     // 「0 行」误读成缺列的副作用。
-    warnings.push('该表无数据；先运行 `qiyu sync run`')
+    warnings.push('该表无数据；先运行 `' + syncRunCommand(input.dbPath) + '`')
   }
 
   // 窗口内部空洞（端到端场景 F4）：iso-day 表 + 完整区间时，比较「区间应覆盖的自然日数」
@@ -567,14 +569,15 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
         return fail({
           code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
           message: `数据库中缺表：${tableDef.name}（本表在 CLI 的表定义中存在，库里没有）`,
-          hint: MISSING_TABLE_CAUSES + '。用 `qiyu db tables` 查看库中实际有数据的表',
+          hint: missingTableCauses(opened.dbPath) + '。用 `qiyu db tables` 查看库中实际有数据的表',
         })
       }
     }
 
     if (tableDef !== undefined) {
       return await runTableQuery(session, {
-        table: tableDef, since: sinceMs, until: untilMs, groupBy: flags.groupBy,
+        table: tableDef, dbPath: opened.dbPath,
+        since: sinceMs, until: untilMs, groupBy: flags.groupBy,
         limit, timeoutMs, noMask: flags.noMask, now: nowMs,
       })
     }

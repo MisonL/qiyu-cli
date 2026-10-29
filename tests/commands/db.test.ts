@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { dbCommand } from '../../src/commands/db.js'
-import { MISSING_TABLE_CAUSES } from '../../src/query/errors.js'
+import { missingTableCauses } from '../../src/query/errors.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { TABLES, MIGRATIONS } from '../../src/store/schema.js'
 import type { Store } from '../../src/store/types.js'
@@ -566,10 +566,12 @@ describe('db describe', () => {
     // （store init 建全部声明表 → 未同步的库 25 张全在；缺库/空库在 openGuardedSession
     // 里已是 store_not_initialized）。与 db tables/query/stats 共用 MISSING_TABLE_CAUSES。
     expect(text).not.toMatch(/未同步/)
-    expect(text).toContain(MISSING_TABLE_CAUSES)
+    expect(text).toContain(missingTableCauses(dbPath()))
     // 关键对策必须在场：被删的表 store init 不会重建，Agent 不能靠「再同步一次」修
     expect(text).toContain('store init 不会重建该表')
     expect(text).toContain('需重建库')
+    // 恢复命令必须指向本次的库（否则照 hint 跑会建默认库，见 output.ts）
+    expect(text).toContain('--db ' + dbPath())
     expect(meta().notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
   })
 
