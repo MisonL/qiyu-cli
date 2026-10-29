@@ -10,7 +10,7 @@
 //     每条带 source；`observed` 是本地 payload 的数据分布，不是语义；
 //   · `-1` 是「该窗口没有匹配到数据」的哨兵（设计稿实测，厂商未文档化）——
 //     sentinel 恒在，且 min/max 一律排除 -1（否则 Agent 会报出 -100%）。
-import { thrownToQueryExit, suggestNames } from '../query/errors.js'
+import { thrownToQueryExit, suggestNames, MISSING_TABLE_CAUSES } from '../query/errors.js'
 import { METRIC_CATALOG, REPORT_TABLES, declareMetric } from '../query/metric-catalog.js'
 import type { MetricDecl, MetricSource, MetricUnit } from '../query/metric-catalog.js'
 import { TABLES } from '../store/schema.js'
@@ -288,9 +288,7 @@ async function statsFields(argv: string[]): Promise<number> {
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库中缺表：${table}（${opened.dbPath}）`,
-        hint: '若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
-          + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
-          + '——需重建库（删除库文件后重新 qiyu store init 并重新同步）',
+        hint: MISSING_TABLE_CAUSES,
       })
     }
 

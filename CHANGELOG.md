@@ -9,6 +9,28 @@
 
 ### 修复
 
+- **`db describe` 缺表时给的成因是错的：`表 X 在库中不存在（未同步或未建库）`——
+  两个成因都到不了这个分支**。2026-10-29 真库实测：
+  ① 「未同步」不产生缺表 —— `store init` 的迁移一次建全部 25 张声明表，从未同步过的库
+  表数仍是 25、`db describe tickets` 给出 `row_count: 0` 且无缺表警告（`sync run` 自身
+  也先调 `store.init()`）；② 「未建库」在这个分支之前就被拦下 —— 库文件不存在或零表时
+  `openGuardedSession` 早已返回 `store_not_initialized`（退出码 1，hint 指 `store init`）。
+  Agent 照这句话会去「先同步一次」，而对被删的表那只会撞 `Catalog Error: Table with name
+  tickets does not exist!`——`store init` 也只重放 `version > MAX(version)` 的迁移，
+  已迁移库上 DROP 掉的表返回 ok 却仍然缺（实测）。
+  同一份事实的另外三个出口（`db tables` 的 warning、`query --table` 与 `stats fields` 的
+  hint）早就写对了两条真实成因与对策，只有 `db describe` 分叉——正是本仓库一直在消除的
+  「同一规则多处拷贝」。
+  修法：两句话提取为 `src/query/errors.ts` 的 `MISSING_TABLE_CAUSES`（唯一实现），
+  四个出口共用；`db describe` 的文案改为「声明有而库中无 …… （row_count/time_range
+  无法得知，置 null）」+ 该共享成因（旧措辞不得复活，因为它指向一个不存在的动作）。
+  测试：新增 `tests/missing-table-causes.test.ts`——行为层在真 DuckDB 上删表，断言四个
+  出口逐字共用同一份成因、都不得出现「未同步」、都给出「store init 不会重建」与
+  「需重建库」；另有「从未同步的库无缺表警告」的正面用例；漂移层静态扫描 `src/`
+  （注释除外），成因字符串只许出现在 `errors.ts`，附自检用例防止守卫退化成恒真。
+  `tests/commands/db.test.ts` 的 R5 用例补钉共享文案与两条对策。变异 3 条红
+  （改回假成因 / stats 内联拷贝 / 把「不会重建」改成「会重建」），无等价变异。
+
 - **`sync run --since ''` / `--until ''` 被静默当成「没给区间」，`--full --since ''`
   因此绕过互斥守卫跑了一次全量重刷**。2026-10-29 真库实测：判据此前是**真值**
   （`flags['--since'] || flags['--until']`），而 `''` 是假值 —— 于是显式给出的空白取值

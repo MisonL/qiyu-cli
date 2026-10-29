@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { dbCommand } from '../../src/commands/db.js'
+import { MISSING_TABLE_CAUSES } from '../../src/query/errors.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { TABLES, MIGRATIONS } from '../../src/store/schema.js'
 import type { Store } from '../../src/store/types.js'
@@ -549,7 +550,7 @@ describe('db describe', () => {
     const d = data() as DescribeOut
     expect(d.row_count).toBeNull()
     expect(d.time_range).toBeNull()
-    // 声明元数据照常：Agent 需要知道该表「应该」有什么列，才能判断是没同步还是没建库
+    // 声明元数据照常：Agent 需要知道该表「应该」有什么列，才能核对列漂移
     expect(d.columns).toHaveLength(sessionsDef().columns.length)
     expect(d.pii_columns).toEqual(SESSIONS_PII)
     expect(d.time_column).toEqual({ name: 'startTime', kind: 'epoch-ms' })
@@ -559,8 +560,16 @@ describe('db describe', () => {
     expect(warnings).toHaveLength(1)
     const text = warnings.join('\n')
     expect(text).toMatch(/sessions/)
-    expect(text).toMatch(/不存在/)
+    expect(text).toMatch(/在库中不存在/)
     expect(text).toMatch(/声明元数据/)
+    // ⚠️ 2026-10-29 实测修正：旧文案「未同步或未建库」两个成因都到不了该分支
+    // （store init 建全部声明表 → 未同步的库 25 张全在；缺库/空库在 openGuardedSession
+    // 里已是 store_not_initialized）。与 db tables/query/stats 共用 MISSING_TABLE_CAUSES。
+    expect(text).not.toMatch(/未同步/)
+    expect(text).toContain(MISSING_TABLE_CAUSES)
+    // 关键对策必须在场：被删的表 store init 不会重建，Agent 不能靠「再同步一次」修
+    expect(text).toContain('store init 不会重建该表')
+    expect(text).toContain('需重建库')
     expect(meta().notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
   })
 

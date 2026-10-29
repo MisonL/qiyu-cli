@@ -168,6 +168,27 @@ const TABLE_REF_RE = /Binder Error: Referenced table "([^"]+)" not found/
 const COLUMN_NAMED_RE = /Binder Error: Table "[^"]+" does not have a column named "([^"]+)"/
 const COLUMN_NAME_RE = /Binder Error: Referenced column "([^"]+)" (?:was )?not found/
 
+/**
+ * 「声明有而库中无」的成因与对策（**唯一实现**：db tables 的 warning、db describe 的
+ * warning、query --table 与 stats fields 的 hint 四个出口共用——同一事实四处拷贝必然漂移，
+ * 而 `db describe` 曾经独立写成「未同步或未建库」，两个成因都到不了该分支）。
+ *
+ * ⚠️ 成因口径经实测收窄（2026-10-29），「未同步」「未建库」两条都到不了这里：
+ * · 「未同步」不产生缺表：`store init` 的迁移一次建全部声明表，从未同步的库 25 张声明表
+ *   全在（row_count=0，无缺表警告）；`sync run` 自身也先调 `store.init()`（sync-run.ts）。
+ * · 「未建库」到不了这个分支：`openGuardedSession` 先要求 `schema_version` 存在——库文件
+ *   不存在或零表时早已是 `store_not_initialized`（实测）。
+ * 能到达的只有两种：① 旧版 CLI 建的库，部分迁移没跑完（store init 会重放
+ * `version > MAX(version)` 的迁移，可补建）；② 迁移已完成后表被删/损坏（store init
+ * 返回 ok 但**不会**重建该表——迁移已跳过；重新同步只会 Catalog Error
+ * `Table with name … does not exist`，实测）。
+ * 故文案不得承诺「store init 一定能修」，也不得把 Agent 指向「先同步一次」。
+ */
+export const MISSING_TABLE_CAUSES =
+  '若为建库未完成（迁移未跑完），运行 qiyu store init 可补建缺失的迁移；'
+  + '若迁移已完成而表被删或损坏，store init 不会重建该表，重新同步也只会写入失败（缺表）'
+  + '——需重建库（删除库文件后重新 qiyu store init 并重新同步）'
+
 /** 表不存在的中文消息 + 候选 hint（原生分支与 cause 补算分支共用，裁决 R9）。 */
 function tableNotFound(name: string, msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
   const candidates = mergeCandidates(
