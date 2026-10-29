@@ -108,6 +108,9 @@ describe('缺表成因的行为口径（真 DuckDB）', () => {
       expect(text, `${where} 缺少「store init 不会重建」的对策`).toContain('store init 不会重建该表')
       expect(text, `${where} 缺少「需重建库」的修复路径`).toContain('需重建库')
       expect(text, `${where} 未要求重建前先备份`).toContain('先备份库文件')
+      // 恢复命令必须沿用本次的存储选择：hint 会出现在 `--db <自定义路径>` 的输出里，
+      // 只说「运行 qiyu store init」会让 Agent 初始化默认库，选中的库依然缺失
+      expect(text, `${where} 未要求沿用本次的 --db/--profile/--backend`).toContain('与本次相同的 --db')
     }
   })
 })
