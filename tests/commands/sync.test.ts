@@ -1257,6 +1257,36 @@ describe('sync install', () => {
     }
   })
 
+  it('空串 env 不得烘进调度命令：QIYU_DB_PATH= / QIYU_STORE_BACKEND= → 不加对应 flag', async () => {
+    // ⚠️ 2026-10-29 实测缺陷（与上一条同一条口径）：`export QIYU_DB_PATH=` 时
+    // resolveStoreConfig 会正确回落到配置文件里的 store.path，但 storeArgsFor 只判
+    // `!== undefined`，于是把**回落后**的路径当成「用户用 env 指定的库」固化进调度命令。
+    // 后果不是立刻报错，而是静默钉死：之后改配置文件的 store.path 对已装的调度任务
+    // 永远不生效，且用户从未设过的变量变成了一个显式 flag。
+    const cfgDir = join(dir, '.config', 'qiyu')
+    mkdirSync(cfgDir, { recursive: true })
+    writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
+      profiles: { default: { store: { path: dbPath() } } },
+    }))
+    await seedSynced()
+    vi.stubEnv('QIYU_DB_PATH', '')
+    vi.stubEnv('QIYU_STORE_BACKEND', '')
+    try {
+      const code = await syncCommand(['install', '--schedule', '*/30 * * * *'])
+      expect(code).toBe(0)
+      const content = (data().entries as Array<{ content: string }>)[0]!.content
+      expect(content, '空串 QIYU_DB_PATH 不得固化成 --db').not.toMatch(/<string>--db<\/string>/)
+      expect(content, '空串 QIYU_STORE_BACKEND 不得固化成 --backend').not.toMatch(/<string>--backend<\/string>/)
+      // 非空 env 仍照常固化（判据只多一个空串条件，没误伤这条路径）
+      out = ''
+      vi.stubEnv('QIYU_DB_PATH', dbPath())
+      expect(await syncCommand(['install', '--schedule', '*/30 * * * *'])).toBe(0)
+      expect((data().entries as Array<{ content: string }>)[0]!.content).toMatch(/<string>--db<\/string>/)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   /** 在任意路径建库并留下成功证据（前置探测要求「库已初始化 + 跑通过」）。 */
   async function seedAt(path: string): Promise<void> {
     mkdirSync(dirname(path), { recursive: true })

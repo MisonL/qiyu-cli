@@ -11,7 +11,7 @@
 import { homedir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
 import type { BackendName, StoreConfig } from './types.js'
-import { configPathFor, loadConfigFile, checkPermissions, configHasCredentials, insecureConfigError, resolveProfileName } from '../core/config.js'
+import { configPathFor, loadConfigFile, checkPermissions, configHasCredentials, insecureConfigError, nonEmptyValue, resolveProfileName } from '../core/config.js'
 import type { ProfileBlock } from '../core/config.js'
 
 export interface StoreEnv { QIYU_DB_PATH?: string; QIYU_STORE_BACKEND?: string; QIYU_PROFILE?: string }
@@ -39,6 +39,21 @@ function assertKnownKeys(obj: Record<string, unknown>, known: Set<string>, prefi
 
 function expandHome(p: string, home: string): string {
   return p === '~' ? home : p.startsWith('~/') ? join(home, p.slice(2)) : p
+}
+
+/**
+ * 取「命令行 > 环境变量 > 配置文件 > 内置默认」的某一层，**同时返回来源**（spec §3.2）。
+ *
+ * 为什么要来源：报错得说清是哪一层坏的（见下面的空白守卫）。
+ * ⚠️ 环境变量层的空串已由 `nonEmptyValue`（core/config.ts，全仓唯一实现）归一成
+ * undefined —— 传进来的 `env.QIYU_*` 必须先过它，否则 `''` 会遮蔽配置文件里的真值。
+ */
+function pickLayer(
+  layers: ReadonlyArray<{ source: string; value: string | undefined }>,
+  fallback: string,
+): { value: string; source: string } {
+  for (const l of layers) if (l.value !== undefined) return { value: l.value, source: l.source }
+  return { value: fallback, source: '内置默认' }
 }
 
 function assertPositiveInt(v: unknown, key: string, max?: number): number {
@@ -156,20 +171,41 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
   const prof = Object.hasOwn(profiles, profileName) ? profiles[profileName] : {}
   const storeBlock = (prof.store ?? {}) as Record<string, unknown>
 
-  const rawBackend = flags.backend ?? env.QIYU_STORE_BACKEND ?? (storeBlock.backend as string | undefined) ?? DEFAULTS.backend
+  // backend 的类型守卫与 path 同款（此前只有 path 有）：配置写 123 / {} 时，
+  // `未知后端：[object Object]。目前仅支持 duckdb` 既不点名键路径、也读不出坏了什么。
+  if (storeBlock.backend !== undefined && typeof storeBlock.backend !== 'string') {
+    throw new Error(`配置文件 profiles.${profileName}.store.backend 必须是字符串`)
+  }
+  const backend = pickLayer([
+    { source: '--backend', value: flags.backend },
+    { source: 'QIYU_STORE_BACKEND', value: nonEmptyValue(env.QIYU_STORE_BACKEND) },
+    { source: `配置文件 profiles.${profileName}.store.backend`, value: storeBlock.backend as string | undefined },
+  ], DEFAULTS.backend)
+  const rawBackend = backend.value
   if (rawBackend !== 'duckdb') {
-    throw new Error(`未知后端：${rawBackend}。目前仅支持 duckdb`)
+    throw new Error(`未知后端：${JSON.stringify(rawBackend)}（来自 ${backend.source}）。目前仅支持 duckdb`)
   }
   // ⚠️ path 类型守卫（K 组 M1）：配置写数字/对象时，expandHome 会对非字符串调
   // startsWith 抛裸英文 TypeError，且不点名键路径 —— 违反 fail-closed 点名键路径约定。
   if (storeBlock.path !== undefined && typeof storeBlock.path !== 'string') {
     throw new Error(`配置文件 profiles.${profileName}.store.path 必须是字符串`)
   }
-  const rawPath = flags.db ?? env.QIYU_DB_PATH ?? (storeBlock.path as string | undefined) ?? DEFAULTS.relPath
-  // ⚠️ 空串守卫（K 组 M4）：`--db ""`（脚本里变量未设的典型形态）会穿过所有前置检查
-  // 直达 DuckDB，产出难懂的底层错误。空串不是合法路径，usage 拒绝。
+  const path = pickLayer([
+    { source: '--db', value: flags.db },
+    { source: 'QIYU_DB_PATH', value: nonEmptyValue(env.QIYU_DB_PATH) },
+    { source: `配置文件 profiles.${profileName}.store.path`, value: storeBlock.path as string | undefined },
+  ], DEFAULTS.relPath)
+  const rawPath = path.value
+  // ⚠️ 空串守卫（K 组 M4）：空白值会穿过所有前置检查直达 DuckDB，产出难懂的底层错误。
+  // 空串不是合法路径，usage 拒绝。
+  // ⚠️ 文案点名**真正给了空白值的那一层**（2026-10-29 实测修）：此前写死
+  // 「--db / QIYU_DB_PATH / store.path 均为空」—— 而实测 store.path 明明配了值，
+  // 是被 `QIYU_DB_PATH=` 遮蔽的（报错把三层一起指控，Agent 会去改没坏的那层）。
+  // ⚠️ 环境变量的**空串**到不了这里（`nonEmptyValue` 已视为未设置）；能到这里的是
+  // 显式 flag 的空白值、空白串环境变量（`'   '`）、以及配置文件里的空白 path。
   if (rawPath.trim() === '') {
-    throw new Error('数据库路径不能为空（--db / QIYU_DB_PATH / store.path 均为空）')
+    throw new Error(`数据库路径不能为空：${path.source} 给了空白值 ${JSON.stringify(rawPath)}。`
+      + '空串不是合法路径 —— 想回落到下一层：别传这个 flag / unset 这个变量 / 删掉这个配置键')
   }
   const readOnlyRetryMs = storeBlock.readOnlyRetryMs === undefined
     ? DEFAULTS.readOnlyRetryMs

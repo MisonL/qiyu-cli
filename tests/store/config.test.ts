@@ -230,10 +230,54 @@ describe('store 配置 —— fail-closed', () => {
     expect(() => resolveStoreConfig({ home })).toThrow(/batchSize 不得超过/)
   })
 
-  it('空串路径 → usage 拒绝（K 组 M4：--db "" 穿透所有前置检查的同族事故）', () => {
-    expect(() => resolveStoreConfig({ home, flags: { db: '' } })).toThrow(/路径不能为空/)
-    expect(() => resolveStoreConfig({ home, flags: { db: '   ' } })).toThrow(/路径不能为空/)
-    expect(() => resolveStoreConfig({ home, env: { QIYU_DB_PATH: '' } })).toThrow(/路径不能为空/)
+  it('空白路径 → usage 拒绝，且文案点名真正给空白值的那一层（K 组 M4）', () => {
+    // `--db ""` / `--db "   "`：显式 flag 的空白值仍是错误 —— 把用户明确给出的空值
+    // 悄悄换成另一份资源是「静默回落」缺陷本体，不是修复。
+    expect(() => resolveStoreConfig({ home, flags: { db: '' } })).toThrow(/路径不能为空：--db 给了空白值/)
+    expect(() => resolveStoreConfig({ home, flags: { db: '   ' } })).toThrow(/路径不能为空：--db 给了空白值/)
+    // ⚠️ 文案不得再声称三层都空：实测 store.path 配了值，也被同一句话术指控
+    // （Agent 会去改没坏的那一层）。
+    let msg = ''
+    try { resolveStoreConfig({ home, flags: { db: '' } }) } catch (e) { msg = (e as Error).message }
+    expect(msg).not.toContain('均为空')
+  })
+
+  it('QIYU_DB_PATH 空串 = 未设置：回落到 store.path / 内置默认（2026-10-29 实测修）', () => {
+    writeCfg({ profiles: { default: { store: { path: '/tmp/from-file.duckdb' } } } })
+    // 此前 `??` 链把 '' 当有效值放行 → 遮蔽配置文件里真实存在的 store.path，
+    // 命令以「路径不能为空」失败（而同一份配置在不设该变量时工作正常）。
+    expect(resolveStoreConfig({ home, env: { QIYU_DB_PATH: '' } }).config.path)
+      .toBe('/tmp/from-file.duckdb')
+    // 配置文件也没有时回落到内置默认路径（与变量未导出完全等价）
+    rmSync(join(home, '.config'), { recursive: true, force: true })
+    expect(resolveStoreConfig({ home, env: { QIYU_DB_PATH: '' } }).config.path)
+      .toBe(join(home, '.qiyu', 'duckdb', 'qiyu.duckdb'))
+    // 空白串不是空串：仍是非法值，且点名 QIYU_DB_PATH
+    expect(() => resolveStoreConfig({ home, env: { QIYU_DB_PATH: '   ' } }))
+      .toThrow(/路径不能为空：QIYU_DB_PATH 给了空白值/)
+  })
+
+  it('QIYU_STORE_BACKEND 空串 = 未设置：不遮蔽配置文件里的 backend（2026-10-29 实测修）', () => {
+    writeCfg({ profiles: { default: { store: { backend: 'duckdb' } } } })
+    expect(resolveStoreConfig({ home, env: { QIYU_STORE_BACKEND: '' } }).config.backend).toBe('duckdb')
+    // 非空非法值照旧拒绝，且点名来自哪一层（空串曾渲染成「未知后端：。」）
+    expect(() => resolveStoreConfig({ home, env: { QIYU_STORE_BACKEND: 'oracle' } }))
+      .toThrow(/未知后端："oracle"（来自 QIYU_STORE_BACKEND）/)
+    expect(() => resolveStoreConfig({ home, flags: { backend: '' } }))
+      .toThrow(/未知后端：""（来自 --backend）/)
+  })
+
+  it('store.backend 非 string → fail-closed 点名键路径（与 store.path 同款守卫）', () => {
+    writeCfg({ profiles: { default: { store: { backend: 123 } } } })
+    expect(() => resolveStoreConfig({ home })).toThrow(/profiles\.default\.store\.backend 必须是字符串/)
+    writeCfg({ profiles: { default: { store: { backend: { name: 'duckdb' } } } } })
+    expect(() => resolveStoreConfig({ home })).toThrow(/store\.backend 必须是字符串/)
+  })
+
+  it('配置文件 store.path 为空串 → 拒绝，且点名配置键（不再谎称三层都空）', () => {
+    writeCfg({ profiles: { default: { store: { path: '' } } } })
+    expect(() => resolveStoreConfig({ home }))
+      .toThrow(/路径不能为空：配置文件 profiles\.default\.store\.path 给了空白值/)
   })
 })
 

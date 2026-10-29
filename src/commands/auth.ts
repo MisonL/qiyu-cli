@@ -3,8 +3,8 @@ import { dirname } from 'node:path'
 import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty, EXIT } from '../output.js'
 import {
-  configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions, shellPath,
-  resolveProfileName,
+  configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions, nonEmptyValue,
+  resolveProfileName, shellPath,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS } from './spec-types.js'
@@ -212,8 +212,8 @@ async function login(argv: string[]): Promise<number> {
   // 与 credentials-source.ts 的口径一致 —— 两层对"空"的判定不能分叉）。
   const envKey = process.env.QIYU_APP_KEY
   const envSecret = process.env.QIYU_APP_SECRET
-  const appKey = envKey !== undefined && envKey !== '' ? envKey : undefined
-  const appSecret = envSecret !== undefined && envSecret !== '' ? envSecret : undefined
+  const appKey = nonEmptyValue(envKey)
+  const appSecret = nonEmptyValue(envSecret)
   // ⚠️ 缺任一即 usage（退出码 2）：这是"调用方式"问题（shell 里少 export 一个），
   // 与"凭证无效"（业务错误）不同 —— 后者要发请求才知道，login 不发请求。
   // ⚠️ 必须点名叫用户 export 什么，否则它只知道"少东西"。
@@ -333,10 +333,10 @@ function whoami(): number {
   const fileKey = profBlock?.credentials?.appKey
   const fileSecret = profBlock?.credentials?.appSecret
 
-  const fromEnvKey = envKey !== undefined && envKey !== ''
-  const fromEnvSecret = envSecret !== undefined && envSecret !== ''
-  const fromFileKey = fileKey !== undefined && fileKey !== ''
-  const fromFileSecret = fileSecret !== undefined && fileSecret !== ''
+  const fromEnvKey = nonEmptyValue(envKey) !== undefined
+  const fromEnvSecret = nonEmptyValue(envSecret) !== undefined
+  const fromFileKey = nonEmptyValue(fileKey) !== undefined
+  const fromFileSecret = nonEmptyValue(fileSecret) !== undefined
 
   const configured = (fromEnvKey || fromFileKey) && (fromEnvSecret || fromFileSecret)
 

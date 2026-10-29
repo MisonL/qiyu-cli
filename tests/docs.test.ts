@@ -473,6 +473,23 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
     const s = read('src/commands/sync.ts')
     expect(s).toMatch(/不继承你的 shell 环境/)
   })
+
+  it('2026-10-29 空串口径：README 写明 env 空串=未设置、显式 flag 空串=用法错误', () => {
+    // ⚠️ 钉住 README 的实质主张（不只是出现变量名）：这三句各自对应一条实测缺陷 ——
+    // ① env 空串遮蔽配置文件里真实存在的值；② 显式 `--db ''` 不得静默改道；
+    // ③ 旧文案「均为空」把没坏的那层一起指控。
+    const md = read('README.md')
+    expect(md, 'env 空串=未设置必须写明').toMatch(/QIYU_DB_PATH=` \/ `QIYU_STORE_BACKEND=`[\s\S]{0,120}视为\*\*未设置\*\*/)
+    expect(md, '显式 flag 空串仍是用法错误必须写明').toMatch(/显式\*\* `--db ''`[\s\S]{0,80}用法错误/)
+    expect(md, '必须点明空白串不等于空串，两者都拒绝').toMatch(/空白串[\s\S]{0,40}不是空串，两者都拒绝/)
+    // sync install 段：空串 env 时「解析结果不固化」的理由必须写明 —— 这不是同一个
+    // 缺陷的复述，而是它的**第二后果**（固化了回落后的路径 = 悄悄钉死配置）。
+    expect(md, 'sync install 段必须写明空串 env 不固化解析结果')
+      .toMatch(/QIYU_STORE_BACKEND=`[\s\S]{0,60}解析结果不固化/)
+    // 旧文案本身（「…均为空」把三层一起指控）不得作为**主张**留在 README 里 ——
+    // 允许作为历史引注出现（本段就在解释它错在哪），所以判据是「引用之外不出现」。
+    expect(md.match(/均为空/g)?.length ?? 0, '「均为空」只允许作为历史引注出现一次').toBeLessThanOrEqual(1)
+  })
 })
 
 describe('CI 工作流 —— 承诺的检查必须真的接在 npm 脚本上', () => {

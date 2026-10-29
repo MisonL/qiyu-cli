@@ -46,6 +46,7 @@ import type { Store } from '../store/types.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 import { STORE_VALUE_FLAG_NAMES } from './store-flags.js'
+import { nonEmptyValue } from '../core/config.js'
 
 /** `sync install` 的业务 flag。 */
 const INSTALL_FLAGS: FlagSpec[] = [
@@ -478,7 +479,9 @@ const INSTALL_STORE_PASSTHROUGH: readonly string[] = STORE_VALUE_FLAGS
  *      这里只固化「env 派生」：配置文件 store.path（HOME 下，调度任务自己读得到）与
  *      内置默认值**不固化**（批 4 裁定：默认值固化会引入漂移）。
  * 实现约束：**不读配置文件内容来生成参数**（配置路径不固化，调度任务自己会读它）；
- * env 已给但解析失败/为空时由 resolveConfig 在更早处抛 usage，不会走到这里。
+ * env 已给但解析失败时由 resolveConfig 在更早处抛 usage，不会走到这里。
+ * ⚠️ env 值为**空串**不算「已给」（2026-10-29）：空串视为未设置，这条来源整体不成立
+ * —— 否则固化的是**回落后的**配置文件/默认值，等于把安装当时的配置悄悄钉进调度命令。
  * 同一 flag 只在 flag 缺席时才补 env 派生值 —— 显式 flag 永远优先（与 resolveStoreConfig
  * 的 flags > env 优先级一致），不会出现两个 --db。
  */
@@ -491,7 +494,11 @@ function storeArgsFor(parsed: ParsedFlags, resolved: { path: string; backend: st
     if (v !== undefined) push(f, v)
   }
   // ② env 派生 → 固化解析结果（仅当对应 flag 未给）
-  if (parsed.values['--db'] === undefined && process.env.QIYU_DB_PATH !== undefined) {
+  // ⚠️ 空串视为未设置（2026-10-29，与下面的 --profile 同一条口径）：`QIYU_DB_PATH=` 时
+  // resolveStoreConfig 会正确回落到配置文件/默认值，但这里若照烘 `--db <解析结果>`，
+  // 调度命令就被钉死在**安装当时**的路径上 —— 之后改配置文件的 store.path 不再生效，
+  // 且用户从未设过的变量变成了一个显式 flag。
+  if (parsed.values['--db'] === undefined && nonEmptyValue(process.env.QIYU_DB_PATH) !== undefined) {
     // 固化的是 resolveStoreConfig 解析后的**绝对路径**（env 的相对路径/`~` 已展开）——
     // 调度任务的 cwd 与 HOME 都可能不同，相对路径会指向别处。
     push('--db', resolved.path)
@@ -501,11 +508,11 @@ function storeArgsFor(parsed: ParsedFlags, resolved: { path: string; backend: st
   //   sync run --profile "" → 每次调度执行都报「--profile 不能为空」退出码 2，
   //   而安装时（dry-run 与 --yes 都一样）不报任何错 —— 装完才开始永久失败。
   // 判据与 `resolveProfileName` 的空串口径同源（core/config.ts）。
-  if (parsed.values['--profile'] === undefined
-      && process.env.QIYU_PROFILE !== undefined && process.env.QIYU_PROFILE !== '') {
-    push('--profile', process.env.QIYU_PROFILE)
+  if (parsed.values['--profile'] === undefined) {
+    const envProfile = nonEmptyValue(process.env.QIYU_PROFILE)
+    if (envProfile !== undefined) push('--profile', envProfile)
   }
-  if (parsed.values['--backend'] === undefined && process.env.QIYU_STORE_BACKEND !== undefined) {
+  if (parsed.values['--backend'] === undefined && nonEmptyValue(process.env.QIYU_STORE_BACKEND) !== undefined) {
     // backend 当前唯一合法值 duckdb（resolveStoreConfig 已校验），固化解析结果而非原始 env 值。
     push('--backend', resolved.backend)
   }
