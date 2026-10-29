@@ -103,9 +103,11 @@ describe('缺表成因的行为口径（真 DuckDB）', () => {
       // 用宽判据（只要出现「未同步」就红），防止把「未同步或未建库」改写成
       // 「可能未同步」这类同义复活。
       expect(text, `${where} 仍在声称「未同步」`).not.toMatch(/未同步/)
-      // 真正的修复路径必须在场
+      // 真正的修复路径必须在场，且必须先备份（重建库是破坏性动作：未声明表与
+      // 超出 API 回补窗口的本地历史删了就回不来）
       expect(text, `${where} 缺少「store init 不会重建」的对策`).toContain('store init 不会重建该表')
       expect(text, `${where} 缺少「需重建库」的修复路径`).toContain('需重建库')
+      expect(text, `${where} 未要求重建前先备份`).toContain('先备份库文件')
     }
   })
 })
@@ -123,7 +125,7 @@ describe('缺表成因的漂移守卫（源码文本）', () => {
     text.split('\n').filter((l) => !/^\s*(\/\/|\/\*|\*)/.test(l)).join('\n')
 
   it('成因与对策的字符串只在 src/query/errors.ts（其余出口必须 import，不得拷贝）', () => {
-    const phrases = ['store init 不会重建该表', '需重建库（删除库文件后']
+    const phrases = ['store init 不会重建该表', '需重建库：先备份库文件']
     const offenders: string[] = []
     for (const f of walk(SRC)) {
       const rel = relative(SRC, f)
@@ -148,10 +150,10 @@ describe('缺表成因的漂移守卫（源码文本）', () => {
     // 防止 stripCommentLines / 短语失配把守卫悄悄变成永远为真
     const bogus = [
       "const hint = '若迁移已完成而表被删或损坏，store init 不会重建该表'",
-      "const w = '需重建库（删除库文件后重新 qiyu store init 并重新同步）'",
+      "const w = '需重建库：先备份库文件，再删除并重新 qiyu store init、重新同步'",
     ].join('\n')
     expect(stripCommentLines(bogus).includes('store init 不会重建该表')).toBe(true)
-    expect(stripCommentLines(bogus).includes('需重建库（删除库文件后')).toBe(true)
+    expect(stripCommentLines(bogus).includes('需重建库：先备份库文件')).toBe(true)
     // 注释行必须被抹掉（否则本仓库自己的解释性注释会误报）
     expect(stripCommentLines('// 旧文案「未同步或未建库」').includes('未同步或未建库')).toBe(false)
     expect(stripCommentLines(' * 旧文案「未同步或未建库」').includes('未同步或未建库')).toBe(false)
