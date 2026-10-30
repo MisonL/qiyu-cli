@@ -18,7 +18,8 @@ import { openGuardedSession } from './db.js'
 import { parseStoreFlags } from './store-flags.js'
 import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
-  dbTablesCommand, dbDescribeCommand, querySqlCommand, storeLocationFromFlags, storeLocationOf,
+  dbTablesCommand, dbDescribeCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE,
+  storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
@@ -343,7 +344,7 @@ async function statsFields(argv: string[]): Promise<number> {
       warnings.push(`该表有 ${badJson} 行 payload 不是合法 JSON，未计入统计`
         + '（正常同步写入的是 JSON 字符串；这些行可能来自旧版 CLI、外部工具或库损坏）。'
         + '用 `' + querySqlCommand(storeLocationOf(opened.dbPath, opened.profileFlag))
-        + '` 单独查看它们以确认成因')
+        + '` 单独查看它们以确认成因（' + SQL_ARG_REPLACE_NOTE + '）')
     }
     const emptyKey = countOf(shape.empty_key)
     if (emptyKey > 0) {

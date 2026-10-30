@@ -213,15 +213,29 @@ export function queryTableCommand(table: string, loc?: StoreLocation): string {
 }
 
 /**
- * `qiyu query --sql <SQL>` 诊断命令，指向本次的存储定位。
+ * `query --sql` hint 里占位符的**替换契约**（三处 hint 共用这一句，避免文案漂移）。
  *
- * ⚠️ 占位符 `<SQL>` 不是装饰（CodeRabbit 2026-10-30 minor）：`--sql` 是**取值** flag，
+ * 为什么必须写出来（CodeRabbit 2026-10-30 major）：占位符在**引号里**，用户若只把
+ * `<SQL>` 这个词换掉、引号留着，SQL 里带单引号时就会把引号提前闭合 ——
+ * `--sql 'SELECT '2026-10-01''` 经 shell 解析后 CLI 收到的是 `SELECT 2026-10-01`
+ *（可能照跑并给出不同结果，是静默错误而不是报错）。正确做法是**整段（含引号）**
+ * 换成按当前 shell 规则引号化好的 SQL 参数。
+ */
+export const SQL_ARG_REPLACE_NOTE =
+  "`'<SQL>'` 要整段替换成按你的 shell 规则转义好的 SQL，不要只替换引号里的词"
+
+/**
+ * `qiyu query --sql '<SQL>'` 诊断命令，指向本次的存储定位。
+ *
+ * ⚠️ 占位符不是装饰（CodeRabbit 2026-10-30 minor）：`--sql` 是**取值** flag，
  * 而 `commands/query.ts` 的值位守卫把「取值恰好是已知 flag」判为缺值 —— 渲染成
  * `qiyu query --sql --db <path>` 时，`--db` 会被当成 `--sql` 的值位，逐字执行报
  * 「--sql 缺少取值」并退出 2。**hint 里的命令必须真的能跑**，所以值位先给占位符，
- * 定位 flag 排在它之后（与 `queryTableCommand` 的 `<表>` 同一约定：占位符需替换后执行）。
+ * 定位 flag 排在它之后。
  * 占位符**必须加引号**：SQL 含空格，`--sql SELECT 1` 在 shell 里会被拆成两个参数
  *（`1` 落成位置参数 → 未知参数退出 2）；`<`/`>` 不加引号还会变成重定向。
+ * 加引号的代价是替换契约必须一起说清 —— 见 `SQL_ARG_REPLACE_NOTE`，**用到本渲染器
+ * 的 hint 必须把它带上**（否则用户可能只替换引号内的词，见那里的静默错误说明）。
  */
 export function querySqlCommand(loc?: StoreLocation): string {
   return "qiyu query --sql '<SQL>'" + storeLocationFlags(loc)

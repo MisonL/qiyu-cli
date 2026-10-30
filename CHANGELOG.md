@@ -33,6 +33,13 @@
   （占位符加引号：SQL 含空格，`--sql SELECT 1` 会被 shell 拆成两个参数）；
   并新增「渲染出的诊断命令占位符替换后逐条真的执行」用例（含 `--no-mask` 形态），
   把「带上了 --db」与「命令可执行」两件事分开守。
+  第二轮复审再补一条 major（已修复）：占位符在**引号里**，用户若只替换引号内的词而
+  保留引号，SQL 自带单引号会提前闭合 —— `--sql 'SELECT '2026-10-01''` 经 shell 解析后
+  变成 `SELECT 2026-10-01`（DuckDB 算成 2015，**静默给错结果**）。新增
+  `SQL_ARG_REPLACE_NOTE`（「整段替换成按你的 shell 规则转义好的 SQL」）并接到三处
+  `--sql` hint；加「凡渲染 `querySqlCommand` 的文件必须同时带上该契约」的漂移守卫
+  （剥掉 import 行再判，否则单靠 import 就假绿 —— 实测过），可执行性用例改用
+  **带单引号的 SQL** + `shellArg` 整段替换来复现原失败形态。
   变异验证 13 处（`storeLocationFlags` 恒空、逐点丢 `loc`、闭集校验丢原始 flag、
   `querySqlCommand` 退回无值位、源码重新引入裸形态），对应用例均红（逐条 grep 确认改动真落地）。
 

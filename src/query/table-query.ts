@@ -20,7 +20,7 @@
 import { shanghaiDayIso, shanghaiDayStart, shanghaiIso } from '../core/time.js'
 import { timeShapeClauses } from './time-shape.js'
 import { suggestNames } from './errors.js'
-import { describeArgs, querySqlCommand } from '../output.js'
+import { describeArgs, querySqlCommand, SQL_ARG_REPLACE_NOTE } from '../output.js'
 import type { StoreLocation } from '../output.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
 
@@ -173,7 +173,8 @@ export function validateGroupBy(
       throw new TableQueryUsageError(
         `--group-by 不接受敏感列 ${name}：脱敏会把不同取值归并成同一个分组键，`
         + '分组结果无法区分（计数本身准确，但每个分组代表哪些原值不可知）。'
-        + '确需按原值分组请改用 `' + querySqlCommand(loc) + ' --no-mask`（显式承担 PII 风险）')
+        + '确需按原值分组请改用 `' + querySqlCommand(loc) + ' --no-mask`（显式承担 PII 风险；'
+        + SQL_ARG_REPLACE_NOTE + '）')
     }
     if (seen.has(name)) {
       throw new TableQueryUsageError(`--group-by 列重复：${name}（同一列只能给一次，不做静默去重）`)

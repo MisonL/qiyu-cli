@@ -29,7 +29,8 @@ import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
 import {
   ok, fail, usageFail, failFromTagged, sanitizeControlChars, describeArgs, setPretty,
-  storeInitCommand, dbTablesCommand, querySqlCommand, storeLocationFromFlags, storeLocationOf,
+  storeInitCommand, dbTablesCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE,
+  storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
@@ -201,7 +202,7 @@ function dirtyTimeWarning(
 ): string {
   return `表 ${table} 的时间列 ${column} 有 ${n} 个值不符合约定形态（已从 time_range 中排除）`
     + '——可能来自旧版 CLI、外部工具或库损坏；用 `' + querySqlCommand(loc)
-    + '` 单独查看它们以确认成因'
+    + '` 单独查看它们以确认成因（' + SQL_ARG_REPLACE_NOTE + '）'
 }
 
 /**

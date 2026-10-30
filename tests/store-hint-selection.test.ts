@@ -319,15 +319,20 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
       if (argv[0] === 'sync') return syncCommand(argv.slice(1))
       return queryCommand(argv.slice(1))
     }
-    const placeholders: Array<[string, string]> = [['<表>', 'sessions'], ['<SQL>', 'SELECT 1']]
+    // ⚠️ `<SQL>` 的替换契约是**整段（含引号）**替换（CodeRabbit 2026-10-30 major）：
+    // 只换引号里的那个词而保留引号时，SQL 自带单引号会把引号提前闭合 ——
+    // `--sql 'SELECT '2026-10-01''` 经 shell 解析后变成 `SELECT 2026-10-01`
+    //（DuckDB 会把它算成 2015，静默给错结果）。所以这里按契约用 shellArg 整体替换，
+    // 并故意用带单引号的 SQL 来复现那种失败形态。
+    const sql = "SELECT '2026-10-01' AS d"
     const commands = [
       dbTablesCommand(loc), dbDescribeCommand('<表>', loc), syncStatusCommand(loc),
       queryTableCommand('<表>', loc), querySqlCommand(loc),
       // 敏感列分组建议的完整形态：`--no-mask` 必须排在值位之后（同一处 minor）
       querySqlCommand(loc) + ' --no-mask',
-    ]
+    ].map((c) => c.split("'<SQL>'").join(shellArg(sql)))
     for (const raw of commands) {
-      const cmd = placeholders.reduce((c, [ph, v]) => c.split(ph).join(v), raw)
+      const cmd = raw.split('<表>').join('sessions')
       const code = await run(cmd)
       // 只要不是 2（用法错误）就说明命令形态本身是合法的：数据/覆盖问题不是本用例的目标
       expect(code, `命令不可执行：${cmd}`).not.toBe(2)
@@ -508,6 +513,35 @@ describe('恢复命令的漂移守卫（源码文本）', () => {
       if (BARE_DIAG_HINT.test(code)) offenders.push(rel)
     }
     expect(offenders).toEqual([])
+  })
+
+  it('凡渲染 querySqlCommand 的文件，必须同时带上占位符替换契约', () => {
+    // 占位符在引号里：不带契约时用户可能只替换引号内的词，SQL 自带单引号会提前闭合
+    // 引号（CodeRabbit 2026-10-30 major）—— `--sql 'SELECT '2026-10-01''` 静默变成
+    // `SELECT 2026-10-01`。渲染器没法替用户转义，只能把契约写在 hint 里；这条守卫保证
+    // 新增的调用点不会漏掉它。
+    const missing: string[] = []
+    for (const f of walk(SRC)) {
+      const rel = relative(SRC, f)
+      if (rel === 'output.ts') continue // 渲染器与契约常量的定义处
+      // ⚠️ 必须连 import 行一起剥掉：`import { querySqlCommand, SQL_ARG_REPLACE_NOTE }`
+      // 单独就能让「含该标识符」成立，守卫会变成假绿（实测：只删用法、留着 import 时
+      // 该用例仍通过）。剥掉后剩下的只有真正的使用点。
+      const code = stripCommentLines(readFileSync(f, 'utf8'))
+        .split('\n').filter((l) => !/^\s*import\b/.test(l)).join('\n')
+      if (code.includes('querySqlCommand(') && !code.includes('SQL_ARG_REPLACE_NOTE')) {
+        missing.push(rel)
+      }
+    }
+    expect(missing).toEqual([])
+    // 双向自检：事故形态必红、修复形态放过（判据与上面逐字同款，防止守卫本身写歪）
+    const flagged = (code: string): boolean =>
+      code.includes('querySqlCommand(') && !code.includes('SQL_ARG_REPLACE_NOTE')
+    expect(flagged("+ '` 单独查看它们以确认成因')")).toBe(false) // 无 querySqlCommand → 不适用
+    expect(flagged(
+      "'用 `' + querySqlCommand(loc) + '` 单独查看它们以确认成因')")).toBe(true)
+    expect(flagged(
+      "'用 `' + querySqlCommand(loc) + '` 单独查看（' + SQL_ARG_REPLACE_NOTE + '）')")).toBe(false)
   })
 
   it('自检：只读诊断的裸形态必红、经渲染的拼接形态放过', () => {
