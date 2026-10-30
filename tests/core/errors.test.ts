@@ -246,13 +246,18 @@ describe('错误分类', () => {
       .toMatch(/切片/)
   })
 
-  it('14501 对齐错误判定为 window_misaligned —— 切片修不好它', () => {
+  it('14501 的 endTime 越界判定为 window_misaligned —— 切片修不好它', () => {
     // 设计稿 §6.2 实测：staffAttendance / performance 在 endTime = now 时
-    // 返回的就是这一种。对它"自动分片"是无效修复，正确动作是把 endTime
-    // 对齐到自然日边界。两者错误码相同、修复方式完全不同。
-    expect(classify(14501, 'endTime is invalid')).toMatchObject({
-      kind: 'window_misaligned', retryable: false,
-    })
+    // 返回的就是这一种。对它"自动分片"是无效修复，正确动作是取**纯历史日期**
+    // （endTime 必须**早于**今天 00:00 —— 「今天 0:00」这条边界实测不稳定，
+    // 同一取值时而 200 时而 14501，所以不能写成「不晚于」把等号划进安全区）。
+    // 两者错误码相同、修复方式完全不同。
+    const misaligned = classify(14501, 'endTime is invalid')
+    expect(misaligned).toMatchObject({ kind: 'window_misaligned', retryable: false })
+    // hint 是 Agent 直接读的动作指令 —— 它必须给「早于」，不能给会踩不稳定边界的「不晚于」
+    expect(misaligned.hint, 'hint 必须写明「早于今天 00:00」').toMatch(/早于今天 00:00/)
+    expect(misaligned.hint, 'hint 不得再写「不晚于今天 00:00」（它把等号当安全上界）')
+      .not.toMatch(/不晚于今天 00:00/)
   })
 
   // —— 14004 与 14500 一样是多义码（设计稿 §4.3 明确要求分发表）——

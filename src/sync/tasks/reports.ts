@@ -359,7 +359,7 @@ export const REPORT_TASKS: SyncTask[] = [
     watermark: { field: 'stat_date', initial: null },
     primaryKey: ['order_id'], reportDayRotation: true,
     endpoint: 'statistic.performance',
-    // G 高-1：与 staff_attendance 同族的 endTime 对齐检查（14501 endTime is invalid）
+    // G 高-1：与 staff_attendance 同族的 endTime 上界检查（14501 endTime is invalid）
     windowEndClamp: 'shanghaiYesterday',
     write: RANGE_INSERT,
     // orders:null = 筛选失败、不是空窗口（staffIdList 含租户不存在的 id 时 code:200

@@ -325,7 +325,7 @@ function fetchCtx(ctx: RunCtx): FetchCtx {
 
 /**
  * 窗口末端上限（G 高-1，任务声明式）：`staffAttendance` / `statistic.performance` 的
- * `endTime` 不得晚于今天 00:00（`14501 endTime is invalid`），而「今天 0:00」这条边界
+ * `endTime` 必须早于今天 00:00（`14501 endTime is invalid`），而「今天 0:00」这条边界
  * 本身不稳定（同一取值时而 200 时而 14501，设计稿 §6.2 实测）→ 统一退到**昨天 00:00**。
  * 返回该任务本轮可拉的末端上限（未声明钳制的任务为 +∞，行为不变）。
  */

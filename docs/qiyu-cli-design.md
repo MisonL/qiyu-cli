@@ -203,24 +203,26 @@ qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ so
 | 14008 | IP 不在白名单 | 否 | 必须在七鱼控制台配置 |
 | 14009 | 请求频率过快 | 见下文 | 携带 `retry_after` + `retry_strategy` |
 | 14500 | **语义歧义的 code（已对线上 API 验证出 4 种含义，见下文）** | — | **绝不能只看 code**：内部错误 → core 退避；`Service Offline` → **永久熔断**；`Param format error` → **不可重试**；`单位时间内请求过于频繁` → **是限流，必须延迟重试** |
-| 14501 | 数据量超限 | — | **core 层不切片**；按 message 区分两种并各自给下一步（见下）：跨度过大 → `kind: 'window_too_large'`（按上限切片）；endTime 越界 → `kind: 'window_misaligned'`（**两个条件**：对齐自然日边界**且**不晚于今天 00:00 —— 只对齐不挪回允许区间仍会被拒） |
+| 14501 | 数据量超限 | — | **core 层不切片**；按 message 区分两种并各自给下一步（见下）：跨度过大 → `kind: 'window_too_large'`（按上限切片）；endTime 越界 → `kind: 'window_misaligned'`（**必须早于今天 00:00** —— 用纯历史日期；「不晚于」是错的，它把「今天 0:00」这条**实测不稳定**的边界当成了安全上界） |
 | 14515 | 权限不足 | 否 | 该接口需单独申请 |
 
 **原则：凡是 CLI 自己能吸收的错误，都不以 `retryable: true` 的形式暴露给 Agent。** 14003/14500 在 core 层被吸收（重签重试 / 判死为 `module_offline`）；**14501 只被翻译、不被吸收** —— 见下方收窄说明。`retryable: true` 只保留给 Agent 必须**改变策略**的情况。
 
 > **⚠️ 「core 层自动分片」的收窄（2026-10-30 回写）**：本表原写 `14501 → core 层自动分片`。
 > 实现里 **core 不做分片**：`src/core/errors.ts` 把两种 `14501` 报文翻成**两个不同的 kind** ——
-> `endTime is invalid`（越界）→ `kind: 'window_misaligned'`，hint 是一个**双条件**动作
-> （与 `src/core/errors.ts` 逐字一致）：`endTime 必须对齐到自然日边界（不得晚于今天 00:00）`
-> —— **对齐**与**上界**是两件事，两个都要满足：明天 00:00 是"对齐的"但越界，仍会被拒，
-> （§6.2 实测：同一 `endTime = 今天 0:00` 有时 200 有时被拒 —— 这条边界的**本身不稳定**，
-> 所以给具体数字既不可靠也不符合实测；指令应该是面向概念的：
-> **endTime 用纯历史日期，不包含今天数据** —— 这是三个接口都工作的原则）。
-> **⚠️ 「对齐」只针对上界附近的越界，不适用于纯历史窗口**（CodeRabbit round 9 指出、§6.2
-> 实测核实：`5 天前 0:00 → 5 天前 12:00` 返回 200）—— 纯历史日期的 `endTime` 取**任意时刻**
-> 都接受（不必是 0:00）；实测唯一被拒的形态是 `endTime` **晚于今天 0:00**（以及它恰好等于
-> 今天 0:00 时不稳定）。所以 hint 里的「对齐」对调用方是「取纯历史日期」的意思，
-> 不是"每个 endTime 都必须写成 0:00"。`…is invalid`
+> `endTime is invalid`（越界）→ `kind: 'window_misaligned'`，hint 只讲**一个**条件
+> （与 `src/core/errors.ts` 逐字一致）：`endTime 必须早于今天 00:00（用纯历史日期，不要包含今天的数据）`
+> —— **⚠️ 本注的前一版把它写成「对齐自然日边界 **且** 不晚于今天 00:00」的「双条件」，两个都错**
+> （CodeRabbit #50 round 10 指出、§6.2 实测核实）：其一 **「对齐」根本不是要求** —— 纯历史日期的
+> `endTime` 取**任意时刻**都接受（§6.2 实测：`5 天前 0:00 → 5 天前 12:00` 返回 200），
+> 「每个 endTime 都要写成 0:00」是把提示语读过头；其二 **「不晚于」把等号放进了安全区** ——
+> `endTime = 今天 0:00` 恰是那条**本身不稳定**的边界（同一取值有时 200 有时被拒），
+> 写「不晚于」等于教 Agent 去踩它。实测唯一被拒的形态是 `endTime` **不早于今天 0:00**
+> （即今天 0:00 及其后）；上一版把「（恰好等于时不稳定）」写在括号里当补充，力度不够 ——
+> 它决定了「早于」与「不晚于」的差别，是这句话的主干而不是脚注。
+> 所以 hint 给的是**面向概念**的指令：**endTime 用纯历史日期，不包含今天数据** ——
+> 这是三个接口都工作的原则，也是唯一不需要知道"今天几点"的做法。
+> `…is invalid`
 > （跨度过大）→ `kind: 'window_too_large'`、`retryable: false`
 > **两者不能混**：切片救不了越界 —— 一个 1–2 天的窗口，endTime 越界照样报 `endTime is invalid`
 > （§6.2 实测）—— 一律当"跨度"让 Agent 反复按切片重试同一个失败请求，会浪费一排网络往返。
@@ -575,7 +577,7 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 >
 > 在共享的 `(staff, date)` 上交叉核对：天粒度行报告 `loginDuration = 86400024`，而同一客服的小时行报告 `3600001`。相同的 `(staff, date)` 对从不重复。
 >
-> → **省略 `startTime` 的同步会把天粒度行写进主键为 `staff_id + hour_ts` 的表，并无声地少抓约 10 倍。** 同步必须**始终传 `startTime`**，且表必须记录粒度，以便混合粒度可被检出。（`endTime` 仍不得晚于今天 00:00 —— `endTime = now` 返回 `14501 endTime is invalid`。）
+> → **省略 `startTime` 的同步会把天粒度行写进主键为 `staff_id + hour_ts` 的表，并无声地少抓约 10 倍。** 同步必须**始终传 `startTime`**，且表必须记录粒度，以便混合粒度可被检出。（`endTime` 仍 **必须早于今天 00:00** —— `endTime = now` 返回 `14501 endTime is invalid`；§6.2 实测这条边界本身不稳定，故取纯历史日期。）
 > **⚠️ `data.overview.session` 不是报表** —— 它只返回**当前实时快照**，**没有历史回填能力**。把它放进报表同步是错的；应作为实时接口单独列出。
 >
 > **⚠️ 但它并非"忽略所有输入参数" —— 本说明的早期版本这么写过，这是错的。** A/B 交替实测 5 轮：当 `toGroup`/`toStaff`/`assignStaff` 全为 `[-1]` 时响应为 `sessionCount=15, totalSessionCount=1121, kefuCount=6`；传**真实** id 时为 `sessionCount=0, totalSessionCount=0, kefuCount=0, averageWaitingTime=-1`。秒级内可复现、可逆转。→ **`-1` 是真正的"不过滤／全部"选择器，而且这三个键确实必填**（完全省略 body 会返回 `14004 Not found param`）。只有 `type` 固定为 `1`。传真实 id 的调用方会得到一份全零快照，看起来像"没有流量"。
@@ -622,19 +624,19 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 - **时间参数始终是毫秒**。传秒**不报错，但会无声降级**（`overview` 会把 69 个字段中的 49 个变成 `-1`，而 `code` 仍是 200）—— 最危险的坑
 - **⭐ `data.overview.session`（实时报表）有三个必填请求参数，其全部文档就是一个哨兵值**：`toGroup`、`toStaff`、`assignStaff` 都是 `array<integer>`，都被列为 `required`，而官方对每一个的说明逐字为 **`当前版本是-1`**（当前版本是 -1）。文档中唯一可用的取值是 **`-1`**，给在示例 body 里。→ **Agent 无法从任何地方推导出这一点** —— 参数名暗示着真实的筛选语义（"发给哪个组／哪个客服／指派给谁"），而 API 却忽略它们。CLI 必须硬编码文档给出的 `-1` 三元组，并在 `--help` 中说明这些是占位符，以免 Agent 被误导去传真实的组或客服 id
 
-**⚠️ `endTime` 的整日对齐检查只对两个接口成立（实测，逐接口核实）**
+**⚠️ `endTime` 的上界检查只对两个接口成立（实测，逐接口核实）**
 
-| 接口 | `endTime` 越界（晚于今天 0:00） | 是否需要整日对齐 |
+| 接口 | `endTime` 越界（不早于今天 0:00）被拒 | 该接口的 `endTime` 是否受上界检查 |
 |---|---|---|
-| **`staffAttendance`** | **`14501 endTime is invalid`** | ✅ **需要** |
-| **`performance`** | **`14501 endTime is invalid`** | ✅ **需要** |
-| `overview` / `staffworklod` / `staffquality` / `satisfaction.report` | **正常返回 200**（传 `NOW` 也可以） | ❌ 不需要 |
+| **`staffAttendance`** | **`14501 endTime is invalid`** | ✅ **受** |
+| **`performance`** | **`14501 endTime is invalid`** | ✅ **受** |
+| `overview` / `staffworklod` / `staffquality` / `satisfaction.report` | **正常返回 200**（传 `NOW` 也可以） | ❌ 不受 |
 
-- 对齐检查**与跨度无关**：实测在 `staffAttendance` 跨度只有 1–2 天时，越界的 `endTime` 仍报 `endTime is invalid`
-- 纯历史窗口**不受此限制**（`5 天前 0:00 → 5 天前 12:00` 正常工作）
+- 上界检查**与跨度无关**：实测在 `staffAttendance` 跨度只有 1–2 天时，越界的 `endTime` 仍报 `endTime is invalid`
+- 纯历史窗口**不受此限制**（`5 天前 0:00 → 5 天前 12:00` 正常工作）—— 这条同时证明被检查的是**上界**而不是「整日对齐」：`5 天前 12:00` 不是整日对齐的值，照样 200
 - **⚠️ 今天 0:00 这条边界不稳定**：实测同一个 `endTime = 今天 0:00` 有时返回 200，有时返回 `endTime is invalid` → **不要把「今天 0:00」当可靠上界**。
   **能做的是避开它，不是贴着它留余量**（2026-10-30 更正：本节原写「用 `昨天 0:00 → 今天 0:00`，不要贴着边界」—— 那个建议自相矛盾，**它的右端正是那条不稳定边界**，而且它不含今天 0:00 之后的数据，用起来像是"拿到了今天"其实没有）。
-  **当前唯一可靠的做法**：`endTime` 取**纯历史日期的 0:00**（无今天的窗口）—— 三个接口在这种情况下都正常（见上表与「纯历史窗口不受此限制」一条）。**CLI 自己就是这么做的**：`attendance` / `performance` 两个任务声明了 `windowEndClamp: 'shanghaiYesterday'`，引擎把窗口右端**钳到昨天 0:00**（`src/core/time.ts` 的 `shanghaiYesterdayStart` —— 「统一退到昨天 0:00 留整日余量：当天数据不做，绝不贴着边界」）。
+  **当前唯一可靠的做法**：`endTime` 取**纯历史日期**（无今天的窗口）—— 三个接口在这种情况下都正常（见上表与「纯历史窗口不受此限制」一条）。**CLI 自己就是这么做的**：`attendance` / `performance` 两个任务声明了 `windowEndClamp: 'shanghaiYesterday'`，引擎把窗口右端**钳到昨天 0:00**（`src/core/time.ts` 的 `shanghaiYesterdayStart` —— 「统一退到昨天 0:00 留整日余量：当天数据不做，绝不贴着边界」）。
   **代价如实说**：**今天的数据拿不到** —— 而且不是「明天就有」，是**要等到下一次同步跑**。
   机制：clamp 把窗口右端钳到**当天 0:00 的前一天 0:00**（`shanghaiYesterdayStart`），
   所以窗口是 `[start, 昨天 0:00)`，**不含昨天整天的数据**。举例（上海时间）：
@@ -646,7 +648,7 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
   —— **没有"贴着边界就稳"的参数**（`昨天 0:00 → 今天 0:00` 不是解法：它的右端**正是**那条
   不稳定边界，而且它不含今天 0:00 之后的数据，用起来像是"拿到了今天"其实没有）。
 
-**⚠️ 两种 `14501` 必须靠 message 区分**：`endTime is invalid` 是**对齐问题**，`(endTime - startTime)/millsADay > 31 is invalid` 是**跨度问题**。错误码相同，但修复方式完全不同 —— CLI 必须解析 message，而不能只看 code。
+**⚠️ 两种 `14501` 必须靠 message 区分**：`endTime is invalid` 是**上界越界问题**（endTime 不早于今天 0:00），`(endTime - startTime)/millsADay > 31 is invalid` 是**跨度问题**。错误码相同，但修复方式完全不同 —— CLI 必须解析 message，而不能只看 code。
 
 **元数据表**：`sync_state`（水位、区间状态、最近错误）、`sync_gaps`
 
@@ -807,7 +809,7 @@ qiyu sync verify [task]         # 校验本地与远端一致性
 |---|---|---|---|
 | 历史数据概览 `statistic.overview` | **31 天** | `query_start` | 无必填参数；默认 = 最近 31 天 |
 | 坐席工作量 / 质量 / 满意度 | **31 天** | `query_start` | 每个坐席 1 行；`date` 不可信 |
-| **坐席考勤 `staffAttendance`** | **31 天** | `query_start` | **只有传入 `startTime` 时粒度才是 坐席 × 小时**；不传则得到 坐席 × 天，且 `total` 约小 10 倍（§6.2）。**务必传 `startTime`**。`endTime` 不得晚于今天 00:00 |
+| **坐席考勤 `staffAttendance`** | **31 天** | `query_start` | **只有传入 `startTime` 时粒度才是 坐席 × 小时**；不传则得到 坐席 × 天，且 `total` 约小 10 倍（§6.2）。**务必传 `startTime`**。`endTime` 必须早于今天 00:00 |
 | **考勤明细 `salaryDetail`** | **无限制**（400 天也可以） | `staff_id + work_date` | **必须传单个 `staffId`**；只返回该窗口的起始日 |
 | **订单绩效 `performance`** | **365 天** | `query_start` | 明细 + `sum`；测试账号没有这类数据 |
 | **机器人会话统计 `robot.summary`** | **31 天** | `query_start` | 忽略 `robotId`；超限报 `14004`（不是 `14501`） |

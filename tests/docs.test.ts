@@ -723,36 +723,48 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(row14501, '表行必须点名 window_misaligned').toContain("window_misaligned")
     // ⚠️ CodeRabbit round 8 指出并核实成立：表行的 `window_misaligned` 指引也必须带上界 ——
     // 只写「对齐自然日边界」的读者会把明天 00:00（已对齐但越界）原样重发。
-    expect(row14501, '表行必须写明越界的上界条件').toMatch(/不晚于今天 00:00/)
+    expect(row14501, '表行必须写明越界的上界条件 —— 早于而非不晚于（§6.2 实测今天 0:00 不稳定）').toMatch(/必须早于今天 00:00/)
     // ⚠️ CodeRabbit #50 round 2 指出并核实成立：两种 14501 的下一步**不同**。
     // 越界（endTime is invalid）→ 对齐自然日边界；跨度过大 → 按上限切片。
     // 回写第一版把两者都写成「按 maxWindowDays 切片后重试」，会让 Agent 对越界窗口
     // 反复按切片重试同一个失败请求（1–2 天的窗口切片也救不了越界）。
     expect(s).toMatch(/endTime is invalid`（越界）→ `kind: 'window_misaligned'`/)
     expect(s).toMatch(/切片救不了越界/)
-    // ⚠️ CodeRabbit round 6 指出并核实成立：越界的处置是**双条件**（对齐 + 上界），
-    // 只写「对齐到自然日边界」会让 Agent 把「明天 00:00」这种**已对齐但越界**的值
-    // 原样重发（它对齐了，仍会被拒）。必须同时写明「不得晚于今天 00:00」。
-    // ⚠️ CodeRabbit round 8 指出并核实成立：原断言对**全文** `toMatch(/不得晚于今天 00:00/)` ——
-    // 该措辞在 §6.2 与 §7.2 的多处表格里都有，即使把 §11.2 表行 / §4.3 回写注里的上界
-    // 整个删掉，全文判照样绿。必须**切出 §4.3 回写注那一块**再在块内断言。
+    // ⚠️ CodeRabbit #50 round 10 指出并核实成立（§6.2 实测）：本注的前一版把越界处置写成
+    // 「对齐自然日边界 **且** 不晚于今天 00:00」的**双条件**，两半都错 ——
+    // ① 「对齐」从来不是要求：纯历史日期的 endTime 取**任意时刻**都接受（`5 天前 0:00 →
+    //    5 天前 12:00` 返回 200），round 9 已把这一条写进注里，但表行与双条件句没跟着改；
+    // ② 「不晚于」把等号划进安全区：`endTime = 今天 0:00` 恰是那条**本身不稳定**的边界
+    //    （同一取值有时 200 有时被拒）。教 Agent 用「不晚于今天 0:00」＝教它去踩这条边界。
+    // 正确表述是单条件的「**早于**今天 00:00 / 用纯历史日期」。守卫因此分两层：
+    // 事故文本（双条件句 + 等号措辞）必须被判红，回写后的单条件表述必须放过。
     const errs = read('src/core/errors.ts')
     const noteStart = s.indexOf('> **⚠️ 「core 层自动分片」的收窄（2026-10-30 回写）**')
     expect(noteStart, '§4.3 的 14501 收窄注必须存在').toBeGreaterThanOrEqual(0)
     const noteRest = s.slice(noteStart)
     const noteEnd = noteRest.split('\n').findIndex((l, i) => i > 0 && l.trim() !== '' && !l.startsWith('>'))
     const noteBlock = noteEnd === -1 ? noteRest : noteRest.split('\n').slice(0, noteEnd).join('\n')
-    expect(noteBlock, '§4.3 回写注必须写明双条件（对齐 + 不晚于今天 00:00）')
-      .toMatch(/不得晚于今天 00:00/)
-    expect(noteBlock, '§4.3 回写注必须写明「对齐」与「上界」是两件事')
-      .toMatch(/\*\*对齐\*\*与\*\*上界\*\*是两件事/)
-    // ⚠️ CodeRabbit round 9 指出并核实成立（§6.2 实测：`5 天前 0:00 → 5 天前 12:00`
-    // 返回 200）：不能把 hint 里的「对齐到自然日边界」读成「每个 endTime 都必须写成 0:00」——
-    // 纯历史日期的 endTime 取任意时刻都接受，唯一被拒的形态是「晚于今天 0:00」。
-    expect(noteBlock, '必须限定「对齐」只针对上界越界、不适用纯历史窗口')
-      .toMatch(/只针对上界附近的越界|不适用于纯历史窗口/)
-    expect(noteBlock, '必须写明纯历史日期取任意时刻都接受').toMatch(/任意时刻/)
-    // ⚠️ CodeRabbit round 7 指出并核实成立：§4.3 回写注不应给出不安全示例
+    // 双向自检的「红」侧：事故文本必须被正则抓住 —— 证明下面的改正断言不是恒真的摆设
+    const ACCIDENT_DUAL = '（**两个条件**：对齐自然日边界**且**不晚于今天 00:00）'
+    expect(/两个条件|不晚于今天 00:00/.test(ACCIDENT_DUAL)).toBe(true)
+    // ⚠️ 只能锚**转述 hint 的那一行**做反向断言，不能对整块 `not.toMatch(/不晚于今天 00:00/)` ——
+    // 更正说明本身逐字引用了旧措辞（「本注的前一版把它写成……『不晚于今天 00:00』」），
+    // 对整块判会把「解释旧错」误判成「仍在犯旧错」。这与 §11.2 E 行是同一形态。
+    const transcribeLine = noteBlock.split('\n').find((l) => /逐字一致）/.test(l)) ?? ''
+    expect(transcribeLine, '§4.3 回写注必须转述实现 hint 那一行').not.toBe('')
+    expect(transcribeLine, '转述行必须写明单条件「早于今天 00:00」').toMatch(/必须早于今天 00:00/)
+    expect(transcribeLine, '转述行不得再把「不晚于今天 00:00」当作 hint 内容')
+      .not.toMatch(/不晚于今天 00:00/)
+    expect(noteBlock, '回写注必须写明「对齐」不是要求（纯历史日期取任意时刻都接受）')
+      .toMatch(/任意时刻/)
+    expect(noteBlock, '回写注必须点明「不晚于」把等号划进了安全区').toMatch(/把等号放进/)
+    // 反向自检：文档转述的上界必须与**实现 hint** 逐字一致（否则文档教的和真报的对不上）
+    const hintLine = errs.split('\n').find((l) => /hint: 'endTime 必须早于今天 00:00/.test(l)) ?? ''
+    expect(hintLine, '实现里的 window_misaligned hint 必须存在且已改为「早于」').not.toBe('')
+    expect(hintLine).toContain('必须早于今天 00:00')
+    expect(noteBlock, '文档转述的实现 hint 必须与 src/core/errors.ts 逐字一致')
+      .toContain(hintLine.trim().replace(/^hint: '/, '').replace(/' }$/, ''))
+    // ⚠️ CodeRabbit round 7 指出并核实成立：§6.2 的不稳定边界段不应给出不安全示例
     // 「昨天 0:00 → 今天 0:00」—— 其右端正是那条不稳定边界（且不含今天 0:00 之后的
     // 数据，让人以为「拿到了今天」）。改为面向概念的「endTime 用纯历史日期」。
     // ⚠️ 只能锚**主张所在的那一行**不能对全文 `not.toMatch`：更正说明里逐字引用了旧建议
@@ -767,10 +779,6 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const unstableBlock = s.slice(idx, idx + 700)
     expect(unstableBlock, '该段必须写明可靠做法是避开而不是贴边').toMatch(/避开它|不是贴着它留余量/)
     expect(s, '必须写明纯历史日期方案').toMatch(/纯历史日期/)
-    // 反向自检：文档转述的上界必须与实现 hint 一致（否则文档教的和真报的对不上）
-    const hintLine = errs.split('\n').find((l) => /hint: 'endTime 必须对齐到自然日边界/.test(l)) ?? ''
-    expect(hintLine, '实现里的 window_misaligned hint 必须存在').not.toBe('')
-    expect(hintLine, '实现 hint 必须自带「不得晚于今天 00:00」').toContain('不得晚于今天 00:00')
     // 反向自检：kind 名与实现一致（假的名字会让这条守卫守错东西）
     expect(errs, 'window_misaligned 必须真实存在').toContain("kind: 'window_misaligned'")
     expect(errs, 'window_too_large 必须真实存在').toContain("kind: 'window_too_large'")
@@ -799,9 +807,18 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(ACCIDENT.includes('只能经逃生通道')).toBe(true)
     expect(s, '「只能经逃生通道访问」的旧措辞不得回归').not.toMatch(/只能经逃生通道/)
     expect(s).toMatch(/\*\*缺的是"语义层"，不是"数据"\*\*/)
-    expect(s).toMatch(/落库后走 `query --table` \/[\s\S]{0,20}`query --sql`/)
+    // ⚠️ CodeRabbit #50 round 10 指出并核实成立：这条对**全文** `s` 断言四个表名 ——
+    // 四张表在 §6（报表/TABLES）等别处也逐字出现，把它们从**状态注**里整段删掉后
+    // 全文判照样绿。假护栏。必须与上面第一条 §2 用例一样，先把状态注那一块切出来。
+    const start = s.indexOf('> **⚠️ 交付状态（2026-10-30 回写）**')
+    expect(start, '§2 交付状态注必须存在').toBeGreaterThanOrEqual(0)
+    const rest = s.slice(start)
+    const blockEnd = rest.split('\n').findIndex((l, i) => i > 0 && l.trim() !== '' && !l.startsWith('>'))
+    const block = blockEnd === -1 ? rest : rest.split('\n').slice(0, blockEnd).join('\n')
+    expect(block).toMatch(/\*\*缺的是"语义层"，不是"数据"\*\*/)
+    expect(block, '本地通道的两条路（--table / --sql）必须在状态注块内').toMatch(/落库后走 `query --table`/)
     for (const t of ['`tickets`', '`ticket_logs`', '`knowledge_items`', '`knowledge_categories`']) {
-      expect(s, `§2 状态注必须点名本地表 ${t}`).toContain(t)
+      expect(block, `§2 状态注块内必须点名本地表 ${t}`).toContain(t)
     }
   })
 
