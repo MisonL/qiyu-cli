@@ -124,36 +124,58 @@ describe('注册表', () => {
     expect(note, 'note 必须澄清 verified 的含义').toMatch(/verified/)
   })
 
-  it('receive.message 的 note 里的「唯一」是真的唯一 —— 那是它唯一的论据', () => {
+  it('note 里的「唯一」是真的唯一 —— 那是它唯一的论据（2026-10-30 起是三条）', () => {
     // ⚠️ 这条守的是一个**会随注册表增长而失效**的说法（2026-10-06 补）。
-    // note 里写「本记录是全表**唯一** `verified: true` 与 `envelope: null` 并存的
-    // 一条」，而这条 note 的全部作用就是解释"为什么这个 verified 不是那个意思"——
-    // **唯一性就是它的论据**。而此前**零断言**：生成脚本补齐到 154 条时，若另一条
-    // 记录也成了 `verified && envelope: null`，note 仍会信誓旦旦地说"唯一"，
-    // 而那句话此时是**错的**（且错得没边 —— 154 条里"唯一"是极强的主张）。
-    // 这与「标题里的数字必须与断言一致」同源，只是这次唯一性藏在 note 里。
-    const both = allEndpoints().filter((e) => e.verified && e.envelope === null).map((e) => e.id)
-    expect(both, 'note 声称 receive.message 是唯一的 verified && envelope:null')
-      .toEqual(['receive.message'])
-    // 反向：verified:true 的三条都得进注册表（否则"唯一"是因为别的都丢了，
-    // 而那本身是更严重的缺陷）—— 钉住这个集合，"唯一"才有意义。
+    // receive.message 的 note 里写「本记录与 X、Y 是全表仅有的三条 `verified: true`
+    // 与 `envelope: null` 并存」，而这条 note 的全部作用就是解释"为什么这个 verified
+    // 不是那个意思"—— **这条名单就是它的论据**，且 `envelope: null` 的反直觉含义
+    // 全靠它。此前**零断言**：生成脚本补齐注册表时，若另一条记录也成了
+    // `verified && envelope: null`，note 仍会信誓旦旦地说"仅有的三条"，
+    // 而那句话此时是**错的**（且错得没边 —— 154 条里"仅有"是极强的主张）。
+    // 这与「标题里的数字必须与断言一致」同源，只是这次名单藏在 note 里。
+    //
+    // ⚠️ 2026-10-30 起这个集合从 1 条变成 3 条：`chat.queue.group.query`（载荷在
+    // staffInfo）与 `ipcc.customfield.template.get`（裸数组）实测确认**形状不在
+    // A/B/C/D 内**，故也以 `envelope: null` + `verified: true` 登记。三者的 null
+    // 成因不同（两个是形状超出枚举，一个是响应体由我方实现决定、无从实测），
+    // note 里必须各自说清——下面的第二条断言就是在守这一点。
+    const both = allEndpoints().filter((e) => e.verified && e.envelope === null)
+    expect(both.map((e) => e.id).sort(),
+      'note 声称 verified && envelope:null 的恰好是这三条')
+      .toEqual(['chat.queue.group.query', 'ipcc.customfield.template.get', 'receive.message'])
+    // ⚠️ note 声称三条的 `envelope: null` 都**不表示「未实测」** —— 这个反直觉的
+    // 说法必须逐条落地。`envelope: null` 在 `normalize` 里等价于"未实测、走宽松分支"，
+    // 而这三条的 null 各有各的成因；某一条的 note 若漏了这句话，Agent 就会把
+    // 「形状超出枚举」读成「这个接口的信封没测过」—— 那是一次事实上的误导。
+    // 反向包含在上面：漏登记新成员时第一条会红。
+    for (const e of both) {
+      expect(e.note ?? '', `${e.id} 的 note 必须点明 null 不表示未实测`)
+        .toMatch(/不表示[^。]{0,6}未实测/)
+    }
+    // 反向：verified:true 的记录都得进注册表（否则名单成立是因为别的都丢了，
+    // 而那本身是更严重的缺陷）—— 钉住这个集合，名单才有意义。
     expect(allEndpoints().filter((e) => e.verified).map((e) => e.id).sort())
       .toEqual([
         'ai.knowledge.getCategoryTree', 'ai.knowledge.getDetail', 'ai.knowledge.search',
-        'ai.statistic.transferHuman', 'category.list', 'data.overview.ipcc',
+        'ai.statistic.transferHuman', 'category.list', 'chat.queue.group.query',
+        'data.overview.ipcc',
         'data.overview.session', 'evaluation.setting.get', 'export.session',
         'export.session.check', 'export.session.one', 'export.session.one.message',
-        'icoutcall.history.seat', 'icoutcall.history.team', 'kefu.v2.query',
+        'icoutcall.history.seat', 'icoutcall.history.team',
+        'ipcc.calltaskdetail.get', 'ipcc.customfield.template.get', 'kefu.v2.query',
         'online.session.category.list', 'online.session.customfield.template',
         'receive.message', 'robot.data.getQuestionsByCategoryName', 'robot.data.knowledge',
         'robot.data.kpoint', 'robot.data.queryStandardByEffectiveQuestion',
         'robot.data.queryStandardQuestionList', 'robot.evaluation.setting',
-        'robot.session.msgAssociate', 'robot.statistic.summary', 'robot.transfer.config',
+        'robot.session.commonQuestions', 'robot.session.msgAssociate', 'robot.session.msgPredict',
+        'robot.statistic.summary', 'robot.transfer.config',
         'session.user.profile', 'smstask.status', 'staff.group.list.new',
         'staff.group.members.new', 'staff.list.new', 'statistic.overview',
         'statistic.performance', 'statistic.salaryDetail', 'statistic.satisfaction.report',
         'statistic.staffAttendance', 'statistic.staffquality', 'statistic.staffworklod',
-        'tag.all', 'ticket.filter.count', 'ticket.filter.list', 'ticket.search',
+        'tag.all', 'ticket.filter.count', 'ticket.filter.list', 'ticket.list', 'ticket.log',
+        'ticket.new.detail',
+        'ticket.search',
         'ticket.template.fields', 'ticket.template.list',
       ])
   })

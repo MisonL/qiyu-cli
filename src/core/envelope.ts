@@ -62,10 +62,15 @@ function isEmptyPayload(v: unknown): boolean {
  * 仅 {code,message} 一种形状就分裂成五种（JSON 对象/数组/数字/纯文本/键不存在），
  * 只按键集合分支的解析器会错四种。
  *
- * ⚠️ 最要命的一条：**形状 C 的端点，每一个错误也都返回 code:200**，配一段纯文本的
+ * ⚠️ 最要命的一条：**形状 C 的端点，错误也可能返回 code:200**，配一段纯文本的
  * message（`14501 ...`、`14004 Not found param`、`14009 api call too frequent`）。
  * 因此形状 C 上"message 解析不出 JSON"必须判为**失败**，不能当"成功但无数据"——
  * 否则 Agent 会把限流当成"这段时间没有数据"，这是设计稿 §9.2 点名的头号静默失败。
+ *
+ * ⚠️ 本句此前写作「每一个错误都返回 code:200」，2026-10-30 实测 `ticket.list` 证伪：
+ * 它的 `staffId` 非法时返回 **`code:14100`** + 纯文本 `Bad holder staff id`。
+ * 判据不变（C 上 message 解析失败仍判错，且本分支先判 code、非 200 直接失败），
+ * 但"每一个"这个量词是错的 —— 留着它会让人以为"C 的响应只要 code 是 200 就安全"。
  */
 export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
   // 裸数组：ipcc.customfield.template.get 完全没有信封
@@ -141,8 +146,8 @@ export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
 
   // 形状 A / D：数据在 data
   //
-  // ⚠️ **但"data 为空 ⇒ not_found"这条规则只在 envelope 已实测时成立。**
-  // envelope 为 null（未实测）的接口恰恰**全部是写接口**，而写接口的 `data` 语义
+  // ⚠️ **但"data 为空 ⇒ not_found"这条规则只在 envelope 已登记时成立。**
+  // envelope 为 null 的接口里，此前观测到的**全部是写接口**，而写接口的 `data` 语义
   // 与读接口相反 —— 设计稿 §5.4.1 的**文档依据**（这 5 个接口实测中刻意未调用）：
   //   · `addKnowledge`  → `data` 是新 id（integer）
   //   · `editKnowledge` / `editKnowledgeNoSimilars` / `editChannelAnswer` → `data` 是 `true`
@@ -154,8 +159,15 @@ export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
   // 而真相是**全部删掉了**。这是 §9.2 静默失败最危险的方向：它把一个已完成的
   // 破坏性操作描述成一次空操作。
   //
-  // → 未实测的接口**不判 not_found**：注册表既然不知道这个接口的 `data` 语义，
-  // 就不能假装知道。"空 data 是什么"这个问题，只有实测过才能回答。
+  // ⚠️ **2026-10-30 起 `envelope: null` 有两种含义**，不再等于"未经实测"：
+  //   ① 该接口的信封**从未实测**（写接口全部如此，`verified: false`）；
+  //   ② 实测过，但形状**不在 A/B/C/D 里**（`chat.queue.group.query` 的 staffInfo、
+  //      `ipcc.customfield.template.get` 的裸数组）—— 两者都由更前面的结构分支接住，
+  //      **根本走不到这里**，所以 null 对它们无害。
+  // 两种情况下这条 `data` 分支的判据都一样：**不判 not_found**。
+  //
+  // → 不知道 `data` 语义的接口**不判 not_found**：注册表既然不知道这个接口的
+  // `data` 语义，就不能假装知道。"空 data 是什么"这个问题，只有实测过才能回答。
   if ('data' in o) {
     return { ok: codeOk, code, payload: o.data, messageText,
              notFound: codeOk && envelope !== null && envelope !== undefined
@@ -169,7 +181,9 @@ export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
     return { ok: codeOk, code, payload: o.staffInfo, messageText, notFound: false }
   }
 
-  // 宽松模式（envelope 为 undefined 或 null —— 该接口的信封未经实测）：
+  // 宽松模式（envelope 为 undefined 或 null）：该接口的信封形状未经登记 ——
+  // 可能是从未实测，也可能是实测确认形状不在 A/B/C/D 里（登记了非标形状的两个接口
+  // 由更前面的结构分支提前接住，走不到这里）。
   // 按设计稿 §9.0，此时唯一能做的就是试探 message 能否解析。
   // ⚠️ 这与形状 C 的严格语义不同：解析失败**不判错**，因为无从区分
   // "形状 C 的错误报文"与"staff.list 那种 message='OK' 的正常响应"。
@@ -195,15 +209,23 @@ export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
 
   // 其余形状走到这里意味着"200 但无载荷"。
   //
-  // ⚠️ **envelope 为 null（未实测）时与 data/result 两个分支取同一条规则：不判 not_found。**
+  // ⚠️ **envelope 为 undefined 或 null 时与 data/result 两个分支取同一条规则：不判 not_found。**
   // 设计稿 §9.0 的规则原文是"`code:200` 且无数据字段的，一律当作 not_found"，但它同时
   // 写明这条规则"必须是**注册表查询**而非启发式判断"—— 它假定每个接口都登记了 `envelope`。
-  // 在计划交付的 11 条骨架里那 5 个知识库写接口的 `envelope` 正是 `null`，生成脚本产出
-  // 154 条时 `null` 只会更多。若这里写 `envelope !== 'D'`，`null !== 'D'` 为真，于是
+  // 骨架里那 5 个知识库写接口的 `envelope` 正是 `null`（未实测），生成脚本产出 154 条时
+  // `null` 只会更多。若这里写 `envelope !== 'D'`，`null !== 'D'` 为真，于是
   // **同一个未实测接口**会因为"载荷挂在 data 上还是完全缺席"得到相反的判定：
   // `{code:200,data:[]}` 走 data 分支判 false，`{code:200}` 走这里判 true。
   // 对未实测的写接口，`{code:200}` 无载荷恰恰可能就是"操作成功"，判成 not_found 会把
   // 一次成功的写描述成"什么都没发生"—— 与 data 分支注释里那条最危险的静默失败同构。
+  //
+  // ⚠️ **2026-10-30 起 envelope:null 有第二种来源，同样依赖这条规则：**
+  //   实测过的接口若返回 `{code}`（无 data/result/message/staffInfo），说明该接口
+  //   的"成功但查无此物"与"纯确认"是**同一报文**，而 `normalize` 只收到一个 envelope
+  //   参数、不知道是哪个接口 —— 它无法替调用方分辨。这类接口（`msgAssociate` 的
+  //   not-found 路径、`robot.transfer.config` 的正常空壳）靠注册表按接口登记
+  //   `'D-nf'` / `'D'` 兑现。若某个实测接口没机会这样登记（形状是无结构分支的
+  //   branch 提前接住），它的 notFound 取尾部兜底 —— 与 data/result 分支同规则。
   // → 与 data/result 对齐：不知道就不断言。'D' / 'D-nf' 这些**已登记**的取值照旧区分。
   //
   // ⚠️ 形状 D 这一族里**语义相反的两个接口共用同一个报文**，必须分开登记：

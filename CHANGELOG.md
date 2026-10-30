@@ -9,6 +9,30 @@
 
 ### 修复
 
+- **只读接口实测收口（20 个）：A6 的 `verified:false` 从「全都未实测」变成「逐个如实登记」**。
+  用真实凭证对 20 个未实测的只读接口逐个采样（`ticket.log` / `ticket.new.detail` /
+  `ticket.list` / `chat.queue.group.query` / `ipcc.calltaskdetail.get` /
+  `ipcc.customfield.template.get` / `robot.session.commonQuestions` /
+  `robot.session.msgPredict` / `event.queryQueueStatus` / `merchant.{list,query}` /
+  `ipcc.calltask.get` / `robot.session.chat` / 7 个 `icoutcall.*`），把结果写进注册表：
+  8 个走通了成功路径 → `verified:true` + 实测 `envelope`（`ticket.log`/`ticket.new.detail`/
+  `ipcc.calltaskdetail.get`/`robot.session.commonQuestions`/`robot.session.msgPredict` →
+  形状 A；`ticket.list` → 形状 C；`chat.queue.group.query` 与 `ipcc.customfield.template.get`
+  实测确认形状**不在 A/B/C/D 里**（载荷在 `staffInfo` / 裸数组），以 `envelope:null` +
+  `verified:true` 登记，note 逐条点明「null 不表示未实测」）；其余 12 个保持
+  `verified:false`，note 如实记录实测到的错误（`icoutcall.*` ×7 → `14500 Service Offline`，
+  且同模块 `icoutcall.history.seat` 实测可用，证明离线是按子服务判定；`merchant.*` → `8002`
+  需平台版 appKey；`ipcc.calltask.get` → `8012` 需真实任务 id；`robot.session.chat` → `14004`
+  `msg` 须传对象——该接口是写行为、不继续采样；`event.queryQueueStatus` → `14007` 需排队中 uid）。
+
+  实测同时修正两处**文档与实测不符**的旧断言：
+  · `ticket.list` 的 `staffId` 非法时返回 **`code:14100`** + 纯文本 `Bad holder staff id`，
+    不是「形状 C 的错误也都返回 code:200」—— 该量词从信封注释与设计稿 §9.0 收回；
+  · `ticket.log` / `ticket.new.detail` 实测成功信封是 `{code,data}`（**无 message**）。
+  新增可重复采样器 `scripts/registry/sample.mjs`（只读接口、拒绝危险写接口；凭据只从 env
+  读；输出只含结构不含业务值），带 14 条护栏（签名复用 `dist/core/sign.js` 单一实现点、
+  凭证不进 argv、输出不含哨兵值、不进 CI）。
+
 - **只读诊断 hint 不带存储选择：照做会去读默认库，Agent 据此断定「表真的不存在」（#45 边界 ②）**。
   2026-10-30 补全与上一条同族的另一半：上一条只修了**恢复**命令（`store init` / `sync run`），
   而**只读诊断**命令（`db tables` / `db describe` / `sync status` / `query --table` / `query --sql`）
