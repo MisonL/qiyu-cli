@@ -701,6 +701,12 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(s, '14501 不再声称 core 自动分片').not.toMatch(/\| 14501 \| 数据量超限 \| — \| \*\*core 层自动分片\*\* \|/)
     expect(s).toMatch(/14501 只被翻译、不被吸收/)
     expect(s).toMatch(/真正切片的只有同步引擎/)
+    // ⚠️ CodeRabbit round 3 指出并核实成立：**表行本身**也要区分两种 14501，
+    // 不能只在下方状态注里说 —— 状态注在别处，读者若只读表格会照旧按「切片」处理越界。
+    const row14501 = s.split('\n').find((l) => /^\| 14501 \|/.test(l)) ?? ''
+    expect(row14501, '14501 表行必须存在').not.toBe('')
+    expect(row14501, '表行必须点名 window_too_large').toContain("window_too_large")
+    expect(row14501, '表行必须点名 window_misaligned').toContain("window_misaligned")
     // ⚠️ CodeRabbit #50 round 2 指出并核实成立：两种 14501 的下一步**不同**。
     // 越界（endTime is invalid）→ 对齐自然日边界；跨度过大 → 按上限切片。
     // 回写第一版把两者都写成「按 maxWindowDays 切片后重试」，会让 Agent 对越界窗口
@@ -759,12 +765,21 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     }
   })
 
-  it('设计稿 §6.4/§6.5：退避是固定间隔、陈旧锁超时未实现、CHECKPOINT 不自动执行', () => {
+  it('设计稿 §6.4/§6.5：退避是固定间隔、陈旧锁超时未实现、CHECKPOINT 是运维责任而非承诺', () => {
     const s = design()
     expect(s, '「以指数退避重试」的旧措辞不得回归').not.toMatch(/冲突时\*\*以指数退避重试\*\*/)
     expect(s).toMatch(/曲线是固定间隔，不是指数退避/)
     expect(s).toMatch(/陈旧锁超时未实现/)
-    expect(s).toMatch(/CLI \*\*不自动执行 `CHECKPOINT`\*\*/)
+    // ⚠️ CodeRabbit round 3 指出并核实成立：只写「CLI 不执行 CHECKPOINT → 文件无界膨胀，
+    // 只能手动」把两件事都说过了 —— ① CLI 确实不执行（全仓无 CHECKPOINT 调用，这句话保留）；
+    // ② 但 DuckDB 会按 WAL 大小自动 checkpoint（内置 `wal_autocheckpoint` 设置，仓库不改默认），
+    //    所以「文件只增不减」是错的；③ 手动 CHECKPOINT 只部分回收已删除行空间。三者都要如实写。
+    // 判据：不该再承诺「必须手动、否则无界膨胀」，而应写「CLI 不执行 + 可手动」。
+    expect(s, '不得再声称文件只会手动回收才不膨胀')
+      .not.toMatch(/库文件只增不减[\s\S]{0,20}唯有.*手动|不断累积已删除行的空间/)
+    expect(s, '必须写明 CLI 不执行 CHECKPOINT（运维责任）').toMatch(/CLI \*\*不执行 `CHECKPOINT`\*\*/)
+    expect(s, '必须写明 DuckDB 会按 WAL 自动 checkpoint').toMatch(/自动 checkpoint|wal_autocheckpoint/)
+    expect(s, '必须限定手动 CHECKPOINT 只部分回收空间').toMatch(/部分|一部分/)
   })
 
   it('设计稿 §7.4/§7.4.1：限频持久化与 maxWindowDays 预校验各自收窄到 sync', () => {
