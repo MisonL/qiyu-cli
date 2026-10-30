@@ -9,6 +9,26 @@
 
 ### 修复
 
+- **只读诊断 hint 不带存储选择：照做会去读默认库，Agent 据此断定「表真的不存在」（#45 边界 ②）**。
+  2026-10-30 补全与上一条同族的另一半：上一条只修了**恢复**命令（`store init` / `sync run`），
+  而**只读诊断**命令（`db tables` / `db describe` / `sync status` / `query --table` / `query --sql`）
+  同样会打偏库 —— 读错库与写错库一样误导。例：`query --table sessions --db <非默认库>` 报
+  「未知表」时，裸 `qiyu db tables` 列的是默认库的表，Agent 会得出「这张表真的不存在」的结论。
+  修法：`src/output.ts` 新增 `StoreLocation` 与六个渲染器（`storeLocationFlags` /
+  `dbTablesCommand` / `dbDescribeCommand` / `syncStatusCommand` / `queryTableCommand` /
+  `querySqlCommand`），参数统一走 `shellArg`（含 win32 的 PowerShell 方言）；定位由
+  `storeLocationOf(已解析路径, 档名)` 或 `storeLocationFromFlags(原始 flag)` 构造。
+  线程到 7 个文件：`query/errors.ts`（未知表/未知列/漂移守卫）、`query/mask.ts`（漂移列与
+  `--sql` 缺口警告）、`query/table-query.ts`（敏感列分组）、`query/sandbox.ts`（打开失败的
+  store init）、`commands/{query,db,stats}.ts`（0 行/截断/iso-day/脏时间值/坏 payload/闭集校验）。
+  漂移守卫：`tests/store-hint-selection.test.ts` 新增 `BARE_DIAG_HINT`（闭合形态 + 字面量在命令名处
+  截断的拼接形态），豁免仅两处且各有可证伪理由（`output.ts` 是唯一实现点；`api call` 不吃
+  `--db`/`--profile`，并有「api 一吃上存储 flag 就变红」的自检）。
+  行为覆盖 15 个用例（真 DuckDB）：未知表/未知列/敏感分组/0 行（两通道）/脱敏建议/iso-day/
+  截断/闭集校验三命令/漂移列/sandbox 打开失败/脏时间值/坏 payload。
+  变异验证 12 处（`storeLocationFlags` 恒空、逐点丢 `loc`、闭集校验丢原始 flag、源码重新引入裸形态），
+  对应用例均红（逐条 grep 确认改动真落地）。
+
 - **反向图例覆盖不完整（#38 挂账）：`stats fields` 的 `table`/`sentinel` 与 `query` 的 data 字段无释义，`api schema` 无「输出 ⊆ 图例」方向**。
   2026-10-30 补齐三处：
   ① `statsFieldNotes()` 新增 `table`（回显输入、不是「库里有哪张表」的依据）与 `sentinel`

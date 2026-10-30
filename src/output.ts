@@ -150,6 +150,74 @@ export function syncRunCommand(path: string, profileFlag?: string): string {
 }
 
 /**
+ * 存储定位（与 `StoreFlags` 同键名，命令层可直接透传）。
+ *
+ * ⚠️ 为什么所有只读诊断 hint 都要带上它（#45 边界 ②，2026-10-30）：hint 里写
+ * 「用 `qiyu db tables` 查看可用表」时，若本次是用 `--db <自定义路径>` 跑的，逐字执行
+ * 会去列**默认库**的表 —— 读错库与写错库同样误导：Agent 会据此断定「表真的不存在」。
+ * `db` 常是**已解析出的绝对路径**（命令层 `opened.dbPath`）；前置闭集校验阶段
+ * （尚未解析）传用户原始 flag 值，语义仍是「复现本次选择」。
+ */
+export interface StoreLocation { db?: string; profile?: string }
+
+/**
+ * 从**尚未解析**的 `--db`/`--profile` 原始取值构造定位（前置闭集校验阶段的用法）。
+ * 两者都没给 → `undefined`（渲染不带任何 flag，等价于默认解析）。
+ */
+export function storeLocationFromFlags(
+  flags: { db?: string; profile?: string },
+): StoreLocation | undefined {
+  if (flags.db === undefined && flags.profile === undefined) return undefined
+  const loc: StoreLocation = {}
+  if (flags.db !== undefined) loc.db = flags.db
+  if (flags.profile !== undefined) loc.profile = flags.profile
+  return loc
+}
+
+/** 已解析出的库路径/档名 → 定位（命令层 `opened` 的用法）。 */
+export function storeLocationOf(db: string, profile?: string): StoreLocation {
+  return profile === undefined ? { db } : { db, profile }
+}
+
+/** `--db <p> [--profile <q>]`（带前导空格）；两者都没有时返回空串。 */
+export function storeLocationFlags(loc?: StoreLocation): string {
+  if (loc === undefined) return ''
+  let s = ''
+  if (loc.db !== undefined) s += ` --db ${shellArg(loc.db)}`
+  if (loc.profile !== undefined) s += ` --profile ${shellArg(loc.profile)}`
+  return s
+}
+
+/** `qiyu db tables` 诊断命令，指向本次的存储定位（口径见 `StoreLocation`）。 */
+export function dbTablesCommand(loc?: StoreLocation): string {
+  return 'qiyu db tables' + storeLocationFlags(loc)
+}
+
+/**
+ * `qiyu db describe <表>` 诊断命令，指向本次的存储定位。
+ * `table` 只接受 `TABLES` 里的表名或占位符 `<表>`（代码内常量，不是用户输入）——
+ * 表中列名不承载外部输入，故原样渲染；路径/档名走 `shellArg`。
+ */
+export function dbDescribeCommand(table: string, loc?: StoreLocation): string {
+  return `qiyu db describe ${table}` + storeLocationFlags(loc)
+}
+
+/** `qiyu sync status` 诊断命令，指向本次的存储定位（sync 族同样接受三件套）。 */
+export function syncStatusCommand(loc?: StoreLocation): string {
+  return 'qiyu sync status' + storeLocationFlags(loc)
+}
+
+/** `qiyu query --table <表>` 诊断命令，指向本次的存储定位。 */
+export function queryTableCommand(table: string, loc?: StoreLocation): string {
+  return `qiyu query --table ${table}` + storeLocationFlags(loc)
+}
+
+/** `qiyu query --sql` 诊断命令，指向本次的存储定位。 */
+export function querySqlCommand(loc?: StoreLocation): string {
+  return 'qiyu query --sql' + storeLocationFlags(loc)
+}
+
+/**
  * 单个参数值的 shell 渲染：安全集内裸渲染，其余单引号包裹。
  * POSIX 安全集取自 Python `shlex.quote`（`[A-Za-z0-9_@%+=:,./-]`）；**win32 安全集更窄**
  *（去掉 `@` `%` `,`）—— PowerShell 下裸 `a,b` 会变成 `Object[]`、前导 `@` 是 splatting、

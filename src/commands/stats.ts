@@ -16,7 +16,11 @@ import type { MetricDecl, MetricSource, MetricUnit } from '../query/metric-catal
 import { TABLES } from '../store/schema.js'
 import { openGuardedSession } from './db.js'
 import { parseStoreFlags } from './store-flags.js'
-import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand } from '../output.js'
+import {
+  ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
+  dbTablesCommand, dbDescribeCommand, querySqlCommand, storeLocationFromFlags, storeLocationOf,
+} from '../output.js'
+import type { StoreLocation } from '../output.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
@@ -248,6 +252,8 @@ async function statsFields(argv: string[]): Promise<number> {
   if (flags.rest.length > 1) return usageFail(`未知参数：${flags.rest.slice(1).join(' ')}`)
 
   const table = sanitizeControlChars(flags.rest[0])
+  // 尚未解析存储（闭集校验先于一切 I/O）：诊断 hint 只能复现用户原始 flag。
+  const preOpenLoc = storeLocationFromFlags(flags)
   // spec §9.1：闭集校验先于一切 I/O —— 非报表表不进库、不开连接。
   if (!REPORT_TABLES.includes(table)) {
     // ⚠️ hint 必须按**这句话是否成立**来给（2026-10-18 手工验收发现，复审 Minor-1 补齐）：
@@ -262,12 +268,14 @@ async function statsFields(argv: string[]): Promise<number> {
     const payloadCol = known?.columns.find((c) => c.name === 'payload')
     const hint = known === undefined
       ? (candidates.length > 0
-        ? `候选：${candidates.join('、')}（stats fields 只接受报表域表；用 \`qiyu db tables\` 查看全部表）`
-        : '用 `qiyu db tables` 查看全部表；stats fields 只接受报表域表')
+        ? `候选：${candidates.join('、')}（stats fields 只接受报表域表；用 `
+          + '`' + dbTablesCommand(preOpenLoc) + '` 查看全部表）'
+        : '用 `' + dbTablesCommand(preOpenLoc) + '` 查看全部表；stats fields 只接受报表域表')
       : payloadCol !== undefined && payloadCol.sensitive
         ? '该表的 payload 是整行 PII 副本：统计它没有价值且会扩大暴露面'
         : payloadCol !== undefined
-          ? '该表的业务字段收敛在 payload 里但不属于报表域；stats fields 只做报表指标，字段清单请用 `qiyu db describe ' + table + '`'
+          ? '该表的业务字段收敛在 payload 里但不属于报表域；stats fields 只做报表指标，字段清单请用 `'
+            + dbDescribeCommand(table, preOpenLoc) + '`'
           : '该表的业务字段不是整体收敛进 payload 的（没有 payload 列），字段自描述对它没有意义'
     return usageFail(
       `stats fields 只接受报表域表，收到：${describeArgs([table])}\n可用表：${REPORT_TABLES.join('、')}`,
@@ -335,7 +343,8 @@ async function statsFields(argv: string[]): Promise<number> {
     if (badJson > 0) {
       warnings.push(`该表有 ${badJson} 行 payload 不是合法 JSON，未计入统计`
         + '（正常同步写入的是 JSON 字符串；这些行可能来自旧版 CLI、外部工具或库损坏）。'
-        + '用 `qiyu query --sql` 单独查看它们以确认成因')
+        + '用 `' + querySqlCommand(storeLocationOf(opened.dbPath, opened.profileFlag))
+        + '` 单独查看它们以确认成因')
     }
     const emptyKey = countOf(shape.empty_key)
     if (emptyKey > 0) {
@@ -364,7 +373,7 @@ async function statsFields(argv: string[]): Promise<number> {
       { table, sentinel: SENTINEL, declared: Object.fromEntries(declared), observed, unknown_fields: unknownFields },
       { field_notes: statsFieldNotes(), warnings })
   } catch (e) {
-    return thrownToQueryExit(e, TABLES)
+    return thrownToQueryExit(e, TABLES, false, storeLocationOf(opened.dbPath, opened.profileFlag))
   } finally {
     await session.close()
   }

@@ -17,7 +17,8 @@
 //
 // ⚠️ 分层约束（spec §5.1）：不 import `sync/`、`commands/`。`output.ts` 是 CLI 输出层
 // （信封与退出码），不是命令层，可以 import。
-import { fail, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand } from '../output.js'
+import { fail, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand, dbTablesCommand, dbDescribeCommand } from '../output.js'
+import type { StoreLocation } from '../output.js'
 import type { TableDef } from '../store/schema.js'
 
 export interface QueryFailure {
@@ -199,7 +200,7 @@ export function missingTableCauses(path: string, profileFlag?: string): string {
 }
 
 /** 表不存在的中文消息 + 候选 hint（原生分支与 cause 补算分支共用，裁决 R9）。 */
-function tableNotFound(name: string, msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
+function tableNotFound(name: string, msg: string, tables: readonly TableDef[], loc?: StoreLocation): { message: string; hint: string } {
   const candidates = mergeCandidates(
     // 多要一个：只有知道「还有第 6 个」才能决定 hint 末尾加不加「等」。
     suggestNames(name, tables.map((t) => t.name), CANDIDATE_LIMIT + 1),
@@ -210,12 +211,12 @@ function tableNotFound(name: string, msg: string, tables: readonly TableDef[]): 
   )
   return {
     message: `表 ${name} 不存在`,
-    hint: candidates.length > 0 ? candidateHint(candidates) : '用 `qiyu db tables` 查看可用表',
+    hint: candidates.length > 0 ? candidateHint(candidates) : '用 `' + dbTablesCommand(loc) + '` 查看可用表',
   }
 }
 
 /** 列不存在的中文消息 + 候选 hint（候选池 = 全部表的全部列名：SQL 不告诉我们 FROM 哪张表）。 */
-function columnNotFound(name: string, msg: string, tables: readonly TableDef[]): { message: string; hint: string } {
+function columnNotFound(name: string, msg: string, tables: readonly TableDef[], loc?: StoreLocation): { message: string; hint: string } {
   const allColumns = [...new Set(tables.flatMap((t) => t.columns.map((c) => c.name)))]
   const candidates = mergeCandidates(
     suggestNames(name, allColumns, CANDIDATE_LIMIT + 1),
@@ -226,7 +227,7 @@ function columnNotFound(name: string, msg: string, tables: readonly TableDef[]):
     message: `列 ${name} 不存在`,
     hint: candidates.length > 0
       ? candidateHint(candidates)
-      : '用 `qiyu db describe <表>` 查看列清单',
+      : '用 `' + dbDescribeCommand('<表>', loc) + '` 查看列清单',
   }
 }
 
@@ -237,11 +238,12 @@ function columnNotFound(name: string, msg: string, tables: readonly TableDef[]):
 function missingNameFailure(
   msg: string,
   tables: readonly TableDef[],
+  loc?: StoreLocation,
 ): { message: string; hint: string } | null {
   const byTableName = TABLE_NAME_RE.exec(msg) ?? TABLE_REF_RE.exec(msg)
-  if (byTableName) return tableNotFound(byTableName[1], msg, tables)
+  if (byTableName) return tableNotFound(byTableName[1], msg, tables, loc)
   const byColumn = COLUMN_NAMED_RE.exec(msg) ?? COLUMN_NAME_RE.exec(msg)
-  if (byColumn) return columnNotFound(byColumn[1], msg, tables)
+  if (byColumn) return columnNotFound(byColumn[1], msg, tables, loc)
   return null
 }
 
@@ -254,7 +256,7 @@ function missingNameFailure(
  * 误报成「已被只读沙箱拦截」会把环境问题（退出码 1）说成用法问题（退出码 2）。
  * `retryable` 一律 false：这些都是确定性错误，重试同一个查询只会得到同样的结果。
  */
-export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): QueryFailure {
+export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc?: StoreLocation): QueryFailure {
   // ① 已分类错误原样透传（sandbox 的分工：它分类，这里不重新分类）。
   // ⚠️ 唯一例外（裁决 R9）：sandbox 在 prepare 期把原生 Catalog/Binder 错误包成
   // `usage`/`query_error` 并把原文挂在 `cause` 上 —— kind/code 仍以 sandbox 为准，
@@ -273,7 +275,7 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
       const causeMsg = errorText(classified.cause)
       // 表/列不存在只对 usage 补算（sandbox 的 prepare 期包装；Minor #6 守卫）。
       if (classified.kind === 'usage') {
-        const refined = missingNameFailure(causeMsg, tables)
+        const refined = missingNameFailure(causeMsg, tables, loc)
         if (refined) {
           f.message = refined.message
           f.hint = refined.hint
@@ -301,7 +303,7 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
   }
 
   // ③ 表/列不存在：spec §十一 行 5（四种原生形态统一走 missingNameFailure）。
-  const missing = missingNameFailure(msg, tables)
+  const missing = missingNameFailure(msg, tables, loc)
   if (missing) {
     return { kind: 'usage', code: 'query_error', retryable: false, ...missing }
   }
@@ -363,9 +365,9 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[]): Qu
  * `query_timeout` 不设特殊分支）。若将来 `output.usageFail` 支持自定义 code，可改回复用它。
  */
 export function thrownToQueryExit(
-  e: unknown, tables: readonly TableDef[], noMask = false,
+  e: unknown, tables: readonly TableDef[], noMask = false, loc?: StoreLocation,
 ): number {
-  return emitQueryFailure(classifyDuckDbError(e, tables), noMask)
+  return emitQueryFailure(classifyDuckDbError(e, tables, loc), noMask)
 }
 
 /**
@@ -438,15 +440,17 @@ export function emitQueryFailure(f: QueryFailure, noMask = false): number {
  * 判据收紧到「缺失名确实属于该表的声明」才认作漂移 —— 否则可能把真实的代码 bug
  *（生成的 SQL 里写错了列名）掩盖成环境问题。不属于时返回 null，交回原生分派。
  */
-export function driftFailureFor(table: TableDef, e: unknown): QueryFailure | null {
+export function driftFailureFor(table: TableDef, e: unknown, loc?: StoreLocation): QueryFailure | null {
   const msg = errorText(e)
   const byTable = TABLE_NAME_RE.exec(msg) ?? TABLE_REF_RE.exec(msg)
   if (byTable !== null && byTable[1] === table.name) {
     return {
       code: 'query_error', kind: 'usage', retryable: false,
       message: `表 ${table.name} 在库中不存在——与 TABLES 声明漂移（表被删或建库不完整）`,
-      hint: `这不是你的查询写错了：本命令的 SQL 由 CLI 生成。用 \`qiyu db describe ${table.name}\` 核对，`
-        + '并考虑重新同步或重建库（`qiyu store init` 只补未执行的迁移，不重建已删的表）',
+      hint: '这不是你的查询写错了：本命令的 SQL 由 CLI 生成。用 `' + dbDescribeCommand(table.name, loc) + '` 核对，'
+        + '并考虑重新同步或重建库（`'
+        + (loc?.db !== undefined ? storeInitCommand(loc.db) : 'qiyu store init')
+        + '` 只补未执行的迁移，不重建已删的表）',
     }
   }
   const byColumn = COLUMN_NAMED_RE.exec(msg) ?? COLUMN_NAME_RE.exec(msg)
@@ -454,8 +458,8 @@ export function driftFailureFor(table: TableDef, e: unknown): QueryFailure | nul
     return {
       code: 'query_error', kind: 'usage', retryable: false,
       message: `列 ${byColumn[1]} 在库中不存在（表 ${table.name}）——库与 TABLES 声明漂移`,
-      hint: `这不是你的查询写错了：本命令的 SQL 由 CLI 生成，列名来自 TABLES 声明。`
-        + `用 \`qiyu db describe ${table.name}\` 查看实际列集与漂移警告`,
+      hint: '这不是你的查询写错了：本命令的 SQL 由 CLI 生成，列名来自 TABLES 声明。'
+        + '用 `' + dbDescribeCommand(table.name, loc) + '` 查看实际列集与漂移警告',
     }
   }
   return null

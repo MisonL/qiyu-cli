@@ -29,8 +29,9 @@ import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
 import {
   ok, fail, usageFail, failFromTagged, sanitizeControlChars, describeArgs, setPretty,
-  storeInitCommand,
+  storeInitCommand, dbTablesCommand, querySqlCommand, storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
+import type { StoreLocation } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
 import { describeFieldNotes, tablesFieldNotes } from './db-notes.js'
 import type { StoreFlags } from './store-flags.js'
@@ -195,9 +196,12 @@ async function dirtyTimeValues(
 }
 
 /** 脏时间值的公共警告文案（tables 与 describe 同一句话）。 */
-function dirtyTimeWarning(table: string, column: string, n: number): string {
+function dirtyTimeWarning(
+  table: string, column: string, n: number, loc?: StoreLocation,
+): string {
   return `表 ${table} 的时间列 ${column} 有 ${n} 个值不符合约定形态（已从 time_range 中排除）`
-    + '——可能来自旧版 CLI、外部工具或库损坏；用 `qiyu query --sql` 单独查看它们以确认成因'
+    + '——可能来自旧版 CLI、外部工具或库损坏；用 `' + querySqlCommand(loc)
+    + '` 单独查看它们以确认成因'
 }
 
 /**
@@ -239,7 +243,7 @@ export async function openGuardedSession(
   let session: SandboxSession
   try {
     session = await openSandbox(config)
-  } catch (e) { return { exit: thrownToQueryExit(e, TABLES) } }
+  } catch (e) { return { exit: thrownToQueryExit(e, TABLES, false, storeLocationOf(config.path, profileFlag)) } }
 
   try {
     // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
@@ -264,7 +268,7 @@ export async function openGuardedSession(
     }
   } catch (e) {
     await session.close()
-    return { exit: thrownToQueryExit(e, TABLES) }
+    return { exit: thrownToQueryExit(e, TABLES, false, storeLocationOf(config.path, profileFlag)) }
   }
   return { session, dbPath: config.path, ...(profileFlag !== undefined ? { profileFlag } : {}) }
 }
@@ -359,7 +363,8 @@ async function dbTables(argv: string[]): Promise<number> {
         if (actualCols.has(tc.name)) {
           timeRange = await timeRangeOf(session, t)
           const dirty = await dirtyTimeValues(session, t)
-          if (dirty > 0) warnings.push(dirtyTimeWarning(t.name, tc.name, dirty))
+          if (dirty > 0) warnings.push(
+            dirtyTimeWarning(t.name, tc.name, dirty, storeLocationOf(opened.dbPath, opened.profileFlag)))
         } else {
           warnings.push(`表 ${t.name} 缺少时间列 ${tc.name}（可能来自旧版 CLI 或库损坏），time_range 置 null`)
         }
@@ -375,7 +380,7 @@ async function dbTables(argv: string[]): Promise<number> {
 
     return ok({ tables }, { notice: PII_NOTICE, warnings, field_notes: tablesFieldNotes() })
   } catch (e) {
-    return thrownToQueryExit(e, TABLES)
+    return thrownToQueryExit(e, TABLES, false, storeLocationOf(opened.dbPath, opened.profileFlag))
   } finally {
     await session.close()
   }
@@ -426,7 +431,9 @@ async function dbDescribe(argv: string[]): Promise<number> {
   if (table === undefined) {
     const candidates = suggestNames(name, TABLES.map((t) => t.name))
     return usageFail(`未知表：${describeArgs([name])}`,
-      candidates.length > 0 ? `候选：${candidates.join('、')}` : '用 `qiyu db tables` 查看可用表')
+      candidates.length > 0
+        ? `候选：${candidates.join('、')}`
+        : '用 `' + dbTablesCommand(storeLocationFromFlags(flags)) + '` 查看可用表')
   }
 
   const opened = await openGuardedSession(flags)
@@ -472,7 +479,8 @@ async function dbDescribe(argv: string[]): Promise<number> {
       if (tc !== undefined && actualSet.has(tc.name)) {
         timeRange = await timeRangeOf(session, table)
         const dirty = await dirtyTimeValues(session, table)
-        if (dirty > 0) warnings.push(dirtyTimeWarning(table.name, tc.name, dirty))
+        if (dirty > 0) warnings.push(
+          dirtyTimeWarning(table.name, tc.name, dirty, storeLocationOf(opened.dbPath, opened.profileFlag)))
       }
       // tc 缺失时 timeRange 保持 null；下面的「少列」warning 已点名该时间列。
 
@@ -497,7 +505,7 @@ async function dbDescribe(argv: string[]): Promise<number> {
       pii_columns: piiColumnsOf(table),
     }, { notice: PII_NOTICE, warnings, field_notes: describeFieldNotes() })
   } catch (e) {
-    return thrownToQueryExit(e, TABLES)
+    return thrownToQueryExit(e, TABLES, false, storeLocationOf(opened.dbPath, opened.profileFlag))
   } finally {
     await session.close()
   }

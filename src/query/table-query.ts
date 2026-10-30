@@ -20,7 +20,8 @@
 import { shanghaiDayIso, shanghaiDayStart, shanghaiIso } from '../core/time.js'
 import { timeShapeClauses } from './time-shape.js'
 import { suggestNames } from './errors.js'
-import { describeArgs } from '../output.js'
+import { describeArgs, querySqlCommand } from '../output.js'
+import type { StoreLocation } from '../output.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
 
 /** 时间列定义（`TableDef.timeColumn` 的非空形态）。 */
@@ -153,7 +154,9 @@ function boundParam(kind: TimeColumnKind, ms: number): unknown {
  *   · 敏感列 → 拒绝（脱敏会把不同取值归并成同一个分组键，分组与计数都会失真）；
  *   · 重复列 → 拒绝（不静默去重，否则 Agent 会以为按两列分组）。
  */
-export function validateGroupBy(table: TableDef, groupBy: readonly string[]): string[] {
+export function validateGroupBy(
+  table: TableDef, groupBy: readonly string[], loc?: StoreLocation,
+): string[] {
   const names = table.columns.map((c) => c.name)
   const sensitive = new Set(table.columns.filter((c) => c.sensitive === true).map((c) => c.name))
   const seen = new Set<string>()
@@ -170,7 +173,7 @@ export function validateGroupBy(table: TableDef, groupBy: readonly string[]): st
       throw new TableQueryUsageError(
         `--group-by 不接受敏感列 ${name}：脱敏会把不同取值归并成同一个分组键，`
         + '分组结果无法区分（计数本身准确，但每个分组代表哪些原值不可知）。'
-        + '确需按原值分组请改用 `qiyu query --sql --no-mask`（显式承担 PII 风险）')
+        + '确需按原值分组请改用 `' + querySqlCommand(loc) + ' --no-mask`（显式承担 PII 风险）')
     }
     if (seen.has(name)) {
       throw new TableQueryUsageError(`--group-by 列重复：${name}（同一列只能给一次，不做静默去重）`)
