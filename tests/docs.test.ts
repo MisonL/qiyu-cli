@@ -734,7 +734,21 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const errs = read('src/core/errors.ts')
     expect(s, '必须写明 endTime 的双条件（对齐 + 不晚于今天 00:00）')
       .toMatch(/不得晚于今天 00:00/)
-    expect(s, '必须写明越界值要挪回允许区间').toMatch(/挪回允许区间/)
+    // ⚠️ CodeRabbit round 7 指出并核实成立：§4.3 回写注不应给出不安全示例
+    // 「昨天 0:00 → 今天 0:00」—— 其右端正是那条不稳定边界（且不含今天 0:00 之后的
+    // 数据，让人以为「拿到了今天」）。改为面向概念的「endTime 用纯历史日期」。
+    // ⚠️ 只能锚**主张所在的那一行**不能对全文 `not.toMatch`：更正说明里逐字引用了旧建议
+    // （「本节原写「用 `昨天 0:00 → 今天 0:00`，不要贴着边界」」），对全文判会把引用误判成主张。
+    const idx = s.indexOf('- **⚠️ 今天 0:00 这条边界不稳定**')
+    expect(idx, '§6.2 的不稳定边界说明必须存在').toBeGreaterThanOrEqual(0)
+    const claimLine = s.slice(idx, s.indexOf('\n', idx))
+    // 主张行本身不得再给不安全示例（更正说明里会引用旧建议，故只判主张行）
+    expect(claimLine, '主张行不得再给「留安全余量/昨天→今天」的不安全示例')
+      .not.toMatch(/留出安全余量|不要贴着边界|昨天 0:00 → 今天 0:00/)
+    expect(claimLine, '主张行必须写明「不要当作可靠上界」').toMatch(/不要.*当可靠上界|不可靠/)
+    const unstableBlock = s.slice(idx, idx + 700)
+    expect(unstableBlock, '该段必须写明可靠做法是避开而不是贴边').toMatch(/避开它|不是贴着它留余量/)
+    expect(s, '必须写明纯历史日期方案').toMatch(/纯历史日期/)
     // 反向自检：文档转述的上界必须与实现 hint 一致（否则文档教的和真报的对不上）
     const hintLine = errs.split('\n').find((l) => /hint: 'endTime 必须对齐到自然日边界/.test(l)) ?? ''
     expect(hintLine, '实现里的 window_misaligned hint 必须存在').not.toBe('')

@@ -213,9 +213,10 @@ qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ so
 > `endTime is invalid`（越界）→ `kind: 'window_misaligned'`，hint 是一个**双条件**动作
 > （与 `src/core/errors.ts` 逐字一致）：`endTime 必须对齐到自然日边界（不得晚于今天 00:00）`
 > —— **对齐**与**上界**是两件事，两个都要满足：明天 00:00 是"对齐的"但越界，仍会被拒，
-> 必须把它**挪回允许区间**（§6.2 实测：同一 `endTime = 今天 0:00` 有时 200 有时被拒，
-> 故拉取含今天的窗口要留余量，用「昨天 0:00 → 今天 0:00」）；`…is invalid`（跨度过大）→
-> `kind: 'window_too_large'`、`retryable: false`（hint 让调用方「按 `maxWindowDays` 切片后重试」）。
+> （§6.2 实测：同一 `endTime = 今天 0:00` 有时 200 有时被拒 —— 这条边界的**本身不稳定**，
+> 所以给具体数字既不可靠也不符合实测；指令应该是面向概念的：
+> **endTime 用纯历史日期，不包含今天数据** —— 这是三个接口都工作的原则）；`…is invalid`
+> （跨度过大）→ `kind: 'window_too_large'`、`retryable: false`
 > **两者不能混**：切片救不了越界 —— 一个 1–2 天的窗口，endTime 越界照样报 `endTime is invalid`
 > （§6.2 实测）—— 一律当"跨度"让 Agent 反复按切片重试同一个失败请求，会浪费一排网络往返。
 > **真正切片的只有同步引擎**（`src/sync/engine.ts` 的 `sliceForTask` / `sliceByMaxWindow`）：
@@ -626,7 +627,10 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 
 - 对齐检查**与跨度无关**：实测在 `staffAttendance` 跨度只有 1–2 天时，越界的 `endTime` 仍报 `endTime is invalid`
 - 纯历史窗口**不受此限制**（`5 天前 0:00 → 5 天前 12:00` 正常工作）
-- **⚠️ 今天 0:00 这条边界不稳定**：实测同一个 `endTime = 今天 0:00` 有时返回 200，有时返回 `endTime is invalid` → **拉取包含今天的窗口时留出安全余量（用 `昨天 0:00 → 今天 0:00`，不要贴着边界）**
+- **⚠️ 今天 0:00 这条边界不稳定**：实测同一个 `endTime = 今天 0:00` 有时返回 200，有时返回 `endTime is invalid` → **不要把「今天 0:00」当可靠上界**。
+  **能做的是避开它，不是贴着它留余量**（2026-10-31 更正：本节原写「用 `昨天 0:00 → 今天 0:00`，不要贴着边界」—— 那个建议自相矛盾，**它的右端正是那条不稳定边界**，而且它不含今天 0:00 之后的数据，用起来像是"拿到了今天"其实没有）。
+  **当前唯一可靠的做法**：`endTime` 取**纯历史日期的 0:00**（无今天的窗口）—— 三个接口在这种情况下都正常（见上表与「纯历史窗口不受此限制」一条）。**CLI 自己就是这么做的**：`attendance` / `performance` 两个任务声明了 `windowEndClamp: 'shanghaiYesterday'`，引擎把窗口右端**钳到昨天 0:00**（`src/core/time.ts` 的 `shanghaiYesterdayStart` —— 「统一退到昨天 0:00 留整日余量：当天数据不做，绝不贴着边界」）。
+  **代价如实说**：**今天的数据拿不到**（这类报表本来也不是实时数据源，今天的数要到明天才完整）。若非要取今天，只能自己在 `api call` 里重试、拿到 `endTime is invalid` 就退回去取昨天为止 —— **没有"贴着边界就稳"的参数**（`昨天 0:00 → 今天 0:00` 不是解法：它的右端**正是**那条不稳定边界，而且它不含今天 0:00 之后的数据，用起来像是"拿到了今天"其实没有）。
 
 **⚠️ 两种 `14501` 必须靠 message 区分**：`endTime is invalid` 是**对齐问题**，`(endTime - startTime)/millsADay > 31 is invalid` 是**跨度问题**。错误码相同，但修复方式完全不同 —— CLI 必须解析 message，而不能只看 code。
 
