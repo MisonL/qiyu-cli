@@ -2,7 +2,8 @@
 // （命令树 / 表名 / 错误 kind / 位置参数取值域）比对，产出三档判定（设计稿 D3）：
 //
 //   · violations：引用不存在的命令 / flag / kind / 位置参数取值；flag 写错了位置；正文
-//     出现表名；出现完整 SQL 序列；推荐了被显式拒绝的 flag（`--pretty`）。
+//     出现表名；出现完整 SQL 序列；推荐了被显式拒绝的 flag（`rejected` 清单当前为空，
+//     2026-10-24 前 `--pretty` 曾是唯一成员，G1 实现后清空、规则保留）。
 //   · warnings：无法静态判定的引用（含管道 / 选择 / 复合命令符号等），不阻塞，但要指认位置。
 //   · 两者皆空：通过。
 //
@@ -125,8 +126,10 @@ function dropFlagsAndValues(tokens: string[], flagAt: Map<number, FlagSlot>): st
  * 判定顺序（同一行内多条违规的产出顺序）：
  *   1. 命令路径：`findSpec` 最长前缀匹配，未命中 → `unknown_command`；
  *   2. flag 接受集：**先查 `spec.rejected`**，再查 `spec.flags` 的完整接受集。顺序是硬要求 ——
- *      `--pretty` 同时在 `GLOBAL_FLAGS`（因而在每条 spec 的 `flags` 里）与 `REJECTED_FLAGS`
- *      里，反过来先查 `flags` 会把它判成合法，`rejected_flag` 永远报不出来；
+ *      一个 flag 可能同时在两者里（`--pretty` 曾是这种情形：在 `GLOBAL_FLAGS` 里、又在
+ *      `REJECTED_FLAGS` 里），反过来先查 `flags` 会把它判成合法，`rejected_flag` 永远报不出来。
+ *      2026-10-24（G1）起 `--pretty` 已实现、不再是 rejected，故当前 `REJECTED_FLAGS` 为空；
+ *      **次序规则保留**，将来再出现「已知但显式拒绝」的 flag 时按同一次序判。
  *   3. flag 的位置：落在命令路径之内 → `flag_before_subcommand`；落在「第一个位置参数」槽位
  *      → `flag_before_positional`；值位 flag 缺取值 → `flag_missing_value`；
  *   4. 位置参数取值域：命令词之后的字面 token 逐个按 `spec.positionals[i].domain` 查注入的
@@ -170,7 +173,8 @@ function checkCommand(cmd: CommandRef, ctx: CheckContext, violations: Violation[
   // 2：flag 接受集。
   for (const flag of cmd.flags) {
     if (spec.rejected.includes(flag.name)) {
-      // ⚠️ 必须先于 accepted 判断：--pretty 同时属于两者（见函数注释）。
+      // ⚠️ 必须先于 accepted 判断：一个 flag 可能同时在两者里（`--pretty` 曾是这种情形，
+      // G1 实现后已不在 `rejected` 里；次序规则保留）。
       violations.push({
         line: cmd.line,
         rule: 'rejected_flag',
@@ -286,8 +290,9 @@ function checkCommand(cmd: CommandRef, ctx: CheckContext, violations: Violation[
  * 判定顺序（violations 最终按行稳定排序，便于按出现位置阅读）：
  *   1. 命令路径：`findSpec` 最长前缀匹配，未命中 → `unknown_command`；
  *   2. flag：**先查 `spec.rejected`**，再查 `spec.flags` 的完整接受集。顺序是硬要求 ——
- *      `--pretty` 同时在 `GLOBAL_FLAGS`（因而在每条 spec 的 `flags` 里）与 `REJECTED_FLAGS`
- *      里，反过来先查 `flags` 会把它判成合法，`rejected_flag` 永远报不出来；
+ *      一个 flag 可能同时在两者里（`--pretty` 曾是这种情形，G1 实现后不再是），反过来先查
+ *      `flags` 会把它判成合法，`rejected_flag` 永远报不出来。次序规则与空清单的现状见
+ *      `checkCommand` 的注释。
  *   3. flag 的位置与缺值（见 checkCommand 的注释）；
  *   4. 位置参数取值域：命令词之后的字面 token 逐个按 `spec.positionals[i].domain` 查注入的
  *      闭集；不在闭集 → `unknown_positional`，位置参数个数超过 spec 声明同样违规；

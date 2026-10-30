@@ -206,13 +206,15 @@ describe('锚定断言（钉住 spec §8.3 的具体落点，防只改一半）'
     // §八.2：「Store 的完整接口签名与 DDL」行 —— store status 可查表清单
     expect(lineWith(s, /的完整接口签名与 DDL/)).toMatch(/store status/)
   })
-  it('设计稿锚定：§11.2 错误处理表与全文两处 C1 阶段标注都在（L 组 H3；L3 修：按行内容锚定）', () => {
+  it('设计稿锚定：§11.2 错误处理表的缓存口径与全文两处 C1 阶段标注都在（L 组 H3；L3 修：按行内容锚定；2026-10-30 回写：D 交付后缓存生效）', () => {
     const s = read('docs/qiyu-cli-design.md')
-    // §11.2 错误处理表的 store_locked 行：表行锚定 + 行内含 C1 阶段标注
+    // §11.2 错误处理表的 store_locked 行 —— 2026-10-30 回写：
+    // 原文承诺「D 交付后缓存查询生效」，而查询缓存**从未实现**（`meta.cached` 也无生产者）。
+    // 现在断言该行**不得**再出现「缓存生效」类承诺，且必须如实写明缓存能力不存在。
     const lockedRow = lineWith(s, /\| `store_locked` \|/)
-    expect(lockedRow).toMatch(/C1 阶段/)
-    // §9.5 同步引擎一节：全文件内两处 C1 阶段标注（§11.2 一处 + §9.5 一处），
-    // 结构性断言兜底防止只改一半。
+    expect(lockedRow, 'store_locked 行必须如实写明无查询缓存').toMatch(/无「查询缓存」能力|无查询缓存/)
+    expect(lockedRow, '「D 交付后缓存查询生效」的旧承诺不得回归').not.toMatch(/缓存查询生效/)
+    // §9.5 状态码一节：全文内两处 C1 阶段标注（纯结构断言，防止只改一半）。
     const marks = s.match(/C1 阶段|C1 交付|C1：已交付/g) ?? []
     expect(marks.length).toBeGreaterThanOrEqual(2)
   })
@@ -646,5 +648,108 @@ describe('E 查询与沙箱交付联动 —— 不得说假话（E-T12）', () =
     const s = read('tests/store/layering.test.ts')
     expect(s).toMatch(/query\/ 不得 import sync\/ 与 commands\//)
     expect(s).toMatch(/store\/ 不得 import query\//)
+  })
+})
+
+describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10-30）', () => {
+  // ⚠️ 这一组守的是「已交付的能力不得再被文档说成没实现 / 已声明的承诺不得被当成事实」。
+  // 每条都以**双向自检**写：真实事故文本必须被判红，回写后的合法文本必须放过。
+  // 只用 `not.toMatch` 的守卫会随文档改版悄悄变恒真（README 的 notYet 段就是这样失守的），
+  // 故每条都配一个正锚（回写后的措辞必须在场）。
+  const design = (): string => read('docs/qiyu-cli-design.md')
+
+  it('设计稿 §2：语义化命令的「未交付挂账」状态注在场，且点名两条未交付项', () => {
+    const s = design()
+    expect(s, '§2 必须带交付状态注').toMatch(/交付状态（2026-10-30 回写）/)
+    expect(s).toMatch(/工单领域的语义化命令[\s\S]{0,400}未交付/)
+    expect(s).toMatch(/知识库领域的语义化命令（只读）[\s\S]{0,600}未交付/)
+    // 反向：不得再出现「本节范围内」被读成已交付的旧错觉 —— 状态注明写「不是交付清单」
+    expect(s).toMatch(/本节是\*\*范围声明\*\*，不是交付清单/)
+  })
+
+  it('设计稿 §11.2 E：`--pretty` 不再是「未实现」，且醒目写明它已实现', () => {
+    const s = design()
+    // 双向自检：事故形态（旧原文）必须被正则抓住 —— 证明这条守卫不是恒真的摆设
+    const ACCIDENT = '不要使用 `--pretty`（未实现），不要把 `query --table` 当作任意 SQL 的替代品'
+    expect(/不要使用 `--pretty`（未实现）/.test(ACCIDENT)).toBe(true)
+    // ⚠️ 只能锚**E 禁止事项那一行**做反向断言，不能对全文 `not.toMatch` —— 回写的状态注
+    // 本身就逐字引用了旧措辞（「原文写「不要使用 `--pretty`（未实现）」」），对全文判会
+    // 把「解释旧错」误判成「仍在犯旧错」。这正是本仓库反复打的形态：守卫的判据要与它要
+    // 防的东西对齐，而不是与文本里出现的任意子串对齐。
+    const eLine = s.split('\n').find((l) => /^\*\*E\. 禁止事项\*\*/.test(l)) ?? ''
+    expect(eLine, 'E 禁止事项行必须存在').not.toBe('')
+    expect(/不要使用 `--pretty`（未实现）/.test(eLine), 'E 行的旧措辞不得回归').toBe(false)
+    expect(eLine, 'E 行必须写明 --pretty 已实现').toMatch(/它\*\*已实现\*\*/)
+    expect(s, '必须给出回写状态注').toMatch(/`--pretty` \*\*自 2026-10-24（G1）起已实现\*\*/)
+  })
+
+  it('设计稿 §4.2：whoami 不再谎称「校验凭证」（只检查存在性）', () => {
+    const s = design()
+    const ACCIDENT = 'qiyu auth whoami               # 校验凭证并显示当前 profile（+ source / robots）'
+    expect(/校验凭证并显示当前 profile/.test(ACCIDENT)).toBe(true)
+    expect(s, '「校验凭证并显示当前 profile」的旧措辞不得回归').not.toMatch(/校验凭证并显示当前 profile/)
+    expect(s).toMatch(/措辞收窄（2026-10-30 回写）/)
+    expect(s).toMatch(/只判断凭证\*\*是否存在\*\*/)
+    expect(s).toMatch(/\*\*从不向服务端发请求\*\*/)
+  })
+
+  it('设计稿 §4.3：14500 熔断与 14501 分片的收窄状态注在场（计数/持久化未做，切片在 sync）', () => {
+    const s = design()
+    expect(s).toMatch(/承诺收窄（2026-10-30 回写）\*\*：落地的是\*\*等效防死循环\*\*/)
+    expect(s, '熔断状态的旧承诺不得回归').toMatch(/持久化的熔断状态\*\*（没有写进本地库/)
+    // 14501：core 不切片，切片在 sync —— 旧表行「core 层自动分片」必须改掉
+    expect(s, '14501 不再声称 core 自动分片').not.toMatch(/\| 14501 \| 数据量超限 \| — \| \*\*core 层自动分片\*\* \|/)
+    expect(s).toMatch(/14501 只被翻译、不被吸收/)
+    expect(s).toMatch(/真正切片的只有同步引擎/)
+  })
+
+  it('设计稿 §6.4/§6.5：退避是固定间隔、陈旧锁超时未实现、CHECKPOINT 不自动执行', () => {
+    const s = design()
+    expect(s, '「以指数退避重试」的旧措辞不得回归').not.toMatch(/冲突时\*\*以指数退避重试\*\*/)
+    expect(s).toMatch(/曲线是固定间隔，不是指数退避/)
+    expect(s).toMatch(/陈旧锁超时未实现/)
+    expect(s).toMatch(/CLI \*\*不自动执行 `CHECKPOINT`\*\*/)
+  })
+
+  it('设计稿 §7.4/§7.4.1：限频持久化与 maxWindowDays 预校验各自收窄到 sync', () => {
+    const s = design()
+    expect(s).toMatch(/这句话\*\*只对 `sync` 成立\*\*/)
+    expect(s).toMatch(/`api call` 是\*\*一次性进程\*\*/)
+    expect(s).toMatch(/预校验只有 `sync` 做，`api call` 不做/)
+    expect(s).toMatch(/它不知道这个接口的窗口起止放在 body 的哪两个字段里/)
+  })
+
+  it('设计稿 §9.1/§11.2：`meta.cached` 从输出样本删除，缓存能力的旧承诺不得回归', () => {
+    const s = design()
+    expect(s, '`meta.cached` 不得再出现在输出样本里').not.toMatch(/"cached": false/)
+    expect(s).toMatch(/`meta\.cached` 已从样本里删掉（2026-10-30 回写）/)
+    expect(s, '「D 交付后缓存查询生效」的旧承诺不得回归').not.toMatch(/D 交付后缓存查询生效/)
+  })
+
+  it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
+    const s = read('docs/superpowers/specs/2026-10-13-存储层-design.md')
+    expect(s).toMatch(/本 spec 是 2026-10-13 的历史记录（2026-10-30 状态注）/)
+    expect(s).toMatch(/`auth login` 已于 \*\*2026-10-25\*\* 实现/)
+    expect(s).toMatch(/本节已整体过时（2026-10-30 状态注）/)
+    expect(s).toMatch(/`--pretty` 已于 \*\*2026-10-24（G1 第二批）实现\*\*/)
+    // 验收口径的作废必须点名（防实施者照旧文验收）
+    expect(s).toMatch(/那两处「--pretty 尚未实现」的验收口径\*\*已作废\*\*|验收口径\*\*已作废\*\*/)
+  })
+
+  it('skill spec / query spec：`--pretty` 的 rejected 建模与「不做 --pretty」各自标了作废', () => {
+    const skill = read('docs/superpowers/specs/2026-10-20-skill-design.md')
+    expect(skill, '待评审的旧状态行必须改掉').not.toMatch(/^> 状态：待评审/)
+    expect(skill).toMatch(/\*\*已批准并交付（2026-10-26 合并，PR #32）\*\*/)
+    expect(skill).toMatch(/本条已作废\*\* —— `--pretty` 于 \*\*2026-10-24（G1）实现\*\*/)
+    const query = read('docs/superpowers/specs/2026-10-17-查询接口与沙箱-design.md')
+    expect(query).toMatch(/本条已被 G1 推翻 —— `--pretty` 2026-10-24 已实现/)
+    expect(query).toMatch(/`--pretty` 已于 2026-10-24 实现 —— 现在 `query --table … --pretty` 退出码 0/)
+  })
+
+  it('skill 正文 forbidden.md：对 Agent 的 `--pretty` 口径是「没有增益」而非「未实现」', () => {
+    const md = read('src/skill/qiyu/forbidden.md')
+    expect(md, '不得再声称 --pretty 未实现').not.toMatch(/--pretty.{0,12}未实现/)
+    expect(md).toMatch(/不需要 `--pretty`/)
+    expect(md).toMatch(/对\s*\n?\s*Agent 没有增益|对 Agent 没有增益/)
   })
 })
