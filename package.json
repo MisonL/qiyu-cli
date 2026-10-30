@@ -1,6 +1,6 @@
 {
   "name": "qiyu-cli",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "网易七鱼开放 API 的命令行封装，主要用户是 AI Agent：默认输出机器可读 JSON，用退出码表达意图，危险操作有硬门禁",
   "type": "module",
   "license": "MIT",
