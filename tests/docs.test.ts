@@ -206,13 +206,15 @@ describe('锚定断言（钉住 spec §8.3 的具体落点，防只改一半）'
     // §八.2：「Store 的完整接口签名与 DDL」行 —— store status 可查表清单
     expect(lineWith(s, /的完整接口签名与 DDL/)).toMatch(/store status/)
   })
-  it('设计稿锚定：§11.2 错误处理表与全文两处 C1 阶段标注都在（L 组 H3；L3 修：按行内容锚定）', () => {
+  it('设计稿锚定：§11.2 错误处理表的缓存口径与全文两处 C1 阶段标注都在（L 组 H3；L3 修：按行内容锚定；2026-10-30 回写：D 交付后缓存生效）', () => {
     const s = read('docs/qiyu-cli-design.md')
-    // §11.2 错误处理表的 store_locked 行：表行锚定 + 行内含 C1 阶段标注
+    // §11.2 错误处理表的 store_locked 行 —— 2026-10-30 回写：
+    // 原文承诺「D 交付后缓存查询生效」，而查询缓存**从未实现**（`meta.cached` 也无生产者）。
+    // 现在断言该行**不得**再出现「缓存生效」类承诺，且必须如实写明缓存能力不存在。
     const lockedRow = lineWith(s, /\| `store_locked` \|/)
-    expect(lockedRow).toMatch(/C1 阶段/)
-    // §9.5 同步引擎一节：全文件内两处 C1 阶段标注（§11.2 一处 + §9.5 一处），
-    // 结构性断言兜底防止只改一半。
+    expect(lockedRow, 'store_locked 行必须如实写明无查询缓存').toMatch(/无「查询缓存」能力|无查询缓存/)
+    expect(lockedRow, '「D 交付后缓存查询生效」的旧承诺不得回归').not.toMatch(/缓存查询生效/)
+    // §9.5 状态码一节：全文内两处 C1 阶段标注（纯结构断言，防止只改一半）。
     const marks = s.match(/C1 阶段|C1 交付|C1：已交付/g) ?? []
     expect(marks.length).toBeGreaterThanOrEqual(2)
   })
@@ -646,5 +648,292 @@ describe('E 查询与沙箱交付联动 —— 不得说假话（E-T12）', () =
     const s = read('tests/store/layering.test.ts')
     expect(s).toMatch(/query\/ 不得 import sync\/ 与 commands\//)
     expect(s).toMatch(/store\/ 不得 import query\//)
+  })
+})
+
+describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10-30）', () => {
+  // ⚠️ 这一组守的是「已交付的能力不得再被文档说成没实现 / 已声明的承诺不得被当成事实」。
+  // 每条都以**双向自检**写：真实事故文本必须被判红，回写后的合法文本必须放过。
+  // 只用 `not.toMatch` 的守卫会随文档改版悄悄变恒真（README 的 notYet 段就是这样失守的），
+  // 故每条都配一个正锚（回写后的措辞必须在场）。
+  const design = (): string => read('docs/qiyu-cli-design.md')
+
+  it('设计稿 §2：语义化命令的「未交付挂账」状态注在场，且点名两条未交付项', () => {
+    const s = design()
+    expect(s, '§2 必须带交付状态注').toMatch(/交付状态（2026-10-30 回写）/)
+    // ⚠️ 判据必须锚在**状态注那一块**（连续的 `>` 引用块），不能写成
+    // `/工单领域的语义化命令[\s\S]{0,400}未交付/` —— 实测那个写法虽然能过（间距 391 < 400），
+    // 但它匹配的起点是**范围清单那一行**（§2 的 `<li>`），不是状态注：真正被断言的只是
+    // 「清单行的 400 字之内出现过『未交付』」。清单多一行就变红、状态注写成别的意思也能过，
+    // 两种失效方向都错。这里把块先切出来，再在块内断言。
+    const start = s.indexOf('> **⚠️ 交付状态（2026-10-30 回写）**')
+    expect(start, '§2 交付状态注必须存在').toBeGreaterThanOrEqual(0)
+    const rest = s.slice(start)
+    // 块在第一个非 `>` 开头的非空行处结束（Markdown 引用块的自然边界）
+    const blockEnd = rest.split('\n').findIndex((l, i) => i > 0 && l.trim() !== '' && !l.startsWith('>'))
+    const block = blockEnd === -1 ? rest : rest.split('\n').slice(0, blockEnd).join('\n')
+    // 状态注的语义是「上面两条……未交付」，两条是它下面的两个分点 —— 所以判据分两步：
+    // ① 块内必须有一句「两条……未交付」的论断；② 块内必须逐个点名两条命令。
+    expect(block, '状态注必须写明「上面两条……未交付」').toMatch(/两条\*\*语义化命令\*\*未交付/)
+    expect(block, '状态注必须点名工单领域').toMatch(/工单领域的语义化命令/)
+    expect(block, '状态注必须点名知识库领域').toMatch(/知识库领域的语义化命令（只读）/)
+    // 反向：不得再出现「本节范围内」被读成已交付的旧错觉 —— 状态注明写「不是交付清单」
+    expect(block, '状态注必须写明「不是交付清单」').toMatch(/本节是\*\*范围声明\*\*，不是交付清单/)
+  })
+
+  it('设计稿 §11.2 E：`--pretty` 不再是「未实现」，且醒目写明它已实现', () => {
+    const s = design()
+    // 双向自检：事故形态（旧原文）必须被正则抓住 —— 证明这条守卫不是恒真的摆设
+    const ACCIDENT = '不要使用 `--pretty`（未实现），不要把 `query --table` 当作任意 SQL 的替代品'
+    expect(/不要使用 `--pretty`（未实现）/.test(ACCIDENT)).toBe(true)
+    // ⚠️ 只能锚**E 禁止事项那一行**做反向断言，不能对全文 `not.toMatch` —— 回写的状态注
+    // 本身就逐字引用了旧措辞（「原文写「不要使用 `--pretty`（未实现）」」），对全文判会
+    // 把「解释旧错」误判成「仍在犯旧错」。这正是本仓库反复打的形态：守卫的判据要与它要
+    // 防的东西对齐，而不是与文本里出现的任意子串对齐。
+    const eLine = s.split('\n').find((l) => /^\*\*E\. 禁止事项\*\*/.test(l)) ?? ''
+    expect(eLine, 'E 禁止事项行必须存在').not.toBe('')
+    expect(/不要使用 `--pretty`（未实现）/.test(eLine), 'E 行的旧措辞不得回归').toBe(false)
+    expect(eLine, 'E 行必须写明 --pretty 已实现').toMatch(/它\*\*已实现\*\*/)
+    expect(s, '必须给出回写状态注').toMatch(/`--pretty` \*\*自 2026-10-24（G1）起已实现\*\*/)
+  })
+
+  it('设计稿 §4.2：whoami 不再谎称「校验凭证」（只检查存在性）', () => {
+    const s = design()
+    const ACCIDENT = 'qiyu auth whoami               # 校验凭证并显示当前 profile（+ source / robots）'
+    expect(/校验凭证并显示当前 profile/.test(ACCIDENT)).toBe(true)
+    expect(s, '「校验凭证并显示当前 profile」的旧措辞不得回归').not.toMatch(/校验凭证并显示当前 profile/)
+    expect(s).toMatch(/措辞收窄（2026-10-30 回写）/)
+    expect(s).toMatch(/只判断凭证\*\*是否存在\*\*/)
+    expect(s).toMatch(/\*\*从不向服务端发请求\*\*/)
+  })
+
+  it('设计稿 §4.3：14500 熔断与 14501 分片的收窄状态注在场（计数/持久化未做，切片在 sync）', () => {
+    const s = design()
+    expect(s).toMatch(/承诺收窄（2026-10-30 回写）\*\*：落地的是\*\*等效防死循环\*\*/)
+    expect(s, '熔断状态的旧承诺不得回归').toMatch(/持久化的熔断状态\*\*（没有写进本地库/)
+    // 14501：core 不切片，切片在 sync —— 旧表行「core 层自动分片」必须改掉
+    expect(s, '14501 不再声称 core 自动分片').not.toMatch(/\| 14501 \| 数据量超限 \| — \| \*\*core 层自动分片\*\* \|/)
+    expect(s).toMatch(/14501 只被翻译、不被吸收/)
+    expect(s).toMatch(/真正切片的只有同步引擎/)
+    // ⚠️ CodeRabbit round 3 指出并核实成立：**表行本身**也要区分两种 14501，
+    // 不能只在下方状态注里说 —— 状态注在别处，读者若只读表格会照旧按「切片」处理越界。
+    const row14501 = s.split('\n').find((l) => /^\| 14501 \|/.test(l)) ?? ''
+    expect(row14501, '14501 表行必须存在').not.toBe('')
+    expect(row14501, '表行必须点名 window_too_large').toContain("window_too_large")
+    expect(row14501, '表行必须点名 window_misaligned').toContain("window_misaligned")
+    // ⚠️ CodeRabbit round 8 指出并核实成立：表行的 `window_misaligned` 指引也必须带上界 ——
+    // 只写「对齐自然日边界」的读者会把明天 00:00（已对齐但越界）原样重发。
+    expect(row14501, '表行必须写明越界的上界条件 —— 早于而非不晚于（§6.2 实测今天 0:00 不稳定）').toMatch(/必须早于今天 00:00/)
+    // ⚠️ CodeRabbit #50 round 2 指出并核实成立：两种 14501 的下一步**不同**。
+    // 越界（endTime is invalid）→ 对齐自然日边界；跨度过大 → 按上限切片。
+    // 回写第一版把两者都写成「按 maxWindowDays 切片后重试」，会让 Agent 对越界窗口
+    // 反复按切片重试同一个失败请求（1–2 天的窗口切片也救不了越界）。
+    expect(s).toMatch(/endTime is invalid`（越界）→ `kind: 'window_misaligned'`/)
+    expect(s).toMatch(/切片救不了越界/)
+    // ⚠️ CodeRabbit #50 round 10 指出并核实成立（§6.2 实测）：本注的前一版把越界处置写成
+    // 「对齐自然日边界 **且** 不晚于今天 00:00」的**双条件**，两半都错 ——
+    // ① 「对齐」从来不是要求：纯历史日期的 endTime 取**任意时刻**都接受（`5 天前 0:00 →
+    //    5 天前 12:00` 返回 200），round 9 已把这一条写进注里，但表行与双条件句没跟着改；
+    // ② 「不晚于」把等号划进安全区：`endTime = 今天 0:00` 恰是那条**本身不稳定**的边界
+    //    （同一取值有时 200 有时被拒）。教 Agent 用「不晚于今天 0:00」＝教它去踩这条边界。
+    // 正确表述是单条件的「**早于**今天 00:00 / 用纯历史日期」。守卫因此分两层：
+    // 事故文本（双条件句 + 等号措辞）必须被判红，回写后的单条件表述必须放过。
+    const errs = read('src/core/errors.ts')
+    const noteStart = s.indexOf('> **⚠️ 「core 层自动分片」的收窄（2026-10-30 回写）**')
+    expect(noteStart, '§4.3 的 14501 收窄注必须存在').toBeGreaterThanOrEqual(0)
+    const noteRest = s.slice(noteStart)
+    const noteEnd = noteRest.split('\n').findIndex((l, i) => i > 0 && l.trim() !== '' && !l.startsWith('>'))
+    const noteBlock = noteEnd === -1 ? noteRest : noteRest.split('\n').slice(0, noteEnd).join('\n')
+    // 双向自检的「红」侧：事故文本必须被正则抓住 —— 证明下面的改正断言不是恒真的摆设
+    const ACCIDENT_DUAL = '（**两个条件**：对齐自然日边界**且**不晚于今天 00:00）'
+    expect(/两个条件|不晚于今天 00:00/.test(ACCIDENT_DUAL)).toBe(true)
+    // ⚠️ 只能锚**转述 hint 的那一行**做反向断言，不能对整块 `not.toMatch(/不晚于今天 00:00/)` ——
+    // 更正说明本身逐字引用了旧措辞（「本注的前一版把它写成……『不晚于今天 00:00』」），
+    // 对整块判会把「解释旧错」误判成「仍在犯旧错」。这与 §11.2 E 行是同一形态。
+    const transcribeLine = noteBlock.split('\n').find((l) => /逐字一致）/.test(l)) ?? ''
+    expect(transcribeLine, '§4.3 回写注必须转述实现 hint 那一行').not.toBe('')
+    expect(transcribeLine, '转述行必须写明单条件「早于今天 00:00」').toMatch(/必须早于今天 00:00/)
+    expect(transcribeLine, '转述行不得再把「不晚于今天 00:00」当作 hint 内容')
+      .not.toMatch(/不晚于今天 00:00/)
+    expect(noteBlock, '回写注必须写明「对齐」不是要求（纯历史日期取任意时刻都接受）')
+      .toMatch(/任意时刻/)
+    expect(noteBlock, '回写注必须点明「不晚于」把等号划进了安全区').toMatch(/把等号放进/)
+    // 反向自检：文档转述的上界必须与**实现 hint** 逐字一致（否则文档教的和真报的对不上）
+    const hintLine = errs.split('\n').find((l) => /hint: 'endTime 必须早于今天 00:00/.test(l)) ?? ''
+    expect(hintLine, '实现里的 window_misaligned hint 必须存在且已改为「早于」').not.toBe('')
+    expect(hintLine).toContain('必须早于今天 00:00')
+    expect(noteBlock, '文档转述的实现 hint 必须与 src/core/errors.ts 逐字一致')
+      .toContain(hintLine.trim().replace(/^hint: '/, '').replace(/' }$/, ''))
+    // ⚠️ CodeRabbit round 7 指出并核实成立：§6.2 的不稳定边界段不应给出不安全示例
+    // 「昨天 0:00 → 今天 0:00」—— 其右端正是那条不稳定边界（且不含今天 0:00 之后的
+    // 数据，让人以为「拿到了今天」）。改为面向概念的「endTime 用纯历史日期」。
+    // ⚠️ 只能锚**主张所在的那一行**不能对全文 `not.toMatch`：更正说明里逐字引用了旧建议
+    // （「本节原写「用 `昨天 0:00 → 今天 0:00`，不要贴着边界」」），对全文判会把引用误判成主张。
+    const idx = s.indexOf('- **⚠️ 今天 0:00 这条边界不稳定**')
+    expect(idx, '§6.2 的不稳定边界说明必须存在').toBeGreaterThanOrEqual(0)
+    const claimLine = s.slice(idx, s.indexOf('\n', idx))
+    // 主张行本身不得再给不安全示例（更正说明里会引用旧建议，故只判主张行）
+    expect(claimLine, '主张行不得再给「留安全余量/昨天→今天」的不安全示例')
+      .not.toMatch(/留出安全余量|不要贴着边界|昨天 0:00 → 今天 0:00/)
+    expect(claimLine, '主张行必须写明「不要当作可靠上界」').toMatch(/不要.*当可靠上界|不可靠/)
+    const unstableBlock = s.slice(idx, idx + 700)
+    expect(unstableBlock, '该段必须写明可靠做法是避开而不是贴边').toMatch(/避开它|不是贴着它留余量/)
+    expect(s, '必须写明纯历史日期方案').toMatch(/纯历史日期/)
+    // 反向自检：kind 名与实现一致（假的名字会让这条守卫守错东西）
+    expect(errs, 'window_misaligned 必须真实存在').toContain("kind: 'window_misaligned'")
+    expect(errs, 'window_too_large 必须真实存在').toContain("kind: 'window_too_large'")
+  })
+
+  it('设计稿 §6.4：读者重试不得把 `api` 算进来（api call 零加载 store，不持 RO 锁）', () => {
+    const s = design()
+    const ACCIDENT = '- **读者重试**：`query` / `api` 等只读操作以 RO 模式打开'
+    expect(ACCIDENT.includes('`query` / `api`')).toBe(true)
+    // ⚠️ CodeRabbit #50 round 2 指出并核实成立：`api call` 不 import store/（api.ts 的
+    // import 清单里没有任何 store 模块），不打开本地库 → 它不会撞 store_locked。
+    expect(s, '读者重试不得再列 `api`').not.toMatch(/`query` \/ `api` 等只读操作/)
+    expect(s).toMatch(/\*\*2026-10-30 收窄：`api call` 不在其中\*\*/)
+    // 反向自检：api.ts 确实不 import store（若将来它开始读库，这条守卫必须同步改）
+    const apiSrc = read('src/commands/api.ts')
+    expect(apiSrc, 'api.ts 一旦 import store/ ，本条守卫的判据就失效、必须复核')
+      .not.toMatch(/from '\.\.\/(?:store|query)\//)
+  })
+
+  it('设计稿 §2：未交付的两条语义化命令不得被说成「只能经 api call 访问」（本地通道也要提）', () => {
+    const s = design()
+    // ⚠️ CodeRabbit #50 指出并核实成立：只写「只能经逃生通道 api call 访问」会让读的人
+    // 以为工单/知识库数据全都拿不到 —— 实际数据两条路都有（api call 拉远程 / query 查本地库，
+    // 四张表都在 TABLES 里且有同步任务）。缺的只是"语义层"这层包装。
+    const ACCIDENT = '两条都只能经逃生通道（`api call`）访问'
+    expect(ACCIDENT.includes('只能经逃生通道')).toBe(true)
+    expect(s, '「只能经逃生通道访问」的旧措辞不得回归').not.toMatch(/只能经逃生通道/)
+    expect(s).toMatch(/\*\*缺的是"语义层"，不是"数据"\*\*/)
+    // ⚠️ CodeRabbit #50 round 10 指出并核实成立：这条对**全文** `s` 断言四个表名 ——
+    // 四张表在 §6（报表/TABLES）等别处也逐字出现，把它们从**状态注**里整段删掉后
+    // 全文判照样绿。假护栏。必须与上面第一条 §2 用例一样，先把状态注那一块切出来。
+    const start = s.indexOf('> **⚠️ 交付状态（2026-10-30 回写）**')
+    expect(start, '§2 交付状态注必须存在').toBeGreaterThanOrEqual(0)
+    const rest = s.slice(start)
+    const blockEnd = rest.split('\n').findIndex((l, i) => i > 0 && l.trim() !== '' && !l.startsWith('>'))
+    const block = blockEnd === -1 ? rest : rest.split('\n').slice(0, blockEnd).join('\n')
+    expect(block).toMatch(/\*\*缺的是"语义层"，不是"数据"\*\*/)
+    expect(block, '本地通道的两条路（--table / --sql）必须在状态注块内').toMatch(/落库后走 `query --table`/)
+    for (const t of ['`tickets`', '`ticket_logs`', '`knowledge_items`', '`knowledge_categories`']) {
+      expect(block, `§2 状态注块内必须点名本地表 ${t}`).toContain(t)
+    }
+  })
+
+  it('skill spec：`--pretty` 的「违规判据」一档已删（实现里从来没有这条检查）', () => {
+    const sk = read('docs/superpowers/specs/2026-10-20-skill-design.md')
+    // ⚠️ CodeRabbit #50 指出并核实成立：原文把「推荐了 --pretty」写成 skill check 的违规判据，
+    // 但 ViolationRule 只有 table_name / sql_sequence / unknown_kind，flag 侧只有 rejected_flag，
+    // 而 REJECTED_FLAGS 为空 → 推荐 --pretty 不会触发任何规则。
+    // 上一版回写还写了「由内容红线兜底」—— 那句话是错的（三条内容红线都不看 flag），本条一并纠正。
+    const violationRow = sk.split('\n').find((l) => /^\| 违规 \|/.test(l)) ?? ''
+    expect(violationRow, '违规判据行必须存在').not.toBe('')
+    expect(violationRow, '不得再声称推荐 --pretty 是违规判据').not.toMatch(/推荐了 `--pretty`/)
+    expect(sk, '必须写明它只是写作口径、不是可校验判据').toMatch(/不是可校验的判据/)
+    // 反向自检：三条内容红线的真实规则名必须在场（证明纠正后的表述与实现对齐）
+    const check = read('src/skill/check.ts')
+    for (const r of ["'table_name'", "'sql_sequence'", "'unknown_kind'"]) {
+      expect(check, `ViolationRule 必须含 ${r}`).toContain(r)
+    }
+  })
+
+  it('设计稿 §6.4/§6.5：退避是固定间隔、陈旧锁超时未实现、CHECKPOINT 是运维责任而非承诺', () => {
+    const s = design()
+    expect(s, '「以指数退避重试」的旧措辞不得回归').not.toMatch(/冲突时\*\*以指数退避重试\*\*/)
+    expect(s).toMatch(/曲线是固定间隔，不是指数退避/)
+    expect(s).toMatch(/陈旧锁超时未实现/)
+    // ⚠️ CodeRabbit round 3 指出并核实成立：只写「CLI 不执行 CHECKPOINT → 文件无界膨胀，
+    // 只能手动」把两件事都说过了 —— ① CLI 确实不执行（全仓无 CHECKPOINT 调用，这句话保留）；
+    // ② 但 DuckDB 会按 WAL 大小自动 checkpoint（内置 `wal_autocheckpoint` 设置，仓库不改默认），
+    //    所以「文件只增不减」是错的；③ 手动 CHECKPOINT 只部分回收已删除行空间。三者都要如实写。
+    // 判据：不该再承诺「必须手动、否则无界膨胀」，而应写「CLI 不执行 + 可手动」。
+    expect(s, '不得再声称文件只会手动回收才不膨胀')
+      .not.toMatch(/库文件只增不减[\s\S]{0,20}唯有.*手动|不断累积已删除行的空间/)
+    expect(s, '必须写明 CLI 不执行 CHECKPOINT（运维责任）').toMatch(/CLI \*\*不执行 `CHECKPOINT`\*\*/)
+    expect(s, '必须写明 DuckDB 会按 WAL 自动 checkpoint').toMatch(/自动 checkpoint|wal_autocheckpoint/)
+    // ⚠️ CodeRabbit round 6 指出并核实成立：判据不能只写 `/部分|一部分/` 对全文判 ——
+    // 上面「自动 checkpoint 不等于文件有界」那段里也有「只回收一部分」，即使**手动指引那一句**
+    // 改成承诺「完全回收」，全文判照样绿。必须锚到手动指引那一句本身。
+    const manualLine = s.split('\n').find((l) => /什么时候需要手动做/.test(l)) ?? ''
+    expect(manualLine, '手动 CHECKPOINT 的指引必须存在').not.toBe('')
+    // 手工指引跨行 —— 取它后面紧跟的两行一起判（「别期待它一定把文件缩小」+「空间只回收一部分」）
+    const idx = s.indexOf(manualLine)
+    const manualBlock = s.slice(idx, idx + 400)
+    expect(manualBlock, '手动指引必须写明「别期待它一定把文件缩小」')
+      .toMatch(/别期待它一定把文件缩小/)
+    expect(manualBlock, '手动指引必须限定空间只部分回收')
+      .toMatch(/只回收一部分|部分回收|只\*\*部分\*\*回收/)
+    // ⚠️ CodeRabbit round 8 指出并核实成立：`CHECKPOINT` 不是「把数据重写到新文件」——
+    // DuckDB 定义它是把 WAL 同步回主数据文件；要紧凑的新文件得用 `COPY FROM DATABASE`。
+    // DuckDB 定义它是把 WAL 同步回主数据文件；要紧凑的新文件得用 `COPY FROM DATABASE`。
+    expect(manualBlock, '不得说 CHECKPOINT「重写到新文件」')
+      .not.toMatch(/把数据重写到新文件/)
+    expect(manualBlock, '必须写明 CHECKPOINT = WAL 同步回主数据文件')
+      .toMatch(/把 WAL 同步回主数据文件/)
+    expect(manualBlock, '必须给出紧凑新文件的正解 COPY FROM DATABASE')
+      .toMatch(/COPY FROM DATABASE/)
+    // ⚠️ CodeRabbit round 4 指出并核实成立：原稿写「长时间反复同步不会无界膨胀」把话说满 ——
+    // 自动 checkpoint 限制的是 WAL 累积，不是 DB 文件大小；已删除行空间只部分回收，
+    // 主库文件仍可能增长。判定：不得承诺「文件大小有界」。
+    // ⚠️ 只锚**事故原句**，不能对全文 `not.toMatch(/文件大小有界/)` —— 回写正确的句子
+    // 本身就在说「自动 checkpoint 不等于「文件大小有界」」，对全文判会把「澄清」判成「仍在承诺」。
+    expect(s, '「长时间反复同步不会无界膨胀」的事故原句不得回归')
+      .not.toMatch(/长时间反复同步\*\*不会\*\*无界膨胀|长时间反复同步不会无界膨胀/)
+    expect(s, '必须写明自动 checkpoint 不等于文件有界').toMatch(/自动 checkpoint 不等于「文件大小有界」/)
+    expect(s, '必须写明主库文件仍可能增长').toMatch(/仍可能[\s\S]{0,16}增长/)
+  })
+
+  it('设计稿 §7.4/§7.4.1：限频持久化与 maxWindowDays 预校验各自收窄到 sync', () => {
+    const s = design()
+    expect(s).toMatch(/这句话\*\*只对 `sync` 成立\*\*/)
+    expect(s).toMatch(/`api call` 是\*\*一次性进程\*\*/)
+    expect(s).toMatch(/预校验只有 `sync` 做，`api call` 不做/)
+    expect(s).toMatch(/它不知道这个接口的窗口起止放在 body 的哪两个字段里/)
+    // ⚠️ CodeRabbit round 4 指出并核实成立：不能承诺「不切就拿到 window_too_large」——
+    // 超限报错码按接口族不同（statistic/* → 14501、summary → 14004、transferHuman → 14500），
+    // 只有**已识别的那几种报文**才会被归成 window_too_large。
+    const ACCIDENT = '不切就会拿到\n  `window_too_large`（hint 会再告诉你上限'
+    expect(ACCIDENT.includes('不切就会拿到')).toBe(true)
+    expect(s, '「不切就会拿到 window_too_large」的事故句不得回归')
+      .not.toMatch(/不切就会拿到/)
+    expect(s, '必须写明报错码按接口族不同').toMatch(/报错码与报文按接口族不同/)
+    expect(s, '必须写明 window_too_large 只覆盖已识别报文').toMatch(/已识别.*那几种报文|识别到的那几种报文/)
+  })
+
+
+  it('设计稿 §9.1/§11.2：`meta.cached` 从输出样本删除，缓存能力的旧承诺不得回归', () => {
+    const s = design()
+    expect(s, '`meta.cached` 不得再出现在输出样本里').not.toMatch(/"cached": false/)
+    expect(s).toMatch(/`meta\.cached` 已从样本里删掉（2026-10-30 回写）/)
+    expect(s, '「D 交付后缓存查询生效」的旧承诺不得回归').not.toMatch(/D 交付后缓存查询生效/)
+  })
+
+  it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
+    const s = read('docs/superpowers/specs/2026-10-13-存储层-design.md')
+    expect(s).toMatch(/本 spec 是 2026-10-13 的历史记录（2026-10-30 状态注）/)
+    expect(s).toMatch(/`auth login` 已于 \*\*2026-10-25\*\* 实现/)
+    expect(s).toMatch(/本节已整体过时（2026-10-30 状态注）/)
+    expect(s).toMatch(/`--pretty` 已于 \*\*2026-10-24（G1 第二批）实现\*\*/)
+    // 验收口径的作废必须点名（防实施者照旧文验收）
+    expect(s).toMatch(/那两处「--pretty 尚未实现」的验收口径\*\*已作废\*\*|验收口径\*\*已作废\*\*/)
+  })
+
+  it('skill spec / query spec：`--pretty` 的 rejected 建模与「不做 --pretty」各自标了作废', () => {
+    const skill = read('docs/superpowers/specs/2026-10-20-skill-design.md')
+    expect(skill, '待评审的旧状态行必须改掉').not.toMatch(/^> 状态：待评审/)
+    expect(skill).toMatch(/\*\*已批准并交付（2026-10-26 合并，PR #32）\*\*/)
+    expect(skill).toMatch(/本条已作废\*\* —— `--pretty` 于 \*\*2026-10-24（G1）实现\*\*/)
+    const query = read('docs/superpowers/specs/2026-10-17-查询接口与沙箱-design.md')
+    expect(query).toMatch(/本条已被 G1 推翻 —— `--pretty` 2026-10-24 已实现/)
+    expect(query).toMatch(/`--pretty` 已于 2026-10-24 实现 —— 现在 `query --table … --pretty` 退出码 0/)
+  })
+
+  it('skill 正文 forbidden.md：对 Agent 的 `--pretty` 口径是「没有增益」而非「未实现」', () => {
+    const md = read('src/skill/qiyu/forbidden.md')
+    expect(md, '不得再声称 --pretty 未实现').not.toMatch(/--pretty.{0,12}未实现/)
+    expect(md).toMatch(/不需要 `--pretty`/)
+    expect(md).toMatch(/对\s*\n?\s*Agent 没有增益|对 Agent 没有增益/)
   })
 })

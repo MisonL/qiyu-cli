@@ -154,12 +154,15 @@ export function classify(code: number | string, rawMessage: string): QiyuError {
   if (has(message, 'Too many running task')) return rate()
 
   // —— 14501 有两种含义，必须先按 message 区分（设计稿 §6.2）——
-  // 跨度问题 → 调用方切片重试；对齐问题 → 必须把 endTime 对齐到自然日边界。
+  // 跨度问题 → 调用方切片重试；endTime 越界（晚于今天 0:00）→ 必须用纯历史日期。
   // 两者错误码相同、修复方式完全不同；一律当"跨度"会让 Agent 反复重试无效操作。
   if (String(code) === '14501') {
     if (has(message, 'endTime is invalid'))
       return { ...base, kind: 'window_misaligned', retryable: false,
-               hint: 'endTime 必须对齐到自然日边界（不得晚于今天 00:00）' }
+               // ⚠️ 必须是「早于」而不是「不晚于」：实测 `endTime = 今天 0:00` 本身不稳定
+               // （有时 200 有时被拒，设计稿 §6.2），贴着等号的写法会把这条不稳定边界
+               // 当成安全上界教给 Agent。纯历史日期是唯一可靠做法。
+               hint: 'endTime 必须早于今天 00:00（用纯历史日期，不要包含今天的数据）' }
     if (has(message, 'is invalid'))
       return { ...base, kind: 'window_too_large', retryable: false,
                // ⚠️ 不要写"core 会重切" —— 本计划没有自动切片（见「已知缺口」），

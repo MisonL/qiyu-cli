@@ -50,7 +50,7 @@ export function shanghaiDayStart(ms: number): number {
 
 /**
  * 毫秒 → 上海「昨天 00:00」的 epoch 毫秒。
- * attendance/performance 的 `endTime` 不得晚于今天 00:00（`14501 endTime is invalid`），
+ * attendance/performance 的 `endTime` 必须早于今天 00:00（`14501 endTime is invalid`），
  * 且实测「今天 0:00」这条边界不稳定（同一取值时而 200 时而 14501，设计稿 §6.2）——
  * 统一退到昨天 0:00 留整日余量：当天数据不做（次日自动补上），绝不贴着边界。
  */

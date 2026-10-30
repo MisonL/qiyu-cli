@@ -1,6 +1,9 @@
 # F 子项目：Skill 化 —— 设计
 
-> 状态：待评审（brainstorming 完成，三路调研已回收）
+> 状态：**已批准并交付（2026-10-26 合并，PR #32）** —— 原文写「待评审」，是 brainstorming 完成时的状态；
+> 本 spec 的全部产出（`src/skill/` 正文 + `skill install/check/where` + `--version` +
+> `CommandSpec` 事实源 + postinstall + 首次运行检测）均已落地。**⚠️ 文中若干 `--pretty` 判断已被
+> G1 推翻**（它 2026-10-24 已实现，不再属于 `rejected`），逐处见文中状态注。
 > 权威来源：`docs/qiyu-cli-design.md` §11；`docs/superpowers/specs/2026-10-09-后续交付路线图-design.md` §四.F
 > 前置：A（注册表）、E（查询与沙箱）均已交付
 > 日期：2026-10-20
@@ -135,8 +138,19 @@ qiyu skill where   [--dir <path>]
 | 档 | 判据 | 退出码 |
 |---|---|---|
 | 通过 | 引用的命令/flag/位置参数域/`kind` 全部存在 | 0 |
-| 违规 | 引用了不存在的命令路径、flag 或 `kind`；正文出现 `TABLES` 里的表名；出现完整 SQL 关键字序列；推荐了 `--pretty` | 1 |
+| 违规 | 引用了不存在的命令路径、flag 或 `kind`；正文出现 `TABLES` 里的表名；出现完整 SQL 关键字序列 | 1 |
 | 无法校验 | 含占位符/管道/省略号等无法静态判定的文本 | 0，`meta.warnings` 列出并指认位置 |
+
+> **⚠️ 2026-10-30 状态注：本表原文的「推荐了 `--pretty`」一档已删除（CodeRabbit #50 指出，核实成立）。**
+> 原文把它列为 `skill check` 的违规判据，但实现里**从来没有这条检查**：`ViolationRule` 只有
+> `table_name` / `sql_sequence` / `unknown_kind` 三条内容红线（`src/skill/check.ts`），flag 侧只有
+> `rejected_flag` —— 而 `REJECTED_FLAGS` **当前为空**（`--pretty` 2026-10-24 已实现），所以
+> 「推荐 `--pretty`」**不会被任何一条规则判违规**。★ 上一版回写曾写「这一档现在由内容红线兜底」——
+> **那句话是错的**，三条内容红线都不看 flag。正确表述：`--pretty` 不进命令示例是**写作口径**
+> （`forbidden.md` §2 的「对 Agent 没有增益」），**不是可校验的判据**。
+> **为什么不补一条专用检查**：那等于为「一个合法但没用的 flag」建一条特例规则，而它要防的
+> 实际危害（Agent 照抄命令多打一个 `--pretty`）远小于维护一条特例规则的代价 ——
+> 判据是 YAGNI，且 `--pretty` 的输出**仍然是合法 JSON**，推荐它不会让 Agent 拿到错数据。
 
 **引用怎么提取**：不要求写标记语法（对写作者是负担，且容易写成假的）。扫描规则：
 
@@ -145,7 +159,14 @@ qiyu skill where   [--dir <path>]
 - 遇 `<...>` 占位符时只校验到占位符之前
 - 其余含 `<`、`|`、`…` 的视为不可静态校验 → warning
 
-**flag 校验是真实在岗的，不是摆设**：skill 的通道路由部分会推荐 `query --table`、`sync run --full`、`api call --body <JSON> --yes` 这类带 flag 的命令——它们都要过 `CommandSpec.flags` 的比对。判定规则：**引用的 flag 不在该命令的 `flags` 里即违规**；命中 `rejected`（如 `--pretty`）给专门话术「已知但未实现，别用」，其余给「该命令不接受此 flag」。§11.1 禁的是**数据侧事实**（表名/列名/错误码列表/完整 SQL），**不禁 flag**——flag 是 CLI 的稳定接口，正是 skill 该写、也该被校验的内容。
+**flag 校验是真实在岗的，不是摆设**：skill 的通道路由部分会推荐 `query --table`、`sync run --full`、`api call --body <JSON> --yes` 这类带 flag 的命令——它们都要过 `CommandSpec.flags` 的比对。判定规则：**引用的 flag 不在该命令的 `flags` 里即违规**；命中 `rejected` 给专门话术「已知但未实现，别用」，其余给「该命令不接受此 flag」。§11.1 禁的是**数据侧事实**（表名/列名/错误码列表/完整 SQL），**不禁 flag**——flag 是 CLI 的稳定接口，正是 skill 该写、也该被校验的内容。
+
+> **⚠️ 2026-10-30 状态注**：原文举例「命中 `rejected`（如 `--pretty`）」。**`--pretty` 已不再属于 `rejected`**
+> —— 它 2026-10-24（G1）已实现，`REJECTED_FLAGS` 当前为**空数组**（机制保留）。因此 `skill check` 的
+> `rejected_flag` 规则**目前对任何 flag 都不触发**（登记表里没有成员），但规则本身仍在岗：将来若
+> 再出现「已知但显式拒绝」的 flag，直接登记即生效。skill 正文（`forbidden.md` §2）也据此改口径 ——
+> 从「未实现」改为「对 Agent 没有增益」。
+
 
 **`kind` 引用也校验**：skill 正文用 `` `kind: rate_limit` `` 这个形态写错误分类（窄模式，易提取）。`core/errors.ts` 把 `ErrorKind` 联合类型改造为**同时导出运行时常量**（`export const ERROR_KINDS = [...] as const; export type ErrorKind = typeof ERROR_KINDS[number]`——标准的类型/常量单源写法）。`skill check` 把正文里的 `kind: x` 逐个对着 `ERROR_KINDS` 比，不存在即违规。逐命令的 `kinds`/`exits` 映射**v1 仍不做**（那没有现存事实源，见 D4）。
 
@@ -155,7 +176,9 @@ qiyu skill where   [--dir <path>]
 
 1. `cli.ts` 的顶层 USAGE 里，`db tables` / `db describe` 两行**没写** `--db/--profile/--backend`（它们只在后面的「查询族参数」公共段出现），而 `db.ts` 自己的 USAGE 写了
 2. 同理 `sync status` / `sync verify` 的顶层行只写 `[任务...]`，实际接受 store 三件套
-3. `api.ts` 的 `api schema <id> [--pretty]` 把 `--pretty` 写进用法，但它在所有命令里都是**显式拒绝**（`api.ts:290`）——扫散文会把一个必然失败的命令判成合法
+3. `api.ts` 的 `api schema <id> [--pretty]` 把 `--pretty` 写进用法，但**该 flag 当时在所有命令里都是显式拒绝**（`api.ts:290`）——扫散文会把一个必然失败的命令判成合法
+   （**2026-10-30 状态注**：G1 起 `--pretty` 已实现，这条漂移的具体形态已消失；但它论证的
+   「不能扫散文、必须建 `CommandSpec` 事实源」这个结论**依然成立且已落地**。）
 
 ```ts
 export interface FlagSpec {
@@ -166,7 +189,7 @@ export interface CommandSpec {
   path: string[]                       // ['db', 'describe']
   flags: FlagSpec[]
   positionals: { name: string; domain: Domain; repeatable?: boolean }[]
-  rejected: string[]                   // 已知但显式拒绝（当前只有 --pretty）
+  rejected: string[]                   // 已知但显式拒绝（**当前为空**：--pretty 已于 2026-10-24 实现）
 }
 type Domain = 'tables' | 'report-tables' | 'task-ids' | 'endpoint-ids'
 ```
@@ -181,6 +204,10 @@ type Domain = 'tables' | 'report-tables' | 'task-ids' | 'endpoint-ids'
 
 1. **`KNOWN` 不能直接当 `flags`**。6 个模块（store/sync/sync-run/db/stats/query）的 `KNOWN` 只含 `--help`/`-h`/`--pretty`，**不含任何业务 flag**。直接导出会让 `db tables --db` 被判非法。必须先把**各命令接受的 flag 全量**从现有解析器提成命名常量：`db.ts:59` / `store.ts:30` / `stats.ts:52` 的 `a === '--db' || ...`、`sync-run.ts:216` 的内联条件、`sync.ts` 五个调用点的内联数组（含 `sync install` 的 `--schedule`、`sync uninstall` 的 `--yes`）、`api list` 的 `--all`、`api call` 的 `--body/--yes/--no-validate/--strict`、`query` 的十个（`--group-by` 标 `repeatable`）。**`flags` 必须是完整接受集，不能只记 `rejected`**——否则 skill 里写 `` `qiyu api call --no-validate` ``（真实的用法错误）也会被判通过。
 2. **`--pretty` 建模成 `rejected`**，不是合法 flag。它在每个模块都走 `usageFail`（`query.ts:434`、`api.ts:290`、`db.ts:275` 等），但 usage 散文里却写着 `[--pretty]`。§11.2 E 也明令「不要使用 `--pretty`」。
+   **⚠️ 2026-10-30 状态注：本条已作废** —— `--pretty` 于 **2026-10-24（G1）实现**，现在是**合法 flag**
+   （走 `GLOBAL_FLAGS`，缩进 JSON），`REJECTED_FLAGS` 清空为空数组（机制保留）。落地时按**当时**的
+   事实把它建模成了 `rejected`，G1 把它实现后这一条随之退场；`skill check` 的 `rejected_flag`
+   规则仍在岗、只是当前无成员。**保留原文 + 状态注**，是为了让后来者知道这个字段当初为什么存在。
 3. **v1 不做逐命令的 `kinds` / `exits`**。它们没有任何现存事实源（`ErrorKind` 是全局联合类型、`exitCodeFor` 是 `output.ts` 私有函数），逐命令手写等于新增两份易漂移的声明。`skill check` 改用**全局 `ERROR_KINDS` 常量**校验正文里的 `kind: x` 提及（见 D3）。
 
 **附带修掉一个已知缺陷**：`db.ts:50-53` 的注释自己承认「`parseFlags` 与 store.ts / stats.ts 逐字相同……改动这里必须同步那两处，或干脆收成共享模块」。调研核实**属实**（store 只是类型注解不同）。F 顺带把三份合并到 `src/commands/store-flags.ts`，让 spec 与 parser 消费同一常量。
@@ -238,9 +265,12 @@ description: <一句话说明何时用，含关键词>
 - ✅ 该用 `query --table`：B 表判定为本地数据库通道、且问题是「某表的行/计数/时间范围」
 - ✅ 该用 `query --sql`：需要 JOIN / 跨表聚合，`--table` 表达不了
 - ❌ 不要用 `query --sql` 去跑单表简单过滤——`--table` 更安全（列白名单、精确脱敏）
-- ❌ 不要用 `--pretty`（未实现，必然失败）
+- ❌ 不要用 `--pretty`（**2026-10-30 状态注：原文写「未实现，必然失败」，已作废** —— G1 起它已实现；
+  落地到 skill 正文的口径是「对 Agent 没有增益」，见 `src/skill/qiyu/forbidden.md` §2）
 
 ⚠️ **这处冲突需要回写设计稿 §11.2 E**（把 `--table` 从禁止项里拿掉，或改成「不要把 `--table` 当通用 SQL 替代品」）。本 spec 给出裁决与依据，改设计稿的措辞归 F 的实施波一并做。
+**✅ 已完成（2026-10-26 F 交付时执行；2026-10-30 复核）**：`docs/qiyu-cli-design.md` §11.2 E 已按本裁决改文
+（`--table` 从禁止项改为「不要当通用 SQL 替代品」），同处的 `--pretty` 亦已由本次回写修正为「已实现、但对 Agent 无增益」。
 
 **按需加载**：Claude Code 只在 skill 被触发时读 `SKILL.md` 全文，其余文件按正文指示才读。所以拆分 `references/` 不增加每轮上下文成本——这正是 DESIGN 稿鼓励的形态。
 
@@ -320,4 +350,6 @@ description: <一句话说明何时用，含关键词>
 - 不写 `~/.agents/.skill-lock.json`（C2/C3 的理由）
 - 不做 `kinds` / `exits` 的逐命令声明（D4 的理由）
 - 不实现 `--pretty`（仍是显式拒绝，`skill check` 会把它当违规推荐）
+  **（2026-10-30 状态注：本条已被 G1 推翻 —— `--pretty` 2026-10-24 已实现；`skill check` 的
+  `rejected_flag` 规则因此当前无成员可命中，但机制保留。）**
 - 不做 skill 的多语言版本（全文中文，与仓库约定一致）

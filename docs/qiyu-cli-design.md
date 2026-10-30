@@ -58,6 +58,23 @@
 - 定时任务生成（crontab / launchd / systemd / Task Scheduler）
 - 配套 skill（Agent 手册）
 
+> **⚠️ 交付状态（2026-10-30 回写）**：本节是**范围声明**，不是交付清单 —— 两者曾被混读。
+> 本阶段实际交付了前六个子项目（见 README「当前状态」）：鉴权与签名层、通用 API 逃生通道、
+> 本地数据仓库、同步引擎、Agent 查询接口与只读沙箱、配套 skill，外加本地数据库自描述
+> （`db tables` / `db describe`）与定时任务生成（`sync install` / `sync uninstall`）。
+> **上面两条**语义化命令**未交付、且当前无落点**：
+> · **工单领域的语义化命令** —— 从未进入路线图任何子项目（A/B/C1/D/E/F 都不含）；
+> · **知识库领域的语义化命令（只读）** —— 同上。
+> **缺的是"语义层"，不是"数据"**（这两件事别混）：两条领域的**数据**都能拿到 ——
+> 远程走 `api call <接口 id>`（如 `v2/ticket/search`），落库后走 `query --table` /
+> `query --sql`（`tickets` / `ticket_logs` / `knowledge_items` / `knowledge_categories`
+> 都在 `TABLES` 里、都有对应同步任务）。**没有的是**把这些包成人类语义的
+> 那层命令（§9.4 设想的那种 `qiyu ticket … --assignee "张三"` 名称解析、按 `group_id` 聚合、
+> 标准问/相似问切换）—— 所以 Agent 得自己看 `api schema` 拼 body、或自己写 SQL。
+> `src/cli.ts` 的命令树里没有 `ticket` / `kb` 命令。
+> 这是**挂账**而非放弃：重开需要独立 spec→plan，理由与 §9.4 名称解析那条同源
+> （语义化命令要复用的写命令族同样不存在）。**读本节时不要把它当作"已经有了"。**
+
 ### 本阶段范围外
 
 - **消息明细 `messages`**（一行一句话，体量最大；`sessions` 已覆盖分类/时长/评价维度）
@@ -144,8 +161,16 @@ time     = current UTC second-level timestamp                 // 有效期 5 分
 export QIYU_APP_KEY=xxx        # Agent / CI 场景
 export QIYU_APP_SECRET=yyy
 qiyu auth login --profile prod # 人工使用：写入 ~/.config/qiyu/config.json（目录 0700 / 文件 0600）
-qiyu auth whoami               # 校验凭证并显示当前 profile（+ source / robots）
+qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ source / robots）
 ```
+
+> **⚠️ 措辞收窄（2026-10-30 回写）**：`auth whoami` 的原文是「**校验**凭证」。**它不校验。**
+> `src/commands/auth.ts` 的 `whoami()` 只判断凭证**是否存在**（键在 env 或文件里、且非空），
+> **从不向服务端发请求**——所以「凭证过期了」「appKey 被重置了」「IP 不在白名单」这些情形，
+> `whoami` 全部报成功。要真的校验，只能跑一条真实调用（如 `qiyu api call <某只读接口>`）看返回。
+> 这不是缺陷，是分层约束的结果：`auth` 命令**零加载 `store/` 且不碰网络**（`tests/store/layering.test.ts`
+> 钉着），校验就得联网；而无网络的 `whoami` 至少能回答「这台机器上配没配、从哪读到的」——
+> 这正是 Agent 最常问的那个问题。原文的「校验」二字会让人以为成功 = 凭证有效，故改掉。
 
 **✅ 已交付（G1 第三批，2026-10-25）**：`auth login` 从**环境变量**读凭证（不接受
 `--app-key`/`--app-secret` —— argv 会留在 shell 历史与 `ps` 里），原子写（临时文件 +
@@ -178,10 +203,35 @@ qiyu auth whoami               # 校验凭证并显示当前 profile（+ source 
 | 14008 | IP 不在白名单 | 否 | 必须在七鱼控制台配置 |
 | 14009 | 请求频率过快 | 见下文 | 携带 `retry_after` + `retry_strategy` |
 | 14500 | **语义歧义的 code（已对线上 API 验证出 4 种含义，见下文）** | — | **绝不能只看 code**：内部错误 → core 退避；`Service Offline` → **永久熔断**；`Param format error` → **不可重试**；`单位时间内请求过于频繁` → **是限流，必须延迟重试** |
-| 14501 | 数据量超限 | — | **core 层自动分片** |
+| 14501 | 数据量超限 | — | **core 层不切片**；按 message 区分两种并各自给下一步（见下）：跨度过大 → `kind: 'window_too_large'`（按上限切片）；endTime 越界 → `kind: 'window_misaligned'`（**必须早于今天 00:00** —— 用纯历史日期；「不晚于」是错的，它把「今天 0:00」这条**实测不稳定**的边界当成了安全上界） |
 | 14515 | 权限不足 | 否 | 该接口需单独申请 |
 
-**原则：凡是 CLI 自己能吸收的错误，都不以 `retryable: true` 的形式暴露给 Agent。** 14003/14500/14501 都在 core 层被吸收。`retryable: true` 只保留给 Agent 必须**改变策略**的情况。
+**原则：凡是 CLI 自己能吸收的错误，都不以 `retryable: true` 的形式暴露给 Agent。** 14003/14500 在 core 层被吸收（重签重试 / 判死为 `module_offline`）；**14501 只被翻译、不被吸收** —— 见下方收窄说明。`retryable: true` 只保留给 Agent 必须**改变策略**的情况。
+
+> **⚠️ 「core 层自动分片」的收窄（2026-10-30 回写）**：本表原写 `14501 → core 层自动分片`。
+> 实现里 **core 不做分片**：`src/core/errors.ts` 把两种 `14501` 报文翻成**两个不同的 kind** ——
+> `endTime is invalid`（越界）→ `kind: 'window_misaligned'`，hint 只讲**一个**条件
+> （与 `src/core/errors.ts` 逐字一致）：`endTime 必须早于今天 00:00（用纯历史日期，不要包含今天的数据）`
+> —— **⚠️ 本注的前一版把它写成「对齐自然日边界 **且** 不晚于今天 00:00」的「双条件」，两个都错**
+> （CodeRabbit #50 round 10 指出、§6.2 实测核实）：其一 **「对齐」根本不是要求** —— 纯历史日期的
+> `endTime` 取**任意时刻**都接受（§6.2 实测：`5 天前 0:00 → 5 天前 12:00` 返回 200），
+> 「每个 endTime 都要写成 0:00」是把提示语读过头；其二 **「不晚于」把等号放进了安全区** ——
+> `endTime = 今天 0:00` 恰是那条**本身不稳定**的边界（同一取值有时 200 有时被拒），
+> 写「不晚于」等于教 Agent 去踩它。实测唯一被拒的形态是 `endTime` **不早于今天 0:00**
+> （即今天 0:00 及其后）；上一版把「（恰好等于时不稳定）」写在括号里当补充，力度不够 ——
+> 它决定了「早于」与「不晚于」的差别，是这句话的主干而不是脚注。
+> 所以 hint 给的是**面向概念**的指令：**endTime 用纯历史日期，不包含今天数据** ——
+> 这是三个接口都工作的原则，也是唯一不需要知道"今天几点"的做法。
+> `…is invalid`
+> （跨度过大）→ `kind: 'window_too_large'`、`retryable: false`
+> **两者不能混**：切片救不了越界 —— 一个 1–2 天的窗口，endTime 越界照样报 `endTime is invalid`
+> （§6.2 实测）—— 一律当"跨度"让 Agent 反复按切片重试同一个失败请求，会浪费一排网络往返。
+> **真正切片的只有同步引擎**（`src/sync/engine.ts` 的 `sliceForTask` / `sliceByMaxWindow`）：
+> 它按任务注册的 `maxWindowDays` 把范围切成多窗、逐窗发请求、合并结果。
+> `qiyu api call` **不切片** —— 它没有分片所需的参数知识（注册表不登记窗口起止在哪个字段里），
+> 所以给 Agent 的是一个可执行的下一步（按 `max_window_days` 自己切），而不是替它切。
+> **读法**：本表这一行的「14501 是数据量超限」这个分类学没错，错的是「core 层自动」四个字 ——
+> 分片能力存在，但它在 sync，不在 core。
 
 **⚠️ 官方通用错误码表只有 10 行，完全没有描述七鱼真实的错误面。** 已对 `https://qiyukf.apifox.cn/doc-436972.md` 逐字核验（2026-09-30）—— 完整表为 `200`、`14001`、`14002`、`14003`、`14004`、`14008`、`14009`、`14500`、`14501`、`14515`。这就是全部；没有第二张表，也没有逐码展开说明。由此有三个塑造错误层的结论：
 
@@ -218,6 +268,17 @@ qiyu auth whoami               # 校验凭证并显示当前 profile（+ source 
 
 **⚠️ 14500 必须熔断（否则无限循环）**：已对线上 API 验证，`/openapi/icoutcall/*` 下全部 8 条路径都返回 `14500 Service Offline`。这是**永久性**的（模块未开通）；在 0s/10s/30s/60s 重试得到的响应逐字节相同。
 若实现为“14500 → core 层退避重试”，这些接口将**永远重试下去**。熔断是必须的：同一路径连续 N 次返回 `14500 Service Offline`（推荐 3 次）→ 判定模块未开通，立即失败并给出明确信息，同时写入本地熔断状态，避免之后反复尝试。
+
+> **⚠️ 承诺收窄（2026-10-30 回写）**：落地的是**等效防死循环**，不是这里描述的那个熔断器。
+> 实测（`src/core/errors.ts`）：`14500` + `message` 含 `Service Offline` → 直接判
+> `kind: 'module_offline'`、`retryable: false`。**一次就判死，不重试** —— 因为 `Service Offline`
+> 在 0s/10s/30s/60s 的响应逐字节相同（本段自己的实测），"连续 N 次"与"一次"结论必然一致，
+> 计数只是把同一个答案多算几遍。**未实现的两样**：① 跨次调用的**计数器**（没有"上次也是它"的记忆）；
+> ② **持久化的熔断状态**（没有写进本地库的"这个模块别试了"标记）—— 因此下一个 `qiyu api call`
+> 进程仍会再打一次网络、再拿一次 `Service Offline`。**代价如实说明**：Agent 反复调用同一未开通
+> 接口，每次都会付一次网络往返；换来的是**永不无限循环**（这是熔断在这里的唯一目的）与
+> `kind: module_offline` 这个可分派的答案。真正需要"一次失败后再也不碰"的场景（如同一进程内
+> 批量调用），由调用方自己按 `kind` 短路 —— 判据是 `kind`，不是计数器。
 
 **14500 的第三种含义：缺参数导致的 NPE**。已对线上 API 验证，`kefu/v2/query` 不传 `id`、`robot/session/assist` 不传 `content`，两者都返回 `14500`，并**泄漏 Java 内部类名与包路径**（形如 `Cannot invoke "<厂商内部包>.<类名>.getId()" because "staff" is null`）。
 
@@ -516,7 +577,7 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 >
 > 在共享的 `(staff, date)` 上交叉核对：天粒度行报告 `loginDuration = 86400024`，而同一客服的小时行报告 `3600001`。相同的 `(staff, date)` 对从不重复。
 >
-> → **省略 `startTime` 的同步会把天粒度行写进主键为 `staff_id + hour_ts` 的表，并无声地少抓约 10 倍。** 同步必须**始终传 `startTime`**，且表必须记录粒度，以便混合粒度可被检出。（`endTime` 仍不得晚于今天 00:00 —— `endTime = now` 返回 `14501 endTime is invalid`。）
+> → **省略 `startTime` 的同步会把天粒度行写进主键为 `staff_id + hour_ts` 的表，并无声地少抓约 10 倍。** 同步必须**始终传 `startTime`**，且表必须记录粒度，以便混合粒度可被检出。（`endTime` 仍 **必须早于今天 00:00** —— `endTime = now` 返回 `14501 endTime is invalid`；§6.2 实测这条边界本身不稳定，故取纯历史日期。）
 > **⚠️ `data.overview.session` 不是报表** —— 它只返回**当前实时快照**，**没有历史回填能力**。把它放进报表同步是错的；应作为实时接口单独列出。
 >
 > **⚠️ 但它并非"忽略所有输入参数" —— 本说明的早期版本这么写过，这是错的。** A/B 交替实测 5 轮：当 `toGroup`/`toStaff`/`assignStaff` 全为 `[-1]` 时响应为 `sessionCount=15, totalSessionCount=1121, kefuCount=6`；传**真实** id 时为 `sessionCount=0, totalSessionCount=0, kefuCount=0, averageWaitingTime=-1`。秒级内可复现、可逆转。→ **`-1` 是真正的"不过滤／全部"选择器，而且这三个键确实必填**（完全省略 body 会返回 `14004 Not found param`）。只有 `type` 固定为 `1`。传真实 id 的调用方会得到一份全零快照，看起来像"没有流量"。
@@ -563,19 +624,31 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 - **时间参数始终是毫秒**。传秒**不报错，但会无声降级**（`overview` 会把 69 个字段中的 49 个变成 `-1`，而 `code` 仍是 200）—— 最危险的坑
 - **⭐ `data.overview.session`（实时报表）有三个必填请求参数，其全部文档就是一个哨兵值**：`toGroup`、`toStaff`、`assignStaff` 都是 `array<integer>`，都被列为 `required`，而官方对每一个的说明逐字为 **`当前版本是-1`**（当前版本是 -1）。文档中唯一可用的取值是 **`-1`**，给在示例 body 里。→ **Agent 无法从任何地方推导出这一点** —— 参数名暗示着真实的筛选语义（"发给哪个组／哪个客服／指派给谁"），而 API 却忽略它们。CLI 必须硬编码文档给出的 `-1` 三元组，并在 `--help` 中说明这些是占位符，以免 Agent 被误导去传真实的组或客服 id
 
-**⚠️ `endTime` 的整日对齐检查只对两个接口成立（实测，逐接口核实）**
+**⚠️ `endTime` 的上界检查只对两个接口成立（实测，逐接口核实）**
 
-| 接口 | `endTime` 越界（晚于今天 0:00） | 是否需要整日对齐 |
+| 接口 | `endTime` 越界（不早于今天 0:00）被拒 | 该接口的 `endTime` 是否受上界检查 |
 |---|---|---|
-| **`staffAttendance`** | **`14501 endTime is invalid`** | ✅ **需要** |
-| **`performance`** | **`14501 endTime is invalid`** | ✅ **需要** |
-| `overview` / `staffworklod` / `staffquality` / `satisfaction.report` | **正常返回 200**（传 `NOW` 也可以） | ❌ 不需要 |
+| **`staffAttendance`** | **`14501 endTime is invalid`** | ✅ **受** |
+| **`performance`** | **`14501 endTime is invalid`** | ✅ **受** |
+| `overview` / `staffworklod` / `staffquality` / `satisfaction.report` | **正常返回 200**（传 `NOW` 也可以） | ❌ 不受 |
 
-- 对齐检查**与跨度无关**：实测在 `staffAttendance` 跨度只有 1–2 天时，越界的 `endTime` 仍报 `endTime is invalid`
-- 纯历史窗口**不受此限制**（`5 天前 0:00 → 5 天前 12:00` 正常工作）
-- **⚠️ 今天 0:00 这条边界不稳定**：实测同一个 `endTime = 今天 0:00` 有时返回 200，有时返回 `endTime is invalid` → **拉取包含今天的窗口时留出安全余量（用 `昨天 0:00 → 今天 0:00`，不要贴着边界）**
+- 上界检查**与跨度无关**：实测在 `staffAttendance` 跨度只有 1–2 天时，越界的 `endTime` 仍报 `endTime is invalid`
+- 纯历史窗口**不受此限制**（`5 天前 0:00 → 5 天前 12:00` 正常工作）—— 这条同时证明被检查的是**上界**而不是「整日对齐」：`5 天前 12:00` 不是整日对齐的值，照样 200
+- **⚠️ 今天 0:00 这条边界不稳定**：实测同一个 `endTime = 今天 0:00` 有时返回 200，有时返回 `endTime is invalid` → **不要把「今天 0:00」当可靠上界**。
+  **能做的是避开它，不是贴着它留余量**（2026-10-30 更正：本节原写「用 `昨天 0:00 → 今天 0:00`，不要贴着边界」—— 那个建议自相矛盾，**它的右端正是那条不稳定边界**，而且它不含今天 0:00 之后的数据，用起来像是"拿到了今天"其实没有）。
+  **当前唯一可靠的做法**：`endTime` 取**纯历史日期**（无今天的窗口）—— 三个接口在这种情况下都正常（见上表与「纯历史窗口不受此限制」一条）。**CLI 自己就是这么做的**：`attendance` / `performance` 两个任务声明了 `windowEndClamp: 'shanghaiYesterday'`，引擎把窗口右端**钳到昨天 0:00**（`src/core/time.ts` 的 `shanghaiYesterdayStart` —— 「统一退到昨天 0:00 留整日余量：当天数据不做，绝不贴着边界」）。
+  **代价如实说**：**今天的数据拿不到** —— 而且不是「明天就有」，是**要等到下一次同步跑**。
+  机制：clamp 把窗口右端钳到**当天 0:00 的前一天 0:00**（`shanghaiYesterdayStart`），
+  所以窗口是 `[start, 昨天 0:00)`，**不含昨天整天的数据**。举例（上海时间）：
+  · 11-01 凌晨跑 → 右端钳到 10-31 0:00 → 覆盖到 10-30 为止，**10-31 的数据不在库里**；
+  · 11-02 凌晨再跑 → 右端钳到 11-01 0:00 → 这才覆盖到 10-31，**10-31 的数据此时才落库**。
+  → **某一天的数据，最早在「次日的下一次同步」之后才可查**（即 D 日的数据在 D+2 日
+  的同步后才进库）；`sync status` 的 `resolved_range` / 水位是判断覆盖到哪的唯一依据。
+  若非要取今天，只能自己在 `api call` 里重试、拿到 `endTime is invalid` 就退回去取昨天为止
+  —— **没有"贴着边界就稳"的参数**（`昨天 0:00 → 今天 0:00` 不是解法：它的右端**正是**那条
+  不稳定边界，而且它不含今天 0:00 之后的数据，用起来像是"拿到了今天"其实没有）。
 
-**⚠️ 两种 `14501` 必须靠 message 区分**：`endTime is invalid` 是**对齐问题**，`(endTime - startTime)/millsADay > 31 is invalid` 是**跨度问题**。错误码相同，但修复方式完全不同 —— CLI 必须解析 message，而不能只看 code。
+**⚠️ 两种 `14501` 必须靠 message 区分**：`endTime is invalid` 是**上界越界问题**（endTime 不早于今天 0:00），`(endTime - startTime)/millsADay > 31 is invalid` 是**跨度问题**。错误码相同，但修复方式完全不同 —— CLI 必须解析 message，而不能只看 code。
 
 **元数据表**：`sync_state`（水位、区间状态、最近错误）、`sync_gaps`
 
@@ -605,10 +678,23 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 
 **设计**：
 - **单写者**：`sync` 持有 RW，并在进程退出时释放
-- **读者重试**：`query` / `api` 等只读操作以 RO 模式打开，冲突时**以指数退避重试**（实测：一个读者在约 2.6 秒、13 次重试后成功）
+- **读者重试**：`query` / `db` / `sync status` / `sync verify` / `stats` 等读库命令以 RO 模式打开，冲突时**以固定间隔退避重试**（实测：一个读者在约 2.6 秒、13 次重试后成功）
+  （**2026-10-30 收窄：`api call` 不在其中** —— 它零加载 `store/`（§7.4），根本不打开本地库、不持有 RO 锁，也不会撞 `store_locked`，别指望它等你。）
 - **有界重试**：超过阈值（默认 30 秒）后返回 `kind: "store_locked"` + `hint`；**Agent 不得被无限阻塞**
-- **`sync` 之间的互斥**：在 `sync_state` 中加入 `locked_by` / `locked_at`，并设置陈旧锁超时
+- **`sync` 之间的互斥**：在 `sync_state` 中加入 `locked_by` / `locked_at`
 - 多个纯读进程可以并发运行（实测：3/3 成功）
+
+> **⚠️ 两处收窄（2026-10-30 回写）**：
+> 1. **曲线是固定间隔，不是指数退避。** 实现（`src/store/retry.ts`）每次重试间隔恒为 **200ms**，
+>    由实测反推：2.6 秒 13 次成功 ≈ 200ms/次。原文的「指数退避」是错的 —— 指数曲线在剩余预算
+>    不足时会大幅越过 `maxMs`（例如最后只剩 300ms 预算却按指数该睡 1.6s），与「超过 30 秒就返回
+>    `store_locked`」这条有界承诺直接冲突。**按固定间隔读，按固定间隔实现。**
+> 2. **陈旧锁超时未实现。** `locked_by` / `locked_at` 两列**已落库**、任务开始盖上、结束（含异常）
+>    清空，但**没有**"锁超过 N 分钟就判定持有者已死、强行接管"的逻辑。这与 `sync` 的实际形态
+>    自洽：`sync` 是**前台进程**（不是守护进程 —— 守护进程明确列为非目标），进程退出时锁必然被
+>    清空；能留下的陈旧锁只有 `kill -9` 一类硬杀。**当前行为**：`sync status` 的 `locked` 字段
+>    会照实报告「被持有」，`locked_at` 供读方自行判断是否陈旧；CLI 不替你做接管。
+>    若将来 `sync` 变成常驻/后台形态，这条必须补实现 —— 那时陈旧锁才是真问题。
 
 **写操作必须包在事务中。** 实测：DuckDB 的 `BEGIN/DELETE/INSERT/COMMIT` 可避免空档；在 `kill -9` 之后 WAL 会自动重放，数据完整且未损坏。
 
@@ -674,6 +760,22 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 
 **`DELETE` 不会回收空间**：官方文档明确写道"执行 DELETE 并不意味着空间被回收"；需要定期执行 `CHECKPOINT`。
 
+> **⚠️ 运维须知（2026-10-30 回写）**：CLI **不执行 `CHECKPOINT`**，也没有任何命令替你做这件事
+> （全仓无 `CHECKPOINT` 调用 —— 这是范围外而非遗漏）。
+> **「不回空间」不等于「文件只增不减」**：DuckDB **自己**会按 WAL 大小自动 checkpoint
+> （内置设置 `wal_autocheckpoint`；本仓库不改它、用默认值 —— 该设置名可从随包的
+> `libduckdb.dylib` 字符串表核到），所以 WAL 的累积是被自动限制的。
+> **但自动 checkpoint 不等于「文件大小有界」** —— 它限制的是 **WAL** 的增长，而
+> **已删除行的空间只回收一部分**，所以反复同步**仍可能**让主库文件缓慢增长。
+> **别把「会自动 checkpoint」读成「不用管文件大小」**：要盯着看 `ls -l`。
+> **什么时候需要手动做**：删过大量行、想让空间尽量回收时，用 DuckDB 客户端连上库执行
+> `CHECKPOINT`。**别期待它一定把文件缩小** —— checkpoint 会把 WAL 同步回主数据文件（不是
+> 重写到新文件，若要紧凑的新文件请用 `COPY FROM DATABASE`），**已删除行
+> 的空间只回收一部分**，能否变小取决于剩余数据布局。**判断依据**：`store status` 报的行数是
+> **逻辑行数**，不反映文件膨胀；文件大小要自己看 `ls -l`。
+> **✅ / ⚠️ 边界**：以上「DuckDB 自动 checkpoint」来自其文档与随包二进制的设置名，
+> **本仓库未对「多大 WAL 触发」做实测**；手动 `CHECKPOINT` 的回收效果同样**未实测**。
+
 ## 7. 同步引擎
 
 **可重复的全量同步是一等公民** —— 只有第一次快不叫生产力；随时能重建才叫。
@@ -707,7 +809,7 @@ qiyu sync verify [task]         # 校验本地与远端一致性
 |---|---|---|---|
 | 历史数据概览 `statistic.overview` | **31 天** | `query_start` | 无必填参数；默认 = 最近 31 天 |
 | 坐席工作量 / 质量 / 满意度 | **31 天** | `query_start` | 每个坐席 1 行；`date` 不可信 |
-| **坐席考勤 `staffAttendance`** | **31 天** | `query_start` | **只有传入 `startTime` 时粒度才是 坐席 × 小时**；不传则得到 坐席 × 天，且 `total` 约小 10 倍（§6.2）。**务必传 `startTime`**。`endTime` 不得晚于今天 00:00 |
+| **坐席考勤 `staffAttendance`** | **31 天** | `query_start` | **只有传入 `startTime` 时粒度才是 坐席 × 小时**；不传则得到 坐席 × 天，且 `total` 约小 10 倍（§6.2）。**务必传 `startTime`**。`endTime` 必须早于今天 00:00 |
 | **考勤明细 `salaryDetail`** | **无限制**（400 天也可以） | `staff_id + work_date` | **必须传单个 `staffId`**；只返回该窗口的起始日 |
 | **订单绩效 `performance`** | **365 天** | `query_start` | 明细 + `sum`；测试账号没有这类数据 |
 | **机器人会话统计 `robot.summary`** | **31 天** | `query_start` | 忽略 `robotId`；超限报 `14004`（不是 `14501`） |
@@ -771,6 +873,22 @@ qiyu sync verify [task]         # 校验本地与远端一致性
 > **⚠️ `robot.statistic.summary` 文档写的是 30 天，但实际可执行的上限是 31**（`一次最多支持获取30天时间范围内的数据`；实测，31 天精确到毫秒被接受，31 天 + 1 毫秒被拒绝）。它也是唯一一个超限错误是 `14004` 而不是 `14501` 的报表。→ **注册 `maxWindowDays: 31` 以对齐服务端实际执行的口径，并保留 `14004` 的分派。** 注册文档里的 30 会每个窗口都静默少取一天；注册实测的 31 既正确又安全。
 
 > ⚠️ **上限和错误码都不统一** —— 对于同一个「超限」情形，有的返回 `14501`，有的返回 `14004`，而且报文中英混杂。**CLI 不能靠错误码判断「超限」；它必须按接口注册表里的 `maxWindowDays` 预先校验**，否则 Agent 会收到一个它无法理解的错误。
+
+> **⚠️ 承诺收窄（2026-10-30 回写）：预校验只有 `sync` 做，`api call` 不做。**
+> · **`sync`**：任务注册了 `maxWindowDays`，引擎按它**切窗**（`src/sync/engine.ts`
+>   `sliceForTask`）—— 超限窗口**发不出去**，这才是这条要求真正兑现的地方。
+> · **`api call`**：`src/commands/api.ts` 的 `call()` **没有这道预检**，`api list` / `api schema`
+>   只**输出** `max_window_days`（供 Agent 自己看），不拦你。**为什么**：注册表**不登记 `params`**
+>   —— 它不知道这个接口的窗口起止放在 body 的哪两个字段里，无从校验。硬做只能按字段名猜
+>   （`startTime`/`endTime`/`start`/`end`/`query_start`…），猜错就是对着合法调用报错。
+> · **对 Agent 的实际含义**：`api call` 里读到 `max_window_days` **必须自己按它切**。
+>   **别指望「不切也一定能拿到某个固定 kind」** —— 超限的**报错码与报文按接口族不同**
+>   （§7.4.1 的表格：`/openapi/statistic/*` 是 `14501`、`robot.statistic.summary` 是 `14004`、
+>   `ai.statistic.transferHuman` 是 `14500`、`ticket.search` 是 `14004 range over limit`）。
+>   CLI 把**已识别的那几种报文**都归成 `kind: 'window_too_large'`（hint 里带上限数字），
+>   但这是「识别到的措辞」而非「所有接口的保证」：某个接口若换一种没见过的超限报文，
+>   就会落到 `param` / `unknown`。**判据**：先按 `max_window_days` 切，别等报错再猜 ——
+>   切错了是白打一次网络，猜错了是把参数错误当成能靠重试解决的。
 > ⚠️ **判定式并不是 `span > N days`，而且两个报表族用的判定方式不同。** 已线上二分验证（2026-09-30）：
 >
 > | 族 | 判定式 | 接受 | 拒绝 |
@@ -787,6 +905,20 @@ qiyu sync verify [task]         # 校验本地与远端一致性
 > ⚠️ **在该接口上，把秒当毫秒传同样会静默降级。** `robot.statistic.summary` 传一个秒级别的范围会返回 **`code:200` 且所有计数器都是 `0`** —— 不报错，一份看起来很像样的空报表。§14 已经为 `overview` 记录了这个坑；它并非 `overview` 独有，注册表必须按接口标注单位。
 
 CLI 在本地持久化限频状态：命中 14009 之后它会记下「下次可调用时间」，之后对同一接口的调用**不碰网络直接快速失败**，因此 `retry_after` 永远是准确的。
+
+> **⚠️ 承诺收窄（2026-10-30 回写）**：这句话**只对 `sync` 成立**，对 `api call` 不成立。
+> - **`sync`**：`src/sync/rate-gate.ts` 把冷却写进 `sync_state`（`next_allowed_at` /
+>   `last_rate_limited_at` 两列），**跨进程持久** —— 这是本节要的东西。
+> - **`api call` / `auth` 等**：令牌桶是**进程内**的 `Map`（`src/core/ratelimit.ts`），不落库、
+>   不跨进程。而 `api call` 是**一次性进程**（一调一退），所以两次 `qiyu api call` 之间**没有任何
+>   共享状态** —— 每次都是全新的空桶。"记下下次可调用时间、下次不碰网络"对它**完全不成立**：
+>   第二次调用照样打网络，`retry_after` 来自**这一次**服务端的响应（或本地桶对同一进程内后续调用的估计）。
+>   **这也不是缺陷**：CLI 有一条红线「`auth`/`api` 零加载 `store/`」（`tests/store/layering.test.ts`），
+>   要把冷却写进库就得把 DuckDB 拖进 `api call` 的启动路径 —— 为一次读调用付一个数据库引擎的
+>   启动代价，得不偿失。限频表真正约束的是**将来那个单进程内批量调用的命令**（如同进程循环批量编辑）；
+>   对当前的单次 `api call`，它在"同一进程里被调用多次"时才生效。
+> **Agent 的实际依据**：单次 `api call` 撞限流时，读 `retry_after` 与 `retry_strategy` —— 那是这次
+> 服务端如实给的，不是持久化状态推出来的。
 
 ### 7.5 会话导出流水线（本阶段的核心）—— 实测
 
@@ -1132,8 +1264,7 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
   "rows": 42, "truncated": false, "limit_applied": 1000,
   "resolved_range": ["2026-09-23T00:00:00+08:00", "2026-09-29T23:59:59+08:00"],
   "data_coverage": {"min": "...", "max": "..."},
-  "last_synced_at": "2026-09-30T10:15:00+08:00",
-  "cached": false
+  "last_synced_at": "2026-09-30T10:15:00+08:00"
 }}
 
 // 失败
@@ -1155,6 +1286,13 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 > ① **只承诺「有表可查」**，不承诺表非空、更不承诺覆盖调用方要的时间窗 —— hint 要求先 `qiyu db tables` / `qiyu sync status` 确认；
 > ② **危险接口不给**（调用方要的是写操作，一个本地读的表名帮不上忙，反而可能被误读成本地也能执行）；
 > ③ 无映射 / 库文件不存在 / 探测异常 → **两个键都不出现**（不编一个指向不存在表的命令），原始限流错误原样返回。
+
+> **⚠️ `meta.cached` 已从样本里删掉（2026-10-30 回写）**：它是**承诺过、没有实现**的字段 ——
+> 全仓没有生产者（`grep -r "'cached'" src/` 无命中），也没有任何查询缓存。它曾是本节的
+> 「成功输出样本」的一部分，读的人会以为每次成功都能读到它、并据此判断数据是不是缓存来的。
+> **实际判据**：要判断数据新鲜度看 `meta.last_synced_at` 与 `data_coverage`（这两个**有**生产者）；
+> §11.2 错误处理表的 `store_locked` 行同源 —— 缓存能力整体未交付，也从未进入任何子项目的范围。
+> 删掉样本里的键，是为了不让一份不存在的契约看起来像存在。
 > 实现分层：`commands/local-fallback.ts` 是零依赖注入槽（`api.ts` 只 import 它，保住 auth/api 零 store 加载红线），`commands/local-fallback-wiring.ts` 持有映射与探测，由 `cli.ts` 在启动时接线。
 
 ### 9.2 静默失败防护
@@ -1198,7 +1336,7 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 
 - `kind: "store_not_initialized"` + 指向 `qiyu store init` 的提示（C1 阶段与 D 交付后**同口径**：修复批 2 裁定不改指 `qiyu sync run` —— `sync run` 首跑虽会自动建库，但「初始化存储」的最小命令是 store init。**E 期架构审查 F1 收窄**：仅「库不存在 / 空库」四处出口（`store status`/`sync status`/`sync verify`/`sync install`）同指 store init；「他人库 / 非 DuckDB 文件 / 依赖未安装」跑 store init 会再次失败，hint 改指成因（换 `--db` 路径 / 装依赖），skill 正文 errors.md 据此让 Agent 按 `hint` 行动）
 - `kind: "auth_missing"` + `retryable: false` + 指向 §4.2 的提示
-- `kind: "store_locked"` + 说明正在同步的提示（C1 阶段：写进程持锁，无同步概念；D 交付后为同步窗口）
+- `kind: "store_locked"` + 说明正在同步的提示（C1 阶段：写进程持锁，无同步概念；D 交付后为同步窗口；**E 起读者进程也会被同步者的 RW 锁挡住** —— 判定在 DuckDB，不在本层）
 
 ### 9.6 机器人会话生命周期（实测）
 
@@ -1793,11 +1931,23 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 | `rate_limit`（retry_after > 60） | **不要 sleep**；改为查询本地数据库 |
 | `needs_confirmation`（退出码 4） | **停下来**，向人类复述该操作及其目标，**绝不自动追加 `--yes`** |
 | `ambiguous` | 把候选交给人类，**不得自行选择** |
-| `store_locked` | 正在同步中；稍后重试或查询缓存（C1 阶段无「查询缓存」能力：写进程持锁，退避后重试即可；D 交付后缓存查询生效） |
+| `store_locked` | 正在同步中；稍后重试即可（**本阶段无「查询缓存」能力**，它从未进入任何子项目范围；写进程持锁，退避后重试是唯一出路） |
 
-**E. 禁止事项**：不要读取配置文件（其中含 appSecret），不要使用 `--pretty`（未实现），不要把 `query --table` 当作任意 SQL 的替代品——需要 JOIN/跨表聚合时用 `--sql`，不要盲目重试，不要在未先确认新鲜度的情况下下结论
+**E. 禁止事项**：不要读取配置文件（其中含 appSecret），不要把 `--pretty` 写进你生成的命令示例（它**已实现**，但对 Agent 无增益——默认输出已是紧凑可解析的 JSON），不要把 `query --table` 当作任意 SQL 的替代品——需要 JOIN/跨表聚合时用 `--sql`，不要盲目重试，不要在未先确认新鲜度的情况下下结论
+
+> **⚠️ E 的两处陈旧措辞已回写（2026-10-30）**：原文写「不要使用 `--pretty`（未实现）」，而
+> `--pretty` **自 2026-10-24（G1）起已实现**（缩进 JSON，须写在具体子命令之后；`REJECTED_FLAGS`
+> 已清空为空数组、机制保留）。**禁的是"写进 Agent 生成的命令示例"，不是"它会失败"** ——
+> 这个区别很重要：Agent 若把 `--pretty` 当"必然报错"写进排障指引，遇到真的用 `--pretty`
+> 的人类用户会给出错误判断。skill 正文（`src/skill/qiyu/forbidden.md` §2）已按此口径写：
+> 「对 Agent 没有增益」而不是「未实现」。
 
 > **裁决依据（F 实施波回写，与本 spec D5 一致）**：E 的原文是「不要使用 `--pretty`/`--table`」，逐字执行会与 §11.2 B 的路由表自相矛盾——B 表明确把「历史趋势 / 聚合 / JOIN / 跨窗口」导向本地数据库通道，而 `query --table` 正是这一通道的受约束入口（§8 定义其为列白名单 + 时间语义 + 精确脱敏），禁掉它等于禁掉 B 的一半；§9.1 的限流降级示例本身就建议 `fallback: "qiyu query --table order_performance"`。两个并列项的性质也不同：`--pretty` 是「承诺过、未实现」（每次调用都给明确话术），`--table` 是已交付的通道。故 E 那句的本意是「别把 `--table` 当成任意查询的通用替代品」，而不是通道级禁令。落到 skill 正文：单表过滤/分组计数用 `query --table`（列白名单与精确脱敏），JOIN/跨表聚合用 `query --sql`，`--pretty` 一律不用。
+>
+> **⚠️ 2026-10-30 复核**：本段裁决**仍然成立**（`--table` 不是通道级禁令），但括号里的依据有一半已过时 ——
+> `--pretty` **已实现**（G1，2026-10-24），不再是「承诺过、未实现」。裁决的**结论**（不用 `--pretty` 写进
+> 命令示例）不变，理由从「必然失败」变成「对 Agent 无增益」：`--pretty` 与 `--table` 现在都是**已交付的
+> 通道**，区别只在于前者对 Agent 无用、后者是 B 表的正规入口。**别把这段读成「`--pretty` 会报错」。**
 
 ### 11.3 需要预先配置的 ID
 
