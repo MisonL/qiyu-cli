@@ -109,6 +109,26 @@ export function readCreds(env) {
   return { appKey, appSecret }
 }
 
+/**
+ * 非 JSON 响应的摘要：**一个正文字符都不带**。
+ *
+ * ⚠️ 为什么单独拆出来：这一支最初写成 `text.slice(0, 20)`，理由写的是「只报类别、
+ * 不贴正文」，而前 20 个字符**就是正文** —— nginx 错误页/网关纯文本的开头完全可能
+ * 带着真实租户信息（会话 id、手机号、URL query）。约束③ 的破口出现在**唯一没被测试
+ * 覆盖的那一支**，这正是「不做某事」型契约不写用例就会烂掉的方式（CodeRabbit 2026-10-30 指出）。
+ * 现在只报元数据：状态码、Content-Type、长度、首字符是否 '<'（够区分 HTML 错误页与
+ * 纯文本网关页，足以判断「注册表 path 写错」还是「网关故障」，一个正文字符都不要）。
+ */
+export function describeNonJson(httpStatus, contentType, text) {
+  return {
+    httpStatus,
+    nonJson: true,
+    contentType: contentType ?? null,
+    length: text.length,
+    looksLikeHtml: text.trimStart().startsWith('<'),
+  }
+}
+
 async function main() {
   const casesPath = process.argv[2]
   if (!casesPath) {
@@ -152,8 +172,8 @@ async function main() {
       try {
         parsed = JSON.parse(text)
       } catch {
-        // 非 JSON 响应：只报状态码与前 40 字节的**类别**，不贴正文（可能是 HTML 错误页）。
-        console.log(id, '=>', JSON.stringify({ httpStatus: res.status, nonJson: true, startsWith: text.slice(0, 20) }))
+        // 非 JSON 响应：只报元数据，一个正文字符都不给（见 describeNonJson 的说明）
+        console.log(id, '=>', JSON.stringify(describeNonJson(res.status, res.headers.get('content-type'), text)))
         continue
       }
       console.log(id, '=>', JSON.stringify({ httpStatus: res.status, ...summarize(parsed) }))

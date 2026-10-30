@@ -15,7 +15,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  describeShape, summarize, assertSampleable, readCreds,
+  describeShape, describeNonJson, summarize, assertSampleable, readCreds,
 } from '../../scripts/registry/sample.mjs'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -77,6 +77,33 @@ describe('describeShape —— 只有结构，没有业务值', () => {
     expect(s.top).toBe('<array>')
     expect(s.shape).toEqual({ array: { id: 'number', name: 'string' } })
     expect(JSON.stringify(s)).not.toContain('SENTINEL-NAME')
+  })
+})
+
+describe('describeNonJson —— 非 JSON 响应一个正文字符都不带', () => {
+  it('HTML 错误页与纯文本网关页都只报元数据，正文字符不上屏', () => {
+    // ⚠️ 该支最初写成 `text.slice(0, 20)` 并自称「只报类别」（CodeRabbit 2026-10-30
+    // 指出）。而 nginx 错误页/网关纯文本的开头完全可能带业务信息 —— 这个破口正好
+    // 落在唯一没有用例的分支上，所以这里必须钉住：哨兵放在**正文最开头**，
+    // 任何"截前 N 个字符"的回归都会被直接抓住（放在第 20 位之后的话，
+    // slice(0,20) 依然通过 —— 那样这条就只是看着像在守）。
+    const body = 'SENTINEL-ORDER <html><body>上游 500 处理失败</body></html>'
+    const s = describeNonJson(500, 'text/html', body) as Record<string, unknown>
+    expect(JSON.stringify(s)).not.toContain('SENTINEL-ORDER')
+    expect(JSON.stringify(s)).not.toContain('html><body>')
+    expect(s).toEqual({
+      httpStatus: 500, nonJson: true, contentType: 'text/html',
+      length: body.length, looksLikeHtml: false,
+    })
+  })
+
+  it('纯文本网关页：looksLikeHtml=false，contentType 缺失时是 null 而不是 undefined', () => {
+    // undefined 在 JSON 里会整个丢键 —— Agent 读到的是"没有这个字段"，而不是"服务端没给"
+    const s = describeNonJson(502, null, 'Bad Gateway\nSENTINEL-HOST') as Record<string, unknown>
+    expect(s.looksLikeHtml).toBe(false)
+    expect(s.contentType).toBeNull()
+    expect(JSON.stringify(s), 'undefined 会让键整个消失').toContain('"contentType":null')
+    expect(JSON.stringify(s)).not.toContain('SENTINEL-HOST')
   })
 })
 
