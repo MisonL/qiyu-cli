@@ -209,8 +209,12 @@ qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ so
 **原则：凡是 CLI 自己能吸收的错误，都不以 `retryable: true` 的形式暴露给 Agent。** 14003/14500 在 core 层被吸收（重签重试 / 判死为 `module_offline`）；**14501 只被翻译、不被吸收** —— 见下方收窄说明。`retryable: true` 只保留给 Agent 必须**改变策略**的情况。
 
 > **⚠️ 「core 层自动分片」的收窄（2026-10-30 回写）**：本表原写 `14501 → core 层自动分片`。
-> 实现里 **core 不做分片**：`src/core/errors.ts` 把两种 `14501` 报文都翻成
-> `kind: 'window_too_large'`、`retryable: false`，hint 让调用方「按 `maxWindowDays` 切片后重试」。
+> 实现里 **core 不做分片**：`src/core/errors.ts` 把两种 `14501` 报文翻成**两个不同的 kind** ——
+> `endTime is invalid`（越界）→ `kind: 'window_misaligned'`（hint 让调用方把 endTime 对齐到
+> 自然日边界，见 §6.2 的对齐检查）；`…is invalid`（跨度过大）→ `kind: 'window_too_large'`、
+> `retryable: false`（hint 让调用方「按 `maxWindowDays` 切片后重试」）。**两者不能混**：
+> 切片救不了越界 —— 一个 1–2 天的窗口，endTime 越界照样报 `endTime is invalid`（§6.2 实测）
+> —— 一律当"跨度"让 Agent 反复按切片重试同一个失败请求，会浪费一排网络往返。
 > **真正切片的只有同步引擎**（`src/sync/engine.ts` 的 `sliceForTask` / `sliceByMaxWindow`）：
 > 它按任务注册的 `maxWindowDays` 把范围切成多窗、逐窗发请求、合并结果。
 > `qiyu api call` **不切片** —— 它没有分片所需的参数知识（注册表不登记窗口起止在哪个字段里），
@@ -651,7 +655,8 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 
 **设计**：
 - **单写者**：`sync` 持有 RW，并在进程退出时释放
-- **读者重试**：`query` / `api` 等只读操作以 RO 模式打开，冲突时**以固定间隔退避重试**（实测：一个读者在约 2.6 秒、13 次重试后成功）
+- **读者重试**：`query` / `db` / `sync status` / `sync verify` / `stats` 等读库命令以 RO 模式打开，冲突时**以固定间隔退避重试**（实测：一个读者在约 2.6 秒、13 次重试后成功）
+  （**2026-10-30 收窄：`api call` 不在其中** —— 它零加载 `store/`（§7.4），根本不打开本地库、不持有 RO 锁，也不会撞 `store_locked`，别指望它等你。）
 - **有界重试**：超过阈值（默认 30 秒）后返回 `kind: "store_locked"` + `hint`；**Agent 不得被无限阻塞**
 - **`sync` 之间的互斥**：在 `sync_state` 中加入 `locked_by` / `locked_at`
 - 多个纯读进程可以并发运行（实测：3/3 成功）

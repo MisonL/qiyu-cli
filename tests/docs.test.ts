@@ -701,6 +701,30 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(s, '14501 不再声称 core 自动分片').not.toMatch(/\| 14501 \| 数据量超限 \| — \| \*\*core 层自动分片\*\* \|/)
     expect(s).toMatch(/14501 只被翻译、不被吸收/)
     expect(s).toMatch(/真正切片的只有同步引擎/)
+    // ⚠️ CodeRabbit #50 round 2 指出并核实成立：两种 14501 的下一步**不同**。
+    // 越界（endTime is invalid）→ 对齐自然日边界；跨度过大 → 按上限切片。
+    // 回写第一版把两者都写成「按 maxWindowDays 切片后重试」，会让 Agent 对越界窗口
+    // 反复按切片重试同一个失败请求（1–2 天的窗口切片也救不了越界）。
+    expect(s).toMatch(/endTime is invalid`（越界）→ `kind: 'window_misaligned'`/)
+    expect(s).toMatch(/切片救不了越界/)
+    // 反向自检：kind 名与实现一致（假的名字会让这条守卫守错东西）
+    const errs = read('src/core/errors.ts')
+    expect(errs, 'window_misaligned 必须真实存在').toContain("kind: 'window_misaligned'")
+    expect(errs, 'window_too_large 必须真实存在').toContain("kind: 'window_too_large'")
+  })
+
+  it('设计稿 §6.4：读者重试不得把 `api` 算进来（api call 零加载 store，不持 RO 锁）', () => {
+    const s = design()
+    const ACCIDENT = '- **读者重试**：`query` / `api` 等只读操作以 RO 模式打开'
+    expect(ACCIDENT.includes('`query` / `api`')).toBe(true)
+    // ⚠️ CodeRabbit #50 round 2 指出并核实成立：`api call` 不 import store/（api.ts 的
+    // import 清单里没有任何 store 模块），不打开本地库 → 它不会撞 store_locked。
+    expect(s, '读者重试不得再列 `api`').not.toMatch(/`query` \/ `api` 等只读操作/)
+    expect(s).toMatch(/\*\*2026-10-30 收窄：`api call` 不在其中\*\*/)
+    // 反向自检：api.ts 确实不 import store（若将来它开始读库，这条守卫必须同步改）
+    const apiSrc = read('src/commands/api.ts')
+    expect(apiSrc, 'api.ts 一旦 import store/ ，本条守卫的判据就失效、必须复核')
+      .not.toMatch(/from '\.\.\/(?:store|query)\//)
   })
 
   it('设计稿 §2：未交付的两条语义化命令不得被说成「只能经 api call 访问」（本地通道也要提）', () => {
