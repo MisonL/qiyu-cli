@@ -117,6 +117,20 @@ describe('图例本身：键集、形态与「不撒谎」的措辞', () => {
       '图例键集必须与真实 meta 键集一致（多一个 = 幽灵键，少一个 = 没释义）').toEqual(tableKeys)
   })
 
+  it('data 字段是自明的 columns/rows，且仅此两个（反向：#38 挂账的 query 侧，2026-10-30 补）', async () => {
+    // ⚠️ 上面的键集断言只覆盖 meta；query 的 `data` 此前没有任何「输出 ⊆ 图例」检查。
+    // README §输出契约明写 `data` 形态是 `{columns, rows}`（rows 为对象数组）—— 两者
+    // 自明，无需 meta.field_notes。多出任何键都说明引入了没有释义的字段，必须补图例。
+    await seed()
+    await q('--table', 'daily_overview')
+    const t = parsed().data as Record<string, unknown>
+    expect(Object.keys(t).sort(), '--table 的 data 只应有 columns/rows').toEqual(['columns', 'rows'])
+    expect(Array.isArray(t.columns) && Array.isArray(t.rows)).toBe(true)
+    await q('--sql', 'SELECT * FROM daily_overview')
+    const s = parsed().data as Record<string, unknown>
+    expect(Object.keys(s).sort(), '--sql 的 data 与 --table 同形').toEqual(['columns', 'rows'])
+  })
+
   it('field_notes 不带 Markdown 加粗、正文不含分隔符 `；`', () => {
     // 与 stats / skill / sync 同款约定：stdout JSON 给 Agent，`**` 是噪声；
     // `；` 是 renderNotes 的拼接符，正文里再出现会让反向解析多出幽灵取值（PR #26 踩过两次）。
