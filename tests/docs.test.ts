@@ -746,6 +746,12 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/不得晚于今天 00:00/)
     expect(noteBlock, '§4.3 回写注必须写明「对齐」与「上界」是两件事')
       .toMatch(/\*\*对齐\*\*与\*\*上界\*\*是两件事/)
+    // ⚠️ CodeRabbit round 9 指出并核实成立（§6.2 实测：`5 天前 0:00 → 5 天前 12:00`
+    // 返回 200）：不能把 hint 里的「对齐到自然日边界」读成「每个 endTime 都必须写成 0:00」——
+    // 纯历史日期的 endTime 取任意时刻都接受，唯一被拒的形态是「晚于今天 0:00」。
+    expect(noteBlock, '必须限定「对齐」只针对上界越界、不适用纯历史窗口')
+      .toMatch(/只针对上界附近的越界|不适用于纯历史窗口/)
+    expect(noteBlock, '必须写明纯历史日期取任意时刻都接受').toMatch(/任意时刻/)
     // ⚠️ CodeRabbit round 7 指出并核实成立：§4.3 回写注不应给出不安全示例
     // 「昨天 0:00 → 今天 0:00」—— 其右端正是那条不稳定边界（且不含今天 0:00 之后的
     // 数据，让人以为「拿到了今天」）。改为面向概念的「endTime 用纯历史日期」。
@@ -843,6 +849,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(manualBlock, '手动指引必须限定空间只部分回收')
       .toMatch(/只回收一部分|部分回收|只\*\*部分\*\*回收/)
     // ⚠️ CodeRabbit round 8 指出并核实成立：`CHECKPOINT` 不是「把数据重写到新文件」——
+    // DuckDB 定义它是把 WAL 同步回主数据文件；要紧凑的新文件得用 `COPY FROM DATABASE`。
     // DuckDB 定义它是把 WAL 同步回主数据文件；要紧凑的新文件得用 `COPY FROM DATABASE`。
     expect(manualBlock, '不得说 CHECKPOINT「重写到新文件」')
       .not.toMatch(/把数据重写到新文件/)
