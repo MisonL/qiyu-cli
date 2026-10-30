@@ -13,6 +13,8 @@
 // 聚合数字 JSON，列名级会把它们整列误杀；会话/工单的 payload 含 PII 则靠值级 JSON 检测兜底
 // （实测手机号 99% 行存在，足以命中）。这是显式取舍：`--table` 通道对 payload 仍整值替换。
 import type { TableDef } from '../store/schema.js'
+import { dbDescribeCommand, queryTableCommand } from '../output.js'
+import type { StoreLocation } from '../output.js'
 
 export type MaskRule = 'phone' | 'email' | 'ip' | 'full'
 
@@ -40,6 +42,11 @@ export interface MaskInput {
     | { kind: 'sql'; sql: string; tables: TableDef[] }
   /** 关闭全部脱敏（--no-mask）：原样返回 + PII 警告。 */
   noMask?: boolean
+  /**
+   * 本次存储定位：警告里的诊断命令（`db describe` / `query --table`）必须指回它，
+   * 否则照 hint 执行会读默认库（#45 边界 ②）。缺省不带任何 flag（库层单测的用法）。
+   */
+  loc?: StoreLocation
 }
 
 /** spec §7.1：无格式敏感值的整值替换标记。导出供命令层/测试复用，避免文案漂移。 */
@@ -167,7 +174,7 @@ function sqlSensitiveNames(tables: TableDef[]): string[] {
  * `noMask` 时直接返回入参数组（不拷贝，因为一个字节都不会改）。
  */
 export function maskQueryRows(input: MaskInput): MaskOutcome {
-  const { rows, columns, mode, noMask } = input
+  const { rows, columns, mode, noMask, loc } = input
 
   // --no-mask：脱敏整体关闭，缺口警告随之失去意义（没有「脱敏不完整」，只有「没脱敏」）。
   // ⚠️ 但**形态类**警告与脱敏开关无关，必须保留（契约审查 C-06）：
@@ -203,8 +210,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     const undeclared = columns.filter((n) => n !== 'count' && !declared.has(n))
     const driftWarnings = undeclared.length > 0
       ? [`输出含表定义之外的列 ${undeclared.join('、')}（可能来自旧版 CLI 或库损坏）：`
-        + '这些列不在 `TABLES` 元数据中，未做脱敏。要核对请用 `qiyu db describe '
-        + mode.table.name + '`']
+        + '这些列不在 `TABLES` 元数据中，未做脱敏。要核对请用 `'
+        + dbDescribeCommand(mode.table.name, loc) + '`']
       : []
     const sensitive = new Set(
       mode.table.columns.filter((c) => c.sensitive).map((c) => c.name))
@@ -346,13 +353,14 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     warnings.push(
       'SQL 使用了 query()/query_table()/COLUMNS() 这类**在其内部再执行 SQL 或批量重命名**的构造：'
       + '内层引用的敏感列无法被列名级识别，姓名/地址等无格式 PII 可能未经脱敏。'
-      + '需要可靠脱敏请把内层查询单独执行，或改用 `qiyu query --table <表>`')
+      + '需要可靠脱敏请把内层查询单独执行，或改用 `' + queryTableCommand('<表>', loc) + '`')
   }
   if ((payloadReferenced || hasJsonBlob) && payloadPiiTables.length > 0) {
     warnings.push(
       `引用了 payload 或整行 JSON（含 PII 的表 ${payloadPiiTables.join('、')}）：`
       + '本通道只对 payload 做值级检测（手机号/邮箱/IPv4），其中的姓名/地址等无格式 PII 可能未脱敏'
-      + '（别名、JSON 提取、整行序列化都绕得过列名级）。要整值替换请用 `qiyu query --table <表>`')
+      + '（别名、JSON 提取、整行序列化都绕得过列名级）。要整值替换请用 `'
+      + queryTableCommand('<表>', loc) + '`')
   }
 
   for (const name of sensitiveNames) {
@@ -369,7 +377,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     if (!new RegExp(`\\b${name}\\b`, 'i').test(mode.sql)) continue
     warnings.push(
       `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，` +
-      '建议用 `qiyu query --table` 或保持列名原样')
+      '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样')
   }
 
   // 分组 / 去重会把不同原值压成同一个脱敏值（场景审查 7.3，2026-10-20 实测）：
@@ -400,7 +408,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     warnings.push(
       `列 ${falsePositive.join('、')} 不在敏感列清单里，是按**值形态**（手机号/邮箱/IPv4）`
       + '命中的脱敏：若它其实是订单号、聚合值等业务数字，输出值已被改写。'
-      + '这类列可用 `qiyu query --table` 取得原始值（该通道按列声明脱敏）')
+      + '这类列可用 `' + queryTableCommand('<表>', loc) + '` 取得原始值（该通道按列声明脱敏）')
   }
 
   const maskedColumns = columns.filter((n) => changed.has(n))

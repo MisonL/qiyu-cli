@@ -150,6 +150,98 @@ export function syncRunCommand(path: string, profileFlag?: string): string {
 }
 
 /**
+ * 存储定位（与 `StoreFlags` 同键名，命令层可直接透传）。
+ *
+ * ⚠️ 为什么所有只读诊断 hint 都要带上它（#45 边界 ②，2026-10-30）：hint 里写
+ * 「用 `qiyu db tables` 查看可用表」时，若本次是用 `--db <自定义路径>` 跑的，逐字执行
+ * 会去列**默认库**的表 —— 读错库与写错库同样误导：Agent 会据此断定「表真的不存在」。
+ * `db` 常是**已解析出的绝对路径**（命令层 `opened.dbPath`）；前置闭集校验阶段
+ * （尚未解析）传用户原始 flag 值，语义仍是「复现本次选择」。
+ */
+export interface StoreLocation { db?: string; profile?: string }
+
+/**
+ * 从**尚未解析**的 `--db`/`--profile` 原始取值构造定位（前置闭集校验阶段的用法）。
+ * 两者都没给 → `undefined`（渲染不带任何 flag，等价于默认解析）。
+ */
+export function storeLocationFromFlags(
+  flags: { db?: string; profile?: string },
+): StoreLocation | undefined {
+  if (flags.db === undefined && flags.profile === undefined) return undefined
+  const loc: StoreLocation = {}
+  if (flags.db !== undefined) loc.db = flags.db
+  if (flags.profile !== undefined) loc.profile = flags.profile
+  return loc
+}
+
+/** 已解析出的库路径/档名 → 定位（命令层 `opened` 的用法）。 */
+export function storeLocationOf(db: string, profile?: string): StoreLocation {
+  return profile === undefined ? { db } : { db, profile }
+}
+
+/** `--db <p> [--profile <q>]`（带前导空格）；两者都没有时返回空串。 */
+export function storeLocationFlags(loc?: StoreLocation): string {
+  if (loc === undefined) return ''
+  let s = ''
+  if (loc.db !== undefined) s += ` --db ${shellArg(loc.db)}`
+  if (loc.profile !== undefined) s += ` --profile ${shellArg(loc.profile)}`
+  return s
+}
+
+/** `qiyu db tables` 诊断命令，指向本次的存储定位（口径见 `StoreLocation`）。 */
+export function dbTablesCommand(loc?: StoreLocation): string {
+  return 'qiyu db tables' + storeLocationFlags(loc)
+}
+
+/**
+ * `qiyu db describe <表>` 诊断命令，指向本次的存储定位。
+ * `table` 只接受 `TABLES` 里的表名或占位符 `<表>`（代码内常量，不是用户输入）——
+ * 表中列名不承载外部输入，故原样渲染；路径/档名走 `shellArg`。
+ */
+export function dbDescribeCommand(table: string, loc?: StoreLocation): string {
+  return `qiyu db describe ${table}` + storeLocationFlags(loc)
+}
+
+/** `qiyu sync status` 诊断命令，指向本次的存储定位（sync 族同样接受三件套）。 */
+export function syncStatusCommand(loc?: StoreLocation): string {
+  return 'qiyu sync status' + storeLocationFlags(loc)
+}
+
+/** `qiyu query --table <表>` 诊断命令，指向本次的存储定位。 */
+export function queryTableCommand(table: string, loc?: StoreLocation): string {
+  return `qiyu query --table ${table}` + storeLocationFlags(loc)
+}
+
+/**
+ * `query --sql` hint 里占位符的**替换契约**（三处 hint 共用这一句，避免文案漂移）。
+ *
+ * 为什么必须写出来（CodeRabbit 2026-10-30 major）：占位符在**引号里**，用户若只把
+ * `<SQL>` 这个词换掉、引号留着，SQL 里带单引号时就会把引号提前闭合 ——
+ * `--sql 'SELECT '2026-10-01''` 经 shell 解析后 CLI 收到的是 `SELECT 2026-10-01`
+ *（可能照跑并给出不同结果，是静默错误而不是报错）。正确做法是**整段（含引号）**
+ * 换成按当前 shell 规则引号化好的 SQL 参数。
+ */
+export const SQL_ARG_REPLACE_NOTE =
+  "`'<SQL>'` 要整段替换成按你的 shell 规则转义好的 SQL，不要只替换引号里的词"
+
+/**
+ * `qiyu query --sql '<SQL>'` 诊断命令，指向本次的存储定位。
+ *
+ * ⚠️ 占位符不是装饰（CodeRabbit 2026-10-30 minor）：`--sql` 是**取值** flag，
+ * 而 `commands/query.ts` 的值位守卫把「取值恰好是已知 flag」判为缺值 —— 渲染成
+ * `qiyu query --sql --db <path>` 时，`--db` 会被当成 `--sql` 的值位，逐字执行报
+ * 「--sql 缺少取值」并退出 2。**hint 里的命令必须真的能跑**，所以值位先给占位符，
+ * 定位 flag 排在它之后。
+ * 占位符**必须加引号**：SQL 含空格，`--sql SELECT 1` 在 shell 里会被拆成两个参数
+ *（`1` 落成位置参数 → 未知参数退出 2）；`<`/`>` 不加引号还会变成重定向。
+ * 加引号的代价是替换契约必须一起说清 —— 见 `SQL_ARG_REPLACE_NOTE`，**用到本渲染器
+ * 的 hint 必须把它带上**（否则用户可能只替换引号内的词，见那里的静默错误说明）。
+ */
+export function querySqlCommand(loc?: StoreLocation): string {
+  return "qiyu query --sql '<SQL>'" + storeLocationFlags(loc)
+}
+
+/**
  * 单个参数值的 shell 渲染：安全集内裸渲染，其余单引号包裹。
  * POSIX 安全集取自 Python `shlex.quote`（`[A-Za-z0-9_@%+=:,./-]`）；**win32 安全集更窄**
  *（去掉 `@` `%` `,`）—— PowerShell 下裸 `a,b` 会变成 `Object[]`、前导 `@` 是 splatting、

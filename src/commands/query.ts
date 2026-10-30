@@ -28,7 +28,12 @@ import {
 import type { BuiltTableQuery } from '../query/table-query.js'
 import { openGuardedSession } from './db.js'
 import { queryFieldNotes } from './query-notes.js'
-import { ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand } from '../output.js'
+import {
+  ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
+  dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand,
+  storeLocationFromFlags, storeLocationOf,
+} from '../output.js'
+import type { StoreLocation } from '../output.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -111,9 +116,14 @@ const TIMEOUT_MAX_MS = 2_147_483_647
 // 是合法 SQL；敏感匹配会让 0 行警告静默失效（正是「0 行 ≠ 没有数据」要防的场景）。
 const ZERO_ROW_TIME_RE = /\b(stat_date|work_date|hour_ts|startTime|endTime)\b/i
 
-/** 0 行警告的后半句（两个通道同源）；前半句各自说明触发条件与实际区间。 */
-const ZERO_ROW_HINT =
-  '这不代表没有数据：同步可能未覆盖该区间——用 `qiyu sync status` 查看覆盖范围，或放宽过滤条件'
+/**
+ * 0 行警告的后半句（两个通道同源）；前半句各自说明触发条件与实际区间。
+ * 带本次存储定位：`sync status` 不带 `--db` 会去看默认库的覆盖范围（#45 边界 ②）。
+ */
+function zeroRowHint(loc?: StoreLocation): string {
+  return '这不代表没有数据：同步可能未覆盖该区间——用 `' + syncStatusCommand(loc)
+    + '` 查看覆盖范围，或放宽过滤条件'
+}
 
 /**
  * iso-day 字面量比较警告（端到端场景 F3，`--sql` 通道）。
@@ -134,10 +144,11 @@ const ISO_DAY_COL_RE = /\b(stat_date|work_date)\b/i
 // ⚠️ 必须同时接受 `T` 与**空格**分隔（场景审查 4）：SQL 里 `'2026-10-12 00:00:00'` 是
 // 与 `'…T00:00:00'` 等价的合法写法，旧正则只认 `T` → 空格形态静默少算一天、零 warning。
 const DAY_LITERAL_RE = /'\d{4}-\d{2}-\d{2}([T ]00:00:00(\.0+)?(\+08:00)?)?'/
-const ISO_DAY_LITERAL_HINT =
-  '该列列内是 UTC `…Z` 形态的字符串（上海日零点 = 前一日 16:00Z），按字典序比较，' +
-  '日期字面量会**少算或漏掉当天**。要在 --sql 里过滤请写 UTC 形态（如 \'2026-10-12T16:00:00.000Z\'），' +
-  '或改用 `qiyu query --table <表> --since/--until`（该通道已处理取整语义）'
+function isoDayLiteralHint(loc?: StoreLocation): string {
+  return '该列列内是 UTC `…Z` 形态的字符串（上海日零点 = 前一日 16:00Z），按字典序比较，' +
+    '日期字面量会**少算或漏掉当天**。要在 --sql 里过滤请写 UTC 形态（如 \'2026-10-12T16:00:00.000Z\'），' +
+    '或改用 `' + queryTableCommand('<表>', loc) + ' --since/--until`（该通道已处理取整语义）'
+}
 
 /**
  * 截断警告（两个通道**文案必须分开**）。
@@ -154,15 +165,17 @@ const ISO_DAY_LITERAL_HINT =
  */
 function truncationWarning(
   returned: number, limit: number, channel: 'sql' | 'table', hasTimeColumn = true,
+  loc?: StoreLocation,
 ): string {
   const head = `结果被 --limit ${limit} 截断，本次只返回 ${returned} 行（不是全部）；`
     + '聚合与「是否存在数据缺口」的判断都不应基于这批不完整的结果——'
+  const describe = dbDescribeCommand('<表>', loc)
   if (channel === 'sql') {
-    return head + '请在 SQL 里加 WHERE 条件收窄，或用 `qiyu db describe <表>` 看总行数与时间范围'
+    return head + '请在 SQL 里加 WHERE 条件收窄，或用 `' + describe + '` 看总行数与时间范围'
   }
   return head + (hasTimeColumn
-    ? '请用 `qiyu db describe <表>` 看总行数与时间范围，或加过滤条件（--since/--until/--group-by）收窄'
-    : '请用 `qiyu db describe <表>` 看总行数，或用 `--group-by <列>` 聚合成计数收窄'
+    ? '请用 `' + describe + '` 看总行数与时间范围，或加过滤条件（--since/--until/--group-by）收窄'
+    : '请用 `' + describe + '` 看总行数，或用 `--group-by <列>` 聚合成计数收窄'
       + '（该表没有时间列，不接受 --since/--until）')
 }
 
@@ -286,14 +299,16 @@ function toEpochMs(v: unknown, kind: TimeColumnKind): number | null {
 /** 0 行警告（spec §十）：说明**实际生效**的区间，没有完整区间时如实说明。 */
 function zeroRowWarning(
   range: [number, number] | null, tc: TableDef['timeColumn'], until?: number,
+  loc?: StoreLocation,
 ): string {
+  const tail = zeroRowHint(loc)
   if (range !== null) {
-    return `查询在区间 [${shanghaiIso(range[0])}, ${shanghaiIso(range[1])}] 返回 0 行。${ZERO_ROW_HINT}`
+    return `查询在区间 [${shanghaiIso(range[0])}, ${shanghaiIso(range[1])}] 返回 0 行。${tail}`
   }
   if (tc !== undefined && until !== undefined) {
-    return `查询在上限 ${shanghaiIso(effectiveBound(tc.kind, until))}（下界未能解析）返回 0 行。${ZERO_ROW_HINT}`
+    return `查询在上限 ${shanghaiIso(effectiveBound(tc.kind, until))}（下界未能解析）返回 0 行。${tail}`
   }
-  return `查询在给定时间条件下返回 0 行。${ZERO_ROW_HINT}`
+  return `查询在给定时间条件下返回 0 行。${tail}`
 }
 
 interface TableRunInput {
@@ -318,6 +333,11 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
   const { table } = input
   const tc = table.timeColumn
   const warnings: string[] = []
+  // 本次存储定位：所有诊断 hint（db describe / query --table / sync status）都要指回它，
+  // 否则照 hint 执行会读默认库（#45 边界 ②）。
+  const loc: StoreLocation = input.profileFlag === undefined
+    ? { db: input.dbPath }
+    : { db: input.dbPath, profile: input.profileFlag }
 
   // 只给 --until：先查该表时间列下界（契约 B）。空表 → 不解析，交给纯函数出 warning。
   // 超时预算与主查询同一口径（--timeout 0 = 不限时）。
@@ -366,7 +386,7 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
   // 脱敏唯一出口（spec §7.2）；--table 通道按列精确命中（mode.kind='table'）。
   const masked = maskQueryRows({
     rows: result.rows, columns: result.columns,
-    mode: { kind: 'table', table }, noMask: input.noMask,
+    mode: { kind: 'table', table }, noMask: input.noMask, loc,
   })
 
   // 库漂移「声明有而实际无」（场景审查 9）：`SELECT *` 只返回库里真实存在的列，
@@ -378,7 +398,7 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     : table.columns.map((c) => c.name).filter((n) => !result.columns.includes(n))
   if (missingCols.length > 0) {
     warnings.push(`库中缺列 ${missingCols.join('、')}（表 ${table.name} 的定义里有、实际没有）：`
-      + '可能来自旧版 CLI 或库损坏；`qiyu db describe ' + table.name + '` 可核对声明与实况的差异')
+      + '可能来自旧版 CLI 或库损坏；`' + dbDescribeCommand(table.name, loc) + '` 可核对声明与实况的差异')
   }
   // ⚠️ `COUNT(*)` 经 getRowObjectsJson 是**字符串**（BIGINT）—— 输出必须是 number，
   // 否则 Agent 拿 `"count": "3"` 做算术会静默出错（与 db describe 的 Number() 同款）。
@@ -388,7 +408,7 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
 
   // 0 行 ≠ 没有数据（spec §十 / 红线 3）：给了时间过滤而 0 行时附可操作提示。
   if (result.rows.length === 0 && (input.since !== undefined || input.until !== undefined)) {
-    warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until))
+    warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until, loc))
   } else if (result.rows.length === 0) {
     // 没给时间过滤也 0 行：spec §十 把「空表」列为 warnings 的触发条件。
     // 这里必须能区分「表空」与「查询没命中」—— `--table` 通道没有 WHERE 子句（除了时间过滤），
@@ -430,14 +450,14 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     if (daysInWindow < expectedDays) {
       const scope = input.until === undefined ? '（不含今天：当天数据次日才同步）' : ''
       warnings.push(`区间内应有 ${expectedDays} 个自然日${scope}，实际只有 ${daysInWindow} 个有数据`
-        + '（窗口内部存在缺口）；用 `qiyu sync status` 查看缺口详情，或放宽过滤条件')
+        + '（窗口内部存在缺口）；用 `' + syncStatusCommand(loc) + '` 查看缺口详情，或放宽过滤条件')
     }
   }
 
   // 截断不得静默（同上）：`--limit` 生效时 Agent 读到的不是全量。
   // 无时间列的表不能建议 --since/--until（那是条走不通的路），故传入 tc 是否存在。
   if (result.truncated) {
-    warnings.push(truncationWarning(rows.length, input.limit, 'table', tc !== undefined))
+    warnings.push(truncationWarning(rows.length, input.limit, 'table', tc !== undefined, loc))
   }
 
   // --no-mask 的风险警告属于「脱敏整体关闭」，进 meta.warnings；mask_warnings 只装
@@ -521,10 +541,12 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     if (tableDef === undefined) {
       const candidates = suggestNames(name, TABLES.map((t) => t.name))
       return usageFail(`未知表：${describeArgs([name])}`,
-        candidates.length > 0 ? `候选：${candidates.join('、')}` : '用 `qiyu db tables` 查看可用表')
+        candidates.length > 0
+          ? `候选：${candidates.join('、')}`
+          : '用 `' + dbTablesCommand(storeLocationFromFlags(flags)) + '` 查看可用表')
     }
     try {
-      validateGroupBy(tableDef, flags.groupBy)
+      validateGroupBy(tableDef, flags.groupBy, storeLocationFromFlags(flags))
       sinceMs = resolveTimeFlag(flags.since, '--since', () => nowMs)
       untilMs = resolveTimeFlag(flags.until, '--until', () => nowMs)
     } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
@@ -551,6 +573,8 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
   })
   if ('exit' in opened) return opened.exit
   const session = opened.session
+  // 已解析的存储定位：--sql 通道与错误出口的诊断 hint 都指回它（#45 边界 ②）。
+  const openedLoc = storeLocationOf(opened.dbPath, opened.profileFlag)
 
   try {
     // 库结构校验（缺 schema_version → store_not_initialized）在 openGuardedSession 里
@@ -570,7 +594,8 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
         return fail({
           code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
           message: `数据库中缺表：${tableDef.name}（本表在 CLI 的表定义中存在，库里没有）`,
-          hint: missingTableCauses(opened.dbPath, opened.profileFlag) + '。用 `qiyu db tables` 查看库中实际有数据的表',
+          hint: missingTableCauses(opened.dbPath, opened.profileFlag) + '。用 `'
+            + dbTablesCommand(openedLoc) + '` 查看库中实际有数据的表',
         })
       }
     }
@@ -590,20 +615,23 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     const masked = maskQueryRows({
       rows: result.rows, columns: result.columns,
       mode: { kind: 'sql', sql: sqlText, tables: TABLES }, noMask: flags.noMask,
+      loc: openedLoc,
     })
 
     // 0 行 ≠ 没有数据（spec §十 / 红线 3）：时间过滤查询 0 行时附可操作提示。
     const warnings: string[] = []
     if (result.rows.length === 0 && ZERO_ROW_TIME_RE.test(sqlText)) {
-      warnings.push(`查询返回 0 行，且 SQL 引用了业务时间列。${ZERO_ROW_HINT}`)
+      warnings.push(`查询返回 0 行，且 SQL 引用了业务时间列。${zeroRowHint(openedLoc)}`)
     }
     // iso-day 列 + 日期形态字面量 → 按字符串比较会少一天（场景 F3）。与 0 行无关：
     // 非 0 行也可能已经悄悄少了一整天，这正是它危险的地方。
     if (ISO_DAY_COL_RE.test(sqlText) && DAY_LITERAL_RE.test(sqlText)) {
-      warnings.push(ISO_DAY_LITERAL_HINT)
+      warnings.push(isoDayLiteralHint(openedLoc))
     }
     // 截断不得静默：Agent 会把「只看到前 N 行」当成事实（spec §十）。
-    if (result.truncated) warnings.push(truncationWarning(masked.rows.length, limit, 'sql'))
+    if (result.truncated) {
+      warnings.push(truncationWarning(masked.rows.length, limit, 'sql', true, openedLoc))
+    }
 
     // --no-mask 的风险警告属于「脱敏整体关闭」，进 meta.warnings；mask_warnings 只装
     // 静态缺口警告（没脱敏就没有「脱敏不完整」可言）。spec §7.2。
@@ -633,10 +661,10 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     // `flags.noMask` 一路传到出口：转换错误会回显表里的真实值（CodeRabbit 终审 major），
     // 只有显式 --no-mask 才允许原样输出。
     if (tableDef !== undefined) {
-      const drift = driftFailureFor(tableDef, e)
+      const drift = driftFailureFor(tableDef, e, openedLoc)
       if (drift !== null) return emitQueryFailure(drift, flags.noMask)
     }
-    return thrownToQueryExit(e, TABLES, flags.noMask)
+    return thrownToQueryExit(e, TABLES, flags.noMask, openedLoc)
   } finally {
     await session.close()
   }

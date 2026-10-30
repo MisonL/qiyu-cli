@@ -25,11 +25,16 @@ import { statsCommand } from '../src/commands/stats.js'
 import { storeCommand } from '../src/commands/store.js'
 import { syncCommand } from '../src/commands/sync.js'
 import { storeInitCommand, syncRunCommand, shellArg } from '../src/output.js'
+import {
+  dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand, querySqlCommand,
+} from '../src/output.js'
 import { createDuckDbStore } from '../src/store/duckdb.js'
 import { markPending } from '../src/sync/state.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/db.test.ts 同款放宽）。
-vi.setConfig({ testTimeout: 15_000 })
+// 2026-10-30：本文件现在每个用例要连开多个库（init → 写 → 读），机器高负载下
+// 实测单例 >15s，放宽到 30s；CI（空闲 runner）通常 2–8s。
+vi.setConfig({ testTimeout: 30_000 })
 
 let dir = ''
 let out = ''
@@ -128,6 +133,212 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     const w2 = (meta().warnings ?? []) as string[]
     expect(w2.some((x) => x.includes(syncRunCommand(db))), w2.join('\n')).toBe(true)
     expect(w2.some((x) => x.includes('--db ' + db)), w2.join('\n')).toBe(true)
+  })
+
+  it('只读诊断 hint 带本次 --db（#45 边界 ②）：未知表/未知列/敏感分组/0 行/脱敏建议/iso-day', async () => {
+    // 读错库与写错库同样误导：`query --table sessions --db <非默认库>` 报「未知表」时
+    // 照裸 `qiyu db tables` 执行会去列**默认库**，Agent 据此断定「表真的不存在」。
+    const db = dbPath('diag.duckdb')
+    out = ''
+    expect(await storeCommand(['init', '--db', db])).toBe(0)
+    const loc = { db }
+
+    // ① 未知表（--sql 通道；无候选 → 落到 db tables）
+    out = ''
+    expect(await queryCommand(['--sql', 'SELECT * FROM no_such_table', '--db', db])).toBe(2)
+    expect(String(errorOf().hint), '未知表').toContain(dbTablesCommand(loc))
+    // 独立于渲染器的字面断言：渲染器漏 --db 时这里也会红
+    expect(String(errorOf().hint), '未知表').toContain('--db ' + db)
+
+    // ② 未知列 → db describe（列名来自全部表，定位不到表 → 占位符 <表>）
+    out = ''
+    expect(await queryCommand(['--sql', 'SELECT no_such_column FROM sessions', '--db', db])).toBe(2)
+    expect(String(errorOf().hint), '未知列').toContain(dbDescribeCommand('<表>', loc))
+
+    // ③ --group-by 敏感列 → query --sql --no-mask
+    out = ''
+    expect(await queryCommand(['--table', 'sessions', '--group-by', 'userPhone', '--db', db])).toBe(2)
+    // usageFail 把整句放进 message（hint 字段为空）：断言 message 里的建议命令
+    expect(String(errorOf().message), '敏感分组').toContain(querySqlCommand(loc) + ' --no-mask')
+
+    // ④ 0 行 + 引用了业务时间列 → sync status
+    out = ''
+    expect(await queryCommand(
+      ['--sql', 'SELECT * FROM sessions WHERE startTime IS NOT NULL', '--db', db])).toBe(0)
+    const w = (meta().warnings ?? []) as string[]
+    expect(w.some((x) => x.includes(syncStatusCommand(loc))), w.join('\n')).toBe(true)
+
+    // ⑤ --sql 引用了敏感列但输出列名不匹配 → 脱敏建议（mask.ts 线程）
+    out = ''
+    expect(await queryCommand(['--sql', 'SELECT userPhone AS p FROM sessions', '--db', db])).toBe(0)
+    const mw = (meta().mask_warnings ?? []) as string[]
+    expect(mw.some((x) => x.includes(queryTableCommand('<表>', loc))), mw.join('\n')).toBe(true)
+
+    // ⑥ iso-day 列 + 日期字面量 → query --table --since/--until
+    out = ''
+    expect(await queryCommand(
+      ['--sql', "SELECT * FROM daily_overview WHERE stat_date >= '2026-10-13'", '--db', db])).toBe(0)
+    const w2 = (meta().warnings ?? []) as string[]
+    expect(w2.some((x) => x.includes(queryTableCommand('<表>', loc) + ' --since/--until')),
+      w2.join('\n')).toBe(true)
+
+    // ⑦ --table 通道的 0 行警告（另一处调用点，与 ④ 的 --sql 通道分开覆盖）
+    out = ''
+    expect(await queryCommand(['--table', 'sessions', '--since', '7d', '--db', db])).toBe(0)
+    const w3 = (meta().warnings ?? []) as string[]
+    expect(w3.some((x) => x.includes(syncStatusCommand(loc))), w3.join('\n')).toBe(true)
+
+    // ⑨ 闭集校验先于 I/O 的三条（尚未解析 → 复现用户原始 flag）
+    out = ''
+    expect(await queryCommand(['--table', 'no_such_table', '--db', db])).toBe(2)
+    expect(String(errorOf().hint), 'query 未知表').toContain(dbTablesCommand({ db }))
+    out = ''
+    expect(await dbCommand(['describe', 'no_such_table', '--db', db])).toBe(2)
+    expect(String(errorOf().hint), 'db describe 未知表').toContain(dbTablesCommand({ db }))
+    out = ''
+    expect(await statsCommand(['fields', 'no_such_table', '--db', db])).toBe(2)
+    expect(String(errorOf().hint), 'stats 未知表').toContain(dbTablesCommand({ db }))
+
+    // ⑧ 截断警告（--sql 通道）→ db describe
+    out = ''
+    expect(await queryCommand(
+      ['--sql', 'SELECT * FROM range(10)', '--limit', '3', '--db', db])).toBe(0)
+    expect(meta().truncated).toBe(true)
+    const w4 = (meta().warnings ?? []) as string[]
+    expect(w4.some((x) => x.includes('qiyu db describe <表> --db ' + db)), w4.join('\n')).toBe(true)
+  })
+
+  it('mask --table 的漂移列警告（db describe）也带本次 --db', async () => {
+    // 库里多出表定义之外的列时，mask.ts 警告 Agent 去 db describe 核对 ——
+    // 这条 hint 同样必须指回本次的库（#45 边界 ②）。
+    const db = dbPath('drift.duckdb')
+    out = ''
+    expect(await storeCommand(['init', '--db', db])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (p: string) => Promise<{
+        connect: () => Promise<{ run: (q: string) => Promise<unknown>; closeSync?: () => void }>
+        closeSync: () => void
+      }> }
+    }
+    const inst = await mod.DuckDBInstance.create(db)
+    const conn = await inst.connect()
+    try { await conn.run('ALTER TABLE sessions ADD COLUMN leaked_extra VARCHAR') } finally {
+      conn.closeSync?.(); inst.closeSync()
+    }
+
+    out = ''
+    expect(await queryCommand(['--table', 'sessions', '--db', db])).toBe(0)
+    const mw = (meta().mask_warnings ?? []) as string[]
+    expect(mw.some((x) => x.includes(dbDescribeCommand('sessions', { db }))), mw.join('\n')).toBe(true)
+  })
+
+  it('sandbox 打开失败 / 脏时间值 / 坏 payload 的 hint 也带本次 --db', async () => {
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (p: string) => Promise<{
+        connect: () => Promise<{ run: (q: string) => Promise<unknown>; closeSync?: () => void }>
+        closeSync: () => void
+      }> }
+    }
+    const exec = async (path: string, sql: string): Promise<void> => {
+      const inst = await mod.DuckDBInstance.create(path)
+      const conn = await inst.connect()
+      try { await conn.run(sql) } finally { conn.closeSync?.(); inst.closeSync() }
+    }
+
+    // ① 不是 DuckDB 文件 → sandbox 的「请确认…由本 CLI 创建（store init）」hint
+    const bogus = dbPath('not-a-db.duckdb')
+    writeFileSync(bogus, 'this is not duckdb')
+    out = ''
+    expect(await dbCommand(['tables', '--db', bogus])).toBe(1)
+    expect(String(errorOf().hint), '打开失败').toContain(storeInitCommand(bogus))
+
+    // ② 脏时间值 → db tables 的 query --sql 建议
+    const dirty = dbPath('dirty.duckdb')
+    out = ''
+    expect(await storeCommand(['init', '--db', dirty])).toBe(0)
+    await exec(dirty, "INSERT INTO sessions (session_id, startTime) VALUES ('s1', 'not-a-time')")
+    out = ''
+    expect(await dbCommand(['tables', '--db', dirty])).toBe(0)
+    const w = (meta().warnings ?? []) as string[]
+    expect(w.some((x) => x.includes(querySqlCommand({ db: dirty }))), w.join('\n')).toBe(true)
+
+    // ③ 坏 payload → stats fields 的 query --sql 建议
+    const bad = dbPath('bad.duckdb')
+    out = ''
+    expect(await storeCommand(['init', '--db', bad])).toBe(0)
+    await exec(bad, "INSERT INTO daily_overview (stat_date, payload) VALUES ('2026-10-01', 'not-json')")
+    out = ''
+    expect(await statsCommand(['fields', 'daily_overview', '--db', bad])).toBe(0)
+    const w2 = (meta().warnings ?? []) as string[]
+    expect(w2.some((x) => x.includes(querySqlCommand({ db: bad }))), w2.join('\n')).toBe(true)
+  })
+
+  it('渲染出的诊断命令真的能跑：占位符替换后逐条执行不得报「缺少取值」', async () => {
+    // ⚠️ 这是 CodeRabbit 2026-10-30 minor 的回归守卫：`querySqlCommand` 曾渲染成
+    // `qiyu query --sql --db <path>` —— `--db` 落在 `--sql` 的值位上，逐字执行报
+    // 「--sql 缺少取值」退出 2。**hint 里的命令必须真的能跑**，而不只是「带上了 --db」。
+    //
+    // 契约是「替换占位符后能跑」（`<表>` 与 `<SQL>` 都是占位符，全仓同一约定）：
+    //   · `<表>` 不用引号 —— 表名不含空白，替换后天然是一个参数；
+    //   · `<SQL>` **必须引号** —— SQL 含空格，`--sql SELECT 1` 会被 shell 拆成两个参数
+    //     （`1` 成为位置参数 → 未知参数退出 2），`<`/`>` 不带引号还会变成重定向。
+    const db = dbPath('runnable.duckdb')
+    out = ''
+    expect(await storeCommand(['init', '--db', db])).toBe(0)
+    const loc = { db }
+    // 按 shell 分词（单引号段视为一个词，含 shellArg 的 `'\''` 字面量引号形态）：
+    // 只有真的按 shell 语义切分，才能证明「照 hint 粘进 shell 能跑」。
+    const split = (cmd: string): string[] => {
+      const out: string[] = []
+      let cur = ''
+      let i = 0
+      while (i < cmd.length) {
+        const c = cmd[i]!
+        if (c === ' ') { if (cur !== '') { out.push(cur); cur = '' }; i++; continue }
+        if (c === "'") {
+          i++
+          while (i < cmd.length) {
+            if (cmd[i] === "'") {
+              if (cmd.startsWith("'\\''", i)) { cur += "'"; i += 4; continue }
+              i++; break
+            }
+            cur += cmd[i]; i++
+          }
+          continue
+        }
+        cur += c; i++
+      }
+      if (cur !== '') out.push(cur)
+      return out
+    }
+    const run = async (cmd: string): Promise<number> => {
+      const argv = split(cmd).slice(1) // 去掉 `qiyu`
+      out = ''
+      if (argv[0] === 'db') return dbCommand(argv.slice(1))
+      if (argv[0] === 'stats') return statsCommand(argv.slice(1))
+      if (argv[0] === 'sync') return syncCommand(argv.slice(1))
+      return queryCommand(argv.slice(1))
+    }
+    // ⚠️ `<SQL>` 的替换契约是**整段（含引号）**替换（CodeRabbit 2026-10-30 major）：
+    // 只换引号里的那个词而保留引号时，SQL 自带单引号会把引号提前闭合 ——
+    // `--sql 'SELECT '2026-10-01''` 经 shell 解析后变成 `SELECT 2026-10-01`
+    //（DuckDB 会把它算成 2015，静默给错结果）。所以这里按契约用 shellArg 整体替换，
+    // 并故意用带单引号的 SQL 来复现那种失败形态。
+    const sql = "SELECT '2026-10-01' AS d"
+    const commands = [
+      dbTablesCommand(loc), dbDescribeCommand('<表>', loc), syncStatusCommand(loc),
+      queryTableCommand('<表>', loc), querySqlCommand(loc),
+      // 敏感列分组建议的完整形态：`--no-mask` 必须排在值位之后（同一处 minor）
+      querySqlCommand(loc) + ' --no-mask',
+    ].map((c) => c.split("'<SQL>'").join(shellArg(sql)))
+    for (const raw of commands) {
+      const cmd = raw.split('<表>').join('sessions')
+      const code = await run(cmd)
+      // 只要不是 2（用法错误）就说明命令形态本身是合法的：数据/覆盖问题不是本用例的目标
+      expect(code, `命令不可执行：${cmd}`).not.toBe(2)
+      const err = JSON.parse(out).error as { message?: string } | undefined
+      expect(String(err?.message ?? ''), cmd).not.toContain('缺少取值')
+    }
   })
 
   it('路径含空白 / shell 元字符 → 恢复命令用单引号包裹（复制进 shell 不注入）', async () => {
@@ -272,6 +483,88 @@ describe('恢复命令的漂移守卫（源码文本）', () => {
    * 不会命中。
    */
   const BARE_HINT = /(?:运行|重跑|先跑通一次同步)[：:]?\s*`?qiyu (?:store init|sync run)/
+
+  /**
+   * 裸**只读诊断**命令的指纹（#45 边界 ②，2026-10-30）：反引号里是一个完整、闭合的
+   * `qiyu db tables` / `db describe` / `sync status` / `query --table` / `query --sql`。
+   * 经共享渲染的正确形态是 ``'用 `' + dbTablesCommand(loc) + '` 查看'`` —— 反引号后紧跟
+   * 引号，不命中；而事故原文 `` '用 `qiyu db tables` 查看可用表' `` 必中。
+   */
+  const BARE_DIAG_HINT =
+    /`qiyu (?:db tables|db describe|sync status|query --table|query --sql)[^'`\n]*`/
+
+  /**
+   * 两个合法例外（都有可证伪的理由，不是「先放过」）：
+   *   · `output.ts` 是**唯一实现点**——`dbTablesCommand` 等渲染器本身的模板串就长这样；
+   *   · `api call` 不吃 `--db`/`--profile`（下方自检钉着），限流建议里的裸命令与
+   *     探测读的是同一份配置/环境解析结果，没有「本次选择」可复现。
+   */
+  const BARE_DIAG_ALLOW: ReadonlyMap<string, string> = new Map([
+    ['output.ts', '诊断命令渲染器本身（唯一实现点）'],
+    [join('commands', 'api.ts'), 'api call 不吃 --db/--profile，裸命令即本次解析结果'],
+  ])
+
+  it('源码里不得再出现裸的只读诊断命令（必须经 dbTablesCommand 等渲染器）', () => {
+    const offenders: string[] = []
+    for (const f of walk(SRC)) {
+      const rel = relative(SRC, f)
+      if (BARE_DIAG_ALLOW.has(rel)) continue
+      const code = stripCommentLines(readFileSync(f, 'utf8'))
+      if (BARE_DIAG_HINT.test(code)) offenders.push(rel)
+    }
+    expect(offenders).toEqual([])
+  })
+
+  it('凡渲染 querySqlCommand 的文件，必须同时带上占位符替换契约', () => {
+    // 占位符在引号里：不带契约时用户可能只替换引号内的词，SQL 自带单引号会提前闭合
+    // 引号（CodeRabbit 2026-10-30 major）—— `--sql 'SELECT '2026-10-01''` 静默变成
+    // `SELECT 2026-10-01`。渲染器没法替用户转义，只能把契约写在 hint 里；这条守卫保证
+    // 新增的调用点不会漏掉它。
+    const missing: string[] = []
+    for (const f of walk(SRC)) {
+      const rel = relative(SRC, f)
+      if (rel === 'output.ts') continue // 渲染器与契约常量的定义处
+      // ⚠️ 必须连 import 行一起剥掉：`import { querySqlCommand, SQL_ARG_REPLACE_NOTE }`
+      // 单独就能让「含该标识符」成立，守卫会变成假绿（实测：只删用法、留着 import 时
+      // 该用例仍通过）。剥掉后剩下的只有真正的使用点。
+      const code = stripCommentLines(readFileSync(f, 'utf8'))
+        .split('\n').filter((l) => !/^\s*import\b/.test(l)).join('\n')
+      if (code.includes('querySqlCommand(') && !code.includes('SQL_ARG_REPLACE_NOTE')) {
+        missing.push(rel)
+      }
+    }
+    expect(missing).toEqual([])
+    // 双向自检：事故形态必红、修复形态放过（判据与上面逐字同款，防止守卫本身写歪）
+    const flagged = (code: string): boolean =>
+      code.includes('querySqlCommand(') && !code.includes('SQL_ARG_REPLACE_NOTE')
+    expect(flagged("+ '` 单独查看它们以确认成因')")).toBe(false) // 无 querySqlCommand → 不适用
+    expect(flagged(
+      "'用 `' + querySqlCommand(loc) + '` 单独查看它们以确认成因')")).toBe(true)
+    expect(flagged(
+      "'用 `' + querySqlCommand(loc) + '` 单独查看（' + SQL_ARG_REPLACE_NOTE + '）')")).toBe(false)
+  })
+
+  it('自检：只读诊断的裸形态必红、经渲染的拼接形态放过', () => {
+    const incidents = [
+      "hint: candidates.length > 0 ? candidateHint(candidates) : '用 `qiyu db tables` 查看可用表',",
+      "'请用 `qiyu db describe <表>` 看总行数与时间范围，或加过滤条件'",
+      "warnings.push(`查询返回 0 行…用 `qiyu sync status` 查看覆盖范围`)",
+      "'或改用 `qiyu query --table <表> --since/--until`（该通道已处理取整语义）'",
+      "'用 `qiyu query --sql` 单独查看它们以确认成因'",
+    ]
+    for (const t of incidents) expect(BARE_DIAG_HINT.test(t), t).toBe(true)
+    const fixed = [
+      "'用 `' + dbTablesCommand(loc) + '` 查看可用表'",
+      "'请用 `' + dbDescribeCommand('<表>', loc) + '` 看总行数与时间范围'",
+      "'用 `' + syncStatusCommand(loc) + '` 查看覆盖范围'",
+      "'或改用 `' + queryTableCommand('<表>', loc) + ' --since/--until`'",
+      "'用 `' + querySqlCommand(loc) + '` 单独查看它们以确认成因'",
+    ]
+    for (const t of fixed) expect(BARE_DIAG_HINT.test(t), t).toBe(false)
+    // 豁免理由必须持续成立：api 侧一吃上 --db/--profile，这条就红，逼着把 hint 线程化
+    const apiSrc = readFileSync(join(SRC, 'commands', 'api.ts'), 'utf8')
+    expect(apiSrc).not.toMatch(/'--db'|'--profile'/)
+  })
 
   it('源码里不得再出现裸的恢复命令 hint（必须经 storeInitCommand/syncRunCommand 渲染）', () => {
     const offenders: string[] = []

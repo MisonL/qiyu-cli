@@ -9,6 +9,40 @@
 
 ### 修复
 
+- **只读诊断 hint 不带存储选择：照做会去读默认库，Agent 据此断定「表真的不存在」（#45 边界 ②）**。
+  2026-10-30 补全与上一条同族的另一半：上一条只修了**恢复**命令（`store init` / `sync run`），
+  而**只读诊断**命令（`db tables` / `db describe` / `sync status` / `query --table` / `query --sql`）
+  同样会打偏库 —— 读错库与写错库一样误导。例：`query --table sessions --db <非默认库>` 报
+  「未知表」时，裸 `qiyu db tables` 列的是默认库的表，Agent 会得出「这张表真的不存在」的结论。
+  修法：`src/output.ts` 新增 `StoreLocation` 与六个渲染器（`storeLocationFlags` /
+  `dbTablesCommand` / `dbDescribeCommand` / `syncStatusCommand` / `queryTableCommand` /
+  `querySqlCommand`），参数统一走 `shellArg`（含 win32 的 PowerShell 方言）；定位由
+  `storeLocationOf(已解析路径, 档名)` 或 `storeLocationFromFlags(原始 flag)` 构造。
+  线程到 7 个文件：`query/errors.ts`（未知表/未知列/漂移守卫）、`query/mask.ts`（漂移列与
+  `--sql` 缺口警告）、`query/table-query.ts`（敏感列分组）、`query/sandbox.ts`（打开失败的
+  store init）、`commands/{query,db,stats}.ts`（0 行/截断/iso-day/脏时间值/坏 payload/闭集校验）。
+  漂移守卫：`tests/store-hint-selection.test.ts` 新增 `BARE_DIAG_HINT`（闭合形态 + 字面量在命令名处
+  截断的拼接形态），豁免仅两处且各有可证伪理由（`output.ts` 是唯一实现点；`api call` 不吃
+  `--db`/`--profile`，并有「api 一吃上存储 flag 就变红」的自检）。
+  行为覆盖 15 个用例（真 DuckDB）：未知表/未知列/敏感分组/0 行（两通道）/脱敏建议/iso-day/
+  截断/闭集校验三命令/漂移列/sandbox 打开失败/脏时间值/坏 payload。
+  CodeRabbit 复审另补一条 minor（已修复）：`querySqlCommand` 最初渲染成
+  `qiyu query --sql --db <path>` —— `--db` 落在 `--sql` 的**值位**上，而 `query` 的
+  值位守卫把「取值恰好是已知 flag」判为缺值，逐字执行报「--sql 缺少取值」退出 2。
+  **hint 里的命令必须真的能跑**，所以改为 `qiyu query --sql '<SQL>' --db <path>`
+  （占位符加引号：SQL 含空格，`--sql SELECT 1` 会被 shell 拆成两个参数）；
+  并新增「渲染出的诊断命令占位符替换后逐条真的执行」用例（含 `--no-mask` 形态），
+  把「带上了 --db」与「命令可执行」两件事分开守。
+  第二轮复审再补一条 major（已修复）：占位符在**引号里**，用户若只替换引号内的词而
+  保留引号，SQL 自带单引号会提前闭合 —— `--sql 'SELECT '2026-10-01''` 经 shell 解析后
+  变成 `SELECT 2026-10-01`（DuckDB 算成 2015，**静默给错结果**）。新增
+  `SQL_ARG_REPLACE_NOTE`（「整段替换成按你的 shell 规则转义好的 SQL」）并接到三处
+  `--sql` hint；加「凡渲染 `querySqlCommand` 的文件必须同时带上该契约」的漂移守卫
+  （剥掉 import 行再判，否则单靠 import 就假绿 —— 实测过），可执行性用例改用
+  **带单引号的 SQL** + `shellArg` 整段替换来复现原失败形态。
+  变异验证 13 处（`storeLocationFlags` 恒空、逐点丢 `loc`、闭集校验丢原始 flag、
+  `querySqlCommand` 退回无值位、源码重新引入裸形态），对应用例均红（逐条 grep 确认改动真落地）。
+
 - **反向图例覆盖不完整（#38 挂账）：`stats fields` 的 `table`/`sentinel` 与 `query` 的 data 字段无释义，`api schema` 无「输出 ⊆ 图例」方向**。
   2026-10-30 补齐三处：
   ① `statsFieldNotes()` 新增 `table`（回显输入、不是「库里有哪张表」的依据）与 `sentinel`

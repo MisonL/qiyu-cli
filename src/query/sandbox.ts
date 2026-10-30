@@ -21,6 +21,7 @@
 import { isLockError, retryWithBackoff, isModuleNotFound } from '../store/retry.js'
 import type { ErrorKind } from '../core/errors.js'
 import type { StoreConfig } from '../store/types.js'
+import { storeInitCommand } from '../output.js'
 
 export interface SandboxResult {
   columns: string[]
@@ -400,7 +401,8 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
     throw sandboxError(
       'store_not_initialized',
       `无法打开数据库：${e instanceof Error ? e.message : String(e)}`,
-      { hint: '请确认数据库文件存在且由本 CLI 创建（qiyu store init），或用 --db 指向其他数据库文件' },
+      { hint: '请确认数据库文件存在且由本 CLI 创建（`' + storeInitCommand(cfg.path)
+        + '`），或用 --db 指向其他数据库文件' },
     )
   }
 
