@@ -703,6 +703,38 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(s).toMatch(/真正切片的只有同步引擎/)
   })
 
+  it('设计稿 §2：未交付的两条语义化命令不得被说成「只能经 api call 访问」（本地通道也要提）', () => {
+    const s = design()
+    // ⚠️ CodeRabbit #50 指出并核实成立：只写「只能经逃生通道 api call 访问」会让读的人
+    // 以为工单/知识库数据全都拿不到 —— 实际数据两条路都有（api call 拉远程 / query 查本地库，
+    // 四张表都在 TABLES 里且有同步任务）。缺的只是"语义层"这层包装。
+    const ACCIDENT = '两条都只能经逃生通道（`api call`）访问'
+    expect(ACCIDENT.includes('只能经逃生通道')).toBe(true)
+    expect(s, '「只能经逃生通道访问」的旧措辞不得回归').not.toMatch(/只能经逃生通道/)
+    expect(s).toMatch(/\*\*缺的是"语义层"，不是"数据"\*\*/)
+    expect(s).toMatch(/落库后走 `query --table` \/[\s\S]{0,20}`query --sql`/)
+    for (const t of ['`tickets`', '`ticket_logs`', '`knowledge_items`', '`knowledge_categories`']) {
+      expect(s, `§2 状态注必须点名本地表 ${t}`).toContain(t)
+    }
+  })
+
+  it('skill spec：`--pretty` 的「违规判据」一档已删（实现里从来没有这条检查）', () => {
+    const sk = read('docs/superpowers/specs/2026-10-20-skill-design.md')
+    // ⚠️ CodeRabbit #50 指出并核实成立：原文把「推荐了 --pretty」写成 skill check 的违规判据，
+    // 但 ViolationRule 只有 table_name / sql_sequence / unknown_kind，flag 侧只有 rejected_flag，
+    // 而 REJECTED_FLAGS 为空 → 推荐 --pretty 不会触发任何规则。
+    // 上一版回写还写了「由内容红线兜底」—— 那句话是错的（三条内容红线都不看 flag），本条一并纠正。
+    const violationRow = sk.split('\n').find((l) => /^\| 违规 \|/.test(l)) ?? ''
+    expect(violationRow, '违规判据行必须存在').not.toBe('')
+    expect(violationRow, '不得再声称推荐 --pretty 是违规判据').not.toMatch(/推荐了 `--pretty`/)
+    expect(sk, '必须写明它只是写作口径、不是可校验判据').toMatch(/不是可校验的判据/)
+    // 反向自检：三条内容红线的真实规则名必须在场（证明纠正后的表述与实现对齐）
+    const check = read('src/skill/check.ts')
+    for (const r of ["'table_name'", "'sql_sequence'", "'unknown_kind'"]) {
+      expect(check, `ViolationRule 必须含 ${r}`).toContain(r)
+    }
+  })
+
   it('设计稿 §6.4/§6.5：退避是固定间隔、陈旧锁超时未实现、CHECKPOINT 不自动执行', () => {
     const s = design()
     expect(s, '「以指数退避重试」的旧措辞不得回归').not.toMatch(/冲突时\*\*以指数退避重试\*\*/)

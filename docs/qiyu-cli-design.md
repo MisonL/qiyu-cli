@@ -65,7 +65,13 @@
 > **上面两条**语义化命令**未交付、且当前无落点**：
 > · **工单领域的语义化命令** —— 从未进入路线图任何子项目（A/B/C1/D/E/F 都不含）；
 > · **知识库领域的语义化命令（只读）** —— 同上。
-> 两条都只能经逃生通道（`api call`）访问，`src/cli.ts` 的命令树里没有 `ticket` / `kb` 命令。
+> **缺的是"语义层"，不是"数据"**（这两件事别混）：两条领域的**数据**都能拿到 ——
+> 远程走 `api call <接口 id>`（如 `v2/ticket/search`），落库后走 `query --table` /
+> `query --sql`（`tickets` / `ticket_logs` / `knowledge_items` / `knowledge_categories`
+> 都在 `TABLES` 里、都有对应同步任务）。**没有的是**把这些包成人类语义的
+> 那层命令（§9.4 设想的那种 `qiyu ticket … --assignee "张三"` 名称解析、按 `group_id` 聚合、
+> 标准问/相似问切换）—— 所以 Agent 得自己看 `api schema` 拼 body、或自己写 SQL。
+> `src/cli.ts` 的命令树里没有 `ticket` / `kb` 命令。
 > 这是**挂账**而非放弃：重开需要独立 spec→plan，理由与 §9.4 名称解析那条同源
 > （语义化命令要复用的写命令族同样不存在）。**读本节时不要把它当作"已经有了"。**
 
