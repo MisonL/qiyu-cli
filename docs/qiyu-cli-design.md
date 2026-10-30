@@ -210,11 +210,14 @@ qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ so
 
 > **⚠️ 「core 层自动分片」的收窄（2026-10-30 回写）**：本表原写 `14501 → core 层自动分片`。
 > 实现里 **core 不做分片**：`src/core/errors.ts` 把两种 `14501` 报文翻成**两个不同的 kind** ——
-> `endTime is invalid`（越界）→ `kind: 'window_misaligned'`（hint 让调用方把 endTime 对齐到
-> 自然日边界，见 §6.2 的对齐检查）；`…is invalid`（跨度过大）→ `kind: 'window_too_large'`、
-> `retryable: false`（hint 让调用方「按 `maxWindowDays` 切片后重试」）。**两者不能混**：
-> 切片救不了越界 —— 一个 1–2 天的窗口，endTime 越界照样报 `endTime is invalid`（§6.2 实测）
-> —— 一律当"跨度"让 Agent 反复按切片重试同一个失败请求，会浪费一排网络往返。
+> `endTime is invalid`（越界）→ `kind: 'window_misaligned'`，hint 是一个**双条件**动作
+> （与 `src/core/errors.ts` 逐字一致）：`endTime 必须对齐到自然日边界（不得晚于今天 00:00）`
+> —— **对齐**与**上界**是两件事，两个都要满足：明天 00:00 是"对齐的"但越界，仍会被拒，
+> 必须把它**挪回允许区间**（§6.2 实测：同一 `endTime = 今天 0:00` 有时 200 有时被拒，
+> 故拉取含今天的窗口要留余量，用「昨天 0:00 → 今天 0:00」）；`…is invalid`（跨度过大）→
+> `kind: 'window_too_large'`、`retryable: false`（hint 让调用方「按 `maxWindowDays` 切片后重试」）。
+> **两者不能混**：切片救不了越界 —— 一个 1–2 天的窗口，endTime 越界照样报 `endTime is invalid`
+> （§6.2 实测）—— 一律当"跨度"让 Agent 反复按切片重试同一个失败请求，会浪费一排网络往返。
 > **真正切片的只有同步引擎**（`src/sync/engine.ts` 的 `sliceForTask` / `sliceByMaxWindow`）：
 > 它按任务注册的 `maxWindowDays` 把范围切成多窗、逐窗发请求、合并结果。
 > `qiyu api call` **不切片** —— 它没有分片所需的参数知识（注册表不登记窗口起止在哪个字段里），

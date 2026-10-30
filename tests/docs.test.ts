@@ -727,8 +727,19 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 反复按切片重试同一个失败请求（1–2 天的窗口切片也救不了越界）。
     expect(s).toMatch(/endTime is invalid`（越界）→ `kind: 'window_misaligned'`/)
     expect(s).toMatch(/切片救不了越界/)
-    // 反向自检：kind 名与实现一致（假的名字会让这条守卫守错东西）
+    // ⚠️ CodeRabbit round 6 指出并核实成立：越界的处置是**双条件**（对齐 + 上界），
+    // 只写「对齐到自然日边界」会让 Agent 把「明天 00:00」这种**已对齐但越界**的值
+    // 原样重发（它对齐了，仍会被拒）。必须同时写明「不得晚于今天 00:00」与「挪回允许区间」，
+    // 且要与实现里的 hint 逐字一致。
     const errs = read('src/core/errors.ts')
+    expect(s, '必须写明 endTime 的双条件（对齐 + 不晚于今天 00:00）')
+      .toMatch(/不得晚于今天 00:00/)
+    expect(s, '必须写明越界值要挪回允许区间').toMatch(/挪回允许区间/)
+    // 反向自检：文档转述的上界必须与实现 hint 一致（否则文档教的和真报的对不上）
+    const hintLine = errs.split('\n').find((l) => /hint: 'endTime 必须对齐到自然日边界/.test(l)) ?? ''
+    expect(hintLine, '实现里的 window_misaligned hint 必须存在').not.toBe('')
+    expect(hintLine, '实现 hint 必须自带「不得晚于今天 00:00」').toContain('不得晚于今天 00:00')
+    // 反向自检：kind 名与实现一致（假的名字会让这条守卫守错东西）
     expect(errs, 'window_misaligned 必须真实存在').toContain("kind: 'window_misaligned'")
     expect(errs, 'window_too_large 必须真实存在').toContain("kind: 'window_too_large'")
   })
@@ -793,7 +804,18 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .not.toMatch(/库文件只增不减[\s\S]{0,20}唯有.*手动|不断累积已删除行的空间/)
     expect(s, '必须写明 CLI 不执行 CHECKPOINT（运维责任）').toMatch(/CLI \*\*不执行 `CHECKPOINT`\*\*/)
     expect(s, '必须写明 DuckDB 会按 WAL 自动 checkpoint').toMatch(/自动 checkpoint|wal_autocheckpoint/)
-    expect(s, '必须限定手动 CHECKPOINT 只部分回收空间').toMatch(/部分|一部分/)
+    // ⚠️ CodeRabbit round 6 指出并核实成立：判据不能只写 `/部分|一部分/` 对全文判 ——
+    // 上面「自动 checkpoint 不等于文件有界」那段里也有「只回收一部分」，即使**手动指引那一句**
+    // 改成承诺「完全回收」，全文判照样绿。必须锚到手动指引那一句本身。
+    const manualLine = s.split('\n').find((l) => /什么时候需要手动做/.test(l)) ?? ''
+    expect(manualLine, '手动 CHECKPOINT 的指引必须存在').not.toBe('')
+    // 手工指引跨行 —— 取它后面紧跟的两行一起判（「别期待它一定把文件缩小」+「空间只回收一部分」）
+    const idx = s.indexOf(manualLine)
+    const manualBlock = s.slice(idx, idx + 400)
+    expect(manualBlock, '手动指引必须写明「别期待它一定把文件缩小」')
+      .toMatch(/别期待它一定把文件缩小/)
+    expect(manualBlock, '手动指引必须限定空间只部分回收')
+      .toMatch(/只回收一部分|部分回收|只\*\*部分\*\*回收/)
     // ⚠️ CodeRabbit round 4 指出并核实成立：原稿写「长时间反复同步不会无界膨胀」把话说满 ——
     // 自动 checkpoint 限制的是 WAL 累积，不是 DB 文件大小；已删除行空间只部分回收，
     // 主库文件仍可能增长。判定：不得承诺「文件大小有界」。
