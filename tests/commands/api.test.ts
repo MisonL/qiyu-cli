@@ -241,30 +241,35 @@ describe('api list', () => {
   it('每条记录带 verified，且 meta 解释了它的含义', async () => {
     // ⚠️ `verified` 若只输出不解释，就是一个"声明了但没人读"的字段：
     // Agent 会看到 true/false 却不知道差别，于是把"注册了"当成"验证过了"。
-    // 当前 154 条注册表中，callable && !dangerous && verified 的接口共有 44 条。
+    // 当前 154 条注册表中，callable && !dangerous && verified 的接口共有 52 条
+    // （2026-10-30 实测收口：20 个只读接口里 8 个走通了成功路径）。
     await apiCommand(['list'])
     expect(rows().length).toBeGreaterThan(0)
-    // 默认视图是 callable && outbound，共 136 条，其中 44 条已实测。
+    // 默认视图是 callable && outbound，共 136 条，其中 52 条已实测。
     expect(rows().filter((r) => r.verified).map((r) => r.id).sort())
       .toEqual([
         'ai.knowledge.getCategoryTree', 'ai.knowledge.getDetail', 'ai.knowledge.search',
-        'ai.statistic.transferHuman', 'category.list', 'data.overview.ipcc',
+        'ai.statistic.transferHuman', 'category.list', 'chat.queue.group.query',
+        'data.overview.ipcc',
         'data.overview.session', 'evaluation.setting.get', 'export.session',
         'export.session.check', 'export.session.one', 'export.session.one.message',
-        'icoutcall.history.seat', 'icoutcall.history.team', 'kefu.v2.query',
+        'icoutcall.history.seat', 'icoutcall.history.team',
+        'ipcc.calltaskdetail.get', 'ipcc.customfield.template.get', 'kefu.v2.query',
         'online.session.category.list', 'online.session.customfield.template',
         'robot.data.getQuestionsByCategoryName', 'robot.data.knowledge', 'robot.data.kpoint',
         'robot.data.queryStandardByEffectiveQuestion', 'robot.data.queryStandardQuestionList',
-        'robot.evaluation.setting', 'robot.session.msgAssociate', 'robot.statistic.summary',
+        'robot.evaluation.setting', 'robot.session.commonQuestions', 'robot.session.msgAssociate',
+        'robot.session.msgPredict', 'robot.statistic.summary',
         'robot.transfer.config', 'session.user.profile', 'smstask.status',
         'staff.group.list.new', 'staff.group.members.new', 'staff.list.new',
         'statistic.overview', 'statistic.performance', 'statistic.salaryDetail',
         'statistic.satisfaction.report', 'statistic.staffAttendance', 'statistic.staffquality',
         'statistic.staffworklod', 'tag.all', 'ticket.filter.count', 'ticket.filter.list',
+        'ticket.list', 'ticket.log', 'ticket.new.detail',
         'ticket.search', 'ticket.template.fields', 'ticket.template.list',
       ])
-    expect(rows().filter((r) => !r.verified).length, '默认视图 136 条里有 44 条实测过')
-      .toBe(92)
+    expect(rows().filter((r) => !r.verified).length, '默认视图 136 条里有 52 条实测过')
+      .toBe(84)
     const notes = JSON.parse(out).meta.field_notes
     expect(notes.verified).toMatch(/实测/)
     // ⚠️ 全局说明是**索引**不是全文（2026-10-07 加）：true 的实测范围三条各不相同

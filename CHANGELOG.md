@@ -9,6 +9,52 @@
 
 ### 修复
 
+- **只读接口实测收口（20 个）：A6 的 `verified:false` 从「全都未实测」变成「逐个如实登记」**。
+  用真实凭证对 20 个未实测的只读接口逐个采样（`ticket.log` / `ticket.new.detail` /
+  `ticket.list` / `chat.queue.group.query` / `ipcc.calltaskdetail.get` /
+  `ipcc.customfield.template.get` / `robot.session.commonQuestions` /
+  `robot.session.msgPredict` / `event.queryQueueStatus` / `merchant.{list,query}` /
+  `ipcc.calltask.get` / `robot.session.chat` / 7 个 `icoutcall.*`），把结果写进注册表：
+  8 个走通了成功路径 → `verified:true` + 实测 `envelope`（`ticket.log`/`ticket.new.detail`/
+  `ipcc.calltaskdetail.get`/`robot.session.commonQuestions`/`robot.session.msgPredict` →
+  形状 A；`ticket.list` → 形状 C；`chat.queue.group.query` 与 `ipcc.customfield.template.get`
+  实测确认形状**不在 A/B/C/D 里**（载荷在 `staffInfo` / 裸数组），以 `envelope:null` +
+  `verified:true` 登记，note 逐条点明「null 不表示未实测」）；其余 12 个保持
+  `verified:false`，note 如实记录实测到的错误（`icoutcall.*` ×7 → `14500 Service Offline`，
+  且同模块 `icoutcall.history.seat` 实测可用，证明离线是按子服务判定；`merchant.*` → `8002`
+  需平台版 appKey；`ipcc.calltask.get` → `8012` 需真实任务 id；`robot.session.chat` → `14004`
+  `msg` 须传对象——该接口是写行为、不继续采样；`event.queryQueueStatus` → `14007` 需排队中 uid）。
+
+  实测同时修正两处**文档与实测不符**的旧断言：
+  · `ticket.list` 的 `staffId` 非法时返回 **`code:14100`** + 纯文本 `Bad holder staff id`，
+    不是「形状 C 的错误也都返回 code:200」—— 该量词已从 `src/core/envelope.ts` 的注释收回
+    （设计稿 §9.0 的同源表述随文档一致性一并回写）；
+  · `ticket.log` / `ticket.new.detail` 实测成功信封是 `{code,data}`（**无 message**）。
+
+  新增可重复采样器 `scripts/registry/sample.mjs`：凭据只从 env 读、签名复用
+  `dist/core/sign.js`（单一实现点）、输出只含结构不含值、**只读白名单默认拒绝**
+  （`dangerous:false` 不等于只读 —— `robot.session.chat` 就是反例），22 条护栏 +
+  8 处变异验证（白名单失效 / 黑名单拼错 id / 非 JSON 分支贴正文 / 键不脱敏 /
+  数组长度丢失 / 口径注释漂移 / 凭证走 argv / CI 误入）。
+
+  CodeRabbit 三轮复审补出五条，都已处理：
+  ① 非 JSON 分支自称「只报类别」却打印 `text.slice(0, 20)` —— 前 20 个字符**就是正文**，
+     破了它自己声明的约束，且这一支当时没有任何用例；改为 `describeNonJson` 只报
+     状态码/Content-Type/长度/是否 HTML，哨兵放在正文**最开头**（放在第 20 位之后，
+     `slice(0,20)` 的回归照样能通过，那条用例就只是看着像在守）。
+  ② `dangerous:false` 被当成只读放行 —— 改用显式 `READ_ONLY_IDS` 白名单，
+     默认拒绝，加接口必须有人写下"它是只读的"。
+  ③ 业务值可能出现在**键**上而不只在值上（`follower`/`customField` 形如
+     `{5000004:"张三"}`，键是员工 id）—— `describeShape` 现在把不匹配
+     `[A-Za-z_][A-Za-z0-9_]{0,39}` 的键折成 `<redacted-keys>` 计数。
+  ④ 数组长度丢失，1 条与 8 条在元素形状相同时输出完全一样，无法支撑任何计数观测 ——
+     改为 `{array: 长度, element: 形状}`；空数组只报 `{array:'empty'}`，不多带一个
+     什么都没说的 `element: 'undefined'`。
+  ⑤ ASCII 人名当键挡不住（`{AliceSmith:'x'}` 会原样打印）—— **不扩正则硬堵**
+     （那要靠「已知字段名」白名单，会让采样器失去发现新字段的能力），改为把口径
+     收窄：保证「不含**值**」，并写明「键名会上屏，别整段当可公开样本贴出去」；
+     用例同时钉住行为与这句口径，防止它悄悄漂回「不含任何标识信息」。
+
 - **只读诊断 hint 不带存储选择：照做会去读默认库，Agent 据此断定「表真的不存在」（#45 边界 ②）**。
   2026-10-30 补全与上一条同族的另一半：上一条只修了**恢复**命令（`store init` / `sync run`），
   而**只读诊断**命令（`db tables` / `db describe` / `sync status` / `query --table` / `query --sql`）

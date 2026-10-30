@@ -19,7 +19,12 @@ export interface EndpointSpec {
   auth: 'checksum' | 'eventType' | 'none'
   verified: boolean
   /**
-   * null = 该接口的信封形状未经实测，解析时退化为宽松模式。
+   * null = **没有登记 A/B/C/D 形状**，解析时退化为宽松模式。两种成因（2026-10-30 起）：
+   *   ① 该接口的信封形状**从未实测**（写接口全部如此，`verified: false`）；
+   *   ② 实测过，但形状**不在 A/B/C/D 里**（`chat.queue.group.query` 的载荷在
+   *      `staffInfo`、`ipcc.customfield.template.get` 是裸数组）—— 这两类由
+   *      `normalize` 里更靠前的结构分支接住，`null` 不参与判定。
+   * → **不要据 `envelope === null` 推断"未实测"**，那要读 `verified` 与该行 note。
    * ⚠️ `'D'` 与 `'D-nf'` 的报文**逐字节相同**（都是 `{code:200}`），语义相反 ——
    * 前者是正常成功，后者是查无此物。生成脚本不得因为"设计稿把这两个接口
    * 写在同一行"就把两者都填成 `'D'`，那样 msgAssociate 的 not-found 会静默变成成功。

@@ -155,9 +155,10 @@
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": false,
+    "verified": true,
     "envelope": null,
-    "category": "在线系统/事件"
+    "category": "在线系统/事件",
+    "note": "成功信封已实测（2026-10-30）：`{code:200, staffInfo:[…]}` —— 载荷在 **staffInfo**，成功时**没有 message**；失败时则相反（`{code:14004, message:\"'groupId' param error\"}`）。空 staffInfo（[]）是「组内无人在线」的**正常**状态，不是 not_found（解析走专用分支，恒不置 not_found）。⚠️ envelope 保持 null：A/B/C/D 没有可登记「载荷在非标准键」的形状，成功形态由结构分支处理、不读 envelope；这里的 null **不表示「未实测」**。该接口是否存在「code:200 + message 纯文本」的 C 式失败**未实测** —— 宽松兜底对这种报文会判成成功。"
   },
   {
     "id": "crm.modifyOrder",
@@ -325,7 +326,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "在线系统/事件"
+    "category": "在线系统/事件",
+    "note": "成功路径未实测（2026-10-30）：未排队的 uid 恒返回 `{code:14007, message:\"user not in queue\"}` —— 这是未排队 uid 的**预期回答**，不是错误（厂商对该接口 code 字段的描述与实际返回的 message 不一致）；需要「正在排队」的 uid 才能取得成功信封，本次构造不出。"
   },
   {
     "id": "event.queueEnter",
@@ -570,7 +572,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "呼叫系统/外呼机器人"
+    "category": "呼叫系统/外呼机器人",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:14500, message:\"Service Offline\"}` —— 服务端对该子服务报告离线，本账号无法走通成功路径（无法从报文区分是子服务未开通还是停用）。⚠️ 同模块的 `icoutcall.history.seat` 实测可用（code:200），可见 Service Offline 是**按子服务**判定，不是整个外呼模块离线；且 14500 这个码同时承载「内部错误」，报错时不能只按 message 区分成因。"
   },
   {
     "id": "icoutcall.dialogFlow.fuzzySearch",
@@ -584,7 +587,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "呼叫系统/外呼机器人"
+    "category": "呼叫系统/外呼机器人",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:14500, message:\"Service Offline\"}` —— 服务端对该子服务报告离线，本账号无法走通成功路径（无法从报文区分是子服务未开通还是停用）。⚠️ 同模块的 `icoutcall.history.seat` 实测可用（code:200），可见 Service Offline 是**按子服务**判定，不是整个外呼模块离线；且 14500 这个码同时承载「内部错误」，报错时不能只按 message 区分成因。"
   },
   {
     "id": "icoutcall.dialogFlow.getDialogFlowList",
@@ -598,7 +602,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "呼叫系统/外呼机器人"
+    "category": "呼叫系统/外呼机器人",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:14500, message:\"Service Offline\"}` —— 服务端对该子服务报告离线，本账号无法走通成功路径（无法从报文区分是子服务未开通还是停用）。⚠️ 同模块的 `icoutcall.history.seat` 实测可用（code:200），可见 Service Offline 是**按子服务**判定，不是整个外呼模块离线；且 14500 这个码同时承载「内部错误」，报错时不能只按 message 区分成因。"
   },
   {
     "id": "icoutcall.get.customer",
@@ -612,7 +617,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "呼叫系统/外呼机器人"
+    "category": "呼叫系统/外呼机器人",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:14500, message:\"Service Offline\"}` —— 服务端对该子服务报告离线，本账号无法走通成功路径（无法从报文区分是子服务未开通还是停用）。⚠️ 同模块的 `icoutcall.history.seat` 实测可用（code:200），可见 Service Offline 是**按子服务**判定，不是整个外呼模块离线；且 14500 这个码同时承载「内部错误」，报错时不能只按 message 区分成因。"
   },
   {
     "id": "icoutcall.get.jobdetail",
@@ -626,7 +632,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "呼叫系统/外呼机器人"
+    "category": "呼叫系统/外呼机器人",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:14500, message:\"Service Offline\"}` —— 服务端对该子服务报告离线，本账号无法走通成功路径（无法从报文区分是子服务未开通还是停用）。⚠️ 同模块的 `icoutcall.history.seat` 实测可用（code:200），可见 Service Offline 是**按子服务**判定，不是整个外呼模块离线；且 14500 这个码同时承载「内部错误」，报错时不能只按 message 区分成因。"
   },
   {
     "id": "icoutcall.get.jobproperties",
@@ -640,7 +647,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "呼叫系统/外呼机器人"
+    "category": "呼叫系统/外呼机器人",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:14500, message:\"Service Offline\"}` —— 服务端对该子服务报告离线，本账号无法走通成功路径（无法从报文区分是子服务未开通还是停用）。⚠️ 同模块的 `icoutcall.history.seat` 实测可用（code:200），可见 Service Offline 是**按子服务**判定，不是整个外呼模块离线；且 14500 这个码同时承载「内部错误」，报错时不能只按 message 区分成因。"
   },
   {
     "id": "icoutcall.history.seat",
@@ -766,7 +774,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "呼叫系统/外呼机器人"
+    "category": "呼叫系统/外呼机器人",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:14500, message:\"Service Offline\"}` —— 服务端对该子服务报告离线，本账号无法走通成功路径（无法从报文区分是子服务未开通还是停用）。⚠️ 同模块的 `icoutcall.history.seat` 实测可用（code:200），可见 Service Offline 是**按子服务**判定，不是整个外呼模块离线；且 14500 这个码同时承载「内部错误」，报错时不能只按 message 区分成因。"
   },
   {
     "id": "ipcc.calltask.add.auto",
@@ -850,7 +859,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "呼叫系统/外呼任务"
+    "category": "呼叫系统/外呼任务",
+    "note": "成功路径未实测（2026-10-30）：taskId=1 返回 `{code:8012, message:\"该任务id不存在\"}` —— 需要真实存在的呼叫任务 id，本次构造不出。"
   },
   {
     "id": "ipcc.calltaskdetail.add",
@@ -890,9 +900,10 @@
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": false,
-    "envelope": null,
-    "category": "呼叫系统/外呼任务"
+    "verified": true,
+    "envelope": "A",
+    "category": "呼叫系统/外呼任务",
+    "note": "顶层信封形状已实测（2026-10-30）：`{code, data}`，**无 message**（形状 A —— 载荷在 data）。⚠️ 只观测到 **空载荷**那一条路径：taskId=1 时 `code:200, data:{}`（该任务不存在，见 ipcc.calltask.get 的 8012），与「空 data = 查无此物」一致；**非空 data（有明细的真实任务）未取得样本**，字段集未知 —— 需要一个真实存在的呼叫任务 id 才能补测。"
   },
   {
     "id": "ipcc.calltaskdetail.update",
@@ -918,9 +929,10 @@
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": false,
+    "verified": true,
     "envelope": null,
-    "category": "呼叫系统/服务记录"
+    "category": "呼叫系统/服务记录",
+    "note": "成功信封已实测（2026-10-30）：**裸 JSON 数组，完全没有 {code,message} 信封**（templateType=1 返回 1 个元素，键 id/name/description），解析先看首字符是否 '['。⚠️ envelope 保持 null：A/B/C/D 没有可登记这个形状的值，这里的 null **不表示「未实测」**。"
   },
   {
     "id": "ipcc.login",
@@ -1131,7 +1143,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "平台电商（Platform OpenAPI）"
+    "category": "平台电商（Platform OpenAPI）",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:8002, message:\"appKey dose not belong to a platform\", total}`（message 拼写原文如此）—— `/platform/api/*` 需要**平台版 appKey**，企业版凭证被拒；须换平台版凭证再实测。"
   },
   {
     "id": "merchant.query",
@@ -1145,7 +1158,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "平台电商（Platform OpenAPI）"
+    "category": "平台电商（Platform OpenAPI）",
+    "note": "成功路径未实测（2026-10-30）：返回 `{code:8002, message:\"appKey dose not belong to a platform\"}`（message 拼写原文如此）—— `/platform/api/*` 需要**平台版 appKey**，企业版凭证被拒；须换平台版凭证再实测。"
   },
   {
     "id": "merchant.update",
@@ -1343,7 +1357,7 @@
     "verified": true,
     "envelope": null,
     "category": "在线系统/消息收发",
-    "note": "入站推送：方向相反，响应信封由我方实现决定，无从实测。⚠️ path 的 \"/\" 是**占位符**，不是真实路径 —— 本接口由七鱼回调我方，不存在可调用的 URL。callable 为 false 即表示这一点。⚠️ 本记录是全表**唯一** `verified: true` 与 `envelope: null` 并存的一条 —— 这里的 `verified` 指的是'**不可主动调用**已实测'（`/` 的 POST 302 实测 —— 它重定向到网易云商产品页，不是可调用的 API 端点），**不是**'信封已实测'；信封（`envelope: null`）恰恰是**无从实测**的，因为响应体由我方实现决定。**也不是**'方向/鉴权已实测'：`direction: inbound` 是据文档对 9 个推送页的分类（302 只证明它不可调用，不能证明七鱼确实会回调我们），`auth: eventType` 是按注册表类型联合做的分类（入站推送不走 checksum）—— 入站推送的**鉴权方式从未实测**（实测它必须真实接收一次推送，而 CLI 不接收推送）。与 `robot.transfer.config` 的 note 同理，不要据 `verified: true` 以为它的信封被验证过"
+    "note": "入站推送：方向相反，响应信封由我方实现决定，无从实测。⚠️ path 的 \"/\" 是**占位符**，不是真实路径 —— 本接口由七鱼回调我方，不存在可调用的 URL。callable 为 false 即表示这一点。⚠️ 本记录与 `chat.queue.group.query`、`ipcc.customfield.template.get` 是全表仅有的三条 `verified: true` 与 `envelope: null` 并存的记录 —— 成因各不相同：那两条是**实测确认形状不在 A/B/C/D 内**（载荷在 staffInfo / 裸数组），本条是响应体由我方实现决定、**无从实测**；三条的 `envelope: null` 都**不表示「未实测」** —— 这里的 `verified` 指的是'**不可主动调用**已实测'（`/` 的 POST 302 实测 —— 它重定向到网易云商产品页，不是可调用的 API 端点），**不是**'信封已实测'；信封（`envelope: null`）恰恰是**无从实测**的，因为响应体由我方实现决定。**也不是**'方向/鉴权已实测'：`direction: inbound` 是据文档对 9 个推送页的分类（302 只证明它不可调用，不能证明七鱼确实会回调我们），`auth: eventType` 是按注册表类型联合做的分类（入站推送不走 checksum）—— 入站推送的**鉴权方式从未实测**（实测它必须真实接收一次推送，而 CLI 不接收推送）。与 `robot.transfer.config` 的 note 同理，不要据 `verified: true` 以为它的信封被验证过"
   },
   {
     "id": "robot.data.getQuestionsByCategoryName",
@@ -1469,7 +1483,8 @@
     "auth": "checksum",
     "verified": false,
     "envelope": null,
-    "category": "机器人/消息接口/会话类接口"
+    "category": "机器人/消息接口/会话类接口",
+    "note": "成功路径未实测（2026-10-30）：`msg` 传字符串返回 `{code:14004, message:\"body内容json解析错误\"}` —— 必须传**对象** `{\"msgType\":\"text\",\"msgBody\":{\"content\":\"…\"}}`（此前已实测记录；厂商文档把 msg 标成 type:string，是错的）。⚠️ 该接口**不是只读**：会话不存在时会**自动创建真实会话**并返回 sessionId，成功采样会向生产机器人写入会话数据（且未命中 FAQ 时 sessionId 会轮换）—— 故未继续采样。dangerous:false 只表示非破坏性，不代表无副作用。"
   },
   {
     "id": "robot.session.close",
@@ -1495,9 +1510,10 @@
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": false,
-    "envelope": null,
-    "category": "机器人/消息接口/会话类接口"
+    "verified": true,
+    "envelope": "A",
+    "category": "机器人/消息接口/会话类接口",
+    "note": "成功信封已实测（2026-10-30）：`{code:200, data:{groupQuestions:[…], questionGuide, questionList:[…], robotId}}`，顶层只有 code 与 data、没有 message；本次一次实测 data 恒含上述 4 键。⚠️ 空 data（{}）会按形状 A 的通用规则置 not_found。"
   },
   {
     "id": "robot.session.create",
@@ -1565,9 +1581,10 @@
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": false,
-    "envelope": null,
-    "category": "机器人/消息接口/会话类接口"
+    "verified": true,
+    "envelope": "A",
+    "category": "机器人/消息接口/会话类接口",
+    "note": "成功信封已实测（2026-10-30）：`{code:200, data:[{action, content, label}, …]}`（本次 8 条），顶层**没有 message** —— 与厂商 schema 矛盾（该端点 schema 对 code/message 本身的描述也是错的）。⚠️ 此前实测：`question` 是死参数（返回同一份静态快捷短语列表）；缺 `uid` 返回 14004。空数组（无快捷短语）会按形状 A 的通用规则置 not_found。"
   },
   {
     "id": "robot.session.transfer",
@@ -1994,9 +2011,10 @@
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": false,
-    "envelope": null,
-    "category": "工单系统"
+    "verified": true,
+    "envelope": "C",
+    "category": "工单系统",
+    "note": "成功信封已实测（2026-10-30）：`{code:200, message:\"<JSON 字符串>\"}`，message 解析为 `{total, tickets:[…]}` —— 形状 C。⚠️ 别把「形状 C 的错误也返回 code:200」当成普遍规律：staffId 非法时返回 **code:14100** + 纯文本 `Bad holder staff id`（不是 200）—— C 类解析先看 code 再看 message，两条路径都判得对，但 C 族的错误码不恒为 200。⚠️ 行内 `follower` 是**字符串**（ticket.new.detail 里是对象）。"
   },
   {
     "id": "ticket.log",
@@ -2008,9 +2026,10 @@
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": false,
-    "envelope": null,
-    "category": "工单系统"
+    "verified": true,
+    "envelope": "A",
+    "category": "工单系统",
+    "note": "成功信封已实测（2026-10-30）：`{code:200, data:[…]}`，顶层**只有 code 与 data、没有 message 键**；失败路径（ticketId 不存在）返回 `{code:14106, message:\"Invalid worksheet\"}` —— **同一接口的顶层键集随成败变化**（成功 {code,data}、失败 {code,message}），envelope 按「载荷在 data」登记。⚠️ `data:[]`（工单无操作记录）会按形状 A 的通用规则置 not_found —— 该情形未实测。"
   },
   {
     "id": "ticket.modify",
@@ -2036,9 +2055,10 @@
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": false,
-    "envelope": null,
-    "category": "工单系统"
+    "verified": true,
+    "envelope": "A",
+    "category": "工单系统",
+    "note": "成功信封已实测（2026-10-30）：`{code:200, data:{…}}`（data 是工单对象，含 attachments/content/customField/follower/questionType 等），顶层只有 code 与 data、没有 message；失败路径与 ticket.log 相同（14106 Invalid worksheet）。⚠️ `follower` 在本端点是**对象**、在 ticket.list 行里却是**字符串**（同名字段形状随命令不同）。⚠️ 此前记载历史工单的 follower 可能含**整数键未加引号**的畸形 JSON（会让整个响应体 JSON.parse 失败，信封层的修复只覆盖 message 载荷、覆盖不到它）；本次 5 个样本（含最早 19 张工单里 follower 非空者）全部解析正常，未复现。"
   },
   {
     "id": "ticket.reminder",
