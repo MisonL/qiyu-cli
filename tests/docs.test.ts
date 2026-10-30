@@ -780,6 +780,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(s, '必须写明 CLI 不执行 CHECKPOINT（运维责任）').toMatch(/CLI \*\*不执行 `CHECKPOINT`\*\*/)
     expect(s, '必须写明 DuckDB 会按 WAL 自动 checkpoint').toMatch(/自动 checkpoint|wal_autocheckpoint/)
     expect(s, '必须限定手动 CHECKPOINT 只部分回收空间').toMatch(/部分|一部分/)
+    // ⚠️ CodeRabbit round 4 指出并核实成立：原稿写「长时间反复同步不会无界膨胀」把话说满 ——
+    // 自动 checkpoint 限制的是 WAL 累积，不是 DB 文件大小；已删除行空间只部分回收，
+    // 主库文件仍可能增长。判定：不得承诺「文件大小有界」。
+    // ⚠️ 只锚**事故原句**，不能对全文 `not.toMatch(/文件大小有界/)` —— 回写正确的句子
+    // 本身就在说「自动 checkpoint 不等于「文件大小有界」」，对全文判会把「澄清」判成「仍在承诺」。
+    expect(s, '「长时间反复同步不会无界膨胀」的事故原句不得回归')
+      .not.toMatch(/长时间反复同步\*\*不会\*\*无界膨胀|长时间反复同步不会无界膨胀/)
+    expect(s, '必须写明自动 checkpoint 不等于文件有界').toMatch(/自动 checkpoint 不等于「文件大小有界」/)
+    expect(s, '必须写明主库文件仍可能增长').toMatch(/仍可能[\s\S]{0,16}增长/)
   })
 
   it('设计稿 §7.4/§7.4.1：限频持久化与 maxWindowDays 预校验各自收窄到 sync', () => {
@@ -788,7 +797,17 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(s).toMatch(/`api call` 是\*\*一次性进程\*\*/)
     expect(s).toMatch(/预校验只有 `sync` 做，`api call` 不做/)
     expect(s).toMatch(/它不知道这个接口的窗口起止放在 body 的哪两个字段里/)
+    // ⚠️ CodeRabbit round 4 指出并核实成立：不能承诺「不切就拿到 window_too_large」——
+    // 超限报错码按接口族不同（statistic/* → 14501、summary → 14004、transferHuman → 14500），
+    // 只有**已识别的那几种报文**才会被归成 window_too_large。
+    const ACCIDENT = '不切就会拿到\n  `window_too_large`（hint 会再告诉你上限'
+    expect(ACCIDENT.includes('不切就会拿到')).toBe(true)
+    expect(s, '「不切就会拿到 window_too_large」的事故句不得回归')
+      .not.toMatch(/不切就会拿到/)
+    expect(s, '必须写明报错码按接口族不同').toMatch(/报错码与报文按接口族不同/)
+    expect(s, '必须写明 window_too_large 只覆盖已识别报文').toMatch(/已识别.*那几种报文|识别到的那几种报文/)
   })
+
 
   it('设计稿 §9.1/§11.2：`meta.cached` 从输出样本删除，缓存能力的旧承诺不得回归', () => {
     const s = design()

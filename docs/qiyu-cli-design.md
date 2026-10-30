@@ -739,10 +739,13 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 
 > **⚠️ 运维须知（2026-10-30 回写）**：CLI **不执行 `CHECKPOINT`**，也没有任何命令替你做这件事
 > （全仓无 `CHECKPOINT` 调用 —— 这是范围外而非遗漏）。
-> **但「不回空间」不等于「文件只增不减」**（这一点要说准）：DuckDB **自己**会按 WAL 大小
-> 自动 checkpoint（内置设置 `wal_autocheckpoint`；本仓库不改它，用默认值 —— 该设置名可从
-> 随包的 `libduckdb.dylib` 字符串表核到）。所以长时间反复同步**不会**无界膨胀。
-> **什么时候需要手动做**：删过大量行、想让空间真正回收时，用 DuckDB 客户端连上库执行
+> **「不回空间」不等于「文件只增不减」**：DuckDB **自己**会按 WAL 大小自动 checkpoint
+> （内置设置 `wal_autocheckpoint`；本仓库不改它、用默认值 —— 该设置名可从随包的
+> `libduckdb.dylib` 字符串表核到），所以 WAL 的累积是被自动限制的。
+> **但自动 checkpoint 不等于「文件大小有界」** —— 它限制的是 **WAL** 的增长，而
+> **已删除行的空间只回收一部分**，所以反复同步**仍可能**让主库文件缓慢增长。
+> **别把「会自动 checkpoint」读成「不用管文件大小」**：要盯着看 `ls -l`。
+> **什么时候需要手动做**：删过大量行、想让空间尽量回收时，用 DuckDB 客户端连上库执行
 > `CHECKPOINT`。**别期待它一定把文件缩小** —— checkpoint 会把数据重写到新文件，但**已删除行
 > 的空间只回收一部分**，能否变小取决于剩余数据布局。**判断依据**：`store status` 报的行数是
 > **逻辑行数**，不反映文件膨胀；文件大小要自己看 `ls -l`。
@@ -854,8 +857,14 @@ qiyu sync verify [task]         # 校验本地与远端一致性
 >   只**输出** `max_window_days`（供 Agent 自己看），不拦你。**为什么**：注册表**不登记 `params`**
 >   —— 它不知道这个接口的窗口起止放在 body 的哪两个字段里，无从校验。硬做只能按字段名猜
 >   （`startTime`/`endTime`/`start`/`end`/`query_start`…），猜错就是对着合法调用报错。
-> · **对 Agent 的实际含义**：`api call` 里读到 `max_window_days` **必须自己按它切**；不切就会拿到
->   `window_too_large`（hint 会再告诉你上限，但那已经是白打一次网络了）。
+> · **对 Agent 的实际含义**：`api call` 里读到 `max_window_days` **必须自己按它切**。
+>   **别指望「不切也一定能拿到某个固定 kind」** —— 超限的**报错码与报文按接口族不同**
+>   （§7.4.1 的表格：`/openapi/statistic/*` 是 `14501`、`robot.statistic.summary` 是 `14004`、
+>   `ai.statistic.transferHuman` 是 `14500`、`ticket.search` 是 `14004 range over limit`）。
+>   CLI 把**已识别的那几种报文**都归成 `kind: 'window_too_large'`（hint 里带上限数字），
+>   但这是「识别到的措辞」而非「所有接口的保证」：某个接口若换一种没见过的超限报文，
+>   就会落到 `param` / `unknown`。**判据**：先按 `max_window_days` 切，别等报错再猜 ——
+>   切错了是白打一次网络，猜错了是把参数错误当成能靠重试解决的。
 > ⚠️ **判定式并不是 `span > N days`，而且两个报表族用的判定方式不同。** 已线上二分验证（2026-09-30）：
 >
 > | 族 | 判定式 | 接受 | 拒绝 |
