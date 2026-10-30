@@ -105,4 +105,19 @@ describe('每条有图例的命令：输出字段必须被图例覆盖（反向�
     expect(notes().profile, 'profile 必须给出完整选择顺序').toContain('QIYU_PROFILE')
     expect(notes().profile, 'profile 不能只说「缺省 default」').toContain('不要假定是 default')
   })
+
+  it('api schema：data 字段必须被图例覆盖或属自明键（此前无「输出 ⊆ 图例」方向，2026-10-30 补）', async () => {
+    // ⚠️ #38 挂账的 api schema 侧：此前只有「图例 ⊆ 输出」方向没人守反方向 ——
+    // data 里多出没有释义的字段，Agent 拿到一个无从判断的键。
+    out = ''
+    expect(await run(['api', 'schema', 'ticket.search'])).toBe(0)
+    // data 顶层：id/title/method/path/callable/dangerous/body_kind/has_body_schema/
+    // params/response_shape（+ 条件 one_of/rate_limit）。除 id/title/method 三个自明键外
+    // 都必须有释义；params 的释义挂在 params[].auto 上（容器本身不单列）。
+    assertAllCovered('api schema', ['id', 'title', 'method'])
+    // 显式钉住几个关键释义确实挂在输出的图例里（而不只是「存在某个键」）
+    expect(notes().path, 'path 的 null 与 "/" 两种不可用形态必须被点破').toContain('入站占位符')
+    expect(notes().callable, 'callable=false 的含义必须被点破').toContain('不可主动调用')
+    expect(Object.keys(notes()), 'params 容器靠 params[].auto 释义').toContain('params[].auto')
+  })
 })

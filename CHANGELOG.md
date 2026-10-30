@@ -9,6 +9,17 @@
 
 ### 修复
 
+- **反向图例覆盖不完整（#38 挂账）：`stats fields` 的 `table`/`sentinel` 与 `query` 的 data 字段无释义，`api schema` 无「输出 ⊆ 图例」方向**。
+  2026-10-30 补齐三处：
+  ① `statsFieldNotes()` 新增 `table`（回显输入、不是「库里有哪张表」的依据）与 `sentinel`
+  （`-1` 是「没有数据」的哨兵、**不是负值或负数比率**）；`tests/stats-field-notes.test.ts`
+  的 `TOP_KEYS` 补这两项，并加「每个顶层键都必须有释义」的反向断言（此前只查「图例 ⊆ 输出」）。
+  ② `query` 补「data 只应有自明的 `columns`/`rows`」反向守卫（此前只覆盖 meta 9 键）。
+  ③ `command-legends-complete.test.ts` 新增 `api schema` 真实输出的反向守卫：`id`/`title`/`method`
+  自明，其余字段必须有释义（`params` 靠 `params[].auto`）。
+  变异验证：`sentinel` 图例键改名 / 去掉 `api schema` 的 `path` 图例 / 往 `query` 的 data 塞未释义
+  字段，对应用例均红（逐条 grep 确认改动真落地）。
+
 - **README「尚未实现」清单的测试是假护栏；`auth` 字段可能与「无条件签名」矛盾；README 横幅陈旧**。
   2026-10-30 审计三处：
   ① `tests/docs.test.ts` 两条用例把 README 的「尚未实现」段切出来再 `.not.toMatch(...)`，

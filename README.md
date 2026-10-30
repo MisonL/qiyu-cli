@@ -499,7 +499,8 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   **只含库中真实存在的表**——声明有而库中无的表不在这里，只在 `warnings` 里点名。
   逐键释义见输出的 `meta.field_notes`。
 
-`stats fields <报表>` 的输出把**声明**与**观测**分开：`declared`（每条带 `source`：
+`stats fields <报表>` 的输出把**声明**与**观测**分开：`table`（回显本次统计的报表表名，
+不是「库里有哪张表」的依据）、`declared`（每条带 `source`：
 `design-doc` 实测 / `name-suffix` 命名推断）、`observed`（`rows_present` / `minus_one` /
 `nulls` / `min` / `max`）、`unknown_fields`（判不出单位的字段）、`sentinel`
 （`-1` = 该窗口或筛选条件没有匹配到数据，**不是负数比率**）。

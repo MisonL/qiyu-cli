@@ -129,7 +129,11 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     const DECLARED_KEYS = ['unit', 'higher_is_better', 'source', 'note']
     // `field` 不在表里：它就是这个对象自己的键名，无需释义
     const OBSERVED_KEYS = ['rows_present', 'minus_one', 'nulls', 'min', 'max']
-    const TOP_KEYS = ['unknown_fields']
+    // ⚠️ 2026-10-30：此前只有 `unknown_fields`，而输出顶层还有 `table` 与 `sentinel` ——
+    // 两者都没释义（`sentinel` 是 Agent 最容易误读的：-1 是「没数据」的哨兵、不是负值）。
+    // 反向 sweep（输出 ⊆ 图例）此前只对 declared/observed 生效，顶层键漏了。现在把
+    // 三个顶层键都列进来，并在下面补「每个顶层键都必须有释义」的反向断言。
+    const TOP_KEYS = ['table', 'sentinel', 'unknown_fields']
     for (const k of Object.keys(NOTES)) {
       if (k.startsWith('declared.')) {
         // ⚠️ `declared` 是**按字段名分组的对象**（`Object.fromEntries`），不是数组 ——
@@ -146,5 +150,8 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     }
     // 每个 observed 键都必须有释义（这些数值的坑最多：min/max 排除 -1、全哨兵为 null）
     for (const k of OBSERVED_KEYS) expect(Object.keys(NOTES)).toContain(`observed[].${k}`)
+    // 反向：每个顶层键都必须有释义（2026-10-30 补 —— 此前 table/sentinel 裸奔，而上面的
+    // 循环只检查「图例键 ⊆ 输出」，不检查「输出 ⊆ 图例」，正是 #38 挂账的假护栏形态）
+    for (const k of TOP_KEYS) expect(Object.keys(NOTES), `顶层键 ${k} 缺释义`).toContain(k)
   })
 })

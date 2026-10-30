@@ -173,6 +173,11 @@ function renderNotes(notes: Record<string, string>): string {
  */
 export function statsFieldNotes(): Record<string, string> {
   return {
+    table: '本次统计的报表表名（回显输入；只接受报表域表，见命令 help 的可用表清单）。'
+      + '它不是「库里有哪些表」的依据 —— 那用 `db tables`；也不是「该表已同步」的证明',
+    sentinel: '`-1` 哨兵的含义对象：`value` 是哨兵数值（-1），`meaning` 说明它表示'
+      + '「该窗口或筛选条件没有匹配到数据」（厂商未文档化，实测报表面族统一）。'
+      + '⚠️ 不要把 -1 当负数比率或负值参与计算 —— 它表示「没有数据」，不是「小于零的数值」',
     // ⚠️ 图例键的路径形态即契约：`declared` 是**按字段名分组的对象**（不是数组），
     // `observed` 才是数组。写成 `declared[].unit` 指的是一个不存在的路径
     // （CodeRabbit 2026-10-27 抓到；测试里有一条钉住这个形态）。
