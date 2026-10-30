@@ -721,6 +721,9 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(row14501, '14501 表行必须存在').not.toBe('')
     expect(row14501, '表行必须点名 window_too_large').toContain("window_too_large")
     expect(row14501, '表行必须点名 window_misaligned').toContain("window_misaligned")
+    // ⚠️ CodeRabbit round 8 指出并核实成立：表行的 `window_misaligned` 指引也必须带上界 ——
+    // 只写「对齐自然日边界」的读者会把明天 00:00（已对齐但越界）原样重发。
+    expect(row14501, '表行必须写明越界的上界条件').toMatch(/不晚于今天 00:00/)
     // ⚠️ CodeRabbit #50 round 2 指出并核实成立：两种 14501 的下一步**不同**。
     // 越界（endTime is invalid）→ 对齐自然日边界；跨度过大 → 按上限切片。
     // 回写第一版把两者都写成「按 maxWindowDays 切片后重试」，会让 Agent 对越界窗口
@@ -729,11 +732,20 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(s).toMatch(/切片救不了越界/)
     // ⚠️ CodeRabbit round 6 指出并核实成立：越界的处置是**双条件**（对齐 + 上界），
     // 只写「对齐到自然日边界」会让 Agent 把「明天 00:00」这种**已对齐但越界**的值
-    // 原样重发（它对齐了，仍会被拒）。必须同时写明「不得晚于今天 00:00」与「挪回允许区间」，
-    // 且要与实现里的 hint 逐字一致。
+    // 原样重发（它对齐了，仍会被拒）。必须同时写明「不得晚于今天 00:00」。
+    // ⚠️ CodeRabbit round 8 指出并核实成立：原断言对**全文** `toMatch(/不得晚于今天 00:00/)` ——
+    // 该措辞在 §6.2 与 §7.2 的多处表格里都有，即使把 §11.2 表行 / §4.3 回写注里的上界
+    // 整个删掉，全文判照样绿。必须**切出 §4.3 回写注那一块**再在块内断言。
     const errs = read('src/core/errors.ts')
-    expect(s, '必须写明 endTime 的双条件（对齐 + 不晚于今天 00:00）')
+    const noteStart = s.indexOf('> **⚠️ 「core 层自动分片」的收窄（2026-10-30 回写）**')
+    expect(noteStart, '§4.3 的 14501 收窄注必须存在').toBeGreaterThanOrEqual(0)
+    const noteRest = s.slice(noteStart)
+    const noteEnd = noteRest.split('\n').findIndex((l, i) => i > 0 && l.trim() !== '' && !l.startsWith('>'))
+    const noteBlock = noteEnd === -1 ? noteRest : noteRest.split('\n').slice(0, noteEnd).join('\n')
+    expect(noteBlock, '§4.3 回写注必须写明双条件（对齐 + 不晚于今天 00:00）')
       .toMatch(/不得晚于今天 00:00/)
+    expect(noteBlock, '§4.3 回写注必须写明「对齐」与「上界」是两件事')
+      .toMatch(/\*\*对齐\*\*与\*\*上界\*\*是两件事/)
     // ⚠️ CodeRabbit round 7 指出并核实成立：§4.3 回写注不应给出不安全示例
     // 「昨天 0:00 → 今天 0:00」—— 其右端正是那条不稳定边界（且不含今天 0:00 之后的
     // 数据，让人以为「拿到了今天」）。改为面向概念的「endTime 用纯历史日期」。
@@ -830,6 +842,14 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/别期待它一定把文件缩小/)
     expect(manualBlock, '手动指引必须限定空间只部分回收')
       .toMatch(/只回收一部分|部分回收|只\*\*部分\*\*回收/)
+    // ⚠️ CodeRabbit round 8 指出并核实成立：`CHECKPOINT` 不是「把数据重写到新文件」——
+    // DuckDB 定义它是把 WAL 同步回主数据文件；要紧凑的新文件得用 `COPY FROM DATABASE`。
+    expect(manualBlock, '不得说 CHECKPOINT「重写到新文件」')
+      .not.toMatch(/把数据重写到新文件/)
+    expect(manualBlock, '必须写明 CHECKPOINT = WAL 同步回主数据文件')
+      .toMatch(/把 WAL 同步回主数据文件/)
+    expect(manualBlock, '必须给出紧凑新文件的正解 COPY FROM DATABASE')
+      .toMatch(/COPY FROM DATABASE/)
     // ⚠️ CodeRabbit round 4 指出并核实成立：原稿写「长时间反复同步不会无界膨胀」把话说满 ——
     // 自动 checkpoint 限制的是 WAL 累积，不是 DB 文件大小；已删除行空间只部分回收，
     // 主库文件仍可能增长。判定：不得承诺「文件大小有界」。

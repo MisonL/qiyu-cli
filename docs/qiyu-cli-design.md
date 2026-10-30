@@ -203,7 +203,7 @@ qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ so
 | 14008 | IP 不在白名单 | 否 | 必须在七鱼控制台配置 |
 | 14009 | 请求频率过快 | 见下文 | 携带 `retry_after` + `retry_strategy` |
 | 14500 | **语义歧义的 code（已对线上 API 验证出 4 种含义，见下文）** | — | **绝不能只看 code**：内部错误 → core 退避；`Service Offline` → **永久熔断**；`Param format error` → **不可重试**；`单位时间内请求过于频繁` → **是限流，必须延迟重试** |
-| 14501 | 数据量超限 | — | **core 层不切片**；按 message 区分两种并各自给下一步（见下）：跨度过大 → `kind: 'window_too_large'`（按上限切片）；endTime 越界 → `kind: 'window_misaligned'`（对齐自然日边界） |
+| 14501 | 数据量超限 | — | **core 层不切片**；按 message 区分两种并各自给下一步（见下）：跨度过大 → `kind: 'window_too_large'`（按上限切片）；endTime 越界 → `kind: 'window_misaligned'`（**两个条件**：对齐自然日边界**且**不晚于今天 00:00 —— 只对齐不挪回允许区间仍会被拒） |
 | 14515 | 权限不足 | 否 | 该接口需单独申请 |
 
 **原则：凡是 CLI 自己能吸收的错误，都不以 `retryable: true` 的形式暴露给 Agent。** 14003/14500 在 core 层被吸收（重签重试 / 判死为 `module_offline`）；**14501 只被翻译、不被吸收** —— 见下方收窄说明。`retryable: true` 只保留给 Agent 必须**改变策略**的情况。
@@ -753,7 +753,8 @@ Kysely **没有官方的 DuckDB dialect**（内置只有 5 种：PG/MySQL/MSSQL/
 > **已删除行的空间只回收一部分**，所以反复同步**仍可能**让主库文件缓慢增长。
 > **别把「会自动 checkpoint」读成「不用管文件大小」**：要盯着看 `ls -l`。
 > **什么时候需要手动做**：删过大量行、想让空间尽量回收时，用 DuckDB 客户端连上库执行
-> `CHECKPOINT`。**别期待它一定把文件缩小** —— checkpoint 会把数据重写到新文件，但**已删除行
+> `CHECKPOINT`。**别期待它一定把文件缩小** —— checkpoint 会把 WAL 同步回主数据文件（不是
+> 重写到新文件，若要紧凑的新文件请用 `COPY FROM DATABASE`），**已删除行
 > 的空间只回收一部分**，能否变小取决于剩余数据布局。**判断依据**：`store status` 报的行数是
 > **逻辑行数**，不反映文件膨胀；文件大小要自己看 `ls -l`。
 > **✅ / ⚠️ 边界**：以上「DuckDB 自动 checkpoint」来自其文档与随包二进制的设置名，
