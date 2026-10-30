@@ -26,8 +26,15 @@
   `--db`/`--profile`，并有「api 一吃上存储 flag 就变红」的自检）。
   行为覆盖 15 个用例（真 DuckDB）：未知表/未知列/敏感分组/0 行（两通道）/脱敏建议/iso-day/
   截断/闭集校验三命令/漂移列/sandbox 打开失败/脏时间值/坏 payload。
-  变异验证 12 处（`storeLocationFlags` 恒空、逐点丢 `loc`、闭集校验丢原始 flag、源码重新引入裸形态），
-  对应用例均红（逐条 grep 确认改动真落地）。
+  CodeRabbit 复审另补一条 minor（已修复）：`querySqlCommand` 最初渲染成
+  `qiyu query --sql --db <path>` —— `--db` 落在 `--sql` 的**值位**上，而 `query` 的
+  值位守卫把「取值恰好是已知 flag」判为缺值，逐字执行报「--sql 缺少取值」退出 2。
+  **hint 里的命令必须真的能跑**，所以改为 `qiyu query --sql '<SQL>' --db <path>`
+  （占位符加引号：SQL 含空格，`--sql SELECT 1` 会被 shell 拆成两个参数）；
+  并新增「渲染出的诊断命令占位符替换后逐条真的执行」用例（含 `--no-mask` 形态），
+  把「带上了 --db」与「命令可执行」两件事分开守。
+  变异验证 13 处（`storeLocationFlags` 恒空、逐点丢 `loc`、闭集校验丢原始 flag、
+  `querySqlCommand` 退回无值位、源码重新引入裸形态），对应用例均红（逐条 grep 确认改动真落地）。
 
 - **反向图例覆盖不完整（#38 挂账）：`stats fields` 的 `table`/`sentinel` 与 `query` 的 data 字段无释义，`api schema` 无「输出 ⊆ 图例」方向**。
   2026-10-30 补齐三处：

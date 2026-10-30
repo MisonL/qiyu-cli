@@ -20,7 +20,6 @@ import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
   dbTablesCommand, dbDescribeCommand, querySqlCommand, storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
-import type { StoreLocation } from '../output.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 

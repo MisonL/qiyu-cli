@@ -273,6 +273,69 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     expect(w2.some((x) => x.includes(querySqlCommand({ db: bad }))), w2.join('\n')).toBe(true)
   })
 
+  it('渲染出的诊断命令真的能跑：占位符替换后逐条执行不得报「缺少取值」', async () => {
+    // ⚠️ 这是 CodeRabbit 2026-10-30 minor 的回归守卫：`querySqlCommand` 曾渲染成
+    // `qiyu query --sql --db <path>` —— `--db` 落在 `--sql` 的值位上，逐字执行报
+    // 「--sql 缺少取值」退出 2。**hint 里的命令必须真的能跑**，而不只是「带上了 --db」。
+    //
+    // 契约是「替换占位符后能跑」（`<表>` 与 `<SQL>` 都是占位符，全仓同一约定）：
+    //   · `<表>` 不用引号 —— 表名不含空白，替换后天然是一个参数；
+    //   · `<SQL>` **必须引号** —— SQL 含空格，`--sql SELECT 1` 会被 shell 拆成两个参数
+    //     （`1` 成为位置参数 → 未知参数退出 2），`<`/`>` 不带引号还会变成重定向。
+    const db = dbPath('runnable.duckdb')
+    out = ''
+    expect(await storeCommand(['init', '--db', db])).toBe(0)
+    const loc = { db }
+    // 按 shell 分词（单引号段视为一个词，含 shellArg 的 `'\''` 字面量引号形态）：
+    // 只有真的按 shell 语义切分，才能证明「照 hint 粘进 shell 能跑」。
+    const split = (cmd: string): string[] => {
+      const out: string[] = []
+      let cur = ''
+      let i = 0
+      while (i < cmd.length) {
+        const c = cmd[i]!
+        if (c === ' ') { if (cur !== '') { out.push(cur); cur = '' }; i++; continue }
+        if (c === "'") {
+          i++
+          while (i < cmd.length) {
+            if (cmd[i] === "'") {
+              if (cmd.startsWith("'\\''", i)) { cur += "'"; i += 4; continue }
+              i++; break
+            }
+            cur += cmd[i]; i++
+          }
+          continue
+        }
+        cur += c; i++
+      }
+      if (cur !== '') out.push(cur)
+      return out
+    }
+    const run = async (cmd: string): Promise<number> => {
+      const argv = split(cmd).slice(1) // 去掉 `qiyu`
+      out = ''
+      if (argv[0] === 'db') return dbCommand(argv.slice(1))
+      if (argv[0] === 'stats') return statsCommand(argv.slice(1))
+      if (argv[0] === 'sync') return syncCommand(argv.slice(1))
+      return queryCommand(argv.slice(1))
+    }
+    const placeholders: Array<[string, string]> = [['<表>', 'sessions'], ['<SQL>', 'SELECT 1']]
+    const commands = [
+      dbTablesCommand(loc), dbDescribeCommand('<表>', loc), syncStatusCommand(loc),
+      queryTableCommand('<表>', loc), querySqlCommand(loc),
+      // 敏感列分组建议的完整形态：`--no-mask` 必须排在值位之后（同一处 minor）
+      querySqlCommand(loc) + ' --no-mask',
+    ]
+    for (const raw of commands) {
+      const cmd = placeholders.reduce((c, [ph, v]) => c.split(ph).join(v), raw)
+      const code = await run(cmd)
+      // 只要不是 2（用法错误）就说明命令形态本身是合法的：数据/覆盖问题不是本用例的目标
+      expect(code, `命令不可执行：${cmd}`).not.toBe(2)
+      const err = JSON.parse(out).error as { message?: string } | undefined
+      expect(String(err?.message ?? ''), cmd).not.toContain('缺少取值')
+    }
+  })
+
   it('路径含空白 / shell 元字符 → 恢复命令用单引号包裹（复制进 shell 不注入）', async () => {
     // 空目录里放一个空库；路径同时含空格与 `; touch` 注入载荷
     const weird = join(dir, 'a b; touch PWNED; #.duckdb')

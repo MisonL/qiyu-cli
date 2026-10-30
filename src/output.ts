@@ -212,9 +212,19 @@ export function queryTableCommand(table: string, loc?: StoreLocation): string {
   return `qiyu query --table ${table}` + storeLocationFlags(loc)
 }
 
-/** `qiyu query --sql` 诊断命令，指向本次的存储定位。 */
+/**
+ * `qiyu query --sql <SQL>` 诊断命令，指向本次的存储定位。
+ *
+ * ⚠️ 占位符 `<SQL>` 不是装饰（CodeRabbit 2026-10-30 minor）：`--sql` 是**取值** flag，
+ * 而 `commands/query.ts` 的值位守卫把「取值恰好是已知 flag」判为缺值 —— 渲染成
+ * `qiyu query --sql --db <path>` 时，`--db` 会被当成 `--sql` 的值位，逐字执行报
+ * 「--sql 缺少取值」并退出 2。**hint 里的命令必须真的能跑**，所以值位先给占位符，
+ * 定位 flag 排在它之后（与 `queryTableCommand` 的 `<表>` 同一约定：占位符需替换后执行）。
+ * 占位符**必须加引号**：SQL 含空格，`--sql SELECT 1` 在 shell 里会被拆成两个参数
+ *（`1` 落成位置参数 → 未知参数退出 2）；`<`/`>` 不加引号还会变成重定向。
+ */
 export function querySqlCommand(loc?: StoreLocation): string {
-  return 'qiyu query --sql' + storeLocationFlags(loc)
+  return "qiyu query --sql '<SQL>'" + storeLocationFlags(loc)
 }
 
 /**
