@@ -32,14 +32,14 @@
   · `ticket.log` / `ticket.new.detail` 实测成功信封是 `{code,data}`（**无 message**）。
 
   新增可重复采样器 `scripts/registry/sample.mjs`：凭据只从 env 读、签名复用
-  `dist/core/sign.js`（单一实现点）、输出只含结构不含业务值、**只读白名单默认拒绝**
-  （`dangerous:false` 不等于只读 —— `robot.session.chat` 就是反例），21 条护栏 +
-  6 处变异验证（白名单失效 / 黑名单拼错 id / 非 JSON 分支贴正文 / 键不脱敏 /
-  凭证走 argv / CI 误入）。
+  `dist/core/sign.js`（单一实现点）、输出只含结构不含值、**只读白名单默认拒绝**
+  （`dangerous:false` 不等于只读 —— `robot.session.chat` 就是反例），22 条护栏 +
+  8 处变异验证（白名单失效 / 黑名单拼错 id / 非 JSON 分支贴正文 / 键不脱敏 /
+  数组长度丢失 / 口径注释漂移 / 凭证走 argv / CI 误入）。
 
-  CodeRabbit 三轮复审补出三条，都已修：
+  CodeRabbit 三轮复审补出五条，都已处理：
   ① 非 JSON 分支自称「只报类别」却打印 `text.slice(0, 20)` —— 前 20 个字符**就是正文**，
-     破了它自己声明的约束③，且这一支当时没有任何用例；改为 `describeNonJson` 只报
+     破了它自己声明的约束，且这一支当时没有任何用例；改为 `describeNonJson` 只报
      状态码/Content-Type/长度/是否 HTML，哨兵放在正文**最开头**（放在第 20 位之后，
      `slice(0,20)` 的回归照样能通过，那条用例就只是看着像在守）。
   ② `dangerous:false` 被当成只读放行 —— 改用显式 `READ_ONLY_IDS` 白名单，
@@ -47,6 +47,13 @@
   ③ 业务值可能出现在**键**上而不只在值上（`follower`/`customField` 形如
      `{5000004:"张三"}`，键是员工 id）—— `describeShape` 现在把不匹配
      `[A-Za-z_][A-Za-z0-9_]{0,39}` 的键折成 `<redacted-keys>` 计数。
+  ④ 数组长度丢失，1 条与 8 条在元素形状相同时输出完全一样，无法支撑任何计数观测 ——
+     改为 `{array: 长度, element: 形状}`；空数组只报 `{array:'empty'}`，不多带一个
+     什么都没说的 `element: 'undefined'`。
+  ⑤ ASCII 人名当键挡不住（`{AliceSmith:'x'}` 会原样打印）—— **不扩正则硬堵**
+     （那要靠「已知字段名」白名单，会让采样器失去发现新字段的能力），改为把口径
+     收窄：保证「不含**值**」，并写明「键名会上屏，别整段当可公开样本贴出去」；
+     用例同时钉住行为与这句口径，防止它悄悄漂回「不含任何标识信息」。
 
 - **只读诊断 hint 不带存储选择：照做会去读默认库，Agent 据此断定「表真的不存在」（#45 边界 ②）**。
   2026-10-30 补全与上一条同族的另一半：上一条只修了**恢复**命令（`store init` / `sync run`），

@@ -1,9 +1,9 @@
 // tests/registry/sample.test.ts —— 采样器（scripts/registry/sample.mjs）的三条硬约束。
 //
 // ⚠️ 为什么这几条必须有测试：`scripts/registry/sample.mjs` 是**唯一会带着真实凭证
-// 打生产接口**的脚本，而它的三条约束（签名单一实现点 / 凭证只从 env / 输出不含业务值）
-// 全都是「不做某件事」型契约 —— 不做的事没有输出，也就没有别的地方能发现它被违反。
-// 它们坏掉的方式都很安静：
+// 打生产接口**的脚本，而它的三条约束（签名单一实现点 / 凭证只从 env /
+// **值不上屏**）全都是「不做某件事」型契约 —— 不做的事没有输出，也就没有别的地方
+// 能发现它被违反。它们坏掉的方式都很安静：
 //   · 有人把 checksum 抄一份进脚本 → 两份实现漂移，症状是线上 14500 查不出原因；
 //   · 有人图省事加个 `--key` 参数 → 凭证进 shell 历史 / `ps` / CI 日志；
 //   · 有人把 `describeShape` 改成返回原值 → 真实客户数据上屏，采样者顺手贴进工单。
@@ -42,12 +42,15 @@ describe('describeShape —— 只有结构，没有业务值', () => {
     }
     // 结构本身必须还在 —— 否则"不含值"可以靠返回空对象作弊
     expect(JSON.parse(text).data.name).toBe('string')
-    expect(JSON.parse(text).data.list).toEqual({ array: { content: 'string' } })
+    expect(JSON.parse(text).data.list).toEqual({ array: 1, element: { content: 'string' } })
   })
 
-  it('数组只给长度与首元素形状（空数组显式标 empty，不是 null）', () => {
+  it('数组给长度与首元素形状（空数组显式标 empty，不是 null）', () => {
     expect(describeShape([])).toEqual({ array: 'empty' })
-    expect(describeShape([1, 2, 3])).toEqual({ array: 'number' })
+    expect(describeShape([1, 2, 3])).toEqual({ array: 3, element: 'number' })
+    // ⚠️ 长度必须进描述：元素形状相同的数组靠长度区分 —— 采样要能支撑"这一批 N 条"的
+    // 观测，而 1 条与 8 条在元素形状相同时此前输出完全一样，无法支撑任何计数断言。
+    expect(describeShape([{}, {}])).toEqual({ array: 2, element: {} })
     expect(describeShape(null)).toBe('null')
     // 超过深度上限只报类型名，不无限展开
     expect(describeShape({ a: { b: { c: { d: 1 } } } }, 0)).toEqual({
@@ -70,11 +73,28 @@ describe('describeShape —— 只有结构，没有业务值', () => {
     expect(describeShape({ 111: 'a', 222: 'b' })).toEqual({ '<redacted-keys>': 2 })
   })
 
+  it('ASCII 形态的键**挡不住** —— 这是记录在案的边界，不是"没发现"', () => {
+    // ⚠️ CodeRabbit 2026-10-30 指出：`SAFE_KEY` 接受 `AliceSmith`，所以把 ASCII 人名
+    // 当键时会打印出来。这条**不是缺陷豁免，是把边界的形状钉住**：
+    //   · 要彻底挡住，只能用「已知 schema 字段名」白名单 —— 而那会让采样器失去
+    //     发现新字段的能力（它的全部用途就是看有哪些字段）；
+    //   · 所以工具改口径：保证「不含**值**」，并在文件头与 SAFE_KEY 注释里写明
+    //     「键名会上屏、别整段当可公开样本贴出去」。
+    // 这条用例守住"口径不许再漂回不含任何标识信息"：头部注释必须写着这句话，
+    // 且行为与注释一致（ASCII 键确实会原样出现）。
+    const s = describeShape({ AliceSmith: 'x' }) as Record<string, unknown>
+    expect(s).toEqual({ AliceSmith: 'string' })   // 行为：ASCII 键照旧打印
+    const src = read(SAMPLE_SRC)
+    expect(src, '文件头必须写明：键名会上屏，保证的是「不含值」而不是「不含标识信息」')
+      .toMatch(/键名会上屏/)
+    expect(src).toMatch(/不含值/)
+  })
+
   it('形状 C 的 message 只报「种类」与解析后的结构，不报内容', () => {
     const raw = { code: 200, message: JSON.stringify({ total: 104170, tickets: [{ content: 'SENTINEL-TICKET' }] }) }
     const s = summarize(raw) as Record<string, unknown>
     expect(s.message).toBe('json-string:object')
-    expect(s.messageShape).toEqual({ tickets: { array: { content: 'string' } }, total: 'number' })
+    expect(s.messageShape).toEqual({ tickets: { array: 1, element: { content: 'string' } }, total: 'number' })
     expect(JSON.stringify(s)).not.toContain('SENTINEL-TICKET')
     expect(JSON.stringify(s)).not.toContain('104170')
   })
@@ -91,7 +111,7 @@ describe('describeShape —— 只有结构，没有业务值', () => {
   it('裸数组：顶层标 <array>，形状挂在 shape 上', () => {
     const s = summarize([{ id: 1, name: 'SENTINEL-NAME' }]) as Record<string, unknown>
     expect(s.top).toBe('<array>')
-    expect(s.shape).toEqual({ array: { id: 'number', name: 'string' } })
+    expect(s.shape).toEqual({ array: 1, element: { id: 'number', name: 'string' } })
     expect(JSON.stringify(s)).not.toContain('SENTINEL-NAME')
   })
 })

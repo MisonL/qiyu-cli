@@ -17,9 +17,13 @@
 //      代价：脚本要求先 build。这是刻意的取舍，不是遗漏。
 //   ② **凭证只从环境变量读**（`QIYU_APP_KEY` / `QIYU_APP_SECRET`），绝不从 argv ——
 //      与 `auth login` 同一条规则：argv 会进 shell 历史、`ps`、CI 日志。
-//   ③ **输出只有形状，没有业务值**：`describeShape` 把每个叶子折成类型名，
-//      数组只给长度。采样时人会把终端输出贴进对话/工单，业务值一旦上屏就可能
-//      永久留存 —— 而这里的样本是真实客户数据。
+//   ③ **值永不上屏**：`describeShape` 把每个叶子折成类型名。采样时人会把终端输出贴进
+//      对话/工单，值一旦上屏就可能永久留存 —— 而这里的样本是真实客户数据。
+//      ⚠️ **键名会上屏**（见下方 SAFE_KEY 的说明）：字段名本身就是采样要记录的东西
+//      （`staffInfo` / `questionList` 这些正是要写进 note 的），而"一个 ASCII 客户名
+//      恰好被当作键"与"一个字段名"在字面上无从区分。所以本工具的保证是**不含值**，
+//      不是"不含任何标识信息" —— 输出里会出现字段名，别整段当作可公开样本贴出去。
+//      标识符形态的键（数字 id、中文、含空格等）照旧折成计数，实测里员工 id 就是这种。
 
 import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
@@ -37,6 +41,10 @@ const MAX_DEPTH = 3
  * **键**上而不是值上 —— 七鱼工单的 `follower` / `customField` 就是
  * `{5000004:"张三"}`（设计稿 §10.2 记载），键是员工 id；把电话号码当键的接口同样存在。
  * 只折值不折键的写法会把这些标识符原样打到终端。
+ *
+ * ⚠️ 这只挡**非标识符形态**的键（数字/中文/空格）。一个长得像字段名的 ASCII 值
+ * （人名 `AliceSmith`）当键时，正则无法与真字段名区分 —— 那是"不含值"这个目标
+ * 的固有边界，见文件头③。本工具保证「不含值」，不冒充「不含任何标识信息」。
  */
 const SAFE_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/
 /** 不满足 SAFE_KEY 的键统一折成这个名字 + 计数（同名多键会撞，所以只报数量）。 */
@@ -52,7 +60,10 @@ export function describeShape(value, depth = 0) {
   if (value === null) return 'null'
   if (Array.isArray(value)) {
     if (depth >= MAX_DEPTH) return 'array'
-    return { array: value.length === 0 ? 'empty' : describeShape(value[0], depth + 1) }
+    // 空数组没有"元素形状"可言 —— 只报 empty，不要多带一个 `element: 'undefined'`
+    // （那是 `describeShape(undefined)` 的返回值，看着像个真类型，其实什么都没说）。
+    if (value.length === 0) return { array: 'empty' }
+    return { array: value.length, element: describeShape(value[0], depth + 1) }
   }
   if (typeof value === 'object') {
     if (depth >= MAX_DEPTH) return 'object'
