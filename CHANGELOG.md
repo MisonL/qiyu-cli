@@ -27,11 +27,26 @@
 
   实测同时修正两处**文档与实测不符**的旧断言：
   · `ticket.list` 的 `staffId` 非法时返回 **`code:14100`** + 纯文本 `Bad holder staff id`，
-    不是「形状 C 的错误也都返回 code:200」—— 该量词从信封注释与设计稿 §9.0 收回；
+    不是「形状 C 的错误也都返回 code:200」—— 该量词已从 `src/core/envelope.ts` 的注释收回
+    （设计稿 §9.0 的同源表述随文档一致性一并回写）；
   · `ticket.log` / `ticket.new.detail` 实测成功信封是 `{code,data}`（**无 message**）。
-  新增可重复采样器 `scripts/registry/sample.mjs`（只读接口、拒绝危险写接口；凭据只从 env
-  读；输出只含结构不含业务值），带 14 条护栏（签名复用 `dist/core/sign.js` 单一实现点、
-  凭证不进 argv、输出不含哨兵值、不进 CI）。
+
+  新增可重复采样器 `scripts/registry/sample.mjs`：凭据只从 env 读、签名复用
+  `dist/core/sign.js`（单一实现点）、输出只含结构不含业务值、**只读白名单默认拒绝**
+  （`dangerous:false` 不等于只读 —— `robot.session.chat` 就是反例），21 条护栏 +
+  6 处变异验证（白名单失效 / 黑名单拼错 id / 非 JSON 分支贴正文 / 键不脱敏 /
+  凭证走 argv / CI 误入）。
+
+  CodeRabbit 三轮复审补出三条，都已修：
+  ① 非 JSON 分支自称「只报类别」却打印 `text.slice(0, 20)` —— 前 20 个字符**就是正文**，
+     破了它自己声明的约束③，且这一支当时没有任何用例；改为 `describeNonJson` 只报
+     状态码/Content-Type/长度/是否 HTML，哨兵放在正文**最开头**（放在第 20 位之后，
+     `slice(0,20)` 的回归照样能通过，那条用例就只是看着像在守）。
+  ② `dangerous:false` 被当成只读放行 —— 改用显式 `READ_ONLY_IDS` 白名单，
+     默认拒绝，加接口必须有人写下"它是只读的"。
+  ③ 业务值可能出现在**键**上而不只在值上（`follower`/`customField` 形如
+     `{5000004:"张三"}`，键是员工 id）—— `describeShape` 现在把不匹配
+     `[A-Za-z_][A-Za-z0-9_]{0,39}` 的键折成 `<redacted-keys>` 计数。
 
 - **只读诊断 hint 不带存储选择：照做会去读默认库，Agent 据此断定「表真的不存在」（#45 边界 ②）**。
   2026-10-30 补全与上一条同族的另一半：上一条只修了**恢复**命令（`store init` / `sync run`），

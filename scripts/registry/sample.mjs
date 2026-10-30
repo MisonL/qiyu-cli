@@ -33,7 +33,17 @@ const BASE = 'https://qiyukf.com'
 const MAX_DEPTH = 3
 
 /**
- * 把一个响应值折成「只有结构」的描述。**任何业务值都不出现在返回值里。**
+ * 键名白名单形态：短 ASCII 标识符。**不满足的一律折成计数**，因为业务值可能出现在
+ * **键**上而不是值上 —— 七鱼工单的 `follower` / `customField` 就是
+ * `{5000004:"张三"}`（设计稿 §10.2 记载），键是员工 id；把电话号码当键的接口同样存在。
+ * 只折值不折键的写法会把这些标识符原样打到终端。
+ */
+const SAFE_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/
+/** 不满足 SAFE_KEY 的键统一折成这个名字 + 计数（同名多键会撞，所以只报数量）。 */
+const REDACTED_KEYS = '<redacted-keys>'
+
+/**
+ * 把一个响应值折成「只有结构」的描述。**业务值与被当成键的标识符都不出现在返回值里。**
  *
  * ⚠️ 为什么单独拆成纯函数：不拆的话「输出不含值」这件事就只能靠读代码相信；
  * 拆开后可以被测试证伪（喂进带哨兵值的载荷，断言输出里没有它）。
@@ -47,7 +57,14 @@ export function describeShape(value, depth = 0) {
   if (typeof value === 'object') {
     if (depth >= MAX_DEPTH) return 'object'
     const out = {}
-    for (const k of Object.keys(value).sort()) out[k] = describeShape(value[k], depth + 1)
+    let redacted = 0
+    for (const k of Object.keys(value).sort()) {
+      if (SAFE_KEY.test(k)) out[k] = describeShape(value[k], depth + 1)
+      else redacted++
+    }
+    // 数量本身是结构信息（「这里有一批动态键」），名字不是。用固定键名承载计数，
+    // 避免两三个不同 id 作为键时互相覆盖、把数量也丢掉。
+    if (redacted > 0) out[REDACTED_KEYS] = redacted
     return out
   }
   return typeof value
@@ -61,8 +78,12 @@ export function describeShape(value, depth = 0) {
  * 但**绝不给出 message 的内容**（它整段就是业务数据）。
  */
 export function summarize(raw) {
+  // 顶层键同样走白名单：实测到的都是 code/message/data/result/staffInfo/total，
+  // 但采样器的输出安全不能依赖"服务端不会那样返回"——规则统一，才没有漏网的分支。
   const top = Array.isArray(raw) ? '<array>'
-    : raw && typeof raw === 'object' ? Object.keys(raw).sort() : typeof raw
+    : raw && typeof raw === 'object'
+      ? Object.keys(raw).sort().map((k) => (SAFE_KEY.test(k) ? k : REDACTED_KEYS))
+      : typeof raw
   const out = { top, code: raw && typeof raw === 'object' && !Array.isArray(raw) ? raw.code ?? null : null }
   const m = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw.message : undefined
   if (m === undefined) out.message = 'absent'
@@ -86,17 +107,56 @@ export function summarize(raw) {
 }
 
 /**
- * 只放行「可主动调用的只读接口」。
+ * 只放行「人工确认过是只读」的接口 —— **白名单，不是黑名单**。
  *
- * ⚠️ 判据取自注册表，不取自调用方：用例文件里写了 `dangerous: true` 的 id 也必须被拒 ——
- * 一次误发的写请求（例如 `icoutcall.job.create`）不是"采样失败"，是在生产租户里造数据。
- * 而 `inbound` / `callable: false` 的 path 是占位符，拼出来必然 404，属于无意义的调用。
+ * ⚠️ **`dangerous: false` 不等于只读**（CodeRabbit 2026-10-30 指出）。注册表里
+ * `robot.session.chat` 就是 `dangerous:false`，但其 note 写着「会话不存在时**自动创建
+ * 真实会话**」—— 一次成功采样会向生产机器人写入会话数据。
+ *
+ * ⚠️ 为什么是白名单而不是「排除已知会写的」：排除法**默认放行**，下一个
+ * `dangerous:false` 但会写数据的接口（注册表还会继续长）不需要任何人做决定就能被采样；
+ * 白名单**默认拒绝**，加一个接口就必须有人写下"它是只读的"这个判断。采样器的失败方向
+ * 必须是「少采一个，补一行」，不能是「多写一次，无法回滚」。
+ *
+ * ⚠️ 另外三条判据取自注册表，不取自调用方：用例文件里写了 `dangerous: true` 的 id
+ * 也必须被拒 —— 一次误发的写请求不是"采样失败"，是在生产租户里造数据。
  */
+export const READ_ONLY_IDS = new Set([
+  // 2026-10-30 采样时逐个人工核对过「只读」的接口（README/note 依据见各条 note）
+  'ticket.log', 'ticket.new.detail', 'ticket.list',
+  'chat.queue.group.query',
+  'ipcc.calltaskdetail.get', 'ipcc.calltask.get', 'ipcc.customfield.template.get',
+  'robot.session.commonQuestions', 'robot.session.msgPredict',
+  'event.queryQueueStatus',
+  'merchant.list', 'merchant.query',
+  'icoutcall.callIntercept.list', 'icoutcall.dialogFlow.fuzzySearch',
+  'icoutcall.dialogFlow.getDialogFlowList', 'icoutcall.get.customer',
+  'icoutcall.get.jobdetail', 'icoutcall.get.jobproperties', 'icoutcall.phone.getLineList',
+])
+/**
+ * 明确**不采**的接口：`dangerous:false` 但有写行为。列在这里是为了让下一个人看到
+ * 「为什么这个明显可调用的接口没在白名单里」—— 否则它看起来像漏登记。
+ * ⚠️ 名单成员必须能在注册表 note 里找到依据（测试钉住），防止「凭印象塞进黑名单、
+ * 而注册表早已把它标成别的」的漂移。
+ */
+export const WRITE_EFFECT_IDS = new Set([
+  'robot.session.chat',   // note：会话不存在时自动创建真实会话
+])
+
 export function assertSampleable(spec, id) {
   if (!spec) throw new Error(`用例里的 id 不在注册表里：${id}`)
   if (spec.dangerous) throw new Error(`拒绝采样危险写接口：${id}（dangerous:true）—— 采样不得改动生产数据`)
   if (!spec.callable) throw new Error(`拒绝采样不可主动调用的接口：${id}（callable:false，path 是占位符）`)
   if (spec.path === null) throw new Error(`拒绝采样没有可用 path 的接口：${id}`)
+  if (WRITE_EFFECT_IDS.has(id)) {
+    throw new Error(`拒绝采样有写行为的接口：${id}（注册表 note 注明会改动生产数据）—— 采样只允许只读`)
+  }
+  if (!READ_ONLY_IDS.has(id)) {
+    throw new Error(
+      `拒绝采样未经确认只读的接口：${id} —— dangerous:false 不代表只读。` +
+      '确认它没有写副作用后，把 id 加进本文件的 READ_ONLY_IDS 白名单（这是一次需要人做出的判断）',
+    )
+  }
 }
 
 /** 把「缺凭据」这件事说清楚，且**不打印任何凭据**（连长度都不打印，见用例）。 */
