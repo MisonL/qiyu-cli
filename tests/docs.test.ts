@@ -6,6 +6,19 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (p: string): string => readFileSync(join(root, p), 'utf8')
 
 /**
+ * README 的「尚未实现」清单段；**段不存在时返回 null，而不是空串**。
+ *
+ * ⚠️ 2026-10-30 修假护栏：六个子项目全部交付后 README 已删掉该段，而旧断言写作
+ * `const notYet = /…/.exec(md)?.[0] ?? ''` 再 `expect(notYet).not.toMatch(…)` ——
+ * 段缺失时 `notYet` 是空串，`.not.toMatch` 恒真。它声称守「已交付命令不得出现在
+ * 未实现清单里」，实际什么都没守。返回 null 让「段不存在」与「段存在但为空」可区分，
+ * 调用方据此二选一断言（不存在 = 全部交付；存在 = 其中不得含已交付命令）。
+ */
+function readmeNotYetSection(md: string): string | null {
+  return /\*\*尚未实现\*\*[\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? null
+}
+
+/**
  * CHANGELOG 的**版本区**（所有 `## [x]` 段，到文件末尾的链接引用块为止）。
  *
  * ⚠️ 为什么从「当前版本段」放宽到「全部版本段」（2026-10-26）：下面这些断言守的是
@@ -153,12 +166,19 @@ describe('readme.test.ts —— C1 追加断言（防文档说假话）', () => 
     expect(md).toMatch(/\[{.*name.*rows.*}\]|\[\{ ?name, ?rows ?\}\]|tables\[.*\].*行数|name.*rows/)
     expect(md).toMatch(/全表.*COUNT|COUNT.*全表|行数.*全表扫描|status.*轮询|轮询.*代价/)
   })
-  it('README 横幅与「尚未实现」清单已更新（I 组 M7：§8.3 第 5 处）', () => {
+  it('README 横幅不谎称「仍在早期」，且不得把已交付命令列为未实现（I 组 M7：§8.3 第 5 处；2026-10-30 修假护栏）', () => {
     const md = read('README.md')
     expect(md).toMatch(/store init\/status 已可用|存储.*已交付/)
-    // 尚未实现清单：查询/同步类仍在「尚未实现」段，store 不在其中
-    const notYet = /尚未实现[\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
-    expect(notYet).not.toMatch(/store init/)
+    // ① 真实事故（2026-10-30）：横幅曾写「本仓库仍在早期：仅实现认证+参数校验+存储基础」，
+    //    与「当前状态」段的「前六个子项目已交付」自相矛盾，且谎称 sync/查询/库未交付。
+    expect(md, '横幅不得声称仓库「仍在早期」').not.toMatch(/仍在早期/)
+    // ② 双向自检：抽取器在事故形态上必须命中（→ ③ 会红），在无该段的合法形态上返回 null。
+    //    确保守卫不是靠恒真的 `not.toMatch` 通过的（那正是本次要修的假护栏）。
+    expect(readmeNotYetSection('**尚未实现**（调用时提示）：`store init`、`sync run`\n\n## 下一步')).toBeTruthy()
+    expect(readmeNotYetSection('## 当前状态\n前六个子项目已交付。')).toBeNull()
+    // ③ 当前真实状态：六个子项目全部交付 → README 不应再有任何「尚未实现」清单。
+    //    将来若重新引入该段（新功能待做），必须同步改这条断言 —— 刻意如此。
+    expect(readmeNotYetSection(md), '六个子项目已全部交付，README 不应再有「尚未实现」清单').toBeNull()
   })
   it('「子项目计数」随交付推进：F 交付后为「前六个」，且不再残留旧计数', () => {
     // 该锚最初（C1 组）钉的是「前两个子项目」不动裁决；E 交付后改成「前五个」，
@@ -212,14 +232,24 @@ describe('D 同步引擎交付联动 —— 不得说假话（D-T15）', () => {
     expect(md).toMatch(/sync verify/)
     expect(md).toMatch(/src\/sync\//)
   })
-  it('README 横幅与「尚未实现」清单：同步与查询均已交付', () => {
+  it('README 已交付的同步与查询命令未被列为未实现（2026-10-30 修假护栏）', () => {
     const md = read('README.md')
     expect(md).toMatch(/同步.*已交付|已交付.*同步/)
     expect(md).toMatch(/查询.*已交付|已交付.*查询/)
-    const notYet = /\*\*尚未实现\*\*（调用时[\s\S]*?(?=\n## |$)/.exec(md)?.[0] ?? ''
-    expect(notYet).not.toMatch(/sync run/)
-    // E 交付后查询命令不得再出现在「尚未实现」清单里（只允许 F 的 Skill 待做）
-    expect(notYet).not.toMatch(/qiyu query|`db tables`|`stats fields`/)
+    // 旧断言把「尚未实现」段切出来再断言其中不含 sync run / qiyu query —— 但该段已被删除，
+    // 切片恒为空串、断言恒真（假护栏）。现在按段存在与否二选一：
+    //   · 段存在（将来回归）：其中不得出现这些已交付命令；
+    //   · 段不存在（当前真实状态）：改由「当前状态」段逐条列出它们，证明它们确实被声明为已交付。
+    const notYet = readmeNotYetSection(md)
+    if (notYet !== null) {
+      expect(notYet, '「尚未实现」段不得包含已交付命令').not.toMatch(/sync run|qiyu query|`db tables`|`stats fields`/)
+    } else {
+      const current = /## 当前状态[\s\S]*?(?=\n## )/.exec(md)?.[0] ?? ''
+      expect(current, '「当前状态」段必须存在').not.toBe('')
+      for (const cmd of ['sync run', 'db tables', 'query --table', 'stats fields']) {
+        expect(current, `「当前状态」段必须列已交付命令：${cmd}`).toContain(cmd)
+      }
+    }
   })
   it('README 依赖分述：sync 零常规运行时依赖（fflate 只在 devDependencies，仅测试夹具用）', () => {
     const md = read('README.md')

@@ -228,6 +228,31 @@ export function loadSpecs(raw: unknown): EndpointSpec[] {
           '合法值为 checksum / eventType / none。',
       )
     }
+    // ⚠️ **不变量：可调用 ⇒ auth 必须是 checksum**（2026-10-30 加）。
+    //
+    // `call()` 对**所有**出站请求无条件签名（`http.ts` 里没有 `auth` 分支），所以
+    // 一条 `callable: true` + `auth !== 'checksum'` 的记录，其 `auth` 值与实际
+    // 发出的请求**互相矛盾** —— Agent 若依据 `api schema` 里这个值判断「调它不用签名」，
+    // 会得到一个与真实契约不符的结论（契约诚实性缺陷：声明了但没人读、且与行为相反）。
+    //
+    // 当前实测（2026-10-30）：154 条里 136 条 `checksum|callable`、7 条 `none|noncallable`、
+    // 2 条 `checksum|noncallable`、9 条 `eventType|noncallable` —— **没有**任何
+    // `callable && auth!=='checksum'`。所以这条不变量今天恒真，它守的是**将来**：
+    // 一旦有人接入一个「不需要签名」的出站接口并标 callable，加载期立刻炸，
+    // 逼他要么在 `call()` 里补上不签名分支、要么把 auth 改对，**不允许**带着
+    // 矛盾的声明上线。
+    //
+    // 这里**刻意不**在 `http.ts` 加 `if (spec.auth === 'none') 不签名` 的分支 ——
+    // 那会是一条当前不可达的死分支（没有可调用的 none 接口），是等价变异。等真有
+    // 这样的接口时，这条不变量会先炸，开发者据此再补分支，而不是现在就凭空写。
+    if (o.callable === true && o.auth !== 'checksum') {
+      throw new Error(
+        `specs.json[${o.id}] 标记为可调用，但 auth 是 ${JSON.stringify(o.auth)}。` +
+          'call() 对所有出站请求无条件签名，可调用接口的 auth 必须是 checksum —— ' +
+          '这一对矛盾说明「声明」与「实际请求」不一致，不允许上线。' +
+          '（若确有免签名接口，先给 call() 加不签名分支，再放开这条不变量。）',
+      )
+    }
     return o as unknown as EndpointSpec
   })
 }

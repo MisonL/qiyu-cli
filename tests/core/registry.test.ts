@@ -540,16 +540,37 @@ describe('loadSpecs —— 加载期校验（唯一挡住门禁 fail-open 的地
     }
   })
 
-  it('auth 缺失或非法时抛错 —— 它决定将来是否签名', () => {
-    // ⚠️ 本计划的 `call()` 无条件签名，不读 `auth`（见「已知缺口」）——
-    // 但字段本身必须是合法枚举：生成脚本产出 154 条时，一个拼错的 auth
-    // 会让"这个接口是否需要签名"这个决定失去依据，而它现在没人读、
-    // 将来一定会被读（`auth: 'none'` 的接口不该签名）。
+  it('auth 缺失或非法时抛错 —— 它决定接口是否需要签名', () => {
+    // ⚠️ `call()` 目前无条件签名（2026-10-30 起有加载期不变量兜底，见下一条）——
+    // 字段本身必须是合法枚举：生成脚本产出 154 条时，一个拼错的 auth
+    // 会让"这个接口是否需要签名"这个决定失去依据。
     const { auth: _drop, ...noAuth } = base
     expect(() => loadSpecs([noAuth])).toThrow(/auth/)
     expect(() => loadSpecs([{ ...base, auth: 'checkum' }])).toThrow(/auth/)
+    // 三种合法枚举在 `callable: false` 下都通过（入站推送的 eventType、文档外接口的 none）
     for (const a of ['checksum', 'eventType', 'none']) {
-      expect(() => loadSpecs([{ ...base, auth: a }]), a).not.toThrow()
+      expect(() => loadSpecs([{ ...base, callable: false, path: null, auth: a }]), a).not.toThrow()
+    }
+  })
+
+  it('可调用 ⇒ auth 必须是 checksum —— 声明与「无条件签名」不允许互相矛盾（2026-10-30 加）', () => {
+    // ⚠️ 为什么这条不变量存在：`call()` 对**所有**出站请求无条件签名（http.ts 无 auth
+    // 分支），所以一条 `callable: true` + `auth !== 'checksum'` 的记录，其 auth 值与
+    // 实际发出的请求互相矛盾 —— Agent 依据 `api schema` 里这个值判断"调它不用签名"
+    // 会得到与真实契约相反的结论。
+    // 实测（2026-10-30）：154 条里 136 条 checksum|callable、7 条 none|noncallable、
+    // 2 条 checksum|noncallable、9 条 eventType|noncallable —— 无任何矛盾组合，
+    // 这条不变量今天恒真，守的是将来（接入免签名出站接口时加载期立刻炸，
+    // 逼开发者先给 call() 加不签名分支，而不是带着矛盾声明上线）。
+    expect(() => loadSpecs([{ ...base, auth: 'none' }])).toThrow(/无条件签名|auth/)
+    expect(() => loadSpecs([{ ...base, auth: 'eventType' }])).toThrow(/无条件签名|auth/)
+    // 反向：合法组合必须通过 —— callable+checksum，以及各非 checksum 的不可调用形态
+    expect(() => loadSpecs([{ ...base, auth: 'checksum' }])).not.toThrow()
+    expect(() => loadSpecs([{ ...base, callable: false, path: null, auth: 'none' }])).not.toThrow()
+    expect(() => loadSpecs([{ ...base, callable: false, path: null, auth: 'eventType' }])).not.toThrow()
+    // 真实注册表必须整体通过这条不变量（防止 specs.json 出现矛盾组合）
+    for (const e of allEndpoints()) {
+      if (e.callable) expect(e.auth, `${e.id} 可调用但 auth=${e.auth}`).toBe('checksum')
     }
   })
 

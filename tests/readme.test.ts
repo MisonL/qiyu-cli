@@ -50,14 +50,25 @@ describe('联动文案（B 上线后不得与事实相反）', () => {
   })
   it('验收 23/32：横幅句、命令一览、已实现清单钉到各自行（非全仓泛匹配）', () => {
     const md = read('README.md')
-    // 横幅是引用块（行首 `> `）——锚到行首，避免命中 README:139 正文（否则横幅不改也绿）
-    expect(md).toMatch(/^> .*已实现.*通用 API 通道.*API 参数校验/m)
+    // 横幅是引用块（行首 `> `）——锚到行首，避免命中正文（否则横幅不改也绿）。
+    // ⚠️ 2026-10-30：横幅重写时把「已实现」改成了「已交付」（原句"本仓库仍在早期：已实现…"
+    // 与「当前状态」段矛盾已被删）。断言钉的是"横幅点名了 通用 API 通道 + API 参数校验"这个
+    // 事实，不是具体动词 —— 故两者都接受。
+    expect(md).toMatch(/^> .*(?:已实现|已交付).*通用 API 通道.*API 参数校验/m)
     expect(md).toMatch(/^qiyu api call <id> \[--body <JSON>\] \[--yes\] \[--no-validate\] \[--strict\]/m)
     expect(md).toMatch(/^qiyu api schema <id>/m)
-    // 段级两向：新事实必须进「已实现」段、旧 bullet 必须从「尚未实现」段移除（spec §八之二 ⑯）
-    const impl = md.slice(md.indexOf('**已实现**'), md.indexOf('**尚未实现**'))
+    // 「已实现」段：新事实（参数校验 / api schema）必须落在其中。
+    // ⚠️ 2026-10-30 修假护栏：旧写法 `md.slice(indexOf('**已实现**'), indexOf('**尚未实现**'))`
+    // 在「尚未实现」段被删后 end=-1，切片退化成"到倒数第一个字符"；下一步
+    // `md.slice(indexOf('**尚未实现**'))` = `md.slice(-1)` 只查最后一个字符 —— 断言恒真。
+    // 改为按「当前状态」小节标题（下一个 `## `）切片，并把"旧 bullet 不得残留"改为全文否定。
+    const implStart = md.indexOf('**已实现**')
+    expect(implStart, '「已实现」段必须存在').toBeGreaterThanOrEqual(0)
+    const nextHeading = md.indexOf('\n## ', implStart)
+    const impl = md.slice(implStart, nextHeading === -1 ? undefined : nextHeading)
     expect(impl).toMatch(/参数校验|api schema/)
-    expect(md.slice(md.indexOf('**尚未实现**'))).not.toMatch(/请求参数校验：/)
+    // 旧 bullet「请求参数校验：」是"未实现"清单里的条目；六个子项目交付后它不得在任何处残留
+    expect(md, '旧的未实现 bullet 不得残留').not.toMatch(/请求参数校验：/)
     // spec ⑰：strict 误拒口径必须写明「严格」或「参数表闭集」
     expect(md).toMatch(/严格|参数表闭集/)
   })
