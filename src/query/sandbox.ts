@@ -18,7 +18,7 @@
 // M-4 后下沉，让 query/ 的依赖面与 spec 白名单逐字一致），两条路径的 hint 逐字一致由它保证。
 //
 // ⚠️ 依赖加载：`@duckdb/node-api` 只经 dynamic import（与 store/duckdb.ts 同款惰性边界）。
-import { isLockError, retryWithBackoff, isModuleNotFound } from '../store/retry.js'
+import { isLockError, retryWithBackoff, isModuleNotFound, classifyOpenFailure, NOT_DUCKDB_HINT, PERMISSION_HINT } from '../store/retry.js'
 import type { ErrorKind } from '../core/errors.js'
 import type { StoreConfig } from '../store/types.js'
 import { storeInitCommand } from '../output.js'
@@ -398,6 +398,20 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
     if (isLockError(e)) throw lockedError(cfg)
     // 其余打开失败（库不存在 / 非 DuckDB 文件 / 权限）→ store_not_initialized（spec §十一：
     // 库不存在 → 退出码 1、hint 指 `qiyu store init`）。底层原文保留在 message 里。
+    // ⚠️ 成因分流走 `store/retry.ts` 的 `classifyOpenFailure`（2026-10-31 单一实现点）：
+    // 判据与 hint 口径必须与 `commands/store.ts` 的 `thrownToExit`、`sync-run.ts` 的
+    // `storeInitFail` 一致 —— 此前三处各写各的，
+    // 同一个 `chmod 000` 的文件在 `store status` 与 `query` 上给出**互相矛盾**的 hint
+    //（store 说「检查读写权限」、query 却说「请确认文件存在且由本 CLI 创建，跑 store init」）。
+    // 判据本身的形态要求（DuckDB 原生报文、strerror 在句尾、锚 `$` 不能子串搜）见 retry.ts。
+    const openFailure = classifyOpenFailure(e)
+    if (openFailure !== null) {
+      throw sandboxError(
+        'store_not_initialized',
+        `无法打开数据库：${e instanceof Error ? e.message : String(e)}`,
+        { hint: openFailure.cause === 'permission' ? PERMISSION_HINT : NOT_DUCKDB_HINT },
+      )
+    }
     throw sandboxError(
       'store_not_initialized',
       `无法打开数据库：${e instanceof Error ? e.message : String(e)}`,

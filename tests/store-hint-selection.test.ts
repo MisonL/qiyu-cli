@@ -245,12 +245,17 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
       try { await conn.run(sql) } finally { conn.closeSync?.(); inst.closeSync() }
     }
 
-    // ① 不是 DuckDB 文件 → sandbox 的「请确认…由本 CLI 创建（store init）」hint
+    // ① 不是 DuckDB 文件 → sandbox 的「该路径已存在且不是 DuckDB 数据库，请换 --db 路径」hint
+    //    ⚠️ 2026-10-31：成因分流收敛到 `store/retry.ts` 的 `classifyOpenFailure` 后，
+    //    「不是 DuckDB 文件」的 hint 与 `store status` 同口径（换 --db 路径），不再给
+    //    「请确认…由本 CLI 创建（store init）」—— 后者会引导 Agent 往一个非 DuckDB 文件上
+    //    跑 `store init`（store init 也会拒绝它，是死路）。判据与三处共用见那三个文件的注释。
     const bogus = dbPath('not-a-db.duckdb')
     writeFileSync(bogus, 'this is not duckdb')
     out = ''
     expect(await dbCommand(['tables', '--db', bogus])).toBe(1)
-    expect(String(errorOf().hint), '打开失败').toContain(storeInitCommand(bogus))
+    expect(String(errorOf().hint), '打开失败').toContain('该路径已存在且不是 DuckDB 数据库')
+    expect(String(errorOf().hint), '不得再引导向 store init（对非 DuckDB 文件是死路）').not.toContain('store init')
 
     // ② 脏时间值 → db tables 的 query --sql 建议
     const dirty = dbPath('dirty.duckdb')

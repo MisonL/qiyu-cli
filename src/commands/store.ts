@@ -6,6 +6,7 @@ import { openStore } from '../store/index.js'
 import {
   ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty, storeInitCommand,
 } from '../output.js'
+import { classifyOpenFailure, NOT_DUCKDB_HINT, PERMISSION_HINT } from '../store/retry.js'
 import { parseStoreFlags } from './store-flags.js'
 import { storeFieldNotes } from './store-notes.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
@@ -59,27 +60,20 @@ export function thrownToExit(e: unknown): number {
   // ① DuckDB 拒绝打开非 DuckDB 文件 / 执行期错误 → 环境/数据问题，退出码 1、internal；
   // ② 其余 → 用法错误，退出码 2（usageFail 双通道）。
   const msg = err.message ?? String(e)
-  if (/not a valid DuckDB database/i.test(msg)) {
+  // ⚠️ 打开失败的成因分流走 `store/retry.ts` 的 `classifyOpenFailure`（2026-10-31 单一实现点）：
+  // 判据与 hint 口径必须与 `query/sandbox.ts` 的 `openSandbox`、`sync-run.ts` 的
+  // `storeInitFail` 一致 —— 此前三处各写各的，
+  // 同一个 `chmod 000` 的文件在 `store status` 与 `query` 上给出**互相矛盾**的 hint
+  // （一个说「检查读写权限」、一个说「请确认文件存在且由本 CLI 创建，跑 store init」）。
+  // 判据本身的形态要求（DuckDB 原生报文、strerror 在句尾、锚 `$` 不能子串搜）见那里的注释。
+  const openFailure = classifyOpenFailure(e)
+  if (openFailure?.cause === 'permission') {
     return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `无法打开 ${msg}`, hint: '该路径已存在且不是 DuckDB 数据库，请换 --db 路径' })
+      message: `无法打开 ${msg}`, hint: PERMISSION_HINT })
   }
-  // ⚠️ open/执行期 errno 分流（R 组 R6；2026-10-31 实测重写判据）：EACCES/EPERM/EROFS 是
-  // 环境问题不是程序错误，归因必须准。**原判据 `/^(EACCES|EPERM|EROFS)/` 是死分支**——
-  // 它按 Node fs 的报文形态（`EACCES: permission denied, open '…'`）写成前缀锚定，但
-  // 到达本函数的只有 **DuckDB 原生错误**（store 链路零 `node:fs`，lstat/stat/mkdir 的
-  // errno 分流都在命令层就地完成，见上），其报文是
-  // `IO Error: Cannot open file "…": Permission denied` —— errno 的 strerror 文本在**句尾**、
-  // `e.code` 为 undefined。实测（探针 + E2E 双层）三种形态：
-  // `: Permission denied`(EACCES) / `: Operation not permitted`(EPERM) /
-  // `: Read-only file system`(EROFS)。原判据一个都匹配不上 → 真实权限错误全部落进下方
-  // internal 兜底，hint 把 Agent 指向「检查数据库状态」，归因是错的。
-  // ⚠️ 判据必须锚**句尾的 strerror**（`:` + 分隔符 + 结尾），不能只搜子串：路径里可能
-  // 恰好含这些词（`/tmp/Permission denied.db`），子串判会把「路径含该词、真因是别的」
-  // 误判成权限错误。`Cannot open file "…": <reason>` 是 DuckDB 的固定模板，真因在冒号后。
-  // hint 保持**读写中性**：status/query 是只读命令，说「写权限」会把只读者引向 init。
-  if (/:\s*(Permission denied|Operation not permitted|Read-only file system)\s*$/.test(msg)) {
+  if (openFailure?.cause === 'not_duckdb') {
     return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `无法打开 ${msg}`, hint: '请检查路径与所在目录的读写权限（磁盘只读也会导致无法打开）' })
+      message: `无法打开 ${msg}`, hint: NOT_DUCKDB_HINT })
   }
   // ⚠️ internal 兜底（第四轮 I 组 H1/M8 修）：spec §8.2 禁止把 DuckDB 英文原文裸透
   // 给 Agent —— 必须中文包装 + 底层原文；hint 中性化（status 只读路径也会走到这里，

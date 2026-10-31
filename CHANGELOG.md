@@ -122,6 +122,54 @@
 
 ### 修复
 
+- **同一起因、两个命令族、两种说法：「打开库文件失败」的解码规则收敛到单一实现点**。
+  上一轮修掉 `thrownToExit` 的死分支后，`--db` 指向同一个 `chmod 000` 的文件时，
+  七个命令给出的 hint 仍然**互相矛盾**：`store status` / `sync status` / `sync install`
+  说「请检查路径与所在目录的读写权限」，而 `db tables` / `query` / `stats fields` /
+  `db describe` 说「请确认数据库文件存在且由本 CLI 创建（`qiyu store init …`）」
+  —— 后者对权限问题**必然再失败**（文件就在那儿，`store init` 也打不开它）。
+  根因是同一份判据被复制到三处：`commands/store.ts`、`query/sandbox.ts`、
+  `commands/sync-run.ts` 各写各的正则、各配各的文案。
+  这是本仓库记录过的形态「同一份解码规则复制到多处 → 同一输入两个结论」的又一实例
+  （前科：`nonEmptyValue` 的空串判据收敛、profile 名解析）。
+
+  **修法**：新增 `src/store/retry.ts` 的 `classifyOpenFailure(e): OpenFailure | null`
+  作为**唯一实现点**（`{ cause: 'not_duckdb' } | { cause: 'permission' }`），
+  连同两份 hint 文案常量 `NOT_DUCKDB_HINT` / `PERMISSION_HINT` 一并收在那里；
+  三处调用点改为消费分类结果，删掉各自的正则与文案。放 `store/retry.ts` 是因为
+  query 层有 import 白名单（查询接口与沙箱 spec），而该文件是纯函数、已在白名单内
+  —— 收敛不需要放宽分层约束。
+
+  **`isModuleNotFound` 只认 ESM 错误码，平台 binding 缺失的生产路径从不命中**（同一轮发现）。
+  原判据要求 `e.code === 'ERR_MODULE_NOT_FOUND'`，而该码只在 **ESM 解析**阶段出现，
+  能命中它的 specifier 恒是 `@duckdb/node-api` 本身（整个包不装时）。
+  **平台子包缺失**是另一条路径：`@duckdb/node-bindings` 内部走 **CJS `require`**
+  （`require('@duckdb/node-bindings-<平台>/duckdb.node')`），抛出的 `e.code` 是
+  **`MODULE_NOT_FOUND`**（无 `ERR_` 前缀）。实测（删掉平台包后真跑）：
+  `code = "MODULE_NOT_FOUND"`、`msg = "Cannot find module '@duckdb/node-bindings-darwin-x64/duckdb.node'"`。
+  只认 ESM 码时这条一路返回 `null` → `depError` 的二分退化成单分支，
+  **「当前平台无预编译包」那句 hint 在生产上从未被执行过**，Agent 拿到的是
+  「未安装 DuckDB 依赖，请 `npm install @duckdb/node-api`」—— 而 `@duckdb/node-api`
+  **本来就装着**（缺的是它的平台子包），照 hint 重装修不好。这正是该分支存在的唯一理由
+  （`optionalDependency` 在不支持的平台漏装）。判据改为同时接受两种码，
+  报文两种形态都覆盖（ESM `Cannot find package '…'` / CJS `Cannot find module '…'`）。
+
+  测试：`tests/store/retry.test.ts` 新增 `classifyOpenFailure` 四条（含双向近似命中：
+  路径含该措辞但真因是权限 → `permission`；路径含该措辞但真因是别的 → `null`）；
+  `tests/store/errors.test.ts` 的 `isModuleNotFound` 夹具换成**真实形态**
+  （`code: 'MODULE_NOT_FOUND'` + `Cannot find module '@duckdb/node-bindings-<平台>/duckdb.node'`）
+  并补反向自检（缺 `@duckdb/node-api` 本身时**不得**给平台 hint）；
+  `tests/store-hint-selection.test.ts` 与 `tests/commands/query.test.ts` 的断言改为统一文案
+  并加反向检查（非 DuckDB 文件的 hint **不得**再引导向 `store init` —— 那是死路）；
+  新增 `tests/open-failure-single-source.test.ts` 漂移守卫（扫描器 + 扫描器自身的双向自检：
+  三条真实事故原文必红、调用点与 Node `fs` errno 判据必放过、注释里的反例不算违规）。
+  **变异验证 9 处**：`sync-run.ts` 判据退回自写子串 → 守卫红；把权限判据复制进
+  `src/commands/db.ts` → 守卫红且点名该行；`MODULE_NOT_FOUND` 不接受 → 3 条红；
+  只匹配 `package` 不匹配 `module` → 2 条红；去掉 `$` 句尾锚 → 2 条红；
+  非 DuckDB 判据放宽锚定 → 1 条红；杀掉权限分支 → 5 条红；
+  恢复旧前缀判据 `^(EACCES|EPERM|EROFS)` → 2 条红；
+  改坏写锁 hint 断言 → 报 `StringMatching /写锁XXXX/`（而不是伪装成「锁落盘竞态超预期」）。
+
 - **`store` 的权限错误归因是死的：真实 EACCES 拿到「数据库执行期错误」的 hint**。
   `src/commands/store.ts` 的 `thrownToExit` 有一条按 errno 分流权限错误的分支（R 组 R6），
   判据写作 `/^(EACCES|EPERM|EROFS)/` —— 那是 **Node `fs` 的报文形态**
