@@ -489,7 +489,27 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(await queryCommand(['--sql', 'SELECT 1', '--db', alien])).toBe(1)
     const e = errorOf()
     expect(e.kind).toBe('store_not_initialized')
-    expect(String(e.hint)).toMatch(/store init|--db/)
+    // 2026-10-31：成因分流统一到 `store/retry.ts` 的 `classifyOpenFailure` 后，
+    // 「不是 DuckDB 文件」的 hint 与 `store status` 同口径 —— 不再说「请确认…由本 CLI
+    // 创建（store init）」，那会把 Agent 引向一个对非 DuckDB 文件必然再失败的命令。
+    expect(String(e.hint)).toMatch(/不是 DuckDB 数据库，请换 --db 路径/)
+    expect(String(e.hint), '不得再引导向 store init（对非 DuckDB 文件是死路）').not.toContain('store init')
+  })
+
+  it('权限不足 → 与 store 同口径的「读写权限」hint（同一成因不在两个命令族给两种说法）', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return  // root 下 chmod 不拦读取
+    const { chmodSync } = await import('node:fs')
+    const p = join(dir, 'noread.db')
+    writeFileSync(p, 'x'.repeat(4096))
+    chmodSync(p, 0o000)
+    try {
+      out = ''; err = ''
+      expect(await queryCommand(['--sql', 'SELECT 1', '--db', p])).toBe(1)
+      const e = errorOf()
+      expect(e.kind).toBe('store_not_initialized')
+      expect(String(e.hint)).toMatch(/读写权限/)
+      expect(String(e.hint), '权限问题不得说成「文件不存在/不是本 CLI 创建」').not.toContain('store init')
+    } finally { chmodSync(p, 0o600) }
   })
 })
 
