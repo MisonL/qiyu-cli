@@ -136,9 +136,13 @@
   的又一实例**：分支存在、注释齐全、判据与真实报文形态不符，于是静默失效。
   判据改为匹配真实到达该函数的三种 strerror 文本
   （`Permission denied` / `Operation not permitted` / `Read-only file system`），
-  hint 同时**改为读写中性**（原判据只覆盖 `EACCES`，文案是「路径写权限」——
-  而 `status`/`query` 是只读命令，只读权限不足会被引导去跑 `store init`）。
-  测试两条：一条逐字注入三种真实报文断言分流与文案（含「非权限错误仍归 internal」的对照），
+  并**锚在句尾**（`Cannot open file "…": <真因>` 是 DuckDB 固定模板）—— 只搜子串会被
+  路径本身带这些词的文件误命中（`/tmp/Permission denied.db` 报 `No such file or
+  directory` 会被判成权限错误）；hint 同时**改为读写中性**（原判据只覆盖 `EACCES`，
+  文案是「路径写权限」—— 而 `status`/`query` 是只读命令，只读权限不足会被引导去跑 `store init`）。
+  测试两条：一条逐字注入三种真实报文断言分流与文案（含「非权限错误仍归 internal」的对照，
+  以及 CodeRabbit 指出的**近似命中**双向：路径含该词但真因不同 → `internal`；
+  路径含该词且真因确是权限 → 仍归权限），
   一条端到端 `chmod 000` 走真 DuckDB（**修前必红**：`kind` 是 `internal`）；
   root/Windows 下 `chmod` 不拦读写，端到端那条按仓内既有惯例早退。
 - **撞锁用例的 `catch` 把断言失败说成平台竞态**（`tests/store/duckdb.test.ts` 读/写两条）。

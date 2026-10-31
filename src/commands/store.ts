@@ -73,8 +73,11 @@ export function thrownToExit(e: unknown): number {
   // `: Permission denied`(EACCES) / `: Operation not permitted`(EPERM) /
   // `: Read-only file system`(EROFS)。原判据一个都匹配不上 → 真实权限错误全部落进下方
   // internal 兜底，hint 把 Agent 指向「检查数据库状态」，归因是错的。
+  // ⚠️ 判据必须锚**句尾的 strerror**（`:` + 分隔符 + 结尾），不能只搜子串：路径里可能
+  // 恰好含这些词（`/tmp/Permission denied.db`），子串判会把「路径含该词、真因是别的」
+  // 误判成权限错误。`Cannot open file "…": <reason>` 是 DuckDB 的固定模板，真因在冒号后。
   // hint 保持**读写中性**：status/query 是只读命令，说「写权限」会把只读者引向 init。
-  if (/Permission denied|Operation not permitted|Read-only file system/.test(msg)) {
+  if (/:\s*(Permission denied|Operation not permitted|Read-only file system)\s*$/.test(msg)) {
     return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
       message: `无法打开 ${msg}`, hint: '请检查路径与所在目录的读写权限（磁盘只读也会导致无法打开）' })
   }

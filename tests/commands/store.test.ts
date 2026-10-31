@@ -416,6 +416,15 @@ describe('store 命令面与 help', () => {
     out = ''; err = ''
     expect(thrownToExit(new Error('IO Error: Cannot open file "/tmp/x/q.db": No such file or directory'))).toBe(1)
     expect(JSON.parse(out).error.kind).toBe('internal')
+    // ⚠️ 近似命中（CodeRabbit 2026-10-31 指出）：判据必须锚**句尾的真因**，不能只搜子串 ——
+    // 否则「路径里含 Permission denied、真因是别的」会被误判成权限错误、给错 hint。
+    out = ''; err = ''
+    expect(thrownToExit(new Error('IO Error: Cannot open file "/tmp/Permission denied.db": No such file or directory'))).toBe(1)
+    expect(JSON.parse(out).error.kind, '路径含该词、真因不是权限 → 仍归 internal').toBe('internal')
+    // 反向：真因是权限、路径里也含该词 → 仍必须归权限（锚尾没有把真命中一起挡掉）
+    out = ''; err = ''
+    expect(thrownToExit(new Error('IO Error: Cannot open file "/tmp/Permission denied.db": Permission denied'))).toBe(1)
+    expect(JSON.parse(out).error.kind, '路径含该词但真因确是权限 → 归权限').toBe('store_not_initialized')
   })
 
   it('权限错误端到端：--db 指向不可读文件 → 1 + store_not_initialized + 权限归因（非 internal）', async () => {
