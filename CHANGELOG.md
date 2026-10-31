@@ -163,18 +163,23 @@
   并加反向检查（非 DuckDB 文件的 hint **不得**再引导向 `store init` —— 那是死路）；
   新增 `tests/open-failure-single-source.test.ts` 漂移守卫（扫描器 + 扫描器自身的双向自检：
   三条真实事故原文必红、调用点与 Node `fs` errno 判据必放过、注释里的反例不算违规）。
-  ⚠️ 另设**禁用形态**一档（CodeRabbit 2026-10-31 指出）：单靠「复制的判据」指纹抓不到
-  事故 1 —— 旧前缀判据的报文片段是 `EACCES: …`（Node `fs` 形态），不在指纹里，
-  于是「把死分支写回去」会让守卫保持绿。故把「裸 errno 的择一形态」单独列为全仓禁用
-  （含唯一实现点自己），并钉住两条合法 `fs` errno 分流（`.code === 'EACCES'` /
-  `['EACCES', …].includes(code)`）不被误伤 —— 合法的 errno 分流比较的是**属性**，
-  只有把 errno 名当成**报文文本**去匹配才会写成 `A|B|C`。
-  **变异验证 11 处**：`sync-run.ts` 判据退回自写子串 → 守卫红；把权限判据复制进
+  ⚠️ 另设**禁用形态**一档（CodeRabbit 2026-10-31 两轮指出）：单靠「复制的判据」指纹抓不到
+  事故 1 —— 旧判据的文本是 `EACCES: …`（Node `fs` 形态），不在指纹里，于是
+  「把死分支写回去」会让守卫保持绿。禁用形态按**判据**钉：errno 名只许出现在属性比较
+  （`.code === 'EACCES'`）或集合成员判定（`['EACCES', …].includes(code)`）里，
+  于是禁两类 —— ① 把 errno 名当正则文本做择一（`/^(EACCES|EPERM|EROFS)/`）；
+  ② 把 errno 名当报文文本去挑（`msg.startsWith('EACCES')` / `msg.includes('EACCES')`，
+  即 errno 字面量出现在字符串检查方法的**实参位**，round 2 抓到 round 1 的守卫漏了这一类）。
+  自检里三条合法 `fs` errno 分流都钉住了、不被误伤。
+  ⚠️ 边界如实记录：两条指纹都是**文本**匹配，抓不到「先切片再比相等」的间接形态 ——
+  但 DuckDB 报文里**根本不含 errno 名**（只有 strerror 文本），那种写法不可能是从真实报文抄来的。
+  **变异验证 13 处**：`sync-run.ts` 判据退回自写子串 → 守卫红；把权限判据复制进
   `src/commands/db.ts` → 守卫红且点名该行；`MODULE_NOT_FOUND` 不接受 → 3 条红；
   只匹配 `package` 不匹配 `module` → 2 条红；去掉 `$` 句尾锚 → 2 条红；
   非 DuckDB 判据放宽锚定 → 1 条红；杀掉权限分支 → 5 条红；
   把旧前缀判据写回 `commands/store.ts` → 禁用形态守卫红；
   把旧前缀判据塞进唯一实现点自己 → 同一条红且点名 `retry.ts`；
+  把 `startsWith('EACCES')` 变体写进 `commands/db.ts` → 第 ② 条指纹红并点名该行；
   改坏写锁 hint 断言 → 报 `StringMatching /写锁XXXX/`（而不是伪装成「锁落盘竞态超预期」）。
 
 - **`store` 的权限错误归因是死的：真实 EACCES 拿到「数据库执行期错误」的 hint**。

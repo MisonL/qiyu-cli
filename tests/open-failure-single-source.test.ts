@@ -50,18 +50,31 @@ const PREDICATES: Array<[string, RegExp]> = [
 /**
  * **任何**文件都不得出现的判据 —— 指纹是这条规则**禁用**的形态，`store/retry.ts` 自己也不许用。
  *
- * 旧前缀判据按 **Node `fs` 的报文形态**写成（`EACCES: permission denied, open '…'`，
+ * 旧判据按 **Node `fs` 的报文形态**写成（`EACCES: permission denied, open '…'`，
  * errno 在**开头**），而打开库文件失败到达的是 **DuckDB 原生错误**（strerror 在**句尾**、
- * `e.code` 为 `undefined`）—— 它一个都匹配不上，是一条**从未执行过**的死分支
+ * `e.code` 为 `undefined`，报文里根本没有 `EACCES` 这个词，只有 `Permission denied`）
+ * —— 它一个都匹配不上，是一条**从未执行过**的死分支
  * （PR #52 修的事故，本文件开头列作「事故 1」）。
  *
- * 指纹钉在**裸 errno 的择一形态**上：合法的 `fs` errno 分流比较的是**属性**
- * （`.code === 'EACCES'`、`['EACCES', …].includes(code)`），不会写出 `A|B|C` 这种择一；
- * 只有把 errno 名当成**报文文本**去匹配才会写成这样 —— 那正是本规则禁止的。
- * 故本指纹不误伤 `fs` errno 分流（自检里两条合法形态都钉住了）。
+ * **判据**：errno 名只许出现在**属性比较**里（`.code === 'EACCES'`）或**集合成员判定**里
+ * （`['EACCES', …].includes(code)`）—— 这两种形态的 errno 字面量都不在
+ * 「拿报文文本去挑」的位置上。于是禁用的形态有两类，各一条指纹：
+ *
+ * ① **把 errno 名当正则文本做择一**：`/^(EACCES|EPERM|EROFS)/`。
+ * ② **把 errno 名当报文文本去挑**：`msg.startsWith('EACCES')` / `msg.includes('EACCES')`
+ *    —— 即 errno 字面量出现在字符串检查方法的**实参位**。
+ *    （CodeRabbit 2026-10-31 round 2 指出：只守 ① 时，② 这条变体可以溜进来,
+ *    而它同样是把 errno 名当报文文本用 —— 自检里原本还把它当合法形态放过了。）
+ *
+ * ⚠️ **边界（诚实记录）**：两条指纹都是**文本**匹配，抓不到「先把报文切片、再拿切片与
+ * errno 名比相等」这种间接形态（`msg.split(': ').pop() === 'EACCES'`）。
+ * 之所以不为它再加指纹：DuckDB 报文里**根本不含 errno 名**（只有 strerror 文本），
+ * 那种写法不可能是从真实报文抄来的形态，且加宽正则会把合法的 `.code` 判定误伤。
  */
 const FORBIDDEN: Array<[string, RegExp]> = [
-  ['errno 前缀判据（Node fs 报文形态，本规则禁用）', /EACCES\s*\|\s*EPERM\s*\|\s*EROFS/],
+  ['errno 择一判据（Node fs 报文形态，本规则禁用）', /EACCES\s*\|\s*EPERM\s*\|\s*EROFS/],
+  ['errno 文本挑拣判据（Node fs 报文形态，本规则禁用）',
+    /\.(?:startsWith|endsWith|includes|indexOf|match|search)\s*\(\s*['"](?:EACCES|EPERM|EROFS)['"]/],
 ]
 
 /** 唯一实现点（相对 ROOT）。 */
@@ -123,8 +136,11 @@ describe('打开失败的成因判据必须只有一处实现（classifyOpenFail
     const cases: Array<[string, string, number]> = [
       // 事故 1：`commands/store.ts` 里那条**从未执行过**的 errno 前缀判据（PR #52 修的那个）
       ['旧前缀判据', "  if (/^(EACCES|EPERM|EROFS)/.test(msg)) {", 1],
-      // 事故 1 的变体：去掉行首锚 / 换成 startsWith
-      ['旧前缀判据 变体', "  if (msg.startsWith('EACCES') || msg.startsWith('EPERM')) {", 0],
+      // 事故 1 的变体：换一种写法把 errno 名当报文文本挑 —— 同样是 Node `fs` 形态，
+      // 同样匹配不上 DuckDB 报文，必须一并拒（CodeRabbit 2026-10-31 round 2 指出）
+      ['旧判据 变体 startsWith', "  if (msg.startsWith('EACCES') || msg.startsWith('EPERM')) {", 1],
+      ['旧判据 变体 includes', "  if (msg.includes('EACCES') || msg.includes('EROFS')) {", 1],
+      ['旧判据 变体 endsWith', "  if (msg.endsWith('EACCES')) {", 1],
       // 事故 2：子串搜索权限文本（CodeRabbit round 1 抓到的误命中形态）
       ['旧子串判据', "  if (/Permission denied|Operation not permitted|Read-only file system/.test(msg)) {", 1],
       // 事故 3：`sync-run.ts` 自己写的那份「非 DuckDB 文件」子串判据
@@ -132,11 +148,15 @@ describe('打开失败的成因判据必须只有一处实现（classifyOpenFail
       // 合法：调用唯一实现
       ['合法 调用', "  const f = classifyOpenFailure(e)", 0],
       ['合法 用结果', "  if (classifyOpenFailure(e)?.cause === 'permission') {", 0],
-      // 合法：Node `fs` 的 errno 判据是**另一件事**（它真有 `e.code`，不归本规则管）
+      // 合法：Node `fs` 的 errno 判据是**另一件事**（它真有 `e.code`，不归本规则管）——
+      // 这两种形态里 errno 字面量都不在「拿报文文本去挑」的位置上
       ['合法 fs errno', "    if ((e as { code?: string }).code === 'EACCES') {", 0],
       ['合法 fs errno 集合', "    if (['EACCES', 'EPERM', 'EROFS'].includes(code)) {", 0],
+      ['合法 fs errno Set', "    if (READONLY_ERRNOS.has(code as string)) {", 0],
       // 合法：非权限的 DuckDB 报文（库不存在）本就不该被抓
       ['合法 库不存在', "  /cannot open database .* in read-only mode/i.test(msg)", 0],
+      // 合法：`store/retry.ts` 自己那条锁判据是报文字符串不是 errno 名
+      ['合法 锁判据', "  return msg.includes('Conflicting lock')", 0],
     ]
     for (const [label, text, want] of cases) {
       expect(scanText(text, PREDICATES.concat(FORBIDDEN)).length, `${label}：${text}`).toBe(want)
