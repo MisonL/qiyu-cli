@@ -36,7 +36,7 @@ const stripCommentLines = (text: string): string =>
   text.split('\n').filter((l) => !/^\s*(\/\/|\/\*|\*)/.test(l)).join('\n')
 
 /**
- * 「打开失败成因」判据的指纹 —— 都是 **DuckDB 原生报文**的片段（不是 Node `fs` 的
+ * 必须在唯一实现点出现的判据 —— 都是 **DuckDB 原生报文**的片段（不是 Node `fs` 的
  * `EACCES: …` 前缀；见 `store/retry.ts` 的形态说明）。
  *
  * 为什么用这些片段而不是 `classifyOpenFailure` 的函数名：**复制判据的人不会复制函数名**，
@@ -47,15 +47,35 @@ const PREDICATES: Array<[string, RegExp]> = [
   ['非 DuckDB 文件判据', /not a valid DuckDB database/i],
 ]
 
+/**
+ * **任何**文件都不得出现的判据 —— 指纹是这条规则**禁用**的形态，`store/retry.ts` 自己也不许用。
+ *
+ * 旧前缀判据按 **Node `fs` 的报文形态**写成（`EACCES: permission denied, open '…'`，
+ * errno 在**开头**），而打开库文件失败到达的是 **DuckDB 原生错误**（strerror 在**句尾**、
+ * `e.code` 为 `undefined`）—— 它一个都匹配不上，是一条**从未执行过**的死分支
+ * （PR #52 修的事故，本文件开头列作「事故 1」）。
+ *
+ * 指纹钉在**裸 errno 的择一形态**上：合法的 `fs` errno 分流比较的是**属性**
+ * （`.code === 'EACCES'`、`['EACCES', …].includes(code)`），不会写出 `A|B|C` 这种择一；
+ * 只有把 errno 名当成**报文文本**去匹配才会写成这样 —— 那正是本规则禁止的。
+ * 故本指纹不误伤 `fs` errno 分流（自检里两条合法形态都钉住了）。
+ */
+const FORBIDDEN: Array<[string, RegExp]> = [
+  ['errno 前缀判据（Node fs 报文形态，本规则禁用）', /EACCES\s*\|\s*EPERM\s*\|\s*EROFS/],
+]
+
 /** 唯一实现点（相对 ROOT）。 */
 const SINGLE_SOURCE = join('src', 'store', 'retry.ts')
 
-function scanText(text: string): Array<{ line: number; why: string; snippet: string }> {
+function scanText(
+  text: string,
+  preds: Array<[string, RegExp]> = PREDICATES,
+): Array<{ line: number; why: string; snippet: string }> {
   const lines = stripCommentLines(text).split('\n')
   const hits: Array<{ line: number; why: string; snippet: string }> = []
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!
-    const why = PREDICATES.find(([, re]) => re.test(line))?.[0]
+    const why = preds.find(([, re]) => re.test(line))?.[0]
     if (why !== undefined) hits.push({ line: i + 1, why, snippet: line.trim().slice(0, 120) })
   }
   return hits
@@ -75,6 +95,21 @@ describe('打开失败的成因判据必须只有一处实现（classifyOpenFail
     ).toEqual([])
   })
 
+  it('禁用形态（旧 errno 前缀判据）在任何文件里都不得复活 —— 含唯一实现点自己', () => {
+    // ⚠️ 单靠上面那条**抓不到**它：旧前缀判据的报文片段是 `EACCES: …`（Node fs 形态），
+    // 不在 `PREDICATES` 的指纹里 —— 于是「把死分支写回去」会让上面那条保持绿。
+    // 这正是本文件开头列为「事故 1」的那个事故，必须被守住（CodeRabbit 2026-10-31 指出）。
+    const hits = walk(SRC).flatMap((f) =>
+      scanText(readFileSync(f, 'utf8'), FORBIDDEN).map((h) => ({ file: relative(ROOT, f), ...h })))
+    const rendered = hits.map((h) => `${h.file}:${h.line}  [${h.why}]  ${h.snippet}`)
+    expect(
+      rendered,
+      '这些地方恢复了按 **Node `fs` 报文形态**写的 errno 前缀判据 —— 打开库文件失败到达的'
+      + '是 DuckDB 原生错误（strerror 在句尾、`e.code` 为 undefined），前缀锚定一条都匹配不上，'
+      + '会退化成从未执行过的死分支:\n' + rendered.join('\n'),
+    ).toEqual([])
+  })
+
   it('唯一实现点确实在场（防「扫描器扫了个空」——文件被改名/搬走后这条仍须红）', () => {
     const text = readFileSync(join(ROOT, SINGLE_SOURCE), 'utf8')
     const rendered = PREDICATES.map(([why]) => why)
@@ -86,8 +121,10 @@ describe('打开失败的成因判据必须只有一处实现（classifyOpenFail
   it('扫描器自身有牙：真实事故的原样文本必须被抓到，合法写法必须放过', () => {
     // ⚠️ 没有这一条，上面的断言可能是「扫了个空」—— 正则退化成永不命中会恒绿。
     const cases: Array<[string, string, number]> = [
-      // 事故 1：`commands/store.ts` 里那条**从未执行过**的前缀判据（PR #52 修的那个）
-      ['旧前缀判据', "  if (/^(EACCES|EPERM|EROFS)/.test(msg)) {", 0],
+      // 事故 1：`commands/store.ts` 里那条**从未执行过**的 errno 前缀判据（PR #52 修的那个）
+      ['旧前缀判据', "  if (/^(EACCES|EPERM|EROFS)/.test(msg)) {", 1],
+      // 事故 1 的变体：去掉行首锚 / 换成 startsWith
+      ['旧前缀判据 变体', "  if (msg.startsWith('EACCES') || msg.startsWith('EPERM')) {", 0],
       // 事故 2：子串搜索权限文本（CodeRabbit round 1 抓到的误命中形态）
       ['旧子串判据', "  if (/Permission denied|Operation not permitted|Read-only file system/.test(msg)) {", 1],
       // 事故 3：`sync-run.ts` 自己写的那份「非 DuckDB 文件」子串判据
@@ -97,11 +134,12 @@ describe('打开失败的成因判据必须只有一处实现（classifyOpenFail
       ['合法 用结果', "  if (classifyOpenFailure(e)?.cause === 'permission') {", 0],
       // 合法：Node `fs` 的 errno 判据是**另一件事**（它真有 `e.code`，不归本规则管）
       ['合法 fs errno', "    if ((e as { code?: string }).code === 'EACCES') {", 0],
+      ['合法 fs errno 集合', "    if (['EACCES', 'EPERM', 'EROFS'].includes(code)) {", 0],
       // 合法：非权限的 DuckDB 报文（库不存在）本就不该被抓
       ['合法 库不存在', "  /cannot open database .* in read-only mode/i.test(msg)", 0],
     ]
     for (const [label, text, want] of cases) {
-      expect(scanText(text).length, `${label}：${text}`).toBe(want)
+      expect(scanText(text, PREDICATES.concat(FORBIDDEN)).length, `${label}：${text}`).toBe(want)
     }
     // 注释里的反例不得算违规（各文件大量引用旧写法做说明）
     expect(scanText("// 旧写法：/Permission denied|Operation not permitted/.test(msg)\nconst a = 1").length,
