@@ -63,11 +63,23 @@ export function thrownToExit(e: unknown): number {
     return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
       message: `无法打开 ${msg}`, hint: '该路径已存在且不是 DuckDB 数据库，请换 --db 路径' })
   }
-  // ⚠️ open/执行期 errno 分流（R 组 R6）：EACCES/EPERM/EROFS 是环境问题不是程序错误，
-  // 归因必须准（K 组 M3 只做了 lstat/statSync 层，这里补 open 期）。
-  if (/^(EACCES|EPERM|EROFS)/.test(msg)) {
+  // ⚠️ open/执行期 errno 分流（R 组 R6；2026-10-31 实测重写判据）：EACCES/EPERM/EROFS 是
+  // 环境问题不是程序错误，归因必须准。**原判据 `/^(EACCES|EPERM|EROFS)/` 是死分支**——
+  // 它按 Node fs 的报文形态（`EACCES: permission denied, open '…'`）写成前缀锚定，但
+  // 到达本函数的只有 **DuckDB 原生错误**（store 链路零 `node:fs`，lstat/stat/mkdir 的
+  // errno 分流都在命令层就地完成，见上），其报文是
+  // `IO Error: Cannot open file "…": Permission denied` —— errno 的 strerror 文本在**句尾**、
+  // `e.code` 为 undefined。实测（探针 + E2E 双层）三种形态：
+  // `: Permission denied`(EACCES) / `: Operation not permitted`(EPERM) /
+  // `: Read-only file system`(EROFS)。原判据一个都匹配不上 → 真实权限错误全部落进下方
+  // internal 兜底，hint 把 Agent 指向「检查数据库状态」，归因是错的。
+  // ⚠️ 判据必须锚**句尾的 strerror**（`:` + 分隔符 + 结尾），不能只搜子串：路径里可能
+  // 恰好含这些词（`/tmp/Permission denied.db`），子串判会把「路径含该词、真因是别的」
+  // 误判成权限错误。`Cannot open file "…": <reason>` 是 DuckDB 的固定模板，真因在冒号后。
+  // hint 保持**读写中性**：status/query 是只读命令，说「写权限」会把只读者引向 init。
+  if (/:\s*(Permission denied|Operation not permitted|Read-only file system)\s*$/.test(msg)) {
     return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `无法打开 ${msg}`, hint: '请检查路径写权限（磁盘只读或目录无写权限都会导致无法打开）' })
+      message: `无法打开 ${msg}`, hint: '请检查路径与所在目录的读写权限（磁盘只读也会导致无法打开）' })
   }
   // ⚠️ internal 兜底（第四轮 I 组 H1/M8 修）：spec §8.2 禁止把 DuckDB 英文原文裸透
   // 给 Agent —— 必须中文包装 + 底层原文；hint 中性化（status 只读路径也会走到这里，

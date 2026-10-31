@@ -396,10 +396,21 @@ describe('duckdb —— init 与关闭', () => {
         holder = await spawnHolder(p)
         if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
         let t = 0
+        // ⚠️ 2026-10-31（B6-3）：这里**不能用** `expect(...).rejects` 包在 `catch { continue }` 里 ——
+        // 那样「撞锁成功但断言写错」（kind 变了、hint 改了、假时钟没走）与「锁落盘竞态」
+        // 会落进同一个 catch，最终只报「5 轮内未取得…锁落盘竞态超预期」：**归因是错的**，
+        // 真正红的是断言，却被说成平台竞态。改为显式分类：开成功 = 竞态（换轮），
+        // 抛 store_locked = 断言（错了就直接红），抛别的 = 被测代码 bug（也直接红）。
+        let opened = false
         try {
-          await expect(createDuckDbStore({ ...cfg, path: p, readOnlyRetryMs: 1000 }, 'ro', {
+          await createDuckDbStore({ ...cfg, path: p, readOnlyRetryMs: 1000 }, 'ro', {
             sleep: async (ms) => { t += ms }, now: () => t,
-          })).rejects.toMatchObject({
+          })
+          opened = true
+        } catch (e) {
+          const err = e as { kind?: string }
+          if (err.kind !== 'store_locked') throw e   // 不是竞态也不是预期形态 —— 直接失败
+          expect(err).toMatchObject({
             kind: 'store_locked',
             retryable: true,
             // hint 逐字（P 组 P-M2 改：前半句复述 message 已删，给第二动作）
@@ -410,7 +421,8 @@ describe('duckdb —— init 与关闭', () => {
           })
           expect(t).toBeGreaterThan(0)   // 读者确实走了退避（与写者「不退避」分形）
           asserted = true
-        } catch { /* 锁竞态窗口（CONFLICT 后仍打开），换轮重来 */ }
+        }
+        if (opened) continue   // 锁落盘竞态窗口（CONFLICT 后仍打开），换轮重来
       }
       expect(asserted, '5 轮内未取得「锁生效且读者撞锁」——锁落盘竞态超预期').toBe(true)
     } finally {
@@ -469,16 +481,24 @@ describe('duckdb —— init 与关闭', () => {
         holder = await spawnHolder(p)
         if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
         const sleep = vi.fn(async () => {})
+        // ⚠️ 2026-10-31（B6-3）：同上，不用 `rejects.toMatchObject` + 空 catch 的组合 ——
+        // 断言失败与锁竞态会落进同一个 catch，红的时候归因指向平台竞态而非真错的断言。
+        let opened = false
         try {
-          await expect(createDuckDbStore({ ...cfg, path: p }, 'rw', { sleep, now: () => 0 }))
-            .rejects.toMatchObject({
-              kind: 'store_locked',
-              retryable: true,
-              hint: expect.stringMatching(/写锁/),
-            })
+          await createDuckDbStore({ ...cfg, path: p }, 'rw', { sleep, now: () => 0 })
+          opened = true
+        } catch (e) {
+          const err = e as { kind?: string }
+          if (err.kind !== 'store_locked') throw e   // 不是竞态也不是预期形态 —— 直接失败
+          expect(err).toMatchObject({
+            kind: 'store_locked',
+            retryable: true,
+            hint: expect.stringMatching(/写锁/),
+          })
           expect(sleep).not.toHaveBeenCalled()   // 写者不退避（spec §5.2）
           asserted = true
-        } catch { /* 锁竞态窗口（CONFLICT 后仍打开），换轮重来 */ }
+        }
+        if (opened) continue   // 锁落盘竞态窗口（CONFLICT 后仍打开），换轮重来
       }
       expect(asserted, '5 轮内未取得「锁生效且写者撞锁」——锁落盘竞态超预期').toBe(true)
     } finally {

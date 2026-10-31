@@ -122,6 +122,40 @@
 
 ### 修复
 
+- **`store` 的权限错误归因是死的：真实 EACCES 拿到「数据库执行期错误」的 hint**。
+  `src/commands/store.ts` 的 `thrownToExit` 有一条按 errno 分流权限错误的分支（R 组 R6），
+  判据写作 `/^(EACCES|EPERM|EROFS)/` —— 那是 **Node `fs` 的报文形态**
+  （`EACCES: permission denied, open '…'`）。但 store 链路**零 `node:fs`**：
+  `lstat`/`stat`/`mkdir` 的 errno 分流都在命令层就地完成，到达 `thrownToExit` 的只有
+  **DuckDB 原生错误**，其报文是 `IO Error: Cannot open file "…": Permission denied`
+  —— strerror 在**句尾**、`e.code` 为 `undefined`（探针 + DuckDB 二进制里的
+  `Cannot open file "%s": %s` 模板双向确认）。**前缀锚定因此一个都匹配不上**：
+  这条分支从写下起就没执行过，真实权限错误全部落进 `internal` 兜底，
+  hint 把 Agent 指向「用 `qiyu store status` 检查数据库状态，或用 --db 指向其他数据库文件」
+  —— 而真正要做的是改文件权限。**这是本仓库记录过的形态「错误里点名的成因全都到不了该分支」
+  的又一实例**：分支存在、注释齐全、判据与真实报文形态不符，于是静默失效。
+  判据改为匹配真实到达该函数的三种 strerror 文本
+  （`Permission denied` / `Operation not permitted` / `Read-only file system`），
+  并**锚在句尾**（`Cannot open file "…": <真因>` 是 DuckDB 固定模板）—— 只搜子串会被
+  路径本身带这些词的文件误命中（`/tmp/Permission denied.db` 报 `No such file or
+  directory` 会被判成权限错误）；hint 同时**改为读写中性**（原判据只覆盖 `EACCES`，
+  文案是「路径写权限」—— 而 `status`/`query` 是只读命令，只读权限不足会被引导去跑 `store init`）。
+  测试两条：一条逐字注入三种真实报文断言分流与文案（含「非权限错误仍归 internal」的对照，
+  以及 CodeRabbit 指出的**近似命中**双向：路径含该词但真因不同 → `internal`；
+  路径含该词且真因确是权限 → 仍归权限），
+  一条端到端 `chmod 000` 走真 DuckDB（**修前必红**：`kind` 是 `internal`）；
+  root/Windows 下 `chmod` 不拦读写，端到端那条按仓内既有惯例早退。
+- **撞锁用例的 `catch` 把断言失败说成平台竞态**（`tests/store/duckdb.test.ts` 读/写两条）。
+  跨进程持真锁 + 换路径重试 ≤5 轮的用例里，断言写成 `expect(...).rejects.toMatchObject(...)`
+  并整段包在 `catch { /* 锁竞态窗口，换轮重来 */ }` —— 于是「锁真的生效但断言写错」
+  （kind 改名、hint 改文案）与「锁没落盘」**落进同一个 catch**，重试耗尽后只报
+  「5 轮内未取得…锁落盘竞态超预期」：**归因指错了方向**，红的是断言、报出来的是平台。
+  改为显式分类：打开成功 = 竞态（换轮）、抛 `store_locked` = 走断言（错了直接红）、
+  抛其他 = 被测代码 bug（也直接红）。变异验证：把写者用例的 hint 期望改成不可能的正则，
+  现在红在 `AssertionError: … to match object … "hint": StringMatching /写锁XXXXXXXX/`，
+  修前只会报「锁落盘竞态超预期」。
+  （同批挂账的第三条「`status` 路径 TOCTOU 双 `statSync`」核实**已在 b252ffd 修掉**，
+  本轮不再改动；仅此项从「低优先过程项」升为缺陷，因为探针显示判据本身失效。）
 - **只读接口实测收口（20 个）：A6 的 `verified:false` 从「全都未实测」变成「逐个如实登记」**。
   用真实凭证对 20 个未实测的只读接口逐个采样（`ticket.log` / `ticket.new.detail` /
   `ticket.list` / `chat.queue.group.query` / `ipcc.calltaskdetail.get` /

@@ -382,11 +382,70 @@ describe('store 命令面与 help', () => {
       vi.doUnmock('../../src/store/index.js')
     }
   })
+
+  // —— 权限错误（errno）分流：判据必须匹配**真实到达该函数的报文形态** ——
+  // ⚠️ 2026-10-31 实测修缺陷：原判据是 `/^(EACCES|EPERM|EROFS)/`，按 Node `fs` 的报文
+  // 前缀写成 —— 但 store 链路**零 `node:fs`**（lstat/stat/mkdir 的 errno 分流都在命令层
+  // 就地完成），到达 thrownToExit 的只有 DuckDB 原生错误：
+  // `IO Error: Cannot open file "…": Permission denied`（strerror 在**句尾**、`e.code`
+  // 为 undefined）。三条判据一个都匹配不上 → 真实权限错误全部落进 internal 兜底，
+  // hint 把 Agent 指向「检查数据库状态」，归因是错的。下面三条钉住三种 strerror 文本。
+  it('thrownToExit 的权限错误分流：三种真实 DuckDB 报文都归 store_not_initialized（不是 internal）', async () => {
+    // 探针实测（本机 macOS，@duckdb/node-api 1.5.6-r.1）逐字得到的三条：
+    //   chmod 000 目标文件                 → `: Permission denied`      （EACCES）
+    //   chflags uchg 目标文件              → `: Operation not permitted` （EPERM）
+    //   只读文件系统（EROFS，本机不可复现）→ `: Read-only file system`  （取自 DuckDB 二进制
+    //                                       的 `Cannot open file "%s": %s` 模板，strerror 由 libc 提供）
+    const { thrownToExit } = await import('../../src/commands/store.js')
+    const cases = [
+      'IO Error: Cannot open file "/tmp/x/q.db": Permission denied',
+      'IO Error: Cannot open file "/tmp/x/q.db": Operation not permitted',
+      'IO Error: Cannot open file "/tmp/x/q.db": Read-only file system',
+    ]
+    for (const m of cases) {
+      out = ''; err = ''
+      expect(thrownToExit(new Error(m)), m).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind, m).toBe('store_not_initialized')
+      expect(e.message, m).toContain(m)
+      // hint 必须**读写中性**：status/query 是只读命令，说「写权限」会把只读者引向 init
+      expect(e.hint, m).toMatch(/读写权限/)
+      expect(e.hint, m).not.toContain('路径写权限')   // 旧的写权限口径不得回归
+    }
+    // 对照：非权限的执行期错误仍然走 internal（判据没有放宽成「含 cannot open 就算权限」）
+    out = ''; err = ''
+    expect(thrownToExit(new Error('IO Error: Cannot open file "/tmp/x/q.db": No such file or directory'))).toBe(1)
+    expect(JSON.parse(out).error.kind).toBe('internal')
+    // ⚠️ 近似命中（CodeRabbit 2026-10-31 指出）：判据必须锚**句尾的真因**，不能只搜子串 ——
+    // 否则「路径里含 Permission denied、真因是别的」会被误判成权限错误、给错 hint。
+    out = ''; err = ''
+    expect(thrownToExit(new Error('IO Error: Cannot open file "/tmp/Permission denied.db": No such file or directory'))).toBe(1)
+    expect(JSON.parse(out).error.kind, '路径含该词、真因不是权限 → 仍归 internal').toBe('internal')
+    // 反向：真因是权限、路径里也含该词 → 仍必须归权限（锚尾没有把真命中一起挡掉）
+    out = ''; err = ''
+    expect(thrownToExit(new Error('IO Error: Cannot open file "/tmp/Permission denied.db": Permission denied'))).toBe(1)
+    expect(JSON.parse(out).error.kind, '路径含该词但真因确是权限 → 归权限').toBe('store_not_initialized')
+  })
+
+  it('权限错误端到端：--db 指向不可读文件 → 1 + store_not_initialized + 权限归因（非 internal）', async () => {
+    // 端到端复现本轮缺陷：本用例在修前**必红**（kind 是 internal、hint 指向「检查数据库状态」）。
+    if (process.platform === 'win32' || process.getuid?.() === 0) return  // root 下 chmod 不拦读取
+    const p = join(dir, 'noread.db')
+    writeFileSync(p, 'x'.repeat(4096))
+    const { chmodSync } = await import('node:fs')
+    chmodSync(p, 0o000)
+    try {
+      expect(await storeCommand(['status', '--db', p])).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind, '权限错误必须是 store_not_initialized，不是 internal').toBe('store_not_initialized')
+      expect(e.message).toMatch(/Permission denied/)
+      expect(e.hint).toMatch(/读写权限/)
+    } finally { chmodSync(p, 0o600) }
+  })
 })
 
 describe('store 命令 —— 未知 profile 必须拒绝（2026-10-27 实测修）', () => {
   // ⚠️ 端到端钉住「拼错的 profile 不再静默读/建默认库」：此前
-  // `store init --profile prodd` 会在 ~/.qiyu/duckdb/qiyu.duckdb 创建一个
   // 用户从未配置的库并返回 ok:true；`store status --profile prodd` 则读默认库。
   // 配置层已有单测（tests/store/config.test.ts），这里钉的是**命令出口**：
   // 退出码 2（usage：改参数重来）+ 绝不产生文件。
