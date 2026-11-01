@@ -11,7 +11,10 @@
 // 两条同根：**判据拿整条报文做子串搜索，而报文会把外部文本带进来**。
 // 修法：判据集中到 `query/native-error.ts`，锚 DuckDB 自己的类别前缀，并在判定前剥 SQL 回显。
 import { describe, it, expect } from 'vitest'
-import { isInterrupt, isLayer2Blocked, withoutSqlEcho } from '../../src/query/native-error.js'
+import {
+  isInterrupt, isLayer2Blocked, withoutSqlEcho,
+  duckDbSaysMissingName, isBinderOrCatalogError, isOutOfMemory, isParserError,
+} from '../../src/query/native-error.js'
 
 describe('withoutSqlEcho —— 剥掉 DuckDB 的 SQL 回显', () => {
   it('裁掉 \\nLINE n: 及其后全文，保留类别与行号标记', () => {
@@ -120,5 +123,59 @@ describe('isLayer2Blocked —— 只认真 layer2 拦截（实测五形态）', 
     const real = 'Failed to extract statements: Parser Error: syntax error\n\n'
       + 'LINE 1: SELECT \'Permission Error: Cannot access file "/etc/passwd" - file system operations are disabled by configuration\''
     expect(isLayer2Blocked(real)).toBe(false)
+  })
+})
+
+// —— 2026-11-01 审查（第二轮，同族第三个落点）——
+// 表/列不存在、Binder/Catalog、Out of Memory、未绑参四条**分类判据**此前都是裸子串判，
+// 与 isInterrupt/isLayer2Blocked 同一形态。用户数据（Conversion Error 回显列值）与用户
+// SQL（Parser Error 回显出错行）都能逐字包含这些串。以下用例逐字取自探针实测。
+describe('分类判据同样只认 DuckDB 自己那句话（回显/列值里的仿冒串不算）', () => {
+  it('Conversion Error 的列值含「表不存在」串 → duckDbSaysMissingName 不命中', () => {
+    // 探针实测：`SELECT * FROM sessions LIMIT '<值>'` 在 prepare 期常量折叠
+    const real = "Conversion Error: Could not convert string 'Catalog Error: Table with name zzz does not exist!' to INT64"
+      + '\n\nLINE 1: SELECT * FROM sessions LIMIT \'…\'\n        ^'
+    expect(duckDbSaysMissingName(real, /Catalog Error: Table with name ([^\s]+) does not exist/)).toBeNull()
+    // 对照：真报文（探针逐字）必须命中
+    const real2 = 'Catalog Error: Table with name sessons does not exist!\nDid you mean "sessions"?'
+      + '\n\nLINE 1: SELECT * FROM sessons\n                      ^'
+    expect(duckDbSaysMissingName(real2, /Catalog Error: Table with name ([^\s]+) does not exist/)?.[1])
+      .toBe('sessons')
+  })
+  it('Parser Error 的 SQL 回显里含「表不存在」串 → 不命中', () => {
+    const real = 'Failed to extract statements: Parser Error: syntax error at or near "SELEC"\n\n'
+      + 'LINE 1: SELEC\'Binder Error: Referenced table "sessons" not found!\'\n        ^'
+    expect(duckDbSaysMissingName(real, /Binder Error: Referenced table "([^"]+)" not found/)).toBeNull()
+  })
+  it('带 `Failed to extract statements: ` 包装的真 Binder/Catalog 报文仍命中（包装要容忍）', () => {
+    expect(duckDbSaysMissingName('Failed to extract statements: Binder Error: Referenced table "x" not found',
+      /Binder Error: Referenced table "([^"]+)" not found/)?.[1]).toBe('x')
+  })
+  it('isBinderOrCatalogError：真报文 true，列值/回显里的仿冒串 false', () => {
+    expect(isBinderOrCatalogError('Binder Error: No function matches the given name')).toBe(true)
+    expect(isBinderOrCatalogError('Catalog Error: Table with name x does not exist!')).toBe(true)
+    expect(isBinderOrCatalogError(
+      "Conversion Error: Could not convert string 'Catalog Error: Table with name zzz does not exist!' to INT64"))
+      .toBe(false)
+  })
+  it('isOutOfMemory：真报文 true，列值含该串的 Conversion Error false', () => {
+    // 真报文逐字（探针：SET memory_limit 小 + 大分配）
+    expect(isOutOfMemory('Out of Memory Error: failed to allocate data of size 16.0 MiB (16.5 MiB/28.6 MiB used)'))
+      .toBe(true)
+    expect(isOutOfMemory(
+      "Conversion Error: Could not convert string 'Out of Memory Error: fake' to INT32 when casting from source column x"))
+      .toBe(false)
+  })
+})
+
+describe('isParserError —— 只有 DuckDB 自己说语法错才算（2026-11-01 第二轮）', () => {
+  it('真语法错报文（带 extractStatements 包装）→ true', () => {
+    expect(isParserError('Failed to extract statements: Parser Error: syntax error at or near "SELEC"')).toBe(true)
+    expect(isParserError('Parser Error: syntax error at or near "SELEC"')).toBe(true)
+  })
+  it('⚠️ 事故原文：列值含 Parser Error 串的 Conversion Error → false（此前被谎报成语法错）', () => {
+    const real = "Conversion Error: Could not convert string 'Parser Error: syntax error at or near' to INT32 when casting from source column x"
+      + '\n\nLINE 1: SELECT CAST(x AS INT) FROM t\n               ^'
+    expect(isParserError(real), '值里的字面量 ≠ DuckDB 说语法错').toBe(false)
   })
 })

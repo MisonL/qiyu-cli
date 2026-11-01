@@ -155,8 +155,14 @@ describe('打开失败的成因判据必须只有一处实现（classifyOpenFail
       ['合法 fs errno Set', "    if (READONLY_ERRNOS.has(code as string)) {", 0],
       // 合法：非权限的 DuckDB 报文（库不存在）本就不该被抓
       ['合法 库不存在', "  /cannot open database .* in read-only mode/i.test(msg)", 0],
-      // 合法：`store/retry.ts` 自己那条锁判据是报文字符串不是 errno 名
-      ['合法 锁判据', "  return msg.includes('Conflicting lock')", 0],
+      // 合法：`store/retry.ts` 自己那条**锁**判据（不是打开失败的成因判据，不归本规则管）
+      ['合法 锁判据（模板锚定）', "  return /^IO Error: Could not set lock on file \"[\\s\\S]*\": Conflicting lock is held in /i.test(msg)", 0],
+      // ⚠️ 事故形态（2026-11-01，另一条单一实现点的教训）：锁判据的**裸子串**写法
+      // —— 它把路径里恰好含这两个词的非 DuckDB 文件判成撞锁（30s 假退避 + 假 retryable）。
+      // 本规则不管它（那是 lock 判据的事），但必须与「合法模板锚」区分开，否则
+      // 自检会把两者混为一谈。这里断言的是：**裸子串形态不被本扫描器误伤**（仍 0 命中），
+      // 它由 `tests/store/retry.test.ts` 的行为用例负责（那里有真报文的双向锚）。
+      ['裸锁子串判（不由本扫描器负责）', "  return msg.includes('Conflicting lock')", 0],
     ]
     for (const [label, text, want] of cases) {
       expect(scanText(text, PREDICATES.concat(FORBIDDEN)).length, `${label}：${text}`).toBe(want)

@@ -385,9 +385,10 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 | `export_fixture_unreported` | 导出流未上报窗口声明行，空窗可能真空也可能被截断 | 抽查该窗行数，必要时重跑 |
 | `export_window_mismatch` | 导出声明的窗口宽于请求（重叠行由幂等 upsert 吸收） | 数据不受损，知悉即可 |
 
-⚠️ 后四个是**成功窗上的业务提示**（窗口数据照常提交）：`gaps` 非空不等于同步失败，
-按 reason 区分「失败缺口」与「提示」。新增 reason 必须同时更新本表与源码枚举
-（`tests/sync-enums.test.ts` 双向核对）。
+⚠️ `knowledge_row_malformed` / `filter_matched_no_staff` / `export_fixture_unreported` /
+`export_window_mismatch` 这四个是**成功窗上的业务提示**（窗口数据照常提交）：`gaps` 非空
+不等于同步失败，按 reason 区分「失败缺口」与「提示」。新增 reason 必须同时更新本表与源码
+枚举（`tests/sync-enums.test.ts` 双向核对）。
 
 **`drift[].kind` 的全部取值**（`sync verify`）：`not_synced`（从未同步 → 先 `sync run`）、
 `state_pending`（上次运行未完成或中断 → 重跑 `sync run` 补全后再 verify）、

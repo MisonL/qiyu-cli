@@ -1,10 +1,12 @@
 // tests/store-field-notes.test.ts —— `store init` / `store status` 的 meta 图例（2026-10-28）。
 //
-// 背景：这两个命令输出的 `schema_version` 是一个裸数字，`tables` 则是**全库**表清单
-// （含内部表），而 `db tables` 只列业务表 —— 三处都容易被 Agent 误读。真库实测：
+// 背景：这两个命令输出的 `schema_version` 是一个裸数字，`tables` 容易被 Agent 误读。真库实测：
 //   · 新库 `schema_version` = 当前 CLI 的 LATEST_VERSION，要跟它比才有意义；
-//   · `store status` 的 `tables` 含 `schema_version` / `sync_state` / `sync_gaps`，
-//     而 `db tables` 只列 TABLES 闭集里的业务表，**两边数量不同**；
+//   · `store status` 的 `tables` 与 `db tables` 是**同一组**表（都含内部表
+//     `schema_version` / `sync_state` / `sync_gaps`，两边数量一致）—— 文件头此处曾写
+//     「db tables 只列业务表、两边数量不同」，被下方「两边应当是同一组表」用例证伪，
+//     2026-11-01 修（陈旧注释与文件内断言矛盾；PR #54 把同名旧措辞也从 README 与
+//     `field_notes.tables` 里清掉了）；
 //   · `config_exists: false` 不代表存储不可用（`--db` 照样工作，init 也不写配置文件）。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
@@ -99,7 +101,7 @@ describe('真库实测：图例的字面结论靠它成立', () => {
       .toContain(`当前 CLI 是 ${LATEST_VERSION}`)
   })
 
-  it('store status 的 tables 含内部表，而 db tables 只列业务表（两边数量不同）', async () => {
+  it('store status 的 tables 含内部表，且与 db tables 是同一组表（两边数量一致）', async () => {
     expect(await store('init')).toBe(0)
     out = ''
     expect(await store('status')).toBe(0)
@@ -112,7 +114,9 @@ describe('真库实测：图例的字面结论靠它成立', () => {
     expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
     const dbNames = (data().tables as Array<{ name: string }>).map((t) => t.name)
     // ⚠️ 实测：db tables 也列内部表（TABLES 闭集里就有），两边是**同一组**表。
-    // 我最初以为「db tables 只列业务表、两边数量不同」—— 是错的，被这条断言抓住。
+    // 本用例的标题曾写「db tables 只列业务表（两边数量不同）」—— 是错的，被下面
+    // 这条断言抓住；2026-11-01 把标题与文件头一起改成实况（PR #54 同口径：README 与
+    // field_notes 里同源旧措辞也是那时清掉的）。
     for (const internal of ['schema_version', 'sync_state', 'sync_gaps']) {
       expect(dbNames, `db tables 同样列内部表 ${internal}`).toContain(internal)
     }

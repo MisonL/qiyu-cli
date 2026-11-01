@@ -1,7 +1,14 @@
 import { describe, it, expect, vi } from 'vitest'
 import { retryWithBackoff, isLockError, classifyOpenFailure } from '../../src/store/retry.js'
 
-const lockErr = () => new Error('IO Error: Could not set lock on file "x": Conflicting lock is held')
+// ⚠️ 夹具用**探针逐字**的真报文形态（跨进程真持锁实测）：判据已从「子串搜 Conflicting lock」
+// 收紧为模板锚定（2026-11-01，见 store/retry.ts 的 isLockError 注释）—— 那条子串判会把
+// 「路径里恰好含这两个词的非 DuckDB 文件」判成撞锁。
+const LOCK_MSG = (path = '/tmp/x/q.db') =>
+  `IO Error: Could not set lock on file "${path}": Conflicting lock is held in `
+  + '/Users/x/.nvm/versions/node/v24/bin/node (PID 83991) by user x. '
+  + 'See also https://duckdb.org/docs/stable/connect/concurrency'
+const lockErr = () => new Error(LOCK_MSG())
 
 describe('classifyOpenFailure —— 打开失败的成因分类（2026-10-31 单一实现点）', () => {
   // 判据是 `store/retry.ts` 的 `classifyOpenFailure` 的唯一实现，store/query/sync 三处共用。
@@ -39,6 +46,17 @@ describe('isLockError —— 锁错误识别', () => {
   it('其他错误 → false（不无谓退避）', () => {
     expect(isLockError(new Error('ENOENT: no such file'))).toBe(false)
     expect(isLockError(new Error('EACCES: permission denied'))).toBe(false)
+  })
+  it('⚠️ 路径里含 `Conflicting lock` 的**非 DuckDB 文件** → false（子串判会把用户路径当锁）', () => {
+    // 实测事故（2026-11-01）：`db tables --db '/tmp/Conflicting lock/q.db'`（内容是垃圾）
+    // 被子串判认成撞锁 → 白白退避 30 秒 → 报「数据库被写进程占用」+ retryable: true，
+    // 而真相是那个路径根本不是数据库文件（重试一万次也一样）。
+    expect(isLockError(new Error(
+      'IO Error: The file "/private/tmp/qreview/Conflicting lock/q.db" exists, '
+      + 'but it is not a valid DuckDB database file!'))).toBe(false)
+    // 同类：权限错也把路径原文嵌进报文
+    expect(isLockError(new Error(
+      'IO Error: Cannot open file "/tmp/Conflicting lock.db": Permission denied'))).toBe(false)
   })
 })
 

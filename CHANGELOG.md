@@ -122,6 +122,55 @@
 
 ### 修复
 
+- **同一形态的第三批落点：四条错误分类判据也是裸子串判，能被列值与 SQL 回显仿冒**。
+  上一批只把 `isInterrupt` / `isLayer2Blocked` 收紧，**同一文件里另外四条分类判据漏在外面**
+  —— 表/列不存在（四条正则）、`Parser Error`、`Binder|Catalog Error`、`Out of Memory Error`。
+  它们同样是「拿整条报文做子串搜索」，而报文里嵌着外部字节。实测：
+  · `SELECT * FROM sessions LIMIT '<值>'` 在 **prepare 期**常量折叠成
+    `Conversion Error: Could not convert string 'Catalog Error: Table with name zzz does not exist!' to INT64 …`
+    —— 类型转换错误被报成「表 zzz 不存在」+ 候选清单，把 Agent 支使去改它没写过的表名；
+  · ``SELEC'Binder Error: Referenced table "sessons" not found!'`` —— 纯语法错被报成
+    「表 sessons 不存在」+「候选：sessions」；
+  · 列值含 `Out of Memory Error` 时，类型转换错误拿到「缩小时间范围或加过滤条件」的假修法；
+  · 列值含 `Parser Error` 时，类型转换错误被报成「SQL 语法错误」。
+  **修法**：四条判据一并收进 `src/query/native-error.ts`（`duckDbSaysMissingName` /
+  `isParserError` / `isBinderOrCatalogError` / `isOutOfMemory`），统一「剥 SQL 回显 +
+  要求 DuckDB 自己那句话**在报文开头**」（容忍 `Failed to extract statements: ` 包装 ——
+  真 Parser 报文实测带它；真 Catalog/Binder 报文实测不带）。
+  **连带修**：`driftFailureFor`（`query --table` 的库漂移识别）此前拿 sandbox 包装后的
+  中文串去匹配，判据收窄后**永远不命中**，hint 退化成「用 `db describe <表>` 查看列清单」
+  —— 正是它要防的那句话。改为吃 `cause` 上的原生原文。
+
+- **撞锁判据的子串搜索把「路径里含 `Conflicting lock` 的非 DuckDB 文件」判成撞锁**。
+  实测：`db tables --db '/tmp/Conflicting lock/q.db'`（内容是垃圾）耗时 **30.1 秒**、报
+  `store_locked` + `retryable: true`（「数据库被写进程占用，请稍后重试」）—— 而同一份内容
+  放在不含该词的路径上 0.3 秒就给出正确的 `store_not_initialized`。根因：DuckDB 的**非锁**
+  报文也把库路径原文嵌进去（`IO Error: The file "…" exists, but it is not a valid DuckDB
+  database file!`）。判据改为锚 DuckDB 的模板骨架（`Could not set lock on file "…":` +
+  `Conflicting lock is held in ` + ` by user `），三处都不在路径里，没有第二种报文能命中。
+  设计稿 §5.2 的「message 含 `Conflicting lock`」已就地回写为该口径（意图不变：非锁错误不
+  无谓退避）。
+
+- **`db` / `stats` 的「未知参数」把空串渲染成隐形**。`query` / `api` 早走 `describeArgs`
+  （空串渲染成 `''`），`db` / `stats` 共八处仍是裸 `join(' ')` —— `db tables ''` 得到
+  「未知参数：」冒号后一片空白，退出码 2 的全部价值（「改哪里」）丢失。八处统一改走
+  `describeArgs`。
+
+- **`sync run` 的 `tasks[].gaps` 图例用位置指代「后四个 reason」**。位置依赖 README 图例表的
+  排列顺序，而那个顺序**没有任何守卫**（`tests/sync-enums.test.ts` 的双向核对用 `sort()`，
+  重排表格照样绿）；更关键的是 Agent 读的是 run 输出、手里未必有那张表 ——「后四个」在它那里
+  无法解析。改为从 `TASK_GAP_REASONS` **逐名渲染**（加了值也同步），README 同段一起改。
+
+- **`tests/store-field-notes.test.ts` 的文件头与文件内断言互相矛盾**：头部注释写「`db tables`
+  只列业务表、两边数量不同」，而下方用例 `expect(dbNames).toEqual(storeNames)` 早已证伪
+  （实测两边都含内部表、都是同一组）。用例标题与注释一并改为实况。
+
+  **变异验证**：本轮 9 处变异全部转红 —— `Binder|Catalog` 判据退回裸子串、`OOM` 判据退回
+  裸子串、`duckDbSaysMissingName` 去掉 `^` 锚、`driftFailureFor` 不再吃 `cause`、
+  `db` / `stats` 的 `describeArgs` 退回裸 join（三处）、锁判据退回
+  `msg.includes('Conflicting lock')`、图例退回「后四个」；每处先 `grep` 确认落地，
+  跑完 `diff` 确认还原。
+
 - **DuckDB 报文回声污染：用户数据与用户 SQL 能把错误伪装成「查询超时」或「沙箱拦截」**。
   DuckDB 的报文会带进外部文本：`Conversion Error` 回显**列值**，`Parser Error` 在
   `\nLINE n:` 之后回显出错行的 **SQL 原文**。原判据对整条 message 做子串搜索，于是：

@@ -2,10 +2,36 @@
 // ⚠️ 曲线是**固定间隔**（实测 2.6s/13 次成功 ≈ 200ms 间隔，spec §5.2）——
 // 不是指数：指数曲线在剩余预算不足时会大幅越过 maxMs。
 
-/** 锁冲突的识别规则（spec §5.2 定死）：message 含 `Conflicting lock`。 */
+/**
+ * 锁冲突的识别：**模板**匹配，不是子串搜索。
+ *
+ * 真实报文（探针逐字，@duckdb/node-api 1.5.6-r.1、跨进程真持锁）：
+ *   `IO Error: Could not set lock on file "<路径>": Conflicting lock is held in
+ *    /usr/bin/node (PID 83991) by user mison. See also https://duckdb.org/docs/stable/connect/concurrency`
+ *
+ * ⚠️⚠️ **不能**只搜 `Conflicting lock` 子串（2026-11-01 实测，形态「报文里嵌了用户给的
+ * 路径」）：DuckDB 的**其它**报文同样把库路径原文嵌进去 ——
+ * `IO Error: The file "/tmp/Conflicting lock/q.db" exists, but it is not a valid
+ *  DuckDB database file!`（路径里恰好含这两个词）。子串判于是把**非 DuckDB 文件**
+ * 判成撞锁：`db tables` / `store status` 会**白白退避 30 秒**再报「数据库被写进程占用」，
+ * `retryable: true` 还把 Agent 引向「稍后重试」—— 而真相是那个路径根本不是数据库文件，
+ * 重试一万次也一样。实测：`db tables --db '/tmp/qreview/Conflicting lock/q.db'` 耗时
+ * 30.1s、`kind: store_locked`；同一份内容放在不含该词的路径上 0.4s 就给出正确的
+ * `store_not_initialized`。
+ *
+ * 判据因此锚住 DuckDB 自己的**模板骨架**：句首 `IO Error: Could not set lock on file `、
+ * 冒号后 `Conflicting lock is held in `、以及所有者片段 ` by user `。三处都不在路径里
+ * 就没有第二种报文能命中（`not a valid DuckDB database file` 那句句首是 `The file `）。
+ * ⚠️ 边界如实记录：路径由用户给出且会被原文嵌入，理论上可以构造一个同时凑齐这三段的
+ * 路径；代价是那个路径**必须**长得就像 DuckDB 的锁报文 —— 比「恰好含两个词」苛刻得多，
+ * 而放宽的代价（上面那 30 秒假锁 + 假 retryable）是实测发生的。
+ *
+ * 与 spec §5.2 原文「message 含 `Conflicting lock`」的偏离是**有意**的：那句话写于
+ * 判据只有一处消费点、且假设报文只可能是锁报文的时候。
+ */
 export function isLockError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e)
-  return msg.includes('Conflicting lock')
+  return /^IO Error: Could not set lock on file "[\s\S]*": Conflicting lock is held in [\s\S]* by user /i.test(msg)
 }
 
 /**

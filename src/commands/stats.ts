@@ -234,7 +234,7 @@ async function statsFields(argv: string[]): Promise<number> {
   // 子命令级次序沿 db.ts：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const extra = argv.filter((a) => !KNOWN.has(a))
-    if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)
+    if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -245,11 +245,11 @@ async function statsFields(argv: string[]): Promise<number> {
   try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
 
   const flagish = flags.rest.filter((a) => a.startsWith('-'))
-  if (flagish.length > 0) return usageFail(`未知参数：${flagish.join(' ')}`)
+  if (flagish.length > 0) return usageFail(`未知参数：${describeArgs(flagish)}`)
   if (flags.rest.length === 0) {
     return usageFail(`缺少表名：请给 stats fields <表>\n可用表：${REPORT_TABLES.join('、')}`)
   }
-  if (flags.rest.length > 1) return usageFail(`未知参数：${flags.rest.slice(1).join(' ')}`)
+  if (flags.rest.length > 1) return usageFail(`未知参数：${describeArgs(flags.rest.slice(1))}`)
 
   const table = sanitizeControlChars(flags.rest[0])
   // 尚未解析存储（闭集校验先于一切 I/O）：诊断 hint 只能复现用户原始 flag。
@@ -385,7 +385,7 @@ export async function statsCommand(argv: string[]): Promise<number> {
   if (sub === undefined || sub === '--help' || sub === '-h') {
     // --help 不吞额外参数；--pretty 豁免（db.ts 同族惯例）
     const extra = rest.filter((a) => !KNOWN.has(a))
-    if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)
+    if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -393,7 +393,7 @@ export async function statsCommand(argv: string[]): Promise<number> {
   if (sub === '--pretty') {
     const extra = rest.filter((a) => !KNOWN.has(a))
     if (extra.length > 0)
-      return usageFail(`未知参数：${extra.join(' ')}。--pretty 不接受额外参数`)
+      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 不接受额外参数`)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
       return 0

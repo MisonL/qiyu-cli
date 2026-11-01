@@ -833,7 +833,8 @@ describe('openSandbox 的错误路径', () => {
   it('ro 撞锁退避超限 → store_locked + retryable + hint（注入 importer，不持真锁）', async () => {
     const importer = async (): Promise<unknown> => ({
       DuckDBInstance: {
-        create: async () => { throw new Error('Conflicting lock on database file') },
+        // 探针逐字的真锁报文形态（判据已锚模板，见 store/retry.ts 的 isLockError）
+        create: async () => { throw new Error('IO Error: Could not set lock on file "/x/q.db": Conflicting lock is held in /usr/bin/node (PID 1) by user u') },
       },
       StatementType: {},
     })
