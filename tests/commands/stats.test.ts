@@ -460,6 +460,12 @@ describe('stats fields', () => {
     expect(await statsCommand(['fields', 'daily_overview', '--bogus'])).toBe(2)
     expect(errorOf().kind).toBe('usage')
 
+    // ⚠️ 空串参数必须可见（2026-11-01 审查，与 db 同一条口径）：此前裸 `join(' ')`
+    // 把空串渲染成隐形，退出码 2 的价值（「改哪里」）也一并丢了。
+    out = ''; err = ''
+    expect(await statsCommand(['fields', 'daily_overview', ''])).toBe(2)
+    expect(err, '空串必须渲染成 \'\'').toMatch(/未知参数：''/)
+
     out = ''; err = ''
     expect(await statsCommand(['fields', 'daily_overview', '--db'])).toBe(2)   // 值位守卫
     expect(err).toMatch(/--db 缺少取值/)

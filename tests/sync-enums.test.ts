@@ -75,6 +75,21 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
     expect(p, '「提示 ≠ 失败」的语义必须写明').toMatch(/成功窗上的提示/)
   })
 
+  // 2026-11-01 审查：「提示类四值」此前在 run 图例里写「后四个 reason」——位置指代
+  // 依赖 README 图例表的**排列顺序**，而顺序没有任何守卫（上面的双向核对用 sort()，
+  // 重排表格照样绿）；Agent 读 run 输出时手里也未必有那张表，「后四个」无法解析。
+  // 现在逐名渲染，这条钉住「四个名字都在」且「位置指代不复活」。
+  it('run 图例的 gaps 单元格逐名点名四个业务提示 reason（不用位置指代「后四个」）', async () => {
+    const { runFieldNotes } = await import('../src/commands/sync-notes.js')
+    const cell = runFieldNotes()['tasks[].gaps']!
+    for (const r of TASK_GAP_REASONS) {
+      expect(cell, `run 图例必须逐名点名 ${r}（Agent 手里没有 README 表）`).toContain(r)
+    }
+    expect(cell, '位置指代「后四个」依赖没有守卫的表格顺序，不得复活').not.toMatch(/后四个|前四个/)
+    // 变异自检：合成一个位置指代形态，上面的正则必须命中（防正则退化恒绿）
+    expect('gaps 非空不等于同步失败：后四个 reason 是成功窗上的业务提示').toMatch(/后四个|前四个/)
+  })
+
   it('skill 协议不得把 sync verify 说成两类任务都与远端核对（CodeRabbit 2026-10-27）', () => {
     // windowed 任务不做上游全量重拉，verify 只看本地行数与 sync_state —— 协议若笼统写
     // 「核对本地与远端的一致性」，Agent 会用「drift 为空」错误排除「本地数据未反映远端

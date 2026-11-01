@@ -52,6 +52,74 @@ export function isInterrupt(msg: string): boolean {
 }
 
 /**
+ * DuckDB 说「表/列不存在」时，它**自己**那句话必须出现在报文的开头。
+ *
+ * ⚠️ 为什么判据要锚开头（2026-11-01 审查实测，与 `isInterrupt` 同族）：
+ * `errors.ts` 的四条表/列正则只锚了类别前缀（`Catalog Error:` / `Binder Error:`），
+ * 以为这样就挡住了 Parser Error 的 SQL 回显。**挡不住** —— 回显本身就是用户写的文本，
+ * 用户（或数据）写的字符串里可以逐字含类别前缀：
+ *   · `Conversion Error: Could not convert string 'Catalog Error: Table with name zzz does not exist!' to INT64 …`
+ *     （prepare 期常量折叠，实测：`SELECT * FROM sessions LIMIT '<值>'`）
+ *   · `Parser Error: …\n\nLINE 1: SELEC'Binder Error: Referenced table "sessons" not found!'`
+ * 两者都让 `TABLE_NAME_RE` 命中，于是**类型转换错误/语法错被谎报成「表 X 不存在」**，
+ * 还附带一份候选清单把 Agent 支使去改一个它没写过的表名。
+ * 真报文（探针逐字）：`Catalog Error: Table with name sessons does not exist!` —— 类别前缀
+ * 就在开头；带包装的只有 Parser（`Failed to extract statements: Parser Error: …`），
+ * 而 Parser 不是本判据要认的类别。故「剥回显 + 锚开头（容忍该包装）」两者都满足才算。
+ */
+export function duckDbSaysMissingName(msg: string, pattern: RegExp): RegExpExecArray | null {
+  const own = withoutSqlEcho(msg)
+  const wrap = /^\s*(?:Failed to extract statements:\s*)?/.exec(own)?.[0] ?? ''
+  const rest = own.slice(wrap.length)
+  if (!/^(?:Catalog|Binder) Error:/i.test(rest)) return null
+  // ⚠️ 判据模式本身也必须锚在**那句话的开头**（2026-11-01 CodeRabbit）：只查「报文以类别
+  // 前缀开头」还不够 —— 列名是用户给的，可以整段长成另一条报文的形状。实测：
+  // 列名 = `Catalog Error: Table with name zzz does not exist!` 时，DuckDB 说
+  // `Binder Error: Referenced column "Catalog Error: Table with name zzz does not exist!" not found`
+  // —— 前缀检查通过（Binder Error: 在开头），而表名正则在**列名内部**命中，
+  // 于是「列不存在」被报成「表 zzz 不存在」（实测复现）。锚开头后两者不会互串。
+  return new RegExp('^(?:' + pattern.source + ')', pattern.flags.replace('g', '')).exec(rest)
+}
+
+/**
+ * DuckDB **自己**说语法错（`Parser Error: syntax error at or near …`）。
+ *
+ * ⚠️ 同样不能只搜子串（2026-11-01 审查实测，与同族三条同一形态）：`Conversion Error`
+ * 回显列值时，值里含 `Parser Error` 就会被判成「SQL 语法错误」——而归因是假的
+ *（真实成因是类型转换，修法完全不同：改数据或改 cast，不是改语法）。
+ * 实测：`SELECT CAST(x AS INT) FROM t`（`t.x` 值含该串）→ 曾被报成语法错。
+ *
+ * ⚠️ 容忍 `Failed to extract statements: ` 包装：真 Parser 报文实测就带它
+ *（`extractStatements` 阶段抛出，探针逐字）。
+ */
+export function isParserError(msg: string): boolean {
+  return /^\s*(?:Failed to extract statements:\s*)?Parser Error:/i.test(withoutSqlEcho(msg))
+}
+
+/**
+ * DuckDB **自己**说内存不足（`Out of Memory Error: failed to allocate …`，探针实测）。
+ *
+ * ⚠️ 同样不能只搜子串（2026-11-01 审查实测）：`Conversion Error` 会回显列值，
+ * 值里含 `Out of Memory Error` 时（实测 `INSERT INTO t VALUES ('Out of Memory Error: fake')`
+ * 后 `CAST(x AS INT)`）子串判会给这条**类型转换错误**补上「缩小时间范围或加过滤条件」的
+ * hint —— 真正的修法是改数据/改 cast，按 hint 去缩窗口只会白跑一轮。
+ */
+export function isOutOfMemory(msg: string): boolean {
+  return /^\s*(?:Failed to extract statements:\s*)?Out of Memory Error:/i.test(withoutSqlEcho(msg))
+}
+
+/**
+ * DuckDB **自己**说的 Binder/Catalog 错误（函数不存在、类型不匹配等）。
+ *
+ * ⚠️ 子串判可被列值/回显伪造（同族）：值里含 `Catalog Error:` 时，
+ * `Conversion Error` 的报文会被判成「SQL 写错了」——真正的修法完全不同。
+ * 真报文在开头（Parser 形态带 `Failed to extract statements: ` 包装），故锚开头。
+ */
+export function isBinderOrCatalogError(msg: string): boolean {
+  return /^\s*(?:Failed to extract statements:\s*)?(?:Binder|Catalog) Error:/i.test(withoutSqlEcho(msg))
+}
+
+/**
  * layer2 只读沙箱的文件/网络拦截。实测五形态（read_csv / read_text / glob / COPY /
  * ATTACH / EXPORT / INSTALL）报文恒以 `Permission Error: Cannot access file|directory
  * "…" - file system operations are disabled by configuration` 开头。

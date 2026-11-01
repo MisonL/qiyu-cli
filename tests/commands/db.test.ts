@@ -508,6 +508,16 @@ describe('db describe', () => {
     expect(await dbCommand(['describe', 'sessions', 'extra', '--db', dbPath()])).toBe(2)
     expect(err).toMatch(/未知参数/)
 
+    // ⚠️ 空串参数必须**可见**（2026-11-01 审查）：`db`/`stats` 的「未知参数」此前走裸
+    // `join(' ')`，空串渲染成隐形，Agent 拿到一句「未知参数：」冒号后什么都没有 ——
+    // 而 `query`/`api` 早走 `describeArgs`（`未知参数：''`）。同一错误两个命令族两种说法。
+    out = ''; err = ''
+    expect(await dbCommand(['describe', 'sessions', '', '--db', dbPath()])).toBe(2)
+    expect(err, '空串必须渲染成 \'\'，不能隐形').toMatch(/未知参数：''/)
+    out = ''; err = ''
+    expect(await dbCommand(['tables', 'foo', '', '--db', dbPath()])).toBe(2)
+    expect(err, '多个未知参数里空串同样要可见').toMatch(/未知参数：foo、''/)
+
     // 未知 flag 不得被当成表名；--pretty 沿全族显式拒绝
     out = ''; err = ''
     expect(await dbCommand(['describe', 'sessions', '--bogus', '--db', dbPath()])).toBe(2)

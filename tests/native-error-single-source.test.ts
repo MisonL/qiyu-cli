@@ -54,6 +54,15 @@ const PREDICATES: Array<[string, RegExp]> = [
 ]
 
 /**
+ * 分类类判据的**载荷**（`errors.ts` 持有的四条表/列正则、`Out of Memory Error:` 等）。
+ *
+ * ⚠️ 它们**不算判据**：判据是「拿这段载荷去测整条报文」这个动作，而载体只描述「长什么样」。
+ * 载荷留在消费点是正当的（`duckDbSaysMissingName(msg, TABLE_NAME_RE)` 必须能拿到它），
+ * 所以本文件只用 FORBIDDEN 抓**判定形态**（载荷 + `.test(`/`.exec(` 同行），不抓声明。
+ */
+const CLASSIFICATION_PAYLOADS = /(?:Catalog|Binder) Error|Out of Memory Error|INTERRUPT Error/i
+
+/**
  * **任何**文件都不得出现的判据 —— 指纹是这条规则**禁用**的形态。
  *
  * ⚠️ 用函数而不是单条正则：禁用形态是「**判据的载荷**里出现了那个词、却**没有**
@@ -69,6 +78,26 @@ const FORBIDDEN: Array<[string, (line: string) => boolean]> = [
     /\/[^/]*INTERRUPT[^/]*\//i.test(l) && !/INTERRUPT\s*Error/i.test(l)],
   ['裸 layer2 特征句判（无类别锚）', (l) =>
     /file system operations are disabled/i.test(l) && !/Permission\s*Error/i.test(l)],
+  // ⚠️ 第二轮（2026-11-01）：**判定形态**同样禁用 —— 分类类判据（表/列不存在、OOM、
+  // Binder/Catalog）此前都在消费点写成裸子串判，用户数据与 SQL 回显能逐字仿冒它们。
+  // 指纹按「判据」而非「文本」表述：**载荷 + `.test(`/`.exec(` 同行**才算判定，
+  // 单说载荷（`const TABLE_NAME_RE = /Catalog Error: …/`）是正当的 —— 它是喂给
+  // 唯一实现点的参数，不是判据（抓声明会把 `errors.ts:108-111` 误伤）。
+  ['裸 OOM 子串判（无开头锚）', (l) =>
+    /\/[^/]*Out of Memory Error[^/]*\/[a-z]*\.(?:test|exec)\(/i.test(l) && !/\^/.test(l)],
+  // 第二次「按判据表述」的实践：Binder|Catalog 的**择一写法**有好几种
+  //（`/(Binder|Catalog) Error/`、`/Binder Error|Catalog Error/`、`/[BC]inder Error/`），
+  // 只钉现场那一种就会漏一族。这里按**判据**表述：正则字面量里出现 `…Error` 特征词、
+  // 与 `.test(`/`.exec(` 同行（= 判定动作）、且不含开头锚 `^`。
+  ['裸 Binder/Catalog 子串判（无开头锚）', (l) =>
+    /\/[^/]*(?:Binder|Catalog)[^/]*\//i.test(l) && /Error/i.test(l)
+    && /\.(?:test|exec)\(/.test(l) && !/\^/.test(l)],
+  // 变体：`msg.includes('Catalog Error:')` / `msg.indexOf('Out of Memory Error')` ——
+  // 事故的另一种写法（本仓库记过：禁用形态要按判据表述，别只钉现场那一种写法）。
+  ['裸 Parser 子串判（无开头锚）', (l) =>
+    /\/[^/]*Parser[^/]*\//i.test(l) && /Error/i.test(l) && /\.(?:test|exec)\(/.test(l) && !/\^/.test(l)],
+  ['裸分类串 includes/indexOf 判', (l) =>
+    /(?:includes|indexOf)\(\s*['"][^'"]*(?:Catalog|Binder) Error[^'"]*['"]/i.test(l)],
 ]
 
 function scanText(
@@ -136,7 +165,15 @@ describe('DuckDB 原生报文判据必须只有一处实现（native-error.ts）
       expect(start, `${SINGLE_SOURCE} 里找不到 ${name}`).toBeGreaterThanOrEqual(0)
       return codeOnly.slice(start, codeOnly.indexOf('\n}', start))
     }
-    for (const [name, anchor] of [['isInterrupt', /\^INTERRUPT Error:/i], ['isLayer2Blocked', /\^Permission Error:/i]] as const) {
+    for (const [name, anchor] of [
+      ['isInterrupt', /\^INTERRUPT Error:/i],
+      ['isLayer2Blocked', /\^Permission Error:/i],
+      // 第二轮（2026-11-01）：分类判据同样要锚开头 + 剥回显（列值/回显可逐字仿冒）
+      ['isOutOfMemory', /\^/],
+      ['isBinderOrCatalogError', /\^/],
+      ['duckDbSaysMissingName', /\^/],
+      ['isParserError', /\^/],
+    ] as const) {
       expect(bodyOf(name), `${name} 必须把类别前缀锚在开头（^）`).toMatch(anchor)
       expect(bodyOf(name), `${name} 必须先剥 SQL 回显再判定`).toMatch(/withoutSqlEcho\(/)
     }
@@ -153,8 +190,9 @@ describe('DuckDB 原生报文判据必须只有一处实现（native-error.ts）
     const missing = PREDICATES.map(([why]) => why)
       .filter((why) => !scanText(text, PREDICATES).some((h) => h.why === why))
     expect(missing, `${SINGLE_SOURCE} 缺这些判据（扫描器等于没守任何东西）`).toEqual([])
-    expect(text).toMatch(/export function isInterrupt/)
-    expect(text).toMatch(/export function isLayer2Blocked/)
+    for (const fn of ['isInterrupt', 'isLayer2Blocked', 'isOutOfMemory', 'isBinderOrCatalogError', 'isParserError', 'duckDbSaysMissingName']) {
+      expect(text, `${SINGLE_SOURCE} 缺 ${fn}`).toMatch(new RegExp(`export function ${fn}\\b`))
+    }
   })
 
   it('扫描器自身有牙：真实事故的原样文本必须被抓到，合法写法必须放过', () => {
@@ -169,8 +207,18 @@ describe('DuckDB 原生报文判据必须只有一处实现（native-error.ts）
       // 合法：调用唯一实现
       ['合法 调用', '        if (isInterrupt(msg)) {', 0],
       ['合法 layer2 调用', '  if (isLayer2Blocked(msg)) {', 0],
-      // 合法：与这两条判据无关的其它报文判据
-      ['合法 其它判据', "  if (/Out of Memory Error/i.test(msg)) {", 0],
+      // ⚠️ 第二轮（2026-11-01）：OOM 判据**不再**是「无关判据」—— 它在消费点也曾被写成
+      // 裸子串判（`errors.ts` 的 ⑦ 支），值回显能逐字仿冒它。故下面这条从「合法(0)」
+      // 改成「事故形态(1)」，并把修法（调唯一实现点）作为新的合法形态。
+      ['裸 OOM 子串判（事故形态，第二轮发现）', "  if (/Out of Memory Error/i.test(msg)) {", 1],
+      ['裸 Binder/Catalog 子串判（事故形态，第二轮发现）', "  if (/(Binder|Catalog) Error/i.test(msg)) {", 1],
+      ['裸分类串 includes 判（事故的另一写法）', "  if (msg.includes('Catalog Error:')) {", 1],
+      ['裸 Parser 子串判（事故形态，第二轮发现）', "  if (/Parser Error/i.test(msg)) {", 1],
+      ['合法 Parser 调用', '  if (isParserError(msg)) {', 0],
+      // 合法：载荷声明**不是**判据（喂给唯一实现点的参数），不得误伤
+      ['合法 载荷声明', 'const TABLE_NAME_RE = /Catalog Error: Table with name ([^\\s]+) does not exist/', 0],
+      ['合法 OOM 调用', '  if (isOutOfMemory(msg)) {', 0],
+      ['合法 Binder/Catalog 调用', '  if (isBinderOrCatalogError(msg)) {', 0],
     ]
     for (const [label, text, want] of cases) {
       expect(scanText(text, PREDICATES, FORBIDDEN).length, `${label}：${text}`).toBe(want)

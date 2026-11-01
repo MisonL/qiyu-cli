@@ -245,7 +245,7 @@ async function dbTables(argv: string[]): Promise<number> {
   // 子命令级次序沿 store.ts：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 未知参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const rawRest = argv.filter((a) => !KNOWN.has(a))
-    if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
+    if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -254,7 +254,7 @@ async function dbTables(argv: string[]): Promise<number> {
 
   let flags: ReturnType<typeof parseStoreFlags>
   try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
-  if (flags.rest.length > 0) return usageFail(`未知参数：${flags.rest.join(' ')}`)
+  if (flags.rest.length > 0) return usageFail(`未知参数：${describeArgs(flags.rest)}`)
 
   const opened = await openGuardedSession(flags)
   if ('exit' in opened) return opened.exit
@@ -374,7 +374,7 @@ async function dbDescribe(argv: string[]): Promise<number> {
   // 子命令级次序沿 dbTables：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
     const rawRest = argv.filter((a) => !KNOWN.has(a))
-    if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
+    if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -386,11 +386,11 @@ async function dbDescribe(argv: string[]): Promise<number> {
 
   // 未知 flag（`--bogus`）会落进 rest —— 先按 `-` 前缀挑出来，避免被当成表名。
   const flagish = flags.rest.filter((a) => a.startsWith('-'))
-  if (flagish.length > 0) return usageFail(`未知参数：${flagish.join(' ')}`)
+  if (flagish.length > 0) return usageFail(`未知参数：${describeArgs(flagish)}`)
   if (flags.rest.length === 0) {
     return usageFail(`缺少表名：请给 db describe <表>\n可用表：${TABLES.map((t) => t.name).join('、')}`)
   }
-  if (flags.rest.length > 1) return usageFail(`未知参数：${flags.rest.slice(1).join(' ')}`)
+  if (flags.rest.length > 1) return usageFail(`未知参数：${describeArgs(flags.rest.slice(1))}`)
 
   // spec §8.2「未知 → usage + 候选」：闭集校验先于一切 I/O（不打开库就知道表名拼错）。
   // 候选来自 `TABLES`（前缀/编辑距离，大小写不敏感），不裸透 DuckDB 英文原文。
@@ -485,7 +485,7 @@ export async function dbCommand(argv: string[]): Promise<number> {
   if (sub === undefined || sub === '--help' || sub === '-h') {
     // --help 不吞额外参数；--pretty 豁免（store.ts 同族惯例）
     const extra = rest.filter((a) => !KNOWN.has(a))
-    if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)
+    if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -494,7 +494,7 @@ export async function dbCommand(argv: string[]): Promise<number> {
     const unknown = rest.filter((a) => a.startsWith('-') && !KNOWN.has(a))
     const positional = rest.filter((a) => !a.startsWith('-'))
     if (unknown.length + positional.length > 0)
-      return usageFail(`未知参数：${[...unknown, ...positional].join(' ')}。--pretty 不接受额外参数`)
+      return usageFail(`未知参数：${describeArgs([...unknown, ...positional])}。--pretty 不接受额外参数`)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
       return 0

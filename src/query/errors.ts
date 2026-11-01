@@ -20,7 +20,10 @@
 import { fail, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand, dbTablesCommand, dbDescribeCommand } from '../output.js'
 import type { StoreLocation } from '../output.js'
 import type { TableDef } from '../store/schema.js'
-import { isLayer2Blocked } from './native-error.js'
+import {
+  isLayer2Blocked, duckDbSaysMissingName, isOutOfMemory, isBinderOrCatalogError,
+  isParserError, withoutSqlEcho,
+} from './native-error.js'
 
 export interface QueryFailure {
   code: string
@@ -165,10 +168,31 @@ function candidateHint(candidates: string[]): string {
 // DuckDB 的错误消息会**回显 SQL 原文**（`LINE 1: …`），Parser Error 的报错里若恰好含
 // `Referenced column "x" not found` 字样，无锚的正则会把「语法错」误判成「列不存在」。
 // 实测：`SELECT 1 WHERE x = Referenced column "zzz" not found` → 原文是 Parser Error。
+//
+// ⚠️⚠️ **只锚类别前缀还不够**（2026-11-01 审查实测，与 PR #54 的报文回声污染同一形态）：
+// 回显区与列值都是**用户写的文本**，里面可以逐字含类别前缀。实测两个假归因：
+//   · `Parser Error: …` 的 `LINE 1:` 回显里写 ``SELEC'Binder Error: Referenced table "sessons" not found!'``
+//     → 纯**语法错**被报成「表 sessons 不存在」+ 候选 `sessions`（Agent 会去改它没写过的表名）；
+//   · `SELECT … LIMIT '<值>'` 在 **prepare 期**常量折叠，`Conversion Error: Could not convert
+//     string 'Catalog Error: Table with name zzz does not exist!' to INT64 …` —— 值里的类别前缀
+//     让 `TABLE_NAME_RE` 命中，**类型转换错误**被报成「表 zzz 不存在」。
+// 判据因此收进 `native-error.ts` 的 `duckDbSaysMissingName`（**唯一实现点**）：先剥 SQL 回显，
+// 再要求 DuckDB **自己那句话在开头** —— 真报文的类别前缀就在报文开头（探针逐字核对：
+// `Catalog Error: Table with name sessons does not exist!`），唯一带包装的是 Parser
+//（`Failed to extract statements: Parser Error:`），而它不在本判据要认的类别里。
 const TABLE_NAME_RE = /Catalog Error: Table with name ([^\s]+) does not exist/
 const TABLE_REF_RE = /Binder Error: Referenced table "([^"]+)" not found/
 const COLUMN_NAMED_RE = /Binder Error: Table "[^"]+" does not have a column named "([^"]+)"/
 const COLUMN_NAME_RE = /Binder Error: Referenced column "([^"]+)" (?:was )?not found/
+
+/** 四条的**唯一判定入口**：DuckDB 自己说「表/列不存在」才算（回显/列值里的仿冒串不算）。 */
+function matchMissingName(msg: string, patterns: readonly RegExp[]): RegExpExecArray | null {
+  for (const p of patterns) {
+    const m = duckDbSaysMissingName(msg, p)
+    if (m !== null) return m
+  }
+  return null
+}
 
 /**
  * 「声明有而库中无」的成因与对策（**唯一实现**：db tables 的 warning、db describe 的
@@ -241,9 +265,9 @@ function missingNameFailure(
   tables: readonly TableDef[],
   loc?: StoreLocation,
 ): { message: string; hint: string } | null {
-  const byTableName = TABLE_NAME_RE.exec(msg) ?? TABLE_REF_RE.exec(msg)
+  const byTableName = matchMissingName(msg, [TABLE_NAME_RE, TABLE_REF_RE])
   if (byTableName) return tableNotFound(byTableName[1], msg, tables, loc)
-  const byColumn = COLUMN_NAMED_RE.exec(msg) ?? COLUMN_NAME_RE.exec(msg)
+  const byColumn = matchMissingName(msg, [COLUMN_NAMED_RE, COLUMN_NAME_RE])
   if (byColumn) return columnNotFound(byColumn[1], msg, tables, loc)
   return null
 }
@@ -286,7 +310,7 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
       }
       // R11：sandbox 的执行期 catch 把 OOM 包成 internal 且（修复后）挂 cause ——
       // message 保持 sandbox 原文，只补可操作 hint。
-      if (classified.kind === 'internal' && /Out of Memory Error/i.test(causeMsg)) {
+      if (classified.kind === 'internal' && isOutOfMemory(causeMsg)) {
         f.hint = '缩小时间范围或加过滤条件'
       }
     }
@@ -311,7 +335,9 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
   }
 
   // ④ SQL 语法错：spec §十一 行 6 —— 中文包装 + 底层原文（原文自带位置信息，保留全部行）。
-  if (/Parser Error/i.test(msg)) {
+  // 判据走唯一实现点（锚开头 + 剥回显）：子串判会被列值里那句 `Parser Error` 伪造，
+  // 把类型转换错误说成语法错（修法完全不同：改数据 vs 改 SQL）。
+  if (isParserError(msg)) {
     return {
       kind: 'usage', code: 'query_error', retryable: false,
       message: `SQL 语法错误：${msg}`,
@@ -319,7 +345,13 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
   }
 
   // ⑤ 未绑参：spec §十一 行 6（「SQL 语法错 / 未绑参」同归 usage/query_error）。
-  if (/Expected \d+ parameters/i.test(msg)) {
+  // ⚠️ 实测两件事：① 真报文前缀是 `Invalid Input Error: Expected 1 parameters, but none were
+  // supplied`（探针：`conn.run('SELECT ?')`）；prepared 路径抛的是另一句
+  // `Values were not provided for the following prepared statement parameters`。本 CLI 的
+  // 沙箱在 layer1-③ 用 `parameterCount !== params.length` **提前拦下**，所以这一支在
+  // 用户 SQL 路径上不可达，是防御支；② 即便如此也**锚开头 + 剥回显** —— 子串判同样可被
+  // 回显里那句字面量伪造（与 ③⑥⑦ 同族），假归因不会因为分支不可达就变得无害。
+  if (/^\s*Invalid Input Error:\s*Expected \d+ parameters/i.test(withoutSqlEcho(msg))) {
     return {
       kind: 'usage', code: 'query_error', retryable: false,
       message: `SQL 参数个数不匹配：${msg}`,
@@ -328,8 +360,9 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
   }
 
   // ⑥ 其余 Binder / Catalog 错误（函数不存在、类型不匹配等）：同样是 SQL 写错了。
-  // ⚠️ 不锚定行首：sandbox 实测会包一层前缀（`Failed to extract statements: Binder Error: …`）。
-  if (/(Binder|Catalog) Error/i.test(msg)) {
+  // 判据走唯一实现点（锚开头 + 剥回显，容忍 `Failed to extract statements: ` 包装）：
+  // 子串判会被列值/回显里的 `Catalog Error:` 伪造，把类型转换错误说成 SQL 写错。
+  if (isBinderOrCatalogError(msg)) {
     return {
       kind: 'usage', code: 'query_error', retryable: false,
       message: `SQL 无法执行：${msg}`,
@@ -338,7 +371,9 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
   }
 
   // ⑦ 内存不足：环境问题，不是 SQL 写错 —— internal + 可操作 hint。
-  if (/Out of Memory Error/i.test(msg)) {
+  // 判据走唯一实现点：子串判会被列值里的 `Out of Memory Error` 伪造，给类型转换错误
+  // 补一条「缩小时间范围」的假修法。
+  if (isOutOfMemory(msg)) {
     return {
       kind: 'internal', code: 'internal', retryable: false,
       message: `查询内存不足（${msg}）`,
@@ -443,8 +478,12 @@ export function emitQueryFailure(f: QueryFailure, noMask = false): number {
  *（生成的 SQL 里写错了列名）掩盖成环境问题。不属于时返回 null，交回原生分派。
  */
 export function driftFailureFor(table: TableDef, e: unknown, loc?: StoreLocation): QueryFailure | null {
-  const msg = errorText(e)
-  const byTable = TABLE_NAME_RE.exec(msg) ?? TABLE_REF_RE.exec(msg)
+  // ⚠️ 判据要吃**原生原文**：sandbox 把 prepare 期的原生错误包成 `SQL 无法执行：…` 并把原文
+  // 挂在 `cause` 上（裁决 R9），而 2026-11-01 起表/列判据要求「DuckDB 自己那句话在报文
+  // 开头」—— 拿包装后的中文串去判会**永远不命中**（本用例实测：删列后 hint 退化成
+  // 「用 db describe <表> 查看列清单」，把用户支使去改一个它没写过的东西，正是本函数要防的）。
+  const msg = errorText((e as { cause?: unknown } | null)?.cause ?? e)
+  const byTable = matchMissingName(msg, [TABLE_NAME_RE, TABLE_REF_RE])
   if (byTable !== null && byTable[1] === table.name) {
     return {
       code: 'query_error', kind: 'usage', retryable: false,
@@ -455,7 +494,7 @@ export function driftFailureFor(table: TableDef, e: unknown, loc?: StoreLocation
         + '` 只补未执行的迁移，不重建已删的表）',
     }
   }
-  const byColumn = COLUMN_NAMED_RE.exec(msg) ?? COLUMN_NAME_RE.exec(msg)
+  const byColumn = matchMissingName(msg, [COLUMN_NAMED_RE, COLUMN_NAME_RE])
   if (byColumn !== null && table.columns.some((c) => c.name === byColumn[1])) {
     return {
       code: 'query_error', kind: 'usage', retryable: false,
