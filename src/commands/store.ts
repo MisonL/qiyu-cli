@@ -1,5 +1,5 @@
 // src/commands/store.ts
-import { statSync, lstatSync, mkdirSync } from 'node:fs'
+import { lstatSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
@@ -8,6 +8,9 @@ import {
 } from '../output.js'
 import { classifyOpenFailure, NOT_DUCKDB_HINT, PERMISSION_HINT } from '../store/retry.js'
 import { parseStoreFlags } from './store-flags.js'
+import {
+  statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables, undeclaredTablesWarning,
+} from './store-precheck.js'
 import { storeFieldNotes } from './store-notes.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
@@ -156,13 +159,18 @@ export async function storeCommand(argv: string[]): Promise<number> {
       }
     }
     if (st !== undefined && st.isFile() === false && st.isDirectory() === true) {
+      // ⚠️ 两处「非普通文件」文案走 `store-precheck.ts` 的 `nonRegularFileHint`（2026-10-31
+      // 单一实现点）——此前 init/status 与 db/sync 各写各的，`!isFile()` 这个判据
+      // 覆盖了目录 / FIFO / 设备 / 套接字 四种成因，而 status 只按「目录」写死文案，
+      // 对 FIFO 说出「你传了个目录」（假话）。init 的结构不并入共享实现（它的
+      // lstat/符号链接拒绝/建父目录是写路径特有），但这段文案与 status/db/sync 同源。
       return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `不是普通文件：${config.path}`, hint: '--db 指向的不是普通文件，请改成一个数据库文件路径' })
+        message: `不是普通文件：${config.path}`, hint: nonRegularFileHint(true) })
     }
     if (st !== undefined && st.isFile() === false && st.isSymbolicLink() === false && st.isDirectory() === false) {
       // 其它特殊文件（设备/套接字等）同样拒绝
       return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `不是普通文件：${config.path}`, hint: '--db 指向的不是普通文件，请改成一个数据库文件路径' })
+        message: `不是普通文件：${config.path}`, hint: nonRegularFileHint(false) })
     }
     if (st !== undefined && st.isSymbolicLink() === true) {
       return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
@@ -186,55 +194,60 @@ export async function storeCommand(argv: string[]): Promise<number> {
     } catch (e) { return thrownToExit(e) }
     try {
       await store.init()
-      const tables = await store.tables()
+      // ⚠️ 与 `store status` 同口径（2026-11-01）：`store.tables()` 给的是**全库**清单
+      // （含未声明表），两个命令若一个全给、一个只给声明表，README 承诺的
+      // 「两边数量应当一致」就成了假话。未声明的表名进 warnings，不静默丢弃。
+      const all = await store.tables()
       const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
+      const undeclared = undeclaredTables(all)
       return ok({ path: config.path, backend: config.backend, config_path: configPath,
         config_exists: configExists,
         schema_version: Number(sv.rows[0]?.v ?? 0),
-        tables }, { field_notes: storeFieldNotes() })
+        tables: all.filter((n) => !undeclared.includes(n)) },
+      undeclared.length === 0
+        ? { field_notes: storeFieldNotes() }
+        : { field_notes: storeFieldNotes(), warnings: undeclaredTablesWarning(undeclared) })
     } catch (e) { return thrownToExit(e) } finally { await store.close() }
   }
 
   // status
-  // ⚠️ statSync 异常按 errno 分流（K 组 M6）：EACCES 误报「请先运行 init」会把
-  // 只读路径的权限错误引导向写操作（init），Agent 必然再失败一次 —— 归因必须准。
-  let st: ReturnType<typeof statSync>
-  try { st = statSync(config.path) } catch (e) {
-    const code = (e as { code?: string }).code
-    if (code === 'ENOENT') {
-      return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库文件不存在：${config.path}`,
-        hint: '数据库尚未初始化。请先运行：' + storeInitCommand(config.path) })
-      // ⚠️ 修复批 2 裁定：D 交付后本 hint **不改指** `qiyu sync run`（设计稿 §9.5 的
-      // 「D 交付后改指 sync run」不再采纳）——「初始化存储」的最小命令是 store init，
-      // 且 sync status/verify 是只读命令，指它们跑一次写操作并非必要。
-      // 同步侧（sync status/verify/install、sync run 的 storeInitFail）与 C1 同口径。
-    }
-    return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `无法访问 ${config.path}：${e instanceof Error ? e.message : String(e)}`,
-      hint: '请检查路径权限（status 是只读命令，不需要写权限）' })
-  }
-  if (!st.isFile()) {
-    // ⚠️ P 组 P-H2：目录成因**不能**引导向 store init（init 也拒绝目录 → 死循环）——
-    // 独立 hint，与「不存在」成因分形。
-    return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `不是普通文件：${config.path}`,
-      hint: '--db 指向的是目录而非数据库文件，请给出 .duckdb 数据库文件路径' })
-  }
+  // 库前置检查（ENOENT / 权限 / 非普通文件）走 `store-precheck.ts` 的 `statGuard`
+  // ——**唯一实现点**（2026-10-31 收敛）。此前这里自己写了一份，与 db/sync 那两份
+  // already 漂移出两种说法：本文件的权限 hint 写「status 是只读命令」、非普通文件写
+  // 「指向的是目录」（对 FIFO/设备是假话）；db/sync 写「只读命令」「不是普通文件」。
+  // ⚠️ 「不存在」成因的裁定保留在此（不进共享实现）：D 交付后本 hint **不改指**
+  // `qiyu sync run`（设计稿 §9.5 的「D 交付后改指 sync run」不再采纳）——「初始化存储」
+  // 的最小命令是 store init，且 sync status/verify 是只读命令，指它们跑一次写操作并非必要。
+  // 同步侧（sync status/verify/install、sync run 的 storeInitFail）与 C1 同口径。
+  const guarded = statGuard(config.path)
+  if (guarded !== null) return guarded
   let store
   try { store = await openStore(config, 'ro') } catch (e) { return thrownToExit(e) }
   try {
     const names = await store.tables()
-    if (!names.includes('schema_version')) {
-      return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: names.length > 0 ? '目标数据库不是本 CLI 创建的，请换 --db 路径' : '请运行：' + storeInitCommand(config.path) })
-    }
+    // ⚠️ 成因分形（他人库不引导向 init）在共享实现里，口径与 db/sync 逐字一致。
+    const missing = schemaVersionMissing(config.path, names)
+    if (missing !== null) return fail(missing)
     const tables: Array<{ name: string; rows: number }> = []
-    for (const n of names) tables.push({ name: n, rows: await store.count(n) })
+    // ⚠️ 只能对**声明表**（`TABLES`）做 COUNT（2026-11-01 实测修）：`store.count()` 内部
+    // 走 `assertTable`，库里有未声明的表（旧版 CLI 或其它工具建的）时抛 `usage`
+    // （`未知表：xxx`，退出码 2）—— 于是 `store status` 在**库恰好有漂移时整条命令失败**，
+    // 连 `schema_version` 都拿不到，而 `db tables` 对同一状态只是把它列进 warnings
+    //（README 与 `db tables` 都明确把「库中有而声明无」当作**要警告、不失败**的漂移）。
+    // `names` 来自全库 `information_schema`（含未声明表），因此必须按声明集过滤后再 COUNT；
+    // 未声明的表名进 warnings（不得静默 —— 与 `db tables` 同口径，README 承诺要报警）。
+    const undeclared = new Set(undeclaredTables(names))
+    for (const n of names) {
+      if (undeclared.has(n)) continue
+      tables.push({ name: n, rows: await store.count(n) })
+    }
     const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
+    const warnings = undeclaredTablesWarning([...undeclared])
     return ok({ path: config.path, backend: config.backend, config_path: configPath,
       config_exists: configExists,
-      schema_version: Number(sv.rows[0]?.v ?? 0), tables }, { field_notes: storeFieldNotes() })
+      schema_version: Number(sv.rows[0]?.v ?? 0), tables },
+    undeclared.size === 0
+      ? { field_notes: storeFieldNotes() }
+      : { field_notes: storeFieldNotes(), warnings })
   } catch (e) { return thrownToExit(e) } finally { await store.close() }
 }

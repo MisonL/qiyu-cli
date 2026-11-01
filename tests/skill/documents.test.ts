@@ -63,6 +63,23 @@ describe('skill 文档', () => {
     expect(row).not.toMatch(/先跑 `qiyu store init`/)
   })
 
+  // 回归钉（2026-11-01，PR #54）：`window_misaligned` 的正文此前写「结束边界**不得晚于**
+  // 今天零点」—— `不得晚于` 是 ≤，把等号划进了安全区，而 `endTime = 今天 0:00` 恰是
+  // 实测**不稳定**的那条边界（同一取值有时 200 有时被拒，设计稿 §6.2）。
+  // 正确口径是**严格早于**。这轮错误在设计稿与 `src/core/errors.ts` 的 hint 里都已修正
+  // 并各有一条守卫（`tests/docs.test.ts:726`、`tests/core/errors.test.ts`），
+  // **但 skill 正文（Agent 真正读的那份）没有跟着改** —— 第二事实源漏改。
+  // 形态归属：「文档与 Agent 可见的 hint 说两套话本身就是契约不诚实」（判据五）。
+  it('errors.md 的 window_misaligned 说「早于」而不是「不得晚于」（边界值实测不稳定）', () => {
+    const text = readFileSync(join(dir, 'errors.md'), 'utf8')
+    const row = text.split('\n').find((l) => l.includes('`kind: window_misaligned`')) ?? ''
+    expect(row, '找不到 window_misaligned 行').not.toBe('')
+    expect(row, '必须写明「早于今天 00:00」').toContain('早于')
+    expect(row, '不得再写「不得晚于」（把等号当安全上界）').not.toMatch(/不得晚于/)
+    // 与实现 hint 的关键词对拍（不逐字：正文是摘要，但「早于」这个判据必须同源）
+    expect(row).toContain('今天 00:00')
+  })
+
   // —— 契约号与正文结构绑定（2026-10-26 审查 Sourcery）——
   // 问题：`--version` 的测试从 `SKILL_CONTRACT_VERSION` 推导期望值，于是若有人改了
   // 正文却忘了递增契约号，测试照样绿 —— 而 spec D6 的整条纪律就是「正文结构性改变

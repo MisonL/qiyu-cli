@@ -17,11 +17,11 @@
 //     元数据**（`row_count`/`time_range` 为 null + warning，裁决 R5）——Agent 需要知道
 //     该表应该有什么列，以便核对列漂移。缺表的成因不是「未同步或未建库」（实测两个都
 //     到不了该分支），唯一口径见 `missingTableCauses()`。
-import { statSync } from 'node:fs'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
+import { statGuard, schemaVersionMissing } from './store-precheck.js'
 import { suggestNames, thrownToQueryExit, missingTableCauses } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
@@ -29,7 +29,7 @@ import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
 import {
   ok, fail, usageFail, failFromTagged, sanitizeControlChars, describeArgs, setPretty,
-  storeInitCommand, dbTablesCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE,
+  dbTablesCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
@@ -76,37 +76,12 @@ const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 const PII_NOTICE = '本数据库包含客户 PII；不要将其写入日志或对外报表'
 
 /**
- * 只读命令的库前置检查（ENOENT / 非普通文件 / 权限三分 → 退出码，否则 null）。
- * ⚠️ 与 sync.ts 的私有 statGuard 同款，但**独立落点**：brief 指定 E 族单一落点
- * （本函数由 db.ts 导出给 query/stats 复用，避免三份拷贝漂移；不为它抽独立模块，
- * 两处足够小，YAGNI）。
- * hint 统一指 `qiyu store init`（spec §九）。
+ * 只读命令的库前置检查 → 见 `commands/store-precheck.ts` 的 `statGuard`
+ * （**唯一实现点**：本轮把它从本文件的私有函数收敛过去，此前 db/sync/store 三份拷贝
+ * 已经漂移 —— 同一成因在不同命令上给出互相矛盾、乃至事实错误的 hint）。
+ * 本文件不再自带一份；E 族四命令统一经 `openGuardedSession` 走它。
  */
-export function statGuard(path: string): number | null {
-  let st: ReturnType<typeof statSync>
-  try { st = statSync(path) } catch (e) {
-    if ((e as { code?: string }).code === 'ENOENT') {
-      return fail({
-        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库文件不存在：${path}`,
-        hint: '数据库尚未初始化。请先运行：' + storeInitCommand(path),
-      })
-    }
-    return fail({
-      code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `无法访问 ${path}：${e instanceof Error ? e.message : String(e)}`,
-      hint: '请检查路径权限（只读命令不需要写权限）',
-    })
-  }
-  if (!st.isFile()) {
-    return fail({
-      code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `不是普通文件：${path}`,
-      hint: '--db 指向的不是普通文件，请给出 .duckdb 数据库文件路径',
-    })
-  }
-  return null
-}
+export { statGuard } from './store-precheck.js'
 
 /** 表的 PII 列名（`sensitive: true`，保持声明顺序）——`TABLES` 是唯一权威。 */
 function piiColumnsOf(t: TableDef): string[] {
@@ -249,23 +224,15 @@ export async function openGuardedSession(
   try {
     // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
     // 口径与实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
-    // ⚠️ 成因分形（sync.ts openRo / store.ts 同款）：「有表但无 schema_version」是**他人库**
-    // —— store init 会再次拒绝（duckdb.ts init 的他人库防线），无条件引导过去就是
-    // store init → db tables 死循环；「零表」才是「init 可补」的成因。
+    // ⚠️ 成因分形与文案走 `store-precheck.ts` 的 `schemaVersionMissing`（**唯一实现点**，
+    // 2026-10-31 收敛；此前 store/db/sync 三份已漂移出不同说法）。
     const tables = await session.run(
       "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
     const names = tables.rows.map((r) => String(r.table_name))
-    if (!names.includes('schema_version')) {
+    const missing = schemaVersionMissing(config.path, names)
+    if (missing !== null) {
       await session.close()
-      return {
-        exit: fail({
-          code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-          message: `数据库结构不完整（缺表）：${config.path}`,
-          hint: names.length > 0
-            ? '目标数据库不是本 CLI 创建的，请换 --db 路径'
-            : '空库（无任何表）。请先运行：' + storeInitCommand(config.path),
-        }),
-      }
+      return { exit: fail(missing) }
     }
   } catch (e) {
     await session.close()

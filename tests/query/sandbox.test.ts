@@ -121,9 +121,11 @@ describe('三层沙箱 · 攻击表（spec §5.4）', () => {
       await expectReject(s.run(`EXPORT DATABASE '${exportDir}'`), {
         kind: 'usage', code: 'sandbox_blocked',
       })
-      // INSTALL 的报告类型是 21（LOAD/INSTALL），由 layer1 拒绝
+      // INSTALL 的报告类型是 21 —— 驱动枚举里 21 = LOAD（实测 INSTALL 与 LOAD 同值，
+      // INSTALL 在 DuckDB 内部即 LOAD 语义），所以 message 点名的是 LOAD。
+      // ⚠️ 2026-11-01 修之前表里写 21='INSTALL'，与驱动枚举相反（第 20 种形态）。
       await expectReject(s.run('INSTALL httpfs'), {
-        kind: 'usage', code: 'sandbox_blocked', match: /INSTALL/,
+        kind: 'usage', code: 'sandbox_blocked', match: /LOAD/,
       })
     })
     expect(existsSync(attachTarget)).toBe(false)
@@ -462,7 +464,7 @@ describe('白名单与截断', () => {
         ['PRAGMA force_checkpoint', /PRAGMA/],                       // 17
         ['CALL pragma_version()', /CALL/],                           // 19
         ["SET TimeZone='UTC'", /SET/],                               // 20
-        ['INSTALL httpfs', /INSTALL/],                               // 21
+        ['INSTALL httpfs', /LOAD/],                                  // 21（驱动枚举 21=LOAD；INSTALL 与 LOAD 同值）
         [`ATTACH '${join(dir, 'a.db')}' AS a`, /ATTACH/],            // 25
         ['DELETE FROM t', /DELETE/],                                 // 5（类型名，不再是裸数字）
         ['UPDATE t SET a = 1', /UPDATE/],                            // 3

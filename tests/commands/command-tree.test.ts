@@ -275,12 +275,17 @@ describe('COMMAND_TREE', () => {
   // 这条补充「first 只许出现在 positionals[0]」的结构约束：第二个槽位上的 first 无人读，
   // 写上去等于假声明（`skill check` 只读 `positionals[0]?.first`）。
   it('first 标记只允许出现在第一个位置参数槽位上（写在后面等于假声明）', () => {
-    for (const s of COMMAND_TREE) {
-      for (const [i, p] of s.positionals.entries()) {
-        if (i === 0) continue
-        expect(p.first, `${s.path.join(' ')} 的第 ${i + 1} 个位置参数不该有 first`).toBeUndefined()
-      }
-    }
+    // ⚠️ 当前真实树里没有任何命令有两个以上位置参数槽位，直接遍历 COMMAND_TREE 时
+    // 「第 2 个槽位」分支零次迭代、断言从不求值（2026-11-01 审查 7b）。
+    // 所以判据抽成纯函数，先在合成 spec 上双向自检，再作用于真实树。
+    const misplacedFirst = (specs: ReadonlyArray<{ path: string[]; positionals: Array<{ first?: boolean }> }>): string[] =>
+      specs.flatMap((s) => s.positionals.slice(1)
+        .map((p, j) => (p.first === undefined ? null : `${s.path.join(' ')} 第 ${j + 2} 槽位`))
+        .filter((x): x is string => x !== null))
+    expect(misplacedFirst([{ path: ['x', 'y'], positionals: [{}, { first: true }] }])).toEqual(['x y 第 2 槽位'])
+    expect(misplacedFirst([{ path: ['x', 'y'], positionals: [{}, { first: false }] }])).toEqual(['x y 第 2 槽位'])
+    expect(misplacedFirst([{ path: ['x', 'y'], positionals: [{ first: true }, {}] }])).toEqual([])
+    expect(misplacedFirst(COMMAND_TREE), '第二个及以后的槽位上不该有 first').toEqual([])
   })
   // —— G3 审查 C1：skill 三条的 spec 与解析器逐 flag 对齐 ——
   //
