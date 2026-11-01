@@ -141,6 +141,12 @@
   中文串去匹配，判据收窄后**永远不命中**，hint 退化成「用 `db describe <表>` 查看列清单」
   —— 正是它要防的那句话。改为吃 `cause` 上的原生原文。
 
+  首版还差一步（CodeRabbit 抓到并在同 PR 内修）：只查「报文以类别前缀开头」不够 ——
+  **列名是用户给的**，可以整段长成另一条报文的形状。实测
+  `SELECT "Catalog Error: Table with name zzz does not exist!" FROM sessions` 时，
+  DuckDB 说 `Binder Error: Referenced column "…" not found`，前缀检查通过而表名正则
+  在**列名内部**命中 →「列不存在」被报成「表 zzz 不存在」。现判据模式本身也锚在那句话的开头。
+
 - **撞锁判据的子串搜索把「路径里含 `Conflicting lock` 的非 DuckDB 文件」判成撞锁**。
   实测：`db tables --db '/tmp/Conflicting lock/q.db'`（内容是垃圾）耗时 **30.1 秒**、报
   `store_locked` + `retryable: true`（「数据库被写进程占用，请稍后重试」）—— 而同一份内容
@@ -165,8 +171,9 @@
   只列业务表、两边数量不同」，而下方用例 `expect(dbNames).toEqual(storeNames)` 早已证伪
   （实测两边都含内部表、都是同一组）。用例标题与注释一并改为实况。
 
-  **变异验证**：本轮 9 处变异全部转红 —— `Binder|Catalog` 判据退回裸子串、`OOM` 判据退回
-  裸子串、`duckDbSaysMissingName` 去掉 `^` 锚、`driftFailureFor` 不再吃 `cause`、
+  **变异验证**：本轮 10 处变异全部转红 —— `Binder|Catalog` 判据退回裸子串、`OOM` 判据退回
+  裸子串、`duckDbSaysMissingName` 去掉 `^` 锚、判据模式不锚开头（列名伪装）、
+  `driftFailureFor` 不再吃 `cause`、
   `db` / `stats` 的 `describeArgs` 退回裸 join（三处）、锁判据退回
   `msg.includes('Conflicting lock')`、图例退回「后四个」；每处先 `grep` 确认落地，
   跑完 `diff` 确认还原。

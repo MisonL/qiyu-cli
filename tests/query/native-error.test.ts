@@ -179,3 +179,28 @@ describe('isParserError —— 只有 DuckDB 自己说语法错才算（2026-11-
     expect(isParserError(real), '值里的字面量 ≠ DuckDB 说语法错').toBe(false)
   })
 })
+
+describe('duckDbSaysMissingName —— 模式也必须锚在那句话的开头（2026-11-01 CodeRabbit）', () => {
+  // ⚠️ 只查「报文以类别前缀开头」不够：**列名是用户给的**，可以整段长成另一条报文的形状。
+  // 探针实测（`CREATE TABLE t("Catalog Error: Table with name zzz does not exist!" INT)` 后查询）：
+  //   `Binder Error: Referenced column "Catalog Error: Table with name zzz does not exist!" not found in FROM clause!`
+  // 前缀检查通过（Binder Error: 在开头），而表名正则在**列名内部**命中 ——
+  // 「列不存在」被报成「表 zzz 不存在」。
+  const TABLE = /Catalog Error: Table with name ([^\s]+) does not exist/
+  it('列名里含表不存在句式的真 Binder 报文：表正则不命中、列正则命中', () => {
+    const real = 'Binder Error: Referenced column "Catalog Error: Table with name zzz does not exist!" '
+      + 'not found in FROM clause!\nCandidate bindings: "id"\n\n'
+      + 'LINE 1: SELECT "…" FROM sessions\n               ^'
+    expect(duckDbSaysMissingName(real, TABLE), '表正则不得在列名内部命中').toBeNull()
+    expect(duckDbSaysMissingName(real, /Binder Error: Referenced column "([^"]+)" (?:was )?not found/)?.[1])
+      .toBe('Catalog Error: Table with name zzz does not exist!')
+  })
+  it('对照：真表不存在报文仍命中', () => {
+    expect(duckDbSaysMissingName('Catalog Error: Table with name sessons does not exist!', TABLE)?.[1])
+      .toBe('sessons')
+  })
+  it('包装容忍仍生效（`Failed to extract statements: ` 前缀不破坏锚定）', () => {
+    expect(duckDbSaysMissingName('Failed to extract statements: Catalog Error: Table with name x does not exist',
+      TABLE)?.[1]).toBe('x')
+  })
+})

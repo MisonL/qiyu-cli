@@ -69,8 +69,16 @@ export function isInterrupt(msg: string): boolean {
  */
 export function duckDbSaysMissingName(msg: string, pattern: RegExp): RegExpExecArray | null {
   const own = withoutSqlEcho(msg)
-  if (!/^\s*(?:Failed to extract statements:\s*)?(?:Catalog|Binder) Error:/i.test(own)) return null
-  return pattern.exec(own)
+  const wrap = /^\s*(?:Failed to extract statements:\s*)?/.exec(own)?.[0] ?? ''
+  const rest = own.slice(wrap.length)
+  if (!/^(?:Catalog|Binder) Error:/i.test(rest)) return null
+  // ⚠️ 判据模式本身也必须锚在**那句话的开头**（2026-11-01 CodeRabbit）：只查「报文以类别
+  // 前缀开头」还不够 —— 列名是用户给的，可以整段长成另一条报文的形状。实测：
+  // 列名 = `Catalog Error: Table with name zzz does not exist!` 时，DuckDB 说
+  // `Binder Error: Referenced column "Catalog Error: Table with name zzz does not exist!" not found`
+  // —— 前缀检查通过（Binder Error: 在开头），而表名正则在**列名内部**命中，
+  // 于是「列不存在」被报成「表 zzz 不存在」（实测复现）。锚开头后两者不会互串。
+  return new RegExp('^(?:' + pattern.source + ')', pattern.flags.replace('g', '')).exec(rest)
 }
 
 /**
