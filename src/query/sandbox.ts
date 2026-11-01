@@ -22,6 +22,7 @@ import { isLockError, retryWithBackoff, isModuleNotFound, classifyOpenFailure, N
 import type { ErrorKind } from '../core/errors.js'
 import type { StoreConfig } from '../store/types.js'
 import { storeInitCommand } from '../output.js'
+import { isInterrupt, isLayer2Blocked } from './native-error.js'
 
 export interface SandboxResult {
   columns: string[]
@@ -83,13 +84,23 @@ export function memoryLimitBytes(display: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
-// statementType 数值 → 类型名（spec §5.3 映射表；实测值见任务 brief）。
-// ⚠️ 补全 3/5/9/15（edge F6）：此前 DELETE/UPDATE/DROP/ALTER 被拒时报「类型 5」这类裸数字，
-// Agent 既查不到含义也无法据此改查询；spec §十一要求点明类型名。
-const TYPE_NAMES: Record<number, string> = {
-  2: 'INSERT', 3: 'UPDATE', 5: 'DELETE', 7: 'CREATE', 9: 'ALTER', 11: 'COPY',
-  15: 'DROP', 16: 'EXPORT', 17: 'PRAGMA', 19: 'CALL', 20: 'SET', 21: 'INSTALL',
-  25: 'ATTACH',
+// statementType 数值 → 类型名。
+// ⚠️ **整表按驱动枚举逐值抄写**（2026-11-01 修）：此表此前是从任务 brief 抄的，其中
+// `21: 'INSTALL'` 与事实相反 —— `@duckdb/node-api` 的 `StatementType` 枚举 21 = **LOAD**，
+// INSTALL 与 LOAD 在实测中都返回 21（`INSTALL json` 与 `LOAD json` 逐语句探针实测），
+// 于是 `LOAD json` 被拒时报「不接受 INSTALL 语句」—— 点名的语句名与用户输入的不符。
+// 同时补上此前落裸数字的 6/8/12/18/26（spec §十一要求点明类型名）。
+// 形态归属：本仓库记录过的「枚举字面量与事实相反」。
+// 唯一事实源：`node -e "console.log(require('@duckdb/node-api').StatementType)"`（见
+// `tests/query/statement-type-names.test.ts` 的对拍守卫）。
+/** 导出供对拍守卫（`tests/query/statement-type-names.test.ts`）逐值核对驱动的枚举。 */
+export const TYPE_NAMES: Record<number, string> = {
+  0: 'INVALID', 1: 'SELECT', 2: 'INSERT', 3: 'UPDATE', 4: 'EXPLAIN', 5: 'DELETE',
+  6: 'PREPARE', 7: 'CREATE', 8: 'EXECUTE', 9: 'ALTER', 10: 'TRANSACTION', 11: 'COPY',
+  12: 'ANALYZE', 13: 'VARIABLE_SET', 14: 'CREATE_FUNC', 15: 'DROP', 16: 'EXPORT',
+  17: 'PRAGMA', 18: 'VACUUM', 19: 'CALL', 20: 'SET', 21: 'LOAD', 22: 'RELATION',
+  23: 'EXTENSION', 24: 'LOGICAL_PLAN', 25: 'ATTACH', 26: 'DETACH', 27: 'MULTI',
+  28: 'COPY_DATABASE', 29: 'UPDATE_EXTENSIONS', 30: 'MERGE_INTO',
 }
 
 // —— DuckDB 原语的最小结构化类型（本文件不静态 import @duckdb/node-api）——
@@ -344,7 +355,12 @@ function hasAnalyzeToken(sql: string): boolean {
  */
 function mapPrepareError(e: unknown): SandboxError {
   const msg = e instanceof Error ? e.message : String(e)
-  if (/file system operations are disabled|Cannot access file/i.test(msg)) {
+  // 判据走 `query/native-error.ts` 的 `isLayer2Blocked`（**唯一实现点**，2026-11-01），
+  // 与 `query/errors.ts` 同源。锚类别前缀 `Permission Error:` + 特征句，并在判定前
+  // 剥掉 SQL 回显：Parser Error 会把出错行 SQL 全文附在 `LINE n:` 之后，SQL 里恰好
+  // 含特征句时（`SELEC 'file system operations are disabled by configuration'`，
+  // 实测）会被谎报成「已被沙箱拦截」（真实成因是语法错，exit 同为 2 但归因是假的）。
+  if (isLayer2Blocked(msg)) {
     return sandboxError('usage', '该语句尝试访问文件或网络，已被只读沙箱拦截', {
       code: 'sandbox_blocked',
       hint: '沙箱只允许读取数据库内的数据：read_csv / read_text / glob / COPY TO / ATTACH / EXPORT / INSTALL 均不可用',
@@ -573,7 +589,13 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
         reader = await p.runAndReadUntil(limit + 1)
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
-        if (/INTERRUPT/i.test(msg)) {
+        // ⚠️ 判据走 `query/native-error.ts` 的 `isInterrupt`（**唯一实现点**，2026-11-01）：
+        // 只锚类别前缀 `INTERRUPT Error:`，不能只搜 `/INTERRUPT/i` —— Conversion Error 会
+        // 把列值原文回显进 message，数据里恰好含 interrupt 时（如 `Could not convert
+        // string 'interrupt' to INT32 …`）子串判会把**类型转换错误**谎报成查询超时
+        // （kind 与真实成因相反、真实错误线索被整体丢弃、`--timeout 0` 也照样报超时）。
+        // 形态与边界见那里的注释。
+        if (isInterrupt(msg)) {
           // 实测：interrupt 约 300ms 生效，中断后连接仍可用（探针 6/9）。
           // ⚠️ hint 不得点名 `--timeout`（审查 I-4）：只有 `query` 接受该 flag，
           // `db tables` / `db describe` / `stats fields` 共用本出口，建议一个它们

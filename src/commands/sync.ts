@@ -25,8 +25,9 @@
 // 输出键一律下划线命名（spec §七：range_status / gaps_count / local_rows /
 // expected_from_api / state_windows_consistent）——本仓 Agent 契约的统一形态。
 import { homedir } from 'node:os'
-import { statSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { statGuard, schemaVersionMissing } from './store-precheck.js'
 import { SYNC_TASKS, taskById, UNSUPPORTED_DATASETS } from '../sync/registry.js'
 import { listGaps, listWatermarks } from '../sync/state.js'
 import type { SyncTask } from '../sync/types.js'
@@ -37,7 +38,7 @@ import { tableByName } from '../store/schema.js'
 import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
 import {
   ok, fail, usageFail, failFromTagged, setPretty, describeArgs,
-  storeInitCommand, syncRunCommand,
+  syncRunCommand,
 } from '../output.js'
 import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
@@ -219,31 +220,6 @@ function resolveConfig(flags: StoreFlags): {
 }
 
 /** 只读命令的库前置检查（statSync 分流沿 store status；hint 统一指 store init，spec §九）。 */
-function statGuard(path: string): number | null {
-  let st: ReturnType<typeof statSync>
-  try { st = statSync(path) } catch (e) {
-    if ((e as { code?: string }).code === 'ENOENT') {
-      return fail({
-        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库文件不存在：${path}`,
-        hint: '数据库尚未初始化。请先运行：' + storeInitCommand(path),
-      })
-    }
-    return fail({
-      code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `无法访问 ${path}：${e instanceof Error ? e.message : String(e)}`,
-      hint: '请检查路径权限（只读命令不需要写权限）',
-    })
-  }
-  if (!st.isFile()) {
-    return fail({
-      code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `不是普通文件：${path}`,
-      hint: '--db 指向的不是普通文件，请给出 .duckdb 数据库文件路径',
-    })
-  }
-  return null
-}
 
 /** 打开 ro 库；结构不完整（缺 schema_version）视为「不是本 CLI 创建的库」。 */
 async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?: Store; code?: number }> {
@@ -253,18 +229,12 @@ async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?
   } catch (e) { return { code: thrownToExit(e) } }
   try {
     const names = await store.tables()
-    if (!names.includes('schema_version')) {
+    const missing = schemaVersionMissing(config.path, names)
+    if (missing !== null) {
       await store.close()
-      // 成因分形（store.ts 同款）：有表无 schema_version 是他人库——store init 会再次
-      // 拒绝（duckdb.ts init 的他人库防线），引导过去就是 store init → sync status 死循环；
-      // 空库（无任何表）才是「init 可补」的成因。
-      return { code: fail({
-        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-        message: `数据库结构不完整（缺表）：${config.path}`,
-        hint: names.length > 0
-          ? '目标数据库不是本 CLI 创建的，请换 --db 路径'
-          : '空库（无任何表）。请先运行：' + storeInitCommand(config.path),
-      }) }
+      // 成因分形在共享实现里（有表无 schema_version = 他人库 → 换路径；
+      // 零表才是「init 可补」）。关 store 是调用方的所有权责任，故在此 fail。
+      return { code: fail(missing) }
     }
     return { store }
   } catch (e) {

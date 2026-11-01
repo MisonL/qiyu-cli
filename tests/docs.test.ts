@@ -163,8 +163,19 @@ describe('readme.test.ts —— C1 追加断言（防文档说假话）', () => 
   it('README 含输出契约描述（O 组 O-12：六字段 + tables 形态 + status 轮询代价）', () => {
     const md = read('README.md')
     expect(md).toMatch(/schema_version/)
-    expect(md).toMatch(/\[{.*name.*rows.*}\]|\[\{ ?name, ?rows ?\}\]|tables\[.*\].*行数|name.*rows/)
-    expect(md).toMatch(/全表.*COUNT|COUNT.*全表|行数.*全表扫描|status.*轮询|轮询.*代价/)
+    // ⚠️ 按锚行判定，不用全文档备选正则（2026-11-01 审查 7c）：原先的 /name.*rows/ 分支会撞上
+    // 506 行**无关**的字段语义段落（`name-suffix` … `rows_present`），把 tables 形态原句删掉
+    // 断言照样绿 —— 备选分支必须要能证明自己守的是同一句话。
+    const shapeLine = md.split('\n').find((l) => l.includes('形状随命令不同')) ?? ''
+    expect(shapeLine, '找不到「tables 形状随命令不同」段落').not.toBe('')
+    expect(shapeLine).toMatch(/\{name, rows\}/)
+    expect(shapeLine).toMatch(/store status/)
+    const initShapeLine = md.split('\n').find((l) => l.includes('给表名数组')) ?? ''
+    expect(initShapeLine, '找不到 store init 的 tables 形态句').toMatch(/`store init`/)
+    // 轮询代价：`全表 COUNT` 与 `轮询代价` 同处该段落（防把守卫换成别处的 `轮询` 二字蒙混）
+    const pollLine = md.split('\n').find((l) => /全表.*COUNT/.test(l)) ?? ''
+    expect(pollLine, '找不到全表 COUNT 句').not.toBe('')
+    expect(pollLine).toMatch(/轮询代价/)
   })
   it('README 横幅不谎称「仍在早期」，且不得把已交付命令列为未实现（I 组 M7：§8.3 第 5 处；2026-10-30 修假护栏）', () => {
     const md = read('README.md')
@@ -454,9 +465,13 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
     const md = read('README.md')
     // N-2 正锚：「由下轮日对齐 run 补全」必须带「末残段」限定，且写明首残段处置三要素
     for (const [name, doc] of [['spec', s], ['README', md]] as const) {
-      // 反锚：任何「由下轮日对齐」出现处的前文必须含「末残段」（无条件补全承诺不得回归）
-      for (const m of doc.matchAll(/由下轮日对齐/g)) {
-        const before = doc.slice(Math.max(0, m.index! - 24), m.index!)
+      // 反锚：任何「日对齐 run 补全」出现处的前文必须含「末残段」（无条件补全承诺不得回归）。
+      // ⚠️ 锚必须是正文**现行**措辞：旧锚「由下轮日对齐」在批 8 改写后已不在文中，
+      // 循环零次迭代、断言从不求值（2026-11-01 审查 7a）—— 故下面先断言命中数 > 0。
+      const hits = [...doc.matchAll(/日对齐 run 补全/g)]
+      expect(hits.length, `${name}: 找不到补全承诺锚句，反锚会零次迭代`).toBeGreaterThan(0)
+      for (const m of hits) {
+        const before = doc.slice(Math.max(0, m.index! - 60), m.index!)
         expect(before, `${name}: 补全承诺须限定末残段`).toMatch(/末残段/)
       }
       expect(doc, `${name}: 末残段正锚`).toMatch(/末残段/)

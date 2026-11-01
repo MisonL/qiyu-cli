@@ -122,6 +122,53 @@
 
 ### 修复
 
+- **DuckDB 报文回声污染：用户数据与用户 SQL 能把错误伪装成「查询超时」或「沙箱拦截」**。
+  DuckDB 的报文会带进外部文本：`Conversion Error` 回显**列值**，`Parser Error` 在
+  `\nLINE n:` 之后回显出错行的 **SQL 原文**。原判据对整条 message 做子串搜索，于是：
+  · 列值恰好含 `interrupt` 时（实测 `CAST(name AS INT)`，`name = 'interrupt'`），类型转换
+    错误被报成 `query_timeout`，`--timeout 0`（不限时）下也照样报超时，真实线索整体丢失；
+  · SQL 里恰好含特征句时（实测 `SELEC 'file system operations are disabled by configuration'`），
+    语法错被报成「已被只读沙箱拦截」。
+  **修法**：新增 `src/query/native-error.ts` 作为**唯一实现点**（`isInterrupt` /
+  `isLayer2Blocked` / `withoutSqlEcho`）：锚类别前缀 `INTERRUPT Error:` / `Permission Error:`，
+  判定前先剥 SQL 回显；layer2 还要求特征句 `file system operations are disabled`
+  （裸 `Permission Error: Cannot access file "…"` 是库文件的 OS 权限问题，不算拦截）。
+  `sandbox.ts` 与 `query/errors.ts` 此前各写一份逐字相同的正则，现在都调它。
+  诚实边界：类别前缀是 DuckDB 的书写惯例、不是可解析的结构；判据失配时退化方向是
+  「真拦截被报成原生错误」，不会再把别的错误说成超时或拦截。
+- **`store status` 遇到库里有未声明的表时整条命令失败（`未知表：stray_table`，退出码 2）**。
+  `tables` 来自全库 `information_schema`，而逐表 `COUNT` 走 `store.count()`，它的
+  `assertTable` 只认本 CLI 声明的表 —— 判据问的是「是不是声明表」，调用点要回答的却是
+  「库里有几张表」。旧版 CLI 或其它工具建过表的库因此根本看不了状态。
+  现在 `store status` / `store init` 的 `tables` 只列声明表（与 `db tables` 同一组，两边
+  数量在双向漂移下实测一致：都是 24），未声明表在 `meta.warnings` 中点名。
+  README 与 `field_notes.tables` 的「两边数量应当一致」此前只解释了「缺表」一个方向，
+  会把 Agent 引向「库不完整 → 重建」，而重建会**销毁**那些未声明表；两处都改为两个方向
+  都解释，并明说数量不等时先读 `warnings`。
+- **`TYPE_NAMES[21]` 写成 `INSTALL`，驱动枚举里 21 是 `LOAD`**。`LOAD json` 被拒时报
+  「不接受 INSTALL 语句」，点名的语句与用户写的不符。整张表改为按 `@duckdb/node-api` 的
+  `StatementType` 逐值抄写（顺带补上此前落裸数字的 6/8/12/18/26），新增逐值对拍守卫
+  `tests/query/statement-type-names.test.ts`。
+- **skill 正文 `errors.md` 仍教「结束边界不得晚于今天零点」**。`不得晚于` 是 ≤，把实测不稳定
+  的边界值 `endTime = 今天 0:00` 划进了安全区；设计稿与 `core/errors.ts` 的 hint 早已改成
+  「早于」，Agent 真正读的 skill 正文漏改。已改并加守卫。
+- **只读库前置检查的三份副本收敛到 `src/commands/store-precheck.ts`**。`db` / `sync` / `store`
+  各自维护一份 `statGuard`（不存在 / 权限 / 非普通文件）与 `schema_version` 缺表探测，
+  `store init` 还把命名管道、设备等特殊文件一律报成「是目录」（`!isFile()` 覆盖四种成因，
+  文案只写了一种）。现在七个读命令对目录 / FIFO / 字符设备 / 父目录 `chmod 000` / 不存在 /
+  空库 / 他人库给出逐字相同的 hint，特殊文件报「不是普通文件」。
+- **三条恒真的漂移守卫**（独立审查发现）：`tests/docs.test.ts` 的「补全承诺限定末残段」反锚
+  用的锚句 `由下轮日对齐` 已不在正文里，循环零次迭代；`tests/commands/command-tree.test.ts`
+  的「first 只许在第一槽位」在真实树上零次迭代（没有命令有两个槽位）；README tables 形态
+  断言的备选正则 `/name.*rows/` 会撞上无关段落，删掉被守卫的原句仍绿。三条都改为先证明
+  锚存在（或判据先在合成输入上双向自检）再断言。
+
+  **变异验证**：本轮 10 处变异全部转红 —— 裸 `INTERRUPT` 判、`errors.ts` 裸特征句判、
+  `TYPE_NAMES[21]` 退回 `INSTALL`、`store status` 去掉未声明表过滤、skill 正文退回
+  「不得晚于」、`sync-run.ts` 复制回一份空库 hint、锚句措辞漂移、去掉「末残段」限定、
+  删掉 tables 形态句、给第二槽位标 `first`；
+  每处先 `grep` 确认改动落地，跑完逐文件 `diff` 确认还原。
+
 - **同一起因、两个命令族、两种说法：「打开库文件失败」的解码规则收敛到单一实现点**。
   上一轮修掉 `thrownToExit` 的死分支后，`--db` 指向同一个 `chmod 000` 的文件时，
   七个命令给出的 hint 仍然**互相矛盾**：`store status` / `sync status` / `sync install`

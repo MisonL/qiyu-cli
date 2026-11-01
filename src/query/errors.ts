@@ -20,6 +20,7 @@
 import { fail, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand, dbTablesCommand, dbDescribeCommand } from '../output.js'
 import type { StoreLocation } from '../output.js'
 import type { TableDef } from '../store/schema.js'
+import { isLayer2Blocked } from './native-error.js'
 
 export interface QueryFailure {
   code: string
@@ -251,9 +252,11 @@ function missingNameFailure(
  * 原生错误 → QueryFailure（spec §十一 分派表）。
  *
  * 分派顺序有意义：先透传已分类错误，再按原文形态分流。
- * ⚠️ layer2 的判定与 sandbox 对齐（`sandbox.ts` 的收窄裁决）：只认「配置禁用了文件系统」
- * 的措辞，**不认裸 `Permission Error`** —— 读库文件本身的 OS 权限错误也带这个前缀，
- * 误报成「已被只读沙箱拦截」会把环境问题（退出码 1）说成用法问题（退出码 2）。
+ * ⚠️ layer2 的判定与 sandbox **同源**（`query/native-error.ts` 的 `isLayer2Blocked`，
+ * 2026-11-01 单一实现点；此前两处各写一份逐字相同的正则）：锚类别前缀
+ * `Permission Error:` + 特征句，并在判定前剥掉 SQL 回显 —— 只认「配置禁用了文件系统」
+ * 的措辞，**不认裸 `Permission Error`**（读库文件本身的 OS 权限错误也带这个前缀，
+ * 误报成「已被只读沙箱拦截」会把环境问题说成用法问题）。
  * `retryable` 一律 false：这些都是确定性错误，重试同一个查询只会得到同样的结果。
  */
 export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc?: StoreLocation): QueryFailure {
@@ -292,10 +295,9 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
 
   const msg = errorText(e)
 
-  // ② layer2 拦截（文件/网络）：spec §十一 行 4。
-  // ⚠️ 与 sandbox.ts 的收窄裁决对齐：裸 `Permission Error` 不算（可能是库文件的 OS
-  // 权限问题），只认「文件系统操作被配置禁用」的两种措辞。
-  if (/file system operations are disabled|Cannot access file/i.test(msg)) {
+  // ② layer2 拦截（文件/网络）：spec §十一 行 4。判据与 sandbox 同源
+  // （`native-error.ts` 的 `isLayer2Blocked`，单一实现点；形态与边界见那里）。
+  if (isLayer2Blocked(msg)) {
     return {
       kind: 'usage', code: 'sandbox_blocked', retryable: false,
       message: '该语句尝试访问文件或网络，已被只读沙箱拦截',

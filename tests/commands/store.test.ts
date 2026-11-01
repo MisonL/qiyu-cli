@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, symlinkSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { storeCommand } from '../../src/commands/store.js'
 
 let dir = '', out = '', err = ''
@@ -129,6 +130,55 @@ describe('store status', () => {
 
   it('--db 指向目录（非普通文件）→ 1', async () => {
     expect(await storeCommand(['status', '--db', dir])).toBe(1)
+  })
+
+  it('--db 指向 FIFO → 1，hint 说「不是普通文件」**不说**「是目录」（2026-11-01 实测修）', async () => {
+    // 缺陷原文：status 的判据是 `!st.isFile()`（覆盖目录/FIFO/设备/套接字四种成因），
+    // 而 hint 按「目录」一种写死 —— 对 FIFO 说出「--db 指向的是目录」是**假话**，
+    // Agent 会去查「我是不是传了目录」（它没有），真正要做的只是换个路径。
+    if (process.platform === 'win32') return   // mkfifo 不存在
+    const fifo = join(dir, 'pipe.duckdb')
+    execFileSync('mkfifo', [fifo])
+    expect(await storeCommand(['status', '--db', fifo])).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('store_not_initialized')
+    expect(e.hint, 'FIFO 不是目录，不得说成目录').not.toContain('是目录')
+    expect(e.hint).toContain('不是普通文件')
+    // 对照：真正的目录仍说「目录」（两个成因分形，没有被合并成一句）
+    out = ''
+    expect(await storeCommand(['status', '--db', dir])).toBe(1)
+    expect(JSON.parse(out).error.hint).toContain('是目录')
+  })
+
+  it('库里有未声明的表 → status 成功 + warnings 点名（不再整条命令失败，2026-11-01 实测修）', async () => {
+    // 缺陷原文：status 对**全库** information_schema 的表逐个 COUNT，而 store.count()
+    // 内部 assertTable 对未声明表抛 usage（退出码 2）—— 于是「库恰好有漂移」这个
+    // **已知可接受**的状态（db tables 只警告不失败）让 store status 整条不可用。
+    const p = dbPath()
+    expect(await storeCommand(['init', '--db', p])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown> }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(p)
+    const conn = await inst.connect()
+    await conn.run('CREATE TABLE stray_table (a INT)')
+    inst.closeSync()
+
+    out = ''
+    expect(await storeCommand(['status', '--db', p]), '有漂移不等于命令不可用').toBe(0)
+    const d = JSON.parse(out)
+    const names = (d.data.tables as Array<{ name: string }>).map((t) => t.name)
+    expect(names, '未声明表不得混进 tables').not.toContain('stray_table')
+    expect(names, '声明表必须照常输出').toContain('schema_version')
+    expect((d.meta.warnings as string[]).join('\n'), '必须点名未声明表（不得静默）')
+      .toContain('stray_table')
+    // 对照：干净库不产生 warnings 键（该键是条件键）
+    out = ''
+    expect(await storeCommand(['init', '--db', join(dir, 'clean.db')])).toBe(0)
+    expect(JSON.parse(out).meta.warnings, '干净库不得带 warnings 键').toBeUndefined()
+    out = ''
+    expect(await storeCommand(['status', '--db', join(dir, 'clean.db')])).toBe(0)
+    expect(JSON.parse(out).meta.warnings).toBeUndefined()
   })
 
   it('status 缺表两半边：空库 → hint 含 store init；他人库 → hint 含换路径', async () => {

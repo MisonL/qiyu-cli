@@ -28,9 +28,10 @@ import { readWatermark } from '../sync/state.js'
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
-import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty, storeInitCommand } from '../output.js'
+import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
 import { classifyOpenFailure, NOT_DUCKDB_HINT } from '../store/retry.js'
+import { storeNotInitializedHint } from './store-precheck.js'
 import { runFieldNotes } from './sync-notes.js'
 import type { Store } from '../store/types.js'
 import { GLOBAL_FLAGS, STORE_FLAGS, renderFlagNames, valueFlagNames } from './spec-types.js'
@@ -239,7 +240,7 @@ function storeInitFail(e: unknown, path: string): number {
     // 「路径存在但不是 DuckDB 文件」由 DuckDB 原文判定（与 store.ts 同一份文案）。
     const hint = err.hint ?? (notDuckdb
       ? NOT_DUCKDB_HINT
-      : '数据库尚未初始化。请先运行：' + storeInitCommand(path))
+      : storeNotInitializedHint(path))
     return fail({
       code: 'store_not_initialized', kind: 'store_not_initialized',
       retryable: false,
