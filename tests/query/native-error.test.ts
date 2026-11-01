@@ -99,6 +99,16 @@ describe('isLayer2Blocked —— 只认真 layer2 拦截（实测五形态）', 
     expect(isLayer2Blocked('Permission Error: Cannot access file "/x"')).toBe(false)
     expect(isLayer2Blocked('Permission Error: Loading external extensions is disabled through configuration')).toBe(false)
   })
+  it('引号路径里含特征句、句尾不是它 → false（特征句必须锚句尾，Sourcery）', () => {
+    // 合成形态（如实标注）：路径由用户给出，可以包含任意文本。
+    const synthetic = 'Permission Error: Cannot access file '
+      + '"/tmp/file system operations are disabled by configuration/x.csv": Permission denied'
+    expect(isLayer2Blocked(synthetic)).toBe(false)
+    // 对照：同样的怪路径、但真被沙箱拦截（句尾是特征句）→ 仍是 true
+    expect(isLayer2Blocked('Permission Error: Cannot access file '
+      + '"/tmp/file system operations are disabled by configuration/x.csv"'
+      + ' - file system operations are disabled by configuration')).toBe(true)
+  })
   it('前缀真在开头、特征句只在 SQL 回显里 → false（剥回显真正防的那一种）', () => {
     // 合成形态（如实标注，非实测原文）：头部是不带特征句的 Permission Error，
     // SQL 字面量里恰好含特征句。不剥回显时「锚开头 + 搜特征句」两个条件都满足 → 误判拦截。

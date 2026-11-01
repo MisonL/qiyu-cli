@@ -56,7 +56,7 @@ export function isInterrupt(msg: string): boolean {
  * ATTACH / EXPORT / INSTALL）报文恒以 `Permission Error: Cannot access file|directory
  * "…" - file system operations are disabled by configuration` 开头。
  *
- * ⚠️ 三个条件缺一不可：
+ * ⚠️ 四个条件缺一不可：
  *   · 剥掉 SQL 回显后判定 —— `Parser Error` 会把出错行 SQL 全文附在 `LINE n:` 之后，
  *     SQL 里恰好含特征句（`SELEC 'file system operations are disabled by configuration'`，
  *     实测）会被判成「已被沙箱拦截」（真实成因是语法错，归因是假的）；
@@ -64,9 +64,12 @@ export function isInterrupt(msg: string): boolean {
  *   · 同时要特征句 **`file system operations are disabled`** —— 这才是「配置禁用」的
  *     标记。`Cannot access file` 单独出现不作数：裸的文件访问失败也可能带
  *     `Permission Error:` 前缀，把它算成「被沙箱拦截」会把环境问题说成用法问题。
+ *   · 特征句还必须锚在**句尾**（` - … by configuration` 结尾，2026-11-01 Sourcery）：
+ *     头部里的引号路径是用户给的，路径本身含这句话时只搜子串仍会误判。
+ *     七种实测形态全部以这半句收尾。
  */
 export function isLayer2Blocked(msg: string): boolean {
   const head = withoutSqlEcho(msg)
   return /^Permission Error:/i.test(head)
-    && /file system operations are disabled/i.test(head)
+    && / - file system operations are disabled by configuration\s*$/i.test(head)
 }

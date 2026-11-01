@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { storeCommand } from '../../src/commands/store.js'
+import { TABLES } from '../../src/store/schema.js'
 
 let dir = '', out = '', err = ''
 const dbPath = (): string => join(dir, 'q.db')
@@ -168,10 +169,18 @@ describe('store status', () => {
     expect(await storeCommand(['status', '--db', p]), '有漂移不等于命令不可用').toBe(0)
     const d = JSON.parse(out)
     const names = (d.data.tables as Array<{ name: string }>).map((t) => t.name)
-    expect(names, '未声明表不得混进 tables').not.toContain('stray_table')
-    expect(names, '声明表必须照常输出').toContain('schema_version')
+    // 断言**整组**而不是挑一张（Sourcery）：过滤写错成「只剩 schema_version」时，
+    // 「不含 stray + 含 schema_version」两条照样绿。
+    const declared = TABLES.map((t) => t.name).sort()
+    expect([...names].sort(), 'tables 必须恰为声明表全集（不多不少）').toEqual(declared)
     expect((d.meta.warnings as string[]).join('\n'), '必须点名未声明表（不得静默）')
       .toContain('stray_table')
+    // init 走同一条过滤（此前只有 status 有行为用例）
+    out = ''
+    expect(await storeCommand(['init', '--db', p])).toBe(0)
+    const di = JSON.parse(out)
+    expect([...(di.data.tables as string[])].sort(), 'init 的 tables 同样恰为声明表全集').toEqual(declared)
+    expect((di.meta.warnings as string[]).join('\n')).toContain('stray_table')
     // 对照：干净库不产生 warnings 键（该键是条件键）
     out = ''
     expect(await storeCommand(['init', '--db', join(dir, 'clean.db')])).toBe(0)
