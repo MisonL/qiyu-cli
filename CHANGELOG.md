@@ -163,6 +163,10 @@
   （`… Conflicting lock is held in /opt/hostedtoolcache/node/24.22.1/x64/bin/node (PID 4894). See also …`）。
   现只锚两段跨平台都有的骨架，并给测试补了 Linux 形态夹具。教训与「采样源按平台核对」同族。
 
+  同 PR 内还回写了**实施计划**（`docs/superpowers/plans/2026-10-13-存储层.md`）里那份
+  已作废的 `isLockError` 实现与示例夹具 —— 照抄计划的人会把缺陷原样搬回来
+  （Sourcery 指出）。计划不是只读历史：它是对后来者的**指令**。
+
 - **`db` / `stats` 的「未知参数」把空串渲染成隐形**。`query` / `api` 早走 `describeArgs`
   （空串渲染成 `''`），`db` / `stats` 共八处仍是裸 `join(' ')` —— `db tables ''` 得到
   「未知参数：」冒号后一片空白，退出码 2 的全部价值（「改哪里」）丢失。八处统一改走
