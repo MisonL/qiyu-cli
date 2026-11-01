@@ -40,9 +40,15 @@ export function withoutSqlEcho(msg: string): string {
  * `Could not convert string 'interrupt' to INT32 …`）子串判会把**类型转换错误**
  * 谎报成查询超时 —— kind 与真实成因相反、真实错误线索被整体丢弃，
  * `--timeout 0`（用户显式关闭超时）下也照样报「查询超过 0ms 未完成」。
+ *
+ * ⚠️ 只锚 `INTERRUPT Error` 这个词也不够（2026-11-01 CodeRabbit + 探针实测）：值恰为
+ * `'INTERRUPT Error: Interrupted!'` 时，Conversion Error 的**头部**就逐字含这串
+ * （`Could not convert string 'INTERRUPT Error: Interrupted!' to INT32 …`）。
+ * 所以与 `isLayer2Blocked` 同样两步：先剥 SQL 回显，再要求前缀锚在**开头**（`^`）。
+ * 真实中断报文实测无包装前缀（`runAndReadUntil` 抛出的 message 恰为上面那句）。
  */
 export function isInterrupt(msg: string): boolean {
-  return /INTERRUPT Error/i.test(msg)
+  return /^INTERRUPT Error:/i.test(withoutSqlEcho(msg))
 }
 
 /**

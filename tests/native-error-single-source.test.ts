@@ -128,7 +128,18 @@ describe('DuckDB 原生报文判据必须只有一处实现（native-error.ts）
     // ⚠️ 负向断言必须跑**剥注释后**的文本：文件头正是用 `/INTERRUPT/i` 逐字解释了
     // 「不能这么写」（本仓库第 5 次踩这个陷阱 —— 对全文判会把「解释旧错」判成「仍在犯旧错」）。
     const codeOnly = stripCommentLines(text)
-    expect(codeOnly, 'isInterrupt 必须锚类别前缀').toMatch(/INTERRUPT Error/i)
+    // ⚠️ 按函数体判，不按全文（CodeRabbit round 1）：上一版只断言全文「含 INTERRUPT Error」，
+    // 于是 `/INTERRUPT Error/i.test(msg)`（不锚开头、不剥回显）照样绿 —— 而它会被头部回显
+    // 中断报文原文的 Conversion Error 骗过。两个判据都必须**锚开头 + 先剥回显**。
+    const bodyOf = (name: string): string => {
+      const start = codeOnly.indexOf(`export function ${name}(`)
+      expect(start, `${SINGLE_SOURCE} 里找不到 ${name}`).toBeGreaterThanOrEqual(0)
+      return codeOnly.slice(start, codeOnly.indexOf('\n}', start))
+    }
+    for (const [name, anchor] of [['isInterrupt', /\^INTERRUPT Error:/i], ['isLayer2Blocked', /\^Permission Error:/i]] as const) {
+      expect(bodyOf(name), `${name} 必须把类别前缀锚在开头（^）`).toMatch(anchor)
+      expect(bodyOf(name), `${name} 必须先剥 SQL 回显再判定`).toMatch(/withoutSqlEcho\(/)
+    }
     // 用 RegExp 构造而不是字面量：这条断言的**说明文字**里就要写出那个被禁的形态，
     // 写成字面量会让 esbuild 在字符串里找正则的结尾（实测报 Unterminated regular expression）。
     expect(codeOnly, 'isInterrupt 不得裸用不带类别锚的子串判')

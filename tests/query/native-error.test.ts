@@ -40,6 +40,19 @@ describe('isInterrupt —— 只认真中断（实测报文：INTERRUPT Error: I
       + 'LINE 1: SELECT -- interrupt me\n               ^'
     expect(isInterrupt(real)).toBe(false)
   })
+  it('⚠️ 事故原文：回显列值恰为中断报文原文的 Conversion Error → false（CodeRabbit round 1）', () => {
+    // 2026-11-01 探针实测：值恰为 `INTERRUPT Error: Interrupted!` 时，Conversion Error 的
+    // **头部**逐字含这串 —— 只锚词、不锚「开头」的写法会把类型转换错误再谎报成超时
+    //（上一版只把裸 `/INTERRUPT/i` 收紧到 `/INTERRUPT Error/i`，这个值仍能骗过它）。
+    const real = "Conversion Error: Could not convert string 'INTERRUPT Error: Interrupted!' to INT32 when casting from source column x"
+      + '\n\nLINE 1: SELECT CAST(x AS INT) AS n FROM t\n               ^'
+    expect(isInterrupt(real), '头部含该串 ≠ 报文本身就是它').toBe(false)
+  })
+  it('真中断报文带 SQL 回显也 → true（剥回显是防御性；实测真中断无回显）', () => {
+    // 诚实边界：探针实测 `runAndReadUntil` 抛出的真中断报文恰为 `INTERRUPT Error: Interrupted!`，
+    // 不携带回显；这里钉的是「若将来驱动附带回显，剥除不破坏判定」。
+    expect(isInterrupt("INTERRUPT Error: Interrupted!\n\nLINE 1: SELECT COUNT(*) FROM range(1e11)")).toBe(true)
+  })
   it('大小写与措辞：类别前缀大小写不敏感', () => {
     expect(isInterrupt('interrupt error: Interrupted!')).toBe(true)
   })
@@ -85,6 +98,13 @@ describe('isLayer2Blocked —— 只认真 layer2 拦截（实测五形态）', 
     // 但若出现裸 Permission Error（无特征句），也不能判成 layer2
     expect(isLayer2Blocked('Permission Error: Cannot access file "/x"')).toBe(false)
     expect(isLayer2Blocked('Permission Error: Loading external extensions is disabled through configuration')).toBe(false)
+  })
+  it('前缀真在开头、特征句只在 SQL 回显里 → false（剥回显真正防的那一种）', () => {
+    // 合成形态（如实标注，非实测原文）：头部是不带特征句的 Permission Error，
+    // SQL 字面量里恰好含特征句。不剥回显时「锚开头 + 搜特征句」两个条件都满足 → 误判拦截。
+    const synthetic = 'Permission Error: Cannot access file "/x"'
+      + "\n\nLINE 1: SELECT 'file system operations are disabled by configuration' FROM t\n        ^"
+    expect(isLayer2Blocked(synthetic)).toBe(false)
   })
   it('回显区里的 Permission Error 前缀不生效（前缀必须锚在被判定文本的开头）', () => {
     const real = 'Failed to extract statements: Parser Error: syntax error\n\n'

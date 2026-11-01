@@ -130,8 +130,9 @@
   · SQL 里恰好含特征句时（实测 `SELEC 'file system operations are disabled by configuration'`），
     语法错被报成「已被只读沙箱拦截」。
   **修法**：新增 `src/query/native-error.ts` 作为**唯一实现点**（`isInterrupt` /
-  `isLayer2Blocked` / `withoutSqlEcho`）：锚类别前缀 `INTERRUPT Error:` / `Permission Error:`，
-  判定前先剥 SQL 回显；layer2 还要求特征句 `file system operations are disabled`
+  `isLayer2Blocked` / `withoutSqlEcho`）：先剥 SQL 回显，再要求类别前缀 `INTERRUPT Error:` /
+  `Permission Error:` 锚在**开头**（只锚词不够：值恰为 `'INTERRUPT Error: Interrupted!'` 时
+  Conversion Error 的头部就逐字含这串，实测）；layer2 还要求特征句 `file system operations are disabled`
   （裸 `Permission Error: Cannot access file "…"` 是库文件的 OS 权限问题，不算拦截）。
   `sandbox.ts` 与 `query/errors.ts` 此前各写一份逐字相同的正则，现在都调它。
   诚实边界：类别前缀是 DuckDB 的书写惯例、不是可解析的结构；判据失配时退化方向是
@@ -163,7 +164,8 @@
   断言的备选正则 `/name.*rows/` 会撞上无关段落，删掉被守卫的原句仍绿。三条都改为先证明
   锚存在（或判据先在合成输入上双向自检）再断言。
 
-  **变异验证**：本轮 10 处变异全部转红 —— 裸 `INTERRUPT` 判、`errors.ts` 裸特征句判、
+  **变异验证**：本轮 12 处变异全部转红 —— 裸 `INTERRUPT` 判、`INTERRUPT Error` 不锚开头、
+  `isLayer2Blocked` 不剥回显、`errors.ts` 裸特征句判、
   `TYPE_NAMES[21]` 退回 `INSTALL`、`store status` 去掉未声明表过滤、skill 正文退回
   「不得晚于」、`sync-run.ts` 复制回一份空库 hint、锚句措辞漂移、去掉「末残段」限定、
   删掉 tables 形态句、给第二槽位标 `first`；
