@@ -99,6 +99,8 @@ describe('api call 的图例与真实输出', () => {
       .toContain('--no-validate 只保证不产生 ①')
     expect(notes().warnings, '必须点破元素形状不统一（消费者按 w.kind 会拿到 undefined）')
       .toContain('裸字符串')
+    expect(notes().warnings, '必须点破 field 不是每个元素都有（non_json_body 没有它）')
+      .toContain('non_json_body')
   })
 
   it('data 的释义必须点明是上游载荷、不要按其他命令的形状推断', () => {

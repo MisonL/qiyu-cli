@@ -1545,6 +1545,28 @@ describe('并发安装（gap 8）', () => {
       // ⚠️ 不能只查「内容与包内一致」——它也是「仅清单落后」文案的公共子串（复审 W4）。
       // 完全一致时不得落到那条分支。
       expect(joined, '完全一致时不得说「清单落后」').not.toContain('清单落后')
+      // ⚠️ `upToDate` 也必须为 true（Sourcery 2026-11-02）：并发赢家装好的实体与包内
+      // **完全一致**时，本进程虽然零写入（`status` 仍如实记 `'skipped'`），**最终状态
+      // 却是最新的** —— 旧判据只看 `plan.status`（恒为 `'installed'`），会把这种情况
+      // 判成「未完成更新」，postinstall 于是对一个已装好的实体说反话。
+      expect(r.upToDate, '并发赢家装了完全一致的实体 → 最终状态是最新的').toBe(true)
+    } finally {
+      fsRenameFault.set(null)
+    }
+  })
+
+  it('⚠️ 并发赢家只有「清单落后」时 upToDate 必须为 false（不能一刀切说最新）', async () => {
+    const src = makeSource()
+    const entity = defaultEntityDir(home)
+    mkdirSync(dirname(entity), { recursive: true })
+
+    fsRenameFault.set('ENOTEMPTY_STALE_MANIFEST')
+    try {
+      const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+      expect(r.status).toBe('skipped')
+      expect(r.warnings.join('\n')).toContain('清单落后')
+      // 正文一致、清单落后 ⇒ 还没「最新」（重跑一次才补上清单）。
+      expect(r.upToDate, '清单落后 ≠ 已是最新').toBe(false)
     } finally {
       fsRenameFault.set(null)
     }

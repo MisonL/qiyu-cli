@@ -173,8 +173,10 @@ appSecret 对同机其他用户可读。不读配置的命令（`--version`、`a
 >
 > `whoami` 输出的 `robots` 来自配置里的 `profiles.<name>.robots`（`{"1000001":"机器人A"}` 形态），
 > 同样**未校验有效性**。它是 `sync run` 的兜底来源：`profiles.<name>.store.options.knowledgeRobotIds`
-> 缺席时，知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。空数组有两种成因：
-> 该档没配 robots，或该档根本不存在。
+> 缺席时，知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。空数组有**三种**成因：
+> 该档没配 robots、该档根本不存在，或**配置文件读取失败**（畸形 JSON / 未知键）——
+> 第三种会在 `meta.warnings` 里点名，先读 `warnings` 再判断，别把读不到配置当成「该档没配」。
+> （含凭证且权限过宽不是「读取失败」：那种情况 `whoami` 直接以 `config_insecure` 报错。）
 
 ## 使用
 

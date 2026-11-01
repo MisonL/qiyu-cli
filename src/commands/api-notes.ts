@@ -16,7 +16,12 @@ export function callFieldNotes(): Record<string, string> {
       + '不要按其他命令 data 的形状推断',
     endpoint: '本次调用的接口 id（把结果与请求对上用）',
     warnings: '⚠️ 这是多来源数组，元素形状不统一：'
-      + '① body 校验的软告警（对象，含 `kind` / `field` / `message`），'
+      + '① body 校验的软告警（对象，含 `kind` / `message`），'
+      // ⚠️ `field` **不保证**存在（Sourcery 指出）：`non_json_body`（body_kind 非 json 时
+      // 照原样发字面量）是**整条请求**级的提示，没有单一字段可归因 —— 它只带 `kind` 与
+      // `message`。消费者按 `w.field` 取值会拿到 `undefined`。
+      + '`field` 仅在告警属于某个具体字段时出现（如 `missing_required` / `unknown_field` / '
+      + '`type_mismatch`），`non_json_body` 这类整条请求级的提示没有它，'
       + '② CLI 级的安装态提示（如 skill 未安装）——'
       + '同一次输出里已有 ① 时它被包成 `{kind:"skill_drift", message}`，否则是裸字符串。'
       + '故按 `w.kind` 取值前先判元素类型，别假定它一定是对象。'

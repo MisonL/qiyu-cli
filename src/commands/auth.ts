@@ -397,8 +397,9 @@ function whoami(): number {
       robots: '来自配置文件的 profiles.<name>.robots 映射（robotId → 显示名），**未校验有效性**、' +
         '未与本地库比对；sync run 在 profiles.<name>.store.options.knowledgeRobotIds 缺席时回退使用它。'
         + '⚠️ 空数组有三种成因：该档没配 robots，该档在配置文件里根本不存在（见 profile 的说明），'
-        + '或**配置文件读取失败**（畸形 JSON / 未知键 / 权限不足）—— 第三种会在 meta.warnings 里'
-        + '点名，先读 warnings 再判断；把第三种读成「该档没配 robots」会让人去改一个没问题的档',
+        + '或**配置文件读取失败**（畸形 JSON / 未知键）—— 第三种会在 meta.warnings 里点名，'
+        + '先读 warnings 再判断。⚠️ **权限不足不在其列**：含凭证且权限过宽时本命令直接以 '
+        + 'config_insecure **报错**（走 failFromTagged），根本到不了这个成功形态',
       configured: 'true 只表示"两个字段都有值"，**不代表**它们有效 —— 拼错的 appKey 同样返回 true',
     },
   })

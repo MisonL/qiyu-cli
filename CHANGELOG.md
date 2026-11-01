@@ -148,8 +148,22 @@
     `robots` 静默变 `[]`。实测 `{profiles:{…}, unknownKey:1}` 时输出 `configured:true` + `robots:[]`
     且无任何警告，Agent 照图例只会得出「该档没配 robots」。现成功路径也把原因放进 `meta.warnings`。
 
-  **变异验证**：本批 4 处全红 —— `mapThrownToExit` 退回手写出口、`direction` 退回全称断言、
-  `upToDate` 去掉 `plan.warnings.length === 0`、`whoami` 去掉成功路径的 warnings。
+  **Sourcery 复审补了四处**（均已核实并修）：
+  · `upToDate` 漏了**并发收敛**这一支 —— 两个安装进程竞争一个不存在的实体时，赢家装出的
+    内容可能与包内**完全一致**，而本进程 `plan.status` 恒为 `'installed'`，于是判成
+    「未完成更新」（对一个已装好的实体说反话）。现加 `convergedByConcurrent` 标记，
+    并**双向**钉住：完全一致 → `upToDate: true`；仅清单落后 → `false`。
+  · `api call` 图例把 `field` 说成软告警的必备键 —— `non_json_body`（body_kind 非 json 时
+    照原样发字面量）是**整条请求**级提示，只带 `kind` 与 `message`，消费者按 `w.field`
+    取值会得 `undefined`。已写明 `field` 只在告警属于具体字段时出现。
+  · `whoami` 图例把「权限不足」也归进「配置读取失败 → meta.warnings」—— 权限过宽（含凭证）
+    走的是 `failFromTagged` → `config_insecure` **错误**，根本到不了成功路径。已如实区分。
+  · README 第 176 行仍写「空数组有两种成因」—— 与同 PR 改过的图例不一致（第二事实源漏改）。
+    已改为三种并指向 `meta.warnings`。
+
+  **变异验证**：本批 6 处全红 —— `mapThrownToExit` 退回手写出口、`direction` 退回全称断言、
+  `upToDate` 去掉 `plan.warnings.length === 0`、`upToDate` 去掉并发标记、
+  并发标记不看 `action === 'none'`、`whoami` 去掉成功路径的 warnings。
 
 - **同一形态的第三批落点：四条错误分类判据也是裸子串判，能被列值与 SQL 回显仿冒**。
   上一批只把 `isInterrupt` / `isLayer2Blocked` 收紧，**同一文件里另外四条分类判据漏在外面**

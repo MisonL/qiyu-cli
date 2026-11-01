@@ -1131,6 +1131,13 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
   const warnings = [...plan.warnings]
 
   let status: InstallResult['status'] = plan.status
+  /**
+   * 并发收敛标记（Sourcery 2026-11-02）：另一个进程先装好了**与包内一致**的实体，
+   * 本进程零写入 —— 此时 `status` 仍如实记为 `'skipped'`（本进程确实什么都没写），
+   * 但**最终状态**其实是最新的。`upToDate` 描述的是后者，所以要带上这个标记，
+   * 否则 postinstall 会对一个已经装好的实体报「未完成更新」。
+   */
+  let convergedByConcurrent = false
   if (plan.action === 'write') {
     const outcome = writeInstalled(
       entityDir, sourceDir, plan.sourceFiles, version, plan.sourceHash, warnings,
@@ -1164,6 +1171,9 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
       const sameContent =
         replan.warnings.length === 0
         && (replan.action === 'none' || replan.action === 'rewrite-manifest')
+      // 只有 `action === 'none'` 且**无警告**才是真正收敛（正文与清单都是包内那份）；
+      // `rewrite-manifest` 说明清单还落后，那不算「最新」。
+      convergedByConcurrent = replan.warnings.length === 0 && replan.action === 'none'
       warnings.push(
         replan.action === 'rewrite-manifest'
           ? `另一个并发安装已完成，实体内容与包内一致，仅安装清单落后；重跑一次 qiyu skill install 即会补写清单（无需 --force）：${entityDir}`
@@ -1195,7 +1205,8 @@ export async function installSkill(opts: InstallOptions): Promise<InstallResult>
   // 链接阶段的警告（未发现 Agent 目录等）不算，它们与「正文是否最新」无关。
   return {
     entityDir, status, plannedStatus: plan.status, links, warnings,
-    upToDate: status === 'skipped' && plan.status === 'skipped' && plan.warnings.length === 0,
+    upToDate: (status === 'skipped' && plan.status === 'skipped' && plan.warnings.length === 0)
+      || convergedByConcurrent,
   }
 }
 
