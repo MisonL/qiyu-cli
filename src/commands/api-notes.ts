@@ -15,9 +15,19 @@ export function callFieldNotes(): Record<string, string> {
       + '取出后原样透传、不改写不脱敏。字段含义用 `qiyu api schema <id>` 查，'
       + '不要按其他命令 data 的形状推断',
     endpoint: '本次调用的接口 id（把结果与请求对上用）',
-    warnings: 'body 校验的软告警（缺省字段、别名归一、取值可疑）。没有软告警时这个键不出现，'
-      + '--no-validate 时恒不出现。⚠️ 不出现 ≠ body 正确（--no-validate 根本没校验）。'
-      + '它是本 CLI 的校验提示，不是上游的业务告警',
+    warnings: '⚠️ 这是多来源数组，元素形状不统一：'
+      + '① body 校验的软告警（对象，含 `kind` / `message`），'
+      // ⚠️ `field` **不保证**存在（Sourcery 指出）：`non_json_body`（body_kind 非 json 时
+      // 照原样发字面量）是**整条请求**级的提示，没有单一字段可归因 —— 它只带 `kind` 与
+      // `message`。消费者按 `w.field` 取值会拿到 `undefined`。
+      + '`field` 仅在告警属于某个具体字段时出现（如 `missing_required` / `unknown_field` / '
+      + '`type_mismatch`），`non_json_body` 这类整条请求级的提示没有它，'
+      + '② CLI 级的安装态提示（如 skill 未安装）——'
+      + '同一次输出里已有 ① 时它被包成 `{kind:"skill_drift", message}`，否则是裸字符串。'
+      + '故按 `w.kind` 取值前先判元素类型，别假定它一定是对象。'
+      + '⚠️ 键不出现 ≠ body 正确：它只在「没有软告警且没有 CLI 提示」时不出现，'
+      + '--no-validate 只保证不产生 ①（body 未校验），② 照旧出现。'
+      + '它是本 CLI 的提示，不是上游的业务告警',
     not_found: 'true = 解包后的载荷为空。判据作用在解包后的 payload 上：'
       + 'data / result 形状下是 {} / []，或整条 200 响应没有载荷键（仅已实测信封，'
       + 'envelope 为 null 的接口不断言）。staffInfo 形状恒不置位。'

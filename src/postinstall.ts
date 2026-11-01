@@ -124,11 +124,20 @@ export async function runPostinstall(opts: PostinstallOptions): Promise<number> 
       ...(entityDir !== undefined ? { entityDir } : {}),
     })
 
-    // 措辞按**实际**结果（审查 B2）：计划要写、实际零写入时 status 是 skipped，
-    // 说「已是最新，跳过」是谎报——此时正文其实没跟上包内版本。
-    const label = result.status === 'skipped'
-      ? (result.plannedStatus === 'skipped' ? '已是最新，跳过' : '未完成更新（详见下方提示）')
-      : `已安装（${result.status}）`
+    // 措辞按**实际**结果（审查 B2）：
+    //   · `upToDate`（正文与清单都是包内那份）→ 「已是最新，跳过」；
+    //   · 其余 `status === 'skipped'` → 「未完成更新」。
+    // ⚠️ 判据**不能**写成「`status === 'skipped' && plannedStatus === 'skipped'`」
+    // （2026-11-02 审查实测）：`planInstall` 的 `skipped` 有四种含义，其中「内容不同且
+    // 未加 `--force`」「清单被非普通文件占用」「实体目录列不出来」三种都零写入且**没跟上**，
+    // 但 `plannedStatus` 同样是 `'skipped'` —— 旧写法把它们全说成「已是最新」，
+    // 紧接着下一行又打印「内容与包内不同，未覆盖」，同一进程两行自相矛盾（实测复现）。
+    // 判据现由 `installSkill` 算成 `result.upToDate` 一个字段（见 install.ts 的说明）。
+    const label = result.upToDate
+      ? '已是最新，跳过'
+      : result.status === 'skipped'
+        ? '未完成更新（详见下方提示）'
+        : `已安装（${result.status}）`
     note(`skill ${label}：${result.entityDir}`)
     if (result.warnings.length > 0) {
       // 零链接（审查 B3 / #58）等提示同样要出现在 npm 自动安装路径上。

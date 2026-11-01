@@ -443,3 +443,21 @@ describe('auth 已挂载到入口', () => {
     expect(err).not.toContain('未知子命令：auth')
   })
 })
+
+describe('whoami：配置读取失败必须在成功路径可见（2026-11-02 审查）', () => {
+  it('凭证齐全 + 配置文件畸形 → configured 仍 true，但 meta.warnings 点名', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k-test')
+    vi.stubEnv('QIYU_APP_SECRET', 's-test')
+    // 未知键 → parseConfig 抛（配置畸形）
+    writeCfg({ profiles: { default: { credentials: { appKey: 'fk', appSecret: 'fs' } } }, unknownKey: 1 })
+    out = ''
+    expect(await authCommand(['whoami'])).toBe(0)
+    const j = JSON.parse(out)
+    expect(j.data.configured).toBe(true)
+    expect(j.data.robots, '读不到配置时 robots 必为空').toEqual([])
+    // ⚠️ 旧行为：成功路径完全不提，图例只说「空数组有两种成因」—— Agent 会得出
+    // 「该档没配 robots」，而真相是配置根本没读成功（那个档里可能配了 robots）。
+    expect(String((j.meta.warnings ?? []).join(' ')), '必须点名配置读取失败')
+      .toContain('配置文件读取失败')
+  })
+})

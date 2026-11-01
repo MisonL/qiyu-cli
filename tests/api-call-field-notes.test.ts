@@ -91,7 +91,16 @@ describe('api call 的图例与真实输出', () => {
     stubBody({ code: 200, message: JSON.stringify({ total: 0, tickets: [] }) })
     expect(await apiCommand(['call', 'ticket.search', '--no-validate']), out.slice(0, 400)).toBe(0)
     expect(meta().warnings).toBeUndefined()
-    expect(notes().warnings, '--no-validate 的省略必须写明').toContain('--no-validate 时恒不出现')
+    // ⚠️ 旧断言要求图例写「--no-validate 时恒不出现」—— 那是**假承诺**（2026-11-02 审查实测）：
+    // skill 安装态提示经 `ok()` 的 mergeSkillWarning 并进**任何**成功输出的 meta.warnings，
+    // `--no-validate` 也不例外（实测 `meta.warnings = ["skill 未安装到 …"]`，元素是裸字符串）。
+    // 现在图例如实说「只保证不产生软告警」，并点明元素形状不统一。
+    expect(notes().warnings, '--no-validate 的省略必须**收窄**到软告警，不能承诺整键不出现')
+      .toContain('--no-validate 只保证不产生 ①')
+    expect(notes().warnings, '必须点破元素形状不统一（消费者按 w.kind 会拿到 undefined）')
+      .toContain('裸字符串')
+    expect(notes().warnings, '必须点破 field 不是每个元素都有（non_json_body 没有它）')
+      .toContain('non_json_body')
   })
 
   it('data 的释义必须点明是上游载荷、不要按其他命令的形状推断', () => {
