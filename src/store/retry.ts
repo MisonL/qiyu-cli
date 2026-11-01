@@ -5,9 +5,14 @@
 /**
  * 锁冲突的识别：**模板**匹配，不是子串搜索。
  *
- * 真实报文（探针逐字，@duckdb/node-api 1.5.6-r.1、跨进程真持锁）：
- *   `IO Error: Could not set lock on file "<路径>": Conflicting lock is held in
- *    /usr/bin/node (PID 83991) by user mison. See also https://duckdb.org/docs/stable/connect/concurrency`
+ * 真实报文（跨进程真持锁，@duckdb/node-api 1.5.6-r.1）。**两种平台形态**（都逐字实测）：
+ *   · macOS：`IO Error: Could not set lock on file "<路径>": Conflicting lock is held in
+ *     /Users/x/.nvm/…/bin/node (PID 83991) by user x. See also https://…`
+ *   · Linux：`… Conflicting lock is held in /opt/hostedtoolcache/node/24.22.1/x64/bin/node
+ *     (PID 4894). See also https://…` —— **没有 ` by user ` 那段**。
+ * 首版判据锚了三段（含 ` by user `），那是**只在本机探针过**的产物：CI 立刻在
+ * Node 20.12/22/24 上全红（同一个用例在我这里是绿的）。教训与「采样源按平台核对」同族 ——
+ * 探针跑在哪个平台，判据就只对那个平台成立。现只锚两段跨平台实测都有的骨架。
  *
  * ⚠️⚠️ **不能**只搜 `Conflicting lock` 子串（2026-11-01 实测，形态「报文里嵌了用户给的
  * 路径」）：DuckDB 的**其它**报文同样把库路径原文嵌进去 ——
@@ -19,19 +24,19 @@
  * 30.1s、`kind: store_locked`；同一份内容放在不含该词的路径上 0.4s 就给出正确的
  * `store_not_initialized`。
  *
- * 判据因此锚住 DuckDB 自己的**模板骨架**：句首 `IO Error: Could not set lock on file `、
- * 冒号后 `Conflicting lock is held in `、以及所有者片段 ` by user `。三处都不在路径里
- * 就没有第二种报文能命中（`not a valid DuckDB database file` 那句句首是 `The file `）。
- * ⚠️ 边界如实记录：路径由用户给出且会被原文嵌入，理论上可以构造一个同时凑齐这三段的
- * 路径；代价是那个路径**必须**长得就像 DuckDB 的锁报文 —— 比「恰好含两个词」苛刻得多，
- * 而放宽的代价（上面那 30 秒假锁 + 假 retryable）是实测发生的。
+ * 判据锚 DuckDB 自己的**模板骨架**：句首 `IO Error: Could not set lock on file "<路径>": `
+ * 与紧随的 `Conflicting lock is held in `。两段都不在路径里，第二种报文命中不了
+ *（`not a valid DuckDB database file` 那句句首是 `The file `）。
+ * ⚠️ 边界如实记录：路径由用户给出且会被原文嵌入，理论上可以构造一个路径让这句看起来
+ * 也像别的报文；但那要求整条报文**以** `IO Error: Could not set lock on file "` 开头，
+ * 而只有锁报文会这样开头 —— 放宽的代价（上面那 30 秒假锁 + 假 retryable）则是实测发生的。
  *
  * 与 spec §5.2 原文「message 含 `Conflicting lock`」的偏离是**有意**的：那句话写于
  * 判据只有一处消费点、且假设报文只可能是锁报文的时候。
  */
 export function isLockError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e)
-  return /^IO Error: Could not set lock on file "[\s\S]*": Conflicting lock is held in [\s\S]* by user /i.test(msg)
+  return /^IO Error: Could not set lock on file "[\s\S]*": Conflicting lock is held in /i.test(msg)
 }
 
 /**

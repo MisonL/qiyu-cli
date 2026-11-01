@@ -157,6 +157,12 @@
   设计稿 §5.2 的「message 含 `Conflicting lock`」已就地回写为该口径（意图不变：非锁错误不
   无谓退避）。
 
+  ⚠️ **同 PR 内的 CI 修正**：首版判据锚了三段骨架（含 ` by user `），那是**只在本机
+  （macOS）探针过**的产物 —— CI 的 Node 20.12 / 22 / 24 **三个矩阵项全红**，而同一个用例
+  在我这里绿。真实原因是平台差异：**Linux 的锁报文没有 ` by user ` 那段**
+  （`… Conflicting lock is held in /opt/hostedtoolcache/node/24.22.1/x64/bin/node (PID 4894). See also …`）。
+  现只锚两段跨平台都有的骨架，并给测试补了 Linux 形态夹具。教训与「采样源按平台核对」同族。
+
 - **`db` / `stats` 的「未知参数」把空串渲染成隐形**。`query` / `api` 早走 `describeArgs`
   （空串渲染成 `''`），`db` / `stats` 共八处仍是裸 `join(' ')` —— `db tables ''` 得到
   「未知参数：」冒号后一片空白，退出码 2 的全部价值（「改哪里」）丢失。八处统一改走
@@ -171,8 +177,9 @@
   只列业务表、两边数量不同」，而下方用例 `expect(dbNames).toEqual(storeNames)` 早已证伪
   （实测两边都含内部表、都是同一组）。用例标题与注释一并改为实况。
 
-  **变异验证**：本轮 10 处变异全部转红 —— `Binder|Catalog` 判据退回裸子串、`OOM` 判据退回
+  **变异验证**：本轮 11 处变异全部转红 —— `Binder|Catalog` 判据退回裸子串、`OOM` 判据退回
   裸子串、`duckDbSaysMissingName` 去掉 `^` 锚、判据模式不锚开头（列名伪装）、
+  锁判据加回 ` by user ` 段（Linux 上退化成永不命中）、
   `driftFailureFor` 不再吃 `cause`、
   `db` / `stats` 的 `describeArgs` 退回裸 join（三处）、锁判据退回
   `msg.includes('Conflicting lock')`、图例退回「后四个」；每处先 `grep` 确认落地，

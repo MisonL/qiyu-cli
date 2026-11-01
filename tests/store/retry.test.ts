@@ -8,6 +8,14 @@ const LOCK_MSG = (path = '/tmp/x/q.db') =>
   `IO Error: Could not set lock on file "${path}": Conflicting lock is held in `
   + '/Users/x/.nvm/versions/node/v24/bin/node (PID 83991) by user x. '
   + 'See also https://duckdb.org/docs/stable/connect/concurrency'
+
+// ⚠️ **Linux 形态没有 ` by user ` 那段**（CI 实测，见 store/retry.ts 的 isLockError 注释）：
+// 首版判据锚了三段骨架，本机（macOS）绿、CI 三个 Node 版本全红 —— 「探针跑在哪个平台，
+// 判据就只对那个平台成立」。这条夹具把两个平台形态一起钉住。
+const LOCK_MSG_LINUX = (path = '/tmp/x/q.db') =>
+  `IO Error: Could not set lock on file "${path}": Conflicting lock is held in `
+  + '/opt/hostedtoolcache/node/24.22.1/x64/bin/node (PID 4894). '
+  + 'See also https://duckdb.org/docs/stable/connect/concurrency'
 const lockErr = () => new Error(LOCK_MSG())
 
 describe('classifyOpenFailure —— 打开失败的成因分类（2026-10-31 单一实现点）', () => {
@@ -40,8 +48,11 @@ describe('classifyOpenFailure —— 打开失败的成因分类（2026-10-31 �
 })
 
 describe('isLockError —— 锁错误识别', () => {
-  it('message 含 Conflicting lock → true', () => {
+  it('真锁报文（macOS 形态，含 ` by user `）→ true', () => {
     expect(isLockError(lockErr())).toBe(true)
+  })
+  it('真锁报文（Linux 形态，**无** ` by user `）→ true（判据不得只对 macOS 成立）', () => {
+    expect(isLockError(new Error(LOCK_MSG_LINUX()))).toBe(true)
   })
   it('其他错误 → false（不无谓退避）', () => {
     expect(isLockError(new Error('ENOENT: no such file'))).toBe(false)
