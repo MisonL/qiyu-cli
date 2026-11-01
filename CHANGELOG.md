@@ -122,6 +122,35 @@
 
 ### 修复
 
+- **四条错误分类判据（本轮第二批落点）之外，另有五处独立缺陷**（均由独立审查 agent 发现并复现）：
+
+  · **`api call` / `api schema` 的用法错误在 `--pretty` 下被缩进**。`usageFail()` 是「用法错误
+    永远紧凑」的唯一收口点（README 与设计稿都写明这条契约），而这两个子命令的用法错误走的是
+    **手写的第三个出口** `mapThrownToExit`，它自己净化、自己写 stderr、自己调 `fail()` ——
+    前两项与 `usageFail` 逐字重复，第三项漏了最重要的一条。实测 `api call nosuchid --pretty`
+    与 `api call ticket.search --body '[]' --pretty` 都输出**缩进**信封，而同一退出码的
+    `api list extra --pretty` 是紧凑的。测试只钉了走 `usageFail` 的三条分支。现改为 `usageFail`。
+  · **`api list` 的 `direction` 图例把 inbound 说成「其 path 是占位符 `/`」** —— 全称断言，
+    而 17 条 inbound 里 9 条是 `/`、**5 条有真实路径**（`get_token` `/get_token` 等，全部
+    `callable: false`）、3 条是 `null`。Agent 会拿「path 是不是 `/`」当 inbound 的判据。
+    已收窄并点明真正依据是 `direction` / `callable` 两个字段。
+  · **`api call` 的 `meta.warnings` 图例承诺 `--no-validate` 时恒不出现** —— 假承诺：
+    skill 安装态提示经 `ok()` 的 `mergeSkillWarning` 并进**任何**成功输出，`--no-validate`
+    也不例外（实测 `meta.warnings = ["skill 未安装到 …"]`）；且元素形状**不统一**
+    （无软告警时是裸字符串，消费者按 `w.kind` 取值会得 `undefined`）。已如实改写。
+  · **`postinstall` 的「已是最新，跳过」是假归因** —— `planInstall` 的 `skipped` 有四种含义，
+    而判据只看了 `status === 'skipped' && plannedStatus === 'skipped'`，于是「正文被手工改动、
+    未加 `--force`」这一支（零写入、正文没跟上）也被说成「已是最新」，**紧接着下一行又打印
+    「内容与包内不同，未覆盖」，同一进程两行自相矛盾**（实测复现）。判据改为 `installSkill`
+    算出的 `upToDate` 一个字段（消费方不必各写一份四态判断）。
+  · **`auth whoami` 的 `robots` 图例说「空数组有两种成因」，实为三种，且第三种静默** ——
+    凭证齐全时畸形配置（非法 JSON / 未知键 / 权限不足）被吞进 `configError`，成功路径完全不提，
+    `robots` 静默变 `[]`。实测 `{profiles:{…}, unknownKey:1}` 时输出 `configured:true` + `robots:[]`
+    且无任何警告，Agent 照图例只会得出「该档没配 robots」。现成功路径也把原因放进 `meta.warnings`。
+
+  **变异验证**：本批 4 处全红 —— `mapThrownToExit` 退回手写出口、`direction` 退回全称断言、
+  `upToDate` 去掉 `plan.warnings.length === 0`、`whoami` 去掉成功路径的 warnings。
+
 - **同一形态的第三批落点：四条错误分类判据也是裸子串判，能被列值与 SQL 回显仿冒**。
   上一批只把 `isInterrupt` / `isLayer2Blocked` 收紧，**同一文件里另外四条分类判据漏在外面**
   —— 表/列不存在（四条正则）、`Parser Error`、`Binder|Catalog Error`、`Out of Memory Error`。

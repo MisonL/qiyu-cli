@@ -376,6 +376,15 @@ function whoami(): number {
     profile: profileName,
     robots,
   }, {
+    // ⚠️ 配置文件读取失败**必须在成功路径上也可见**（2026-11-02 审查实测）：
+    // 凭证齐全时 env 那两票足以让 configured 为 true，畸形配置（非法 JSON / 未知键）
+    // 被吞进 `configError` —— 上一段代码只在 `!configured` 时把它拼进 message，
+    // 成功路径完全不提，而 `robots` 静默变成 `[]`。实测：配置文件是
+    // `{ "profiles": {...}, "unknownKey": 1 }` 时，whoami 输出
+    // `{configured:true, source:"env", profile:"default", robots:[]}`，
+    // 图例却只说「空数组有两种成因」—— Agent 会得出「该档没配 robots」，
+    // 而真相是**配置根本没读成功**（那个档里可能配了 robots）。
+    ...(configError !== undefined ? { warnings: [`配置文件读取失败（${configError}），本次的 profile / robots 均按「文件不存在」处理`] } : {}),
     field_notes: {
       source: 'env = 两个字段都来自环境变量；file = 都来自配置文件；mixed = 各来自一处（合法组合）',
       profile: '本次解析出的配置档名。选择顺序：环境变量 QIYU_PROFILE > 配置文件里声明的默认档名 > '
@@ -387,7 +396,9 @@ function whoami(): number {
         + '它们按内置默认路径照常工作，不报错',
       robots: '来自配置文件的 profiles.<name>.robots 映射（robotId → 显示名），**未校验有效性**、' +
         '未与本地库比对；sync run 在 profiles.<name>.store.options.knowledgeRobotIds 缺席时回退使用它。'
-        + '⚠️ 空数组有两种成因：该档没配 robots，或该档在配置文件里根本不存在（见 profile 的说明）',
+        + '⚠️ 空数组有三种成因：该档没配 robots，该档在配置文件里根本不存在（见 profile 的说明），'
+        + '或**配置文件读取失败**（畸形 JSON / 未知键 / 权限不足）—— 第三种会在 meta.warnings 里'
+        + '点名，先读 warnings 再判断；把第三种读成「该档没配 robots」会让人去改一个没问题的档',
       configured: 'true 只表示"两个字段都有值"，**不代表**它们有效 —— 拼错的 appKey 同样返回 true',
     },
   })

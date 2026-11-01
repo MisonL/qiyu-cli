@@ -11,7 +11,6 @@ import { loadValidationOverrides } from '../core/registry/validation-overrides.j
 import { loadParams } from '../core/registry/params.js'
 import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/validate.js'
 import { ok, fail, usageFail, describeArgs, setPretty, EXIT } from '../output.js'
-import { sanitizeMessage } from '../core/sanitize.js'
 import { localFallbackFor } from './local-fallback.js'
 import { callFieldNotes } from './api-notes.js'
 import { GLOBAL_FLAGS, prettyAfterSubcommand, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
@@ -290,11 +289,22 @@ function list(argv: string[]): number {
       dangerous: 'true = 危险操作，调用时需 --yes',
       // ⚠️ direction 也必须解释 —— 它是 Agent 判断「我方能调它」还是「它回调我方」
       // 的唯一依据。只输出 `outbound`/`inbound` 两个英文词，Agent 无从知道哪个
-      // 是"我可以主动调用"，可能对着 inbound 的接口去拼 URL（那类接口路径是
-      // 占位符 `/`，拼出来必然 404）。与 verified/dangerous 同一条标准：只输出
-      // 不解释 = 没输出。
-      direction: 'outbound = 本方主动调用它；inbound = 对方向本方推送（不可主动调用，' +
-        '其 path 是占位符 `/`，拼 URL 必然失败）',
+      // 是"我可以主动调用"，可能对着 inbound 的接口去拼 URL。与 verified/dangerous
+      // 同一条标准：只输出不解释 = 没输出。
+      //
+      // ⚠️⚠️ 措辞**不能**说「inbound 的 path 是占位符 `/`」（2026-11-02 审查实测）：
+      // 那是全称断言，而 17 条 inbound 里 9 条是 `/`、**5 条有真实路径**
+      // （`get_token` `/get_token`、`get_order` `/get_order`、`get_user_info`
+      //  `/get_user_info`、`get_call_order` `/get_call_order`、`get_call_user_info`
+      //  `/get_call_user_info`，全部 `callable: false`）、3 条是 `null`（路径未收录）。
+      // 旧措辞会让 Agent 拿「path 是不是 `/`」当 inbound 的判据：看到 `/get_token`
+      // 就以为它可主动调用 —— 而它同样不可调用（这几条是**厂商推送给本方、由本方提供
+      // 的地址**，方向是入站）。真正的判据只有 `callable` 与 `direction` 两个字段。
+      direction: 'outbound = 本方主动调用它；inbound = 对方向本方推送（**一律不可主动调用**，'
+        + '以 direction 与 callable 为准）。⚠️ inbound 的 path **不保证**是占位符 `/`：'
+        + '多数（9/17）是占位符，另有若干是真实路径（如 `/get_token`）——那是厂商推送给'
+        + '本方时用的地址，`direction: inbound` 的那些即便有真实路径也不可主动调用；'
+        + '另有 3 条是 `null`（路径未收录，见 path 说明）。',
       callable: 'false = 结构上不可主动调用（如 inbound 推送）；Agent 只能查、不能调',
       // ⚠️ **`path` 的两种"不可用"必须区分**（2026-10-05 加）。`api list --all` 会输出
       // `path: null` 的行（`wecom.robot.switch` 的文档页 paths 键是中文散文、解析不出路径）。
@@ -759,14 +769,15 @@ function mapThrownToExit(e: unknown, spec?: EndpointSpec): number {
       ...(fallback !== undefined ? { fallback } : {}),
     })
   }
-  // 用法错误双通道：fail() 出 stdout JSON，同时手工补 stderr 一条（与 usageFail 的可见性一致）
-  // ⚠️ 必须在出口净化（架构审查 F3）：`api call <ESC 序列>` 曾把原始 ANSI/OSC 写进 stderr，
-  // 而 db/query 走 `usageFail` 的同款输入会变成 `·`。与 output.ts 的「净化在出口做一次」
-  // 是同一约定 —— 这是第三个手写出口，同样不能漏。
-  const raw = e instanceof Error ? e.message : String(e)
-  const message = sanitizeMessage(raw)
-  process.stderr.write(message.endsWith('\n') ? message : message + '\n')
-  return fail({ code: 'usage', kind: 'usage', retryable: false, message: message.replace(/\n+$/, ''), hint: err.hint })
+  // 用法错误走 `usageFail`（**唯一出口**，2026-11-02 收敛）。
+  // ⚠️ 这里曾是**手写的第三个出口**：自己净化、自己写 stderr、自己调 `fail()` ——
+  // 前两项与 `usageFail` 逐字重复（架构审查 F3 曾为此补过一次），第三项漏了它最重要的一条
+  // 契约：**用法错误永远是紧凑 JSON，即使 `--pretty` 已开启**（README「输出格式」/
+  // 设计稿 §11.2）。实测：`api call nosuchid --pretty` 与 `api call ticket.search --body '[]' --pretty`
+  // 都输出**缩进**的错误信封，而同一 exit 2 的 `api list extra --pretty`（走 usageFail）是紧凑的
+  // —— 同一退出码两种报文形态，而 Agent 会拿缩进当「格式化已生效」的证据。
+  // 那三条断言之所以没抓到：`tests/commands/api.test.ts` 只钉了走 `usageFail` 的那三条分支。
+  return usageFail(e instanceof Error ? e.message : String(e), err.hint)
 }
 
 /** `ParamSpec` 的浅复制 + `auto`：见 §三 `params` 说明。`auto` 只加给 query 里的鉴权参数。 */

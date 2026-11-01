@@ -282,6 +282,14 @@ describe('api list', () => {
     // 只输出 `outbound`/`inbound` 两个英文词，它无从知道哪个能主动调用，
     // 可能对着 inbound 接口拼 URL（那类 path 是占位符 `/`，必然 404）。
     expect(notes.direction, 'direction 必须解释 outbound 与 inbound 的差别').toMatch(/主动调用|推送/)
+    // ⚠️ 2026-11-02 审查实测：图例曾写「inbound … 其 path 是占位符 `/`」—— **全称断言**，
+    // 而 17 条 inbound 里 9 条是 `/`、**5 条有真实路径**（`get_token` `/get_token` 等，
+    // 全部 `callable: false`）。Agent 会拿「path 是不是 `/`」当 inbound 的判据，看到
+    // `/get_token` 就以为可主动调用。判据必须收窄，并点明真正的依据是 direction/callable。
+    expect(notes.direction, '不得把「path 是占位符 /」写成 inbound 的普遍性质')
+      .toMatch(/不保证|多数|并非全部/)
+    expect(notes.direction, '必须点明判据是 direction / callable 而不是 path 形态')
+      .toMatch(/callable/)
     expect(notes.callable, 'callable=false 的含义必须解释').toMatch(/不可主动调用|只能查/)
     // ⚠️ `dangerous` 的说明**此前零断言**（2026-10-05 补）。七个 field_notes 里
     // 其余六个各有一条断言，唯独这条没有 —— 变异测试确认：把
@@ -1414,6 +1422,13 @@ describe('api call —— 危险操作门禁', () => {
       ['api schema 缺 id', ['schema', '--pretty']],
       ['api call 缺 id', ['call', '--pretty']],
       ['api list 位置参数', ['list', 'extra', '--pretty']],
+      // ⚠️ 下面两条是 2026-11-02 审查补的缺口：**抛异常**的用法错误走
+      // `mapThrownToExit`（当时是手写的第三个出口），它自己调 `fail()` 而**没经过
+      // `usageFail` 的「强制紧凑」那一步** —— 上面三条全走 `usageFail`，所以
+      // 这一族漏在外面（实测 `api call nosuchid --pretty` 输出缩进信封）。
+      // 现在 `mapThrownToExit` 的用法分支改为 `return usageFail(...)`。
+      ['api call 未知 id（抛异常路径）', ['call', 'nosuchid', '--pretty']],
+      ['api schema 未知 id（抛异常路径）', ['schema', 'nosuchid', '--pretty']],
     ] as const) {
       out = ''; err = ''
       expect(await apiCommand([...argv]), label).toBe(2)

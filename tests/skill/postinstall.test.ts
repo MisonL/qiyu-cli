@@ -21,6 +21,7 @@ import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runPostinstall, mainEntry, isEntry } from '../../src/postinstall.js'
 import { defaultEntityDir } from '../../src/skill/paths.js'
+import { installSkill } from '../../src/skill/install.js'
 import { npmRelativeBase, resolveEntityDirSources } from '../../src/skill/detect.js'
 
 let home: string
@@ -150,6 +151,46 @@ describe('runPostinstall', () => {
     // 第二次什么都不写（installSkill 的幂等命中），文件集合不变。
     expect(readdirSync(entityDir).sort()).toEqual(before)
     expect(installed(entityDir)).toBe(true)
+  })
+
+  it('⚠️ 正文被改动后重跑：说「未完成更新」而不是「已是最新」（2026-11-02 审查实测）', async () => {
+    // 旧判据是 `status === 'skipped' && plannedStatus === 'skipped'`，而 `planInstall` 的
+    // `skipped` 有**四种**含义 —— 其中「内容不同且未加 --force」零写入，`plannedStatus`
+    // 同样是 skipped，于是被判成「已是最新」，**紧接着下一行又打印「内容与包内不同，未覆盖」**，
+    // 同一进程两行自相矛盾（实测复现）。现在判据是 `result.upToDate`。
+    const sourceDir = makeSource()
+    const env = { npm_config_global: 'true', npm_command: 'install' }
+    await expect(runPostinstall({ env, home, sourceDir })).resolves.toBe(0)
+    const entityDir = defaultEntityDir(home)
+    // 手工改动正文（模拟用户改过 skill）
+    writeFileSync(join(entityDir, 'SKILL.md'), '# qiyu（我改过）\n')
+    const messages: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages.push(String(chunk))
+      return true
+    })
+    try {
+      await expect(runPostinstall({ env, home, sourceDir })).resolves.toBe(0)
+    } finally {
+      spy.mockRestore()
+    }
+    const all = messages.join('')
+    expect(all, '正文与包内不同时不得说「已是最新」').not.toContain('已是最新')
+    expect(all, '应当说「未完成更新」').toContain('未完成更新')
+    // 反方向：真幂等（正文与清单都是包内那份）仍说「已是最新」—— 判据不能一刀切
+    const messages2: string[] = []
+    const spy2 = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      messages2.push(String(chunk))
+      return true
+    })
+    try {
+      // 先把实体恢复成包内内容（重新装一次并 --force 覆盖）
+      await installSkill({ home, sourceDir, version: '0.0.0-dev', force: true })
+      await runPostinstall({ env, home, sourceDir })
+    } finally {
+      spy2.mockRestore()
+    }
+    expect(messages2.join(''), '真幂等仍须说「已是最新」').toContain('已是最新')
   })
 
   it('补 ③：npm_command=exec 即便 global=true 也不安装（npx 判据优先）', async () => {
