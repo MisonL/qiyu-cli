@@ -393,6 +393,17 @@ describe('call', () => {
       expect(err.hint, '危险接口 5xx 仍在对 Agent 说「退避重试」').toMatch(/不会.*重试/)
       expect(err.hint).toMatch(/确认当前状态/)
     }
+    // ⚠️ Spring JSON 载体还要过 redact（CodeRabbit PR #58）：`Object.assign` 右覆盖左，
+    // 把 message 写在 Error 构造参数里会被 `err.message` 原样冲掉 —— 服务端回显的
+    // appKey/checksum 就跟着进 stdout。这里直接让报文带上凭证。
+    fetchMock.mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+      timestamp: '2026-01-01T00:00:00Z', status: 503, error: 'Service Unavailable',
+      message: 'upstream failed, appKey=k secret=s', path: '/openapi/x',
+    }), { status: 503, headers: { 'content-type': 'application/json' } })))
+    const leak = await call(byId('message.send'), { uid: 1 }, { credentials: CREDS }).catch((e) => e)
+    expect(leak.message).not.toContain('secret=s')
+    expect(leak.message).not.toContain('appKey=k')
+    expect(leak.hint).toMatch(/不会.*重试/)
   })
 
   it('读接口的瞬时 5xx 走 core 的重试预算（HTML 与 Spring JSON 两种载体）', async () => {

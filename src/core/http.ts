@@ -424,9 +424,13 @@ export async function call(
       // 故障的两种载体**，此前只有 HTML 载体被收窄，Spring 载体的 `message.send` 仍收到
       // 「服务端/网关瞬时故障，请退避后重试」—— Agent 照着重试就是二次执行。
       // 只改 hint/文案，`retryable` 仍为 true（由 Agent 决定是否重新确认，与其它三支一致）。
+      // ⚠️ message 必须放在**最后**并过 `redact`（CodeRabbit PR #58）：`Object.assign`
+      // 右覆盖左，写成 `Object.assign(new Error(文案), err)` 会让 `err.message`（含原始
+      // 凭证回显）把文案和脱敏结果一起冲掉 —— 与下面通用出口同一条坑。
       if (spec.dangerous && err.kind === 'network') {
-        throw Object.assign(new Error(`${err.message}（${DANGEROUS_NETWORK_HINT}）`),
-          err, { hint: DANGEROUS_NETWORK_HINT })
+        throw Object.assign(new Error(), err, {
+          message: redact(err.message, creds), hint: DANGEROUS_NETWORK_HINT,
+        })
       }
       // 冷却秒数由**限频表**决定，不由分派器猜 —— 实测冷却随接口变化
       const limit = limitForSpec(spec)
