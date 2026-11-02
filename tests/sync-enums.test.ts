@@ -98,23 +98,35 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
   // （`reason: string`），扩展表达式让整个返回值的 contextual type 消失，tsc 不再校验该字面量
   // 与 `TaskGapReason` 的关系（实测：把该 reason 改成 `12345`，`npm run typecheck` 仍 0 error；
   // 同一文件里改成 `rows: 123` 立刻报错）。所以枚举完整性只能靠静态扫描源码字面量来钉。
-  it('任务层源码里的每个 gapHint.reason 字面量都在枚举里', () => {
+  it('任务层源码里的每个 gapHint.reason 字面量都是**任务层**枚举值（不是引擎侧的）', () => {
     const dir = fileURLToPath(new URL('../src/sync/tasks/', import.meta.url))
     const hits: Array<{ file: string; reason: string }> = []
     for (const f of readdirSync(dir)) {
       if (!f.endsWith('.ts')) continue
       const src = readFileSync(`${dir}${f}`, 'utf8')
-      for (const m of src.matchAll(/reason:\s*'([a-z_]+)'/g)) hits.push({ file: f, reason: m[1] })
+      // 单引号与双引号都要收（CodeRabbit 2026-11-02）：只认单引号时，任务层写
+      // `reason: "unknown"` 会被整条漏掉，而既有命中仍能满足下面的下限断言 → 判据静默失效。
+      for (const m of src.matchAll(/reason:\s*(['"])([a-z_]+)\1/g)) hits.push({ file: f, reason: m[2] })
     }
     // 判据不能在空集合上恒真：dim / knowledge / reports / sessions 各至少一处
     expect(hits.length, '没扫到任何 reason 字面量 —— 扫描判据退化了').toBeGreaterThanOrEqual(4)
-    const known = new Set(GAP_REASONS)
+    // 判据收的是 `TASK_GAP_REASONS` 而不是 `GAP_REASONS`（CodeRabbit 2026-11-02）：
+    // 任务层写 `reason: 'fetch_failed'` 能让**成功窗**的提示长出引擎失败语义 ——
+    // 它属于 `ENGINE_GAP_REASONS`，用并集核对会放行（实测：改成 fetch_failed 后本测试仍全绿）。
+    const taskKnown = new Set<string>(TASK_GAP_REASONS)
+    const engineKnown = new Set<string>(ENGINE_GAP_REASONS)
     for (const h of hits) {
-      expect(known.has(h.reason), `${h.file} 产出了枚举外的 reason「${h.reason}」：`
+      expect(engineKnown.has(h.reason), `${h.file} 的 gapHint 用了引擎侧 reason「${h.reason}」：`
+        + '成功窗提示与失败缺口必须可分派，任务层只能用 TASK_GAP_REASONS').toBe(false)
+      expect(taskKnown.has(h.reason), `${h.file} 产出了 TASK_GAP_REASONS 之外的值「${h.reason}」：`
         + '先加进 TASK_GAP_REASONS 并补 README 图例与 skill 文案').toBe(true)
     }
-    // 变异自检：枚举外的形态必须被判据拒掉（防退化恒绿）
-    expect(known.has('zzz_not_a_reason')).toBe(false)
+    // 变异自检：两种「该判据必须拒掉」的形态都要真的被拒（防退化恒绿）
+    expect(taskKnown.has('zzz_not_a_reason')).toBe(false)
+    expect(engineKnown.has('fetch_failed')).toBe(true)
+    // 双引号扫描自检：合成的双引号形态必须被上面那条正则捕获
+    const probe = [...`reason: "zzz_dq"`.matchAll(/reason:\s*(['"])([a-z_]+)\1/g)]
+    expect(probe.map((m) => m[2])).toEqual(['zzz_dq'])
   })
 
   it('skill 协议不得把 sync verify 说成两类任务都与远端核对（CodeRabbit 2026-10-27）', () => {
