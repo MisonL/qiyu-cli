@@ -16,7 +16,7 @@ import type { RunStatus } from '../sync/types.js'
 // 值导入（不是 type）：业务提示类的 reason 名要**逐名**渲染进图例 ——
 // 位置指代（「后四个」）依赖 README 图例表的排列，而那个排列没有守卫（见下方注释）。
 // `sync/types.js` 是纯常量 + 类型模块，无副作用、不引入环。
-import { TASK_GAP_REASONS } from '../sync/types.js'
+import { TASK_GAP_LOSSY_REASONS, TASK_GAP_REASONS } from '../sync/types.js'
 import type { RangeStatusValue } from '../sync/state.js'
 
 /** 渲染成 `a = 释义；b = 释义` —— field_notes 的单元格形态（与 api list / skill where 同款）。 */
@@ -136,7 +136,12 @@ export function runFieldNotes(): Record<string, string> {
       // 排列顺序，而图的顺序**没有**任何守卫（`sync-enums.test.ts` 双向核对用
       // `sort()`，允许重排）；且 Agent 读的是 run 输出，手里未必有那张表 ——
       // 「后四个」在它那里无法解析。名字从 `TASK_GAP_REASONS` 渲染，加了值也同步。
-      + TASK_GAP_REASONS.join(' / ') + ' 这些是成功窗上的业务提示（窗口数据照常提交）',
+      + TASK_GAP_REASONS.join(' / ') + ' 这些是成功窗上的业务提示（窗口数据照常提交）。'
+      // ⚠️ 2026-11-02 审查：「提示」不等于「数据没缺」——把两档合并成一句会让 Agent
+      // 低估 `knowledge_row_malformed` / `staff_id_list_malformed`（这些行**确实没落库**，
+      // 必须核对上游形态）。丢失档从 `TASK_GAP_LOSSY_REASONS` 渲染，与 README/skill 同源。
+      + `其中 ${TASK_GAP_LOSSY_REASONS.join(' / ')} 描述的行确实没落库（detail 是丢失规模，`
+      + '报告人类核对接口形态）；其余可能只是筛选没命中或空窗本来为空，未必缺数据',
     'tasks[].gaps[].range': '本命令的缺口区间已格式化成 `+08:00` ISO（与 resolved_range 同一套时间解析）。'
       + '⚠️ `sync status` 的同名字段不是这个形态：那边原样回显 `sync_gaps` 的 epoch 毫秒字符串'
       + '（引擎落库的存储值）—— 跨命令比较缺口区间前先统一形态',

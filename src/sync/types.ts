@@ -73,15 +73,40 @@ export type WriteStrategy =
  * 与失败类缺口的区别：这些是**成功窗上的提示** —— 窗口数据照常提交，`gaps` 非空
  * 不等于同步失败。此前类型是 `string`、引擎用 `as WindowGapReason` 强转，把
  * 「类型只声明四个」的谎报压了下去（2026-10-27 修）。
+ *
+ * ⚠️⚠️ 「提示」**不等于**「数据没缺」——这一族里有两档，消费方的动作不同，
+ * 合并成一句「数据未必缺」是误导（2026-11-02 审查）：
+ *   · **确实没落库**（`TASK_GAP_LOSSY_REASONS`）：描述的行/成员**真的没进库**，
+ *     `detail` 是丢失规模，必须核对上游形态；
+ *   · **未必缺数据**（其余）：可能只是筛选没命中、或空窗本来就空，按 `detail` 判断。
+ * 两档在 README 图例段有各自的一句话，`tests/sync-enums.test.ts` 双向核对
+ * （常量改了而 README 没改 → 红）。
  */
 export const TASK_GAP_REASONS = [
   'knowledge_row_malformed',    // 快照映射时缺键列的行被丢弃（响应形态漂移）
-  'staff_id_list_malformed',    // staffIdList 非数组/成员 id 为空，该组成员未落库（响应形态漂移）
+  'staff_id_list_malformed',    // staffIdList 非数组（整组）或成员 id 为空（该成员）→ 这些成员未落库
   'filter_matched_no_staff',    // 报表筛选条件未命中任何客服（本窗按 0 行记）
   'export_fixture_unreported',  // 导出流未上报窗口声明行（空窗可能真空也可能被截断）
   'export_window_mismatch',     // 导出声明的窗口宽于请求（重叠行幂等吸收）
 ] as const
 export type TaskGapReason = typeof TASK_GAP_REASONS[number]
+
+/**
+ * `TASK_GAP_REASONS` 里「**描述的行确实没落库**」的那一档（其余是「未必缺数据」的提示）。
+ *
+ * 判据是任务层对行的处理：`knowledge_row_malformed` 丢弃缺键列的行、
+ * `staff_id_list_malformed` 丢弃整组（非数组时）或空 id 成员 —— 这些行不会以任何
+ * 形式进库；而 `filter_matched_no_staff`（上游本就没命中）、
+ * `export_window_mismatch`（重叠行被幂等 upsert 吸收，数据在库里）都不属于这一档，
+ * `export_fixture_unreported` 是「该不该有行」尚不可知，同样不在这一档。
+ *
+ * `tests/sync-enums.test.ts` 钉住它与 `TASK_GAP_REASONS` 的关系是**真划分**
+ * （非空、真子集），并核对 README 两档文案与它一致 —— 单一出处，不得在别处重抄一份。
+ */
+export const TASK_GAP_LOSSY_REASONS = [
+  'knowledge_row_malformed',
+  'staff_id_list_malformed',
+] as const
 
 /** fetch 结果：rows 是未 enrich 的原始行；apiCount 是 API 侧声称的行数（配对核对基准）。 */
 export interface FetchResult {

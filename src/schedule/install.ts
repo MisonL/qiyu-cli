@@ -177,7 +177,34 @@ function runArgs(exec: string[], storeArgs: string[] = []): string[] {
   return [...exec, 'sync', 'run', ...storeArgs]
 }
 
-/** launchd 单键的 XML：单值 <integer>，多值 <array>。 */
+/**
+ * systemd unit 行里的参数渲染：先按 systemd 的**字面量规则**转义，再做引号。
+ *
+ * ⚠️ `ExecStart=` 不是 shell，但它在交给程序之前自己会做三轮替换（官方文档原文）：
+ *   ① `\` 是 C 转义（systemd.syntax(7)「Each command line is unquoted using the rules
+ *      described in Quoting…」「In particular, any backslashes should be doubled」；
+ *      该表把 `\\` 映射成字面 `\`，且**引号内外都解析**——文档没有为单/双引号分别规定）
+ *      → 字面 `\` 必须写 `\\`，否则 `\b` 会被解成退格、行尾 `\` 还会**续行**；
+ *   ② `%` 是指令说明符（systemd.service(5)「The command line accepts "%" specifiers as
+ *      described in systemd.unit(5)」）→ 字面 `%` 必须写 `%%`；
+ *   ③ `$` 会做环境变量替换（systemd.service(5)「to pass a literal dollar sign, use "$$"」）。
+ *
+ * 所以 `--db /tmp/a%b.db` 会被替换成 boot id、`--db /tmp/$HOME/q.db` 会被展开成别处、
+ * `--db 'C:\x\q.db'` 会被吃掉反斜杠 —— 与 crontab 的 `%` 是同一族缺陷的不同载体
+ * （本轮 Sourcery 只点了 crontab，这里把三种字面字符一并收）。良性值（不含
+ * `\`/`%`/`$`）逐字不变，故既有条目形态零漂移。
+ *
+ * ⚠️ 未覆盖边界：本机是 darwin，无 systemd 可端到端实测；上述三条转义依据官方文档，
+ * 未在真实 unit 上验证「引号内 `$$`/`%%` 是否同样折叠」。转义只影响含这三个字符的值
+ * （此前这些值本来就必错），不含它们时是恒等变换。
+ */
+function systemdArg(v: string): string {
+  // ⚠️ 必须用**函数式替换**：替换串里的 `$` 有特殊含义（`$$` → 字面 `$`、`$&` 等），
+  // 写 `v.replace(/\$/g, '$$')` 实测产出**一个** `$`（转义被自身吃掉）。函数返回值
+  // 不做这种解析。
+  return shellQuote(v.replace(/\\/g, () => '\\\\').replace(/%/g, () => '%%').replace(/\$/g, () => '$$'))
+}
+
 function launchdKey(key: string, f: CronField): string {
   const value = f.values.length === 1
     ? `<integer>${f.values[0]}</integer>`
@@ -301,16 +328,51 @@ function unmappable(): Error {
 }
 
 /**
- * crontab 兜底行：**给人手工复制执行的 POSIX shell 行**（cron 以 `/bin/sh -c` 执行它），
- * 所以参数走 `output.ts` 的 `shellArg`（shlex.quote 同一安全集，POSIX 单引号方言）。
+ * crontab 兜底行：**给人手工复制执行的 POSIX shell 行**（cron 以 `/bin/sh -c` 执行它）。
  *
- * ⚠️ 2026-11-02 审查：此前这里用本文件的 `shellQuote`（只把空白与 `"` 视作需引号），
- * `--db /tmp/q$(id).db` 这类值会**裸着**印进兜底行 —— 复制进 shell 时 `$(id)` 真的执行。
- * 同一契约两个实现点：全仓其余 POSIX 渲染都走 `shellArg`。
- * `shellQuote` 保留给 ExecStart / schtasks 这类**不经 shell** 的消费方（那边是双引号方言）。
+ * 两层转义、顺序不能反（crontab(5) 原文核实）：
+ *   ① 先 `shellArg`（shlex.quote 同一安全集，POSIX 单引号方言）—— 挡 `$()`/空白/引号；
+ *   ② 再把 `%` 转义成 `\%` —— **cron 在交给 sh 之前**就处理 `%`：原文「The entire command
+ *      portion of the line, up to a newline or % character, will be executed … Percent-signs (%),
+ *      unless escaped with backslash (\), will be changed into newline characters, and all data
+ *      after the first % will be sent to the command as standard input」。所以单引号挡不住它 ——
+ *      `--db /tmp/a%b.db` 会让 cron 执行 `--db /tmp/a`、把 `b.db` 当 stdin，**静默跑错库**。
+ *      实测（2026-11-02）：修前该值裸着印在兜底行里。
+ *
+ * ⚠️ 未覆盖边界：值里**同时**含 `\` 与 `%` 时不保证（cron 对 `\\` 的处理本机无法实测，
+ * 只核实了文档写明的 `\%` 一条规则）。这类路径极罕见，如实记在这里、不假装已覆盖。
+ * ⚠️ 换行/回车在任何情况下都拒绝（见 `assertSchedulable`）：逐行格式放不下它。
+ *
+ * `shellQuote`（本文件）保留给**不经 shell 也不做替换**的消费方：launchd 的 plist 走
+ * `xmlEscape`；schtasks 的 `/TR` 存的是任务动作，由 Task Scheduler 直接 CreateProcess
+ * （不经 cmd.exe，`$`/`%` 不展开 —— 依据其执行模型推断，本机 darwin 未能实测）。
+ * ExecStart 另有 `systemdArg`（`shellQuote` + systemd 自己的 `%%`/`$$` 转义）。
  */
+function crontabArg(v: string): string {
+  return shellArg(v, 'linux').replace(/%/g, '\\%')
+}
+
 function crontabLine(schedule: string, exec: string[], storeArgs: string[] = []): string {
-  return `${schedule} ${runArgs(exec, storeArgs).map((s) => shellArg(s, 'linux')).join(' ')}`
+  return `${schedule} ${runArgs(exec, storeArgs).map(crontabArg).join(' ')}`
+}
+
+/**
+ * 调度条目放不下 CR/LF —— 显式拒绝，绝不装出一条含义不同的条目。
+ *
+ * 三种载体里 systemd unit 与 crontab 行都是**逐行格式**：值里的换行会把一条条目劈成
+ * 两条（实测 crontab 兜底行：`--db '/tmp/a\n0 0 * * * touch /tmp/x\nb.db'` 变成三个物理
+ * 行，中间那行是一条**真的 cron 计划**）。系统调度器装出来的东西会以安装者身份执行，
+ * 所以这里按「不可表达」处理而不是替用户猜测/清洗。launchd 的 plist 技术上能承载换行，
+ * 但同一份参数在三平台的形态应当一致（且这种路径无实际意义），故三平台统一拒绝。
+ */
+function assertSchedulable(run: string[]): void {
+  for (const v of run) {
+    if (/[\r\n]/.test(v)) {
+      throw usageError(`调度条目的参数不能含换行或回车（${describeArgs([v])}）：`
+        + 'systemd unit 与 crontab 行是逐行格式，换行会把一条条目拆成两条、'
+        + '后半段会成为一条独立的计划。请改用不含换行的路径')
+    }
+  }
 }
 
 /**
@@ -324,6 +386,7 @@ export function planInstall(platform: Platform, schedule: string,
   opts: { home: string; exec: string[]; storeArgs?: string[] }): InstallPlan {
   const spec = parseCron(schedule)
   const run = runArgs(opts.exec, opts.storeArgs ?? [])
+  assertSchedulable(run)
 
   if (platform === 'darwin') {
     const dir = `${opts.home}/Library/LaunchAgents`
@@ -356,7 +419,7 @@ export function planInstall(platform: Platform, schedule: string,
     const dir = `${opts.home}/.config/systemd/user`
     const servicePath = `${dir}/${SYSTEMD_NAMES.service}`
     const timerPath = `${dir}/${SYSTEMD_NAMES.timer}`
-    const execLine = run.map(shellQuote).join(' ')
+    const execLine = run.map(systemdArg).join(' ')
     const onCalendar = systemdOnCalendar(spec)
     const service = `[Unit]
 Description=七鱼数据同步（qiyu sync run）

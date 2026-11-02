@@ -161,8 +161,66 @@ describe('planInstall linux —— systemd unit + timer（crontab 兜底在 note
     // 反向：安全集内的路径不加多余引号（挡住「一律套引号」的过度修法）
     const benign = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/q.db'] })
     expect(benign.notes.find((n) => n.includes('crontab'))!).toContain('sync run --db /tmp/q.db')
-    // 未覆盖边界：ExecStart 由 systemd 直接解析 argv（不经 shell），本轮未在 linux 上实测
-    // systemd 自身的 `$` 展开行为，故此处不复现也不修改它的双引号渲染。
+  })
+
+  // ⚠️ 2026-11-02（Sourcery）：cron **在交给 sh 之前**自己处理 `%`（crontab(5) 原文：
+  // 「Percent-signs (%), unless escaped with backslash (\), will be changed into newline
+  // characters, and all data after the first % will be sent to the command as standard
+  // input」）—— 单引号挡不住它，因为这一层替换发生在 sh 之前。实测修前
+  // `--db /tmp/a%b.db` 裸着落在兜底行里：照抄执行会跑 `--db /tmp/a`、`b.db` 变 stdin，
+  // **静默跑错库**。注意 `%` 也在 `shellArg` 的 POSIX 安全集里，所以这条只有 `\%` 能挡。
+  it('crontab 兜底行把 % 转义成 \\%：cron 在 sh 之前就把裸 % 换成换行 + stdin', () => {
+    const p = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/a%b.db'] })
+    const note = p.notes.find((n) => n.includes('crontab'))!
+    expect(note).toContain('--db /tmp/a\\%b.db')
+    // 反向：不含 `%` 的值不得被改动（挡住「一律加反斜杠」的过度修法，也钉住
+    // 「`%` 就在 shellArg 安全集里、原本是裸的」这一事实）
+    const benign = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/q.db'] })
+    expect(benign.notes.find((n) => n.includes('crontab'))!).toContain('--db /tmp/q.db')
+    expect(benign.notes.find((n) => n.includes('crontab'))!).not.toContain('\\%')
+  })
+
+  // ⚠️ 2026-11-02：三个载体里 systemd unit 与 crontab 行都是**逐行格式**，值里的换行会把
+  // 一条条目劈成两条 —— crontab 兜底行实测会变成 3 个物理行，中间那行是一条**真的 cron
+  // 计划**，以安装者身份执行。系统调度器装出来的东西不该由用户输入决定，所以显式拒绝。
+  it('参数含换行/回车 → 三个平台都拒绝安装（逐行格式会被劈成两条条目）', () => {
+    for (const platform of ['darwin', 'linux', 'win32'] as const) {
+      for (const v of ['/tmp/a\n0 0 * * * touch /tmp/x\nb.db', '/tmp/c\rd.db']) {
+        expect(() => planInstall(platform, '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', v] }),
+          `${platform} 必须拒绝含换行的参数`).toThrow(/不能含换行或回车/)
+      }
+      // 反向：同一位置放良性值必须照常生成（挡住「一律拒绝 storeArgs」的过度修法）
+      expect(planInstall(platform, '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/q.db'] }).commands.length)
+        .toBeGreaterThan(0)
+    }
+  })
+
+  // ⚠️ 2026-11-02：`ExecStart=` **不是 shell**，但 systemd 自己在把 argv 交给程序前做三轮
+  // 替换（官方文档原文）：`\` 是 C 转义（systemd.syntax(7)「any backslashes should be
+  // doubled」，引号内外都解析）、`%` 是指令说明符（systemd.service(5)）、`$` 会做环境变量
+  // 替换（「to pass a literal dollar sign, use "$$"」）。与 crontab 的 `%` 是同一族缺陷的
+  // 不同载体 —— 只修 crontab 会漏掉它。含 `\` 的路径在 Windows 上极常见（本轮修的是渲染，
+  // 不是平台支持）。
+  it('systemd ExecStart 转义字面 % 与 $（否则被 systemd 自己替换成 boot id / 环境变量）', () => {
+    const p = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/a%b$HOME%c.db'] })
+    const svc = p.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!
+    expect(svc.content).toContain('ExecStart=/usr/local/bin/node /opt/qiyu/cli.js sync run --db /tmp/a%%b$$HOME%%c.db')
+    // 反向：良性值逐字不变（既有条目的形态零漂移）
+    const benign = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/q.db'] })
+    expect(benign.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!.content)
+      .toContain('ExecStart=/usr/local/bin/node /opt/qiyu/cli.js sync run --db /tmp/q.db')
+  })
+
+  it('systemd ExecStart 把字面反斜杠写成 \\\\：未成对的反斜杠会被 C 转义吃掉/续行', () => {
+    // `C:\qiyu` 里的 `\q` 不是合法转义序列 —— systemd 会告警并按未知转义处理；
+    // `C:\tmp\` 行尾反斜杠更糟：systemd.syntax(7) 说它「may be used to merge lines」。
+    const p = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', 'C:\\tmp\\q.db'] })
+    const svc = p.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!
+    expect(svc.content).toContain('--db C:\\\\tmp\\\\q.db')
+    // 单引号包住的值同样要转义（systemd 不给单引号「禁止转义」的特权）
+    const spaced = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', 'C:\\a b\\q.db'] })
+    expect(spaced.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!.content)
+      .toContain('--db "C:\\\\a b\\\\q.db"')
   })
 })
 

@@ -15,7 +15,7 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { ENGINE_GAP_REASONS } from '../src/sync/engine.js'
-import { TASK_GAP_REASONS } from '../src/sync/types.js'
+import { TASK_GAP_LOSSY_REASONS, TASK_GAP_REASONS } from '../src/sync/types.js'
 import { DRIFT_KINDS } from '../src/commands/sync.js'
 
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(`../${rel}`, import.meta.url)), 'utf8')
@@ -56,7 +56,7 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
   })
 
   it('图例里没有源码不存在的 gap reason（删值必须同步删图例）', () => {
-    const rows = [...gapLegendSection().matchAll(/^\| `([a-z_]+)` \|/gm)].map((m) => m[1])
+    const rows = [...gapLegendSection().matchAll(/^\| `([a-z0-9_]+)` \|/gm)].map((m) => m[1])
     expect(rows.sort()).toEqual([...GAP_REASONS].sort())
   })
 
@@ -65,7 +65,7 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
   })
 
   it('drift 图例段里没有源码不存在的 kind', () => {
-    const mentioned = [...driftLegendSection().matchAll(/`([a-z_]+)`/g)].map((m) => m[1])
+    const mentioned = [...driftLegendSection().matchAll(/`([a-z0-9_]+)`/g)].map((m) => m[1])
     // 段内的反引号值只应是 kind 名（该段是纯枚举释义，没有其它代码标识符）
     for (const k of mentioned) expect(DRIFT_KINDS as readonly string[], k).toContain(k)
   })
@@ -106,7 +106,11 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
       const src = readFileSync(`${dir}${f}`, 'utf8')
       // 单引号与双引号都要收（CodeRabbit 2026-11-02）：只认单引号时，任务层写
       // `reason: "unknown"` 会被整条漏掉，而既有命中仍能满足下面的下限断言 → 判据静默失效。
-      for (const m of src.matchAll(/reason:\s*(['"])([a-z_]+)\1/g)) hits.push({ file: f, reason: m[2] })
+      // 字符集必须含数字（CodeRabbit 2026-11-02 第二轮）：写成 `[a-z_]+` 时
+      // `reason: 'v2_bad_reason'` 整条不匹配，而其余文件**照样满足** `>= 4` 的下限 ——
+      // 判据静默放行。枚举值里出现数字完全正常（`export_window_mismatch` 的同族命名），
+      // 判据不该靠「值里没有数字」这条未声明的隐含假设成立。
+      for (const m of src.matchAll(/reason:\s*(['"])([a-z0-9_]+)\1/g)) hits.push({ file: f, reason: m[2] })
     }
     // 判据不能在空集合上恒真：dim / knowledge / reports / sessions 各至少一处
     expect(hits.length, '没扫到任何 reason 字面量 —— 扫描判据退化了').toBeGreaterThanOrEqual(4)
@@ -125,8 +129,44 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
     expect(taskKnown.has('zzz_not_a_reason')).toBe(false)
     expect(engineKnown.has('fetch_failed')).toBe(true)
     // 双引号扫描自检：合成的双引号形态必须被上面那条正则捕获
-    const probe = [...`reason: "zzz_dq"`.matchAll(/reason:\s*(['"])([a-z_]+)\1/g)]
+    const probe = [...`reason: "zzz_dq"`.matchAll(/reason:\s*(['"])([a-z0-9_]+)\1/g)]
     expect(probe.map((m) => m[2])).toEqual(['zzz_dq'])
+    // 数字后缀扫描自检（CodeRabbit 2026-11-02 第二轮）：`[a-z_]+` 会整条漏掉带数字的值，
+    // 而别处的命中照样满足下限 —— 扫描判据必须自己证明这一形态被收进来。
+    const probeDigit = [...`reason: 'v2_bad_reason'`.matchAll(/reason:\s*(['"])([a-z0-9_]+)\1/g)]
+    expect(probeDigit.map((m) => m[2]), '带数字的枚举值必须被扫到，否则判据靠隐含假设成立')
+      .toEqual(['v2_bad_reason'])
+  })
+
+  // 2026-11-02 审查（Sourcery + 独立 agent）：「成功窗上的提示」这一句把两种相反的实况
+  // 合并成了一档 —— `knowledge_row_malformed` 的行**真的没落库**，而
+  // `filter_matched_no_staff` 只是筛选没命中（可能一行都不该有）。前者必须核对上游形态、
+  // 后者不必，Agent 按同一句话处理会低估前者。修法是把「确实没落库」的那一档单独声明，
+  // 三处文案（README 图例段 / skill 协议 / sync-notes）都从这一个常量说话。
+  it('「确实没落库」的那一档是真划分，且三处文案与常量一致（不得各写一套）', () => {
+    const all = new Set<string>(TASK_GAP_REASONS)
+    const lossy = new Set<string>(TASK_GAP_LOSSY_REASONS)
+    // 判据不能在空集/全集上恒真：非空、是真子集（否则「两档」退化成一句空话）
+    expect(lossy.size, 'lossy 档不能为空').toBeGreaterThan(0)
+    expect(lossy.size, 'lossy 档必须是真子集（否则「两档」= 一句话）').toBeLessThan(all.size)
+    for (const r of lossy) expect(all.has(r), `${r} 不在 TASK_GAP_REASONS 里`).toBe(true)
+    // 反向：`filter_matched_no_staff` 恰恰是**不该**进 lossy 档的那个（上游本就没命中）
+    expect(lossy.has('filter_matched_no_staff'), '筛选未命中不是「数据丢了」，不该进 lossy 档').toBe(false)
+
+    // README：lossy 档逐名点出「确实没落库」，另一档点出「未必缺数据」
+    const legend = gapLegendSection()
+    expect(legend, 'README 必须点明这一档「确实没落库」').toMatch(/确实没落库|真的没进库/)
+    expect(legend, 'README 必须点明另一档「未必缺数据」').toMatch(/未必缺数据/)
+    // skill 协议（Agent 主入口）：两档都必须落地，否则 Agent 只拿到「提示」这个粗档
+    const p = read('src/skill/qiyu/protocols.md')
+    expect(p, '协议必须保留「成功窗上的提示」这一层').toMatch(/成功窗上的提示/)
+    expect(p, '协议必须分开写「确实没落库」那一档').toMatch(/确实没落库/)
+    expect(p, '协议必须分开写「未必缺数据」那一档').toMatch(/未必缺数据/)
+    // sync-notes 的 run 图例：同一口径（Agent 手里最常有的就是这行）
+    expect(read('src/commands/sync-notes.ts'), 'run 图例不能只说「提示」而不说数据是否缺')
+      .toMatch(/确实没落库/)
+    // 变异自检：上面这些正则要真的能命中「写错的那一版」——把两档合并成一句的旧文案
+    expect('这些是成功窗上的业务提示（数据未必缺，按 detail 判断）').not.toMatch(/确实没落库/)
   })
 
   it('skill 协议不得把 sync verify 说成两类任务都与远端核对（CodeRabbit 2026-10-27）', () => {

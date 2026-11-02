@@ -147,8 +147,52 @@
     `--db /tmp/q$(id).db` 会**裸着**印出来，粘进 shell 时 `$(id)` 真的执行。改走 `output.ts` 的
     `shellArg`（shlex.quote 同一安全集、POSIX 方言），同一契约不再有两个实现点；测试双向钉住
     （含 `$()`/空白的路径必须被单引号包住，安全集内的路径不得多套引号）。`ExecStart` 与 schtasks
-    不经 shell（systemd 直接 execve、schtasks 收单个 `/TR` 字符串），保持原有双引号渲染，
-    并如实注明「systemd 自身的 `$` 展开未在 linux 上实测」。
+    不经 shell；schtasks 收单个 `/TR` 字符串、由计划程序直接 CreateProcess，保持原有双引号渲染。
+
+- **同一族缺陷的另外两个载体 + 一处文案分档（Sourcery 复审与独立 agent 第五轮，2026-11-02）**。
+  Sourcery 只点了 crontab 的 `%`；顺着「同一转义契约在多个载体各写一套」这条往下查，
+  同一份参数实际有**四个载体**（plist XML / systemd ExecStart / crontab 行 / schtasks `/TR`），
+  逐个体检后确认另外两个也各错一处：
+
+  · **`ExecStart` 的 `%` 与 `$` 会被 systemd 自己替换掉**。它不是 shell，但官方文档写明它在
+    把 argv 交给程序前做替换：systemd.unit(5)「`%` specifiers…Use "%%" in place of "%"」、
+    systemd.service(5)「to pass a literal dollar sign, use "$$"」；本轮再核 systemd.syntax(7)
+    发现**第三条**：`\` 是 C 转义且「any backslashes should be doubled」（引号内外都解析）。
+    于是 `--db /tmp/a%b.db` 被换成 boot id、`--db /tmp/$HOME/q.db` 被展开到别处、
+    `--db 'C:\q\q.db'` 被吃掉反斜杠 —— 与 crontab 的 `%` 同族。修法：新增 `systemdArg`
+    （`shellQuote` 之前先做 `\`→`\\`、`%`→`%%`、`$`→`$$`），**必须用函数式替换**——
+    替换串里的 `$$` 有特殊含义，写 `.replace(/\$/g, '$$')` 实测只产出一个 `$`（转义被自身吃掉，
+    首轮实现就踩了这个坑并被新测试抓住）。
+  · **crontab 兜底行的 `%` 没转义**（Sourcery 原始发现）。crontab(5) 原文：`%` 除非写成 `\%`，
+    否则被换成换行、第一个 `%` 之后的内容整体变成命令的 stdin —— 这一层发生在 sh **之前**，
+    所以单引号包不住它；实测修前 `--db /tmp/a%b.db` 裸着落在兜底行里，照抄执行会跑
+    `--db /tmp/a`、`b.db` 变 stdin，**静默跑错库**。注意 `%` 本就在 `shellArg` 的 POSIX 安全集里，
+    只有 `\%` 能挡。
+  · **参数含换行/回车会装出一条「计划里的计划」**：crontab 行与 systemd unit 都是逐行格式，
+    实测 `--db '/tmp/a\n0 0 * * * touch /tmp/x\nb.db'` 让兜底行变成 3 个物理行、中间那行是
+    一条**真的 cron 计划**（以安装者身份执行）。新增 `assertSchedulable()`，三平台统一以用法
+    错误拒绝（launchd 的 plist 技术上能承载换行，但同一份参数在三平台形态应当一致）。
+  · **README / skill 把两种相反的实况合并成了一句「数据未必缺」**。`knowledge_row_malformed`
+    与 `staff_id_list_malformed` 描述的行**确实没落库**（必须核对上游形态），而
+    `filter_matched_no_staff`（上游本就没命中）、`export_fixture_unreported`（该不该有行尚不可知）
+    是「未必缺数据」——Agent 按同一句话处理会低估前者。修法：新增单一出处
+    `TASK_GAP_LOSSY_REASONS`，README 图例段、skill 协议、`sync run` 图例三处都从它说话，
+    测试钉住「真划分」（非空 + 真子集 + `filter_matched_no_staff` 不在其中）与三处文案两档齐全；
+    同时把 `staff_id_list_malformed` 的释义拆到「整组」与「该成员」两种成因（原子句「该组成员
+    未落库」把两种成因合并成一个规模：非数组时确实是整组、空 id 时只有该成员，原句在后者上夸大）。
+
+  **判据自身的两处退化（CodeRabbit 第二轮）**：
+  · gap reason 的静态扫描正则写成 `[a-z_]+`，`reason: 'v2_bad_reason'` 整条不匹配，而**其余文件
+    照样满足 `>= 4` 的下限断言** → 判据静默放行（枚举值含数字完全正常，判据不该靠「值里没有
+    数字」这条未声明的隐含假设成立）。字符集放宽到 `[a-z0-9_]+` 并加数字后缀形态的捕获自检。
+  · 同一族形态的教训：**下限断言可被别处的既有命中满足**，所以每条扫描判据都要配「它必须能
+    捕获的最小反例」，而不是只靠计数。
+
+  **变异验证**：本批 8 处全红 —— `ExecStart` 退回 `shellQuote`（2 红）、`crontabArg` 去掉 `\%`、
+  删掉 `assertSchedulable` 调用、`systemdArg` 去掉 `\` 转义、README 两档合并成一句、
+  reason 扫描退到 `[a-z_]+`、任务层 reason 改成 `v2_bad_reason`。
+  ⚠️ **边界**：`ExecStart` / crontab 的转义依据官方文档，本机是 darwin、**未在真实 systemd 或
+  cron 上端到端实测**；不含 `\`/`%`/`$` 的值是恒等变换（既有条目形态零漂移）。
 - **四条错误分类判据（本轮第二批落点）之外，另有五处独立缺陷**（均由独立审查 agent 发现并复现）：
 
   · **`api call` / `api schema` 的用法错误在 `--pretty` 下被缩进**。`usageFail()` 是「用法错误
