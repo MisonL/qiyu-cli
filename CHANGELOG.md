@@ -122,6 +122,29 @@
 
 ### 修复
 
+- **三处「说的和做的不一致」（独立审查 agent 第四轮，2026-11-02）**：
+
+  · **`dim.ts` 产出的 gap reason 不在枚举里**。`dim.staff_group_members` 写 `staff_id_list_malformed`，
+    而 `TASK_GAP_REASONS` 当时只声明四个 —— 运行时产出了枚举外的值，Agent 按 `gaps[].reason` 分支时
+    在 README 图例里查不到任何释义，图例自称的「全部取值」也少一个。为什么 `typecheck` 没抓住：
+    `...(gapHint ? { gapHint } : {})` 这种扩展表达式让返回值的 contextual type 消失，把该 reason
+    改成 `12345` 仍是 0 error（同一文件改成 `rows: 123` 立刻报错）—— 类型在这里给不出保证。
+    修法：补进 `TASK_GAP_REASONS`，README 图例与 skill 协议同步，并新增**静态扫描守卫**：
+    `src/sync/tasks/*.ts` 里每个 `reason:` 字面量都必须属于枚举，配「扫不到任何字面量则判据退化」
+    的下限断言与变异自检。顺带清掉「8 值」「这四个」这类随枚举长度失真的计数断言（同一个谎报的另一种形态）。
+
+  · **`SyncTask.id` 的注释举例了一个不存在的数据集**。原文写「数据集 id（`'reports.overview'`、`'tag.all'`…）」，
+    但 `tag.all` 只是可调接口、不是同步数据集 —— `tags` 表在 V1 就建了，全仓没有任何同步任务声明它，
+    `sync run tag.all` 只会得到「未知任务」。例子换成真实存在的 `'tickets.search'`；`dim.ts` 头注释里
+    「tags 归属 T12 汇总时一并声明」的旧说法改实况（明确写出没人同步它）。
+
+  · **`sync install` 的 crontab 兜底行用了另一套引号实现**。该行是给人手工复制的 POSIX shell 行
+    （cron 以 `/bin/sh -c` 执行），却走 install.ts 自己的 `shellQuote` —— 它只把空白与 `"` 视作需引号，
+    `--db /tmp/q$(id).db` 会**裸着**印出来，粘进 shell 时 `$(id)` 真的执行。改走 `output.ts` 的
+    `shellArg`（shlex.quote 同一安全集、POSIX 方言），同一契约不再有两个实现点；测试双向钉住
+    （含 `$()`/空白的路径必须被单引号包住，安全集内的路径不得多套引号）。`ExecStart` 与 schtasks
+    不经 shell（systemd 直接 execve、schtasks 收单个 `/TR` 字符串），保持原有双引号渲染，
+    并如实注明「systemd 自身的 `$` 展开未在 linux 上实测」。
 - **四条错误分类判据（本轮第二批落点）之外，另有五处独立缺陷**（均由独立审查 agent 发现并复现）：
 
   · **`api call` / `api schema` 的用法错误在 `--pretty` 下被缩进**。`usageFail()` 是「用法错误

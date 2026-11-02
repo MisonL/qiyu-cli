@@ -53,7 +53,7 @@ const overlapDaysOf = (task: SyncTask): number => (task.overlapDays ?? 0) * DAY
  *
  * ⚠️ 2026-10-27 修：此前 `WindowGapReason` 只声明引擎侧四个，任务 `gapHint.reason`
  * 是 `string` 且落库处用 `as WindowGapReason` 强转 —— 类型对运行时谎报（业务 reason
- * 真实存在于库里），且 8 个值全仓无图例。现在两组都是 `as const` 数组（可导出、
+ * 真实存在于库里），且这些值全仓无图例。现在两组都是 `as const` 数组（可导出、
  * 可被测试逐项核对），README 图例由 `tests/sync-enums.test.ts` 双向钉住。
  */
 export const ENGINE_GAP_REASONS = [

@@ -12,7 +12,7 @@
 //      子集外显式失败并指引手工创建。
 import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { describeArgs } from '../output.js'
+import { describeArgs, shellArg } from '../output.js'
 
 export type Platform = 'darwin' | 'linux' | 'win32'
 
@@ -300,8 +300,17 @@ function unmappable(): Error {
     + '请在 Windows 任务计划程序中手工创建，或换一个可映射的时刻')
 }
 
+/**
+ * crontab 兜底行：**给人手工复制执行的 POSIX shell 行**（cron 以 `/bin/sh -c` 执行它），
+ * 所以参数走 `output.ts` 的 `shellArg`（shlex.quote 同一安全集，POSIX 单引号方言）。
+ *
+ * ⚠️ 2026-11-02 审查：此前这里用本文件的 `shellQuote`（只把空白与 `"` 视作需引号），
+ * `--db /tmp/q$(id).db` 这类值会**裸着**印进兜底行 —— 复制进 shell 时 `$(id)` 真的执行。
+ * 同一契约两个实现点：全仓其余 POSIX 渲染都走 `shellArg`。
+ * `shellQuote` 保留给 ExecStart / schtasks 这类**不经 shell** 的消费方（那边是双引号方言）。
+ */
 function crontabLine(schedule: string, exec: string[], storeArgs: string[] = []): string {
-  return `${schedule} ${runArgs(exec, storeArgs).map(shellQuote).join(' ')}`
+  return `${schedule} ${runArgs(exec, storeArgs).map((s) => shellArg(s, 'linux')).join(' ')}`
 }
 
 /**

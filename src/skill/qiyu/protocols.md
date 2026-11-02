@@ -38,7 +38,8 @@
    漂移时以非零退出码明示）。缺口先看 `gaps[].reason`：
    `rate_limit_local` 等到 `detail` 里的时刻再重跑，`fetch_failed`/`write_failed`/
    `count_mismatch` 重跑 `sync run` 覆盖该区间；`knowledge_row_malformed`/
-   `filter_matched_no_staff`/`export_*` 是**成功窗上的提示**（数据未必缺，按 `detail` 判断）。
+   `staff_id_list_malformed`/`filter_matched_no_staff`/`export_*` 是**成功窗上的提示**
+   （数据未必缺，按 `detail` 判断）。
    - ⚠️ **`range_status` 的两个取值字面都在撒谎**（逐值释义见输出的 `meta.field_notes`）：
      `complete` 只表示「水位推进过」——中窗失败时它照样是 `complete`，**不是**「全窗口成功」；
      `pending` 只表示「最近一次运行没推进水位」——首窗失败时后续成功窗照常落库，**不是**

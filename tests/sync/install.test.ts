@@ -150,6 +150,20 @@ describe('planInstall linux —— systemd unit + timer（crontab 兜底在 note
     expect(timer.content).toMatch(/OnCalendar=Mon \*-\*-\* 09:00:00/)
     expect(timer.content).toMatch(/OnCalendar=\*-\*-01 09:00:00/)
   })
+  it('crontab 兜底行按 POSIX shell 方言渲染：含 $() / 空白的路径必须单引号包住', () => {
+    // ⚠️ 2026-11-02 审查：该行此前用 install.ts 的 shellQuote（只认空白与 `"`），
+    // `--db /tmp/q$(id).db` 会裸着印进这条「手工复制执行」的兜底行 —— cron 用
+    // `/bin/sh -c` 跑它，`$(id)` 会被真的当成命令替换。
+    const hostile = '/tmp/a b$(id).db'
+    const p = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', hostile] })
+    const note = p.notes.find((n) => n.includes('crontab'))!
+    expect(note).toContain(`--db '${hostile}'`)
+    // 反向：安全集内的路径不加多余引号（挡住「一律套引号」的过度修法）
+    const benign = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/q.db'] })
+    expect(benign.notes.find((n) => n.includes('crontab'))!).toContain('sync run --db /tmp/q.db')
+    // 未覆盖边界：ExecStart 由 systemd 直接解析 argv（不经 shell），本轮未在 linux 上实测
+    // systemd 自身的 `$` 展开行为，故此处不复现也不修改它的双引号渲染。
+  })
 })
 
 describe('planInstall win32 —— schtasks 命令行', () => {

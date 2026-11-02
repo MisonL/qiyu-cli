@@ -76,6 +76,7 @@ export type WriteStrategy =
  */
 export const TASK_GAP_REASONS = [
   'knowledge_row_malformed',    // 快照映射时缺键列的行被丢弃（响应形态漂移）
+  'staff_id_list_malformed',    // staffIdList 非数组/成员 id 为空，该组成员未落库（响应形态漂移）
   'filter_matched_no_staff',    // 报表筛选条件未命中任何客服（本窗按 0 行记）
   'export_fixture_unreported',  // 导出流未上报窗口声明行（空窗可能真空也可能被截断）
   'export_window_mismatch',     // 导出声明的窗口宽于请求（重叠行幂等吸收）
@@ -125,7 +126,7 @@ export type EnrichFn = (row: Record<string, unknown>) => Record<string, unknown>
 
 /** 同步任务声明（spec §4.1）。 */
 export interface SyncTask {
-  /** 数据集 id（'reports.overview'、'tag.all'…），sync_state/sync_gaps 的 dataset 主键。 */
+  /** 数据集 id（'reports.overview'、'tickets.search'…），sync_state/sync_gaps 的 dataset 主键。 */
   id: string
   /** 目标表（schema.ts TABLES 中的名字）。 */
   table: string

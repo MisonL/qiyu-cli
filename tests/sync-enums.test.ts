@@ -2,15 +2,17 @@
 //
 // 「sync 输出里的枚举值必须有图例」的可执行判据（2026-10-27）。
 //
-// `gaps[].reason`（8 值）与 `drift[].kind`（4 值）都是 Agent 要按值分支的机器值，
-// 但此前全仓没有一处给出值表：README 只列字段名，skill 只让 Agent「看缺口」，
-// 任务层还有 4 个业务 reason 连类型都没进（`gapHint.reason: string` + `as` 强转）。
+// `gaps[].reason` 与 `drift[].kind` 都是 Agent 要按值分支的机器值。**这里不写死个数**：
+// 2026-11-02 加了一个任务层 reason 后，「8 值」「四个业务提示」这类计数断言全部失真——
+// 值域以 `ENGINE_GAP_REASONS` / `TASK_GAP_REASONS` / `DRIFT_KINDS` 为准。
+// 此前全仓没有一处给出值表：README 只列字段名，skill 只让 Agent「看缺口」，
+// 任务层的业务 reason 连类型都没进（`gapHint.reason: string` + `as` 强转）。
 // 本文件把**源码枚举**与 **README 图例**双向锁住：
 //   · 源码加了值但 README 没写 → 红（图例必须同步）；
 //   · README 写了源码里不存在的值 → 红（图例不能虚报）。
 // 与 `tests/plaintext-channels.test.ts` 同一思路：能静态判定的规则不靠人肉枚举。
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { ENGINE_GAP_REASONS } from '../src/sync/engine.js'
 import { TASK_GAP_REASONS } from '../src/sync/types.js'
@@ -79,7 +81,7 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
   // 依赖 README 图例表的**排列顺序**，而顺序没有任何守卫（上面的双向核对用 sort()，
   // 重排表格照样绿）；Agent 读 run 输出时手里也未必有那张表，「后四个」无法解析。
   // 现在逐名渲染，这条钉住「四个名字都在」且「位置指代不复活」。
-  it('run 图例的 gaps 单元格逐名点名四个业务提示 reason（不用位置指代「后四个」）', async () => {
+  it('run 图例的 gaps 单元格逐名点名每个业务提示 reason（不用位置指代「后四个」）', async () => {
     const { runFieldNotes } = await import('../src/commands/sync-notes.js')
     const cell = runFieldNotes()['tasks[].gaps']!
     for (const r of TASK_GAP_REASONS) {
@@ -88,6 +90,31 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
     expect(cell, '位置指代「后四个」依赖没有守卫的表格顺序，不得复活').not.toMatch(/后四个|前四个/)
     // 变异自检：合成一个位置指代形态，上面的正则必须命中（防正则退化恒绿）
     expect('gaps 非空不等于同步失败：后四个 reason 是成功窗上的业务提示').toMatch(/后四个|前四个/)
+  })
+
+  // 2026-11-02 审查：`dim.ts` 写入了 `staff_id_list_malformed`，而 `TASK_GAP_REASONS` 当时只声明
+  // 四个 —— 运行时产出了枚举外的值，Agent 拿去查 README 图例查不到任何释义。
+  // 为什么类型没抓住：`...(gapHint ? { gapHint } : {})` 里 `gapHint` 是局部推断的对象
+  // （`reason: string`），扩展表达式让整个返回值的 contextual type 消失，tsc 不再校验该字面量
+  // 与 `TaskGapReason` 的关系（实测：把该 reason 改成 `12345`，`npm run typecheck` 仍 0 error；
+  // 同一文件里改成 `rows: 123` 立刻报错）。所以枚举完整性只能靠静态扫描源码字面量来钉。
+  it('任务层源码里的每个 gapHint.reason 字面量都在枚举里', () => {
+    const dir = fileURLToPath(new URL('../src/sync/tasks/', import.meta.url))
+    const hits: Array<{ file: string; reason: string }> = []
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith('.ts')) continue
+      const src = readFileSync(`${dir}${f}`, 'utf8')
+      for (const m of src.matchAll(/reason:\s*'([a-z_]+)'/g)) hits.push({ file: f, reason: m[1] })
+    }
+    // 判据不能在空集合上恒真：dim / knowledge / reports / sessions 各至少一处
+    expect(hits.length, '没扫到任何 reason 字面量 —— 扫描判据退化了').toBeGreaterThanOrEqual(4)
+    const known = new Set(GAP_REASONS)
+    for (const h of hits) {
+      expect(known.has(h.reason), `${h.file} 产出了枚举外的 reason「${h.reason}」：`
+        + '先加进 TASK_GAP_REASONS 并补 README 图例与 skill 文案').toBe(true)
+    }
+    // 变异自检：枚举外的形态必须被判据拒掉（防退化恒绿）
+    expect(known.has('zzz_not_a_reason')).toBe(false)
   })
 
   it('skill 协议不得把 sync verify 说成两类任务都与远端核对（CodeRabbit 2026-10-27）', () => {
