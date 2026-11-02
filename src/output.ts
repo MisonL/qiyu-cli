@@ -374,10 +374,27 @@ function exitCodeFor(kind: string): number {
 export function fail(error: ErrorInput): number {
   // 入参驼峰、出参下划线。这一层改写是刻意的：
   // 内部改字段名不会破坏 Agent 契约，反之亦然。
+  //
+  // ⚠️ **净化必须在这唯一的错误出口做一次**（2026-11-02 第五轮审查，实测发现缺口）：
+  // `message` 与 `hint` 里会拼进**调用方给的字节** —— `--db` 路径、表名、DuckDB 原文。
+  // 此前 `usageFail` / `failFromTagged` / `emitQueryFailure` 三个出口各自净化，而
+  // `fail()` 本体**没有**，于是走它直出的路径（`statGuard` 的库前置检查、
+  // `storeNotInitializedHint`、`thrownToExit` 的多数分支）把 C1 控制字符原样写进 stdout。
+  // 实测：`store status --db $'/tmp/x\u009b31mBAD.db'` 的 stdout 里出现原始字节
+  // `c2 9b 33 31 6d`（CSI 31m，终端里能改色/清屏），而同一路径在 `db describe` 的
+  // hint 里是 `·31m`（被净化过）—— **同一输入两种行为**，与本项目反复修的
+  // 「同一份规则复制到多处」同族。JSON.stringify **不会**转义 `\u007F-\u009F`
+  // （`\u009b` 原样输出），所以这层净化是终端注入的唯一防线。
+  //
+  // ⚠️ 净化**幂等**：上面三个出口已净化的消息再过一遍 `sanitizeMessage` 不变，
+  // 所以这里加一层不会让它们变成双重占位。
+  // ⚠️ 只净化**文本字段**：`retry_after` 是数字、`confirm_required` 等是布尔/闭集字面量，
+  // 不经过此函数；`target` 是回显给 Agent 的目标名（可能是路径/表名），一并净化。
   const e: ErrorPayload = {
-    code: error.code, kind: error.kind, retryable: error.retryable, message: error.message,
+    code: error.code, kind: error.kind, retryable: error.retryable,
+    message: sanitizeMessage(error.message),
   }
-  if (error.hint) e.hint = error.hint
+  if (error.hint) e.hint = sanitizeMessage(error.hint)
   if (error.retryAfter) e.retry_after = error.retryAfter
   if (error.retryStrategy) e.retry_strategy = error.retryStrategy
   if (error.fallback) e.fallback = error.fallback
@@ -394,7 +411,7 @@ export function fail(error: ErrorInput): number {
       e.confirm_required = true
       e.confirm_arg = '--yes'
       e.risk = 'irreversible'
-      e.target = error.target ?? ''
+      e.target = sanitizeMessage(error.target ?? '')
       // ⚠️ 硬置为 false，不接受调用方给别的值 —— 让人工确认一个不可逆操作失败后
       // 自动重试，是最坏的结果（重复执行）。设计稿把这条写成「必须」。
       e.retryable = false
@@ -403,6 +420,32 @@ export function fail(error: ErrorInput): number {
     }
     write({ ok: false, error: e })
     return exitCodeFor(error.kind)
+}
+
+/**
+ * 在**紧凑信封**下走一次 `fail()`（用法错误的唯一渲染口）。
+ *
+ * ⚠️ 契约（README「输出格式」/ 设计稿 §11.2）：`--pretty` 只修饰**成功输出**，
+ * 用法错误（退出码 2）永远保持紧凑 —— 理由不是审美，而是「先修参数，再看格式」：
+ * 一个带缩进的错误信封恰好出现在「你这条命令根本没跑起来」的时刻，Agent 判断
+ * 格式是否生效时会拿它当「格式化已生效」的证据。
+ *
+ * ⚠️ `prettyOutput = false` 这一步**只在此一处**。此前 `usageFail` 自己写了一遍
+ * （只覆盖 `kind:'usage'`），而 `query/errors.ts` 的 `emitQueryFailure` 为保住真实
+ * code（`query_error` / `sandbox_blocked`）复刻了 stderr 写法却**没复刻这一句**，
+ * 于是 `query --sql 'SELEC 1' --pretty` 输出缩进信封、退出码 2 —— 同一契约两个结果。
+ * 复刻一处必然漏另一处，故收敛到这里。
+ */
+export function failCompact(error: ErrorInput): number {
+  const prevPretty = prettyOutput
+  prettyOutput = false
+  try {
+    return fail(error)
+  } finally {
+    // 还原：用法错误是命令的终点，但同进程内连续多次 `run()`（测试里常见）时，
+    // 下一条命令不该因为上一条报了个用法错误就丢掉它的 `--pretty`。
+    prettyOutput = prevPretty
+  }
 }
 
 /**
@@ -459,26 +502,11 @@ export function usageFail(message: string, hint?: string): number {
   // 而同文件的 `未知参数` / `--help` 多余参数路径没补，两种行为并存正是缺口的来源。
   const safe = sanitizeMessage(message)
   process.stderr.write(safe.endsWith('\n') ? safe : safe + '\n')
-  // ⚠️ 用法错误**永远是紧凑 JSON**，即使 `--pretty` 已开启（CodeRabbit 2026-10-25 实测发现）。
-  // 契约写在 README「输出格式」与设计稿 §11.2：`--pretty` 只修饰**成功输出**，
-  // 用法错误（退出码 2）保持紧凑 —— 理由不是审美，而是"先修参数，再看格式"：
-  // 一个带缩进的错误信封恰好出现在"你这条命令根本没跑起来"的时刻，
-  // 而 Agent 判断格式是否生效时会拿它当"格式化已生效"的证据。
-  // 此前有多条分支在 `setPretty(true)` **之后**才报用法错误（如 `api schema --pretty`
-  // 缺 id、`auth login --pretty` 缺环境变量），那些路径输出的就是缩进错误信封。
-  // 现在在唯一的出口处强制收窄 —— 逐个调用点调整次序既脆弱又会随新分支漂移。
-  const prevPretty = prettyOutput
-  prettyOutput = false
-  try {
-    return fail({
-      code: 'usage', kind: 'usage', retryable: false,
-      // message 去尾换行 —— stdout 的 JSON 里不该带控制字符；stderr 的文本保留换行便于阅读。
-      message: safe.replace(/\n+$/, ''),
-      ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
-    })
-  } finally {
-    // 还原：用法错误是命令的终点，但同进程内连续多次 `run()`（测试里常见）时，
-    // 下一条命令不该因为上一条报了个用法错误就丢掉它的 `--pretty`。
-    prettyOutput = prevPretty
-  }
+  // ⚠️ 用法错误**永远是紧凑 JSON**，即使 `--pretty` 已开启 —— 契约与理由见 `failCompact`。
+  return failCompact({
+    code: 'usage', kind: 'usage', retryable: false,
+    // message 去尾换行 —— stdout 的 JSON 里不该带控制字符；stderr 的文本保留换行便于阅读。
+    message: safe.replace(/\n+$/, ''),
+    ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
+  })
 }

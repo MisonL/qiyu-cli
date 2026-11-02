@@ -188,6 +188,12 @@ export const SESSIONS_TASKS: SyncTask[] = [
     primaryKey: ['session_id'],
     // 闸门键 = 主驱动路径（create 是限频的那一个：10 秒 6 次）；check 显式登记为无限频。
     endpoint: 'export.session',
+    // ⚠️ 闸门必须覆盖 fetch 实际调用的**每个** endpoint（2026-11-02 实测修）：
+    // `export.session` 被限流时 penalize 写的是它自己的冷却行，只声明一个键时引擎
+    // 恰好读的就是它 —— 但流水线还会调 `export.session.check`（登记为无限频，
+    // 理论上不会被 penalize）。把它一并声明是**为了让守卫能双向核对**
+    // （tests/sync/gate-keys.test.ts 按 fetch 实际调用的 id 集合比对），不是多余的。
+    gateEndpoints: ['export.session', 'export.session.check'],
     write: { kind: 'upsertRows' },
     fetch: fetchSessions,
     enrich: enrichSession,

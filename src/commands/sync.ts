@@ -187,7 +187,7 @@ function parseSubFlags(argv: string[], valueFlags: string[], boolFlags: string[]
 function subHelp(argv: string[]): number | null {
   if (!argv.includes('--help') && !argv.includes('-h')) return null
   const extra = argv.filter((a) => !KNOWN.has(a))
-  if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)
+  if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
   process.stdout.write(USAGE)
   return 0
 }
@@ -545,7 +545,7 @@ async function syncInstall(argv: string[]): Promise<number> {
   try {
     parsed = parseSubFlags(argv, INSTALL_VALUE_FLAGS, INSTALL_BOOL_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
-  if (parsed.rest.length > 0) return usageFail(`未知参数：${parsed.rest.join(' ')}`)
+  if (parsed.rest.length > 0) return usageFail(`未知参数：${describeArgs(parsed.rest)}`)
   // G1：--pretty 已实现（原拒绝点在 parseSubFlags 的 throw）。
   if (parsed.flags.has('--pretty')) setPretty(true)
   const schedule = parsed.values['--schedule']
@@ -639,7 +639,7 @@ async function syncUninstall(argv: string[]): Promise<number> {
   try {
     parsed = parseSubFlags(argv, [], UNINSTALL_BOOL_FLAGS)
   } catch (e) { return usageFail((e as Error).message) }
-  if (parsed.rest.length > 0) return usageFail(`未知参数：${parsed.rest.join(' ')}`)
+  if (parsed.rest.length > 0) return usageFail(`未知参数：${describeArgs(parsed.rest)}`)
   // G1：--pretty 已实现（原拒绝点在 parseSubFlags 的 throw）。
   if (parsed.flags.has('--pretty')) setPretty(true)
   const yes = parsed.flags.has('--yes')
@@ -698,7 +698,7 @@ export async function syncCommand(argv: string[]): Promise<number> {
   const [sub, ...rest] = argv
   if (sub === undefined || sub === '--help' || sub === '-h') {
     const extra = rest.filter((a) => !KNOWN.has(a))
-    if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)
+    if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -707,7 +707,7 @@ export async function syncCommand(argv: string[]): Promise<number> {
     const unknown = rest.filter((a) => a.startsWith('-') && !KNOWN.has(a))
     const positional = rest.filter((a) => !a.startsWith('-'))
     if (unknown.length + positional.length > 0) {
-      return usageFail(`未知参数：${[...unknown, ...positional].join(' ')}。--pretty 不接受额外参数`)
+      return usageFail(`未知参数：${describeArgs([...unknown, ...positional])}。--pretty 不接受额外参数`)
     }
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
@@ -727,7 +727,7 @@ export async function syncCommand(argv: string[]): Promise<number> {
   // —— tasks ——
   if (rest.includes('--help') || rest.includes('-h')) {
     const rawRest = rest.filter((a) => !KNOWN.has(a))
-    if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
+    if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -736,7 +736,7 @@ export async function syncCommand(argv: string[]): Promise<number> {
 
   try {
     const parsed = parseSubFlags(rest, TASKS_VALUE_FLAGS)
-    if (parsed.rest.length > 0) return usageFail(`未知参数：${parsed.rest.join(' ')}`)
+    if (parsed.rest.length > 0) return usageFail(`未知参数：${describeArgs(parsed.rest)}`)
   } catch (e) { return usageFail((e as Error).message) }
 
   // tasks：只暴露声明元数据，函数字段（fetch/write/enrich）不进 JSON。

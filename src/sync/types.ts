@@ -170,6 +170,21 @@ export interface SyncTask {
    * 否则冷却各记一份、同路径交替调用照样超发（B 中-6）。缺省回退任务 id。
    */
   endpoint?: string
+  /**
+   * 该任务 fetch **实际会调用**的全部 endpoint id（闸门在取数前逐个 acquire）。
+   *
+   * ⚠️ 为什么 `endpoint` 一个不够（2026-11-02 实测修）：闸门的两端用的是**不同的键源**
+   * —— `callPaced(endpointId, …)` 命中远端限频时 penalize 写的是**当下这个** endpoint，
+   * 而引擎取数前 acquire 用的是 `task.endpoint`。于是「一个任务调多个 endpoint」时，
+   * 被限流的那个端点写了冷却行，引擎却去查另一把键，冷却**永远不会被读到**，下一窗
+   * 照旧超发。实测：`ticket.logs` 的 `ticket.log` 被限流 → 冷却行
+   * `__ratelimit__:ticket.log` 落库，而 `acquire('ticket.search')` 放行，紧接着又发了
+   * 4 次 `ticket.log`；`dim.ticket_template_fields` 的 `ticket.template.list` 同理。
+   * 缺省（未声明）视为 `[endpoint ?? id]`，与旧行为一致。
+   * ⚠️ 声明必须**覆盖 fetch 里每一个 callPaced 的 endpoint id** —— 少写一个就是上面那个
+   * 缺陷的形状；`tests/sync/gate-keys.test.ts` 按真实 fetch 调用的 id 集合双向核对。
+   */
+  gateEndpoints?: readonly string[]
   fetch: (w: WindowRef, ctx: FetchCtx) => Promise<FetchResult>
   write: WriteStrategy
   enrich?: EnrichFn

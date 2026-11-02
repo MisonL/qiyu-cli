@@ -261,6 +261,23 @@ describe('store 命令面与 help', () => {
     expect(JSON.parse(out).error.kind).toBe('usage')
   })
 
+  it('store 的未知参数渲染走 describeArgs：空串参数名可见（2026-11-02 实测修）', async () => {
+    // 实测缺陷：store/sync 的「未知参数」出口此前用 `join(' ')`，`store status --db x ''
+    // 报「未知参数：」—— 冒号后空白，Agent 读不出自己传了什么（其余命令已用 describeArgs）。
+    for (const [argv, want] of [
+      [['status', '--db', dbPath(), ''], "未知参数：''"],
+      [['init', '--db', dbPath(), '  '], "未知参数：'  '"],   // 空白原样留在引号里
+    ] as const) {
+      out = ''; err = ''
+      expect(await storeCommand([...argv]), JSON.stringify(argv)).toBe(2)
+      expect(err, `${JSON.stringify(argv)} 的参数名不可见`).toContain(want)
+    }
+    // 多参数用、分隔，而不是空格（空格会被当成参数名的一部分）
+    out = ''; err = ''
+    expect(await storeCommand(['status', '', '  '])).toBe(2)
+    expect(err).toContain("未知参数：''、'  '")
+  })
+
   it('配置层 usage 错误端到端 → 退出码 2（验收 8/9/11/40 的命令级链路，I 组 M1）', async () => {
     vi.stubEnv('HOME', dir)
     vi.stubEnv('USERPROFILE', dir)
