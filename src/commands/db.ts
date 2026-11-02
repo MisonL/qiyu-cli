@@ -21,7 +21,7 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openSandbox } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
-import { statGuard, schemaVersionMissing } from './store-precheck.js'
+import { statGuard, schemaVersionMissing, storeTablesWarnings } from './store-precheck.js'
 import { suggestNames, thrownToQueryExit, missingTableCauses } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
@@ -266,22 +266,11 @@ async function dbTables(argv: string[]): Promise<number> {
       "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
     const actualNames = actual.rows.map((r) => String(r.table_name))
     const actualSet = new Set(actualNames)
-    const declaredSet = new Set(TABLES.map((t) => t.name))
-    const warnings: string[] = []
-    const declaredMissing = TABLES.map((t) => t.name).filter((n) => !actualSet.has(n))
-    if (declaredMissing.length > 0) {
-      // ⚠️ 不得承诺 store init 一定能修（审查 Important #1）：init 只重放
-      // `version > MAX(version)` 的迁移，已迁移到最新版后被 DROP 的表**不会**被
-      // 重建（迁移已跳过，返回 ok 而表仍缺）——那是「成功但无效」的修复。
-      // 成因与对策的唯一实现见 missingTableCauses()（四个出口共用）。
-      warnings.push(`声明有而库中无：${declaredMissing.join('、')}。`
-        + '这些表不出现在 tables 中。' + missingTableCauses(opened.dbPath, opened.profileFlag))
-    }
-    const undeclared = actualNames.filter((n) => !declaredSet.has(n)).sort()
-    if (undeclared.length > 0) {
-      warnings.push(`库中有而声明无：${undeclared.join('、')}。`
-        + '这些表没有元数据声明（可能来自旧版 CLI 或其他工具），不出现在 tables 中')
-    }
+    // ⚠️ 两半漂移的 warning 走 `storeTablesWarnings`（**唯一渲染点**，2026-11-02 收敛）：
+    // 此前本命令自己拼「声明有而库中无」+ `missingTableCauses`，而 `store status`/`init`
+    // 只拼「库中有而声明无」—— 同一库两种漂移，两条命令各报一半，缺表那半在 store 上
+    // 静默。这里与 store 现在共用同一个渲染器，`declaredMissing` 也不再单独算。
+    const warnings = storeTablesWarnings(actualNames, opened.dbPath, opened.profileFlag) ?? []
 
     // 实际列集一次查全库（25 次往返 → 1 次）：时间列被删的表不能让 timeRangeOf 的
     // `MIN("c")` 在 prepare 期抛 Binder Error 把整命令打成退出码 2（Task 7 审查

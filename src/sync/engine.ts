@@ -71,8 +71,9 @@ const lockOwner = (): string => `pid ${process.pid}`
 /** 引擎自己的「现在」：ctx.now 优先（命令层给任务层固定 clock 时引擎仍可用真实时刻）。 */
 const nowOf = (ctx: RunCtx): number => (ctx.now ?? ctx.clock)()
 
-/** 限频闸门的键（B 中-6）：endpoint id 优先，缺省回退任务 id。 */
-const gateKeyOf = (task: SyncTask): string => task.endpoint ?? task.id
+/** 限频闸门的键（B 中-6）：任务声明的全部 endpoint，缺省回退 `endpoint ?? id`。 */
+const gateKeysOf = (task: SyncTask): string[] =>
+  task.gateEndpoints !== undefined ? [...task.gateEndpoints] : [task.endpoint ?? task.id]
 
 /**
  * 首跑起点的合理下界（C 中-2）：起点是 0（或负数）时它是「从头开始」的**哨兵**，
@@ -209,6 +210,11 @@ async function withRetries<T>(ctx: RunCtx, op: () => Promise<T>,
  *   · 网络失败（kind=network）**不在此列** —— core `http.call` 已自带 2 次退避重试
  *     （实测 300ms/600ms），引擎再套一层等于 3 倍往返与 3 倍等待，把 core 的预算语义
  *     变成噪声（实测形态：一次「fetch failed」会从 3 次请求变成 9 次）；
+ *     ⚠️ 这条前提在 2026-11-02 之前**是假的**：当时只有 fetch 抛错与 body 读取失败
+ *     两支会重试，5xx（网关 HTML / Spring JSON 两种载体）**只发 1 个请求就抛出** ——
+ *     于是一次网关 502 就把整个窗口打成 `fetch_failed` gap，而 gap 的 detail 还写着
+ *     「可退避重试」。现在 core 的四支网络载体共用同一预算（实测每支 3 次请求），
+ *     前提才成立；改 core 的重试覆盖面时必须一并回来核对这条注释。
  *   · 限频（kind=rate_limit）不在此列 —— 任务层 callPaced 已有自己的等待预算，
  *     引擎层再等一轮只会把冷却乘起来（限频靠冷却解决，不靠重试）；
  *   · 本地参数错误（usage）、配对核对结论（count_mismatch）、任务层自抛的形态漂移
@@ -261,16 +267,21 @@ const GATE_WAIT_BUDGET = 3
 const GATE_WAIT_FALLBACK_MS = 1_000
 
 async function acquireGated(ctx: RunCtx, task: SyncTask): Promise<void> {
-  const key = gateKeyOf(task)
-  for (let waits = 0; ; waits++) {
-    try {
-      // 冷却是持久化的：读库也在 store 上，撞锁走同一有界重试（B 中-4）。
-      await withStoreRetries(ctx, () => ctx.gate.acquire(key))
-      return
-    } catch (e) {
-      if ((e as { kind?: string }).kind !== 'rate_limit_local' || waits >= GATE_WAIT_BUDGET) throw e
-      const wait = clampGateWait((e as { retryAfter?: number }).retryAfter ?? 0) || GATE_WAIT_FALLBACK_MS
-      await engineSleep(ctx, wait)
+  // ⚠️ 每个声明的 endpoint 都要 acquire（2026-11-02 实测修）：`callPaced` 命中远端限频
+  // 时 penalize 写的是**那个** endpoint 的冷却行，这里只查 `task.endpoint` 会漏掉
+  // 任务实际调用、却被限流的其它端点（ticket.logs 的 ticket.log、dim 的 template.list）。
+  // 漏掉的冷却读不到 → 下一窗照旧超发。逐个等，都到点才放行（慢不是错）。
+  for (const key of gateKeysOf(task)) {
+    for (let waits = 0; ; waits++) {
+      try {
+        // 冷却是持久化的：读库也在 store 上，撞锁走同一有界重试（B 中-4）。
+        await withStoreRetries(ctx, () => ctx.gate.acquire(key))
+        break
+      } catch (e) {
+        if ((e as { kind?: string }).kind !== 'rate_limit_local' || waits >= GATE_WAIT_BUDGET) throw e
+        const wait = clampGateWait((e as { retryAfter?: number }).retryAfter ?? 0) || GATE_WAIT_FALLBACK_MS
+        await engineSleep(ctx, wait)
+      }
     }
   }
 }

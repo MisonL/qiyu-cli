@@ -216,6 +216,11 @@ export const TICKET_TASKS: SyncTask[] = [
     // 同路径任务共享冷却（B 中-6）：touched 集合与逐单日志都经 ticket.search / ticket.log，
     // 闸门键取主要驱动路径 ticket.search（与 tickets.search 任务同键，交替调用照样被拦）。
     endpoint: 'ticket.search',
+    // ⚠️ 闸门必须覆盖 fetch 实际调用的**每个** endpoint（2026-11-02 实测修）：逐单日志
+    // 的 `ticket.log` 被限流时 penalize 写的是 `__ratelimit__:ticket.log`，只声明
+    // `ticket.search` 会让引擎读不到那把冷却、下一窗照旧超发（实测：冷却行在库而
+    // acquire('ticket.search') 放行，随后又发 4 次 ticket.log）。
+    gateEndpoints: ['ticket.search', 'ticket.log'],
     windowStartFloorDays: 31,
     write: { kind: 'upsertRows' },
     fetch: fetchTicketLogs,

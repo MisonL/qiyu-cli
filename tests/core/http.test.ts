@@ -371,6 +371,50 @@ describe('call', () => {
     }
   })
 
+  it('危险接口的 5xx 不得说「退避后重试」—— 两种载体同一句收窄说明', async () => {
+    // 实测缺陷（2026-11-02）：网关 HTML 与 Spring JSON 是**同一次故障的两种载体**，
+    // 而危mechanism 收窄此前只写在 fetch 抛错 / body 读取失败两支。5xx 两处对
+    // `message.send` 仍报「网关瞬时故障，请退避后重试」—— 502/504 恰恰是"上游收到
+    // 请求后失败"的典型形态，Agent 照做就是一次确认变成两次执行。
+    for (const make of [
+      () => new Response('<html>Bad Gateway</html>',
+        { status: 502, headers: { 'content-type': 'text/html' } }),
+      () => new Response(JSON.stringify({
+        timestamp: '2026-01-01T00:00:00Z', status: 503, error: 'Service Unavailable',
+        message: 'down', path: '/openapi/x',
+      }), { status: 503, headers: { 'content-type': 'application/json' } }),
+    ]) {
+      let attempts = 0
+      fetchMock.mockImplementation(() => { attempts++; return Promise.resolve(make()) })
+      const err = await call(byId('message.send'), { uid: 1 }, { credentials: CREDS }).catch((e) => e)
+      expect(attempts, '危险接口的 5xx 只该发一次请求').toBe(1)
+      expect(err).toMatchObject({ kind: 'network', retryable: true })
+      // 必须与另外两支同源：不会被自动重试 + 先确认状态
+      expect(err.hint, '危险接口 5xx 仍在对 Agent 说「退避重试」').toMatch(/不会.*重试/)
+      expect(err.hint).toMatch(/确认当前状态/)
+    }
+  })
+
+  it('读接口的瞬时 5xx 走 core 的重试预算（HTML 与 Spring JSON 两种载体）', async () => {
+    // 实测缺陷（2026-11-02）：只有 fetch 抛错与 body 读取失败会重试，5xx 直接抛出；
+    // 而 `sync/engine.ts` 的 isTransient 以「core 已重试 2 次」为前提不再重试网络类
+    // 错误 —— 于是一次网关 502 只发 1 个请求就把整个窗口打成 fetch_failed。
+    for (const make of [
+      () => new Response('<html>Bad Gateway</html>',
+        { status: 502, headers: { 'content-type': 'text/html' } }),
+      () => new Response(JSON.stringify({
+        timestamp: '2026-01-01T00:00:00Z', status: 503, error: 'Service Unavailable',
+        message: 'down', path: '/openapi/x',
+      }), { status: 503, headers: { 'content-type': 'application/json' } }),
+    ]) {
+      let attempts = 0
+      fetchMock.mockImplementation(() => { attempts++; return Promise.resolve(make()) })
+      await expect(call(byId('ticket.search'), {}, { credentials: CREDS }))
+        .rejects.toMatchObject({ kind: 'network', retryable: true })
+      expect(attempts, '读接口的瞬时 5xx 必须重试到预算耗尽（3 次）').toBe(3)
+    }
+  })
+
   it('404 且响应不是 JSON（nginx HTML）→ route_not_found，不是 internal', async () => {
     // ⚠️ 这条分支此前**没有测试** —— 变异测试确认：把 `if (status === 404)` 改成
     // `if (false)`，全量测试全绿。上面那条网关用例虽然也覆盖了 5 个瞬时码

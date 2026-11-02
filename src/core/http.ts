@@ -173,6 +173,24 @@ function isLocalRequestError(e: unknown): boolean {
   return e instanceof TypeError && !(e as { cause?: unknown }).cause
 }
 
+/**
+ * 危险接口遇到**网络类**故障时给 Agent 的 hint —— **唯一渲染点**。
+ *
+ * ⚠️ 三处载体必须共用这一句（2026-11-02 修）：`fetch` 抛错、响应体读取失败、
+ * HTTP 5xx/429 的两种载体（网关 HTML / Spring JSON）。此前只有前两处写了对危险接口的
+ * 收窄说明，5xx 两处仍报「网关瞬时故障，请退避后重试」—— 同一个 `message.send`
+ * 在「连接断了」时被告知"可能已执行，先确认状态"，在「网关 502」时被告知"退避重试"，
+ * 而两者**同样可能已经执行**（502/504 恰恰是"上游收到请求后失败"的典型形态）。
+ * Agent 照后一句重试，就是一次确认变成两次执行。
+ * ⚠️ 逐字复制这条文案到新分支也算缺陷：新分支应当只调用本常量。
+ */
+const DANGEROUS_NETWORK_HINT =
+  '危险接口的网络故障**不会被自动重试** —— 请求可能已被服务端执行，重发会再执行一次。' +
+  '请先用只读接口确认当前状态，再决定是否重新调用'
+
+/** 一次网络重试的退避（与 14003 重签重试**不共用**预算，见 call() 里的两个计数器）。 */
+const networkBackoffMs = (attempt: number): number => 300 * 2 ** attempt
+
 /** 发起一次已签名调用。业务错误以分类后的异常抛出。 */
 export async function call(
   spec: EndpointSpec,
@@ -267,13 +285,10 @@ export async function call(
       // 判定放在**抛出之前**：给 Agent 一个可重试的 network 错误，
       // 由它自己决定要不要再确认一次 —— 而不是 CLI 替它做这个决定。
       if (spec.dangerous) {
-        throw Object.assign(new Error(err.message), err, {
-          hint: '危险接口的网络故障**不会被自动重试** —— 请求可能已被服务端执行，' +
-                '重发会再执行一次。请先用只读接口确认当前状态，再决定是否重新调用',
-        })
+        throw Object.assign(new Error(err.message), err, { hint: DANGEROUS_NETWORK_HINT })
       }
       if (opts.noRetry || networkAttempts >= 2) throw Object.assign(new Error(err.message), err)
-      await sleep(300 * 2 ** networkAttempts)
+      await sleep(networkBackoffMs(networkAttempts))
       networkAttempts++
       continue
     }
@@ -301,13 +316,10 @@ export async function call(
         // 与 fetch 抛错那条分支保持同一套语义：危险接口不自动重发，
         // 读接口退避重试（预算与 fetch 失败共用 `networkAttempts`）。
         if (spec.dangerous) {
-          throw Object.assign(new Error(err.message), err, {
-            hint: '危险接口的网络故障**不会被自动重试** —— 请求可能已被服务端执行，' +
-                  '重发会再执行一次。请先用只读接口确认当前状态，再决定是否重新调用',
-          })
+          throw Object.assign(new Error(err.message), err, { hint: DANGEROUS_NETWORK_HINT })
         }
         if (opts.noRetry || networkAttempts >= 2) throw Object.assign(new Error(err.message), err)
-        await sleep(300 * 2 ** networkAttempts)
+        await sleep(networkBackoffMs(networkAttempts))
         networkAttempts++
         continue
       }
@@ -343,6 +355,25 @@ export async function call(
       }
       const transient = status === 429 || status === 500 || status === 502 ||
                         status === 503 || status === 504
+      // ⚠️ 危险接口的 5xx 同样可能已经执行（502/504 是"上游收到请求后失败"的典型形态），
+      // hint 必须与 fetch-throw / body-read 两支的收窄同源（DANGEROUS_NETWORK_HINT）——
+      // 此前这里对 message.send 仍说「请退避后重试」，Agent 照做就是二次执行。
+      if (transient && spec.dangerous) {
+        throw Object.assign(
+          new Error(`网关/服务端故障（HTTP ${status}）—— ` + DANGEROUS_NETWORK_HINT),
+          { code: String(status), kind: 'network', retryable: true, hint: DANGEROUS_NETWORK_HINT },
+        )
+      }
+      // ⚠️ 瞬时 5xx 也必须走 core 的重试预算（2026-11-02 修）：此前只有 fetch 抛错与
+      // body 读取失败两支会重试，5xx 直接抛出 —— 而 `sync/engine.ts` 的 `isTransient`
+      // 正是以「core 已重试 2 次」为前提**不**再重试网络类错误。实测：一次网关 502
+      // 只发 1 个请求就把整个窗口打成 fetch_failed gap，那次 502 成了"不可恢复"。
+      // 现在四支的预算一致（同一 `networkAttempts`）。
+      if (transient && !opts.noRetry && networkAttempts < 2) {
+        await sleep(networkBackoffMs(networkAttempts))
+        networkAttempts++
+        continue
+      }
       throw Object.assign(
         new Error(
           `响应不是合法 JSON（HTTP ${status}）` +
@@ -388,6 +419,15 @@ export async function call(
 
     if (!norm.ok) {
       const err = classify(norm.code, norm.messageText)
+      // ⚠️ 危险接口 + 网络类失败（Spring 错误体里的 429/5xx 会经 classify 归成 network）
+      // 必须与另外三支同口径收窄（2026-11-02 修）：Spring JSON 与网关 HTML 是**同一次
+      // 故障的两种载体**，此前只有 HTML 载体被收窄，Spring 载体的 `message.send` 仍收到
+      // 「服务端/网关瞬时故障，请退避后重试」—— Agent 照着重试就是二次执行。
+      // 只改 hint/文案，`retryable` 仍为 true（由 Agent 决定是否重新确认，与其它三支一致）。
+      if (spec.dangerous && err.kind === 'network') {
+        throw Object.assign(new Error(`${err.message}（${DANGEROUS_NETWORK_HINT}）`),
+          err, { hint: DANGEROUS_NETWORK_HINT })
+      }
       // 冷却秒数由**限频表**决定，不由分派器猜 —— 实测冷却随接口变化
       const limit = limitForSpec(spec)
       if (err.kind === 'rate_limit') {
@@ -429,6 +469,14 @@ export async function call(
             '真实冷却可能不同（睡完仍可能再吃限频）。' +
             (err.hint ? ` 原分类提示：${err.hint}` : '')
         }
+      }
+      // ⚠️ 瞬时 5xx/429（Spring JSON 载体）也走 core 的重试预算，与上面四条网络分支
+      // 共用 `networkAttempts` —— 同一个 502 不该因为"代理回 HTML 还是 Spring JSON"
+      // 而一个重试、一个不重试。危险接口已在上面的分支提前抛出不重试。
+      if (err.kind === 'network' && !opts.noRetry && networkAttempts < 2) {
+        await sleep(networkBackoffMs(networkAttempts))
+        networkAttempts++
+        continue
       }
       // ⚠️ message 必须放在**最后** —— Object.assign 是右覆盖左，
       // 若写成 Object.assign(new Error(redact(...)), err)，err.message 会把

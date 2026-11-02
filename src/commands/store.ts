@@ -4,13 +4,14 @@ import { dirname } from 'node:path'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import {
-  ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty, storeInitCommand,
+  ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty, storeInitCommand, describeArgs,
 } from '../output.js'
 import { classifyOpenFailure, NOT_DUCKDB_HINT, PERMISSION_HINT } from '../store/retry.js'
 import { parseStoreFlags } from './store-flags.js'
 import {
-  statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables, undeclaredTablesWarning,
+  statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables, storeTablesWarnings,
 } from './store-precheck.js'
+import { TABLES } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
@@ -91,7 +92,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
   if (sub === undefined || sub === '--help' || sub === '-h') {
     // --help 不吞额外参数；--pretty 豁免（B 惯例）
     const extra = rest.filter((a) => !KNOWN.has(a))
-    if (extra.length > 0) return usageFail(`未知参数：${extra.join(' ')}。--help 不接受额外参数`)
+    if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -102,7 +103,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
       const unknown = rest.filter((a) => a.startsWith('-') && !KNOWN.has(a))
       const positional = rest.filter((a) => !a.startsWith('-'))
       if (unknown.length + positional.length > 0) {
-        return usageFail(`未知参数：${[...unknown, ...positional].join(' ')}。--pretty 不接受额外参数`)
+        return usageFail(`未知参数：${describeArgs([...unknown, ...positional])}。--pretty 不接受额外参数`)
       }
       if (rest.includes('--help') || rest.includes('-h')) {
         process.stdout.write(USAGE)
@@ -117,7 +118,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
   // --db 及其值会被当未知参数误拒（v1 计划的实测缺陷，D/F 组独立发现）。
   if (rest.includes('--help') || rest.includes('-h')) {
     const rawRest = rest.filter((a) => !KNOWN.has(a))
-    if (rawRest.length > 0) return usageFail(`未知参数：${rawRest.join(' ')}`)
+    if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
     process.stdout.write(USAGE)
     return 0
   }
@@ -127,7 +128,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
   let flags
   try { flags = parseStoreFlags(rest) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
   // parseStoreFlags 之后剩下的 rest 才是真正的未知参数（带值 flag 的值位已被消费）
-  if (flags.rest.length > 0) return usageFail(`未知参数：${flags.rest.join(' ')}`)
+  if (flags.rest.length > 0) return usageFail(`未知参数：${describeArgs(flags.rest)}`)
 
   let resolved
   try {
@@ -138,7 +139,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
   } catch (e) { return failFromTagged(e) }
 
-  const { config, configPath, configExists } = resolved
+  const { config, configPath, configExists, profileFlag } = resolved
 
   if (sub === 'init') {
     // 文件前置检查（spec §7.1 步骤 2；验收 41）
@@ -199,14 +200,15 @@ export async function storeCommand(argv: string[]): Promise<number> {
       // 「两边数量应当一致」就成了假话。未声明的表名进 warnings，不静默丢弃。
       const all = await store.tables()
       const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-      const undeclared = undeclaredTables(all)
+      const declared = new Set(TABLES.map((t) => t.name))
+      const warnings = storeTablesWarnings(all, config.path, profileFlag)
       return ok({ path: config.path, backend: config.backend, config_path: configPath,
         config_exists: configExists,
         schema_version: Number(sv.rows[0]?.v ?? 0),
-        tables: all.filter((n) => !undeclared.includes(n)) },
-      undeclared.length === 0
+        tables: all.filter((n) => declared.has(n)) },
+      warnings === undefined
         ? { field_notes: storeFieldNotes() }
-        : { field_notes: storeFieldNotes(), warnings: undeclaredTablesWarning(undeclared) })
+        : { field_notes: storeFieldNotes(), warnings })
     } catch (e) { return thrownToExit(e) } finally { await store.close() }
   }
 
@@ -242,11 +244,15 @@ export async function storeCommand(argv: string[]): Promise<number> {
       tables.push({ name: n, rows: await store.count(n) })
     }
     const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    const warnings = undeclaredTablesWarning([...undeclared])
+    // ⚠️ 两半漂移都进 warnings，**唯一渲染点**在 `storeTablesWarnings`（2026-11-02 实测修）：
+    // 此前这里只算「库中有而声明无」，声明表被删时 tables 少了几张却零 warnings ——
+    // 同一库上 `db tables` 会警告、`store status` 报 ok 且干净，README 又教 Agent
+    // 「数量不等时先读 warnings」，于是 Agent 读到空 warnings 反而确认了「没事」。
+    const warnings = storeTablesWarnings(names, config.path, profileFlag)
     return ok({ path: config.path, backend: config.backend, config_path: configPath,
       config_exists: configExists,
       schema_version: Number(sv.rows[0]?.v ?? 0), tables },
-    undeclared.size === 0
+    warnings === undefined
       ? { field_notes: storeFieldNotes() }
       : { field_notes: storeFieldNotes(), warnings })
   } catch (e) { return thrownToExit(e) } finally { await store.close() }

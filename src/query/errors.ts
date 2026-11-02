@@ -17,7 +17,7 @@
 //
 // ⚠️ 分层约束（spec §5.1）：不 import `sync/`、`commands/`。`output.ts` 是 CLI 输出层
 // （信封与退出码），不是命令层，可以 import。
-import { fail, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand, dbTablesCommand, dbDescribeCommand } from '../output.js'
+import { fail, failCompact, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand, dbTablesCommand, dbDescribeCommand } from '../output.js'
 import type { StoreLocation } from '../output.js'
 import type { TableDef } from '../store/schema.js'
 import {
@@ -397,9 +397,11 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
  * spec §十一 分派表的 code 列（`query_error` / `sandbox_blocked`）——而命令层测试
  * （plan Task 8「多语句 / COPY / ATTACH → sandbox_blocked」）正是按 code 断言的。
  * ⚠️ **这是有意偏离 `usageFail`，不是遗漏**（controller 裁决 R9 concern #2 确认保留）：
- * 故这里复刻 usageFail 的 stderr 写法，stdout 交给 `fail()` 保留真实 code；`fail()`
- * 对 kind='usage' 同样返回退出码 2。其余 kind 直接 `fail({...})`（退出码 1；
- * `query_timeout` 不设特殊分支）。若将来 `output.usageFail` 支持自定义 code，可改回复用它。
+ * 故这里复刻 usageFail 的 stderr 写法，stdout 交回 `output.ts` 的出口渲染，保留真实 code。
+ * ⚠️ 紧凑信封**必须复用 `failCompact`**（2026-11-02 实测修）：此前这里只复刻了 stderr
+ * 写法、直接调 `fail()`，于是 `query --sql 'SELEC 1' --pretty` 输出**缩进**错误信封、
+ * 退出码 2 —— 与 `usageFail` 承诺的「用法错误永远紧凑」相反。复刻一半比不复刻更危险：
+ * 两处看着都在「照同一份契约做」，行为却不同。
  */
 export function thrownToQueryExit(
   e: unknown, tables: readonly TableDef[], noMask = false, loc?: StoreLocation,
@@ -456,10 +458,11 @@ export function emitQueryFailure(f: QueryFailure, noMask = false): number {
   }
   const message = clean(f.message)
   const hint = f.hint === undefined ? undefined : clean(f.hint)
+  const render = f.kind === 'usage' ? failCompact : fail
   if (f.kind === 'usage') {
     process.stderr.write(message.endsWith('\n') ? message : message + '\n')
   }
-  return fail({
+  return render({
     code: f.code, kind: f.kind, retryable: f.retryable,
     message: message.replace(/\n+$/, ''),
     ...(hint !== undefined ? { hint } : {}),

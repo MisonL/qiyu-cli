@@ -122,6 +122,52 @@
 
 ### 修复
 
+- **七处错误出口 / 限频闸门缺陷（独立审查 agent 第六轮，2026-11-02，逐条真实命令复现后修）**：
+
+  · **`fail()` 本体不净化（中高·安全）**：`usageFail` / `failFromTagged` / `emitQueryFailure`
+    三个上层出口各自净化，而走 `fail()` 直出的路径（`statGuard` 的库前置检查、
+    `storeNotInitializedHint`、`thrownToExit` 多数分支）把 C1 控制字符原样写进 stdout ——
+    实测 `store status --db $'/tmp/x\u009b31mBAD.db'` 输出原始字节 `c2 9b 33 31 6d`（CSI，
+    终端可改色/清屏），同一输入在 `db describe` 的 hint 里却是 `·31m`。JSON.stringify
+    不转义 `\u007F-\u009F`，这层净化是终端注入的唯一防线。修法：净化收敛到 `fail()` 唯一
+    出口（幂等，上层出口已净化的消息再过一遍不变），`target` 一并净化。
+  · **`--pretty` 下用法错误被缩进（中）**：`emitQueryFailure` 为保住真实 code
+    （`query_error` / `sandbox_blocked`）复刻了 `usageFail` 的 stderr 写法，却没复刻
+    「临时关掉 --pretty」那一步 —— `query --sql 'SELEC 1' --pretty` 输出缩进错误信封、
+    退出码 2，与 README「--pretty 只修饰成功输出」相反。复刻一半比不复刻更危险。
+    修法：`output.ts` 新增 `failCompact()` 作为紧凑信封的唯一实现，`usageFail` 与
+    `emitQueryFailure` 都走它。
+  · **`store status` / `store init` 对缺表静默（高）**：两者此前只报「库中有而声明无」，
+    声明表被删时零 warnings、`ok:true` —— 同一库上 `db tables` 在警告、`store status`
+    说没事，而 README 恰恰教 Agent「数量不等时先读 warnings」。修法：`storeTablesWarnings()`
+    成为三命令两半漂移的唯一渲染点，缺表那半复用 `missingTableCauses()`（与 db/query/stats
+    逐字同源）；`tests/missing-table-causes.test.ts` 的对拍矩阵从 4 出口扩到 6 出口。
+  · **危险接口的 5xx 说「请退避后重试」（严重）**：`message.send` 这类危险接口在
+    fetch 抛错 / body 读取失败两支网络故障里有「不会被自动重试」的收窄说明，但 5xx 的
+    两种载体（网关 HTML / Spring JSON）仍报「网关瞬时故障，请退避后重试」—— 而 502/504
+    恰恰是「上游收到请求后失败」的典型形态，Agent 照做就是一次确认变成两次执行。
+    修法：`DANGEROUS_NETWORK_HINT` 常量成为四支网络分支的唯一文案源；实测两种载体下
+    `message.send` 均只发 1 个请求且 hint 同源。
+  · **瞬时 5xx 不走 core 重试预算（中）**：只有 fetch 抛错与 body 读取失败会重试，
+    5xx 直接抛出；而 `sync/engine.ts` 的 `isTransient` 以「core 已重试 2 次」为前提
+    不再重试网络类错误 —— 于是（实测）一次网关 502 只发 1 个请求就把整个窗口打成
+    `fetch_failed` gap，且 gap detail 还写着「可退避重试」。修法：HTML 与 Spring JSON
+    两支 5xx 也走同一 `networkAttempts` 预算（实测各 3 次请求），`isTransient` 的前提
+    注释如实记录「此前是假的」。
+  · **闸门键不覆盖任务实际调用的全部 endpoint（中）**：`callPaced` 命中限流时 penalize
+    写的是**当下那个** endpoint 的冷却行，而引擎取数前只 acquire `task.endpoint` ——
+    一个任务调多个 endpoint 时，被限流端点的冷却永远读不到。实测：`ticket.logs` 的
+    `ticket.log` 被限流 → 冷却行 `__ratelimit__:ticket.log` 落库，`acquire('ticket.search')`
+    放行，紧接着又发 4 次 `ticket.log`；`dim.ticket_template_fields` 的
+    `ticket.template.list` 同理。修法：`SyncTask.gateEndpoints` 声明全部实际端点
+    （tickets/dim/sessions 三处补声明），引擎逐个 acquire；`tests/sync/gate-keys.test.ts`
+    以**真实调用采集**（记录型 fetch 跑每个任务）双向核对「声明 ⊇ 实调」，不靠扫源码。
+  · **store/sync 的「未知参数」不渲染空串（中）**：两文件 10 处出口用 `join(' ')`，
+    `store status --db x ''` 报「未知参数：」冒号后空白，Agent 读不出自己传了什么
+    （其余命令早已用 `describeArgs`）。全部收敛到 `describeArgs`。
+
+  以上每条均做变异验证（改坏实现 → 对应用例红 → 还原）。
+
 - **三处「说的和做的不一致」（独立审查 agent 第四轮，2026-11-02）**：
 
   · **`dim.ts` 产出的 gap reason 不在枚举里**。`dim.staff_group_members` 写 `staff_id_list_malformed`，

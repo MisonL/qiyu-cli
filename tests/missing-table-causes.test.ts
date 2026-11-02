@@ -1,8 +1,8 @@
 // tests/missing-table-causes.test.ts —— 「声明有而库中无」的成因与对策只许有一处实现
 // （2026-10-29）。
 //
-// 背景：同一事实有四个出口——`db tables` 的 warning、`db describe` 的 warning、
-// `query --table` 与 `stats fields` 的 hint。前三个出口写对了（迁移未跑完 → store init
+// 背景：同一事实有六个出口——`db tables` 的 warning、`db describe` 的 warning、
+// `query --table` 与 `stats fields` 的 hint、`store status` 与 `store init` 的 warning。前三个出口写对了（迁移未跑完 → store init
 // 可补；迁移完成后表被删 → store init 不会重建，需重建库），只有 `db describe` 独立写成
 // 「未同步或未建库」——**两个成因都到不了该分支**（真库实测）：
 //   · 已 store init、从未同步的库：25 张声明表全在（row_count=0，无缺表警告）；
@@ -11,7 +11,7 @@
 // Agent 照旧文案会去「同步一次」——实测对删掉的表只会 Catalog Error，修不好。
 //
 // 本文件两层守卫：
-//   ① 行为层：真 DuckDB 上删表，四个出口必须给出同一份成因与对策（且不得声称「未同步」）；
+//   ① 行为层：真 DuckDB 上删表，六个出口必须给出同一份成因与对策（且不得声称「未同步」）；
 //   ② 漂移层：成因文案的字符串字面量只许出现在 `src/query/errors.ts` 的
 //      MISSING_TABLE_CAUSES——谁再拷贝一份到别处，直接红。
 // ⚠️ 边界（诚实记录）：①证明运行时输出，②只是**文本**判据，回答「文案是不是还只有
@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url'
 import { dbCommand } from '../src/commands/db.js'
 import { queryCommand } from '../src/commands/query.js'
 import { statsCommand } from '../src/commands/stats.js'
+import { storeCommand } from '../src/commands/store.js'
 import { createDuckDbStore } from '../src/store/duckdb.js'
 import { missingTableCauses } from '../src/query/errors.js'
 import type { Store } from '../src/store/types.js'
@@ -70,7 +71,7 @@ describe('缺表成因的行为口径（真 DuckDB）', () => {
     expect((JSON.parse(out).data as { row_count: number }).row_count).toBe(0)
   })
 
-  it('表被删后，db tables / db describe / query --table / stats fields 给同一份成因与对策', async () => {
+  it('表被删后，六个出口给同一份成因与对策（store status / store init 曾完全静默）', async () => {
     // 选 daily_overview：stats fields 的闭集只收报表表（sessions 会先被用法校验拒绝）
     const s = await initOnly()
     try { await s.query('DROP TABLE "daily_overview"') } finally { await s.close() }
@@ -89,15 +90,25 @@ describe('缺表成因的行为口径（真 DuckDB）', () => {
     // ③ query --table → error.hint（退出码 1：环境问题，不是用法问题）
     out = ''
     expect(await queryCommand(['--table', 'daily_overview', '--db', dbPath()])).toBe(1)
-    texts.push(['query --table', String(errorOf().hint)])
+    texts.push(['query --table', String(errorOf().hint) + String(errorOf().message)])
 
     // ④ stats fields → error.hint
     out = ''
     expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(1)
-    texts.push(['stats fields', String(errorOf().hint)])
+    texts.push(['stats fields', String(errorOf().hint) + String(errorOf().message)])
+
+    // ⑤⑥ store status / store init → meta.warnings
+    // ⚠️ 这两个出口 2026-11-02 之前**只有一半**：它们只报「库中有而声明无」，
+    // 声明表被删时零 warnings、`ok:true` —— 同一库同一时刻，`db tables` 在警告、
+    // `store status` 说没事，而 README 恰恰教 Agent「数量不等时先读 warnings」。
+    for (const [where, argv] of [['store status', ['status']], ['store init', ['init']]] as const) {
+      out = ''
+      expect(await storeCommand([...argv, '--db', dbPath()])).toBe(0)
+      texts.push([where, ((meta().warnings ?? []) as string[]).join('\n')])
+    }
 
     for (const [where, text] of texts) {
-      // 四个出口必须逐字共用同一份成因与对策（拷贝漂移在这里暴露）
+      // 六个出口必须逐字共用同一份成因与对策（拷贝漂移在这里暴露）
       expect(text, `${where} 未使用共享的 missingTableCauses`).toContain(missingTableCauses(dbPath()))
       // 错误成因不得复活：删表与「未同步」无关，Agent 不该被指去跑同步。
       // 用宽判据（只要出现「未同步」就红），防止把「未同步或未建库」改写成
@@ -111,6 +122,10 @@ describe('缺表成因的行为口径（真 DuckDB）', () => {
       // 恢复命令必须指向本次的库：hint 会出现在 `--db <自定义路径>` 的输出里，
       // 只说「运行 qiyu store init」会让 Agent 初始化默认库，选中的库依然缺失
       expect(text, `${where} 的恢复命令未带本次的 --db`).toContain('--db ' + dbPath())
+      // 缺表的表名必须点名（不能只说「有表缺失」）。⚠️ query/stats 的出口是 error.hint，
+      // 表名在**同一条错误的 message** 里（`表 daily_overview 不存在`），不在 hint —— 故
+      // 对 warning 出口断言 hint 文本，对 hint 出口断言整条错误（message + hint）。
+      expect(text, `${where} 未点名缺失的表`).toContain('daily_overview')
     }
   })
 })

@@ -133,6 +133,32 @@ describe('失败输出', () => {
       .toBe(3)
   })
 
+  it('fail() 本体在出口净化 message/hint/target（2026-11-02：此前只有三个上层出口净化）', () => {
+    // 实测缺陷：`usageFail` / `failFromTagged` / `emitQueryFailure` 各自净化，
+    // 而走 `fail()` 直出的路径（statGuard、storeNotInitializedHint、thrownToExit 多数分支）
+    // 把 C1 控制字符原样写进 stdout —— 实测 `store status --db $'/tmp/x\u009b31mBAD.db'`
+    // 的 stdout 出现原始字节 `c2 9b 33 31 6d`（CSI 31m，终端可改色/清屏），同一路径在
+    // `db describe` 的 hint 里却是 `·31m`。JSON.stringify **不**转义 `\u007F-\u009F`，
+    // 所以这层净化是终端注入的唯一防线。
+    fail({
+      code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
+      message: '数据库文件不存在：/tmp/x\u009b31mBAD', hint: '请检查\u009b2J路径',
+      confirmRequired: true, target: '/tmp/t\u009b1m',
+    })
+    // 断言**输出字节**里没有控制序列 —— 只看解析后的对象不够（JSON 里本来就是转义形式）。
+    expect(out, 'stdout 里出现了原始 C1 CSI 字节').not.toMatch(/[\u0080-\u009F]/)
+    const e = JSON.parse(out).error
+    expect(e.message).toContain('·31m')
+    expect(e.hint).toContain('·2J')
+    expect(e.target).toContain('·1m')
+    // 反向：正常多行文案一字不变（净化不得吞换行）
+    out = ''
+    fail({ code: 'x', kind: 'unknown', retryable: false, message: '第一行\n第二行', hint: 'a\nb' })
+    const e2 = JSON.parse(out).error
+    expect(e2.message).toBe('第一行\n第二行')
+    expect(e2.hint).toBe('a\nb')
+  })
+
   it('hint / retry_after 等可选字段被原样透出 —— 它们是错误分类的全部产出', () => {
     // ⚠️ `hint` 是**多数**错误分类的产出，但**不是每条分支都有** —— 限流族就没有：
     // `rate()`（任务 3）返回的 `QiyuError` 不带 `hint`，因此真实的 14009 输出里

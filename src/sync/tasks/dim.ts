@@ -136,9 +136,11 @@ export const DIM_TASKS: SyncTask[] = [
           out.push({ group_id: gid, staff_id: String(sid), synchronized_at: nowIso })
         }
       }
+      // ⚠️ `reason` 必须 `as const`：宽松下推成 `string` 后 `FetchResult.gapHint` 的类型守卫
+      // 会因此报错，而这里唯一可能的取值就是该枚举成员。
       const gapHint = (malformed.length > 0 || skippedMembers > 0)
         ? {
-          reason: 'staff_id_list_malformed',
+          reason: 'staff_id_list_malformed' as const,
           detail: `staffIdList 形态不符：${malformed.length} 个组（${malformed.slice(0, 5).join(',')}）` +
             `的 staffIdList 不是数组、${skippedMembers} 个成员 id 为空——这些成员未落库，` +
             '请核对上游响应形态',
@@ -173,6 +175,10 @@ export const DIM_TASKS: SyncTask[] = [
     watermark: { field: 'synchronized_at', initial: null },
     primaryKey: ['template_id', 'fieldId'],
     endpoint: 'ticket.template.fields',
+    // ⚠️ 闸门必须覆盖 fetch 实际调用的**每个** endpoint（2026-11-02 实测修）：模板列表的
+    // `ticket.template.list` 被限流时 penalize 写的是它自己的冷却行，只声明
+    // `ticket.template.fields` 会让引擎读不到那把冷却、下一窗照旧超发。
+    gateEndpoints: ['ticket.template.list', 'ticket.template.fields'],
     write: { kind: 'upsertRows' },
     // 每模板一次调用（接口按 templateId 取字段）；行补 template_id 列（主键 template_id+fieldId，fieldId 是响应键）。
     // 闸门键取 ticket.template.fields（该任务的主要调用路径）；templates 列表的

@@ -22,6 +22,7 @@ import { statSync } from 'node:fs'
 import { fail, storeInitCommand } from '../output.js'
 import type { ErrorInput } from '../output.js'
 import { TABLES } from '../store/schema.js'
+import { missingTableCauses } from '../query/errors.js'
 
 /**
  * 「库尚未初始化」的恢复命令 hint —— **唯一渲染点**。
@@ -101,18 +102,57 @@ export function statGuard(path: string): number | null {
  */
 export function undeclaredTables(names: readonly string[]): string[] {
   const declared = new Set(TABLES.map((t) => t.name))
-  return names.filter((n) => !declared.has(n))
+  // 排序：`information_schema` 不保证顺序，`db tables` 此前自己 `.sort()`、`store`
+  // 不排序 —— 同一库两次输出 warnings 顺序不同。统一在唯一实现点排序。
+  return names.filter((n) => !declared.has(n)).sort()
+}
+
+/**
+ * 「声明有而库中无」的表名（以 `TABLES` 为权威、按声明顺序）。
+ *
+ * ⚠️ 为什么必须是共享实现（2026-11-02 实测修）：`db tables` / `db describe` 会把它
+ * 列进 warnings 并给出成因与对策（`missingTableCauses`），而 `store status` / `store init`
+ * 此前只算了「库中有而声明无」那一半 —— 同一库、同一时刻，`db tables` 警告
+ * `tickets` 不在，`store status` 却报 `ok` 且零 warnings（README 承诺两边表集一致，
+ * 缺表时恰恰不一致，而 Agent 拿到的却是干净的成功）。只说一半漂移是比不说更容易被
+ * 当成没事的形态：Agent 见 warnings 为空就以为「声明与实况已对齐」。
+ */
+export function declaredMissingTables(names: readonly string[]): string[] {
+  const actual = new Set(names)
+  return TABLES.map((t) => t.name).filter((n) => !actual.has(n))
 }
 
 /**
  * 「库中有而声明无」的 warning 文案 —— **唯一渲染点**（`store init` / `store status` /
- * `db tables` 共用口径；后者的文案稍有不同，见它自己的实现）。
+ * `db tables` 共用；`db tables` 走下面的 `storeTablesWarnings`）。
  * 空数组 → `undefined`（不产生 `meta.warnings` 键：该键是**条件键**）。
  */
 export function undeclaredTablesWarning(undeclared: readonly string[]): string[] | undefined {
   if (undeclared.length === 0) return undefined
   return [`库中有而声明无：${undeclared.join('、')}。这些表没有元数据声明（可能来自旧版 CLI `
     + '或其他工具），不出现在 tables 中']
+}
+
+/**
+ * 「声明 vs 实况」两个方向的 `meta.warnings` —— **唯一渲染点**（`store init` /
+ * `store status` / `db tables` 三处此前各拼一遍）。
+ *
+ * 两半都必须在场：只报「库中有而声明无」会让缺表静默（见 `declaredMissingTables` 的说明）。
+ * 缺表那半的成因与对策**不得**自带一份，取 `query/errors.ts` 的 `missingTableCauses()`
+ * （与 db/query/stats 四个出口逐字同源 —— tests/missing-table-causes.test.ts 钉着）。
+ * 两半都为空 → `undefined`（`meta.warnings` 是条件键）。
+ */
+export function storeTablesWarnings(
+  names: readonly string[], path: string, profileFlag?: string,
+): string[] | undefined {
+  const warnings: string[] = []
+  const missing = declaredMissingTables(names)
+  if (missing.length > 0) {
+    warnings.push(`声明有而库中无：${missing.join('、')}。这些表不出现在 tables 中。`
+      + missingTableCauses(path, profileFlag))
+  }
+  warnings.push(...(undeclaredTablesWarning(undeclaredTables(names)) ?? []))
+  return warnings.length > 0 ? warnings : undefined
 }
 
 /**

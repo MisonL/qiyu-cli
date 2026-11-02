@@ -308,6 +308,22 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(String(e.message)).not.toMatch(/Catalog Error/)   // 中文包装，原文只在 cause 里
   })
 
+  it('--pretty 下的用法错误仍必须**紧凑**（与 usageFail 同契约，2026-11-02 实测修）', async () => {
+    // 实测缺陷：`emitQueryFailure` 为保住真实 code（query_error / sandbox_blocked）
+    // 复刻了 usageFail 的 stderr 写法，却**没复刻「临时关掉 --pretty」那一步** ——
+    // 于是 `query --sql 'SELEC 1' --pretty` 输出**缩进**错误信封、退出码 2，与
+    // README「--pretty 只修饰成功输出、用法错误永远紧凑」相反。复刻一半比不复刻更危险。
+    await seed()
+    expect(await q('--sql', 'SELEC 1', '--pretty')).toBe(2)
+    expect(errorOf().kind).toBe('usage')
+    // 紧凑 = stdout 里那条 JSON 不含换行缩进（`\n  "` 是 pretty 的指纹）
+    expect(out, `用法错误被 --pretty 缩进了：\n${out}`).not.toMatch(/\n\s+"ok":/i)
+    // 反向：同一进程内**成功**输出仍按 --pretty 缩进（收窄只针对错误出口，不误伤成功路径）
+    out = ''
+    expect(await q('--sql', 'SELECT 1 AS x', '--pretty')).toBe(0)
+    expect(out, '成功输出必须仍是缩进的').toMatch(/\n\s+"ok":\s*true/)
+  })
+
   it('多语句 / COPY / ATTACH → sandbox_blocked 退出码 2，且不留副作用', async () => {
     await seed()
 
