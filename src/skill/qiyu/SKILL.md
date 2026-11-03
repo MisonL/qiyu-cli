@@ -58,9 +58,11 @@ qiyu sync status
 - **`qiyu skill where`**：报告实体目录与各 Agent 链接状态，并给出**已安装那份正文**的
   版本元数据：`data.entity.installed.skill_contract_version`（装的那份的契约号）、
   `data.cli_contract_version`（本 CLI 的）与 `data.entity.installed.compatible`
-  （两者是否相等）。**判断「手上的正文能否配这份 CLI」就看这一个字段**，不要拿包版本号
-  去比 —— 包版本不同但契约号相同，正文仍然能用。`installed` 为 `null` = 实体不可用，
-  或清单缺失/损坏，判定不了，不要当成「兼容」。
+  （两者是否相等）。判断「手上的正文能否配这份 CLI」看 `compatible`，但先看它是不是
+  `null`：**这个判定只对「已安装正文与安装清单记录的一致」的那份成立** —— 正文被手工
+  改过（或读不动）时清单仍指着旧正文，`compatible` 报 `null`（判定不了），不会拿旧清单
+  给改过的正文背书。不要拿包版本号去比 —— 包版本不同但契约号相同，正文仍然能用。
+  `installed` 为 `null` = 实体不可用，或清单缺失/损坏，判定不了，不要当成「兼容」。
   `links[].state` 的 `foreign` 表示**那个路径上是别人的东西**（不是本 CLI 建的链接）——
   install 会跳过它，**不要删、不要覆盖**；`unknown` 是「判定不了」，不是「不存在」。
   各状态的完整含义见该命令输出里的 `meta.field_notes`（每个值都带释义与动作）。

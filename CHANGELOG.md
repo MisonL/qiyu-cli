@@ -122,6 +122,30 @@
 
 ### 修复
 
+- **skill install/where/check 五处契约不诚实（独立审查 #9–#13，2026-11-03，逐条真实 CLI 复现）**：
+
+  · **#9 悬空符号链接占着实体路径 → where 报「未安装」并推荐 install，而 install 必退 1**：
+    `statSync` 顺着链接抛 ENOENT，旧实现把「链接占着这个位置」当成「根本不存在」。
+    引入共享判据 `dirShape()`（`paths.ts`，唯一实现点）：`'dir' | 'absent' | 'not_a_directory'`，
+    后者同时覆盖普通文件与悬空链接；install / where / detect 三处 `statSync` 判定全部改为消费它。
+  · **#10 `compatible` 只读清单就给改过的正文背书**：手工改过实体正文后 `where` 仍报
+    `compatible:true`，而 SKILL.md 教 Agent「就看这一个字段」。现在 `where` 拿实体当前内容哈希与
+    清单记录的 `content_hash` 比：不一致（或正文读不动）→ `compatible:null`（判定不了，
+    不是 `false`）+ 点名 `--force` 的警告。四个载体（SKILL.md / README / where 的
+    `field_notes` / `--version` 的 `field_notes`）同步收窄口径。
+  · **#11 agent 的 skills 路径被普通文件占住：where 报 unknown+ENOTDIR、install 报 missing+
+    「目录不存在」（事实错误）**：两边现在都先走 `dirShape`，同报 `unknown` +
+    「路径存在但不是目录」。
+  · **#12 `skill_check_failed` 的 hint 点名一个已不可能触发的成因**：`checkSkillDir` 早已递归
+    进入 `*.md` 子目录（不再当文件读、不会 EISDIR），hint 却仍教用户「把名为 *.md 的子目录改成
+    文件」—— 一句点错方向的指引。改为按系统错误分派：EACCES/EPERM → 权限；ENOENT/ENOTDIR →
+    路径不存在/不是目录；其余 I/O 错误看具体路径。
+  · **#13 真实安装对 ELOOP 自环链接报 `foreign`、dry-run 与 where 报 `unknown`**：
+    `foreign` 的释义是「路径上是别人的东西」，而 ELOOP 是连它是什么都判定不了。install 统一
+    改记 `unknown`（`LINK_REPORT_STATES` 报告域，来自 `paths.ts`），动作不变——不触碰。
+
+  每条配变异验证（4 个变异各自令对应用例红），全量 582 用例 / 4 分片通过。
+
 - **报表/窗口五处数据完整性缺陷（独立审查 agent「报表与窗口数学」路线，2026-11-03，逐条探针复现）**：
 
   · **staff_attendance 的窗边界日丢小时且 `status: complete`（严重）**：`deleteRangeInsert`

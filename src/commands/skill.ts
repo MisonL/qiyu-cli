@@ -47,8 +47,8 @@ import {
   type EntitySource,
 } from '../skill/detect.js'
 import {
-  AGENT_SKILL_SUBDIRS, agentSkillDirs, agentSkillSubdir, LINK_NAME, LINK_STATES, linkState,
-  type AgentDir,
+  AGENT_SKILL_SUBDIRS, agentSkillDirs, agentSkillSubdir, dirShape, LINK_NAME, LINK_REPORT_STATES, linkState,
+  type AgentDir, type LinkReportState,
 } from '../skill/paths.js'
 
 /**
@@ -73,7 +73,9 @@ const SKILL_USAGE = `用法：qiyu skill <子命令> [参数]
                            并给出已安装正文的版本元数据 entity.installed
                            {version, skill_contract_version, compatible} 与
                            CLI 自己的 cli_contract_version —— 判断正文能否配这份
-                           CLI 就看 compatible（实体不可用或清单缺失/损坏时
+                           CLI 看 compatible，但它只对「正文与安装清单一致」的那份
+                           成立：正文被手工改过（或读不动）时 compatible=null
+                           （判定不了，不是 false）；实体不可用或清单缺失/损坏时
                            installed=null（判定不了），不编造）
 
 实体目录定位：--dir > QIYU_SKILL_DIR > npm_config_qiyu_skill_dir（postinstall 的安装
@@ -339,12 +341,22 @@ function notInstalled(entityDir: string, detail?: string): number {
   })
 }
 
-/** 读取 skill 目录失败（权限/目录结构异常）：环境问题，按 message 给出可操作归因。 */
+/**
+ * 读取 skill 目录失败（权限/路径异常）：环境问题，按 message 给出可操作归因。
+ *
+ * ⚠️ hint 必须只列**真能到达这条分支**的成因（审查 #12）：这里捕获的是
+ * `readdirSync`/`statSync`/`readFileSync` 的系统错误 —— EACCES/EPERM（目录或正文
+ * 不可读）、ENOENT/ENOTDIR（路径不存在或不是目录）、以及其余 I/O 错误。旧的
+ * 「名为 *.md 的子目录请改成文件」已随 `collectMarkdownFiles` 改为递归而不再可能
+ * 触发（目录会被递归进入，不会被当文件读），留着就是一句点错方向的指引。
+ */
 function checkFailed(entityDir: string, detail: string): number {
   return fail({
     code: 'skill_check_failed', kind: 'unknown', retryable: false,
     message: `读取 skill 目录失败：${entityDir}（${detail}）`,
-    hint: '请检查目录权限；若目录里有名为 *.md 的子目录，请改成文件或移走',
+    hint: '按括号里的系统错误定位：EACCES/EPERM → 检查该目录与其中正文文件的读权限；'
+      + 'ENOENT/ENOTDIR → 路径不存在或不是目录，用 --dir 指定正确的 skill 目录；'
+      + '其余 I/O 错误看错误信息里的具体路径',
   })
 }
 
@@ -363,8 +375,7 @@ function checkFailed(entityDir: string, detail: string): number {
 export const ENTITY_STATES = ['ok', 'missing', 'not_a_directory', 'unknown'] as const
 export type EntityState = typeof ENTITY_STATES[number]
 /** `links[].state`（`skill where` 与 `skill install` 的 `data.links[].state`）。 */
-export const LINK_REPORT_STATES = [...LINK_STATES, 'unknown'] as const
-export type LinkReportState = typeof LINK_REPORT_STATES[number]
+export { LINK_REPORT_STATES, type LinkReportState }
 /** `links[].action`（仅 `skill install --dry-run` 的计划）。 */
 export const LINK_PLAN_ACTIONS = ['keep', 'create', 'rebuild', 'skip', 'unknown'] as const
 export type LinkPlanAction = typeof LINK_PLAN_ACTIONS[number]
@@ -424,7 +435,9 @@ export function whereFieldNotes(): Record<string, string> {
     'entity.source': `实体目录来源：${ENTITY_SOURCES.join(' > ')}（优先级即顺序）`,
     'entity.exists': 'true/false = 是否存在；null = 无法判定（与 state=unknown 配套）—— 不是「不存在」',
     'entity.state': renderStateNotes(SKILL_STATE_NOTES.entityState),
-    'entity.installed': '已安装那份正文的版本元数据；null = 判定不了（实体不可用或清单缺失/损坏），不是「兼容」',
+    'entity.installed': '已安装那份正文的版本元数据；null（整个对象）= 判定不了（实体不可用或清单缺失/损坏），不是「兼容」'
+      + '。compatible 只对「正文与清单记录的 content_hash 一致」的那份正文成立：'
+      + '正文被手工改过或读不动时为 null（判定不了），不是 false',
     cli_contract_version: '本 CLI 自己的正文契约号。⚠️ 与 entity.installed.skill_contract_version'
       + '（已安装那份的）是两个数：两者相等才说明手上的正文配得上这份 CLI。'
       + '这里报的是 CLI 的，不要当成「已安装版本」',
@@ -1089,6 +1102,25 @@ function probeAgentLinks(
       continue
     }
     const linkPath = join(dir, LINK_NAME)
+    // 形态先走共享判据（审查 #11/#13）：`~/.claude/skills` 被**普通文件**占住时
+    // `linkState` 会顺着 `join()` 得 `ENOTDIR` 抛错，此前这里报 unknown+ENOTDIR；
+    // 而真实安装报的是「路径存在但不是目录」。两条命令对同一状态不同答 —— 现在
+    // 两边都用 `dirShape` 得出同一个 `not_a_directory`。悬空符号链接同理（此前
+    // `linkState` 报 dangling，而那条链接指向的是**目录位置**，不是 skill 链接）。
+    let shape: ReturnType<typeof dirShape>
+    try {
+      shape = dirShape(dir)
+    } catch (e) {
+      links.push({ agent: name, path: linkPath, state: 'unknown', error: errMsg(e) })
+      warnings.push(`${name} 的 skills 目录无法检查（${errMsg(e)}）：${dir}`)
+      continue
+    }
+    if (shape !== 'dir') {
+      // absent 的目录由 probeAgentDirs 过滤掉了；走到这里只剩「存在但不是目录」。
+      links.push({ agent: name, path: linkPath, state: 'unknown', error: '路径存在但不是目录' })
+      warnings.push(`${name} 的 skills 路径存在但不是目录（无法在此建链，需先由人处理该路径）：${dir}`)
+      continue
+    }
     try {
       links.push({ agent: name, path: linkPath, state: linkState(linkPath, entityDir) })
     } catch (e) {
@@ -1111,28 +1143,39 @@ async function skillWhere(argv: string[]): Promise<number> {
   const probe = startupProbeStatus()
   if (probe.note !== undefined) warnings.push(probe.note)
 
-  // 实体状态：只读 stat；ENOENT 是「未安装」，其余异常如实记 unknown。
-  // ⚠️ 显式标注 `EntityState`（不是 `Record<string, unknown>`）：state 的取值域由类型把关，
-  // 新增一个值而不进 `ENTITY_STATES` 会编译失败 —— 图例（README）与新值的漏写才会被测试抓到。
+  // 实体状态：形态走共享判据 `dirShape`（唯一实现，审查 #9）。三态映射到 EntityState：
+  //   · absent → exists:false / missing（真的不存在，= 未安装）；
+  //   · not_a_directory → exists:true / not_a_directory（**路径存在**但不是目录：普通
+  //     文件，或悬空符号链接 —— statSync 抛 ENOENT 但 lstat 看得到那个条目）；
+  //   · dir → exists:true / ok。
+  // ⚠️ 此前这里直接用 `statSync` 并把 ENOENT 等同「不存在」，于是**悬空符号链接**被报成
+  // missing 且警告建议 `qiyu skill install` —— 而那条命令在悬空链接上必然退 1（install
+  // 不覆盖链接）。CLI 自荐了一条走不通的路（实测 #9）。收敛后 where 与 install 同答。
+  // 判定不了（ELOOP/EACCES…）仍如实记 exists:null / unknown：`exists:false` 在那些
+  // 情况下可能是一句假话（审查 M6）。
   let entity: {
     path: string; source: EntitySource; exists: boolean | null
     state: EntityState; error?: string; installed?: unknown
   }
   let entityUsable = false
   try {
-    const st = statSync(entityDir)
-    const isDir = st.isDirectory()
-    entity = { path: entityDir, source, exists: true, state: isDir ? 'ok' : 'not_a_directory' }
-    entityUsable = isDir
-  } catch (e) {
-    if (isErrno(e, 'ENOENT')) {
-      entity = { path: entityDir, source, exists: false, state: 'missing' }
-    } else {
-      // 审查 M6：ELOOP/EACCES 下我们**不知道**路径是否存在——`exists: false` 可能
-      // 是一句假话。用 null 表示「无法判定」，与 state:'unknown' 配套；见 SKILL_USAGE。
-      warnings.push(`实体路径无法检查（${errMsg(e)}）：${entityDir}`)
-      entity = { path: entityDir, source, exists: null, state: 'unknown', error: errMsg(e) }
+    switch (dirShape(entityDir)) {
+      case 'dir':
+        entity = { path: entityDir, source, exists: true, state: 'ok' }
+        entityUsable = true
+        break
+      case 'absent':
+        entity = { path: entityDir, source, exists: false, state: 'missing' }
+        break
+      case 'not_a_directory':
+        entity = { path: entityDir, source, exists: true, state: 'not_a_directory' }
+        break
     }
+  } catch (e) {
+    // 审查 M6：ELOOP/EACCES 下我们**不知道**路径是否存在——`exists: false` 可能
+    // 是一句假话。用 null 表示「无法判定」，与 state:'unknown' 配套；见 SKILL_USAGE。
+    warnings.push(`实体路径无法检查（${errMsg(e)}）：${entityDir}`)
+    entity = { path: entityDir, source, exists: null, state: 'unknown', error: errMsg(e) }
   }
 
   // 已安装那份的**版本元数据**（2026-10-26 补）：`SKILL.md` 教 Agent「用
@@ -1146,14 +1189,40 @@ async function skillWhere(argv: string[]): Promise<number> {
   //     则是「这个字段不存在」，两种沉默对 Agent 含义不同，不能混。
   //   · `compatible` = 三方判定的落点：只有契约号相等才算配套。包版本不同不算
   //     不兼容（正文没变就还能用），这正是 SKILL.md 说「别拿包版本号去比」的原因。
+  //   · ⚠️ 清单只描述**安装那一刻**的正文（审查 #10）：正文被手工改过后清单仍在、
+  //     契约号也不变，只读清单就会拿旧快照给新正文背书，报出 `compatible:true`。
+  //     所以先算实体当前的内容哈希与清单记录的 `content_hash` 比：不一致（或正文读
+  //     不动）→ `compatible:null`（**判定不了**，不是 false：正文改了不等于不配套，
+  //     我们只是没有依据再说它配套）。代价是 `where` 要读一遍正文——它是排查命令，
+  //     不在启动路径上，换来的是这句判定有据可依。
   entity.installed = null
   if (entityUsable) {
     const info = readInstalledManifestInfo(entityDir)
     if (info !== null) {
+      let bodyHash: string | null = null
+      try {
+        bodyHash = contentHash(entityDir)
+      } catch {
+        // 读不动（EACCES 等）→ 判定不了；由下面的警告点名，不编造。
+      }
+      const bodyMatches = bodyHash !== null && bodyHash === info.contentHash
       entity.installed = {
         version: info.version,
         skill_contract_version: info.skillContractVersion,
-        compatible: info.skillContractVersion === SKILL_CONTRACT_VERSION,
+        compatible: bodyMatches ? info.skillContractVersion === SKILL_CONTRACT_VERSION : null,
+      }
+      if (bodyHash === null) {
+        warnings.push(
+          `已安装正文无法读取，无法确认是否与安装清单一致：${entityDir} —— compatible 因此为 null`,
+        )
+      } else if (!bodyMatches) {
+        // 契约号来自清单、清单描述的是旧正文：这时候报 true/false 都是在给改过的
+        // 正文背书。`--force` 是收敛动词（覆盖正文并按当前包装清单）。
+        warnings.push(
+          '已安装正文与安装清单记录的 content_hash 不一致（正文被手工改过或写入不完整）'
+          + ' —— 契约判定只对清单描述的那份正文成立，compatible 因此为 null；'
+          + '运行 `qiyu skill install --force` 可覆盖为包内正文',
+        )
       }
     }
     if (info !== null && info.skillContractVersion !== SKILL_CONTRACT_VERSION) {

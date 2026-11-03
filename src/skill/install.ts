@@ -48,7 +48,11 @@
 //   · foreign  → 不覆盖，记 'foreign' + 警告「已被占用」。
 // 链接阶段任何异常——建链失败、linkState 抛 ELOOP（自指循环链接不落四态，Task 7
 // 实测）、agent 目录不可检查（ENOTDIR/EACCES）——都收敛进 warnings，不让整个安装
-// 失败。ELOOP 这类「判定不了」的路径按 foreign 处理：不触碰、只报告，最保守的归类。
+// 失败。⚠️ 这些「判定不了」的路径记 **unknown**（报告域见 `paths.ts` 的
+// `LINK_REPORT_STATES`），不是 `foreign`：`foreign` 的含义是「路径上是别人的东西、
+// 别删别覆盖」，而 ELOOP 恰恰是我们连它是什么都说不出来（审查 #13：同一条自环链接
+// `where` 报 unknown、真实安装报 foreign，两条命令对同一状态不同答）。
+// 动作不变——不触碰、只报告。
 //
 // 内容比较用 `contentHash`：对目录下所有普通文件按**相对路径（'/' 分隔）升序**，依次
 // update「路径 + 换行 + 换行归一化后的内容」，SHA-256。定界符是必要的——没有它
@@ -67,9 +71,9 @@ import {
 import path from 'node:path'
 import { SKILL_CONTRACT_VERSION } from '../core/edition.js'
 import {
-  agentSkillDirs, agentsMissingSkillDir, createSkillLink, defaultEntityDir, LINK_NAME, linkState,
+  agentSkillDirs, agentsMissingSkillDir, createSkillLink, defaultEntityDir, dirShape, LINK_NAME, linkState,
   linkTarget, MANIFEST, normalizeNewlines,
-  type LinkState,
+  type LinkReportState,
 } from './paths.js'
 
 /**
@@ -194,7 +198,13 @@ export interface InstallResult {
    * 免得每个消费方各写一份四态判断（那正是本仓库记过的漂移形态）。
    */
   upToDate: boolean
-  links: { agent: string; path: string; state: LinkState }[]
+  /**
+   * ⚠️ `state` 用 **报告域**（`LinkReportState`，含 `unknown`），与 `skill where` 同一个域：
+   * 此前这里用四态 `LinkState`，同一条自环链接 `where` 报 `unknown`、真实安装报 `foreign`
+   * （2026-11-03 实测）—— 同一个文件系统状态两个命令两种说法。判定不了的链接
+   *（ELOOP 等）一律 `unknown`，动作仍是「不触碰、只报告」。
+   */
+  links: { agent: string; path: string; state: LinkReportState; error?: string }[]
   warnings: string[]
 }
 
@@ -462,14 +472,15 @@ function isStringRecord(v: unknown): v is Record<string, string> {
   return Object.values(v).every((x) => typeof x === 'string')
 }
 
-/** 判定路径是否存在且是目录；不存在或不是目录返回 false，其余错误照常抛。 */
+/**
+ * 路径是否是**真实目录**（顺着符号链接走；不存在或不是目录返回 false，其余错误照常抛）。
+ *
+ * 判据已下沉到 `paths.ts` 的 `dirShape`（唯一实现，审查 #9/#11）：本函数只是它的
+ * 布尔投影，供「是目录才继续」的调用点用；需要区分「不存在」与「存在但不是目录」
+ * 的调用点（`planInstall`）直接看 `dirShape` 的三态。
+ */
 function isDirectory(p: string): boolean {
-  try {
-    return statSync(p).isDirectory()
-  } catch (err) {
-    if (isErrno(err, 'ENOENT')) return false
-    throw err
-  }
+  return dirShape(p) === 'dir'
 }
 
 /** 实体目录根部是否存在清单文件（不论内容是否可读——存在就是「有上一版」）。 */
@@ -1011,15 +1022,22 @@ export function planInstall(opts: {
 
   const base = { entityDir, sourceFiles, sourceHash }
 
-  if (!isDirectory(entityDir)) {
-    let exists = true
-    try {
-      lstatSync(entityDir)
-    } catch (err) {
-      if (isErrno(err, 'ENOENT')) exists = false
-      else throw err
-    }
-    if (exists) throw new Error(`实体路径已存在但不是目录：${entityDir}`)
+  // 实体路径的三态收敛到 `dirShape`（唯一判据，审查 #9/#11）：此前这里用与 `where`
+  // 各写一份的 `isDirectory`，对**悬空符号链接**占住实体路径的形态给出互相矛盾的结论
+  // ——`where` 用 statSync 得 ENOENT 报 missing 并建议 `qiyu skill install`，而这里
+  // 用 lstatSync 判「存在但不是目录」退 1：CLI 自荐的修复动作**必然失败**（实测）。
+  // 现在两处都按「路径存在（链接本身是存在的条目）、但不是可写目录」处理：install 拒绝
+  // 写它并说清要先由人处理，`where` 报 `not_a_directory`（图例已写明 install 不会写它）。
+  const shape = dirShape(entityDir)
+  if (shape === 'not_a_directory') {
+    throw new Error(
+      `实体路径已存在但不是目录：${entityDir}`
+      // 悬空符号链接是最常见的那种「存在但不是目录」：用户把实体放在大盘/网盘上、
+      // 盘没挂上，或链接指向已被删的旧位置。说清动作，否则用户不知道从哪下手。
+      + '（若这是一条符号链接，请先修正它的指向或删掉它——install 不覆盖这条链接）',
+    )
+  }
+  if (shape === 'absent') {
     return { ...base, status: 'installed', action: 'write', warnings }
   }
 
@@ -1256,32 +1274,47 @@ async function linkAgents(
   }
 
   for (const { dir, agent } of dirs) {
-    let dirOk: boolean
+    // 目录形态用共享判据（审查 #11）：此前用布尔 `isDirectory`，把「agent 装了、
+    // 但 skills 路径被一个**普通文件**占住」也说成「目录不存在」（事实错误——
+    // 路径明明存在），且 links 记 missing，而 `where` 对同一路径报 unknown+ENOTDIR。
+    let shape: ReturnType<typeof dirShape>
     try {
-      dirOk = isDirectory(dir)
+      shape = dirShape(dir)
     } catch (err) {
       // 审查 M1：agent 目录不可检查（EACCES 等）时收敛进 warnings，不让安装失败。
       warnings.push(`检查 ${agent} 的 skills 目录失败（${errMsg(err)}），跳过建链：${dir}`)
       links.push({ agent, path: path.join(dir, LINK_NAME), state: 'missing' })
       continue
     }
-    if (!dirOk) {
+    if (shape === 'absent') {
       // 不替用户创建 agent 目录（spec D1）。显式点名的目录不存在要说出来；
       // links 里补 missing 条目，Task 11 逐 agent 展示状态时不缺行（审查 M3）。
       warnings.push(`${agent} 的 skills 目录不存在，跳过建链：${dir}`)
       links.push({ agent, path: path.join(dir, LINK_NAME), state: 'missing' })
       continue
     }
+    if (shape === 'not_a_directory') {
+      // 路径**存在**但不是目录（普通文件、悬空符号链接…）。说「不存在」是事实错误，
+      // 而且它不能像「不存在」那样 mkdir 一下就好——那条路已被一个非目录占住。
+      // 状态记 unknown 而非 missing：`where` 对同路径报的是 unknown（ENOTDIR 判不了），
+      // 两个命令必须同答（#13 的同一纪律）。
+      warnings.push(`${agent} 的 skills 路径存在但不是目录（无法在此建链，需先由人处理该路径）：${dir}`)
+      links.push({ agent, path: path.join(dir, LINK_NAME), state: 'unknown', error: '路径存在但不是目录' })
+      continue
+    }
     const linkPath = path.join(dir, LINK_NAME)
 
-    let state: LinkState
+    let state: LinkReportState
     try {
       state = linkState(linkPath, entityDir)
     } catch (err) {
-      // ELOOP（自指/成环链接）等不落四态（Task 7 实测）。判定不了的路径按 foreign
-      // 处理：不触碰、只报告——这是四态里最保守的归类。
-      warnings.push(`无法判定 ${agent} 链接状态（${errMsg(err)}），按占用处理、不触碰：${linkPath}`)
-      links.push({ agent, path: linkPath, state: 'foreign' })
+      // ELOOP（自指/成环链接）等不落四态（Task 7 实测）。动作是「不触碰、只报告」，
+      // 但**报告值必须是 unknown，不是 foreign**：foreign 在 Agent 图例里的含义是
+      // 「路径上是别人的东西」——判定不了时这是编造（2026-11-03 实测：同一条自环
+      // 链接 `where` 报 unknown、install 报 foreign）。unknown 的释义正是
+      // 「无法判定，不是『不存在』，不要据此重装或删除」，与动作一致。
+      warnings.push(`无法判定 ${agent} 链接状态（${errMsg(err)}），不触碰：${linkPath}`)
+      links.push({ agent, path: linkPath, state: 'unknown', error: errMsg(err) })
       continue
     }
 
@@ -1369,7 +1402,7 @@ function warnNoAgentLinked(home: string, idempotent: boolean, warnings: string[]
 }
 
 /** 建链失败后重新判定状态；判定本身再抛（ELOOP 等）就退回尝试前的状态。 */
-function recheckState(linkPath: string, entityDir: string, fallback: LinkState): LinkState {
+function recheckState(linkPath: string, entityDir: string, fallback: LinkReportState): LinkReportState {
   try {
     return linkState(linkPath, entityDir)
   } catch {

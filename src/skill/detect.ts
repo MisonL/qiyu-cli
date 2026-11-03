@@ -46,7 +46,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { contentHash, MANIFEST, type Manifest } from './install.js'
-import { defaultEntityDir, readEnvByNormalizedKey } from './paths.js'
+import { defaultEntityDir, dirShape, readEnvByNormalizedKey } from './paths.js'
 import { nonEmptyValue } from '../core/config.js'
 
 /**
@@ -65,12 +65,21 @@ export type SkillState =
   | { kind: 'current' }
   | { kind: 'unknown' }
 
-/** 已安装正文清单里**对外可报**的两个版本号（`skill where` 消费）。 */
+/** 已安装正文清单里**对外可报**的版本号与内容指纹（`skill where` 消费）。 */
 export interface InstalledManifestInfo {
   /** 安装时那份 CLI 的包版本。 */
   version: string
   /** 安装时那份正文的契约版本（设计稿 D6）。 */
   skillContractVersion: number
+  /**
+   * 安装时记录的正文内容哈希（清单 `content_hash`）。
+   *
+   * ⚠️ 消费方必须拿它与**实体当前**的内容哈希比（审查 #10）：清单是安装那一刻的
+   * 快照，手工改过正文之后它仍在、值也不变 —— 只读清单会把「改过的正文」当成
+   * 「就是这个契约版本的那份」。本函数**不**替你算实体哈希（那要看磁盘上的正文，
+   * 属于调用方的代价决策），只把清单里记的值交出去。
+   */
+  contentHash: string
 }
 
 /**
@@ -100,7 +109,11 @@ export function readInstalledManifestInfo(entityDir: string): InstalledManifestI
     const m = readManifestStrict(entityDir)
     if (m === null) return null
     if (!Number.isInteger(m.skill_contract_version) || m.skill_contract_version < 0) return null
-    return { version: m.version, skillContractVersion: m.skill_contract_version }
+    return {
+      version: m.version,
+      skillContractVersion: m.skill_contract_version,
+      contentHash: m.content_hash,
+    }
   } catch {
     return null
   }
@@ -149,16 +162,15 @@ export function detectSkillState(entityDir: string, sourceDir: string, currentVe
 /** 真正的探测逻辑（无缓存）。任何异常都收敛成 unknown。 */
 function probe(entityDir: string, sourceDir: string, currentVersion: string): SkillState {
   try {
-    // statSync 会顺着符号链接走——实体目录本身是指向别处的符号链接是合法安装
-    // 形态（用户可能把实体放在大盘/网盘上），按最终指向判定。
-    let isDir: boolean
-    try {
-      isDir = statSync(entityDir).isDirectory()
-    } catch (err) {
-      if (isErrno(err, 'ENOENT')) return { kind: 'absent' }
-      throw err
-    }
-    if (!isDir) return { kind: 'unknown' } // 路径被文件占用：不是未安装，也不能谎报 stale
+    // 实体路径的形态走共享判据（`paths.ts` 的 `dirShape`，审查 #9）：此前这里直接
+    // `statSync` 并把 ENOENT 认成 absent —— 但**悬空符号链接**（实体在网盘/大盘上、
+    // 盘没挂上）也抛 ENOENT，于是启动探测注入「skill 未安装；运行 `qiyu skill install`」，
+    // 而那条命令在悬空链接上必然退 1（无法覆盖链接）。CLI 自荐了一条走不通的路。
+    // `dirShape` 区分三态：absent（真不存在，提示成立）、not_a_directory（存在但不是
+    // 目录，含悬空链接 → 判定不了，宁可闭嘴）、dir（继续读清单）。
+    const shape = dirShape(entityDir)
+    if (shape === 'absent') return { kind: 'absent' }
+    if (shape === 'not_a_directory') return { kind: 'unknown' } // 存在但不是目录：不是「未安装」，也不谎报 stale
 
     // 只读清单、不读实体正文（spec D2.1 的「零成本」）。readManifestStrict 对
     // 缺失/损坏/字段不全统一返回 null。

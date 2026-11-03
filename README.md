@@ -67,7 +67,8 @@ npm 无法确认可信版本、也就无法 pin 版本，`--allow-scripts` 同�
 但提示不会消失——先清理该占用再跑。其他子命令：
 `qiyu skill where` 报告实体目录与各 Agent 的链接状态（只读，不修复），并给出**已安装那份
 正文**的契约号与兼容判定（`data.entity.installed.compatible`，与 `data.cli_contract_version`
-比较；判定不了时为 `null`，不是 `false`）；`qiyu skill check`
+比较；判定不了时为 `null`，不是 `false`——实体不可用、清单缺失/损坏，以及正文被手工改过
+（与清单记录的 `content_hash` 不一致）都属于判定不了）；`qiyu skill check`
 校验 skill 引用的命令/表/错误 kind 是否仍存在（有违规退出码 1，CI 可跑；`--compare` 模式下
 两份正文内容不一致、或已安装那份不可用，同样退 1）。
 
