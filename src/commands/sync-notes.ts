@@ -65,7 +65,8 @@ export const RANGE_STATUS_NOTES = {
  */
 export const RUN_STATUS_NOTES = {
   complete: '没有失败窗口（windows.failed = 0）。⚠️ 它不保证「全部窗口都跑了」：'
-    + 'windows.skipped 可能大于 0（残段窗被跳过）。判实际覆盖要看 skipped，见该字段的说明',
+    + 'windows.skipped 可能大于 0（残段窗或整窗晚于末端上限被跳过）。判实际覆盖要看 skipped，'
+    + '见该字段的说明',
   partial: '至少一个窗口失败。⚠️ 它也覆盖「一行都没落」的全窗失败（succeeded=0）——'
     + '不要按这个字面判断结果。两个字段分开读：windows.succeeded = 成功窗数'
     + '（空窗也算成功，所以它大于 0 不代表有行）。rows.written = 真正落库的行数'
@@ -124,8 +125,10 @@ const LAST_SYNCED_AT_NOTE = '上次成功提交同步事务的时刻（UTC `Z` �
 export function runFieldNotes(): Record<string, string> {
   return {
     'tasks[].status': renderNotes(RUN_STATUS_NOTES),
-    'tasks[].windows.skipped': '残段窗数（日对齐任务被显式区间钳出的非日界首/末段）：'
-      + '引擎跳过不 fetch、不写库、不推水位，但计入 total（total = succeeded + failed + skipped）',
+    'tasks[].windows.skipped': '没跑的窗数，两种成因：① 残段窗（日对齐任务被显式区间钳出的'
+      + '非日界首/末段）；② 整窗晚于末端上限被丢弃的窗（windowEndClamp：考勤/绩效请求到'
+      + '「今天」时）。两种都跳过不 fetch、不写库、不推水位，但计入 total'
+      + '（total = succeeded + failed + skipped）；stderr 进度行分两句点名成因',
     'tasks[].resolved_range': '本轮请求的水位区间（start = 水位/请求起点语义，'
       + '日对齐任务的首残段可能被跳过、start 前缀不会自动前移，所以它不是「已覆盖」的保证）。'
       + '末端与水位同源：出现失败窗后水位冻结在连续成功末端，因此它可能早于你请求的 end。'

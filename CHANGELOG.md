@@ -147,6 +147,10 @@
     `skipped`、无进度行 —— 请求「今天」的考勤/绩效得到 `total:0, complete, gaps:[]`，
     与「已同步完成」不可分，与仓库自定的「绝不静默消失」相悖。修法：`runWindowed` 与轮转
     路径都统计 `droppedByClamp` 进 total/skipped，并逐窗出「晚于末端上限」进度行。
+    ⚠️ 轮转路径的**非空分支**当时仍漏发进度行（只有空窗分支发了 —— CodeRabbit #59 指出，
+    与 `runWindowed` 两条路径都发不一致）：已补 + 回归（部分钳制 = 1 可执行窗 + 1 丢弃窗）；
+    同时 `windows.skipped` 的 README 与 `meta.field_notes` 释义从「残段窗数」改为
+    「残段窗 + 整窗晚于末端上限（两种成因分开点名）」，不然 `skipped>0` 会被读成只有残段。
   · **order_performance 的 sum 哨兵行跨天互相覆盖（中）**：裸 `order_id='sum'` 在主键只有
     `order_id` 的表里是**全局一行**，回补前一天会 upsert 覆盖后一天的汇总（实测先 day1 再
     day0，day1 汇总消失）。注释声称「与 staff_quality 一致」不成立（后者主键含 stat_date）。

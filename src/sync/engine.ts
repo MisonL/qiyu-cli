@@ -880,6 +880,7 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
       contiguousEnd: null, contiguousBroken: false, resolvedEnd: null }
   }
   for (const w of skippedResidual) ctx.onProgress?.(residualNote(task, w))
+  for (const w of droppedByClamp) ctx.onProgress?.(clampedAwayNote(task, w, limit))
   await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
     await markPending(tx, task.id, state, lock)
   }))

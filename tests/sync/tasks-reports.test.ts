@@ -828,6 +828,33 @@ describe('按天轮转调度（runRotated）', () => {
     await store.close()
   })
 
+  it('2026-11-03 修（CodeRabbit #59）：部分钳制（仍有可执行窗）时，被丢弃窗同样出进度行', async () => {
+    const store = await fresh()
+    const now = 1_700_000_000_000
+    const limit = shanghaiYesterdayStart(now)
+    const lines: string[] = []
+    // 请求 [limit−31d, now)：31 天步长切出 [limit−31d, limit)（可执行）与
+    // [limit, now)（start ≥ limit → 整窗丢弃）。与考勤同形态（31 天窗 + windowEndClamp）。
+    const t = rotTask('reports.staff_attendance', {
+      table: 'staff_attendance', maxWindowDays: 31, windowEndClamp: 'shanghaiYesterday',
+      write: { kind: 'deleteRangeInsert', instantColumn: 'hour_ts' },
+    })
+    const results = await runRotated([t], ctx(store, {
+      rangeOverride: { start: limit - 31 * DAY, end: now },
+      onProgress: (m: string) => lines.push(m),
+    }))
+    expect(results[0].status).toBe('complete')
+    // 可执行 1 + 丢弃 1：丢弃窗计入 total/skipped（「绝不静默消失」）
+    expect(results[0].windows.total).toBe(2)
+    expect(results[0].windows.skipped).toBe(1)
+    // 修复前：planRotation 的非空分支只发残段进度行，被丢弃窗**无进度行**
+    //（只有空窗分支发 —— 与 runWindowed 的两条路径不一致，也与 README/CHANGELOG
+    // 承诺的「逐窗出进度行」矛盾）。
+    expect(lines.join('\n'), '轮转的非空路径同样必须逐窗出「晚于末端上限」进度行')
+      .toMatch(/整窗跳过（晚于末端上限/)
+    await store.close()
+  })
+
   it('修复批 5 #1 + 批 6 #2：轮转路径与单任务同口径 —— 日对齐 + 残段窗跳过', async () => {
     const store = await fresh()
     const gate = { acquire: async () => {} } as unknown as RateGate
