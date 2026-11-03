@@ -306,7 +306,8 @@ qiyu --version                       包版本 + skill_contract_version
 
 `sync run` 的 stdout 是 `{tasks:[...], truncated:false}`，每个任务含 `task` / `status`
 （complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped}`，
-`total = succeeded + failed + skipped`，`skipped` 是跳过的残段窗数，见下）/ `rows` /
+`total = succeeded + failed + skipped`，`skipped` = 跳过的**残段窗**数 + **整窗晚于末端上限
+被丢弃**的窗数，见下）/ `rows` /
 `resolved_range`（Asia/Shanghai 的 `+08:00` ISO 二元组）/ `watermark` / `last_synced_at` /
 `gaps` / `notes`。`gaps[].range` 与 `resolved_range` 同形态（同一套时间解析）；
 `notes` 是中文说明数组（恒在，常为空），例如「请求区间早于接口可得数据的最早边界」
@@ -332,7 +333,7 @@ qiyu --version                       包版本 + skill_contract_version
 
 | status | 含义 | 该做什么 |
 |---|---|---|
-| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗被跳过），判实际覆盖要看 `windows.skipped` |
+| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗**或整窗晚于末端上限**被跳过），判实际覆盖要看 `windows.skipped` |
 | `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 才是落库行数（为 0 也可能是「窗口都成功、只是上游没数据」） |
 | `failed` | 快照任务的失败（本地限频闸门拦截 / 上游取数失败 / 落库失败或行数核对不符） | 快照没有窗口循环，所以不会出现 `partial`；反过来 windowed 任务也**不会**给出 `failed` —— 全窗失败同样是 `partial` |
 
@@ -418,14 +419,18 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 `sync run --full` 对报表任务会从 1970 起切出**上万窗**（≈ 56 年 × 每天 1 窗，每窗至少
 一次调用）——首跑与回补历史请用 `--since/--until` 限定区间（如 `--since 30d` = 30 窗/任务）。
 
-**窗口端点按上海日界对齐**：8 个 `stat_date` 为主键的报表任务（考勤除外）的窗口对齐
-上海自然日 0 点（`windowAlign: 'shanghaiDay'`）——水位续跑（`watermark+1ms`）或任意时刻
+**窗口端点按上海日界对齐**：8 张**声明了 `windowAlign: 'shanghaiDay'` 的报表表**（考勤除外）的窗口起点按
+上海自然日 0 点对齐——其中 6 张的 `stat_date` 在主键里（`order_performance` 的主键是
+`order_id`、`staff_salary_detail` 的是 `staff_id + work_date`），这 6 张才可按 `stat_date` 关联——水位续跑（`watermark+1ms`）或任意时刻
 `--since` 产生的「错相位窗」（如 `[今天18:23, 明天18:23)`）只写一行 `stat_date` 却装着
 跨两天聚合、还会把「明天」日的行删掉不重写。对齐后：**实际拉取的每窗恰是一个完整上海
 自然日**，按日增量的「每日概览」日行恒为全天值。**显式区间的非日界首末段是残段窗**（如
 `--since 30d` 的首段 `[起点, 次日0点)` 与末段 `[昨天0点, 终点)`、`--full` 起点钳出的
 16 小时段）——引擎**跳过不落库**（半日聚合不写日行，避免覆盖该日的整日聚合值；
-`windows.skipped` 如实计数、每窗一条 stderr 进度行）。**末残段**的整日值**可能**由其
+`windows.skipped` 如实计数、每窗一条 stderr 进度行）。**`skipped` 也计入「整窗晚于
+末端上限被丢弃」的窗**（`windowEndClamp`，考勤/绩效请求到「今天」时）：这类窗同样
+不 fetch、不算成功，但会出现在 `skipped` 里并逐窗出「晚于末端上限」进度行——
+`skipped > 0` 不再只意味着「有残段窗被跳过」，判实际覆盖先分清这两种成因。**末残段**的整日值**可能**由其
 请求区间覆盖该整天的日对齐 run 补全（水位停在最后一个整日窗末端；若下一轮的请求区间
 仍未覆盖该整天，该段仍是残段、继续跳过——不保证「下一次 run」就补上）；
 **首残段**不落日行也**不补**——该半日段没有合法落点（写入即半日覆盖整日），属显式

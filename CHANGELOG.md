@@ -122,6 +122,56 @@
 
 ### 修复
 
+- **报表/窗口五处数据完整性缺陷（独立审查 agent「报表与窗口数学」路线，2026-11-03，逐条探针复现）**：
+
+  · **staff_attendance 的窗边界日丢小时且 `status: complete`（严重）**：`deleteRangeInsert`
+    的删除范围是 `[dayOf(start), dayOf(end−1ms)]`，而 31 天窗从任意起点切 —— 下一窗的
+    start 落在上一窗末段的那个自然日之内，删除范围从头删掉该日**全部**小时行、随后只重写
+    start 之后那些，边界日前半段被删且永不重写（实测 fetched=written=960、零 gap，边界日
+    只有 16/24 小时）。修法（两轮收敛）：`deleteRangeInsert` 的删除基准拆成二选一 ——
+    ① 按日粒度范围列删（剩余 8 张报表，窗起止都落上海日界，删除精确覆盖窗）或
+    ② 按行内逐行瞬时时间列删（考勤：`instantColumn: 'hour_ts'`，按 `[w.start, w.end)` 精确删，
+    不依赖日对齐）。中间版本「只删完整落在窗内的自然日」修好了丢数据却留下**陈旧行**
+    （CodeRabbit #59：半个边界日里被上游撤掉的小时永不删、仍 complete）—— 逐行时间列同时
+    做到「窗内精确覆盖、窗外一行不碰」。
+    ⚠️ 曾试「给该任务声明 `windowAlign:'shanghaiDay'`」，复核发现 31 天步长的日对齐网格 +
+    残段窗跳过会让「水位+1ms 落在日中间」的首窗被跳过后再跳 +31 天、中间 30 天不抓 —— 已回退。
+    两类删除基准的**声明前提**由 `sync/write-contract.ts` 在注册表加载期 fail-fast 校验
+    （按日删 ⇒ 必须**同时** `rangeAlign:'shanghaiDay'` **与** `windowAlign:'shanghaiDay'`；
+    瞬时列删 ⇒ 必须是表的 `timeColumn` 且 `kind='iso-instant'`），配
+    `tests/sync/delete-boundary-contract.test.ts` 双向自检。
+    ⚠️ `rangeAlign` 一档是 CodeRabbit #59 三轮补的：漏声明时引擎落到「非天对齐」分支，
+    拿 `toISOString()` 的瞬时串（`…T00:00:00.000Z`）比日粒度列值（`YYYY-MM-DD`），
+    字符串前缀关系让窗起点那一整日的行永远删不掉（陈旧行）而窗口仍 complete ——
+    实测探针：同一删除条件，日对齐形式删掉 `2026-11-03` 行保留 `2026-11-04`，
+    瞬时串形式两行都在。
+  · **staff_quality 不分页，`total=1500` 只取 1000 行仍 complete（严重）**：走 `fetchSimple`
+    单次调用、不读 total（C 中-3 的短读终检只在 `pagedRaw` 里）。实测事实（设计稿 §6.2）：
+    `staffquality` **分页**且 `sum` 覆盖全集 → 改走 `fetchPagedStaff(..., withSum)`，
+    sum 行照旧落 `staff_id='sum'`；回归测试钉「2 个页面都拉到、1501 行」与「短读必须 partial」。
+  · **`windowEndClamp` 之外的窗整窗丢弃且不计数（中）**：既不在 `windows.total` 也不在
+    `skipped`、无进度行 —— 请求「今天」的考勤/绩效得到 `total:0, complete, gaps:[]`，
+    与「已同步完成」不可分，与仓库自定的「绝不静默消失」相悖。修法：`runWindowed` 与轮转
+    路径都统计 `droppedByClamp` 进 total/skipped，并逐窗出「晚于末端上限」进度行。
+    ⚠️ 轮转路径的**非空分支**当时仍漏发进度行（只有空窗分支发了 —— CodeRabbit #59 指出，
+    与 `runWindowed` 两条路径都发不一致）：已补 + 回归（部分钳制 = 1 可执行窗 + 1 丢弃窗）；
+    同时 `windows.skipped` 的 README 与 `meta.field_notes` 释义从「残段窗数」改为
+    「残段窗 + 整窗晚于末端上限（两种成因分开点名）」，不然 `skipped>0` 会被读成只有残段。
+  · **order_performance 的 sum 哨兵行跨天互相覆盖（中）**：裸 `order_id='sum'` 在主键只有
+    `order_id` 的表里是**全局一行**，回补前一天会 upsert 覆盖后一天的汇总（实测先 day1 再
+    day0，day1 汇总消失）。注释声称「与 staff_quality 一致」不成立（后者主键含 stat_date）。
+    修法：哨兵随窗口日 `sum:<上海日>`，自描述且按天唯一（无需迁移）。
+  · **README 的报表任务计数与事实不符（轻）**：写「8 个 `stat_date` 为主键的报表任务」，
+    实际 windowAlign 有 8 个、主键含 `stat_date` 的只有 6 个（`order_performance` 主键
+    `order_id`、`staff_salary_detail` 是 `staff_id + work_date`），会误导 Agent 按
+    `stat_date` 关联这两张表。改说清两个口径，并加双向守卫（枚举计数 + README 措辞 +
+    旧说法不得复活）。
+
+  另删掉 `sync/windowing.ts` 的 `mergeRanges`：导出但**无任何生产调用方**（只有自己的测试），
+  属「声明了没人读」的导出面。
+
+  以上每条均做变异验证（改坏实现 → 对应用例红 → 还原）。
+
 - **七处错误出口 / 限频闸门缺陷（独立审查 agent 第六轮，2026-11-02，逐条真实命令复现后修）**：
 
   · **`fail()` 本体不净化（中高·安全）**：`usageFail` / `failFromTagged` / `emitQueryFailure`
