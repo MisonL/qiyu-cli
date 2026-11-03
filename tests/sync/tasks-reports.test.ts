@@ -517,6 +517,103 @@ describe('报表任务 fetch（http mock）', () => {
       expect(r.rows).toEqual({ fetched: 1, written: 1 })
       const rows = await store.query('SELECT hour_ts FROM staff_attendance')
       expect(rows.rows).toEqual([{ hour_ts: new Date(BASE).toISOString() }])
+      // 审查 #5：丢弃的 2 行必须留痕（原因 + 规模），否则窗口 complete 而 Agent 看不出
+      // 上游有一批行没落库。变异「丢弃不计数/不记 gapHint」→ 本断言红。
+      expect(r.gaps).toEqual([
+        expect.objectContaining({ reason: 'row_missing_key', detail: expect.stringContaining('2 行') }),
+      ])
+      const persisted = await listGaps(store, 'reports.staff_attendance')
+      expect(persisted.some((g) => g.reason === 'row_missing_key')).toBe(true)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('#5：staff_attendance 两类丢弃分开点名（缺 staffId ≠ date 非法，CodeRabbit #61）', async () => {
+    // 变异「把两类合并成一个数/一句话」→ 本用例红（运维会被引向错误的成因）。
+    const H = 3_600_000
+    const BASE = 1_700_000_000_000 - (1_700_000_000_000 % H)
+    const fetchMock = respondQueue([
+      () => okC({ result: [
+        { date: BASE },                        // 缺 staffId
+        { staffId: 1000002, date: 'bad' },     // date 非法
+        { staffId: 1000002, date: BASE },      // 合法
+      ], total: 3 }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.staff_attendance')!, ctx(store))
+      expect(r.status).toBe('complete')
+      const detail = String((r.gaps[0] as { detail?: string } | undefined)?.detail ?? '')
+      expect(detail).toContain('1 行缺 staffId')
+      expect(detail).toContain('1 行的 date 不是合法毫秒时间戳')
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('#5：staff_workload 缺 staffId 键的行被丢弃并记 row_missing_key（窗口仍 complete）', async () => {
+    // 变异「fetchPagedStaff 的丢弃不计数」→ 本用例红（gaps 为空）。
+    const fetchMock = respondQueue([
+      () => okC({ result: [{ staffId: 1000002, x: 1 }, { x: 2 }], total: 2 }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.staff_workload')!, dayCtx(store))
+      expect(r.status).toBe('complete')          // 提示 ≠ 失败
+      expect(r.rows).toEqual({ fetched: 1, written: 1 })
+      expect(r.gaps).toEqual([
+        expect.objectContaining({
+          reason: 'row_missing_key',
+          detail: expect.stringMatching(/staffId.*1 行|1 行.*staffId/s),
+        }),
+      ])
+      // 落库的行为 1 行（缺键行不在库里）
+      expect(await store.count('staff_workload')).toBe(1)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('#5：order_performance 缺 orderId 的订单行被丢弃并记 row_missing_key（sum 行照常落）', async () => {
+    const fetchMock = respondQueue([
+      () => okC({ orders: [{ orderId: 900001, sellMoney: 10 }, { sellMoney: 99 }],
+        sum: { sellMoney: 10 }, total: 2 }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.order_performance')!, dayCtx(store))
+      expect(r.status).toBe('complete')
+      expect(r.gaps).toEqual([
+        expect.objectContaining({ reason: 'row_missing_key', detail: expect.stringContaining('orderId') }),
+      ])
+      // 落库：1 个真订单 + 1 个 sum 哨兵行
+      const rows = await store.query('SELECT order_id FROM order_performance ORDER BY order_id')
+      expect(rows.rows.map((x) => String(x.order_id)).sort()).toEqual(['900001', `sum:${shanghaiDayIso(DAY_RANGE.start)}`].sort())
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('#5 反向：全部行都有主键 → 不产生 row_missing_key gap（守卫不能恒报）', async () => {
+    // 与上面两条成对：防「无条件记一条 gap」蒙混过关。
+    const fetchMock = respondQueue([
+      () => okC({ result: [{ staffId: 1000002, x: 1 }, { staffId: 1000003, x: 2 }], total: 2 }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.staff_workload')!, dayCtx(store))
+      expect(r.status).toBe('complete')
+      expect(r.gaps).toEqual([])
+      expect(r.rows).toEqual({ fetched: 2, written: 2 })
       await store.close()
     } finally {
       vi.unstubAllGlobals()

@@ -32,18 +32,19 @@ const isEmptyKey = (v: unknown): boolean => v === null || v === undefined || v =
  * `keyCols`（C 低-7）：落库主键列 —— 值为空串的行**显式失败**，绝不因 `''` 写出一行
  * 能被反复覆盖的同键行（空串是合法的 VARCHAR 值，upsert 主键语义会把它们当成同一个键）。
  * 只有 cols 里出现的键列才在这里判定（如 template_id 由行外补齐，由调用方自行守卫）。
+ *
+ * ⚠️ 这里**没有** per-row 变换回调（审查 #5，2026-11-03）：早前本函数带 `perRow`，
+ * 但它返回 null 时静默 `continue` 丢行，而**所有**调用点都传 `undefined`——一支永不执行、
+ * 一旦执行就静默丢行的死代码。删除它，丢行只保留「显式抛错（keyCols）」一种形态。
  */
 function project(rows: Record<string, unknown>[], cols: string[],
-  nowIso: string, perRow?: (r: Record<string, unknown>) => Record<string, unknown> | null,
-  keyCols: string[] = [],
+  nowIso: string, keyCols: string[] = [],
 ): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = []
   for (const raw of rows) {
-    const mid = perRow ? perRow(raw) : raw
-    if (mid === null) continue
     const row: Record<string, unknown> = {}
     for (const c of cols) {
-      const v = mid[c]
+      const v = raw[c]
       if (isEmptyKey(v) && keyCols.includes(c)) {
         throw new Error(`响应出现空的主键列 ${c}（值为 ${JSON.stringify(v)}）——` +
           '空串/缺键会写出一行能被反复覆盖的同键行，拒绝落库')
@@ -60,11 +61,10 @@ function project(rows: Record<string, unknown>[], cols: string[],
  * ⚠️ 走 callPaced（B 高-1）：本地令牌桶拒绝被吸收为等待重试，远端限频写持久化冷却行。 */
 async function fetchAll(endpointId: string, body: unknown, cols: string[],
   ctx: FetchCtx, nowIso: string,
-  perRow?: (row: Record<string, unknown>) => Record<string, unknown> | null,
   keyCols: string[] = [],
 ): Promise<FetchResult> {
   const res = await callPaced(endpointId, body, ctx)
-  const rows = project(rowsOf(res, endpointId), cols, nowIso, perRow, keyCols)
+  const rows = project(rowsOf(res, endpointId), cols, nowIso, keyCols)
   return { rows, apiCount: rows.length }
 }
 
@@ -87,7 +87,7 @@ export const DIM_TASKS: SyncTask[] = [
     // role 文档标必填但实测 status/role 都省略时返回全部 330 行（§6.2）——不传，取全量。
     // groupInfo 列表 → JSON 字符串列（project 统一 JSON.stringify，非字符串值均适用）。
     fetch: (w, ctx) =>
-      fetchAll('staff.list.new', {}, STAFF_COLS, ctx, nowIsoOf(ctx), undefined, ['id']),
+      fetchAll('staff.list.new', {}, STAFF_COLS, ctx, nowIsoOf(ctx), ['id']),
   },
   {
     id: 'dim.staff_groups', table: 'staff_groups', kind: 'snapshot',
@@ -97,8 +97,7 @@ export const DIM_TASKS: SyncTask[] = [
     write: { kind: 'upsertRows' },
     // staff:true 取 staffIdList（成员关系单独落 staff_group_members，本表不存）。
     fetch: (w, ctx) =>
-      fetchAll('staff.group.list.new', { staff: true }, STAFF_GROUP_COLS, ctx, nowIsoOf(ctx),
-        undefined, ['id']),
+      fetchAll('staff.group.list.new', { staff: true }, STAFF_GROUP_COLS, ctx, nowIsoOf(ctx), ['id']),
   },
   {
     id: 'dim.staff_group_members', table: 'staff_group_members', kind: 'snapshot',
@@ -157,7 +156,7 @@ export const DIM_TASKS: SyncTask[] = [
     write: { kind: 'upsertRows' },
     // 文档标 type 必填（2=工单分类）；响应列名是 parentId，落库保持原名。
     fetch: (w, ctx) =>
-      fetchAll('category.list', { type: 2 }, CATEGORY_COLS, ctx, nowIsoOf(ctx), undefined, ['id']),
+      fetchAll('category.list', { type: 2 }, CATEGORY_COLS, ctx, nowIsoOf(ctx), ['id']),
   },
   {
     id: 'dim.ticket_templates', table: 'ticket_templates', kind: 'snapshot',
@@ -167,8 +166,7 @@ export const DIM_TASKS: SyncTask[] = [
     write: { kind: 'upsertRows' },
     // 文档标 status 必填（-1=全部状态）；响应 status 全为 1、不携带信息 → 不建列。
     fetch: (w, ctx) =>
-      fetchAll('ticket.template.list', { status: -1 }, TEMPLATE_COLS, ctx, nowIsoOf(ctx),
-        undefined, ['id']),
+      fetchAll('ticket.template.list', { status: -1 }, TEMPLATE_COLS, ctx, nowIsoOf(ctx), ['id']),
   },
   {
     id: 'dim.ticket_template_fields', table: 'ticket_template_fields', kind: 'snapshot',
@@ -196,8 +194,7 @@ export const DIM_TASKS: SyncTask[] = [
         }
         const fres = await callPaced('ticket.template.fields', { templateId: t.id }, ctx)
         // 主键列 fieldId 的空值在 project 内显式失败（C 低-7）
-        const rows = project(rowsOf(fres, 'ticket.template.fields'), FIELD_COLS, nowIso,
-          undefined, ['fieldId'])
+        const rows = project(rowsOf(fres, 'ticket.template.fields'), FIELD_COLS, nowIso, ['fieldId'])
         for (const row of rows) out.push({ ...row, template_id: String(t.id) })
       }
       return { rows: out, apiCount: out.length }

@@ -384,16 +384,19 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 | `fetch_failed` | 取数失败（有界重试后仍失败，本窗未写入） | 稍后重跑覆盖该区间 |
 | `write_failed` | 落库失败（事务已回滚，本窗未写入） | 检查本地库（锁/磁盘）后重跑 |
 | `count_mismatch` | 写入意图行数 ≠ API 声明行数（事务已回滚） | 重跑；持续不符报告人类 |
-| `knowledge_row_malformed` | 快照映射时缺键列的行被丢弃（响应形态漂移） | 报告人类核对接口形态；快照全删重插下这些行已消失 |
+| `knowledge_row_malformed` | 快照映射时缺键列的行被丢弃（响应形态漂移）；含知识库类目树里缺 id 的节点（连同其子树） | 报告人类核对接口形态；快照全删重插下这些行已消失 |
 | `staff_id_list_malformed` | 分两种：`staffIdList` 非数组 → **该组全部成员**未落库（整组跳过）；成员 id 为空 → **该成员**未落库（同组其余成员照常落库） | 报告人类核对接口形态；快照全删重插下这些成员已消失 |
+| `row_missing_key` | 窗口任务（报表 / 工单 / 工单日志）映射时行缺主键列（缺键或空串），**该行未落库**；`detail` 是丢弃行数（工单日志另点名「因缺 id 整单未拉取」的工单数） | 报告人类核对接口形态；`fetched`/`written` 都不含这些行，窗口仍可能 complete |
 | `filter_matched_no_staff` | 报表筛选条件未命中任何客服（本窗按 0 行记） | 结合筛选条件判断——它不是「没有数据」的证据 |
 | `export_fixture_unreported` | 导出流未上报窗口声明行，空窗可能真空也可能被截断 | 抽查该窗行数，必要时重跑 |
 | `export_window_mismatch` | 导出声明的窗口宽于请求（重叠行由幂等 upsert 吸收） | 数据不受损，知悉即可 |
 
-⚠️ 上表后五行是**成功窗上的提示**（窗口数据照常提交）：`gaps` 非空不等于同步失败，
-按 reason 区分「失败缺口」与「提示」。但「提示」**不等于「数据没缺」**，两档要分开读：
-`knowledge_row_malformed` / `staff_id_list_malformed` 描述的行**确实没落库**
-（`detail` 是丢失规模，必须核对上游形态）；`filter_matched_no_staff` /
+⚠️ 上表里 `rate_limit_local` / `fetch_failed` / `write_failed` / `count_mismatch` 是**失败缺口**
+（该窗未写入）；其余都是**成功窗上的提示**（窗口数据照常提交）—— `gaps` 非空不等于同步失败。
+但「提示」**不等于「数据没缺」**，两档要分开读：
+`knowledge_row_malformed` / `staff_id_list_malformed` / `row_missing_key` 描述的行**确实没落库**
+（`detail` 是丢失规模，必须核对上游形态；⚠️ `staff_id_list_malformed` 的整组一档只给
+**受影响的组数**与「成员数未知」—— 它不是行数，别当规模直接用）；`filter_matched_no_staff` /
 `export_fixture_unreported` / `export_window_mismatch` 则**未必缺数据**
 （可能只是筛选没命中、或空窗本来就空，按 `detail` 判断）。
 新增 reason 必须同时更新本表与源码枚举（`tests/sync-enums.test.ts` 双向核对）。
