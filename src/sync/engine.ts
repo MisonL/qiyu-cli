@@ -134,41 +134,39 @@ function failDetail(label: string, e: unknown): string {
 }
 
 /**
- * 写策略落地（事务内调用）：deleteRangeInsert 按范围列删旧 + upsert；upsertRows 直接 upsert。
- * ⚠️ 窗口是**半开** [start, end)，而删除条件是闭区间 —— 天对齐分支的上界必须取
- * `dayIso(end − 1ms)`（窗口内最后一个瞬时所在的自然日），否则 end 恰落在日界
- *（`--until` 指定日期 / windowEndClamp 钳到昨天 0:00 / 日对齐水位都会产生）时
- * `dayIso(end)` = 下一天零点，删除会多删**下一天**的行：`--since D0 --until D2`
- * 的第二窗 end=D2 零点 → 删除范围含 D2 → D2 日已同步的行被删而本轮不重拉（D2 在
- * 请求区间外，永久损失）。`end − 1ms` 后：1 天窗 [D, D+1) → 删除恰好 [D, D]，
- * 31 天考勤窗 [D0, D0+31d) → [D0, D0+30]（= 31 天），与写入行集一致。
+ * 写策略落地（事务内调用）：deleteRangeInsert 按声明基准删旧 + upsert；upsertRows 直接 upsert。
+ * ⚠️ 窗口是**半开** [start, end)，而删除条件是闭区间 —— 上界一律取「最后 1ms」：
+ *   · 天对齐分支取 `dayIso(end − 1ms)`（窗口内最后一个瞬时所在的自然日），否则 end 恰落在
+ *     日界时（`--until` 指定日期 / windowEndClamp 钳到昨天 0:00 / 日对齐水位都会产生）
+ *     `dayIso(end)` = 下一天零点，删除会多删**下一天**的行：`--since D0 --until D2` 的第二窗
+ *     end=D2 零点 → 删除范围含 D2 → D2 日已同步的行被删而本轮不重拉（D2 在请求区间外，
+ *     永久损失）。
+ *   · `instantColumn` 分支取 `toISOString(end − 1ms)`，与行内值同为毫秒精度 ISO 串，
+ *     等价于 `< end`。
  */
 async function writeRows(task: SyncTask, ops: Pick<WriteTx, 'delete' | 'upsert'>,
   rows: Record<string, unknown>[], range: Range): Promise<number> {
-  if (task.write.kind === 'deleteRangeInsert') {
-    const dayAligned = task.write.rangeAlign === 'shanghaiDay'
-    // ⚠️ 天对齐列的删除范围**只含完整落在窗内的自然日**（2026-11-03 实测修）：
-    // 此前一律用 `[dayOf(start), dayOf(end−1ms)]`，窗口起点不在日界时（staff_attendance
-    // 按 31 天从任意起点切窗）会**把相邻窗写好的边界日整片删掉** —— 下一窗删掉边界日的
-    // 全部小时行、只重写 `start` 之后的那些，边界日的前半段被删且永不重写（实测
-    // fetched=written=960、`status: complete`、零 gap，而边界日只有 16/24 小时）。
-    // 只删「完整落在窗内」的天后：首/末的半个自然日只 upsert 不删，邻窗写的行因此保得住，
-    // 整日内被上游撤掉的行仍会被删（不会留下永久陈旧行）。日对齐窗（start/end 都在日界）
-    // 两式等价，行为不变。
-    const headPartial = dayAligned && range.start !== shanghaiDayStart(range.start)
-    const tailPartial = dayAligned && range.end !== shanghaiDayStart(range.end)
-    const from = dayAligned
-      ? shanghaiDayIso(headPartial ? range.start + DAY : range.start)
-      : new Date(range.start).toISOString()
-    const to = dayAligned
-      ? shanghaiDayIso(tailPartial ? range.end - 1 - DAY : range.end - 1)
-      : new Date(range.end).toISOString()
-    // where 是可信代码常量（同 query 红线）：列名来自任务声明（代码级），值参数化绑定。
-    // 范围边界与行内日期列同口径（rangeAlign）：行写「上海天对齐的日期列」时，删除范围
-    // 也必须是天对齐边界——否则 --full 与增量对同一业务日的删除范围互不覆盖（A 中-2）。
-    // 窗内无完整自然日（窗口比一天还窄且不落界）→ 不删，只 upsert。
-    if (!(dayAligned && from > to)) {
-      for (const col of task.write.rangeColumns) {
+  const write = task.write
+  if (write.kind === 'deleteRangeInsert') {
+    if ('instantColumn' in write) {
+      // ⚠️ 行内自带**逐行瞬时时间**的表按 `[start, end)` 精确删（2026-11-03 修，CodeRabbit #59）：
+      // 按自然日删在「窗口起止不在日界」时无解 —— 删整日会把相邻窗写好的边界日整片抹掉
+      // （实测 staff_attendance 边界日 16/24 小时）；改成「只删完整日内」又会把半个边界日里
+      // 被上游撤掉的行永久留下（陈旧行）。逐行时间列能同时避免两头：窗内精确覆盖、窗外不碰。
+      // 列名来自任务声明（代码级），值参数化绑定；`write-contract.ts` 保证它是表的
+      // timeColumn（kind='iso-instant'），与 `toISOString()` 的比较口径一致。
+      await ops.delete(task.table, `"${write.instantColumn}" >= ? AND "${write.instantColumn}" <= ?`,
+        [new Date(range.start).toISOString(), new Date(range.end - 1).toISOString()])
+    } else {
+      const dayAligned = write.rangeAlign === 'shanghaiDay'
+      const from = dayAligned ? shanghaiDayIso(range.start) : new Date(range.start).toISOString()
+      const to = dayAligned ? shanghaiDayIso(range.end - 1) : new Date(range.end).toISOString()
+      // where 是可信代码常量（同 query 红线）：列名来自任务声明（代码级），值参数化绑定。
+      // 范围边界与行内日期列同口径（rangeAlign）：行写「上海天对齐的日期列」时，删除范围
+      // 也必须是天对齐边界——否则 --full 与增量对同一业务日的删除范围互不覆盖（A 中-2）。
+      // ⚠️ 按自然日删**只在窗起止都落在日界时精确**：注册表加载期由 `write-contract.ts`
+      // 校验「rangeAlign='shanghaiDay' ⇒ windowAlign='shanghaiDay'」，不让边界日被邻窗抹掉。
+      for (const col of write.rangeColumns) {
         await ops.delete(task.table, `"${col}" >= ? AND "${col}" <= ?`, [from, to])
       }
     }

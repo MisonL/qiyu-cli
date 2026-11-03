@@ -47,10 +47,24 @@ export interface TaskRunResult {
 
 export type { Range }
 
-/** 写策略（spec §4.2）：报表按范围删旧插新；维度/会话/知识库按主键幂等 upsert。 */
+/**
+ * 写策略（spec §4.2）：报表按范围删旧插新；维度/会话/知识库按主键幂等 upsert。
+ *
+ * `deleteRangeInsert` 的**删除基准是二选一**的（两种都只删「本窗覆盖的那一段」）：
+ *   · 按范围列（日粒度列，`stat_date` 等）删 → 精确前提是每个窗起止都落上海日界；
+ *   · 按行内逐行瞬时时间列删 → `[start, end)` 精确，不依赖日对齐。
+ * 两臂互斥而非「范围列 + 可选覆盖」：考勤表没有按天删除的用法，声明一个没人读的
+ * `rangeColumns` 就是契约谎报（2026-11-03 审查）。选择依据见各臂注释。
+ */
 export type WriteStrategy =
   | {
     kind: 'deleteRangeInsert'
+    /**
+     * 按日粒度范围列删旧。**只有窗起止都落上海日界时才是精确覆盖** ——
+     * 声明本臂的任务必须同时 `windowAlign: 'shanghaiDay'`（首/末残段窗会被跳过、
+     * 末端上限钳制点也在日界；见 engine.ts 的切片与 `isResidualWindow`）。这个前提由
+     * `src/sync/write-contract.ts` 在注册表加载期校验、`tests/sync/delete-boundary-contract.test.ts` 钉住。
+     */
     rangeColumns: string[]
     /**
      * 范围列的对齐口径：'shanghaiDay' = 删除边界按上海自然日零点对齐。
@@ -59,6 +73,21 @@ export type WriteStrategy =
      * 同一个业务日会留下两行（A 中-2 的键分裂）。
      */
     rangeAlign?: 'shanghaiDay'
+  }
+  | {
+    kind: 'deleteRangeInsert'
+    /**
+     * 行内逐行时间列（ISO 字符串，与 `new Date(ms).toISOString()` 同形）：按
+     * `[start, end)` 精确删该列（`>= start AND <= end−1ms`），**不依赖窗是否日对齐**。
+     * 用于窗起止不在日界的表（例：`staff_attendance` 按 31 天从任意起点切窗，行带
+     * `hour_ts`）。按自然日删在这里无解：
+     *   · 按 `[dayOf(start), dayOf(end−1)]` 删 → 会删到相邻窗已经写好的半个边界日
+     *     （实测边界日只剩 16/24 小时）且永不重写；
+     *   · 只删完整自然日 → 半个边界日里被上游撤掉的行永远留着（陈旧行）。
+     * 逐行时间列同时做到「窗内精确覆盖、窗外一行不碰」。该列必须是表声明的
+     * `timeColumn`（kind='iso-instant'）——`write-contract.ts` 校验。
+     */
+    instantColumn: string
   }
   | { kind: 'upsertRows' }
 

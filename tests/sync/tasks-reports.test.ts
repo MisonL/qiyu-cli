@@ -127,9 +127,11 @@ describe('REPORT_TASKS 任务声明', () => {
       expect(t.reportDayRotation, `${t.id} 轮转标记`).toBe(true)
       // A 中-2 钉死：删除边界与行内日期列同口径（上海天对齐）——
       // 否则 --full（start=0）与增量（水位+1ms）对同一业务日的删除范围互不覆盖。
-      expect(t.write, `${t.id} 写策略`).toEqual({
-        kind: 'deleteRangeInsert', rangeColumns: ['stat_date'], rangeAlign: 'shanghaiDay',
-      })
+      // ⚠️ 考勤是唯一例外：31 天窗的起止不落上海日界 → 按逐行 hour_ts 精确删
+      //（按 stat_date 删会抹掉相邻窗的边界日，见 tests/sync/delete-boundary-contract.test.ts）。
+      expect(t.write, `${t.id} 写策略`).toEqual(t.id === 'reports.staff_attendance'
+        ? { kind: 'deleteRangeInsert', instantColumn: 'hour_ts' }
+        : { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'], rangeAlign: 'shanghaiDay' })
       expect(t.primaryKey.length, `${t.id} 主键非空`).toBeGreaterThan(0)
     }
     expect(reportById('reports.overview')!.table).toBe('daily_overview')

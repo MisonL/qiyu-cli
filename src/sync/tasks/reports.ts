@@ -276,8 +276,14 @@ async function staffIds(store: Store): Promise<string[]> {
     .filter((id) => id !== '')
 }
 
-/** 报表任务的通用写策略（A 中-2：删除边界与行内日期列同口径 = 上海天对齐）。 */
+/**
+ * 报表任务的通用写策略（A 中-2：删除边界与行内日期列同口径 = 上海天对齐）。
+ * ⚠️ 只在「窗起止都落在日界」时精确 —— 声明者必须同时 `windowAlign: 'shanghaiDay'`
+ *（注册表加载期由 `write-contract.ts` 校验，见 `tests/sync/delete-boundary-contract.test.ts`）。
+ */
 const RANGE_INSERT: SyncTask['write'] = { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'], rangeAlign: 'shanghaiDay' }
+/** 行内自带逐小时时间戳 → 按窗精确删（`[start, end)`），不碰相邻窗的边界日。 */
+const HOUR_INSERT: SyncTask['write'] = { kind: 'deleteRangeInsert', instantColumn: 'hour_ts' }
 
 export const REPORT_TASKS: SyncTask[] = [
   {
@@ -328,8 +334,9 @@ export const REPORT_TASKS: SyncTask[] = [
     maxWindowDays: 31, overlapDays: 0,
     // ⚠️ **刻意不声明 windowAlign**（2026-11-03 复核）：31 天步长的日对齐网格 + 残段窗
     // 跳过规则会让「水位+1ms 落在日中间」的首窗被整段跳过、再跳到 +31 天，中间 30 天直接
-    // 不抓（日对齐只在 maxWindowDays=1 的任务上安全）。数据不丢靠 `writeRows` 的删除边界
-    // 修复（只删**完整落在窗内**的自然日），见 engine.ts 的注释。
+    // 不抓（日对齐只在 maxWindowDays=1 的任务上安全）。窗不对齐日界就不能按 stat_date 的
+    // 自然日删 —— 改用 `instantColumn: 'hour_ts'`：删除范围跟随窗本身，窗内消失的小时
+    // 精确删、窗外相邻窗写好的小时一行不碰。
     watermark: { field: 'stat_date', initial: null },
     // hour_ts 是响应内唯一可信日期字段（小时对齐时间戳）
     primaryKey: ['staff_id', 'hour_ts'], reportDayRotation: true,
@@ -337,7 +344,8 @@ export const REPORT_TASKS: SyncTask[] = [
     // G 高-1：endTime 不得晚于今天 0:00（14501 endTime is invalid），
     // 且今天 0:00 这条边界不稳定 → 引擎把窗口 end 钳到昨天 0:00（留整日余量）。
     windowEndClamp: 'shanghaiYesterday',
-    write: RANGE_INSERT,
+    // 逐行 hour_ts → 删除按 [start, end) 精确（31 天窗起止不在日界，见 types.ts instantColumn）
+    write: HOUR_INSERT,
     // ⚠️ 请求体恒含 startTime（reportBody 已保证）——省略会静默降级为天粒度、少抓 ~10 倍。
     // 分页 total 收敛拉满（单页 pageSize=1000，31d 实测 17765 行 → 两页），再抽 hour_ts。
     fetch: async (w, ctx) => {
@@ -361,8 +369,7 @@ export const REPORT_TASKS: SyncTask[] = [
         if (isEmptyKey(sid) || !Number.isFinite(n) || n <= 1e11 || n > MAX_SHANGHAI_SAFE_MS) continue
         // 修复批 4：stat_date 按**本行的 hour_ts** 推导上海日（不再用窗口起点）——
         // 31 天窗口里行跨多个自然日，用窗口起点会把它们全标成窗口首日。
-        // 删除范围仍是 [dayOf(w.start), dayOf(w.end)]（writeRows 的天对齐边界），
-        // 覆盖窗内所有天 → 与本行的 stat_date 一致。
+        // 删除范围按 hour_ts ∈ [w.start, w.end)（write 的 instantColumn），与写入逐行同口径。
         mapped.push({ ...baseRow(w, r, nowIso, n), staff_id: String(sid), hour_ts: new Date(n).toISOString() })
       }
       return { rows: mapped, apiCount: mapped.length }

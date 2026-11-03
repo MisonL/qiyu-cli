@@ -128,10 +128,17 @@
     的删除范围是 `[dayOf(start), dayOf(end−1ms)]`，而 31 天窗从任意起点切 —— 下一窗的
     start 落在上一窗末段的那个自然日之内，删除范围从头删掉该日**全部**小时行、随后只重写
     start 之后那些，边界日前半段被删且永不重写（实测 fetched=written=960、零 gap，边界日
-    只有 16/24 小时）。修法：`writeRows` 对天对齐列只删**完整落在窗内**的自然日（首/末半个
-    自然日只 upsert 不删），日对齐窗行为不变、整日内被上游撤掉的行仍会被删。
+    只有 16/24 小时）。修法（两轮收敛）：`deleteRangeInsert` 的删除基准拆成二选一 ——
+    ① 按日粒度范围列删（剩余 8 张报表，窗起止都落上海日界，删除精确覆盖窗）或
+    ② 按行内逐行瞬时时间列删（考勤：`instantColumn: 'hour_ts'`，按 `[w.start, w.end)` 精确删，
+    不依赖日对齐）。中间版本「只删完整落在窗内的自然日」修好了丢数据却留下**陈旧行**
+    （CodeRabbit #59：半个边界日里被上游撤掉的小时永不删、仍 complete）—— 逐行时间列同时
+    做到「窗内精确覆盖、窗外一行不碰」。
     ⚠️ 曾试「给该任务声明 `windowAlign:'shanghaiDay'`」，复核发现 31 天步长的日对齐网格 +
     残段窗跳过会让「水位+1ms 落在日中间」的首窗被跳过后再跳 +31 天、中间 30 天不抓 —— 已回退。
+    两类删除基准的**声明前提**由 `sync/write-contract.ts` 在注册表加载期 fail-fast 校验
+    （按日删 ⇒ 必须 `windowAlign:'shanghaiDay'`；瞬时列删 ⇒ 必须是表的 `timeColumn`
+    且 `kind='iso-instant'`），配 `tests/sync/delete-boundary-contract.test.ts` 双向自检。
   · **staff_quality 不分页，`total=1500` 只取 1000 行仍 complete（严重）**：走 `fetchSimple`
     单次调用、不读 total（C 中-3 的短读终检只在 `pagedRaw` 里）。实测事实（设计稿 §6.2）：
     `staffquality` **分页**且 `sum` 覆盖全集 → 改走 `fetchPagedStaff(..., withSum)`，

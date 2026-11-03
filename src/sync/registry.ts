@@ -9,6 +9,7 @@ import { REPORT_TASKS } from './tasks/reports.js'
 import { TICKET_TASKS } from './tasks/tickets.js'
 import { SESSIONS_TASKS } from './tasks/sessions.js'
 import { KNOWLEDGE_TASKS } from './tasks/knowledge.js'
+import { assertWriteContracts } from './write-contract.js'
 
 /** 全量同步任务注册表：dim 6 + reports 9 + tickets 2 + sessions 1 + knowledge 3 = 21。 */
 export const SYNC_TASKS: SyncTask[] = [
@@ -18,6 +19,10 @@ export const SYNC_TASKS: SyncTask[] = [
   ...SESSIONS_TASKS,
   ...KNOWLEDGE_TASKS,
 ]
+
+// 写策略声明前提的加载期校验（`write-contract.ts`）：声明错了就在此炸，
+// 而不是在某个真实租户的边界日里静默丢/留数据。
+assertWriteContracts(SYNC_TASKS)
 
 /** 按 id 取任务（sync run <id> 的分派入口）。 */
 export function taskById(id: string): SyncTask | undefined {

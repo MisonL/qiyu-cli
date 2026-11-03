@@ -4,7 +4,10 @@
 //   ① staff_attendance 的 31 天窗：窗口起点不在日界时，删除范围 `[dayOf(start), dayOf(end−1ms)]`
 //      会把**相邻窗写好的边界日整片删掉**，只重写 start 之后的小时 —— 边界日前半段被删且
 //      永不重写（修复前实测 fetched=written=960、complete、零 gap，边界日只有 16/24 小时）。
-//      → 修 `writeRows`：天对齐列的删除范围只含**完整落在窗内**的自然日。
+//      → 最终修（CodeRabbit #59 收敛）：`write.instantColumn='hour_ts'`，按 `[w.start, w.end)`
+//      精确删。中间版本「只删完整自然日」修好了丢数据，却留下**陈旧行**（半个边界日里
+//      被上游撤掉的小时永不删）——第三个用例钉住该边。按 stat_date 的自然日删只留给
+//      「窗起止都落日界」的任务（其余报表按天切片），前提由 write-contract.ts 加载期校验。
 //   ② staff_quality 不分页：`fetchSimple` 单次调用不读 total，上游 1500 行只取 1000 仍 complete。
 //      → 改走 `fetchPagedStaff(..., withSum)`（sum 全局行照旧落 staff_id='sum'）。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
@@ -134,6 +137,52 @@ describe('① staff_attendance：窗边界日的整点行不得被相邻窗删�
       }))
       expect(Number((await store.query('SELECT COUNT(*) AS n FROM staff_attendance')).rows[0].n),
         '整日窗必须仍按整日删（陈旧行不得留下）').toBe(12)
+      await store.close()
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('上游撤掉「半个边界日」里的某小时 → 重跑必须删掉该行（陈旧行不得留下）', async () => {
+    // CodeRabbit #59 的边：窗起点不在日界的表（staff_attendance），若只删「完整落在窗内的
+    // 自然日」，半个边界日里被上游撤掉的小时行会**永不删除**（upsert 删不掉不存在的行），
+    // 整轮仍 complete。修法 = 按逐行 hour_ts ∈ [w.start, w.end) 精确删，本用例钉住。
+    const store = await fresh()
+    const rangeStart = shanghaiDayStart(NOW - 45 * DAY) + 11 * HOUR
+    const rangeEnd = rangeStart + 40 * DAY
+    const w2Start = rangeStart + 31 * DAY
+    // 边界日 = 第二窗起始所在的上海自然日；H 取该日 14:00（第二窗的领地，> w2Start）
+    const boundaryDay = shanghaiDayStart(w2Start)
+    const H = boundaryDay + 14 * HOUR
+    const mock = (withdrawH: boolean) => vi.fn(async (_u: string, init?: RequestInit) => {
+      const b = JSON.parse(String(init?.body ?? '{}')) as { startTime: number; endTime: number }
+      const rows: unknown[] = []
+      for (let t = Math.ceil(b.startTime / HOUR) * HOUR; t < b.endTime; t += HOUR) {
+        if (withdrawH && t === H) continue
+        rows.push({ staffId: 1, date: t })
+      }
+      return okC({ result: rows, sum: null, total: rows.length })
+    })
+    try {
+      vi.stubGlobal('fetch', mock(false))
+      const r1 = await runTask(reportById('reports.staff_attendance')!, ctx(store, {
+        rangeOverride: { start: rangeStart, end: rangeEnd },
+      }))
+      expect(r1.status, JSON.stringify(r1.gaps)).toBe('complete')
+      expect(Number((await store.query(
+        'SELECT COUNT(*) AS n FROM staff_attendance WHERE hour_ts = ?', [new Date(H).toISOString()],
+      )).rows[0].n), '前置：H 行已落库').toBe(1)
+      // 上游撤回 H → 重跑整段区间：只有第二窗覆盖 H
+      vi.stubGlobal('fetch', mock(true))
+      const r2 = await runTask(reportById('reports.staff_attendance')!, ctx(store, {
+        rangeOverride: { start: rangeStart, end: rangeEnd },
+      }))
+      expect(r2.status, JSON.stringify(r2.gaps)).toBe('complete')
+      expect(Number((await store.query(
+        'SELECT COUNT(*) AS n FROM staff_attendance WHERE hour_ts = ?', [new Date(H).toISOString()],
+      )).rows[0].n), '被撤回的小时行必须消失（修复前：陈旧行永留）').toBe(0)
+      const day = await store.query(
+        'SELECT COUNT(*) AS n FROM staff_attendance WHERE stat_date = ?',
+        [shanghaiDayIso(boundaryDay)])
+      expect(Number(day.rows[0].n), '边界日其余 23 小时一行不少').toBe(23)
       await store.close()
     } finally { vi.unstubAllGlobals() }
   })
