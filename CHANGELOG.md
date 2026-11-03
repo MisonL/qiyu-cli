@@ -137,8 +137,14 @@
     ⚠️ 曾试「给该任务声明 `windowAlign:'shanghaiDay'`」，复核发现 31 天步长的日对齐网格 +
     残段窗跳过会让「水位+1ms 落在日中间」的首窗被跳过后再跳 +31 天、中间 30 天不抓 —— 已回退。
     两类删除基准的**声明前提**由 `sync/write-contract.ts` 在注册表加载期 fail-fast 校验
-    （按日删 ⇒ 必须 `windowAlign:'shanghaiDay'`；瞬时列删 ⇒ 必须是表的 `timeColumn`
-    且 `kind='iso-instant'`），配 `tests/sync/delete-boundary-contract.test.ts` 双向自检。
+    （按日删 ⇒ 必须**同时** `rangeAlign:'shanghaiDay'` **与** `windowAlign:'shanghaiDay'`；
+    瞬时列删 ⇒ 必须是表的 `timeColumn` 且 `kind='iso-instant'`），配
+    `tests/sync/delete-boundary-contract.test.ts` 双向自检。
+    ⚠️ `rangeAlign` 一档是 CodeRabbit #59 三轮补的：漏声明时引擎落到「非天对齐」分支，
+    拿 `toISOString()` 的瞬时串（`…T00:00:00.000Z`）比日粒度列值（`YYYY-MM-DD`），
+    字符串前缀关系让窗起点那一整日的行永远删不掉（陈旧行）而窗口仍 complete ——
+    实测探针：同一删除条件，日对齐形式删掉 `2026-11-03` 行保留 `2026-11-04`，
+    瞬时串形式两行都在。
   · **staff_quality 不分页，`total=1500` 只取 1000 行仍 complete（严重）**：走 `fetchSimple`
     单次调用、不读 total（C 中-3 的短读终检只在 `pagedRaw` 里）。实测事实（设计稿 §6.2）：
     `staffquality` **分页**且 `sum` 覆盖全集 → 改走 `fetchPagedStaff(..., withSum)`，

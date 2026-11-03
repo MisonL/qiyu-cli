@@ -32,10 +32,21 @@ export function writeContractViolations(task: SyncTask): string[] {
       out.push(`${task.id}：instantColumn '${write.instantColumn}' 必须是表 '${task.table}' 声明的`
         + ` timeColumn 且 kind='iso-instant'（删除值与 new Date(ms).toISOString() 同形的前提）`)
     }
-  } else if (write.rangeAlign === 'shanghaiDay' && task.windowAlign !== 'shanghaiDay') {
-    out.push(`${task.id}：rangeAlign='shanghaiDay' 的按日删除只在窗起止都落日界时精确，`
-      + `但任务未声明 windowAlign='shanghaiDay' —— 边界日会被相邻窗整片删掉；`
-      + `让窗对齐到日界，或改用 instantColumn（行内有逐行时间列时）`)
+  } else {
+    // 两条独立判据（CodeRabbit #59 三轮）：漏声明 rangeAlign 不会落进「对齐」分支，
+    // 引擎于是拿 `toISOString()` 的瞬时串（…T00:00:00.000Z）去比日粒度列值（YYYY-MM-DD）——
+    // 字符串前缀关系让窗起点**那一整日**的行永远删不掉（陈旧行），窗口仍报 complete。
+    if (write.rangeAlign !== 'shanghaiDay') {
+      out.push(`${task.id}：按日粒度范围列（${write.rangeColumns.join(', ')}）删旧必须声明`
+        + ` rangeAlign='shanghaiDay' —— 否则引擎用 ISO 瞬时串与日粒度列值比较，`
+        + `窗起点那一日的行永远删不掉（静默留陈旧行、窗口仍 complete）；`
+        + `行内若有逐行时间列，改用 instantColumn`)
+    }
+    if (task.windowAlign !== 'shanghaiDay') {
+      out.push(`${task.id}：按日粒度范围列删旧只在窗起止都落上海日界时精确，`
+        + `但任务未声明 windowAlign='shanghaiDay' —— 边界日会被相邻窗整片删掉；`
+        + `让窗对齐到日界，或改用 instantColumn（行内有逐行时间列时）`)
+    }
   }
   return out
 }

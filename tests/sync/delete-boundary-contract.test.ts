@@ -27,7 +27,26 @@ describe('写策略声明契约（双向自检）', () => {
     } as SyncTask
     const v = writeContractViolations(t)
     expect(v.length).toBe(1)
-    expect(v[0]).toMatch(/rangeAlign='shanghaiDay'.*未声明 windowAlign='shanghaiDay/)
+    expect(v[0]).toMatch(/未声明 windowAlign='shanghaiDay/)
+  })
+
+  it('按日删但**省略 rangeAlign**（windowAlign 正确）→ 报错（CodeRabbit #59 三轮）', () => {
+    // 省略 rangeAlign 时引擎落到「非天对齐」分支：用 toISOString() 的瞬时串
+    // （2026-11-03T00:00:00.000Z）比日粒度列值（2026-11-03）—— 字符串前缀关系让
+    // 窗起点那一整日的行永远删不掉（上游撤回的行留成陈旧行），窗口仍报 complete。
+    const t: SyncTask = {
+      id: 'test', table: 'staff_workload', windowAlign: 'shanghaiDay',
+      write: { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'] },
+    } as SyncTask
+    const v = writeContractViolations(t)
+    expect(v.length).toBe(1)
+    expect(v[0]).toMatch(/必须声明 rangeAlign='shanghaiDay/)
+    // 反例：两样都缺时两条判据各报一次（逐条点名成因，不漏其中一条）
+    const both: SyncTask = {
+      id: 'test', table: 'staff_workload',
+      write: { kind: 'deleteRangeInsert', rangeColumns: ['stat_date'] },
+    } as SyncTask
+    expect(writeContractViolations(both).length).toBe(2)
   })
 
   it('按日删 + windowAlign 正确 → 通过', () => {
