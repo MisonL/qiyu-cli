@@ -285,8 +285,8 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
           ? {
             gapHint: {
               reason: 'knowledge_row_malformed' as const,
-              detail: `knowledge.categories: ${dropped} 个类目节点缺 id 被丢弃（连同其子树；`
-                + '快照全删重插下这些类目已消失）——接口 ai.knowledge.getCategoryTree 的'
+              detail: `knowledge.categories: ${dropped} 个类目节点被丢弃（自身或祖先缺 id，`
+                + '连同其子树；快照全删重插下这些类目已消失）——接口 ai.knowledge.getCategoryTree 的'
                 + '响应形态漂移，请核对',
             },
           }

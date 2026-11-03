@@ -395,7 +395,8 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 （该窗未写入）；其余都是**成功窗上的提示**（窗口数据照常提交）—— `gaps` 非空不等于同步失败。
 但「提示」**不等于「数据没缺」**，两档要分开读：
 `knowledge_row_malformed` / `staff_id_list_malformed` / `row_missing_key` 描述的行**确实没落库**
-（`detail` 是丢失规模，必须核对上游形态）；`filter_matched_no_staff` /
+（`detail` 是丢失规模，必须核对上游形态；⚠️ `staff_id_list_malformed` 的整组一档只给
+**受影响的组数**与「成员数未知」—— 它不是行数，别当规模直接用）；`filter_matched_no_staff` /
 `export_fixture_unreported` / `export_window_mismatch` 则**未必缺数据**
 （可能只是筛选没命中、或空窗本来就空，按 `detail` 判断）。
 新增 reason 必须同时更新本表与源码枚举（`tests/sync-enums.test.ts` 双向核对）。

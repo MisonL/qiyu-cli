@@ -530,6 +530,31 @@ describe('报表任务 fetch（http mock）', () => {
     }
   })
 
+  it('#5：staff_attendance 两类丢弃分开点名（缺 staffId ≠ date 非法，CodeRabbit #61）', async () => {
+    // 变异「把两类合并成一个数/一句话」→ 本用例红（运维会被引向错误的成因）。
+    const H = 3_600_000
+    const BASE = 1_700_000_000_000 - (1_700_000_000_000 % H)
+    const fetchMock = respondQueue([
+      () => okC({ result: [
+        { date: BASE },                        // 缺 staffId
+        { staffId: 1000002, date: 'bad' },     // date 非法
+        { staffId: 1000002, date: BASE },      // 合法
+      ], total: 3 }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.staff_attendance')!, ctx(store))
+      expect(r.status).toBe('complete')
+      const detail = String((r.gaps[0] as { detail?: string } | undefined)?.detail ?? '')
+      expect(detail).toContain('1 行缺 staffId')
+      expect(detail).toContain('1 行的 date 不是合法毫秒时间戳')
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('#5：staff_workload 缺 staffId 键的行被丢弃并记 row_missing_key（窗口仍 complete）', async () => {
     // 变异「fetchPagedStaff 的丢弃不计数」→ 本用例红（gaps 为空）。
     const fetchMock = respondQueue([

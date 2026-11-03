@@ -158,23 +158,43 @@ async function fetchPagedStaff(taskId: string, w: WindowRef, ctx: FetchCtx,
     mapped.push(row)
   }
   if (withSum && sum) mapped.push({ ...baseRow(w, sum, nowIso), staff_id: 'sum' })
-  return { rows: mapped, apiCount: mapped.length, ...droppedHint(taskId, dropped, 'staffId') }
+  return { rows: mapped, apiCount: mapped.length, ...droppedHint(taskId, dropped, `缺 staffId（主键列，缺键或空串）`) }
 }
 
 /**
- * 行被丢弃（缺主键列）时的 task gapHint（`row_missing_key`）。
+ * 行被丢弃时的 task gapHint（`row_missing_key`）。
  *
  * ⚠️ 为什么必须记（审查 #5，2026-11-03）：`apiCount` 取的是**过滤后**的行数，
  * 配对核对（写库行数 vs apiCount）恒等，缺键行于是**静默消失** —— 窗口照样
  * `status: complete`、`fetched == written`，Agent 无从知道上游有一批行没进库。
  * 这类行是真的没落库（`TASK_GAP_LOSSY_REASONS` 档），必须留痕。
+ *
+ * `what` 是**丢弃成因的完整描述**（不是列名）—— 成因必须点名真正给坏值的那个东西
+ * （CodeRabbit #61：把「date 不是合法时间戳」写成「缺主键列」会把运维引向错的条件）。
  */
-function droppedHint(taskId: string, dropped: number, keyName: string): { gapHint?: FetchResult['gapHint'] } {
+function droppedHint(taskId: string, dropped: number, what: string): { gapHint?: FetchResult['gapHint'] } {
   if (dropped === 0) return {}
   return {
     gapHint: {
       reason: 'row_missing_key',
-      detail: `${taskId}: ${dropped} 行缺 ${keyName}（主键列，缺键或空串）被丢弃、未落库`
+      detail: `${taskId}: ${dropped} 行${what}被丢弃、未落库`
+        + ' —— 上游响应形态漂移，请核对接口返回；本次按已落库的行覆盖窗口',
+    },
+  }
+}
+
+/**
+ * 一行被丢弃时的 gapHint：`dropped` 是按成因分好的几档（每档一个规模 + 一句说明）。
+ * 多个成因时合成一条（引擎每窗只有一个 gapHint），但**逐档点名**、不合并成一个数。
+ */
+function droppedHintParts(taskId: string, parts: Array<[number, string]>): { gapHint?: FetchResult['gapHint'] } {
+  const nonZero = parts.filter(([n]) => n > 0)
+  if (nonZero.length === 0) return {}
+  const detail = nonZero.map(([n, what]) => `${n} 行${what}`).join('；')
+  return {
+    gapHint: {
+      reason: 'row_missing_key',
+      detail: `${taskId}: ${detail}被丢弃、未落库`
         + ' —— 上游响应形态漂移，请核对接口返回；本次按已落库的行覆盖窗口',
     },
   }
@@ -370,7 +390,8 @@ export const REPORT_TASKS: SyncTask[] = [
       const nowIso = nowIsoOf(ctx)
       const { rows } = await pagedRaw('reports.staff_attendance', w, ctx)
       const mapped: Record<string, unknown>[] = []
-      let dropped = 0
+      let badKey = 0
+      let badTs = 0
       for (const r of rows) {
         const sid = r.staffId ?? r.staffid
         const ts = r.date   // 该小时按小时对齐的时间戳
@@ -384,12 +405,11 @@ export const REPORT_TASKS: SyncTask[] = [
         //（与读侧「一条脏值炸整条命令」同一失败模式）。上界取 `MAX_SHANGHAI_SAFE_MS`
         // 而不是 `MAX_DATE_MS`：两者都要「能回显成 +08:00 ISO」，差 8h 就会在
         // `shanghaiDayIso` 的偏移后一段重新抛。
+        // 丢弃的两类分开计数（CodeRabbit #61）：缺 staff_id 是「缺主键列」，
+        // date 非数字/秒级/越界是「脏时间戳」—— 两者的动作不同，不能混成一句。
         const n = Number(ts)
-        // 丢弃的两类（缺 staff_id 键 / 脏时间戳）都计数，见下 gapHint（审查 #5）。
-        if (isEmptyKey(sid) || !Number.isFinite(n) || n <= 1e11 || n > MAX_SHANGHAI_SAFE_MS) {
-          dropped++
-          continue
-        }
+        if (isEmptyKey(sid)) { badKey++; continue }
+        if (!Number.isFinite(n) || n <= 1e11 || n > MAX_SHANGHAI_SAFE_MS) { badTs++; continue }
         // 修复批 4：stat_date 按**本行的 hour_ts** 推导上海日（不再用窗口起点）——
         // 31 天窗口里行跨多个自然日，用窗口起点会把它们全标成窗口首日。
         // 删除范围按 hour_ts ∈ [w.start, w.end)（write 的 instantColumn），与写入逐行同口径。
@@ -397,7 +417,10 @@ export const REPORT_TASKS: SyncTask[] = [
       }
       return {
         rows: mapped, apiCount: mapped.length,
-        ...droppedHint('reports.staff_attendance', dropped, 'staffId 或可信时间戳（date）'),
+        ...droppedHintParts('reports.staff_attendance', [
+          [badKey, '缺 staffId（主键列，缺键或空串）'],
+          [badTs, '的 date 不是合法毫秒时间戳（非数字/秒级/越界，无法作为 hour_ts）'],
+        ]),
       }
     },
   },
@@ -437,7 +460,7 @@ export const REPORT_TASKS: SyncTask[] = [
         if (sum) mapped.push({ ...baseRow(w, sum, nowIso), order_id: `sum:${shanghaiDayIso(w.start)}` })
         return {
           rows: mapped, apiCount: mapped.length,
-          ...droppedHint('reports.order_performance', dropped, 'orderId'),
+          ...droppedHint('reports.order_performance', dropped, '缺 orderId（主键列，缺键或空串）'),
         }
       } catch (e) {
         if ((e as { kind?: string }).kind === 'filter_matched_no_staff') {
