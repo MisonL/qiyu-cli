@@ -1282,8 +1282,10 @@ async function linkAgents(
       shape = dirShape(dir)
     } catch (err) {
       // 审查 M1：agent 目录不可检查（EACCES 等）时收敛进 warnings，不让安装失败。
+      // ⚠️ state 记 `unknown`（不是 missing）：dirShape 抛出的 ELOOP/EACCES 下
+      // 路径**存在**——只是判定不了形态（CodeRabbit #60）。missing 含义是「不存在」。
       warnings.push(`检查 ${agent} 的 skills 目录失败（${errMsg(err)}），跳过建链：${dir}`)
-      links.push({ agent, path: path.join(dir, LINK_NAME), state: 'missing' })
+      links.push({ agent, path: path.join(dir, LINK_NAME), state: 'unknown', error: errMsg(err) })
       continue
     }
     if (shape === 'absent') {

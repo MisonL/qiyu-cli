@@ -634,6 +634,30 @@ describe('skill where', () => {
     expect(metaWarnings()).not.toContain('content_hash')
   })
 
+  it('正文被改过 + 清单契约号也不同 → 仍 compatible:null，且不得断言「不配套」', async () => {
+    // CodeRabbit #60：旧实现里这两条警告会同时出现 —— 一条说 compatible:null、
+    // 另一条说「正文与 CLI 不配套」，同一份输出自相矛盾（清单号描述的是旧正文，
+    // 没有依据判断当前正文配不配套）。变异「不配套警告不受 bodyVerified 约束」→ 本用例红。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const p = join(entity, '.qiyu-skill.json')
+    const m = JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>
+    m.skill_contract_version = SKILL_CONTRACT_VERSION + 1
+    writeFileSync(p, JSON.stringify(m, null, 2))
+    writeFileSync(join(entity, 'SKILL.md'), readFileSync(join(entity, 'SKILL.md'), 'utf8') + '\n手工追加\n')
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({
+      installed: { skill_contract_version: SKILL_CONTRACT_VERSION + 1, compatible: null },
+    })
+    const w = metaWarnings()
+    expect(w).toContain('content_hash')
+    // 清单号仍要报出来（它是唯一线索），但要说清它描述的是旧正文。
+    expect(w).toContain(`安装清单记录的契约版本为 ${SKILL_CONTRACT_VERSION + 1}`)
+    expect(w).toContain('该记录描述的是旧正文')
+    // 与「确实不配套」那条警告分开：这里没有依据说当前正文不配套。
+    expect(w).not.toContain('正文与 CLI 不配套')
+  })
+
   it('自指循环链接（ELOOP）不崩：该 agent 记 unknown 并进 warnings，其余照常', async () => {
     mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
     mkdirSync(join(home, '.codex', 'skills'), { recursive: true })

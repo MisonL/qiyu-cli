@@ -749,6 +749,8 @@ describe('installSkill', () => {
   })
 
   it('linkDirs 的父路径是文件（ENOTDIR）时收敛进 warnings，不让安装失败（审查 M1）', async () => {
+    // CodeRabbit #60：state 必须是 unknown —— dirShape 抛错说明**判定不了**路径形态
+    // （父级是文件时连「这个路径存在吗」都说不出来），missing 是编造。
     const src = makeSource()
     const blocker = join(home, 'blocker')
     writeFileSync(blocker, '')
@@ -759,7 +761,10 @@ describe('installSkill', () => {
     })
 
     expect(r.status).toBe('installed')
-    expect(r.links).toEqual([{ agent: unreachable, path: join(unreachable, 'qiyu'), state: 'missing' }])
+    expect(r.links).toEqual([{
+      agent: unreachable, path: join(unreachable, 'qiyu'), state: 'unknown',
+      error: expect.stringContaining('ENOTDIR'),
+    }])
     expect(r.warnings.some((w) => w.includes('检查') && w.includes(unreachable))).toBe(true)
   })
 

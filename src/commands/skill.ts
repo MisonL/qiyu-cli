@@ -1205,36 +1205,46 @@ async function skillWhere(argv: string[]): Promise<number> {
       } catch {
         // 读不动（EACCES 等）→ 判定不了；由下面的警告点名，不编造。
       }
-      const bodyMatches = bodyHash !== null && bodyHash === info.contentHash
+      // `bodyVerified`：清单描述的正文就是磁盘上这份吗？只有它为真，清单里的契约号
+      // 才是在描述「手上的正文」——否则那个号属于旧正文，不能拿来报 `兼容/不兼容`。
+      const bodyVerified = bodyHash !== null && bodyHash === info.contentHash
+      const contractMismatch = info.skillContractVersion !== SKILL_CONTRACT_VERSION
       entity.installed = {
         version: info.version,
         skill_contract_version: info.skillContractVersion,
-        compatible: bodyMatches ? info.skillContractVersion === SKILL_CONTRACT_VERSION : null,
+        compatible: bodyVerified ? !contractMismatch : null,
       }
+      // 清单号与 CLI 不同时，附一句「这个号描述的是哪份正文」——三种实况分开说，
+      // 不让「正文改过」与「确实不配套」共用一句「不配套」（审查 #10 的连带面：
+      // compatible:null 配一句断言不配套的警告，是同一输出里自相矛盾）。
+      const manifestNote = contractMismatch
+        ? `（安装清单记录的契约版本为 ${info.skillContractVersion}，当前 CLI 是 ${SKILL_CONTRACT_VERSION}）`
+        : ''
       if (bodyHash === null) {
         warnings.push(
-          `已安装正文无法读取，无法确认是否与安装清单一致：${entityDir} —— compatible 因此为 null`,
+          `已安装正文无法读取，无法确认是否与安装清单一致：${entityDir} —— compatible 因此为 null`
+          + manifestNote,
         )
-      } else if (!bodyMatches) {
+      } else if (!bodyVerified) {
         // 契约号来自清单、清单描述的是旧正文：这时候报 true/false 都是在给改过的
         // 正文背书。`--force` 是收敛动词（覆盖正文并按当前包装清单）。
         warnings.push(
           '已安装正文与安装清单记录的 content_hash 不一致（正文被手工改过或写入不完整）'
           + ' —— 契约判定只对清单描述的那份正文成立，compatible 因此为 null；'
-          + '运行 `qiyu skill install --force` 可覆盖为包内正文',
+          + '运行 `qiyu skill install --force` 可覆盖为包内正文'
+          + (contractMismatch ? `${manifestNote}，但该记录描述的是旧正文，不能据此判断当前正文配不配套` : ''),
+        )
+      } else if (contractMismatch) {
+        // ⚠️ 必须推 `--force`（2026-10-26 实测）：正文一改，实体内容哈希就与包内不同，
+        // `planInstall` 此时**不带 --force 一律 skipped + 零写入**——照旧文案推
+        // `qiyu skill install`，用户跑完契约号仍是旧值、警告照旧，等于指了条死路。
+        // `--force` 是两种形态都收敛的动词：正文确实不同 → 覆盖；正文恰好一致但清单
+        // 落后 → 走 rewrite-manifest（该分支排在 force 判断之前），同样把号补正。
+        warnings.push(
+          `已安装的 skill 契约版本为 ${info.skillContractVersion}，当前 CLI 是 ${SKILL_CONTRACT_VERSION}`
+          + ' —— 正文与 CLI 不配套；运行 `qiyu skill install --force` 更新正文',
         )
       }
-    }
-    if (info !== null && info.skillContractVersion !== SKILL_CONTRACT_VERSION) {
-      // ⚠️ 必须推 `--force`（2026-10-26 实测）：正文一改，实体内容哈希就与包内不同，
-      // `planInstall` 此时**不带 --force 一律 skipped + 零写入**——照旧文案推
-      // `qiyu skill install`，用户跑完契约号仍是旧值、警告照旧，等于指了条死路。
-      // `--force` 是两种形态都收敛的动词：正文确实不同 → 覆盖；正文恰好一致但清单
-      // 落后 → 走 rewrite-manifest（该分支排在 force 判断之前），同样把号补正。
-      warnings.push(
-        `已安装的 skill 契约版本为 ${info.skillContractVersion}，当前 CLI 是 ${SKILL_CONTRACT_VERSION}`
-        + ' —— 正文与 CLI 不配套；运行 `qiyu skill install --force` 更新正文',
-      )
     }
   }
 

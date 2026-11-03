@@ -35,8 +35,9 @@ export function versionFieldNotes(): Record<string, string> {
     skill_contract_version: 'CLI 自己的正文契约号 —— 不是已安装那份的。'
       + '要判断已安装的 skill 正文能否配这份 CLI，拿它与 `skill where` 的 '
       + 'entity.installed.skill_contract_version 比，相等才配。'
-      + '⚠️ 本字段只读安装清单、不核正文内容 —— `skill where` 会拿实体当前内容'
-      + '与清单记录的 content_hash 比对：正文被手工改过（或读不动）时，'
+      + '⚠️ `--version` 既不读安装清单、也不读已安装正文：这个值是 CLI 自己的常量，'
+      + '上文「相等才配」只是拿它与 `skill where` 报出的数比。那个数的可靠性由 `skill where` 兜：'
+      + '它会拿实体当前内容与清单记录的 content_hash 比对，正文被手工改过（或读不动）时'
       + '`entity.installed.compatible` 报 null（判定不了），不会拿旧清单给改过的正文背书。'
       + '⚠️ 清单缺失或损坏时整个 entity.installed 是 null（不是它下面某个字段为 null）——'
       + '先判 entity.installed 非 null 再读，也不要把 null 当 0',

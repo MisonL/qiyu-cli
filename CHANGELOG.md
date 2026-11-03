@@ -132,7 +132,9 @@
     `compatible:true`，而 SKILL.md 教 Agent「就看这一个字段」。现在 `where` 拿实体当前内容哈希与
     清单记录的 `content_hash` 比：不一致（或正文读不动）→ `compatible:null`（判定不了，
     不是 `false`）+ 点名 `--force` 的警告。四个载体（SKILL.md / README / where 的
-    `field_notes` / `--version` 的 `field_notes`）同步收窄口径。
+    `field_notes` / `--version` 的 `field_notes`）同步收窄口径；「正文与 CLI 不配套」这条
+    断言只在正文与清单一致时出现 —— 否则同一份输出里 `compatible:null` 与「不配套」自相矛盾
+    （CodeRabbit #60）。
   · **#11 agent 的 skills 路径被普通文件占住：where 报 unknown+ENOTDIR、install 报 missing+
     「目录不存在」（事实错误）**：两边现在都先走 `dirShape`，同报 `unknown` +
     「路径存在但不是目录」。
@@ -142,7 +144,9 @@
     路径不存在/不是目录；其余 I/O 错误看具体路径。
   · **#13 真实安装对 ELOOP 自环链接报 `foreign`、dry-run 与 where 报 `unknown`**：
     `foreign` 的释义是「路径上是别人的东西」，而 ELOOP 是连它是什么都判定不了。install 统一
-    改记 `unknown`（`LINK_REPORT_STATES` 报告域，来自 `paths.ts`），动作不变——不触碰。
+    改记 `unknown`（`LINK_REPORT_STATES` 报告域，来自 `paths.ts`），动作不变——不触碰；
+    agent 目录本身无法检查（EACCES/ELOOP）时 links 同样记 `unknown` 而非 `missing`
+    （CodeRabbit #60：`missing` 含义是「不存在」，而那里只是判定不了）。
 
   每条配变异验证（4 个变异各自令对应用例红），全量 582 用例 / 4 分片通过。
 
