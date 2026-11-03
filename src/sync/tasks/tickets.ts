@@ -164,12 +164,15 @@ async function fetchTickets(w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
  * （两处各写一份是有意的：tickets 与 reports 是两个任务文件，分层上不互相 import；
  * `tests/sync-enums.test.ts` 保证 reason 值同属一个枚举、README 图例只释义一次。）
  */
-function droppedTicketHint(taskId: string, dropped: number, keyName: string): { gapHint?: FetchResult['gapHint'] } {
-  if (dropped === 0) return {}
+function droppedTicketHint(taskId: string, dropped: number, keyName: string, skippedTickets = 0): { gapHint?: FetchResult['gapHint'] } {
+  if (dropped === 0 && skippedTickets === 0) return {}
+  const parts: string[] = []
+  if (dropped > 0) parts.push(`${dropped} 行缺 ${keyName}（主键列，缺键或空串）被丢弃、未落库`)
+  if (skippedTickets > 0) parts.push(`${skippedTickets} 张 touched 工单缺 ${keyName}，其日志整单未拉取（规模未知）`)
   return {
     gapHint: {
       reason: 'row_missing_key',
-      detail: `${taskId}: ${dropped} 行缺 ${keyName}（主键列，缺键或空串）被丢弃、未落库`
+      detail: `${taskId}: ${parts.join('；')}`
         + ' —— 上游响应形态漂移，请核对接口返回；本次按已落库的行覆盖窗口',
     },
   }
@@ -185,8 +188,13 @@ async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult
   const nowIso = nowIsoOf(ctx)
   // —— touched 工单：与 tickets.search 同窗同分页（同一份实现，短读/翻页上限语义一致）——
   const touched: string[] = []
+  let skippedTickets = 0
   for (const r of await searchAllPages(w, ctx)) {
-    if (!isEmptyKey(r.id)) touched.push(String(r.id))
+    // 缺 id 的 touched 工单：**它的日志整单拉不到**（CodeRabbit #61）。这不是「丢了日志
+    // 行」（行都没请求过），必须与 droppedLogs 分开计数并留痕——否则本轮 complete 而
+    // 这张工单的日志一行都没有。
+    if (isEmptyKey(r.id)) { skippedTickets++; continue }
+    touched.push(String(r.id))
   }
   // —— 逐单拉日志 ——
   const out: Record<string, unknown>[] = []
@@ -214,7 +222,12 @@ async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult
       out.push({ ticket_id: tid, log_id: String(logId), payload: JSON.stringify(r), synchronized_at: nowIso })
     }
   }
-  return { rows: out, apiCount: out.length, ...droppedTicketHint('tickets.logs', droppedLogs, 'id') }
+  return {
+    rows: out, apiCount: out.length,
+    // 两种丢失合成一条缺口（引擎每窗只有一个 gapHint）：缺 id 的日志行 + 因缺 id 而
+    // 整单没拉日志的 touched 工单。detail 分开点名，规模不可混为一谈。
+    ...droppedTicketHint('ticket.logs', droppedLogs, 'id', skippedTickets),
+  }
 }
 
 export const TICKET_TASKS: SyncTask[] = [

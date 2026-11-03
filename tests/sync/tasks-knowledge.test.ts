@@ -310,8 +310,9 @@ describe('knowledge.categories —— 按 robotId 隔离（驱动序来自 knowl
   })
 
   it('#5：缺 id 的类目节点连同子树被丢弃 → knowledge_row_malformed gap（规模如实计入子树）', async () => {
-    // 变异「flattenTree 的丢弃不计数 / 不记 gapHint」→ 本用例红。丢一个节点时它的
-    // 后代同样没落库（不再递归），所以 detail 的规模是 3（1 个坏节点 + 2 个后代）。
+    // 变异「flattenTree 的丢弃不计数 / 不记 gapHint」→ 本用例红。空串 id 也与缺键同判
+    // （CodeRabbit #61）。丢一个节点时它的后代同样没落库（不再递归），所以规模是 4
+    //（1 个坏节点 + 2 个后代 + 1 个空串 id 节点）。
     const store = await fresh()
     const stamp = '2026-10-15T00:00:00.000Z'
     await store.upsert('knowledge_items', [{ id: '1', robot_id: '1000001', robot_name: null,
@@ -322,6 +323,7 @@ describe('knowledge.categories —— 按 robotId 隔离（驱动序来自 knowl
           { id: 500009, name: '后代 1', children: null },
           { id: 500010, name: '后代 2', children: null },
         ] },
+        { id: '', name: '空串 id 节点（CodeRabbit #61：与缺键同判）', children: null },
         { id: 500002, name: '好节点', children: null },
       ] },
     ]
@@ -333,7 +335,7 @@ describe('knowledge.categories —— 按 robotId 隔离（驱动序来自 knowl
       expect(res.rows.map((r) => String(r.category_id)).sort()).toEqual(['500001', '500002'])
       expect(res.gapHint).toEqual({
         reason: 'knowledge_row_malformed',
-        detail: expect.stringMatching(/3 个类目节点/),
+        detail: expect.stringMatching(/4 个类目节点/),
       })
       await store.close()
     } finally {

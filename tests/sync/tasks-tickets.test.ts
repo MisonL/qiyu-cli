@@ -293,6 +293,32 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
     }
   })
 
+  it('#5：缺 id 的 touched 工单 → 其日志整单未拉，gap 点名「未拉取」而不冒充丢行（CodeRabbit #61）', async () => {
+    // 变异「skippedTickets 不计数」→ 本用例红（gaps 为空、本轮静默 complete）。
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => okC({ total: 2, tickets: [{ id: 900001 }, {}] }))
+      .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify({
+        code: 200, message: 'OK', data: [{ id: 11, action: '更新工单' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(ticketById('ticket.logs')!, ctx(store, {
+        rangeOverride: { start: NOW - DAY, end: NOW },
+      }))
+      expect(r.status).toBe('complete')
+      expect(r.rows).toEqual({ fetched: 1, written: 1 })
+      const detail = String((r.gaps[0] as { detail?: string } | undefined)?.detail ?? '')
+      expect(detail).toContain('1 张 touched 工单')
+      expect(detail).toContain('整单未拉取')
+      // 未拉取 ≠ 丢了日志行：不能把这张工单写成「N 行被丢弃」
+      expect(detail).not.toMatch(/\d+ 行缺 id/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('ticket.logs：按窗口内 touched 工单逐张拉日志（响应 data 数组），行补 ticket_id/log_id（缺 id 行丢弃并留痕）', async () => {
     // 第一调：search 返回 2 张工单；后续各调：log 返回该单的日志（id 即日志 id）
     const fetchMock = vi.fn()
@@ -318,7 +344,7 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
       // 审查 #5：丢的那 1 行必须留痕（同一形态在 reports/tickets 都要有 gap），
       // 否则窗口 complete 而这一单的日志无声消失。变异「tickets 的丢弃不记 gap」→ 红。
       expect(r.gaps).toEqual([
-        expect.objectContaining({ reason: 'row_missing_key', detail: expect.stringContaining('tickets.logs') }),
+        expect.objectContaining({ reason: 'row_missing_key', detail: expect.stringContaining('ticket.logs') }),
       ])
       await store.close()
     } finally {

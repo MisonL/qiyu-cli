@@ -139,6 +139,12 @@ function projectRows(rows: Record<string, unknown>[],
 }
 
 /**
+ * 空串主键拒绝（C 低-7，与 dim/reports/tickets/sessions 同一判据）：`''` 是合法的
+ * VARCHAR 值，落库后会被 upsert 主键语义当成同一个键反复覆盖。
+ */
+const isEmptyKey = (v: unknown): boolean => v === null || v === undefined || v === ''
+
+/**
  * 类目树拍平（children 在叶子上为 null，实测形态——空数组/null 都没有子节点）。
  *
  * 返回**被丢弃的节点数**（审查 #5，2026-11-03）：缺 id 的脏节点此前静默 `continue`
@@ -152,7 +158,9 @@ function flattenTree(robotId: string, nodes: unknown, level: number,
   let dropped = 0
   for (const n of nodes as Record<string, unknown>[]) {
     const cid = n.id
-    if (cid === null || cid === undefined) { dropped += 1 + countNodes(n.children); continue }
+    // 空串 id 与缺键同等对待（CodeRabbit #61）：`''` 是合法的 VARCHAR 值，落库后会被
+    // 当成同一个主键反复覆盖 —— 与其余任务「空主键行绝不落库」的红线同口径。
+    if (isEmptyKey(cid)) { dropped += 1 + countNodes(n.children); continue }
     const sId = String(cid)
     out.push({ robot_id: robotId, category_id: sId, name: typeof n.name === 'string' ? n.name : null,
       parent_id: parentId, level, payload: JSON.stringify(n), synchronized_at: nowIso })
