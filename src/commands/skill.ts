@@ -40,7 +40,7 @@ import { COMMAND_TREE } from './tree.js'
 import { prettyAfterSubcommand } from './spec-types.js'
 import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult, type ViolationRule } from '../skill/check.js'
-import { contentHash, installSkill, planInstall, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
+import { contentHash, fileHash, installSkill, listFiles, planInstall, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
 import {
   ENTITY_SOURCES, entityUndeterminedNote, npmRelativeBase, readInstalledManifestInfo,
   resetSkillDetectionCache, resolveEntityDirSources, resolveSkillSourceDir,
@@ -1199,15 +1199,51 @@ async function skillWhere(argv: string[]): Promise<number> {
   if (entityUsable) {
     const info = readInstalledManifestInfo(entityDir)
     if (info !== null) {
-      let bodyHash: string | null = null
-      try {
-        bodyHash = contentHash(entityDir)
-      } catch {
-        // 读不动（EACCES 等）→ 判定不了；由下面的警告点名，不编造。
-      }
       // `bodyVerified`：清单描述的正文就是磁盘上这份吗？只有它为真，清单里的契约号
       // 才是在描述「手上的正文」——否则那个号属于旧正文，不能拿来报 `兼容/不兼容`。
-      const bodyVerified = bodyHash !== null && bodyHash === info.contentHash
+      //
+      // ⚠️ 判据是**受管文件**而不是整个实体目录的总哈希（CodeRabbit #60 实测）：
+      // `contentHash(entityDir)` 会把用户自己放进实体的额外文件也算进去，而 `--force`
+      // 刻意不删它们（`cleanupPreviousManaged`）——只比总哈希的话，多一个用户文件就会
+      // 永远报「正文被改过」，而我们推的 `--force` 根本修不好（实测：装好后加
+      // `my-notes.md` → compatible:null，--force 之后仍是 null）。所以：
+      //   · 受管文件逐个比对（清单 `files` + 逐文件 `file_hashes`）；
+      //   · 受管文件都一致但总哈希仍不同 → 正文没被改，差异只在额外文件上
+      //     （额外文件单独进 warnings，不改变配套结论）；
+      //   · 旧清单没有 files/file_hashes → 无从核对受管集，退回总哈希（宁严不宽，
+      //     额外文件会被算成「正文被改过」——那种清单本来也判不出正文是不是旧的）。
+      let bodyVerified = false
+      // `bodyUnreadable` 与「不一致」分开：读不动是环境问题，不是正文漂移。
+      let bodyUnreadable = false
+      let extraFiles: string[] | null = null
+      if (info.files !== undefined && info.fileHashes !== undefined) {
+        const managed = new Set(info.files)
+        let managedOk = true
+        for (const rel of info.files) {
+          let hash: string | null = null
+          try {
+            hash = fileHash(join(entityDir, rel))
+          } catch {
+            // 受管文件缺失/读不动 = 正文不完整，按「被改过」处理。
+          }
+          if (hash === null || hash !== info.fileHashes[rel]) { managedOk = false; break }
+        }
+        bodyVerified = managedOk
+        if (managedOk) {
+          try {
+            // 受管文件一致：额外（非受管）文件不影响正文判定，但要说出来。
+            extraFiles = listFiles(entityDir).filter((rel) => !managed.has(rel))
+          } catch {
+            // 列不出目录不影响「正文一致」的结论，额外文件就不报。
+          }
+        }
+      } else {
+        try {
+          bodyVerified = contentHash(entityDir) === info.contentHash
+        } catch {
+          bodyUnreadable = true
+        }
+      }
       const contractMismatch = info.skillContractVersion !== SKILL_CONTRACT_VERSION
       entity.installed = {
         version: info.version,
@@ -1220,7 +1256,7 @@ async function skillWhere(argv: string[]): Promise<number> {
       const manifestNote = contractMismatch
         ? `（安装清单记录的契约版本为 ${info.skillContractVersion}，当前 CLI 是 ${SKILL_CONTRACT_VERSION}）`
         : ''
-      if (bodyHash === null) {
+      if (bodyUnreadable) {
         warnings.push(
           `已安装正文无法读取，无法确认是否与安装清单一致：${entityDir} —— compatible 因此为 null`
           + manifestNote,
@@ -1228,10 +1264,18 @@ async function skillWhere(argv: string[]): Promise<number> {
       } else if (!bodyVerified) {
         // 契约号来自清单、清单描述的是旧正文：这时候报 true/false 都是在给改过的
         // 正文背书。`--force` 是收敛动词（覆盖正文并按当前包装清单）。
+        //
+        // ⚠️ 旧清单（没有受管文件列表）走总哈希，额外文件会让它「不一致」——而那种
+        // 清单根本分不出「正文被改」与「多了个用户文件」。此时**不能只报前一种成因**：
+        // 报错必须点名真正给坏值的来源（或者如实说分不出来）。
+        const legacyNote = info.files === undefined || info.fileHashes === undefined
+          ? '（该清单没有受管文件列表，无法区分「正文被改」与「实体里有额外的自家文件」）'
+          : ''
         warnings.push(
           '已安装正文与安装清单记录的 content_hash 不一致（正文被手工改过或写入不完整）'
           + ' —— 契约判定只对清单描述的那份正文成立，compatible 因此为 null；'
           + '运行 `qiyu skill install --force` 可覆盖为包内正文'
+          + legacyNote
           + (contractMismatch ? `${manifestNote}，但该记录描述的是旧正文，不能据此判断当前正文配不配套` : ''),
         )
       } else if (contractMismatch) {
@@ -1243,6 +1287,14 @@ async function skillWhere(argv: string[]): Promise<number> {
         warnings.push(
           `已安装的 skill 契约版本为 ${info.skillContractVersion}，当前 CLI 是 ${SKILL_CONTRACT_VERSION}`
           + ' —— 正文与 CLI 不配套；运行 `qiyu skill install --force` 更新正文',
+        )
+      }
+      // 受管文件都对、只是多了用户自己的文件：只陈述事实，不改变 compatible ——
+      // `--force` 不会删它们（清理阶段刻意保留无法核对的文件），所以这里也**不能**
+      // 顺手推 `--force`（CodeRabbit #60 实测：推了也修不好）。
+      if (bodyVerified && extraFiles !== null && extraFiles.length > 0) {
+        warnings.push(
+          `实体目录里有不在安装清单中的额外文件（不影响正文判定，install 不会删除它们）：${extraFiles.join('、')}`,
         )
       }
     }

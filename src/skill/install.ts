@@ -234,8 +234,23 @@ export interface InstallOptions {
  * （安装路径在 I4 处显式捕获）。
  */
 export function contentHash(dir: string): string {
+  return hashFileSet(listFiles(dir), dir)
+}
+
+/**
+ * 只对**指定相对路径集合**算内容哈希（清单 `files` 的核对用，CodeRabbit #60）。
+ *
+ * 与 `contentHash` 同一算法（相对路径升序、路径 + '\n' 定界、换行归一化），只是文件集
+ * 由调用方给 —— 于是「实体里多了一个用户自己的文件」不会污染结果。调用方负责保证
+ * `rels` 都来自受信任的清单（`readInstalledManifestInfo` / `readManifest`）。
+ */
+export function contentHashOfFiles(dir: string, rels: readonly string[]): string {
+  return hashFileSet([...rels].sort(), dir)
+}
+
+function hashFileSet(rels: string[], dir: string): string {
   const hash = createHash('sha256')
-  for (const rel of listFiles(dir)) {
+  for (const rel of rels) {
     // 路径后补 '\n' 定界：没有它，「文件 a + 内容 bc」与「文件 ab + 内容 c」
     // 会拼出同一字节流（测试钉住）。文件名不含换行时定界无歧义。
     hash.update(rel + '\n')
@@ -245,7 +260,7 @@ export function contentHash(dir: string): string {
 }
 
 /** 递归列出目录下普通文件的相对路径（'/' 分隔），升序排序；根部清单除外。 */
-function listFiles(dir: string): string[] {
+export function listFiles(dir: string): string[] {
   const out: string[] = []
   const walk = (abs: string, rel: string): void => {
     for (const ent of readdirSync(abs, { withFileTypes: true })) {
@@ -387,7 +402,7 @@ function copyTree(src: string, dest: string, isRoot = true): void {
  * 单个文件的内容哈希：换行归一化后的 sha256（与 `contentHash` 里的逐文件口径一致）。
  * 清单用它记录「本工具当时写下的内容」，供下一次 --force 清理时核对（审查 #59）。
  */
-function fileHash(abs: string): string {
+export function fileHash(abs: string): string {
   return createHash('sha256').update(normalizeNewlines(readFileSync(abs))).digest('hex')
 }
 
@@ -439,7 +454,7 @@ function writeManifest(
  * （`file_hashes` 为 undefined = 「无从核对」，清理时保守不删任何文件），不接受
  * 部分采用——半份可用的哈希表比没有更容易让后续维护者误以为「已经核对过了」。
  */
-function readManifestSafe(entityDir: string): Manifest | null {
+export function readManifestSafe(entityDir: string): Manifest | null {
   try {
     const raw = JSON.parse(readFileSync(path.join(entityDir, MANIFEST), 'utf8')) as Partial<Manifest>
     if (

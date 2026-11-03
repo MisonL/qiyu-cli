@@ -634,6 +634,41 @@ describe('skill where', () => {
     expect(metaWarnings()).not.toContain('content_hash')
   })
 
+  it('实体里多了用户自己的文件 → compatible 仍按正文判定（不被总哈希拖成 null）', async () => {
+    // CodeRabbit #60 实测：旧实现拿整目录总哈希比清单 content_hash，而 --force 刻意
+    // 不删用户文件 → 加一个 my-notes.md 就永远 compatible:null，且警告里的 --force
+    // 修不好。变异「bodyVerified 回到 contentHash(entityDir) 总哈希」→ 本用例红。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    writeFileSync(join(entity, 'my-notes.md'), '用户自己的笔记\n')
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({ installed: { compatible: true } })
+    // 额外文件要如实报出来（它是真实存在的差异），但不推 --force（推了也修不好）。
+    const w = metaWarnings()
+    expect(w).toContain('my-notes.md')
+    expect(w).toContain('不影响正文判定')
+    expect(w).not.toContain('content_hash 不一致')
+  })
+
+  it('旧清单（无受管文件列表）+ 额外文件 → compatible:null，警告如实说「分不出成因」', async () => {
+    // 旧清单只能比总哈希：额外文件会让它「不一致」，但它根本分不出「正文被改」与
+    // 「多了个用户文件」。报错必须点名真正给的来源，或如实说分不出来 —— 变异
+    // 「legacyNote 去掉」→ 本用例红。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const p = join(entity, '.qiyu-skill.json')
+    const m = JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>
+    delete m.files
+    delete m.file_hashes
+    writeFileSync(p, JSON.stringify(m, null, 2))
+    writeFileSync(join(entity, 'my-notes.md'), '用户自己的笔记\n')
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({ installed: { compatible: null } })
+    const w = metaWarnings()
+    expect(w).toContain('没有受管文件列表')
+    expect(w).toContain('无法区分')
+  })
+
   it('正文被改过 + 清单契约号也不同 → 仍 compatible:null，且不得断言「不配套」', async () => {
     // CodeRabbit #60：旧实现里这两条警告会同时出现 —— 一条说 compatible:null、
     // 另一条说「正文与 CLI 不配套」，同一份输出自相矛盾（清单号描述的是旧正文，

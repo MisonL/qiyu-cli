@@ -134,7 +134,11 @@
     不是 `false`）+ 点名 `--force` 的警告。四个载体（SKILL.md / README / where 的
     `field_notes` / `--version` 的 `field_notes`）同步收窄口径；「正文与 CLI 不配套」这条
     断言只在正文与清单一致时出现 —— 否则同一份输出里 `compatible:null` 与「不配套」自相矛盾
-    （CodeRabbit #60）。
+    （CodeRabbit #60）。判据用**受管文件**（清单 `files` + `file_hashes` 逐个核对）而不是
+    实体目录总哈希：用户自己放进实体的额外文件 `--force` 刻意不删，只比总哈希会让
+    `compatible` 永远停在 null 而警告推荐的 `--force` 修不好（CodeRabbit #60 实测复现）；
+    额外文件单独如实列出、不改变配套结论；旧清单没有受管文件列表时退回总哈希并如实声明
+    「分不出正文被改与额外文件」。
   · **#11 agent 的 skills 路径被普通文件占住：where 报 unknown+ENOTDIR、install 报 missing+
     「目录不存在」（事实错误）**：两边现在都先走 `dirShape`，同报 `unknown` +
     「路径存在但不是目录」。

@@ -45,7 +45,7 @@ import { readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { contentHash, MANIFEST, type Manifest } from './install.js'
+import { contentHash, MANIFEST, readManifestSafe, type Manifest } from './install.js'
 import { defaultEntityDir, dirShape, readEnvByNormalizedKey } from './paths.js'
 import { nonEmptyValue } from '../core/config.js'
 
@@ -80,6 +80,22 @@ export interface InstalledManifestInfo {
    * 属于调用方的代价决策），只把清单里记的值交出去。
    */
   contentHash: string
+  /**
+   * 安装时写入的**受管文件**相对路径（清单 `files`，旧清单可能没有）。
+   *
+   * ⚠️ 与 `contentHash` 配套使用（CodeRabbit #60）：`contentHash(entityDir)` 会把实体里
+   * **所有**普通文件都算进去，而用户自己放进实体目录的额外文件（`--force` 刻意不删）
+   * 永远让它与清单值不同 —— 单看总哈希会把「多了一个用户文件」误报成「正文被改过」。
+   * 所以消费方应先比受管文件、再比总哈希：凡受管文件一致但总哈希不同，差异只在
+   * 额外文件上（正文本身没被改）。
+   */
+  files: string[] | undefined
+  /**
+   * 受管文件的内容哈希表（清单 `file_hashes`，键是 `files` 里的相对路径）。
+   *
+   * 与 `files` 成对：两者都齐时消费方才能逐个核对受管文件（缺一份就退回总哈希）。
+   */
+  fileHashes: Record<string, string> | undefined
 }
 
 /**
@@ -106,13 +122,19 @@ export interface InstalledManifestInfo {
  */
 export function readInstalledManifestInfo(entityDir: string): InstalledManifestInfo | null {
   try {
-    const m = readManifestStrict(entityDir)
+    // ⚠️ 用 `readManifestSafe`（与安装/清理同一个解析器），不是本文件里探测用的
+    // `readManifestStrict`：后者刻意只取四个核心字段、丢掉 files/file_hashes，而
+    // `where` 核对正文需要受管文件清单（CodeRabbit #60）。两者对「缺失/损坏」都返回
+    // null，差别只在是否带出扩展字段。
+    const m = readManifestSafe(entityDir)
     if (m === null) return null
     if (!Number.isInteger(m.skill_contract_version) || m.skill_contract_version < 0) return null
     return {
       version: m.version,
       skillContractVersion: m.skill_contract_version,
       contentHash: m.content_hash,
+      files: m.files,
+      fileHashes: m.file_hashes,
     }
   } catch {
     return null
