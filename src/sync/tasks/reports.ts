@@ -138,13 +138,22 @@ function staffRow(w: WindowRef, r: Record<string, unknown>, nowIso: string): Rec
   return { ...baseRow(w, r, nowIso), staff_id: String(sid) }
 }
 
-/** 分页 + per-staff 投影（staffworklod / staff_satisfaction）。 */
-async function fetchPagedStaff(taskId: string, w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
+/**
+ * 分页 + per-staff 投影（staffworklod / staff_satisfaction；staffquality 传 withSum）。
+ * ⚠️ `withSum`（2026-11-03 实测修）：staffquality 此前走 `fetchSimple` —— **不分页**，
+ * 上游 `total=1500` 只取回首页 1000 行仍 `complete`（C 中-3 的短读终检只存在于 `pagedRaw`，
+ * 实测只发了 1 个请求）。实测事实（设计稿 §6.2）：`staffquality` **分页**（pageSize=5 时
+ * `result` 只有 5 行）且 `sum` 与分页无关、始终覆盖全集 → 分页拉满后照写 sum 全局行
+ * （staff_id='sum' 哨兵，主键含 stat_date，按天各自一行）。
+ */
+async function fetchPagedStaff(taskId: string, w: WindowRef, ctx: FetchCtx,
+  withSum = false): Promise<FetchResult> {
   const nowIso = nowIsoOf(ctx)
-  const { rows } = await pagedRaw(taskId, w, ctx)
+  const { rows, sum } = await pagedRaw(taskId, w, ctx)
   const mapped = rows
     .map((r) => staffRow(w, r, nowIso))
     .filter((r): r is Record<string, unknown> => r !== null)
+  if (withSum && sum) mapped.push({ ...baseRow(w, sum, nowIso), staff_id: 'sum' })
   return { rows: mapped, apiCount: mapped.length }
 }
 
@@ -244,7 +253,9 @@ function fetchSimple(taskId: string, perStaff: boolean): SyncTask['fetch'] {
       const base = baseRow(w, r, nowIso)
       if (perStaff) {
         const sid = r.staffId ?? r.staffid ?? r.staff_id
-        if (isEmptyKey(sid)) continue   // 键缺失/空串行：计入 fetched 不写库
+        // 键缺失/空串行：**丢弃且不计入 fetched**（continue 在 push 之前）。此前注释写
+        // 「计入 fetched」，与代码相反 —— 丢了几行对 Agent 不可见（见 HANDOFF 待办）。
+        if (isEmptyKey(sid)) continue
         mapped.push({ ...base, staff_id: String(sid) })
       } else {
         mapped.push(base)
@@ -297,7 +308,9 @@ export const REPORT_TASKS: SyncTask[] = [
     primaryKey: ['stat_date', 'staff_id'], reportDayRotation: true,
     endpoint: 'statistic.staffquality',
     write: RANGE_INSERT,
-    fetch: fetchSimple('reports.staff_quality', true),
+    // ⚠️ 必须分页（2026-11-03 实测修）：此前 fetchSimple 单次调用不读 total —— 租户
+    // 客服 > 1000 时被静默截断且仍 complete。sum 全局行经 withSum 保留。
+    fetch: (w, ctx) => fetchPagedStaff('reports.staff_quality', w, ctx, true),
   },
   {
     id: 'reports.staff_satisfaction', table: 'staff_satisfaction', kind: 'windowed',
@@ -313,6 +326,10 @@ export const REPORT_TASKS: SyncTask[] = [
     // 逐行可信时间戳（`date` 按小时对齐，落 hour_ts）→ 31 天窗口可行（≈1.7 万行/窗）；
     // stat_date 由该行的 hour_ts 推导（不是窗口起点）——它跟随该行自己的业务日
     maxWindowDays: 31, overlapDays: 0,
+    // ⚠️ **刻意不声明 windowAlign**（2026-11-03 复核）：31 天步长的日对齐网格 + 残段窗
+    // 跳过规则会让「水位+1ms 落在日中间」的首窗被整段跳过、再跳到 +31 天，中间 30 天直接
+    // 不抓（日对齐只在 maxWindowDays=1 的任务上安全）。数据不丢靠 `writeRows` 的删除边界
+    // 修复（只删**完整落在窗内**的自然日），见 engine.ts 的注释。
     watermark: { field: 'stat_date', initial: null },
     // hour_ts 是响应内唯一可信日期字段（小时对齐时间戳）
     primaryKey: ['staff_id', 'hour_ts'], reportDayRotation: true,
@@ -364,9 +381,13 @@ export const REPORT_TASKS: SyncTask[] = [
     write: RANGE_INSERT,
     // orders:null = 筛选失败、不是空窗口（staffIdList 含租户不存在的 id 时 code:200
     // 全 null）→ 显式 gapHint，引擎落 sync_gaps（T5 裁定：透传原始 reason）。
-    // 行映射补主键列 order_id（响应键 orderId）；缺 order_id 的订单行丢弃——
-    // 计入 fetched 不写库（脏单行不致断流，与 per-staff 表同一取舍）；
-    // sum 全局行按 controller 裁定落同表哨兵 order_id='sum'（与 staff_quality 一致）。
+    // 行映射补主键列 order_id（响应键 orderId）；缺 order_id 的订单行**丢弃且不计入
+    // fetched**（`continue` 在 push 之前 —— 此前注释写「计入 fetched」，与代码相反；
+    // 「丢了几行」目前对 Agent 不可见，见 HANDOFF 的 report_row_dropped 待办）。
+    // ⚠️ sum 行必须**按天**唯一（2026-11-03 实测修）：本表主键只有 `order_id`，而
+    // staff_quality 的哨兵 `staff_id='sum'` 之所以按天各一行，是它的主键含 stat_date。
+    // 沿用裸 `'sum'` 时，回补前一天会 upsert 覆盖后一天的 sum（实测：先 day1 再 day0，
+    // day1 的汇总整体消失）—— 故哨兵随窗口日：`sum:<上海日>`。
     fetch: async (w, ctx) => {
       try {
         const nowIso = nowIsoOf(ctx)
@@ -377,7 +398,7 @@ export const REPORT_TASKS: SyncTask[] = [
           if (isEmptyKey(oid)) continue
           mapped.push({ ...baseRow(w, r, nowIso), order_id: String(oid) })
         }
-        if (sum) mapped.push({ ...baseRow(w, sum, nowIso), order_id: 'sum' })
+        if (sum) mapped.push({ ...baseRow(w, sum, nowIso), order_id: `sum:${shanghaiDayIso(w.start)}` })
         return { rows: mapped, apiCount: mapped.length }
       } catch (e) {
         if ((e as { kind?: string }).kind === 'filter_matched_no_staff') {

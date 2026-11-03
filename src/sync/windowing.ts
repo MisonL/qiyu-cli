@@ -34,23 +34,3 @@ export function sliceByMaxWindow(range: Range, maxWindowDays: number, overlapDay
   return windows
 }
 
-/**
- * 合并相邻（start == 前者 end）与重叠的区间，保留缝隙。
- * 输入不要求有序，结果按 start 升序。
- */
-export function mergeRanges(rs: Range[]): Range[] {
-  if (rs.length === 0) return []
-  const sorted = [...rs].sort((a, b) => a.start - b.start)
-  const merged: Range[] = [{ ...sorted[0] }]
-  for (let i = 1; i < sorted.length; i++) {
-    const last = merged[merged.length - 1]
-    const cur = sorted[i]
-    if (cur.start <= last.end) {
-      // 相邻或重叠：延伸右端（含完全包含的情形）
-      last.end = Math.max(last.end, cur.end)
-    } else {
-      merged.push({ ...cur })
-    }
-  }
-  return merged
-}

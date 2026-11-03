@@ -418,8 +418,9 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 `sync run --full` 对报表任务会从 1970 起切出**上万窗**（≈ 56 年 × 每天 1 窗，每窗至少
 一次调用）——首跑与回补历史请用 `--since/--until` 限定区间（如 `--since 30d` = 30 窗/任务）。
 
-**窗口端点按上海日界对齐**：8 个 `stat_date` 为主键的报表任务（考勤除外）的窗口对齐
-上海自然日 0 点（`windowAlign: 'shanghaiDay'`）——水位续跑（`watermark+1ms`）或任意时刻
+**窗口端点按上海日界对齐**：8 张**声明了 `windowAlign: 'shanghaiDay'` 的报表表**（考勤除外）的窗口起点按
+上海自然日 0 点对齐——其中 6 张的 `stat_date` 在主键里（`order_performance` 的主键是
+`order_id`、`staff_salary_detail` 的是 `staff_id + work_date`），这 6 张才可按 `stat_date` 关联——水位续跑（`watermark+1ms`）或任意时刻
 `--since` 产生的「错相位窗」（如 `[今天18:23, 明天18:23)`）只写一行 `stat_date` 却装着
 跨两天聚合、还会把「明天」日的行删掉不重写。对齐后：**实际拉取的每窗恰是一个完整上海
 自然日**，按日增量的「每日概览」日行恒为全天值。**显式区间的非日界首末段是残段窗**（如

@@ -147,13 +147,30 @@ async function writeRows(task: SyncTask, ops: Pick<WriteTx, 'delete' | 'upsert'>
   rows: Record<string, unknown>[], range: Range): Promise<number> {
   if (task.write.kind === 'deleteRangeInsert') {
     const dayAligned = task.write.rangeAlign === 'shanghaiDay'
-    const from = dayAligned ? shanghaiDayIso(range.start) : new Date(range.start).toISOString()
-    const to = dayAligned ? shanghaiDayIso(range.end - 1) : new Date(range.end).toISOString()
+    // ⚠️ 天对齐列的删除范围**只含完整落在窗内的自然日**（2026-11-03 实测修）：
+    // 此前一律用 `[dayOf(start), dayOf(end−1ms)]`，窗口起点不在日界时（staff_attendance
+    // 按 31 天从任意起点切窗）会**把相邻窗写好的边界日整片删掉** —— 下一窗删掉边界日的
+    // 全部小时行、只重写 `start` 之后的那些，边界日的前半段被删且永不重写（实测
+    // fetched=written=960、`status: complete`、零 gap，而边界日只有 16/24 小时）。
+    // 只删「完整落在窗内」的天后：首/末的半个自然日只 upsert 不删，邻窗写的行因此保得住，
+    // 整日内被上游撤掉的行仍会被删（不会留下永久陈旧行）。日对齐窗（start/end 都在日界）
+    // 两式等价，行为不变。
+    const headPartial = dayAligned && range.start !== shanghaiDayStart(range.start)
+    const tailPartial = dayAligned && range.end !== shanghaiDayStart(range.end)
+    const from = dayAligned
+      ? shanghaiDayIso(headPartial ? range.start + DAY : range.start)
+      : new Date(range.start).toISOString()
+    const to = dayAligned
+      ? shanghaiDayIso(tailPartial ? range.end - 1 - DAY : range.end - 1)
+      : new Date(range.end).toISOString()
     // where 是可信代码常量（同 query 红线）：列名来自任务声明（代码级），值参数化绑定。
     // 范围边界与行内日期列同口径（rangeAlign）：行写「上海天对齐的日期列」时，删除范围
     // 也必须是天对齐边界——否则 --full 与增量对同一业务日的删除范围互不覆盖（A 中-2）。
-    for (const col of task.write.rangeColumns) {
-      await ops.delete(task.table, `"${col}" >= ? AND "${col}" <= ?`, [from, to])
+    // 窗内无完整自然日（窗口比一天还窄且不落界）→ 不删，只 upsert。
+    if (!(dayAligned && from > to)) {
+      for (const col of task.write.rangeColumns) {
+        await ops.delete(task.table, `"${col}" >= ? AND "${col}" <= ?`, [from, to])
+      }
     }
   }
   if (rows.length === 0) return 0
@@ -360,6 +377,10 @@ function clampWindowEnd(windows: Range[], limit: number): Range[] {
   return out
 }
 
+/** 被 clampWindowEnd **整窗丢弃**的窗数（丢弃不等于跳过：必须计数可见，2026-11-03 修）。 */
+const clampedAwayCount = (windows: Range[], limit: number): number =>
+  Number.isFinite(limit) ? windows.filter((w) => w.start >= limit).length : 0
+
 /**
  * 声明了 `windowAlign: 'shanghaiDay'` 的任务的**段式日对齐切片**（修复批 5 #1）：
  * 从 `shanghaiDayStart(range.start)`（上海日 0 点）起按 `maxWindowDays` 天的步长推进，
@@ -435,6 +456,11 @@ function isResidualWindow(task: SyncTask, w: Range): boolean {
 }
 
 /** 残段窗的进度行（人读 stderr；skip 窗仍计入 windows.total / windows.skipped）。 */
+/** 整窗晚于末端上限时的进度行（与残段窗同为「有意不 fetch」，但成因不同，分开说）。 */
+const clampedAwayNote = (task: SyncTask, w: Range, limit: number): string =>
+  `[${task.id}] 窗整窗跳过（晚于末端上限 ${new Date(limit).toISOString()}）：`
+  + `[${new Date(w.start).toISOString()}, ${new Date(w.end).toISOString()})`
+
 const residualNote = (task: SyncTask, w: Range): string =>
   `[${task.id}] 残段窗跳过（非日界首/末段）：[${new Date(w.start).toISOString()}, ${new Date(w.end).toISOString()})`
 
@@ -495,6 +521,11 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   const raw = wholeRangeBelowFloor
     ? [resolvedRange]
     : sliceForTask(task, resolvedRange, task.maxWindowDays)
+  // ⚠️ 末端上限之外的窗是**整窗丢弃**（2026-11-03 实测修）：此前它既不在 total 也不在
+  // skipped、无任何进度行 —— 请求「今天」的考勤/绩效会得到 `total:0, complete, gaps:[]`，
+  // Agent 无法区分「今天被上限挡掉了」与「已同步完成」，而本仓自定的残段窗原则是
+  // 「绝不静默消失」。现在与残段窗一样计数进 skipped 并逐窗出进度行。
+  const droppedByClamp = raw.filter((w) => w.start >= limit)
   const clamped = clampWindowEnd(raw, limit)
   const skippedResidual = clamped.filter((w) => isResidualWindow(task, w))
   const windows = skipContained(
@@ -518,8 +549,10 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     //   此时本就退化为 [start, start]（min(end, limit) ≤ limit ≤ start），收口前后等值；
     // ② 全残段跳过（批 6 新增）——outRange 非退化，必须收口到起点。
     for (const w of skippedResidual) progress(residualNote(task, w))
+    for (const w of droppedByClamp) progress(clampedAwayNote(task, w, limit))
+    const skippedAll = skippedResidual.length + droppedByClamp.length
     return { taskId: task.id,
-      windows: { total: skippedResidual.length, succeeded: 0, failed: 0, skipped: skippedResidual.length },
+      windows: { total: skippedAll, succeeded: 0, failed: 0, skipped: skippedAll },
       rows: { fetched: 0, written: 0 },
       resolvedRange: { start: outRange.start, end: outRange.start }, gaps, status: 'complete' }
   }
@@ -548,8 +581,9 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     // 修复批 6 #2：残段窗不进执行循环（上面的过滤已排除），但仍如实计数 ——
     // 裁定：计入 total、标 skipped，每窗一条进度行。「跳过了什么」必须可见，
     // 绝不静默消失；跳过段不算成功窗，contiguousEnd 不受影响（不进循环）。
-    const skipped = skippedResidual.length
+    const skipped = skippedResidual.length + droppedByClamp.length
     for (const w of skippedResidual) progress(residualNote(task, w))
+    for (const w of droppedByClamp) progress(clampedAwayNote(task, w, limit))
 
     for (let i = 0; i < windows.length; i++) {
       const w = windows[i]
@@ -794,6 +828,8 @@ interface RotationPlan {
   windows: Range[]
   // 修复批 6 #2：残段窗（非日界首/末段）——不执行，但计入 total 并标 skipped。
   skippedResidual: Range[]
+  // 2026-11-03：晚于末端上限被整窗丢弃的窗 —— 同样计入 total/skipped（不得静默消失）。
+  droppedByClamp: Range[]
   lock: { by: string; at: string }
   gaps: GapInfo[]
   succeeded: number
@@ -823,9 +859,12 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
   const limit = windowEndLimit(task, now)
   // 残段窗过滤（修复批 6 #2）：与 runWindowed 同口径 —— 切片+钳制后把非日界首/末段
   // 排除在执行集外、收进 skippedResidual（半日聚合不落日行的裁定对轮转路径同样生效）。
-  const clamped = resolvedRange.end <= resolvedRange.start
+  const rawWindows = resolvedRange.end <= resolvedRange.start
     ? []
-    : clampWindowEnd(sliceForTask(task, resolvedRange, task.maxWindowDays), limit)
+    : sliceForTask(task, resolvedRange, task.maxWindowDays)
+  // 末端上限之外的窗整窗丢弃 → 与 runWindowed 同口径：计数可见 + 进度行（见那边的注释）。
+  const droppedByClamp = rawWindows.filter((w) => w.start >= limit)
+  const clamped = clampWindowEnd(rawWindows, limit)
   const skippedResidual = clamped.filter((w) => isResidualWindow(task, w))
   const windows = skipContained(
     clamped.filter((w) => !isResidualWindow(task, w)), overlapMs)
@@ -837,7 +876,8 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
   //（verify 会把 pending 判成未完成）。
   if (windows.length === 0) {
     for (const w of skippedResidual) ctx.onProgress?.(residualNote(task, w))
-    return { task, state, resolvedRange: outRange, windows, skippedResidual, lock, gaps: [],
+    for (const w of droppedByClamp) ctx.onProgress?.(clampedAwayNote(task, w, limit))
+    return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, lock, gaps: [],
       succeeded: 0, failed: 0, fetched: 0, written: 0,
       contiguousEnd: null, contiguousBroken: false, resolvedEnd: null }
   }
@@ -845,7 +885,7 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
   await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
     await markPending(tx, task.id, state, lock)
   }))
-  return { task, state, resolvedRange: outRange, windows, skippedResidual, lock, gaps: [],
+  return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, lock, gaps: [],
     succeeded: 0, failed: 0, fetched: 0, written: 0,
     contiguousEnd: null, contiguousBroken: false, resolvedEnd: null }
 }
@@ -951,8 +991,9 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
   return plans.map((p) => ({
     taskId: p.task.id,
     // 修复批 6 #2：残段窗计入 total、标 skipped（与 runWindowed 同口径）。
-    windows: { total: p.windows.length + p.skippedResidual.length,
-      succeeded: p.succeeded, failed: p.failed, skipped: p.skippedResidual.length },
+    windows: { total: p.windows.length + p.skippedResidual.length + p.droppedByClamp.length,
+      succeeded: p.succeeded, failed: p.failed,
+      skipped: p.skippedResidual.length + p.droppedByClamp.length },
     rows: { fetched: p.fetched, written: p.written },
     resolvedRange: { start: p.resolvedRange.start, end: p.resolvedEnd ?? p.resolvedRange.start },
     gaps: p.gaps,

@@ -2,9 +2,10 @@
 // D-T7：9 报表任务声明 + 按天轮转调度。
 // 真库夹具照 tests/store/duckdb.test.ts；http mock 照 tests/core/http.test.ts。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { runTask, runRotated } from '../../src/sync/engine.js'
 import { RateGate } from '../../src/sync/rate-gate.js'
@@ -310,6 +311,24 @@ describe('REPORT_TASKS 任务声明', () => {
     }
   })
 
+  it('README 的数字与声明一致：8 个 windowAlign 任务，其中 6 个主键含 stat_date（2026-11-03 实测修）', () => {
+    // 缺陷原文：README 写「8 个 `stat_date` 为主键的报表任务」，实际 windowAlign 有 8 个，
+    // 但 `order_performance`（主键 order_id）与 `staff_salary_detail`（主键 work_date）的
+    // 主键不含 stat_date —— Agent 会据此以为这两张表也能按 stat_date 关联。
+    const aligned = REPORT_TASKS.filter((t) => t.windowAlign === 'shanghaiDay')
+    expect(aligned.length).toBe(8)
+    const statDatePk = aligned.filter((t) => t.primaryKey.includes('stat_date'))
+    expect(statDatePk.map((t) => t.id).sort()).toEqual([
+      'reports.overview', 'reports.robot_summary', 'reports.staff_quality',
+      'reports.staff_satisfaction', 'reports.staff_workload', 'reports.transfer_human',
+    ])
+    // README 必须说清这两个口径（旧说法「8 个 stat_date 为主键」不得复活）
+    const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'README.md'), 'utf8')
+    expect(readme).toContain("8 张**声明了 `windowAlign: 'shanghaiDay'` 的报表表**")
+    expect(readme).toContain('其中 6 张的 `stat_date` 在主键里')
+    expect(readme, '旧的错误计数仍在 README').not.toMatch(/8 个 `stat_date` 为主键/)
+  })
+
   it('B 中-6：每个任务声明 endpoint（闸门键 = 注册表路径）', () => {
     const byId = (id: string): SyncTask => reportById(id)!
     expect(byId('reports.overview')!.endpoint).toBe('statistic.overview')
@@ -514,10 +533,12 @@ describe('报表任务 fetch（http mock）', () => {
       expect(r.status).toBe('complete')
       expect(r.rows.written).toBe(3)
       const rows = await store.query('SELECT order_id, stat_date FROM order_performance ORDER BY order_id')
-      // sum 哨兵行按 controller 裁定进同表（order_id='sum'，sum 字段在 payload 里）
-      expect(rows.rows.map((x) => x.order_id)).toEqual(['900001', '900002', 'sum'])
+      // sum 哨兵行进同表，但**按天唯一**（`sum:<上海日>`）：主键只有 order_id，
+      // 裸 'sum' 会在回补前一天时覆盖后一天的汇总（2026-11-03 实测修）。
+      const day = shanghaiDayIso(dayCtx(store).rangeOverride!.start)
+      expect(rows.rows.map((x) => x.order_id)).toEqual(['900001', '900002', `sum:${day}`])
       expect(rows.rows.every((x) => typeof x.order_id === 'string' && x.order_id.length > 0)).toBe(true)
-      const sumRow = await store.query("SELECT payload FROM order_performance WHERE order_id = 'sum'")
+      const sumRow = await store.query(`SELECT payload FROM order_performance WHERE order_id = 'sum:${day}'`)
       expect(JSON.parse(sumRow.rows[0].payload as string)).toEqual({ sellMoney: 30 })
       await store.close()
     } finally {
