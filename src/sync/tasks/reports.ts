@@ -150,11 +150,34 @@ async function fetchPagedStaff(taskId: string, w: WindowRef, ctx: FetchCtx,
   withSum = false): Promise<FetchResult> {
   const nowIso = nowIsoOf(ctx)
   const { rows, sum } = await pagedRaw(taskId, w, ctx)
-  const mapped = rows
-    .map((r) => staffRow(w, r, nowIso))
-    .filter((r): r is Record<string, unknown> => r !== null)
+  const mapped: Record<string, unknown>[] = []
+  let dropped = 0
+  for (const r of rows) {
+    const row = staffRow(w, r, nowIso)
+    if (row === null) { dropped++; continue }   // 缺 staff_id 键的行：丢弃并计数（见下 gapHint）
+    mapped.push(row)
+  }
   if (withSum && sum) mapped.push({ ...baseRow(w, sum, nowIso), staff_id: 'sum' })
-  return { rows: mapped, apiCount: mapped.length }
+  return { rows: mapped, apiCount: mapped.length, ...droppedHint(taskId, dropped, 'staffId') }
+}
+
+/**
+ * 行被丢弃（缺主键列）时的 task gapHint（`row_missing_key`）。
+ *
+ * ⚠️ 为什么必须记（审查 #5，2026-11-03）：`apiCount` 取的是**过滤后**的行数，
+ * 配对核对（写库行数 vs apiCount）恒等，缺键行于是**静默消失** —— 窗口照样
+ * `status: complete`、`fetched == written`，Agent 无从知道上游有一批行没进库。
+ * 这类行是真的没落库（`TASK_GAP_LOSSY_REASONS` 档），必须留痕。
+ */
+function droppedHint(taskId: string, dropped: number, keyName: string): { gapHint?: FetchResult['gapHint'] } {
+  if (dropped === 0) return {}
+  return {
+    gapHint: {
+      reason: 'row_missing_key',
+      detail: `${taskId}: ${dropped} 行缺 ${keyName}（主键列，缺键或空串）被丢弃、未落库`
+        + ' —— 上游响应形态漂移，请核对接口返回；本次按已落库的行覆盖窗口',
+    },
+  }
 }
 
 /**
@@ -236,34 +259,29 @@ function endpointOf(taskId: string): string {
   }
 }
 
-/** 普通报表 fetch（result/全局行形态）：stat_date=窗口起点按上海天对齐；staffId 键取不到时用 'sum' 哨兵。 */
-function fetchSimple(taskId: string, perStaff: boolean): SyncTask['fetch'] {
+/**
+ * 全局汇总报表 fetch（overview / robot_summary / transfer_human）：响应是**一行全局汇总**，
+ * 无 staffId，行形状按目标表列集投影（stat_date + payload）。
+ *
+ * ⚠️ 这里**没有** per-staff 分支（审查 #5，2026-11-03）：早前本函数带 `perStaff` 参数，
+ * 但三个调用点全是全局表，`perStaff=true` 的分支连同它「缺 staffId 就 `continue` 丢弃」
+ * 的逻辑是**死代码**——声明了却永不执行的一支，正是契约诚实性要消灭的形态；per-staff 表
+ * （staffworklod / satisfaction / quality）早已改走 `fetchPagedStaff`（那里的丢弃有
+ * `row_missing_key` 缺口留痕）。因此本函数不做投影过滤，不存在静默丢行。
+ */
+function fetchSimple(taskId: string): SyncTask['fetch'] {
   return async (w, ctx) => {
     const nowIso = nowIsoOf(ctx)
     // B 高-1：走 callPaced（本地令牌桶拒绝被吸收为等待重试；远端限频写持久化冷却行）。
     // 裸 call 会让两种限频都直接冒泡成 fetch_failed gap，而空窗假空重试必然二次调用
     // 同一路径——这是最容易撞上本地限频的一条路径。
     const res = await callPaced(endpointOf(taskId), reportBody(taskId, w), ctx)
-    const { rows, sum } = payloadRows(taskId, res.payload)
-    const mapped: Record<string, unknown>[] = []
-    for (const r of rows) {
-      // perStaff 表（staff_workload/quality/satisfaction）键是 (stat_date, staff_id)；
-      // 全局汇总表（overview/robot_summary/transfer_human）键只有 stat_date——
-      // 响应没有 staffId，行形状按目标表列集投影。
-      const base = baseRow(w, r, nowIso)
-      if (perStaff) {
-        const sid = r.staffId ?? r.staffid ?? r.staff_id
-        // 键缺失/空串行：**丢弃且不计入 fetched**（continue 在 push 之前）。此前注释写
-        // 「计入 fetched」，与代码相反 —— 丢了几行对 Agent 不可见（见 HANDOFF 待办）。
-        if (isEmptyKey(sid)) continue
-        mapped.push({ ...base, staff_id: String(sid) })
-      } else {
-        mapped.push(base)
-      }
-    }
-    // staffquality 全局 sum 行（覆盖全集、与分页无关）：sum 本就没有 staff_id，
-    // 落 perStaff 表时用上游无语义的哨兵 'sum'（约定位置，见 task-7-report）。
-    if (sum && perStaff) mapped.push({ ...baseRow(w, sum, nowIso), staff_id: 'sum' })
+    const { rows } = payloadRows(taskId, res.payload)
+    // ⚠️ 刻意**不写** sum 行：这三张全局表的主键只有 stat_date，而同窗口的 sum 行不带
+    // 任何区分列 —— 写进去会与那一行全局汇总同键互覆（`payloadRows` 对全局表本来也
+    // 返回 sum=null；这里显式不取，避免以后有人以为「漏了」而补上）。per-staff 表的
+    // sum 由 `fetchPagedStaff` 按 `staff_id='sum'` 哨兵处理（那里主键含 stat_date）。
+    const mapped = rows.map((r) => baseRow(w, r, nowIso))
     return { rows: mapped, apiCount: mapped.length }
   }
 }
@@ -295,7 +313,7 @@ export const REPORT_TASKS: SyncTask[] = [
     primaryKey: ['stat_date'], reportDayRotation: true,
     endpoint: 'statistic.overview',
     write: RANGE_INSERT,
-    fetch: fetchSimple('reports.overview', false),
+    fetch: fetchSimple('reports.overview'),
   },
   {
     id: 'reports.staff_workload', table: 'staff_workload', kind: 'windowed',
@@ -352,6 +370,7 @@ export const REPORT_TASKS: SyncTask[] = [
       const nowIso = nowIsoOf(ctx)
       const { rows } = await pagedRaw('reports.staff_attendance', w, ctx)
       const mapped: Record<string, unknown>[] = []
+      let dropped = 0
       for (const r of rows) {
         const sid = r.staffId ?? r.staffid
         const ts = r.date   // 该小时按小时对齐的时间戳
@@ -366,13 +385,20 @@ export const REPORT_TASKS: SyncTask[] = [
         // 而不是 `MAX_DATE_MS`：两者都要「能回显成 +08:00 ISO」，差 8h 就会在
         // `shanghaiDayIso` 的偏移后一段重新抛。
         const n = Number(ts)
-        if (isEmptyKey(sid) || !Number.isFinite(n) || n <= 1e11 || n > MAX_SHANGHAI_SAFE_MS) continue
+        // 丢弃的两类（缺 staff_id 键 / 脏时间戳）都计数，见下 gapHint（审查 #5）。
+        if (isEmptyKey(sid) || !Number.isFinite(n) || n <= 1e11 || n > MAX_SHANGHAI_SAFE_MS) {
+          dropped++
+          continue
+        }
         // 修复批 4：stat_date 按**本行的 hour_ts** 推导上海日（不再用窗口起点）——
         // 31 天窗口里行跨多个自然日，用窗口起点会把它们全标成窗口首日。
         // 删除范围按 hour_ts ∈ [w.start, w.end)（write 的 instantColumn），与写入逐行同口径。
         mapped.push({ ...baseRow(w, r, nowIso, n), staff_id: String(sid), hour_ts: new Date(n).toISOString() })
       }
-      return { rows: mapped, apiCount: mapped.length }
+      return {
+        rows: mapped, apiCount: mapped.length,
+        ...droppedHint('reports.staff_attendance', dropped, 'staffId 或可信时间戳（date）'),
+      }
     },
   },
   {
@@ -400,13 +426,19 @@ export const REPORT_TASKS: SyncTask[] = [
         const nowIso = nowIsoOf(ctx)
         const { rows, sum } = await pagedRaw('reports.order_performance', w, ctx)
         const mapped: Record<string, unknown>[] = []
+        let dropped = 0
         for (const r of rows) {
           const oid = r.orderId ?? r.order_id
-          if (isEmptyKey(oid)) continue
+          // 缺 order_id 的订单行：丢弃并计数（审查 #5，见 droppedHint）；此前只丢弃、
+          // 不留痕，Agent 从 complete 的窗口上看不出上游有一批行没进库。
+          if (isEmptyKey(oid)) { dropped++; continue }
           mapped.push({ ...baseRow(w, r, nowIso), order_id: String(oid) })
         }
         if (sum) mapped.push({ ...baseRow(w, sum, nowIso), order_id: `sum:${shanghaiDayIso(w.start)}` })
-        return { rows: mapped, apiCount: mapped.length }
+        return {
+          rows: mapped, apiCount: mapped.length,
+          ...droppedHint('reports.order_performance', dropped, 'orderId'),
+        }
       } catch (e) {
         if ((e as { kind?: string }).kind === 'filter_matched_no_staff') {
           return { rows: [], apiCount: 0,
@@ -458,7 +490,7 @@ export const REPORT_TASKS: SyncTask[] = [
     endpoint: 'robot.statistic.summary',
     write: RANGE_INSERT,
     // 形状 A；robotId 被服务端忽略 → body 不含（reportBody 保证）
-    fetch: fetchSimple('reports.robot_summary', false),
+    fetch: fetchSimple('reports.robot_summary'),
   },
   {
     id: 'reports.transfer_human', table: 'transfer_human', kind: 'windowed',
@@ -472,7 +504,7 @@ export const REPORT_TASKS: SyncTask[] = [
     endpoint: 'ai.statistic.transferHuman',
     write: RANGE_INSERT,
     // 形状 A；type/robotId 被服务端忽略 → body 不含（reportBody 保证）
-    fetch: fetchSimple('reports.transfer_human', false),
+    fetch: fetchSimple('reports.transfer_human'),
   },
 ]
 

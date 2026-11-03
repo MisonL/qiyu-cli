@@ -138,27 +138,47 @@ function projectRows(rows: Record<string, unknown>[],
   return { rows: out, dropped }
 }
 
-/** 类目树拍平（children 在叶子上为 null，实测形态——空数组/null 都没有子节点）。 */
+/**
+ * 类目树拍平（children 在叶子上为 null，实测形态——空数组/null 都没有子节点）。
+ *
+ * 返回**被丢弃的节点数**（审查 #5，2026-11-03）：缺 id 的脏节点此前静默 `continue`
+ * ——它的**整棵子树**也随之中断（不再递归），而 `apiCount` 取拍平后的行数让配对核对
+ * 恒等，快照全删重插下这些类目无声消失。计数把「丢了多少」留给调用方落 gap。
+ * 子树一并计入（它们同样没落库），所以丢的是一个子树时数字会大于 1。
+ */
 function flattenTree(robotId: string, nodes: unknown, level: number,
-  parentId: string | null, out: Record<string, unknown>[], nowIso: string): void {
-  if (!Array.isArray(nodes)) return
+  parentId: string | null, out: Record<string, unknown>[], nowIso: string): number {
+  if (!Array.isArray(nodes)) return 0
+  let dropped = 0
   for (const n of nodes as Record<string, unknown>[]) {
     const cid = n.id
-    if (cid === null || cid === undefined) continue   // 缺 id 的脏节点：丢弃
+    if (cid === null || cid === undefined) { dropped += 1 + countNodes(n.children); continue }
     const sId = String(cid)
     out.push({ robot_id: robotId, category_id: sId, name: typeof n.name === 'string' ? n.name : null,
       parent_id: parentId, level, payload: JSON.stringify(n), synchronized_at: nowIso })
-    flattenTree(robotId, n.children, level + 1, sId, out, nowIso)
+    dropped += flattenTree(robotId, n.children, level + 1, sId, out, nowIso)
   }
+  return dropped
+}
+
+/** 子树节点总数（缺 id 节点被丢弃时，它的后代同样没落库，规模要如实计入）。 */
+function countNodes(nodes: unknown): number {
+  if (!Array.isArray(nodes)) return 0
+  let n = 0
+  for (const node of nodes as Record<string, unknown>[]) {
+    n += 1 + countNodes(node?.children)
+  }
+  return n
 }
 
 /**
  * 类目树拍平的共享入口（T13 接线）：从根（level=1）拍平一棵 getCategoryTree 响应。
  * 编排层的 robotId 注入路径消费同一实现——复制投影会让行形态在两处漂移。
+ * 返回被丢弃的节点数（缺 id 的脏节点及其子树），调用方据此决定是否记 gap。
  */
 export function flattenCategoryTree(robotId: string, payload: unknown,
-  out: Record<string, unknown>[], nowIso: string): void {
-  flattenTree(robotId, payload, 1, null, out, nowIso)
+  out: Record<string, unknown>[], nowIso: string): number {
+  return flattenTree(robotId, payload, 1, null, out, nowIso)
 }
 
 /**
@@ -244,13 +264,26 @@ export const KNOWLEDGE_TASKS: SyncTask[] = [
           '请先同步 knowledge.items 任务')
       }
       const out: Record<string, unknown>[] = []
+      let dropped = 0
       for (const rid of robotIds) {
         const res = await callPaced('ai.knowledge.getCategoryTree', { robotId: Number(rid) }, ctx)
         // 形状 A：data 直接是树数组；空树机器人整个丢 data 键（not_found）→ 0 行合法
         if (res.payload === undefined || res.payload === null) continue
-        flattenTree(rid, res.payload, 1, null, out, nowIso)
+        dropped += flattenTree(rid, res.payload, 1, null, out, nowIso)
       }
-      return { rows: out, apiCount: out.length }
+      return {
+        rows: out, apiCount: out.length,
+        ...(dropped > 0
+          ? {
+            gapHint: {
+              reason: 'knowledge_row_malformed' as const,
+              detail: `knowledge.categories: ${dropped} 个类目节点缺 id 被丢弃（连同其子树；`
+                + '快照全删重插下这些类目已消失）——接口 ai.knowledge.getCategoryTree 的'
+                + '响应形态漂移，请核对',
+            },
+          }
+          : {}),
+      }
     },
   },
 ]

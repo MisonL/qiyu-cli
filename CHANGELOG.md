@@ -122,6 +122,25 @@
 
 ### 修复
 
+- **sync 行丢弃留痕：缺主键列的行不再静默消失（HANDOFF 报表层 #5，2026-11-03/04）**：
+
+  · **报表/工单/类目树的映射阶段丢弃行时不留痕（中）**：`fetchPagedStaff`（缺 `staffId`）、
+    `staff_attendance`（缺 `staffId` 或脏时间戳）、`order_performance`（缺 `orderId`）、
+    `tickets.search`/`tickets.logs`（缺 `id`）、`knowledge.categories`（缺 `id`）都在
+    `apiCount` **之前**丢弃行 —— 配对核对因此恒等、`fetched == written`、窗口照样
+    `status: complete`，Agent 无从知道上游有一批行没落库。
+    → 新增任务层 gap reason **`row_missing_key`**（进 `TASK_GAP_LOSSY_REASONS` 丢失档），
+    逐处统计丢弃行数并在成功窗落 `sync_gaps`（`detail` 是规模）；`knowledge.categories`
+    复用 `knowledge_row_malformed`（缺 id 的节点连同**子树**一并计数，它们同样没落库）。
+  · **顺带删除两处死代码（同属契约诚实性）**：`fetchSimple` 的 `perStaff` 参数与
+    `dim.ts 的 `perRow` 回调**所有调用点都传 `undefined`** —— 永不执行、一旦执行就静默
+    丢行的一支。删除后「丢行」在本层只剩「显式抛错」（`keyCols` 空主键）与「计数 + gap」
+    两种形态。`fetchSimple` 也因此不再可能写出与全局汇总行同键互覆的 `sum` 行（显式注释）。
+
+  ⚠️ README 的「上表**后五行**是成功窗上的提示」改为逐名点出四个失败类 reason —— 位置
+  指代依赖没有守卫的表格顺序（新增一行即失真），与 `sync-notes` 的 run 图例同一纪律。
+  配 5 条行为用例（含「全部行都有主键 → 不产生 gap」的反向对照）与 4 处变异验证。
+
 - **skill install/where/check 五处契约不诚实（独立审查 #9–#13，2026-11-03，逐条真实 CLI 复现）**：
 
   · **#9 悬空符号链接占着实体路径 → where 报「未安装」并推荐 install，而 install 必退 1**：

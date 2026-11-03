@@ -38,10 +38,11 @@
    漂移时以非零退出码明示）。缺口先看 `gaps[].reason`：
    `rate_limit_local` 等到 `detail` 里的时刻再重跑，`fetch_failed`/`write_failed`/
    `count_mismatch` 重跑 `sync run` 覆盖该区间；`knowledge_row_malformed`/
-   `staff_id_list_malformed`/`filter_matched_no_staff`/`export_*` 是**成功窗上的提示**
-   （不等于同步失败）。⚠️ 「提示」不等于「数据没缺」，两档分开读：
-   `knowledge_row_malformed`/`staff_id_list_malformed` 描述的行**确实没落库**
-   （`detail` 是丢失规模，必须核对上游形态）；`filter_matched_no_staff`/
+   `staff_id_list_malformed`/`row_missing_key`/`filter_matched_no_staff`/`export_*`
+   是**成功窗上的提示**（不等于同步失败）。⚠️ 「提示」不等于「数据没缺」，两档分开读：
+   `knowledge_row_malformed`/`staff_id_list_malformed`/`row_missing_key` 描述的行
+   **确实没落库**（`detail` 是丢失规模，必须核对上游形态；`row_missing_key` 的行连
+   `fetched`/`written` 都不计，窗口仍可能 `complete`）；`filter_matched_no_staff`/
    `export_fixture_unreported`/`export_window_mismatch` **未必缺数据**（可能只是筛选
    没命中、或空窗本来就空）。不确定就读 `detail`。
    - ⚠️ **`range_status` 的两个取值字面都在撒谎**（逐值释义见输出的 `meta.field_notes`）：

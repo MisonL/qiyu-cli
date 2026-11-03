@@ -272,7 +272,28 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
     }
   })
 
-  it('ticket.logs：按窗口内 touched 工单逐张拉日志（响应 data 数组），行补 ticket_id/log_id（缺 id 行丢弃）', async () => {
+  it('#5：tickets.search 缺 id 的工单行被丢弃并记 row_missing_key（窗口仍 complete）', async () => {
+    // 变异「fetchTickets 的丢弃不计数」→ 本用例红（gaps 为空）。
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => okC({ total: 2, tickets: [{ id: 900001, status: 1 }, { status: 1 }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(ticketById('tickets.search')!, ctx(store, {
+        rangeOverride: { start: NOW - DAY, end: NOW },
+      }))
+      expect(r.status).toBe('complete')          // 提示 ≠ 失败
+      expect(r.rows).toEqual({ fetched: 1, written: 1 })
+      expect(r.gaps).toEqual([
+        expect.objectContaining({ reason: 'row_missing_key', detail: expect.stringContaining('tickets.search') }),
+      ])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('ticket.logs：按窗口内 touched 工单逐张拉日志（响应 data 数组），行补 ticket_id/log_id（缺 id 行丢弃并留痕）', async () => {
     // 第一调：search 返回 2 张工单；后续各调：log 返回该单的日志（id 即日志 id）
     const fetchMock = vi.fn()
       .mockImplementationOnce(() => okC({ total: 2, tickets: [{ id: 900001 }, { id: 900002 }] }))
@@ -294,6 +315,11 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
       expect(r.rows).toEqual({ fetched: 1, written: 1 })
       const rows = await store.query('SELECT ticket_id, log_id FROM ticket_logs')
       expect(rows.rows).toEqual([{ ticket_id: '900001', log_id: '11' }])
+      // 审查 #5：丢的那 1 行必须留痕（同一形态在 reports/tickets 都要有 gap），
+      // 否则窗口 complete 而这一单的日志无声消失。变异「tickets 的丢弃不记 gap」→ 红。
+      expect(r.gaps).toEqual([
+        expect.objectContaining({ reason: 'row_missing_key', detail: expect.stringContaining('tickets.logs') }),
+      ])
       await store.close()
     } finally {
       vi.unstubAllGlobals()

@@ -114,6 +114,7 @@ export type WriteStrategy =
 export const TASK_GAP_REASONS = [
   'knowledge_row_malformed',    // 快照映射时缺键列的行被丢弃（响应形态漂移）
   'staff_id_list_malformed',    // staffIdList 非数组（整组）或成员 id 为空（该成员）→ 这些成员未落库
+  'row_missing_key',            // 窗口任务（报表/工单）映射时行缺主键列（缺键/空串）→ 该行被丢弃、未落库
   'filter_matched_no_staff',    // 报表筛选条件未命中任何客服（本窗按 0 行记）
   'export_fixture_unreported',  // 导出流未上报窗口声明行（空窗可能真空也可能被截断）
   'export_window_mismatch',     // 导出声明的窗口宽于请求（重叠行幂等吸收）
@@ -124,8 +125,9 @@ export type TaskGapReason = typeof TASK_GAP_REASONS[number]
  * `TASK_GAP_REASONS` 里「**描述的行确实没落库**」的那一档（其余是「未必缺数据」的提示）。
  *
  * 判据是任务层对行的处理：`knowledge_row_malformed` 丢弃缺键列的行、
- * `staff_id_list_malformed` 丢弃整组（非数组时）或空 id 成员 —— 这些行不会以任何
- * 形式进库；而 `filter_matched_no_staff`（上游本就没命中）、
+ * `staff_id_list_malformed` 丢弃整组（非数组时）或空 id 成员、
+ * `row_missing_key` 丢弃窗口任务里缺主键列的行 —— 这些行不会以任何形式进库；
+ * 而 `filter_matched_no_staff`（上游本就没命中）、
  * `export_window_mismatch`（重叠行被幂等 upsert 吸收，数据在库里）都不属于这一档，
  * `export_fixture_unreported` 是「该不该有行」尚不可知，同样不在这一档。
  *
@@ -135,6 +137,7 @@ export type TaskGapReason = typeof TASK_GAP_REASONS[number]
 export const TASK_GAP_LOSSY_REASONS = [
   'knowledge_row_malformed',
   'staff_id_list_malformed',
+  'row_missing_key',
 ] as const
 
 /** fetch 结果：rows 是未 enrich 的原始行；apiCount 是 API 侧声称的行数（配对核对基准）。 */

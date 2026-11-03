@@ -147,11 +147,32 @@ async function fetchTickets(w: WindowRef, ctx: FetchCtx): Promise<FetchResult> {
   assertOpWindow(w)
   const nowIso = nowIsoOf(ctx)
   const out: Record<string, unknown>[] = []
+  let dropped = 0
   for (const r of await searchAllPages(w, ctx)) {
     const row = ticketRow(r, nowIso)
     if (row) out.push(row)
+    else dropped++
   }
-  return { rows: out, apiCount: out.length }
+  return { rows: out, apiCount: out.length, ...droppedTicketHint('tickets.search', dropped, 'id') }
+}
+
+/**
+ * 行被丢弃（缺主键列）时的 task gapHint（`row_missing_key`）。
+ *
+ * ⚠️ 与 reports.ts 的 `droppedHint` 同形（审查 #5，2026-11-03）：`apiCount` 取的是过滤后
+ * 的行数，配对核对恒等 → 缺键行静默消失、窗口仍 complete。这些行真的没落库，必须留痕。
+ * （两处各写一份是有意的：tickets 与 reports 是两个任务文件，分层上不互相 import；
+ * `tests/sync-enums.test.ts` 保证 reason 值同属一个枚举、README 图例只释义一次。）
+ */
+function droppedTicketHint(taskId: string, dropped: number, keyName: string): { gapHint?: FetchResult['gapHint'] } {
+  if (dropped === 0) return {}
+  return {
+    gapHint: {
+      reason: 'row_missing_key',
+      detail: `${taskId}: ${dropped} 行缺 ${keyName}（主键列，缺键或空串）被丢弃、未落库`
+        + ' —— 上游响应形态漂移，请核对接口返回；本次按已落库的行覆盖窗口',
+    },
+  }
 }
 
 /**
@@ -169,6 +190,7 @@ async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult
   }
   // —— 逐单拉日志 ——
   const out: Record<string, unknown>[] = []
+  let droppedLogs = 0
   for (const tid of touched) {
     const res = await callPaced('ticket.log', { ticketId: Number(tid) }, ctx)
     // ticket.log 信封未实测（registry envelope=null）→ 宽松模式载荷；data 数组形态按实测 §10.3。
@@ -187,11 +209,12 @@ async function fetchTicketLogs(w: WindowRef, ctx: FetchCtx): Promise<FetchResult
     }
     for (const r of rows) {
       const logId = r.id
-      if (isEmptyKey(logId)) continue   // 键缺失/空串行：丢弃且不计入 fetched（C 低-7）
+      // 键缺失/空串行：丢弃、计数并留痕（审查 #5）——否则这一单的日志无声消失（C 低-7）。
+      if (isEmptyKey(logId)) { droppedLogs++; continue }
       out.push({ ticket_id: tid, log_id: String(logId), payload: JSON.stringify(r), synchronized_at: nowIso })
     }
   }
-  return { rows: out, apiCount: out.length }
+  return { rows: out, apiCount: out.length, ...droppedTicketHint('tickets.logs', droppedLogs, 'id') }
 }
 
 export const TICKET_TASKS: SyncTask[] = [
