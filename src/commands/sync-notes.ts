@@ -124,16 +124,27 @@ const LAST_SYNCED_AT_NOTE = '上次成功提交同步事务的时刻（UTC `Z` �
 /** `sync run` 的 `meta.field_notes`（导出供测试核对真实渲染路径）。 */
 export function runFieldNotes(): Record<string, string> {
   return {
+    'tasks[].task': '任务 id（与 `sync tasks` 的 id 同源）',
     'tasks[].status': renderNotes(RUN_STATUS_NOTES),
+    // ⚠️ windows / rows 是嵌套对象，此前只解释了 windows.skipped 与 status 里顺带提到的
+    // 字段（2026-11-04 反向 sweep 实测：total/succeeded/failed 与 rows.* 全部裸奔）。
+    // 这四个数是 Agent 判「这次到底拿到没有」的依据，必须各自可见。
+    'tasks[].windows.total': '本轮切出的窗口总数（= succeeded + failed + skipped）',
+    'tasks[].windows.succeeded': '成功窗数。⚠️ 空窗也算成功，所以 > 0 不代表有数据 —— 看 rows.written',
+    'tasks[].windows.failed': '失败窗数（失败会在 gaps 里逐条记录）',
     'tasks[].windows.skipped': '没跑的窗数，两种成因：① 残段窗（日对齐任务被显式区间钳出的'
       + '非日界首/末段）；② 整窗晚于末端上限被丢弃的窗（windowEndClamp：考勤/绩效请求到'
       + '「今天」时）。两种都跳过不 fetch、不写库、不推水位，但计入 total'
       + '（total = succeeded + failed + skipped）；stderr 进度行分两句点名成因',
+    'tasks[].rows.fetched': '本轮从上游取回的行数（enrich 过滤之前）。与 written 不等说明有行被本地决策淘汰',
+    'tasks[].rows.written': '本轮真正落库的行数。0 可能是「窗口都成功、只是上游没数据」—— 结合 windows 判断',
+    'tasks[].notes': '本任务的逐条说明（恒在、可为空数组）。当前唯一生产者是「请求区间早于接口下界」——'
+      + '把「区间不可得」与「同步故障」分开，看到它不代表本轮失败',
     'tasks[].resolved_range': '本轮请求的水位区间（start = 水位/请求起点语义，'
       + '日对齐任务的首残段可能被跳过、start 前缀不会自动前移，所以它不是「已覆盖」的保证）。'
       + '末端与水位同源：出现失败窗后水位冻结在连续成功末端，因此它可能早于你请求的 end。'
       + '评估真实覆盖要看 end 与 windows.skipped，不要只看 start',
-    'tasks[].gaps': '本轮失败/提示的缺口逐条记录（reason 取值见 README 图例）。'
+    'tasks[].gaps': '本轮失败/提示的缺口逐条记录（每条的 reason 取值见 README 图例）。'
       + 'gaps 非空不等于同步失败：'
       // ⚠️ 逐名渲染，不用「后四个」（2026-11-01 审查）：位置指代依赖 README 图例表的
       // 排列顺序，而图的顺序**没有**任何守卫（`sync-enums.test.ts` 双向核对用
@@ -145,6 +156,9 @@ export function runFieldNotes(): Record<string, string> {
       // 必须核对上游形态）。丢失档从 `TASK_GAP_LOSSY_REASONS` 渲染，与 README/skill 同源。
       + `其中 ${TASK_GAP_LOSSY_REASONS.join(' / ')} 描述的行确实没落库（detail 是丢失规模，`
       + '报告人类核对接口形态）；其余可能只是筛选没命中或空窗本来为空，未必缺数据',
+    'tasks[].gaps[].reason': '缺口成因（取值与动作见 README 的 gaps 图例）',
+    'tasks[].gaps[].detail': '给人读的说明（本命令是引擎产出的原文）。⚠️ 对丢失档的 reason，'
+      + '这里给出的是丢失规模；其余 reason 下它只是描述，不代表数据缺失',
     'tasks[].gaps[].range': '本命令的缺口区间已格式化成 `+08:00` ISO（与 resolved_range 同一套时间解析）。'
       + '⚠️ `sync status` 的同名字段不是这个形态：那边原样回显 `sync_gaps` 的 epoch 毫秒字符串'
       + '（引擎落库的存储值）—— 跨命令比较缺口区间前先统一形态',
@@ -179,6 +193,13 @@ export function statusFieldNotes(): Record<string, string> {
       + '按 reason 区分不出新旧。range 也只能说明「相关」：换边界重跑后数据可能已补齐，'
       + '而旧缺口的 range 仍与你要评估的区间重叠。所以没有一次覆盖核对就不能确认新鲜度——'
       + '报「该区间有历史缺口记录，新鲜度未确认」，不要直接报成当前故障',
+    // ⚠️ 缺口元素的 detail / recorded_at 此前没有释义（2026-11-04 反向 sweep 实测）。
+    // recorded_at 是**落库时刻**（历史记录的时间戳，不是缺口所在区间的时间）。
+    'tasks[].gaps[].detail': '给人读的说明（引擎落库的原文）。⚠️ 对丢失档的 reason 它是丢失规模；'
+      + '其余 reason 下只是描述，不代表数据缺失',
+    'tasks[].gaps[].recorded_at': '这条缺口被记录的时刻（epoch 毫秒数，落库时间）。'
+      + '⚠️ 它不是缺口所在区间的时间（那看 range），也不是「现在是否仍缺」的依据 ——'
+      + '它只说明这条历史记录是何时写下的',
     'tasks[].gaps[].reason': '取值与动作见 README 的 gaps 图例（与 sync run 的 gaps[].reason 同一组值）',
     'tasks[].gaps[].range': '原样回显 sync_gaps 的存储值（epoch 毫秒字符串），不是 run 输出的'
       + ' +08:00 ISO 形态 —— 要比较请先按同一形态解析',
@@ -222,6 +243,12 @@ export function tasksFieldNotes(): Record<string, string> {
     'tasks[].kind': 'windowed = 窗口型：按时间切片增量拉，有水位；'
       + 'snapshot = 快照型：全量拉取、全删重插（幂等）。'
       + '⚠️ 读 verify 的输出前必须先看它：只有 snapshot 的 expected_from_api 有意义',
+    // ⚠️ 这两个是窗口型专属参数，此前完全没有释义（2026-11-04 反向 sweep 实测）。
+    // 快照任务上它们是 null —— 不是「无上限 / 不重叠」，而是「这个概念对它不适用」。
+    'tasks[].maxWindowDays': '窗口型任务的单窗最大天数（切窗依据）。null = 快照任务（没有窗口概念），'
+      + '不是「不限宽」。sync run 按它切片；撞上游 14501 时也按它判断是不是切宽了',
+    'tasks[].overlapDays': '窗口型任务相邻窗口的重叠天数（幂等写入吸收重复）。null = 快照任务。'
+      + '0 = 窗口首尾相接、不重叠',
     unsupported: '明确不做同步的数据集及原因（不是遗漏）。目前唯一取值 realtime = '
       + '实时快照，数据随推随逝、不可回放——这类数据只能走 api call 实时取，别去 sync run 里找',
     'tasks[].watermark.field': '水位取自哪一列（任务声明的时间列名）。'

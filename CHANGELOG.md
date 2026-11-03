@@ -122,6 +122,37 @@
 
 ### 修复
 
+- **反向图例覆盖：18 个带图例的命令补齐「输出 ⊆ 图例 ∪ 自明键」，下沉到元素层（HANDOFF #38 挂账，2026-11-04）**：
+
+  此前全仓图例守卫（`command-legends-complete` / `api-legend-paths` / `stats-field-notes`）
+  只查「图例 ⊆ 输出」——图例里写的键必须在输出上存在；反方向「输出里的每个叶子键都在
+  图例（或登记过的自明键）里有解释」基本无人守。后果是新增字段不留痕：Agent 面对一个
+  没有任何释义的键只能猜。新增 `tests/command-legends-reverse.test.ts`，对 18 个带
+  `field_notes` 的命令逐个**真跑**，递归收集输出的叶子路径（数组下钻到元素、根数组不带
+  `[]` 前缀、`query.rows` 这类列名随表变化的容器登记为 `OPAQUE` 停止下钻），再按
+  `covered()` 判据核对。判据要点：图例键是**路径**（`tasks[].gaps[].detail` 而非裸名）；
+  `[]` 剥离后逐段前缀匹配，`<字段>` / `<name>` / `*` 恰好匹配一段；**枚举规则**——容器
+  一旦有任一条子图例键，它的每个子键都必须自带条目，粗粒度容器注释不得遮蔽缺失的元素级
+  键（否则「删掉一个元素级图例、其余键仍覆盖」的假守卫会原样复发）。`warnings` / `notice`
+  是 README 一次说明的全局元键，`id` / `columns[].name` 等自明键在测试里显式登记，
+  不靠隐式放过。
+
+  本轮补齐的图例全部对应实测能读到的真实字段：`api list` 的 meta 键
+  `rows` / `filter` / `registry_complete` / `registry_note`；`api schema` 的
+  `params[].in/type/required/name/description/example` 与 `endpoint` / `note`；
+  `skill install` 的 `dry_run`、`links[].error`；`sync run` 的
+  `windows.total/succeeded/failed`、`rows.fetched/written`、`notes`、`gaps[].reason/detail`；
+  `sync status` 的 `gaps[].detail`、`gaps[].recorded_at`；`sync tasks` 的
+  `maxWindowDays` / `overlapDays`。`api-legend-paths.test.ts` 同步改为可解析 data **或**
+  meta 上的路径（并把 `request_schema` 登记为「不含参数表」的独立否定声明，而非路径）。
+
+  守卫自身做双向验证：`covered()` 携带 5 条最小反例用例（粗容器遮蔽、元素级漏一、
+  通配符越界、前缀反写、根数组），防止判据退化成恒真；变异 M1–M6（删除/改名图例）与
+  G2–G6（放宽判据）全部变红，G1 经核实为等价变异（单段顶层叶子的两条分支同值）如实记录。
+  过程中即抓到判据自身的一处死代码（枚举规则的元素比较写成了整段比较、永不命中，
+  放宽兜底让漏标蒙混过关），靠变异 M2 复现后修正。另加一条形态约束：stdout JSON 的
+  图例文本禁用 `**` Markdown 加粗（终端里是字面量，不是渲染）。
+
 - **报表空载荷漂移守卫：`{}` / `[]` 不再被当合法空窗（HANDOFF 报表层 #6，2026-11-04 真实上游采样）**：
 
   `payloadRows` 的「一行全局汇总」兜底会把空对象写成一行全空行（覆盖同键的真实汇总），
