@@ -105,6 +105,23 @@ export function reportBody(taskId: string, w: WindowRef): Record<string, unknown
  * transfer_human 是形状 A、载荷在 data）。识别已知包装键（result/orders），
  * 其余对象形态视为「一行全局汇总」（overview 69 字段/summary 27 字段/transfer 恒 1 行）。
  */
+/**
+ * 载荷 → 行数组（逐接口信封实测：C 族载荷是 message 解析物；robot_summary/
+ * transfer_human 是形状 A、载荷在 data）。识别已知包装键（result/orders），
+ * 其余对象形态视为「一行全局汇总」（overview 69 字段/summary 27 字段/transfer 恒 1 行）。
+ *
+ * ⚠️ **结构为空的载荷（`{}` / `[]`）一律拒绝**（HANDOFF 报表层 #6，2026-11-04 真实上游采样）：
+ * 九个报表接口的**空窗**形状全部实测过，没有一个是空容器 ——
+ *   · `overview` → 带 69 字段的**全零行**（`sessions:0` … 比例字段 `-1`）；
+ *   · `robot.summary` → 带字段的汇总行；`transferHuman` → **一行**数组
+ *     `[{count:0, sessionRatio:-1, type:0}]`；`salaryDetail` → 带 account/date/id 的**一行**对象；
+ *   · `staffworklod` / `satisfaction` / `staffAttendance` → `{result:[], total:0}`；
+ *     `staffquality` → `{result:[], sum:{…34 字段}, total:0}`；
+ *     `performance` → `{orders:[], sum:{…20 字段}, total:0}`。
+ * 所以 `{}` 落进下面的「一行全局汇总」兜底会把**一次形态漂移**写成一行全空行（覆盖真实
+ * 汇总的同键行），而 `[]` 会被当合法空窗 → `complete` 且零 gap：两种都是「静默吃掉一整窗」。
+ * 与 `api` 层 `not_found`（解包后 `{}`/`[]`）同一判据，这里只是把它变成**拒绝落库**。
+ */
 function payloadRows(taskId: string, payload: unknown): { rows: Record<string, unknown>[]; sum: Record<string, unknown> | null } {
   // C 中-5：载荷为 null/undefined 是**形状漂移**（信封层丢 data 键、或上游改了形态），
   // 绝不能当合法空窗 —— 静默按空处理会把整段数据吞成 complete。与同文件 orders:null
@@ -112,8 +129,22 @@ function payloadRows(taskId: string, payload: unknown): { rows: Record<string, u
   if (payload === null || payload === undefined) {
     throw new Error(`接口 ${endpointOf(taskId)} 未返回载荷（null/undefined）——响应形态漂移，拒绝按空窗处理`)
   }
-  if (Array.isArray(payload)) return { rows: payload as Record<string, unknown>[], sum: null }
+  if (Array.isArray(payload)) {
+    // 空数组：实测空窗从不是 `[]`（transferHuman 空窗是一行数组）→ 形态漂移。
+    if (payload.length === 0) {
+      throw new Error(`接口 ${endpointOf(taskId)} 返回空数组 [] —— 实测空窗形态是 `
+        + '{result:[],total:0}（result 族）或一行数组（transferHuman），空数组属响应形态漂移，拒绝按空窗处理')
+    }
+    return { rows: payload as Record<string, unknown>[], sum: null }
+  }
   const o = payload as Record<string, unknown>
+  // 空对象：实测空窗从不是 `{}`（全局汇总表返回的是带字段的全零行；salaryDetail 返回带字段的一行）
+  // → 落进下面的「一行全局汇总」兜底会写出全空行，覆盖真实汇总。
+  if (Object.keys(o).length === 0) {
+    throw new Error(`接口 ${endpointOf(taskId)} 返回空对象 {} —— 实测空窗形态是带字段的全零行`
+      + '（overview/summary/salaryDetail）或 {result:[],total:0}，空对象属响应形态漂移，'
+      + '拒绝当作「一行全局汇总」落库')
+  }
   // statistic.performance 的全 null 形态（orders:null/sum:null/total:null，code:200）
   // 是筛选失败（staffIdList 含租户不存在的 id），不是空窗口——fetch 层抛带 kind 的
   // 形态错误，引擎记 sync_gaps（reason=filter_matched_no_staff，T5 裁定透传）。

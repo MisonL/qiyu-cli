@@ -122,6 +122,18 @@
 
 ### 修复
 
+- **报表空载荷漂移守卫：`{}` / `[]` 不再被当合法空窗（HANDOFF 报表层 #6，2026-11-04 真实上游采样）**：
+
+  `payloadRows` 的「一行全局汇总」兜底会把空对象写成一行全空行（覆盖同键的真实汇总），
+  空数组则被当合法空窗（0 行、`complete`、零 gap）—— 两种都是「静默吃掉一整窗」。
+  ⚠️ 此前按「裸 `[]` 对 per-staff 族可能是合法空窗」挂账，**本次用真实凭证逐个采样**九个
+  报表接口的空窗形状后收窄：空窗从来不是空容器 —— `overview` 带 69 字段的全零行、
+  `robot.summary` 带字段汇总行、`transferHuman` **一行数组**、`salaryDetail` 带
+  account/date/id 的一行对象、`staffworklod`/`satisfaction`/`staffAttendance` 是
+  `{result:[],total:0}`、`staffquality`/`performance` 另带 `sum` 字段。故 `{}` 与 `[]`
+  一律**显式失败**（与 `api` 层 `not_found` 同一判据，同步侧升级为拒绝落库）。
+  3 条用例（含「实测两种合法空窗照常接受」的反向对照）+ 2 处变异验证。
+
 - **sync 行丢弃留痕：缺主键列的行不再静默消失（HANDOFF 报表层 #5，2026-11-03/04）**：
 
   · **报表/工单/类目树的映射阶段丢弃行时不留痕（中）**：`fetchPagedStaff`（缺 `staffId`）、

@@ -684,6 +684,64 @@ describe('报表任务 fetch（http mock）', () => {
     }
   })
 
+  it('#6：空对象 {} 载荷 → 显式失败（实测空窗是带字段的全零行，不是空容器）', async () => {
+    // 2026-11-04 真实上游采样：overview/summary/salaryDetail 的空窗都返回带字段的行，
+    // 从不是 {}。变异「去掉空对象守卫」→ 本用例红（{} 落进「一行全局汇总」兜底，
+    // 写出一行全空行并覆盖同键的真实汇总）。
+    const fetchMock = respondQueue([() => okC({})])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const t = reportById('reports.overview')!
+      await expect(t.fetch({ start: 0, end: DAY, index: 0, total: 1 },
+        { store, credentials: ctx(store).credentials })).rejects.toThrow(/空对象/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('#6：空数组 [] 载荷 → 显式失败（transferHuman 的空窗是「一行数组」，不是空数组）', async () => {
+    // 变异「去掉空数组守卫」→ 本用例红（[] 被当合法空窗：0 行、complete、零 gap）。
+    const fetchMock = respondQueue([() => okA([])])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const t = reportById('reports.transfer_human')!
+      await expect(t.fetch({ start: 0, end: DAY, index: 0, total: 1 },
+        { store, credentials: ctx(store).credentials })).rejects.toThrow(/空数组/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('#6 反向：实测的两种「合法空窗」形态照常接受（守卫不能误伤）', async () => {
+    // 与上面两条成对：全局表的全零行（带字段）与 result 族的 {result:[],total:0}
+    // 都必须照常落库/记 0 行 —— 变异「凡空即拒」→ 本用例红。
+    const fetchMock = respondQueue([
+      () => okC({ sessions: 0, messages: 0, avgTime: -1 }),      // overview 全零行
+      () => okA([{ count: 0, sessionRatio: -1, type: 0 }]),     // transferHuman 一行数组
+      () => okC({ result: [], total: 0 }),                      // staffworklod 空窗
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const ov = await reportById('reports.overview')!.fetch({ start: 0, end: DAY, index: 0, total: 1 },
+        { store, credentials: ctx(store).credentials })
+      expect(ov.rows).toHaveLength(1)
+      const th = await reportById('reports.transfer_human')!.fetch({ start: 0, end: DAY, index: 0, total: 1 },
+        { store, credentials: ctx(store).credentials })
+      expect(th.rows).toHaveLength(1)
+      const wl = await reportById('reports.staff_workload')!.fetch({ start: 0, end: DAY, index: 0, total: 1 },
+        { store, credentials: ctx(store).credentials })
+      expect(wl.rows).toHaveLength(0)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('C 中-3：分页短读（声明 total=3 只拿到 1 行 → 空页）→ 显式失败', async () => {
     const fetchMock = respondQueue([
       () => okC({ result: [{ staffId: 1000002, x: 1 }], total: 3 }),
