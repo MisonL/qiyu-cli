@@ -165,13 +165,23 @@ function realpathOrSelf(p: string): string {
 }
 
 /**
- * `skill where` 的 `links[].state` 与 `entity.state` 的全部取值 —— Agent 按值分支，
- * 所以每个值都必须在 `meta.field_notes`（README 同步）有释义与动作
- * （`tests/skill-field-notes.test.ts` 双向核对）。
- * 命令层还会追加 `'unknown'`（无法判定 ≠ 不存在，见 `commands/skill.ts`）。
+ * **可判定**的链接四态 —— `linkState()` 的返回域。ELOOP（自指/成环）等判定不了的情况
+ * 不在其中，`linkState` 会照常抛，由调用方收敛。
  */
 export const LINK_STATES = ['ok', 'dangling', 'foreign', 'missing'] as const
 export type LinkState = typeof LINK_STATES[number]
+
+/**
+ * `links[].state` 的**报告域**（`skill where` 与 `skill install` 共用，5 值）：
+ * 四态 + `unknown`（无法判定 ≠ 不存在）。两个命令必须用**同一个域**——
+ * 此前 `where` 用 5 值、`install` 用 4 值，同一条自环链接 `where` 报 `unknown`、
+ * `install` 报 `foreign`（2026-11-03 实测），同一份输出里两个 `links[].state`
+ * 图例说的却是同一套话（`tests/skill-field-notes.test.ts` 三方核对也因此覆盖不到
+ * install 侧的真实值域）。收敛到这里后，两处都是这 5 个值。
+ * 每个值都必须在 `meta.field_notes`（README 同步）有释义与动作。
+ */
+export const LINK_REPORT_STATES = [...LINK_STATES, 'unknown'] as const
+export type LinkReportState = typeof LINK_REPORT_STATES[number]
 
 /**
  * 判定 `linkPath` 相对 `entityDir` 的状态。
@@ -224,6 +234,44 @@ export function linkState(linkPath: string, entityDir: string): LinkState {
 /** `Stats` 是否带可用的 inode 数字（Windows 的 stat 也有 ino，但为 0 时不可比）。 */
 function hasInode(st: Stats): boolean {
   return typeof st.ino === 'number' && st.ino !== 0 && typeof st.dev === 'number'
+}
+
+/**
+ * 路径的目录形态 —— **唯一判据**（2026-11-03 审查 #9/#11）。
+ *
+ * 此前「这个路径是不是一个可用的目录」有三份各自为政的 `statSync` 判据
+ * （`install.ts` 的 `isDirectory`、`commands/skill.ts` 的 `skill where` 实体探测、
+ * `detect.ts` 的启动探测），对同一条路径给出互相矛盾的结论：
+ *   · 实体路径是**悬空符号链接** → `where` 报 `exists:false / missing` 并建议
+ *     `qiyu skill install`，而 install 退 1「实体路径已存在但不是目录」——
+ *     CLI 自荐的修复动作必然失败（实测）；
+ *   · agent 的 skills 路径是**普通文件** → install 说「目录不存在」（事实错误，
+ *     路径明明存在），`where` 对同一路径报 `unknown`+ENOTDIR。
+ * 收敛到一个函数后，三处对同一路径必然同答。
+ *
+ * 三态与判据（**只看真实文件系统的形态**，不猜意图）：
+ *   · `absent` —— 路径不存在。判据不只是 `statSync` 抛 ENOENT：还要 `lstatSync`
+ *     也拿不到（ENOENT 时 lstat 也失败），否则那是**悬空符号链接**（见下）。
+ *   · `not_a_directory` —— 路径**存在**但不是目录：普通文件/设备，或是一条
+ *     解析不到目标的符号链接（`statSync` 抛 ENOENT，但 `lstatSync` 看得到它）。
+ *     消费方据此说「路径存在但不是目录，需先由人处理」，**不能**说「不存在」。
+ *   · `dir` —— 真实目录（**顺着**符号链接判定：实体目录本身是指向别处的符号链接
+ *     是合法安装形态，见 `probe()` 的注释）。
+ *
+ * **其余错误照常抛**（ENOTDIR=父级是文件、EACCES、ELOOP…）：那些是「判定不了」，
+ * 由调用方按各自语境收敛（install 进 warnings 记 unknown、detect 归 unknown），
+ * 本函数不替它们编一个形态。与 `linkState` 的四态是同一条纪律——判不了就抛。
+ */
+export function dirShape(p: string): 'dir' | 'absent' | 'not_a_directory' {
+  try {
+    return statSync(p).isDirectory() ? 'dir' : 'not_a_directory'
+  } catch (err) {
+    if (!isEnoent(err)) throw err
+    // 解析不到：区分「根本不存在」与「悬空符号链接占着这个位置」。后者是**存在**的
+    // 一个条目（lstat 看得到），只是解析不到目标——它对 install 是「不能写的占用物」，
+    // 对 `where` 是「路径存在但不是目录」，对启动探测是「判定不了」。
+    return lstatOrNull(p) !== null ? 'not_a_directory' : 'absent'
+  }
 }
 
 /**

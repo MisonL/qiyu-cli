@@ -727,7 +727,10 @@ describe('installSkill', () => {
     expect(r.warnings.some((w) => w.includes(missing))).toBe(true)
   })
 
-  it('linkDirs 指向文件而非目录：警告并跳过，links 记 missing，不让安装失败', async () => {
+  it('linkDirs 指向文件而非目录：警告并跳过，links 记 unknown（不是 missing），不让安装失败', async () => {
+    // 变异「按 not_a_directory 处理时仍记 missing」→ 本用例红。missing 的含义是「这里
+    // 没有东西」，而路径明明**存在**；`where` 对同一状态报 unknown（审查 #11/#13：
+    // 两个命令必须同答）。
     const src = makeSource()
     const notDir = join(home, 'not-a-dir')
     writeFileSync(notDir, '')
@@ -737,11 +740,17 @@ describe('installSkill', () => {
     })
 
     expect(r.status).toBe('installed')
-    expect(r.links).toEqual([{ agent: notDir, path: join(notDir, 'qiyu'), state: 'missing' }])
+    expect(r.links).toEqual([{
+      agent: notDir, path: join(notDir, 'qiyu'), state: 'unknown', error: '路径存在但不是目录',
+    }])
     expect(r.warnings.some((w) => w.includes(notDir))).toBe(true)
+    // 文案必须说「存在但不是目录」——此前说「目录不存在」，是事实错误。
+    expect(r.warnings.some((w) => w.includes('存在但不是目录'))).toBe(true)
   })
 
   it('linkDirs 的父路径是文件（ENOTDIR）时收敛进 warnings，不让安装失败（审查 M1）', async () => {
+    // CodeRabbit #60：state 必须是 unknown —— dirShape 抛错说明**判定不了**路径形态
+    // （父级是文件时连「这个路径存在吗」都说不出来），missing 是编造。
     const src = makeSource()
     const blocker = join(home, 'blocker')
     writeFileSync(blocker, '')
@@ -752,7 +761,10 @@ describe('installSkill', () => {
     })
 
     expect(r.status).toBe('installed')
-    expect(r.links).toEqual([{ agent: unreachable, path: join(unreachable, 'qiyu'), state: 'missing' }])
+    expect(r.links).toEqual([{
+      agent: unreachable, path: join(unreachable, 'qiyu'), state: 'unknown',
+      error: expect.stringContaining('ENOTDIR'),
+    }])
     expect(r.warnings.some((w) => w.includes('检查') && w.includes(unreachable))).toBe(true)
   })
 
@@ -800,7 +812,10 @@ describe('installSkill', () => {
     expect(readlinkSync(join(agent, 'qiyu'))).toBe(join('..', '..', '.agents', 'skills', 'qiyu'))
   })
 
-  it('自指循环链接（ELOOP）不落四态：不覆盖、收敛进 warnings，安装照常完成', async () => {
+  it('自指循环链接（ELOOP）不落四态：记 unknown（不是 foreign）、不覆盖、安装照常完成', async () => {
+    // 变异「ELOOP 分支退回 state: 'foreign'」→ 本用例红。foreign 的含义是「路径上是
+    // 别人的东西」，ELOOP 却是连它是什么都判定不了；且 `where` 对同一条自环链报
+    // unknown（审查 #13：两条命令对同一状态不同答）。动作不变——不触碰。
     const src = makeSource()
     const agent = join(home, '.claude', 'skills')
     mkdirSync(agent, { recursive: true })
@@ -811,7 +826,8 @@ describe('installSkill', () => {
 
     expect(r.status).toBe('installed')
     expect(r.links).toHaveLength(1)
-    expect(r.links[0]?.state).toBe('foreign')
+    expect(r.links[0]?.state).toBe('unknown')
+    expect(r.links[0]?.error).toContain('ELOOP')
     expect(r.warnings.some((w) => w.includes(join(agent, 'qiyu')))).toBe(true)
     expect(readlinkSync(join(agent, 'qiyu'))).toBe('qiyu')
   })

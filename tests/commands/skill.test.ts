@@ -601,6 +601,98 @@ describe('skill where', () => {
     expect(metaWarnings()).not.toContain('不配套')
   })
 
+  // —— 审查 #10：清单只描述安装那一刻的正文 ——
+  // 实测：手工改过实体正文后 `where` 仍报 compatible:true（清单的契约号没变），
+  // 等于拿旧快照给改过的正文背书。修法不是加字段，而是把实体当前内容的哈希与
+  // 清单记录的 content_hash 比：不一致 → compatible:null（判定不了）。
+  it('正文被手工改过 → compatible:null（不拿旧清单背书）+ 点名 --force 的警告', async () => {
+    // 变异「compatible 回到只比契约号」→ 本用例红（报 true）。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    writeFileSync(join(entity, 'SKILL.md'), readFileSync(join(entity, 'SKILL.md'), 'utf8') + '\n手工追加的一行\n')
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({
+      installed: {
+        skill_contract_version: SKILL_CONTRACT_VERSION,
+        // 契约号相等，但正文已经不是清单描述的那份 —— 结论是「判定不了」，不是 true。
+        compatible: null,
+      },
+    })
+    const w = metaWarnings()
+    expect(w).toContain('content_hash')
+    expect(w).toContain('`qiyu skill install --force`')
+    // 与「契约号不同」那条分支分开：这里正文不该被说成「不配套」。
+    expect(w).not.toContain('正文与 CLI 不配套')
+  })
+
+  it('正文未被改动 → compatible:true（上一条的反向对照，守卫不能恒为 null）', async () => {
+    // 变异「compatible 恒为 null」→ 本用例红。与上一条成对，防止「一律判不了」蒙混过关。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({ installed: { compatible: true } })
+    expect(metaWarnings()).not.toContain('content_hash')
+  })
+
+  it('实体里多了用户自己的文件 → compatible 仍按正文判定（不被总哈希拖成 null）', async () => {
+    // CodeRabbit #60 实测：旧实现拿整目录总哈希比清单 content_hash，而 --force 刻意
+    // 不删用户文件 → 加一个 my-notes.md 就永远 compatible:null，且警告里的 --force
+    // 修不好。变异「bodyVerified 回到 contentHash(entityDir) 总哈希」→ 本用例红。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    writeFileSync(join(entity, 'my-notes.md'), '用户自己的笔记\n')
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({ installed: { compatible: true } })
+    // 额外文件要如实报出来（它是真实存在的差异），但不推 --force（推了也修不好）。
+    const w = metaWarnings()
+    expect(w).toContain('my-notes.md')
+    expect(w).toContain('不影响正文判定')
+    expect(w).not.toContain('content_hash 不一致')
+  })
+
+  it('旧清单（无受管文件列表）+ 额外文件 → compatible:null，警告如实说「分不出成因」', async () => {
+    // 旧清单只能比总哈希：额外文件会让它「不一致」，但它根本分不出「正文被改」与
+    // 「多了个用户文件」。报错必须点名真正给的来源，或如实说分不出来 —— 变异
+    // 「legacyNote 去掉」→ 本用例红。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const p = join(entity, '.qiyu-skill.json')
+    const m = JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>
+    delete m.files
+    delete m.file_hashes
+    writeFileSync(p, JSON.stringify(m, null, 2))
+    writeFileSync(join(entity, 'my-notes.md'), '用户自己的笔记\n')
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({ installed: { compatible: null } })
+    const w = metaWarnings()
+    expect(w).toContain('没有受管文件列表')
+    expect(w).toContain('无法区分')
+  })
+
+  it('正文被改过 + 清单契约号也不同 → 仍 compatible:null，且不得断言「不配套」', async () => {
+    // CodeRabbit #60：旧实现里这两条警告会同时出现 —— 一条说 compatible:null、
+    // 另一条说「正文与 CLI 不配套」，同一份输出自相矛盾（清单号描述的是旧正文，
+    // 没有依据判断当前正文配不配套）。变异「不配套警告不受 bodyVerified 约束」→ 本用例红。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const p = join(entity, '.qiyu-skill.json')
+    const m = JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>
+    m.skill_contract_version = SKILL_CONTRACT_VERSION + 1
+    writeFileSync(p, JSON.stringify(m, null, 2))
+    writeFileSync(join(entity, 'SKILL.md'), readFileSync(join(entity, 'SKILL.md'), 'utf8') + '\n手工追加\n')
+    out = ''; err = ''
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({
+      installed: { skill_contract_version: SKILL_CONTRACT_VERSION + 1, compatible: null },
+    })
+    const w = metaWarnings()
+    expect(w).toContain('content_hash')
+    // 清单号仍要报出来（它是唯一线索），但要说清它描述的是旧正文。
+    expect(w).toContain(`安装清单记录的契约版本为 ${SKILL_CONTRACT_VERSION + 1}`)
+    expect(w).toContain('该记录描述的是旧正文')
+    // 与「确实不配套」那条警告分开：这里没有依据说当前正文不配套。
+    expect(w).not.toContain('正文与 CLI 不配套')
+  })
+
   it('自指循环链接（ELOOP）不崩：该 agent 记 unknown 并进 warnings，其余照常', async () => {
     mkdirSync(join(home, '.claude', 'skills'), { recursive: true })
     mkdirSync(join(home, '.codex', 'skills'), { recursive: true })
@@ -625,6 +717,28 @@ describe('skill where', () => {
     expect(String(linkOf('claude-code')?.error)).toContain('ENOTDIR')
     expect(linkOf('codex')).toMatchObject({ state: 'missing' })
     expect(metaWarnings()).toContain('ENOTDIR')
+  })
+
+  // —— 审查 #11：agent 的 skills 目录「存在但不是目录」——
+  // 两个命令此前对同一状态不同答：where 报 unknown+ENOTDIR，install 报 missing+
+  // 「目录不存在」（事实错误——路径明明存在）。两边现在都先过 `dirShape`。
+  it('~/.claude/skills 被普通文件占住 → where 与 install 同答（unknown / 存在但不是目录）', async () => {
+    // 变异「where 的逐 agent 探测撤掉 dirShape、直接 linkState」→ 本条 where 段红
+    // （error 变 ENOTDIR 而不是「路径存在但不是目录」）；变异「install 退回 missing」→ install 段红。
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    writeFileSync(join(home, '.claude', 'skills'), '不是目录\n')
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(linkOf('claude-code')).toMatchObject({ state: 'unknown', error: '路径存在但不是目录' })
+    expect(linkOf('codex')).toMatchObject({ state: 'missing' })
+    expect(metaWarnings()).toContain('存在但不是目录')
+
+    out = ''; err = ''
+    const r = await installSkill({ home, sourceDir: resolveSkillSourceDir()!, version: '1.2.3', force: false })
+    expect(r.links.find((l) => l.agent === 'claude-code')).toMatchObject({
+      state: 'unknown', error: '路径存在但不是目录',
+    })
+    // 「目录不存在」在这里是事实错误：那个路径存在。
+    expect(r.warnings.join('\n')).not.toContain('skills 目录不存在')
   })
 
   it('未给 --dir 时用 QIYU_SKILL_DIR，并报告定位来源', async () => {
@@ -1108,15 +1222,16 @@ describe('D3.3：planLinks 的 ELOOP 兜底（自环链接）', () => {
     expect(lstatSync(join(home, '.claude', 'skills', 'qiyu')).isSymbolicLink()).toBe(true)
   })
 
-  it('真实安装：同样不崩，按占用处理（不删自环链接），实体照常装上', async () => {
+  it('真实安装：同样不崩，记 unknown（不是 foreign，与 dry-run/where 同答），不删自环链接，实体照常装上', async () => {
     // 变异「linkAgents 的 catch 分支改成 unlink 自环链接后重建」→ 本用例红（链接消失）。
     selfLoop()
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
     expect(data().status).toBe('installed')
     const links = data().links as Array<Record<string, unknown>>
-    expect(links).toEqual([expect.objectContaining({ agent: 'claude-code', state: 'foreign' })])
+    // 审查 #13：此前这里报 foreign，dry-run 报 unknown —— 同一条链接两条路径不同答。
+    expect(links).toEqual([expect.objectContaining({ agent: 'claude-code', state: 'unknown' })])
     expect(metaWarnings()).toContain('ELOOP')
-    expect(metaWarnings()).toContain('按占用处理')
+    expect(metaWarnings()).toContain('不触碰')
     // 自环原样保留，实体正文照常写进去了。
     expect(lstatSync(join(home, '.claude', 'skills', 'qiyu')).isSymbolicLink()).toBe(true)
     expect(existsSync(join(entity, 'SKILL.md'))).toBe(true)
@@ -1135,6 +1250,24 @@ describe('D3.4：`skill where` 的 not_a_directory 分支', () => {
     // 实体不是目录时仍逐 agent 报告（链接状态照常），且不是错误信封。
     expect(envelope().ok).toBe(true)
     expect((data().links as unknown[]).length).toBe(2)
+  })
+
+  it('悬空符号链接占着实体路径 → exists=true / not_a_directory，不报 missing、不推 install', async () => {
+    // 审查 #9：statSync 顺着链接抛 ENOENT，旧实现把「链接占着这个位置」误报成
+    // 「未安装 + 运行 qiyu skill install」——而 install 在该路径上必然退 1
+    // （不覆盖链接），CLI 自荐了一条走不通的路。变异：dirShape 退回 `statSync` 布尔
+    // 判定 → 本用例红（state 变 missing）。
+    symlinkSync(join(home, 'nowhere'), entity)
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    expect(data().entity).toMatchObject({
+      path: entity, source: '--dir', exists: true, state: 'not_a_directory', installed: null,
+    })
+    expect(metaWarnings()).not.toContain('qiyu skill install')
+    // 反向：install 确实拒绝（两边同答——没有一条路是 CLI 推荐的死路）。
+    out = ''; err = ''
+    expect(await skillCommand(['install', '--dir', entity])).toBe(1)
+    expect(String((envelope().error as Record<string, unknown>).message))
+      .toContain('实体路径已存在但不是目录')
   })
 })
 
@@ -1155,6 +1288,13 @@ describe('D3.6：check --installed / --compare 的目录不可读与 checkFailed
       expect(e.code).toBe('skill_check_failed')
       expect(String(e.message)).toContain('读取 skill 目录失败')
       expect(String(e.message)).toContain('EACCES')
+      // 审查 #12：hint 只许列**真能到达这条分支**的成因。`checkSkillDir` 已递归进入
+      // `*.md` 子目录（不再当文件读、不会 EISDIR），旧的「名为 *.md 的子目录改成文件」
+      // 是一句点错方向的指引 —— 变异「hint 加回 *.md 子目录」→ 本断言红。
+      const hint = String(e.hint)
+      expect(hint).toContain('EACCES')
+      expect(hint).toContain('ENOTDIR')
+      expect(hint).not.toContain('*.md')
     } finally {
       chmodSync(locked, 0o755)
     }
