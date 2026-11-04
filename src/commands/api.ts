@@ -439,7 +439,7 @@ async function schema(argv: string[]): Promise<number> {
         'params[].in': '该参数放哪里：`body` = 进请求体（--body 的字段）；`query` = 进 URL 查询串（鉴权三件套 appKey/time/checksum 都在这里，标 auto）；`path` = 进路径占位符；`header` = 进请求头。⚠️ 放错位置服务端可能静默忽略',
         'params[].type': '参数类型（string/integer/array/object/boolean/number）。api call 的有限校验按它比对 —— 类型不符是软告警，--strict 下升级为拒绝',
         'params[].required': 'true = 必填，缺失会被 api call 拒绝（退出码 2）。⚠️ false 有两种含义：普通可选；或它在某个 one_of 组里（组内任一存在即可，不是「可省」）—— 看 one_of 判断',
-        'params[].name': '参数名（拼 --body 的键用它）',
+        'params[].name': '参数名（拼请求时用。⚠️ 先看 `in` 决定它放 query（URL 查询串）、body（--body 字段）、path（路径占位符）还是 header（请求头）—— 放错位置服务端可能静默忽略）',
         'params[].description': '参数的文档说明（来自厂商文档，原样透出，不做校验）',
         'params[].example': '文档给的示例值（可能含 `{{appKey}}` 这类模板占位符，是要替换的、不是字面值）',
         dangerous: 'true = 危险操作，调用时需 --yes，否则退出码 4。必须由人类确认，不要自动追加 --yes',

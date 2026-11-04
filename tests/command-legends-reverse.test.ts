@@ -320,6 +320,10 @@ describe('两个 data 形状特殊、需生产构造函数或预置数据才有�
   it('sync install：四个形态各自只解释该形态真实存在的键（含 commands 元素）', async () => {
     // sync install 需要「至少成功同步过一次」的前置；这里直接核对图例与**元素契约**，
     // 用真实安装输出（uninstall 不需要前置）覆盖 uninstall-dry/real 两形态。
+    // ⚠️ `sync uninstall` **没有** `--dry-run` flag（UNINSTALL_FLAGS 只有 `--yes`）：
+    // 不带 `--yes` 走的就是 dry-run 输出（sync.ts 的 `if (!yes)` 分支，
+    // field_notes=uninstall-dry）；`--yes` 才是真实卸载。所以这里不带参数即 dry-run 形态。
+    // 真实卸载会执行 launchctl/schtasks 与删文件，不在用例里跑。
     for (const mode of ['uninstall-dry'] as const) {
       await ok(() => syncCommand(['uninstall']))
       const keys = Object.keys(notes())
