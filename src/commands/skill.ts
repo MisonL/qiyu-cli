@@ -455,6 +455,17 @@ export function installFieldNotes(mode: 'dry-run' | 'real'): Record<string, stri
   const common = {
     entity_source: `实体目录来源：${ENTITY_SOURCES.join(' > ')}（优先级即顺序）`,
     'links[].state': renderStateNotes(SKILL_STATE_NOTES.linkState),
+    // ⚠️ `links[].error` 只在 state=unknown（ELOOP 等探测异常）时出现，此前没释义
+    //（2026-11-04 反向 sweep 实测）。它是「这一条链接为什么判不了」的唯一依据。
+    'links[].error': '这条链接探测失败的原因（只在 state=unknown 时出现）。'
+      + '⚠️ 有它不代表链接坏了，而是「读不出来」—— install 会跳过这一条、不动它',
+    // ⚠️ `dry_run` 是 Agent 要按值分支的机器布尔，此前两个形态都没释义（2026-11-04
+    // 反向 sweep 实测）。与 sync install 的同名字段同义 —— 别按「装上没有」读它。
+    // `false` 只说明走的是真实安装流程，**不等于这次写入了东西**（内容一致时
+    // status=skipped、零写入）—— 是否改动看 status / links[]。
+    dry_run: 'true = 只出计划：正文与链接都零写入、零建链（--dry-run）。'
+      + 'false = 走真实安装流程。⚠️ 它不回答「这次是否改动了东西」—— 内容一致时 status=skipped、'
+      + '零写入（要判断看 status 与 links[]）；也不回答「现在装没装」—— dry-run 对已装好的实体也一样只出计划',
   }
   return mode === 'dry-run'
     ? {

@@ -36,8 +36,14 @@ afterEach(() => {
 
 const parsed = (): Record<string, unknown> => JSON.parse(out) as Record<string, unknown>
 const data = (): unknown => parsed().data
+const metaRaw = (): Record<string, unknown> => (parsed().meta ?? {}) as Record<string, unknown>
 const notes = (): Record<string, string> =>
   (parsed().meta as Record<string, unknown>).field_notes as Record<string, string>
+
+/** 图例键可以指向 data **或** meta 的字段（2026-11-04：补了 meta 侧的键）。 */
+function resolves(k: string): boolean {
+  return hasPath(data(), k) || hasPath(metaRaw(), k)
+}
 
 /** 路径解析：`a.b` 逐段下钻；`x[]` 段要求该键是数组且**任一元素**能继续走通。 */
 function hasPath(root: unknown, path: string): boolean {
@@ -64,11 +70,11 @@ describe('api schema 的图例键必须能在真实输出上解析', () => {
   // 它们允许在本接口缺席 —— 所以本用例只对**非条件键**做存在性要求。
   const CONDITIONAL = ['rate_limit', 'one_of']
 
-  it('ticket.search：除条件键外，每个图例键都是 data 上的真实路径', async () => {
+  it('ticket.search：除条件键外，每个图例键都是 data 或 meta 上的真实路径', async () => {
     expect(await apiCommand(['schema', 'ticket.search'])).toBe(0)
     for (const k of Object.keys(notes())) {
       if (CONDITIONAL.includes(k)) continue
-      expect(hasPath(data(), k), `api schema 图例键 ${k} 在真实输出上不可解析`).toBe(true)
+      expect(resolves(k), `api schema 图例键 ${k} 在真实输出上不可解析`).toBe(true)
     }
     // 钉死本轮的缺陷：`auto` 是**元素级**字段，只能在 `params[]` 里找到；
     // 写成顶层裸名 `auto` 时 hasPath 会失败（data.auto 不存在）。
@@ -84,27 +90,36 @@ describe('api schema 的图例键必须能在真实输出上解析', () => {
     for (const k of Object.keys(notes())) {
       // rate_limit 仍是条件键（本接口未登记限频表）
       if (k === 'rate_limit') continue
-      expect(hasPath(data(), k), `api schema 图例键 ${k} 在真实输出上不可解析`).toBe(true)
+      expect(resolves(k), `api schema 图例键 ${k} 在真实输出上不可解析`).toBe(true)
     }
   })
 })
 
 describe('api list 的图例键是行字段（data 是根数组）', () => {
-  // `request_schema` 不是行字段：它是「本 meta 不含参数表」的独立说明键
-  //（内容本身就写着「不含」，所以它不是一条指向字段的路径，而是一条否定声明）。
-  const NOT_ROW_KEYS = ['request_schema']
+  // 不指向**行字段**的图例键：
+  //  · `request_schema` —— 「本 meta 不含参数表」的独立说明键（见下方 DECLARATION_ONLY）；
+  //  · `rows` / `filter` / `registry_complete` / `registry_note` —— **meta 键**
+  //    （2026-11-04 补：它们是整份清单的元信息，不在行里）。
+  const NOT_ROW_KEYS = ['rows', 'filter', 'registry_complete', 'registry_note']
+  // `request_schema` 既不是行字段、也不在 meta 里 —— 它是「本 meta 不含参数表」的
+  // 独立否定声明（内容本身就写着「不含」），不是一条指向某字段的路径。
+  const DECLARATION_ONLY = ['request_schema']
 
-  it('data 是数组，且每个图例键要么是行字段、要么在部分行上存在', async () => {
+  it('data 是数组，且每个图例键要么是行字段、要么是 meta 键', async () => {
     expect(await apiCommand(['list', '--all'])).toBe(0)
     const rows = data() as Array<Record<string, unknown>>
     expect(Array.isArray(rows), 'api list 的 data 是数组').toBe(true)
     expect(rows.length).toBeGreaterThan(0)
     const rowKeys = new Set(rows.flatMap((r) => Object.keys(r)))
     for (const k of Object.keys(notes())) {
-      if (NOT_ROW_KEYS.includes(k)) continue
+      if (DECLARATION_ONLY.includes(k)) continue
+      if (NOT_ROW_KEYS.includes(k)) {
+        expect(Object.keys(metaRaw()), `图例键 ${k} 既不是行字段、meta 里也没有`).toContain(k)
+        continue
+      }
       expect(rowKeys.has(k), `api list 图例键 ${k} 不是行字段（全部行字段：${[...rowKeys].join('、')}）`).toBe(true)
     }
-    // 反向：行字段里不能有图例完全没解释的（`id` / `title` / `method` 是自明键）
+    // 反向：行字段里不能有图例完全没解释的（`id` / `title` / `method` / `note` 是自明键）
     const SELF_EVIDENT = ['id', 'title', 'method', 'note']
     for (const k of rowKeys) {
       if (SELF_EVIDENT.includes(k)) continue

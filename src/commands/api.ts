@@ -350,6 +350,13 @@ function list(argv: string[]): number {
         '⚠️ `--strict` 把「未知字段/类型不符」升级为拒绝，但那是「本地参数表闭集一致性」检查，' +
         '**不是对服务端行为的保证**——参数表漏记时它会误拒合法字段，此时**不要删字段重试**。' +
         '⚠️ 传错的字段可能被服务端以 **14004** 拒绝，也可能被**静默忽略**——**别把「返回成功」当作「字段写对了」**。',
+      // ⚠️ 这四个是 **meta 键**（不在行里），此前完全裸奔（2026-11-04 反向 sweep 实测）：
+      // Agent 读 `registry_complete` 判断「能不能假定清单全」、读 `rows` 判断「拿到几条」，
+      // 而 `rows` 是**过滤后**的条数 —— 不与注册表总数相等是设计如此，不是数据缺口。
+      rows: '本次输出的行数（= data.length。缺省只列可主动调用的出站接口，所以不等于注册表总数）',
+      filter: '本次的过滤口径：`可主动调用`（缺省）= 只含 callable 且 outbound 的接口；`全部` = 带 --all，含入站与不可调用。不要拿缺省行数当注册表总量',
+      registry_complete: 'true = 本地注册表已收录全部接口（154 条）；false = 尚未收录完整，未列出的接口不等于不存在',
+      registry_note: '上面那个布尔的人读说明（与 registry_complete 同源，同时输出不会自相矛盾）',
     },
   })
 }
@@ -425,11 +432,25 @@ async function schema(argv: string[]): Promise<number> {
         has_body_schema: 'true = 本接口有可比对的 body 参数表（body_kind 为 json 且 body 参数数 > 0）；不代表本次请求已校验，也不代表其余 bodyKind。本次校验结果见 api call 的 meta.warnings',
         body_kind: '只有 json 会被 api call 比对字段，其余（none/xml/multipart/text/form）原样透传不校验',
         'params[].auto': 'true = 仅对 callable 且 auth 为 checksum 的接口，CLI 自填鉴权 query 参数（appKey/time/checksum）；入站/eventType 接口由回调方提供，不标 auto，调用方不要也不能通过 --body 传',
+        // ⚠️ params[] 的元素键此前只解释了 `auto`，其余六个全裸奔（2026-11-04 反向 sweep 实测）。
+        // 其中 `in` / `required` 是 Agent 拼 body 时要按值分支的机器值，误读要出错：
+        // `required:false` 在 one_of 组里是「二选一」（不是「可省」，见 one_of），
+        // `in` 决定字段进 query 还是 body（拼错位置服务端会静默忽略）。
+        'params[].in': '该参数放哪里：`body` = 进请求体（--body 的字段）；`query` = 进 URL 查询串（鉴权三件套 appKey/time/checksum 都在这里，标 auto）；`path` = 进路径占位符；`header` = 进请求头。⚠️ 放错位置服务端可能静默忽略',
+        'params[].type': '参数类型（string/integer/array/object/boolean/number）。api call 的有限校验按它比对 —— 类型不符是软告警，--strict 下升级为拒绝',
+        'params[].required': 'true = 必填，缺失会被 api call 拒绝（退出码 2）。⚠️ false 有两种含义：普通可选；或它在某个 one_of 组里（组内任一存在即可，不是「可省」）—— 看 one_of 判断',
+        'params[].name': '参数名（拼请求时用。⚠️ 先看 `in` 决定它放 query（URL 查询串）、body（--body 字段）、path（路径占位符）还是 header（请求头）—— 放错位置服务端可能静默忽略）',
+        'params[].description': '参数的文档说明（来自厂商文档，原样透出，不做校验）',
+        'params[].example': '文档给的示例值（可能含 `{{appKey}}` 这类模板占位符，是要替换的、不是字面值）',
         dangerous: 'true = 危险操作，调用时需 --yes，否则退出码 4。必须由人类确认，不要自动追加 --yes',
         callable: 'false = 结构上不可主动调用（如 inbound 推送）；Agent 只能查、不能调',
         path: 'null = 路径未收录（数据缺口）；"/" = 入站占位符。两者都不可据此拼 URL',
         response_shape: '仅供参照，不做校验',
         one_of: 'one_of 数组每项是一组「组内任一存在即可满足」的字段，全缺会被拒绝（退出码 2）；组内字段的 required 已因此降为 false —— false 是「二选一」的意思，不是「两个都可省」',
+        // meta 的两个键（2026-11-04 反向 sweep 实测此前裸奔）：`endpoint` 回显查询的
+        // 是哪个接口（与 data.id 同值）；`note` 是注册表里的静态说明（同 api call 的 note）。
+        endpoint: '本次查询的接口 id（回显输入，用来把结果与请求对上）',
+        note: '该接口在注册表里登记的已知坑（只在登记了 note 的接口上出现）。⚠️ 它是静态说明，不是本次请求的结果',
       },
     })
   } catch (e) {
