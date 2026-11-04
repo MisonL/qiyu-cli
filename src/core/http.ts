@@ -114,7 +114,11 @@ function parseRetryAfterSeconds(header: string | null, nowMs: number): number | 
   if (!/[A-Za-z]/.test(t)) return undefined
   const at = Date.parse(t)
   if (Number.isNaN(at)) return undefined
-  return Math.max(0, Math.ceil((at - nowMs) / 1000))
+  // ⚠️ 日期分支也必须要求**正数**（CodeRabbit PR #65 第四轮）：过去的时间（或
+  // `May 1` 这种被宽松解析到过去的值）会算出 ≤0 —— 与秒数分支的 0 秒一样是
+  // "立刻重试"，必须退回兜底而不是报 0。
+  const secs = Math.ceil((at - nowMs) / 1000)
+  return secs > 0 ? secs : undefined
 }
 
 /**
