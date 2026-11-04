@@ -104,7 +104,14 @@ function limitForSpec(spec: EndpointSpec): RateLimit | null {
 function parseRetryAfterSeconds(header: string | null, nowMs: number): number | undefined {
   if (!header) return undefined
   const t = header.trim()
-  if (/^\d+$/.test(t)) { const n = Number(t); return Number.isFinite(n) ? n : undefined }
+  // delay-seconds 语法是 1*DIGIT，但 0 秒等于「立刻重试」——在 429 语境下必然再吃限流，
+  // 与 malformed 一样退回兜底（0 无法给出有意义的等待建议）。
+  if (/^\d+$/.test(t)) { const n = Number(t); return Number.isFinite(n) && n > 0 ? n : undefined }
+  // ⚠️ 不能直接 `Date.parse` 任何非数字串（CodeRabbit PR #65 第三轮）：V8 的宽松日期解析
+  // 接受 `1.5`（→ 2001 年）、`-1`（→ 2001 年）这类非 HTTP-date 值，折算成"过去"后
+  // 被 max(0) 压成 0 秒 —— Agent 会立刻重试、再吃限流。HTTP-date 必然含英文星期/月份名，
+  // 用它做形态门（RFC 9110 的三种格式都满足）。
+  if (!/[A-Za-z]/.test(t)) return undefined
   const at = Date.parse(t)
   if (Number.isNaN(at)) return undefined
   return Math.max(0, Math.ceil((at - nowMs) / 1000))

@@ -439,6 +439,14 @@ describe('call', () => {
       status: 429, headers: { 'content-type': 'text/html', 'retry-after': 'soon' } })))
     const e3 = await call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true }).catch((e) => e)
     expect(e3.retryAfter).toEqual({ seconds: 60, source: 'fallback' })
+    // `1.5` / `-1` 能被 V8 Date.parse 解析成 2001 年的历史时间 → max(0) 会给出 0 秒，
+    // 诱导 Agent 立刻重试。HTTP-date 必须含英文星期/月份名，否则退回兜底。
+    for (const bad of ['1.5', '-1', '0']) {
+      fetchMock.mockImplementationOnce(() => Promise.resolve(new Response('<html>', {
+        status: 429, headers: { 'content-type': 'text/html', 'retry-after': bad } })))
+      const eb = await call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true }).catch((e) => e)
+      expect(eb.retryAfter, `Retry-After=${bad} 不得被当作合法日期`).toEqual({ seconds: 60, source: 'fallback' })
+    }
     // 超长数字头 → Number 得 Infinity，必须拒绝、不能塞进信封（否则 retry_after.seconds 变 null）
     fetchMock.mockImplementationOnce(() => Promise.resolve(new Response('<html>', {
       status: 429, headers: { 'content-type': 'text/html', 'retry-after': '9'.repeat(400) } })))

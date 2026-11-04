@@ -159,8 +159,8 @@
 
   13 处变异验证全部变红（回显原文、`typeof` 判型、429 归 network、三态压平、`appId`
   分支失效、hint 退回裸 `api list`、upsert 去重失效、usage 退回旧文案；CodeRabbit 两轮
-  追加的 Retry-After 头、非有限值拒绝、按列类型归一化去重键、复合主键无歧义编码、
-  「无副作用」承诺五处）。
+  追加的 Retry-After 头、非有限值/零值/非 HTTP-date 形态拒绝、按列类型归一化去重键、
+  复合主键无歧义编码、「无副作用」承诺七处）。
 
 - **#63 新增图例的自查修正：params 的「通道」谎言、recorded_at 形态说反、rows.written 记法（2026-11-04）**：
 
