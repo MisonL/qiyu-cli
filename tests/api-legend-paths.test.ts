@@ -16,6 +16,8 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apiCommand } from '../src/commands/api.js'
+import { allEndpoints } from '../src/core/registry/index.js'
+import { loadParams } from '../src/core/registry/params.js'
 
 vi.setConfig({ testTimeout: 30_000 })
 
@@ -126,5 +128,50 @@ describe('api list 的图例键是行字段（data 是根数组）', () => {
       expect(Object.keys(notes()), `api list 行字段 ${k} 没有释义`).toContain(k)
     }
     expect(notes().request_schema, 'request_schema 必须说明参数表不在本 meta').toMatch(/不含|不提供|没有/)
+  })
+})
+
+describe('params[].in 图例与「本 CLI 只有 body 通道」的注册表不变量', () => {
+  // 2026-11-04 自查：`params[].in` 图例的初版写成「path = 进路径占位符；header = 进请求头」，
+  // 读起来像调用方有这四个通道 —— 而 api call 的 URL 是 `${BASE}${spec.path}?${q}`
+  //（不做占位符替换）、headers 只有硬编码 Content-Type（src/core/http.ts）。
+  // 图例已改为如实描述「上游协议位置 ≠ 本 CLI 的通道」。
+  //
+  // 本用例钉住支撑那句图例的**注册表不变量**：可主动调用的接口上，
+  // 非 body 参数只可能是 ① 鉴权三件套（query，CLI 自填、标 auto）
+  // 或 ② content-type（header，CLI 固定发送）。谁破坏了它，
+  // 「非 body 参数没有人工通道」这句话就不再为真，图例必须跟着改。
+  const AUTH = new Set(['appKey', 'time', 'checksum'])
+  it('callable 接口的非 body 参数 ∈ {鉴权 query 三件套, content-type}（其余接口族群不可主动调用）', () => {
+    const offenders: string[] = []
+    for (const e of allEndpoints()) {
+      if (!e.callable) continue
+      for (const p of loadParams(e.id).params) {
+        if (p.in === 'body') continue
+        const isAuthQuery = p.in === 'query' && AUTH.has(p.name)
+        const isContentType = p.in === 'header' && p.name === 'content-type'
+        if (!isAuthQuery && !isContentType) offenders.push(`${e.id}: ${p.name} in=${p.in}`)
+      }
+    }
+    expect(offenders, '出现非 body 且非鉴权/非 content-type 的参数时，params[].in 图例需同步改写').toEqual([])
+  })
+
+  it('path 参数只出现在不可主动调用的接口上（api call 不做占位符替换）', () => {
+    const offenders = allEndpoints()
+      .filter((e) => e.callable)
+      .filter((e) => loadParams(e.id).params.some((p) => p.in === 'path'))
+      .map((e) => e.id)
+    expect(offenders).toEqual([])
+  })
+
+  it('图例本身不得再声称 path/header 通道（2026-11-04 自查的旧说法）', async () => {
+    expect(await apiCommand(['schema', 'ticket.search'])).toBe(0)
+    const n = notes()
+    // 旧说法：把 in 描述成「该参数放哪里」，等于承诺了四个传参通道。
+    expect(n['params[].in'], '不得再写「进路径占位符」这类通道承诺').not.toContain('进路径占位符')
+    expect(n['params[].in'], '不得再写「进请求头」这类通道承诺').not.toContain('进请求头')
+    expect(n['params[].in'], '必须点明本 CLI 不做占位符替换').toContain('不做占位符替换')
+    expect(n['params[].required'], 'required 的强制范围必须限定在 body 参数').toContain('只对 `in=body`')
+    expect(n['params[].type'], 'type 比对范围必须限定在 body 参数').toContain('只有 `in=body`')
   })
 })

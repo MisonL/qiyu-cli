@@ -328,6 +328,20 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     // windows.succeeded 回答 —— 必须同时点名 rows.written。
     expect(runFieldNotes()['tasks[].status'], '必须区分「成功窗数」与「落库行数」')
       .toContain('rows.written')
+    // 自查（2026-11-04）：rows.written **不是**恒等于「实际落库行数」——
+    // 引擎对 count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」
+    //（已随事务回滚，见 sync/engine.ts 的 catch 分支）。图例说成「真正落库」会让
+    // Agent 把回滚掉的行当成已入库。两个出口（status 的 partial 与 tasks[].rows.written）
+    // 都必须点明这条记法。
+    for (const [where, note] of [
+      ['tasks[].status', runFieldNotes()['tasks[].status']!],
+      ['tasks[].rows.written', runFieldNotes()['tasks[].rows.written']!],
+    ] as const) {
+      expect(note, `${where} 必须点明失败窗记「应写行数」`)
+        .toContain('应写行数')
+      expect(note, `${where} 不得把 written 说成恒为「真正落库」`)
+        .not.toContain('真正落库')
+    }
     // CodeRabbit 第三轮：`complete` 只表示「没有失败窗」，skipped>0 时也成立 ——
     // 说成「全部窗口成功」会让 Agent 漏掉被跳过的区间。
     expect(runFieldNotes()['tasks[].status'], 'complete 不得说成「全部窗口成功」')
