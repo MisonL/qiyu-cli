@@ -183,6 +183,10 @@ describe('params[].in 图例与「本 CLI 只有 body 通道」的注册表不�
     expect(await apiCommand(['list'])).toBe(0)
     const n = notes()
     expect(n.verified, '没有 note 时必须给出唯一含义').toContain('没有 note')
+    // receive.message 的 verified:true 只验证了「不可调用」，没有成功响应 ——
+    // 把 true 定义成「成功响应被观测」会让这行变成谎报。
+    expect(n.verified, 'verified 不得被定义成「成功响应一定被观测过」').not.toContain('至少观测到一次成功响应')
+    expect(n.verified).toContain('不是「成功路径一定走通过」')
     expect(n.path, 'null 路径与 callable=false 的强制关系必须说明').toContain('必然伴随 callable=false')
   })
 

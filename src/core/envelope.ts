@@ -120,6 +120,14 @@ export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
     if (!messageText) {
       return { ok: false, code, payload: undefined, messageText: '响应缺少 message', ...nf }
     }
+    // ⚠️ 'OK' 是占位符（CodeRabbit PR #66）：服务端把占位塞进 message 时，
+    // 拿它当任务 key / 下载链接会让下游去下载 /openapi/export/session/OK。
+    // `x 校验`（流水线）与 `api call` 都必须把同一形态判为失败 —— 归一化层挡掉，
+    // 两边共用同一判据，不再各写一份。
+    if (messageText === 'OK') {
+      return { ok: false, code, payload: undefined,
+               messageText: '响应 message 是占位符 `OK`（形态漂移），不是可用的载荷', ...nf }
+    }
     return { ok: true, code, payload: messageText, messageText, ...nf }
   }
 

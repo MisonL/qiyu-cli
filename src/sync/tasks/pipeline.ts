@@ -46,7 +46,7 @@ function messageOf(res: { payload: unknown; messageText: string }, endpointId: s
   if (typeof res.messageText === 'string' && res.messageText !== '' && res.messageText !== 'OK') {
     return res.messageText
   }
-  throw new Error(`接口 ${endpointId} 未返回可用的 message 载荷（响应形态漂移？）`)
+  throw new Error(`接口 ${endpointId} 未返回可用的 message 载荷（响应形态漂移？—— 空串或 'OK' 占位）`)
 }
 
 /**

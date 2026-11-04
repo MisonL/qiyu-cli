@@ -162,8 +162,9 @@
 
   守卫同步加硬：`specs.json` 与 `overrides` 表的一致性（生成物不得陈旧于事实源）、
   生成器必须产出 export 参数表、信封矩阵覆盖 M、export 集成用例断言 key/链接不再丢、
-  图例字符约束（无 `**`、无分隔符 `；`）。变异 7 处全红（M 分支、M payload、生成器
-  params、path 漂移、verified 名单、messageOf 占位符、矩阵覆盖）。
+  图例字符约束（无 `**`、无分隔符 `；`）。变异 11 处全红（M 分支、M payload、生成器
+  params、path 漂移、verified 名单、messageOf 占位符、矩阵覆盖；CodeRabbit 首轮追加的
+  M 的 'OK' 占位符、team 按文档值 300 秒、verified 图例反例、not_found 措辞）。
 
 - **核心请求/错误/存储写入的九处契约修正（2026-11-04 独立审查）**：
 

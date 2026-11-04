@@ -284,11 +284,10 @@ function list(argv: string[]): number {
       // 旧文「false = 仅有文档依据」——但 settings.wxTemplates 实测时真调用过
       // （每次都 14004 appId not bind，错误模式有实测片段，只是成功路径没走通）。
       // 全局只当**索引**：true/false 各自测到/没测到什么，以该行 note 为准。
-      verified: 'true = 至少观测到一次成功响应（信封形状按 envelope 登记解析）；' +
-        'false = 成功路径未实测（可能只有错误响应或纯文档依据）。' +
-        '⚠️ 这只是一句话的事实标签：**具体实测范围只在该行有 note 时才有说明** —— ' +
-        '没有 note 的行不要假定更多（如 export.* 这类文档外接口，缺 note 不代表成功路径未验证）。' +
-        '缺 note 时唯一的含义就是上面这句',
+      verified: 'true = 该接口被真实观测过（不是「成功路径一定走通过」：验证了什么以该行 ' +
+        'note 为准 —— 可能是成功响应，也可能只是错误形态或不可调用状态，如 receive.message）；' +
+        '没有 note 时只能按最弱含义理解「至少接触过真实服务」，不要假定成功路径已验证。' +
+        'false = 成功路径未实测（可能只有错误响应或纯文档依据）。具体范围只在该行有 note 时才有说明',
       dangerous: 'true = 危险操作，调用时需 --yes',
       // ⚠️ direction 也必须解释 —— 它是 Agent 判断「我方能调它」还是「它回调我方」
       // 的唯一依据。只输出 `outbound`/`inbound` 两个英文词，Agent 无从知道哪个

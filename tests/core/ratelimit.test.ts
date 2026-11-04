@@ -141,8 +141,10 @@ describe('限频表', () => {
     // /ipcc/history/team 后，team 尚未实测 → source 必须是 doc（2026-11-04）。
     expect(limitFor('icoutcall.history.seat'))
       .toMatchObject({ limit: 1, windowSeconds: 20, source: 'observed' })
+    // team 未实测：按文档值 300 秒（source:'doc'）——不要拿"未实测的 20 秒"诱导
+    // Agent 在真实冷却前重试。
     expect(limitFor('icoutcall.history.team'))
-      .toMatchObject({ limit: 1, windowSeconds: 20, source: 'doc' })
+      .toMatchObject({ limit: 1, windowSeconds: 300, source: 'doc' })
   })
 
   it('知识库 5 个写接口的限频已登记 —— 三个 1/s、两个 10/s', () => {

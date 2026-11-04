@@ -31,10 +31,12 @@ export function callFieldNotes(): Record<string, string> {
       + '不要写「在 warnings 里找 missing_required」的分支。'
       + '它是本 CLI 的提示，不是上游的业务告警',
     not_found: 'true = 解包后的载荷为空。判据作用在解包后的 payload 上：'
-      + 'data / result 形状下是 {} / []; 形状 C 或宽松模式（envelope 未登记/形状非 A-D）'
-      + '且 message 能解析成 JSON 时，解析出的 {} / [] 同样置位。'
+      + 'data / result 形状下是 {} / []。形状 C 且 message 能解析成 JSON 时，'
+      + '解析出的 {} / [] 同样置位（message 缺失或解析失败是失败，不是 not_found）。'
+      + 'envelope 未登记的宽松模式下，message 能解析成 JSON 且结果为空同样置位。'
       + '整条 200 响应没有载荷键时，只有信封已实测且不是 D 族（A/B/C/D-nf）的接口判为查无此物'
-      + '（envelope 为 null 的接口在此不断言）。staffInfo 形状恒不置位。'
+      + '（envelope 为 null 不在此断言。形状 M 的空 message 判失败，不判 not_found）。'
+      + 'staffInfo 形状恒不置位。'
       + '⚠️ 只覆盖结构性为空：业务为空（如 ticket.search 查到 0 条返回 {total:0,tickets:[]}）'
       + '不会置位 —— 没有 not_found 不等于有数据',
     warning: '与 not_found 同时出现的一句话说明（固定文案）',

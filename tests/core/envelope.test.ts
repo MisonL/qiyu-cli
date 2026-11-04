@@ -63,6 +63,10 @@ describe('信封归一化', () => {
     expect(empty.notFound).toBe(false)
     // message 不是纯文本形状（缺失）同样失败
     expect(normalize({ code: 200 }, 'M').ok).toBe(false)
+    // 'OK' 是占位符：拿它当 key/链接会把下游送去下载 /openapi/export/session/OK。
+    const ok = normalize({ code: 200, message: 'OK' }, 'M')
+    expect(ok.ok).toBe(false)
+    expect(ok.messageText).toMatch(/占位符/)
   })
 
   it('形状 D：只有 code，无 message 也无 data', () => {
