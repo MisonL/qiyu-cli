@@ -166,6 +166,38 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const nonKey = cols.filter((x) => !t.primaryKey.includes(x))
     const setClause = nonKey.map((x) => `"${x}" = excluded."${x}"`).join(', ')
     const pk = t.primaryKey.map((x) => `"${x}"`).join(', ')
+    // ⚠️ 同批重复主键必须先收敛（2026-11-04 修）：DuckDB 的多行 `INSERT ... ON CONFLICT
+    // DO UPDATE` 在同一语句里遇到重复键时**保留第一条**（实测：两条 id=1 的行写入后是
+    // 第一条的值），而分批写入（batchSize=1）时后一条会覆盖前一条 —— 同一批数据的结果
+    // 取决于 batchSize 配置。这里统一成「后出现的行获胜」（与逐条写入的直觉一致），
+    // 且只发一条 INSERT，结果与 batchSize 无关。
+    // ⚠️ 键必须按**列的存储类型**归一化，不能按 JS 的 typeof（CodeRabbit PR #65）：
+    // VARCHAR 主键列里 number 1 与 string '1' 存进去是同一个值；若按 typeof 区分，
+    // 它们在同一批里不会合并（DuckDB 保留第一条），而 batchSize=1 时后者获胜 ——
+    // 又变回 batchSize 相关。数值列（今天只有 schema_version.version 是 INTEGER）
+    // 用 BigInt 归一化整数串：既不让 '01' 与 1 分成两键，也不因 Number 丢精度把
+    // 两个不同的大整数误合成一个。非整数形态（病态输入）退回 Number。
+    const pkTypes = t.primaryKey.map((c) => t.columns.find((x) => x.name === c)!.type)
+    const isNumeric = (ty: string) => /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|FLOAT|REAL|DOUBLE|DECIMAL)/i.test(ty)
+    const normKey = (v: unknown, ty: string): string => {
+      const raw = typeof v === 'bigint' ? v.toString() : String(v)
+      if (!isNumeric(ty)) return raw
+      const t = raw.trim()
+      if (/^[+-]?\d+$/.test(t)) {
+        try { return BigInt(t).toString() } catch { /* 超出 BigInt 范围，退回 Number */ }
+      }
+      return String(Number(t))
+    }
+    const seen = new Map<string, number>()
+    const uniq: Record<string, unknown>[] = []
+    for (const r of rows) {
+      // ⚠️ 用 JSON.stringify 序列化元组，不用分隔符 join（CodeRabbit PR #65）：
+      // 多列 VARCHAR 主键时 delimiter 区分不了复合列自身的值（如 `as:b,c` 与
+      // `a,bs:c` 撞 key）。`JSON.stringify` 的换码天然无歧义。
+      const k = JSON.stringify(t.primaryKey.map((c, idx) => normKey(r[c], pkTypes[idx]!)))
+      const at = seen.get(k)
+      if (at === undefined) { seen.set(k, uniq.length); uniq.push(r) } else uniq[at] = r
+    }
     let written = 0
     // ⚠️ 切批规则（M2 修，与 spec §5.3 对齐）：**batchSize 是首选切批尺寸**，
     // 65000 参数硬顶无条件兜底 —— 实际行数 = min(batchSize, floor(65000/cols))。
@@ -175,8 +207,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 65000 是保守值：实测该版本上限 ≥70000，勿据此放大（Q 组 Q-低-1）。
     const hardCap = Math.max(1, Math.floor(65000 / cols.length))
     const rowsPerStmt = Math.max(1, Math.min(cfg.batchSize, hardCap))
-    for (let i = 0; i < rows.length; i += rowsPerStmt) {
-      const batch = rows.slice(i, i + rowsPerStmt)
+    for (let i = 0; i < uniq.length; i += rowsPerStmt) {
+      const batch = uniq.slice(i, i + rowsPerStmt)
       const placeholders = batch.map(() => `(${cols.map(() => '?').join(', ')})`).join(', ')
       const params = batch.flatMap((r) => cols.map((k) => r[k] ?? null))
       await store.execSql(

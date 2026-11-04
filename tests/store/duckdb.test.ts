@@ -54,6 +54,75 @@ describe('duckdb —— 建表与查询', () => {
     await s.close()
   })
 
+  it('同批重复主键收敛为一行、后出现的获胜，且与 batchSize 无关', async () => {
+    // DuckDB 的多行 INSERT ... ON CONFLICT 在同一语句内遇到重复键时保留**第一条**；
+    // 逐条写入（batchSize=1）时则是后一条覆盖前一条 —— 旧实现让结果取决于 batchSize。
+    // 现在统一为「后出现者获胜」并返回收敛后的行数。
+    for (const batchSize of [1000, 1]) {
+      const s = await createDuckDbStore({ ...cfg, batchSize }, 'rw')
+      await s.init()
+      const n = await s.upsert('tags', [
+        { id: '1', name: 'first', color: '#111111' },
+        { id: '1', name: 'second', color: '#222222' },
+        { id: '2', name: 'other', color: '#333333' },
+      ])
+      expect(n, `batchSize=${batchSize}：返回值应是收敛后的实际写入行数`).toBe(2)
+      expect(await s.count('tags')).toBe(2)
+      const r = await s.query('SELECT name, color FROM tags WHERE id = ?', ['1'])
+      expect(r.rows[0], `batchSize=${batchSize}：后出现的行应获胜`).toEqual({ name: 'second', color: '#222222' })
+      await s.close()
+    }
+  })
+
+  it('VARCHAR 主键的 number 1 与字符串 \'1\' 是同一个存储值 —— 去重键按列类型归一化', async () => {
+    // 按 JS typeof 区分会让 1 与 '1' 分成两个键：同批时 DuckDB 保留第一条、
+    // 逐条写入时后者获胜 —— 结果又取决于 batchSize（CodeRabbit PR #65 指出）。
+    for (const batchSize of [1000, 1]) {
+      const s = await createDuckDbStore({ ...cfg, batchSize }, 'rw')
+      await s.init()
+      const n = await s.upsert('tags', [
+        { id: 1 as unknown as string, name: 'num', color: '#AAAAAA' },
+        { id: '1', name: 'str', color: '#BBBBBB' },
+      ])
+      expect(n, `batchSize=${batchSize}：应合并为一行`).toBe(1)
+      expect(await s.count('tags')).toBe(1)
+      const r = await s.query('SELECT name FROM tags WHERE id = ?', ['1'])
+      expect(r.rows[0]).toEqual({ name: 'str' })
+      await s.close()
+    }
+  })
+
+  it('复合 VARCHAR 主键的去重键无歧义：列值可能含分隔符时不得撞 key', async () => {
+    // 用 JSON.stringify 元组序列化，不用分隔符 join（CodeRabbit PR #65）：
+    // 若 `group_id` 与 `staff_id` 的值能拼出同一条  串，旧实现会把两行当成一行。
+    const s = await fresh()
+    // staff_group_members 主键是 (group_id, staff_id)，两列都 VARCHAR。
+    const rows = [
+      { group_id: 'a', staff_id: 'b', synchronized_at: 't1' },
+      { group_id: 'a', staff_id: 'c', synchronized_at: 't2' },
+      { group_id: 'a', staff_id: 'b', synchronized_at: 't3' },  // 与第一行同主键，应被合并
+    ]
+    const n = await s.upsert('staff_group_members', rows)
+    expect(n).toBe(2)
+    const r = await s.query('SELECT group_id, staff_id, synchronized_at FROM staff_group_members ORDER BY staff_id')
+    expect(r.rows).toEqual([
+      { group_id: 'a', staff_id: 'b', synchronized_at: 't3' },
+      { group_id: 'a', staff_id: 'c', synchronized_at: 't2' },
+    ])
+    // 构造旧实现的真实撞 key：join('\u0001') 下
+    //   ('ab', 'c') → "abc"，('a', 'bc') → "abc"
+    // 两组复合值拼出同一条串 —— 旧实现会把它们当成同一主键、静默丢一行。
+    const s2 = await createDuckDbStore({ ...cfg, path: join(dir, 'q2.db') }, 'rw')
+    await s2.init()
+    const n2 = await s2.upsert('staff_group_members', [
+      { group_id: 'a\u0001b', staff_id: 'c', synchronized_at: 't5' },
+      { group_id: 'a', staff_id: 'b\u0001c', synchronized_at: 't6' },
+    ])
+    expect(n2, '两组不同的复合主键不得被合并').toBe(2)
+    expect(await s2.count('staff_group_members')).toBe(2)
+    await s2.close()
+  })
+
   it('19 位 ID 往返仍是字符串、精度不变', async () => {
     const s = await fresh()
     const big = '1234567890123456789'

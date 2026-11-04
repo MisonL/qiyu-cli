@@ -262,7 +262,8 @@ qiyu --version                       包版本 + skill_contract_version
 
 错误信封还可能有这几个**可选**键（缺省即不出现该键）：
 
-- `retry_after: {seconds, source}` —— 建议等待秒数与它的来源（`observed` 实测 /
+- `retry_after: {seconds, source}` —— 建议等待秒数与它的来源（`header` = 服务端
+  `Retry-After` 响应头直接指定，最可信、优先于其余来源 / `observed` 实测 /
   `doc` 文档值 / `local` 本地令牌桶 / `fallback` 保守兜底）
 - `retry_strategy` + `fallback` —— **只在 `api call` 撞限流、且该接口非危险操作、
   有对应本地表、本地库文件存在时出现**：`"switch_to_local"` + 一条

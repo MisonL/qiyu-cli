@@ -85,7 +85,7 @@ const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 --all     连同不可主动调用的接口一起列出
 --body    请求体（JSON 字面量）。省略与传 {} 是两条不同的服务端路径
 --yes     危险接口（写/破坏性操作）必须显式确认
---no-validate  关闭 body 校验（危险门禁不受影响）
+--no-validate  完全关闭 body 校验、别名改写与 warnings（危险门禁不受影响）
 --strict       把「未知字段/类型不符」的提示升级为拒绝
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。

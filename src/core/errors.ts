@@ -69,13 +69,16 @@ export interface QiyuError {
    *   `'observed'` = 限频表里**实测**到的窗口（最可信）；
    *   `'doc'`      = 限频表里来自**厂商文档**的值，**从未实测过**；
    *   `'local'`    = 本地令牌桶**精确算出**的等待（我方自己限的流）——
-   *     ⚠️ **交付形态下这个取值不可达**（2026-10-07 补）：CLI 每次 `api call`
-   *     是一个**新进程**，桶开局为空、`tryAcquire` 在 `for(;;)` 之外只跑一次，
-   *     单次调用撞不上本地桶。它只有**同进程连续多次 `call()`** 才能触发
-   *     （单元测试就是这么构造的）。保留取值是因为有存储层/批量命令的计划
-   *     会走到它，但**当前 Agent 不会在真实输出里见到 'local'** —— 别把它
-   *     当成"实测过的行为"去反推 CLI 有本地限频能力；
-   *   `'fallback'` = 接口未登记限频时的**保守兜底 60 秒**，可能短于服务端真实冷却。
+   *     ⚠️ **单次 `api call` 不可达，但 `qiyu sync run` 可达**（2026-11-04 订正）：
+   *     `api call` 每次都是新进程，桶开局为空、`tryAcquire` 只跑一次，撞不上；
+   *     而 sync 引擎在同一进程里对同一路径反复 `call()`，`bucketFor().tryAcquire`
+   *     会拒绝并抛 `local_rate_limit` + `reason: 'local'` —— `sync/tasks/pace.ts`
+   *     就是为此写的（它会落持久化冷却再重试）。所以这个取值**在交付形态下可达**，
+   *     别把它当死值；`api call` 的单次输出里见不到它，不代表 CLI 没有本地限频能力。
+   *   `'header'`   = HTTP 429 响应 `Retry-After` 头给出的值（**服务端直接指定**，
+   *     最贴近真实冷却；优先于限频表与兜底）；
+   *   `'fallback'` = 接口未登记限频、且服务端没给 `Retry-After` 时的**保守兜底 60 秒**，
+   *     可能短于服务端真实冷却。
    *
    * ⚠️ **为什么不能用一个布尔**：限频表本身就把来源分成 `'doc'` 与 `'observed'`
    * 两类（见 `RateLimit.source`，设计稿 §7.4 要求每行标来源）。早先写成
@@ -85,7 +88,7 @@ export interface QiyuError {
    * 分辨该不该信。设计稿 §11.2 D 按 `retry_after > 60` 分流，兜底值恰是 60、
    * 实测值里也有 60（ipcc 报表），来源不写清 Agent 无从判断。
    */
-  retryAfter?: { seconds: number; source: 'observed' | 'doc' | 'local' | 'fallback' }
+  retryAfter?: { seconds: number; source: 'observed' | 'doc' | 'local' | 'header' | 'fallback' }
 }
 
 /** 抹掉服务端泄漏的内部实现细节。必须在任何 message 透出前调用。 */
@@ -196,6 +199,13 @@ export function classify(code: number | string, rawMessage: string): QiyuError {
                // 而那正是静默少取约 58 天的路径。上限只有一个权威来源：注册表。
                hint: '时间跨度超出该接口上限。报文里不带数字，' +
                      '请按 `qiyu api list` 里该接口的 max_window_days 切片后重试' }
+    if (has(message, 'appId not bind'))
+      // 实测（settings.wxTemplates 每次返回 `14004 appId not bind`）：这是**账号没绑定
+      // 公众号**，不是请求参数问题。此前落到兜底 `param('核对字段名与类型')` —— Agent
+      // 会反复核对字段并重试，而真实动作是去后台绑定。错误出口必须点名真正的成因。
+      return { ...base, kind: 'module_offline', retryable: false,
+               hint: '该账号未绑定公众号（appId not bind）—— 不是字段或类型错误，改参数与重试都无效；' +
+                     '请先在七鱼后台完成公众号绑定' }
     return param('服务端拒绝了参数，请核对字段名与类型')
   }
 
@@ -217,11 +227,24 @@ export function classify(code: number | string, rawMessage: string): QiyuError {
     // ⚠️ 这里只列**实测出现过**的四个 5xx（500/502/503/504）+ 429；设计稿 §5.3 的措辞
     // 是「5xx/429」，但 501（未实现）/505（版本不支持）本身非瞬时，纳入重试反而有害。
     // 故本集合是"实测子集"，不是"5xx 全集" —— 执行者若要扩到 501/505，须先确证它们是瞬时的。
-    // ⚠️ 这组状态码必须与 http.ts 里 `res.json()` 失败分支的 `transient` 集合**逐字一致**
-    // （两处都是 429/500/502/503/504）—— 否则同一个 500 会因代理返回 HTML 还是 Spring JSON
-    // 被判成 internal 或 network，取决于代理行为，不是调用方能解释的差异。
-    // 401/403 同理，两处都归 `auth`。
-    case '429': case '500': case '502': case '503': case '504':
+    // ⚠️ **429 与 5xx 必须分开**（2026-11-04 修）。两者都是"没有正常业务响应"，但副作用
+    // 语义**相反**：5xx（尤其 502/504）可能已经在服务端执行过业务逻辑；429 是"请求太频繁"
+    // —— 服务端在执行业务逻辑**之前**就拒绝了，肯定没有副作用。旧实现把 5xx/429 归成同一
+    // 个 `network`，危险接口的 429 会收到「请求可能已被服务端执行，重发会再执行一次」——
+    // 把一次确定未执行的限流劝阻成"先确认状态"，方向反了；且 Agent 拿不到 retry_after，
+    // 只能瞎退避。归 `rate_limit` 后由 `call()` 统一附 retry_after 与来源说明。
+    // ⚠️ 与 http.ts 的 HTML 载体现已**刻意不同**：那里 429 走 rate_limit、5xx 走 network。
+    // 同一次 429/5xx 无论载体是 HTML 还是 Spring JSON，都必须落到同一个 kind ——
+    // 两处集合的**语义**一致即可，不要为了"逐字一致"把 429 塞回 5xx 组。
+    case '429':
+      // ⚠️ 不要承诺「一定未执行」（CodeRabbit PR #65 指出）：429 的标准语义是"限流拒绝"，
+      // 但网关/代理可能在**转发之后**合成 429，此时上游是否执行过无法从响应判断。
+      // 对危险接口保留"先只读确认"的动作指引，不给"重发安全"的保证。
+      return { ...base, kind: 'rate_limit', retryable: true,
+               hint: '服务端限流（HTTP 429）—— 通常表示请求在执行业务逻辑之前被拒绝，' +
+                     '但网关也可能在转发后合成 429：危险接口请先用只读接口确认当前状态再重试；' +
+                     '读接口按 retry_after 等待后重试' }
+    case '500': case '502': case '503': case '504':
       return { ...base, kind: 'network', retryable: true,
                hint: `服务端/网关瞬时故障（HTTP ${code}），请退避后重试` }
     case '401': case '403':

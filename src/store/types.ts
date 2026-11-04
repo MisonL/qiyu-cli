@@ -36,7 +36,8 @@ export interface Store {
   /**
    * 批量 upsert。**每行必须提供该表完整列集**，同一批次内键集必须一致（否则 usage）。
    * 事务语义：处于活动事务内则加入，否则自开单次事务（整批原子）。
-   * 返回实际写入行数。
+   * 返回实际写入行数 —— 同批重复主键会先收敛为一行（**后出现的获胜**，与逐条写入
+   * 的直觉一致），返回值按收敛后的行数计。
    */
   upsert(table: string, rows: Record<string, unknown>[]): Promise<number>
   /** 条件删除。where 是可信代码常量（禁外部派生字符串，同 query 红线）；返回删除行数。 */

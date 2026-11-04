@@ -279,7 +279,8 @@ export function byId(id: string): EndpointSpec {
     // ⚠️ 本文件在任务 6、output.ts 在任务 9，**无法 import describeArgs** —— 手写同一规则；
     // 将来若调整 describeArgs 的渲染，记得这里有一份副本（同 cli.ts 任务 1 的手写 JSON）。
     const shown = id.trim() === '' ? `'${id}'` : id
-    throw new Error(`未知接口：${shown}。可用 \`qiyu api list\` 查看全部接口 id。`)
+    throw new Error(`未知接口：${shown}。可用 \`qiyu api list --all\` 查看全部接口 id` +
+      '（默认列表只含可主动调用的接口；入站接口与不可调用项要加 --all 才显示）')
   }
   return spec
 }

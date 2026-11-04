@@ -53,8 +53,29 @@ export function readConfigRaw(configPath: string): Record<string, unknown> {
   try {
     return JSON.parse(raw) as Record<string, unknown>
   } catch (e) {
-    throw new Error(`配置文件 ${configPath} 不是合法 JSON：${e instanceof Error ? e.message : String(e)}`)
+    // ⚠️ 绝不能把 `e.message` 附上：V8 的 JSON.parse 报错**自带出错位置附近的原文片段**
+    // （`Unexpected token 'F', "FAKESECRET…" is not valid JSON`）。配置文件里就有凭证，
+    // 原样带出等于把 appKey/appSecret 的前若干字符写进 stdout —— 违反「凭据绝不出现在
+    // stdout」这条红线（与 store 层 stripSqlEcho 同类：外部字节进报文前必须先剥离）。
+    // 只保留**位置信息**（`at position N (line L column C)`），它对定位语法错误足够，
+    // 且不含任何文件内容；取不到位置时退化为纯类别描述。
+    throw new Error(`配置文件 ${configPath} 不是合法 JSON${jsonErrorPosition(e)}`)
   }
+}
+
+/**
+ * 从 `JSON.parse` 的报错里**只**抽出位置后缀（`。语法错误在 position 12（第 1 行第 13 列）`）。
+ * 报错文本里的原文片段一律丢弃 —— 那是文件内容，可能含凭证（见 `readConfigRaw` 的说明）。
+ * V8 的两种形态都覆盖：新式 `… in JSON at position 5 (line 1 column 6)` 与
+ * 旧式 `… at position 5`；两者都无则返回空串（只留类别描述）。
+ */
+function jsonErrorPosition(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e)
+  const m = /\bat position (\d+)(?:\s*\(line (\d+) column (\d+)\))?/.exec(msg)
+  if (!m) return ''
+  return m[2] !== undefined
+    ? `。语法错误在 position ${m[1]}（第 ${m[2]} 行第 ${m[3]} 列）`
+    : `。语法错误在 position ${m[1]}`
 }
 
 function assertObject(v: unknown, label: string): Record<string, unknown> {
