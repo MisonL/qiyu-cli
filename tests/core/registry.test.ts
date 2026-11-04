@@ -94,6 +94,10 @@ describe('注册表', () => {
     // 本文件在任务 6、output.ts 的 describeArgs 在任务 9（无法 import），
     // byId 里是**手写副本** —— 这条钉住它（变异确认：退回裸插值即红）。
     expect(() => byId(' ')).toThrow(/未知接口：' '/)
+    // ⚠️ hint 必须指向 `api list --all`（2026-11-04 修）：默认 `api list` 只列可主动
+    // 调用的 136 条，而入站接口（receive.message、crm.* 等）与 wecom.robot.switch
+    // 只有 --all 才显示。照旧提示跑默认列表的 Agent 会得出「这个接口不存在」。
+    expect(() => byId('不存在的接口')).toThrow(/api list --all/)
   })
 
   it('工单检索的窗口上限是 31 天，不是文档写的 90 天', () => {

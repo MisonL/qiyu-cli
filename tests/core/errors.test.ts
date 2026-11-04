@@ -282,6 +282,15 @@ describe('错误分类', () => {
     expect(classify(14004, 'group not exist or deleted').kind).toBe('param')
   })
 
+  it('14004 appId not bind 不是参数错误：点名「未绑定公众号」，别让 Agent 反复核对字段', () => {
+    // 实测 settings.wxTemplates 每次返回 `14004 appId not bind`，成因是账号未绑定公众号。
+    // 旧实现落兜底 `param`（「核对字段名与类型」）—— 指向了到不了该分支的动作。
+    const r = classify(14004, 'appId not bind')
+    expect(r.kind).toBe('module_offline')
+    expect(r.hint).toMatch(/绑定公众号/)
+    expect(r.hint).not.toMatch(/核对字段名与类型/)
+  })
+
   it('14007 被识别，尽管它不在官方 10 行错误码表里', () => {
     const r = classify(14007, 'user not in queue')
     expect(r).toMatchObject({ kind: 'not_in_queue' })
@@ -407,10 +416,13 @@ describe('错误分类', () => {
     // body 形状识别、不区分 status 值 —— 所以 500/503 会带着 `code:'500'` 之类
     // 到达 classify。若没有这几个分支，它们会落到 default → unknown/不可重试，
     // 一个瞬时的 5xx 会被 Agent 直接放弃。
-    for (const s of ['429', '500', '502', '503', '504']) {
+    // ⚠️ 429 与 5xx 的副作用语义相反，必须分开（2026-11-04）：5xx 可能已执行 →
+    // network（危险接口提示"可能已执行"）；429 一定未执行 → rate_limit（附 retry_after）。
+    for (const s of ['500', '502', '503', '504']) {
       expect(classify(s, 'Internal Server Error'), `HTTP ${s}`)
         .toMatchObject({ kind: 'network', retryable: true })
     }
+    expect(classify('429', 'Too Many Requests')).toMatchObject({ kind: 'rate_limit', retryable: true })
     for (const s of ['401', '403']) {
       expect(classify(s, 'Unauthorized'), `HTTP ${s}`)
         .toMatchObject({ kind: 'auth', retryable: false })

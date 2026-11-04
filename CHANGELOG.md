@@ -122,6 +122,46 @@
 
 ### 修复
 
+- **核心请求/错误/存储写入的九处契约修正（2026-11-04 独立审查）**：
+
+  · **配置文件解析失败会回显文件内容（安全红线）**：`readConfigRaw` 把 V8 的
+    `JSON.parse` 原文拼进错误（实测 `Unexpected token 'X', "FAKESECRET..." is not valid
+    JSON`）——配置文件里就有 appSecret，等于把凭据前若干字符写进 stdout。改为只保留
+    位置信息（`position N（第 L 行第 C 列）`），原文片段一律丢弃。
+  · **HTTP 429 被当成「可能已执行」的网络故障**：429 是服务端在执行业务逻辑**之前**
+    拒绝的限流（肯定没执行），却被归 `network` —— 危险接口收到「请求可能已被服务端执行，
+    重发会再执行一次」的反向劝阻，且不带任何等待建议。现在 429 在两种载体（网关 HTML /
+    Spring JSON）都归 `rate_limit`，统一经 `decorateRateLimit` 附 `retry_after` 与来源
+    说明，且不自动重试（立即重试只会继续吃限流）。⚠️ hint 不承诺「一定未执行」——
+    网关可能在转发后合成 429，危险接口仍要求先只读确认；响应带 `Retry-After` 头时
+    （秒数或 HTTP 日期）以它为准，`source` 新增 `header`（优先于限频表与兜底）。
+  · **限流 hint 把「实测无限频」说成「未登记」**：`limitFor` 把两者压成同一个 null，
+    5 个显式登记为 `null` 的接口（如 `export.session.check`）撞限流时被告知「未登记在
+    本地限频表」——与 `api schema` 的 `rate_limit` 图例（「null = 实测过，确实没有」）
+    直接矛盾。改用 `registeredRateLimit` 三态分别措辞。
+  · **`14004 appId not bind` 被说成「核对字段名与类型」**：真实成因是账号未绑定公众号，
+    改参数与重试都无效。新增分支归 `module_offline` 并点名「绑定公众号」。
+  · **`retryAfter.source:'local'` 的注释断言「交付形态不可达」**：`qiyu sync run` 在
+    同进程对同一路径反复 `call()` 时就会撞上本地令牌桶（`pace.ts` 专为它而写），注释
+    会让后续维护者把它当死值。改为如实说明「单次 `api call` 不可达、sync 可达」。
+  · **`--no-validate` 的 usage 只说「关闭 body 校验」**：它实际还关闭别名改写与
+    warnings（spec §九 验收 19 的既定语义）。行为不变，把说法补全，并加守卫钉住。
+  · **未知接口 id 的 hint 指向默认 `api list`**：默认列表只含 136 条可主动调用接口，
+    入站接口与不可调用项要 `--all`。打字打错一个入站 id 的 Agent 会按提示跑默认列表、
+    得出「这个接口不存在」。改为 `qiyu api list --all`。
+  · **`integer` 类型校验放行 1.5**：只判 `typeof === 'number'`，小数 id/页码静默通过，
+    而图例承诺「类型不符是软告警」。改为 `Number.isInteger`。
+  · **同批重复主键的 upsert 结果取决于 batchSize**：DuckDB 多行 `INSERT ... ON CONFLICT`
+    在同一语句内遇到重复键保留**第一条**，逐条写入则后一条获胜。现在写入前先收敛为
+    一行（后出现的获胜），返回值按收敛后的实际写入行数计。去重键按**列的存储类型**
+    归一化（VARCHAR 主键的 `1` 与 `'1'` 是同一个值），不按 JS `typeof` —— 否则混合类型
+    的主键仍会随 batchSize 变化。
+
+  13 处变异验证全部变红（回显原文、`typeof` 判型、429 归 network、三态压平、`appId`
+  分支失效、hint 退回裸 `api list`、upsert 去重失效、usage 退回旧文案；CodeRabbit 两轮
+  追加的 Retry-After 头、非有限值/零值/非 HTTP-date 形态拒绝、按列类型归一化去重键、
+  复合主键无歧义编码、「无副作用」承诺七处）。
+
 - **#63 新增图例的自查修正：params 的「通道」谎言、recorded_at 形态说反、rows.written 记法（2026-11-04）**：
 
   PR #63 补齐反向图例覆盖后，我逐条把**每条新图例当成事实断言**回到实现里核对，发现

@@ -59,7 +59,10 @@ export function normalizeAliases(
 
 const BODY_TYPE_MAP: Record<string, (v: unknown) => boolean> = {
   string: (v) => typeof v === 'string',
-  integer: (v) => typeof v === 'number',
+  // ⚠️ 必须是 Number.isInteger，不能只判 typeof === 'number'：后者放行 1.5，
+  // 而注册表声明 integer 的字段（id、页码、时间戳）传小数会被服务端截断或报 14004，
+  // 图例却承诺「类型不符是软告警」—— 等于让 Agent 以为已通过检查。
+  integer: (v) => typeof v === 'number' && Number.isInteger(v),
   number: (v) => typeof v === 'number',
   boolean: (v) => typeof v === 'boolean',
   array: (v) => Array.isArray(v),

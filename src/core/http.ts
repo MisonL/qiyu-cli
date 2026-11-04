@@ -2,7 +2,7 @@
 import { signedQuery } from './sign.js'
 import { classify, type QiyuError } from './errors.js'
 import { normalize } from './envelope.js'
-import { TokenBucket, limitFor, type RateLimit } from './ratelimit.js'
+import { TokenBucket, limitFor, registeredRateLimit, type RateLimit } from './ratelimit.js'
 import { redact, type Credentials } from './credentials.js'
 import type { EndpointSpec } from './registry/index.js'
 
@@ -95,6 +95,77 @@ function bucketKey(spec: EndpointSpec): string {
  */
 function limitForSpec(spec: EndpointSpec): RateLimit | null {
   return limitFor(spec.id)
+}
+
+/**
+ * 解析 HTTP `Retry-After`（RFC 9110）：秒数或 HTTP 日期两种形态；非法/缺失返回 undefined。
+ * 日期形态按注入时钟折算成秒（向上取整、不小于 0）——不要把"过去的时间"折成负数。
+ */
+function parseRetryAfterSeconds(header: string | null, nowMs: number): number | undefined {
+  if (!header) return undefined
+  const t = header.trim()
+  // delay-seconds 语法是 1*DIGIT，但 0 秒等于「立刻重试」——在 429 语境下必然再吃限流，
+  // 与 malformed 一样退回兜底（0 无法给出有意义的等待建议）。
+  if (/^\d+$/.test(t)) { const n = Number(t); return Number.isFinite(n) && n > 0 ? n : undefined }
+  // ⚠️ 不能直接 `Date.parse` 任何非数字串（CodeRabbit PR #65 第三轮）：V8 的宽松日期解析
+  // 接受 `1.5`（→ 2001 年）、`-1`（→ 2001 年）这类非 HTTP-date 值，折算成"过去"后
+  // 被 max(0) 压成 0 秒 —— Agent 会立刻重试、再吃限流。HTTP-date 必然含英文星期/月份名，
+  // 用它做形态门（RFC 9110 的三种格式都满足）。
+  if (!/[A-Za-z]/.test(t)) return undefined
+  const at = Date.parse(t)
+  if (Number.isNaN(at)) return undefined
+  // ⚠️ 日期分支也必须要求**正数**（CodeRabbit PR #65 第四轮）：过去的时间（或
+  // `May 1` 这种被宽松解析到过去的值）会算出 ≤0 —— 与秒数分支的 0 秒一样是
+  // "立刻重试"，必须退回兜底而不是报 0。
+  const secs = Math.ceil((at - nowMs) / 1000)
+  return secs > 0 ? secs : undefined
+}
+
+/**
+ * 限流错误的统一装饰：`retry_after` + 来源说明 + 三态 hint。
+ * 所有 `kind=rate_limit` 的出口（服务端业务码、HTTP 429 的两种载体）都必须经过这里 ——
+ * 否则同一类限流会因载体不同给出不同的等待建议（实测：HTTP 429 曾直接抛出，
+ * 从不附 retry_after）。本地令牌桶的 `local_rate_limit` 自带精确等待，不经过这里。
+ */
+function decorateRateLimit(err: QiyuError, spec: EndpointSpec, serverSeconds?: number): QiyuError {
+  // ⚠️ 服务端 `Retry-After` 头优先于本地限频表（CodeRabbit PR #65）：429 同时带
+  // `Retry-After: 3600` 时，限频表的 20/30 秒会诱导 Agent 提前重试、继续吃限流。
+  if (serverSeconds !== undefined) {
+    err.retryAfter = { seconds: serverSeconds, source: 'header' }
+    err.hint = `服务端通过 Retry-After 指定了等待 ${serverSeconds} 秒（最可信的来源，优先于本地限频表）。` +
+      (err.hint ? ` 原分类提示：${err.hint}` : '')
+    return err
+  }
+  const limit = limitForSpec(spec)
+  // ⚠️ **必须标出这个数字的来源**（2026-10-05 修）：设计稿 §11.2 D 的分流协议按
+  // `retry_after > 60` 二分（`> 60` → 不要 sleep，去查本地库），而**兜底值恰好就是 60**、
+  // 实测值里也真的有 60（ipcc 报表）—— 同一个数字承载不同的来源与可信度。
+  // ⚠️ 直接用**限频表自己的 `source`**，不要压成一个布尔：表里 6 行是 `'doc'`
+  // （文档值、从未实测），压成 `measured: true` 会把它们谎报成实测。
+  err.retryAfter = limit
+    ? { seconds: limit.windowSeconds, source: limit.source }
+    : { seconds: 60, source: 'fallback' }
+  // ⚠️ **三态**（2026-11-04 修）：`limitFor` 把「未登记」与「显式 null（实测过、确实
+  // 没有限频）」压成同一个 null。旧 hint 一律说「未登记在本地限频表」—— 对显式 null 的
+  // 5 个接口（`export.session.check` 等）与 `api schema` 的 `rate_limit` 图例
+  // （「null = 实测过，确实没有限频」）直接矛盾：Agent 被告知"没测过"，schema 刚说"测过"。
+  const registered = registeredRateLimit(spec.id)
+  if (registered === undefined) {
+    err.hint = '该接口未登记在本地限频表，下面的等待秒数是**保守兜底值、不是实测冷却**，' +
+      '可能短于服务端真实冷却（睡完仍可能再吃限频）。真实配额见接口文档。' +
+      (err.hint ? ` 原分类提示：${err.hint}` : '')
+  } else if (registered === null) {
+    err.hint = '本表对该接口的实测结论是「没有限频」（不是没测过），但服务端本次确实限流 —— ' +
+      '以服务端为准；下面的等待秒数是保守兜底值、不是该接口的实测冷却。' +
+      (err.hint ? ` 原分类提示：${err.hint}` : '')
+  } else if (limit?.source === 'doc') {
+    // ⚠️ `doc` 来源也必须说清（2026-10-07 补）：秒数抄自厂商文档、**从未实测过**。
+    // 此前它与 `observed` 走同一段代码、hint 一字不差，等于把文档值当实测值报给 Agent。
+    err.hint = '下面的等待秒数取自**厂商文档、未对本租户实测**，' +
+      '真实冷却可能不同（睡完仍可能再吃限频）。' +
+      (err.hint ? ` 原分类提示：${err.hint}` : '')
+  }
+  return err
 }
 
 function bucketFor(spec: EndpointSpec): TokenBucket {
@@ -353,7 +424,24 @@ export async function call(
             hint: `请求被拒绝（HTTP ${status}）—— 凭证或权限问题，重试无用` },
         )
       }
-      const transient = status === 429 || status === 500 || status === 502 ||
+      // ⚠️ 429 先于 transient 处理（2026-11-04 修）：429 是"请求太频繁"，服务端在执行业务
+      // 逻辑之前就拒绝了，**没有副作用** —— 与 5xx（可能已执行）的语义相反。若留在这组
+      // transient 里，危险接口的 429 会收到 DANGEROUS_NETWORK_HINT（"可能已被执行，重发会
+      // 再执行一次"），把确定未执行的限流劝阻成"先确认状态"；且立即退避重试也不符合
+      // 限流语义（要按服务端冷却等）。这里抛 kind:rate_limit 并立即经 decorateRateLimit
+      // 附上 retry_after 与来源说明（与 Spring JSON 载体走同一条装饰路径）；
+      // 不进入下面的自动重试预算 —— 立即重试只会继续吃限流。
+      if (status === 429) {
+        const e = Object.assign(
+          new Error('响应不是合法 JSON（HTTP 429）—— 服务端限流'),
+          { code: '429', kind: 'rate_limit', retryable: true,
+            hint: '服务端限流（HTTP 429）—— 通常表示请求在执行业务逻辑之前被拒绝，' +
+                  '但网关也可能在转发后合成 429：危险接口请先用只读接口确认当前状态再重试；' +
+                  '读接口按 retry_after 等待后重试' },
+        ) as QiyuError
+        throw decorateRateLimit(e, spec, parseRetryAfterSeconds(res.headers.get('retry-after'), now()))
+      }
+      const transient = status === 500 || status === 502 ||
                         status === 503 || status === 504
       // ⚠️ 危险接口的 5xx 同样可能已经执行（502/504 是"上游收到请求后失败"的典型形态），
       // hint 必须与 fetch-throw / body-read 两支的收窄同源（DANGEROUS_NETWORK_HINT）——
@@ -433,50 +521,13 @@ export async function call(
         })
       }
       // 冷却秒数由**限频表**决定，不由分派器猜 —— 实测冷却随接口变化
-      const limit = limitForSpec(spec)
       if (err.kind === 'rate_limit') {
-        // ⚠️ **必须标出这个数字的来源**（2026-10-05 修）。
-        // 此前是裸的 `{ seconds: N }`，Agent 分不出来：设计稿 §11.2 D 的分流协议
-        // 按 `retry_after > 60` 二分（`> 60` → 不要 sleep，去查本地库），而**兜底值
-        // 恰好就是 60**、实测值里也真的有 60（ipcc 报表）—— 同一个数字承载不同的
-        // 来源与可信度，Agent 无从判断该不该信。
-        // ⚠️ 直接用**限频表自己的 `source`**，不要压成一个布尔：表里 6 行是
-        // `'doc'`（文档值、从未实测），压成 `measured: true` 会把它们谎报成实测。
-        err.retryAfter = limit
-          ? { seconds: limit.windowSeconds, source: limit.source }
-          // 接口没登记限频、但服务端确实报了限流 —— 此时**必须**给个保守兜底，
-          // 否则 Agent 收到限流却拿不到任何等待建议，只能立刻重试、继续吃 14009。
-          //
-          // ⚠️ **兜底值恰好等于设计稿 §11.2 D 的分流阈值（`retry_after > 60`），这是刻意的。**
-          // 该协议说：`> 60` → 「**不要 sleep**；改为查询本地数据库」。
-          // 本计划**没有 `store/`**（见「已知缺口」），所以"查询本地数据库"这条动作
-          // 对本计划的 Agent **不可执行** —— 那等于把 Agent 指向一个不存在的能力。
-          // 落在 `<= 60` 这一侧（可以 sleep）才是当前唯一可执行的下一步。
-          // → **不要**为了让"未登记接口也走不要 sleep 分支"而把这个值改成 61：
-          // 那会把 Agent 送去查一个本计划没有的数据库。等有 `store/` 之后再改，
-          // 届时这个兜底值才有第二种正确取法。
-          : { seconds: 60, source: 'fallback' }
-        // ⚠️ 兜底时**必须**说清它不是实测值，并指明真正的配额要去哪查 ——
-        // 否则 Agent 睡满 60 秒就重试，很可能再吃一次 14009。
-        if (!limit) {
-          err.hint = '该接口未登记在本地限频表，下面的等待秒数是**保守兜底值、不是实测冷却**，' +
-            '可能短于服务端真实冷却（睡完仍可能再吃限频）。真实配额见接口文档。' +
-            (err.hint ? ` 原分类提示：${err.hint}` : '')
-        } else if (limit.source === 'doc') {
-          // ⚠️ `doc` 来源也必须说清（2026-10-07 补）。限频表里 6 行是 `source: 'doc'`
-          // —— 秒数抄自厂商文档、**从未实测过**。此前它与 `observed` 走同一段代码、
-          // hint 一字不差，等于把文档值当实测值报给 Agent —— 与 `source` 存在的
-          // 唯一目的（让 Agent 分辨该不该信）相反。
-          // `source` 字段本身对 Agent 零解释（见「已知缺口」登记），所以 hint 是
-          // 唯一能传达这件事的渠道 —— 与 `fallback` 那条同一条理由。
-          err.hint = '下面的等待秒数取自**厂商文档、未对本租户实测**，' +
-            '真实冷却可能不同（睡完仍可能再吃限频）。' +
-            (err.hint ? ` 原分类提示：${err.hint}` : '')
-        }
+        decorateRateLimit(err, spec, parseRetryAfterSeconds(res.headers.get('retry-after'), now()))
       }
-      // ⚠️ 瞬时 5xx/429（Spring JSON 载体）也走 core 的重试预算，与上面四条网络分支
+      // ⚠️ 瞬时 5xx（Spring JSON 载体）也走 core 的重试预算，与上面四条网络分支
       // 共用 `networkAttempts` —— 同一个 502 不该因为"代理回 HTML 还是 Spring JSON"
       // 而一个重试、一个不重试。危险接口已在上面的分支提前抛出不重试。
+      // 429 不在其中：它归 rate_limit（未执行、需按冷却等待），不自动重试。
       if (err.kind === 'network' && !opts.noRetry && networkAttempts < 2) {
         await sleep(networkBackoffMs(networkAttempts))
         networkAttempts++

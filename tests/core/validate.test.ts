@@ -125,6 +125,14 @@ describe('validateBody —— 软规则与 strict', () => {
     expect(strictTm.hard.some((h) => h.kind === 'type_mismatch')).toBe(true)
     expect(strictTm.hard.find((h) => h.kind === 'type_mismatch')!.message).toMatch(/不要删字段/)
   })
+  it('type_mismatch：integer 收到 1.5 判 mismatch（不是「只要是 number 就算对」）', () => {
+    // 旧实现只判 typeof === 'number'，1.5 静默通过 —— 而图例承诺「类型不符是软告警」。
+    // 传小数 id/页码会被服务端截断或报 14004，CLI 却什么都不说。
+    const file = jsonFile([{ name: 'robotId', in: 'body', required: true, type: 'integer' }])
+    expect(validateBody(spec(), file, { robotId: 1.5 }, undefined, { strict: false })
+      .soft.some((w) => w.kind === 'type_mismatch' && w.field === 'robotId')).toBe(true)
+    expect(validateBody(spec(), file, { robotId: 1 }, undefined, { strict: false }).soft).toEqual([])
+  })
   it('type_mismatch 的 <实际类型> 用固定词 null/数组/string，不用 typeof', () => {
     const file = jsonFile([{ name: 'robotId', in: 'body', required: true, type: 'integer' }])
     const m = validateBody(spec(), file, { robotId: null }, undefined, { strict: false }).soft[0].message

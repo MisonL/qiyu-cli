@@ -95,6 +95,20 @@ describe('结构校验（fail-closed，点名键路径）', () => {
     writeCfg('{ 坏 JSON')
     expect(() => loadConfigFile(cfgPath())).toThrow(/不是合法 JSON/)
   })
+
+  it('JSON 畸形时不得回显文件内容（配置文件里可能有凭证）', () => {
+    // V8 的 JSON.parse 报错会把出错位置附近的**原文**带进 message
+    // （实测 `Unexpected token 'X', "FAKESECRET…" is not valid JSON`）。
+    // 配置文件里就有 appSecret —— 回显等于把凭据前若干字符写进 stdout。
+    writeCfg('{"FAKESECRET-abc123": oops')
+    let msg = ''
+    try { loadConfigFile(cfgPath()) } catch (e) { msg = (e as Error).message }
+    expect(msg).toMatch(/不是合法 JSON/)
+    expect(msg).not.toContain('FAKESECRET')
+    // V8 的「Unexpected token」形态只给出错字面量、不给 position —— 那时只保留类别描述；
+    // 两种形态都不得把带内容的片段带出来（上面的 not.toContain 是主断言）。
+    expect(msg).toMatch(/^配置文件 .+ 不是合法 JSON(。语法错误在 position \d+（第 \d+ 行第 \d+ 列）|。语法错误在 position \d+)?$/)
+  })
 })
 
 describe('权限裁决（loadConfigChecked）', () => {

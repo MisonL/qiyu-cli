@@ -14,7 +14,7 @@ export interface ErrorInput {
   retryable: boolean
   message: string
   hint?: string
-  retryAfter?: { seconds: number; source: 'observed' | 'doc' | 'local' | 'fallback' }
+  retryAfter?: { seconds: number; source: 'observed' | 'doc' | 'local' | 'header' | 'fallback' }
   /**
    * ⚠️ 本计划不填。设计稿 §9.1 在限流示例里列了它，但"改用本地查询"这个动作
    * 依赖存储层，本计划没有 store/（见「已知缺口」）。留空键、等有实现时再填，
@@ -42,7 +42,7 @@ export interface ErrorPayload {
   retryable: boolean
   message: string
   hint?: string
-  retry_after?: { seconds: number; source: 'observed' | 'doc' | 'local' | 'fallback' }
+  retry_after?: { seconds: number; source: 'observed' | 'doc' | 'local' | 'header' | 'fallback' }
   retry_strategy?: string
   fallback?: string
   confirm_required?: true

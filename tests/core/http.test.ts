@@ -352,28 +352,112 @@ describe('call', () => {
     }
   })
 
-  it('网关故障（429/500/502/503/504 返回 HTML）归类为可重试，而不是永久失败', async () => {
+  it('网关 5xx（返回 HTML）归类为可重试的 network；429 单独归 rate_limit', async () => {
     // 实测：网关返回 HTML 错误页时，res.json() 抛错。原先一律判 internal +
     // retryable:false —— Agent 会直接放弃，但这是**瞬时**故障，本该退避重试。
     //
-    // ⚠️ 这五个码必须与 `errors.ts` 的 `classify` 瞬时集**逐字一致**
-    // （两处都是 429/500/502/503/504，见 errors.ts 那条 `for (const s of [...])`）——
-    // 否则同一个 500 会因"代理返回 HTML"（走这里）还是"Spring JSON"（走 classify）
-    // 而落到不同分支。此前这里**漏了 500**：把 http.ts 的 `status === 500 ||` 删掉，
-    // 全量测试仍全绿，而 500 会从"可重试的网络故障"退化为"不可重试的内部错误"，
-    // Agent 直接放弃 —— 正是本用例声称要防的那件事。改一处必须改两处。
-    for (const status of [429, 500, 502, 503, 504]) {
+    // ⚠️ 429 与 5xx 的**副作用语义相反**（2026-11-04 修）：5xx 可能已执行业务逻辑，
+    // 429 是服务端在执行业务逻辑之前拒绝的限流（肯定没执行）。因此 429 归
+    // `rate_limit`（可重试 + 走 retry_after），不再套危险接口的「可能已执行」提示。
+    // 两处载体的集合必须**语义**一致：http.ts（HTML）与 errors.ts（Spring JSON）
+    // 都要把 429 划出 5xx 组 —— 否则同一状态码会因代理行为落到不同 kind。
+    for (const status of [500, 502, 503, 504]) {
       fetchMock.mockImplementationOnce(() => Promise.resolve(
         new Response('<html><body>Bad Gateway</body></html>',
           { status, headers: { 'content-type': 'text/html' } })))
       await expect(call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true }))
         .rejects.toMatchObject({ kind: 'network', retryable: true })
     }
+    fetchMock.mockImplementationOnce(() => Promise.resolve(
+      new Response('<html><body>Too Many Requests</body></html>',
+        { status: 429, headers: { 'content-type': 'text/html' } })))
+    await expect(call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true }))
+      .rejects.toMatchObject({ kind: 'rate_limit', retryable: true })
+  })
+
+  it('危险接口的 429 不得套「可能已执行」：它是未执行的限流，且必须给 retry_after', async () => {
+    // 429 = 服务端在执行业务逻辑之前拒绝 —— 与 5xx 的副作用语义相反。
+    // 旧实现把 429 归 network：危险接口收到「请求可能已被服务端执行，重发会再执行一次」，
+    // 而这次调用根本不可能执行过；Agent 还拿不到任何等待建议。
+    let attempts = 0
+    fetchMock.mockImplementation(() => {
+      attempts++
+      return Promise.resolve(new Response('<html>Too Many Requests</html>',
+        { status: 429, headers: { 'content-type': 'text/html' } }))
+    })
+    const err = await call(byId('message.send'), { uid: 1 }, { credentials: CREDS }).catch((e) => e)
+    expect(attempts, '429 不该被自动重试（等待归调用方，按 retry_after）').toBe(1)
+    expect(err).toMatchObject({ kind: 'rate_limit', retryable: true })
+    expect(err.hint).not.toMatch(/可能已被服务端执行/)
+    // ⚠️ 也不能反向承诺「一定没执行」：网关可能在转发后合成 429（CodeRabbit PR #65）。
+    expect(err.hint).not.toMatch(/未产生副作用|不会产生副作用/)
+    expect(err.hint).toMatch(/确认当前状态/)
+    expect(err.retryAfter, '限流必须给等待建议').toMatchObject({ seconds: expect.any(Number) })
+  })
+
+  it('限流 hint 三态：显式登记「无限频」的接口不得被说成「未登记」', async () => {
+    // `limitFor` 把「未登记」与「显式 null（实测过、确实没有限频）」压成同一个 null。
+    // 此前 hint 一律说「该接口未登记在本地限频表」—— 与 `api schema` 的 rate_limit
+    // 图例（「null = 实测过，确实没有限频」）直接矛盾，Agent 无法判断这个值时该信谁。
+    // export.session.check 在限频表里显式登记为 null（实测无限频）。
+    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify(
+      { code: 14009, message: 'api call too frequent' }),
+      { status: 200, headers: { 'content-type': 'application/json' } })))
+    const err = await call(byId('export.session.check'), {}, { credentials: CREDS, noRetry: true })
+      .catch((e) => e)
+    expect(err).toMatchObject({ kind: 'rate_limit' })
+    expect(err.hint).not.toMatch(/未登记在本地限频表/)
+    expect(err.hint).toMatch(/实测结论是「没有限频」/)
+    // 对照：真正未登记的接口（message.send 不在限频表里）仍说「未登记」
+    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify(
+      { code: 14009, message: 'api call too frequent' }),
+      { status: 200, headers: { 'content-type': 'application/json' } })))
+    const unreg = await call(byId('message.send'), {}, { credentials: CREDS, noRetry: true })
+      .catch((e) => e)
+    expect(unreg).toMatchObject({ kind: 'rate_limit' })
+    expect(unreg.hint).toMatch(/未登记在本地限频表/)
+  })
+
+  it('HTTP 429 的 Retry-After 头优先于本地限频表（秒数与 HTTP 日期两种形态）', async () => {
+    // 服务端直接指定的等待最可信：429 + `Retry-After: 3600` 时若按本地表/兜底的
+    // 60 秒让 Agent 重试，整个冷却期都会继续吃限流（CodeRabbit PR #65）。
+    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response('<html>', {
+      status: 429, headers: { 'content-type': 'text/html', 'retry-after': '3600' } })))
+    const e1 = await call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true }).catch((e) => e)
+    expect(e1.retryAfter).toEqual({ seconds: 3600, source: 'header' })
+    expect(e1.hint).toMatch(/Retry-After/)
+    // HTTP 日期形态按注入时钟折算
+    const base = Date.parse('2026-11-04T00:00:00Z')
+    const at = new Date(base + 120_000).toUTCString()
+    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response('<html>', {
+      status: 429, headers: { 'content-type': 'text/html', 'retry-after': at } })))
+    const e2 = await call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true, now: () => base })
+      .catch((e) => e)
+    expect(e2.retryAfter).toEqual({ seconds: 120, source: 'header' })
+    // 非法头 → 退回本地兜底，不崩
+    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response('<html>', {
+      status: 429, headers: { 'content-type': 'text/html', 'retry-after': 'soon' } })))
+    const e3 = await call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true }).catch((e) => e)
+    expect(e3.retryAfter).toEqual({ seconds: 60, source: 'fallback' })
+    // `1.5` / `-1` 能被 V8 Date.parse 解析成 2001 年的历史时间 → max(0) 会给出 0 秒，
+    // 诱导 Agent 立刻重试。HTTP-date 必须含英文星期/月份名，否则退回兜底。
+    for (const bad of ['1.5', '-1', '0', 'Sun, 06 Nov 1994 08:49:37 GMT', 'May 1']) {
+      fetchMock.mockImplementationOnce(() => Promise.resolve(new Response('<html>', {
+        status: 429, headers: { 'content-type': 'text/html', 'retry-after': bad } })))
+      const eb = await call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true }).catch((e) => e)
+      expect(eb.retryAfter, `Retry-After=${bad} 不得被当作合法日期`).toEqual({ seconds: 60, source: 'fallback' })
+    }
+    // 超长数字头 → Number 得 Infinity，必须拒绝、不能塞进信封（否则 retry_after.seconds 变 null）
+    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response('<html>', {
+      status: 429, headers: { 'content-type': 'text/html', 'retry-after': '9'.repeat(400) } })))
+    const e4 = await call(byId('ticket.search'), {}, { credentials: CREDS, noRetry: true }).catch((e) => e)
+    expect(e4.retryAfter).toEqual({ seconds: 60, source: 'fallback' })
+    expect(Number.isFinite(e4.retryAfter.seconds)).toBe(true)
   })
 
   it('危险接口的 5xx 不得说「退避后重试」—— 两种载体同一句收窄说明', async () => {
     // 实测缺陷（2026-11-02）：网关 HTML 与 Spring JSON 是**同一次故障的两种载体**，
-    // 而危mechanism 收窄此前只写在 fetch 抛错 / body 读取失败两支。5xx 两处对
+    // 而危险接口的收窄此前只写在 fetch 抛错 / body 读取失败两支。5xx 两处对
     // `message.send` 仍报「网关瞬时故障，请退避后重试」—— 502/504 恰恰是"上游收到
     // 请求后失败"的典型形态，Agent 照做就是一次确认变成两次执行。
     for (const make of [
