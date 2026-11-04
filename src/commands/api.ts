@@ -443,7 +443,9 @@ async function schema(argv: string[]): Promise<number> {
           + '`body` = 请求体 —— 唯一能由 `--body` 传的位置；`query` = URL 查询串 —— 本 CLI 只自填鉴权三件套（标 auto），'
           + '非鉴权的 query 参数只出现在不可主动调用的入站接口上；`path` = 路径占位符 —— 本 CLI 不做占位符替换，'
           + '带 path 参数的接口也都不可主动调用；`header` = 请求头 —— 现注册表里只有 content-type，由 CLI 固定发送。'
-          + '⚠️ 不要把非 body 参数塞进 --body（会得到 unknown_field 提示）',
+          + '⚠️ 不要把非 body 参数塞进 --body —— 只有该接口有 JSON body 参数表（has_body_schema=true）'
+          + '且未加 --no-validate 时才会得到 unknown_field 提示；其余情形它会被原样发出、服务端大概率忽略'
+          + '（别把「返回成功」当成「字段生效了」）',
         'params[].type': '参数类型（string/integer/array/object/boolean/number）。⚠️ 只有 `in=body` 且本次传入的字段会被 api call 比对：'
           + '类型不符是软告警，--strict 下升级为拒绝；非 body 参数不做类型校验',
         'params[].required': '上游文档声明必填。⚠️ 本 CLI 只对 `in=body` 的必填做校验：缺了拒绝（退出码 2；--no-validate 时不校验）。'

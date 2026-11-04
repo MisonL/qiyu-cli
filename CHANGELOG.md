@@ -135,6 +135,9 @@
     path 参数只出现在不可主动调用的接口上；header 只有 content-type、由 CLI 固定发送。
     `params[].type` / `params[].required` / `params[].name` / `params[].example` 同步把
     强制范围收窄到 body 参数（`validateBody` 只校验 `in=body`，此前写成了普适承诺）。
+    CodeRabbit 首轮又抓到一处同类收窄：初版结尾写「不要把非 body 参数塞进 --body
+    （会得到 unknown_field 提示）」——该提示只在接口有 JSON body 参数表且未加
+    `--no-validate` 时产生，其余情形会被原样发出，已限定条件。
   · **`sync status` 的 `gaps[].recorded_at` 形态说反**：初版写「epoch 毫秒数」，
     实际落库值是 `new Date(...).toISOString()`（实测 `"2026-11-04T02:29:50.268Z"`，
     ISO 8601 UTC 字符串）—— 反倒是同条目的 `range` 才是 epoch 毫秒字符串。
