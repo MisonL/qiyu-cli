@@ -220,6 +220,26 @@ describe('信封矩阵：形状 × message 类型（§12）', () => {
     })
   })
 
+  describe('形状 M（成功载荷就是 message 原文：export.session / .check）', () => {
+    // 设计稿 §7.5 实测：create → `{code:200, message:"<task key>"}`，
+    // check 完成 → `{code:200, message:"<download link>"}`。message 不是 JSON，
+    // 也不该被 JSON.parse —— 原样作为 payload。
+    it('200 + 非空 message → payload 是 message 原文，不判 notFound', () => {
+      const r = normalizeIn(envelope(200, 'task-key-abc'), 'M')
+      expect(r).toMatchObject({ ok: true, payload: 'task-key-abc', notFound: false })
+    })
+
+    it('200 + 空 message → 失败（没有可用载荷），不判 notFound', () => {
+      const r = normalizeIn(envelope(200, ''), 'M')
+      expect(r).toMatchObject({ ok: false, notFound: false })
+    })
+
+    it('非 200 → 失败：message 是错误文本，不得当成成功载荷', () => {
+      const r = normalizeIn(envelope(14403, 'Wait...'), 'M')
+      expect(r).toMatchObject({ ok: false, code: '14403', payload: undefined })
+    })
+  })
+
   // ——— 宽松模式（envelope 未登记） ———
   describe('未登记信封（undefined）：只试探 message', () => {
     it.each([

@@ -44,11 +44,35 @@ export async function loadRateLimits({ distUrl = DIST_RATELIMIT, srcUrl = SRC_RA
 }
 
 /** 4 个文档外接口（会话导出流水线，150 页里 0 命中）。 */
+// ⚠️ 文档外接口的 params/bodyKind **必须在这里声明**（2026-11-04）：此前一律产出
+// `params: []`、`body_kind: 'none'`，而 4 个接口的 body 都是必需的、同步流水线就在发 ——
+// Agent 按 `api schema` 会看到「没有参数」，照着发出空 body。字段集来自设计稿 §7.5
+// 的端到端实测（`{start,end}` / `{key}` / `{sessionId}` / `{sessionId,mTypes}`）。
 const EXTERNAL_ENDPOINTS = [
-  { id: 'export.session', title: '创建会话导出任务', method: 'POST', path: '/openapi/export/session' },
-  { id: 'export.session.check', title: '查询会话导出任务', method: 'POST', path: '/openapi/export/session/check' },
-  { id: 'export.session.one', title: '单条会话查询', method: 'POST', path: '/openapi/export/session/one' },
-  { id: 'export.session.one.message', title: '单条会话消息查询', method: 'POST', path: '/openapi/export/session/one/message' },
+  { id: 'export.session', title: '创建会话导出任务', method: 'POST', path: '/openapi/export/session',
+    bodyKind: 'json',
+    params: [
+      { name: 'start', in: 'body', required: true, type: 'integer', description: '窗口起点（毫秒时间戳，含）' },
+      { name: 'end', in: 'body', required: true, type: 'integer', description: '窗口终点（毫秒时间戳，不含）' },
+      { name: 'code', in: 'body', required: false, type: 'string', description: '（可选；实测不校验，不传误导性参数）' },
+    ] },
+  { id: 'export.session.check', title: '查询会话导出任务', method: 'POST', path: '/openapi/export/session/check',
+    bodyKind: 'json',
+    params: [
+      { name: 'key', in: 'body', required: true, type: 'string', description: 'create 返回的任务 key' },
+      { name: 'code', in: 'body', required: false, type: 'string', description: '（可选；实测不校验）' },
+    ] },
+  { id: 'export.session.one', title: '单条会话查询', method: 'POST', path: '/openapi/export/session/one',
+    bodyKind: 'json',
+    params: [
+      { name: 'sessionId', in: 'body', required: true, type: 'string', description: '会话 id（单条查询，无需 code）' },
+    ] },
+  { id: 'export.session.one.message', title: '单条会话消息查询', method: 'POST', path: '/openapi/export/session/one/message',
+    bodyKind: 'json',
+    params: [
+      { name: 'sessionId', in: 'body', required: true, type: 'string', description: '会话 id' },
+      { name: 'mTypes', in: 'body', required: true, type: 'string', description: '消息类型，逗号分隔字符串（传数组 → 14500）' },
+    ] },
 ]
 
 /**
@@ -95,7 +119,9 @@ export async function generate({
       ...(a.category !== undefined ? { category: a.category } : {}),
       ...(a.note !== undefined ? { note: a.note } : {}),
     })
-    paramsById[e.id] = { params: [], responseShape: { kind: 'none' }, bodyKind: 'none' }
+    paramsById[e.id] = {
+      params: e.params ?? [], responseShape: { kind: 'none' }, bodyKind: e.bodyKind ?? 'none',
+    }
   }
   specs.sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0))
 

@@ -35,12 +35,14 @@ export interface PipelineCtx {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-/** 形状 A 载荷里的 message 字符串（create 的任务 key / check 的下载链接都走 message）。 */
+/** 形状 M 的载荷（create 的任务 key / check 的下载链接都走 message 原文）。 */
 function messageOf(res: { payload: unknown; messageText: string }, endpointId: string): string {
-  // 形状 A（envelope:'A'）：信封层把 data 放进 payload、原文放 messageText。
+  // 形状 M（envelope:'M'，2026-11-04 修正）：信封层直接把 message 原文放进 payload。
   // 实测 create/check 的载荷就是 message 字符串本身（key/链接），不信任何 data 形态。
+  // ⚠️ 'OK' 是占位符（形态漂移的典型形态）——两个来源都要挡掉，否则会拿 'OK'
+  // 当下载链接去下载。
   const p = res.payload
-  if (typeof p === 'string' && p !== '') return p
+  if (typeof p === 'string' && p !== '' && p !== 'OK') return p
   if (typeof res.messageText === 'string' && res.messageText !== '' && res.messageText !== 'OK') {
     return res.messageText
   }

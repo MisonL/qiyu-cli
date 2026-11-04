@@ -44,6 +44,13 @@ describe('generate', () => {
     expect(readdirSync(join(out, 'params')).length).toBe(EXPECTED_TOTAL)
     expect(JSON.parse(readFileSync(join(out, 'specs.json'), 'utf8')).length).toBe(EXPECTED_TOTAL)
     expect(specs.filter((s: { pageId?: string; id?: string }) => s.pageId).length).toBe(pageIds.length)
+    // ⚠️ 文档外接口的 params/bodyKind 必须由生成器产出（2026-11-04）：
+    // 此前一律 `params: []` + `body_kind: 'none'`，而 create/check 的 body 是必需的、
+    // 同步流水线就在发 —— Agent 按 schema 会看到「没有参数」。这里钉住生成物。
+    const exp = JSON.parse(readFileSync(join(out, 'params', 'export.session.json'), 'utf8'))
+    expect(exp.bodyKind).toBe('json')
+    expect(exp.params.map((p: { name: string }) => p.name).sort()).toEqual(['code', 'end', 'start'])
+    expect(specs.find((s: { id?: string }) => s.id === 'export.session')!.envelope).toBe('M')
   })
 
   it('确定性：跑两次字节一致', async () => {

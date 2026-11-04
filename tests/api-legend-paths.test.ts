@@ -164,6 +164,44 @@ describe('params[].in 图例与「本 CLI 只有 body 通道」的注册表不�
     expect(offenders).toEqual([])
   })
 
+  it('api schema：type/required 的强制范围都限定 body_kind=json；body_kind 不得再说「原样透传」', async () => {
+    // 实测（2026-11-04）：`kefu.add`（xml）传 --body '{}' 不报缺必填；
+    // `--body '<xml>'` 直接 exit 2（CLI 恒 JSON.stringify）。旧图例两处都反着说。
+    expect(await apiCommand(['schema', 'ticket.search'])).toBe(0)
+    const n = notes()
+    expect(n['params[].type'], 'type 比对范围必须限定 body_kind=json').toContain('body_kind=json')
+    expect(n['params[].required'], 'required 强制范围必须限定 body_kind=json').toContain('body_kind=json')
+    expect(n['params[].required'], '非 json bodyKind 必须点明不做必填检查').toContain('非 json bodyKind')
+    expect(n['params[].required'], '入站接口的鉴权字段不能被说成由 CLI 自填').toContain('入站接口')
+    expect(n.body_kind, '必须点明非 JSON 编码无法通过本 CLI 表达').toContain('无法通过本 CLI 表达')
+    expect(n.body_kind, '旧说法「原样透传」不得复活').not.toContain('原样透传')
+  })
+
+  it('api list：verified 不得把「实测范围」全指给 note；path 的 null 必伴随 callable=false', async () => {
+    // 实测：53 条 verified:true 里 42 条没有 note —— 旧图例让 Agent「以该行 note 为准」，
+    // 而多数行没有 note 可读。path 图例说 null 仍可能 callable，加载器却禁止该组合。
+    expect(await apiCommand(['list'])).toBe(0)
+    const n = notes()
+    expect(n.verified, '没有 note 时必须给出唯一含义').toContain('没有 note')
+    expect(n.path, 'null 路径与 callable=false 的强制关系必须说明').toContain('必然伴随 callable=false')
+  })
+
+  it('api call：warnings 不得列 missing_required；not_found 必须覆盖 message 载体与宽松模式', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(
+      JSON.stringify({ code: 200, message: '{"total":0,"tickets":[]}' }),
+      { status: 200, headers: { 'content-type': 'application/json' } }))))
+    expect(await apiCommand(['call', 'ticket.search', '--body', '{}'])).toBe(0)
+    const n = notes()
+    // 图例**必须**提到这个词（否则 Agent 会去找它），但只能出现在否定句里，
+    // 不能出现在「如 ……」的示例清单里。
+    expect(n.warnings, 'missing_required 不得被列为 warnings 的示例 kind').not.toMatch(/如 `[^）]*missing_required/)
+    expect(n.warnings).toContain('永远不会出现在这里')
+    expect(n.not_found, 'message 载体（形状 C / 宽松模式）必须写进判据').toContain('message 能解析成 JSON')
+    expect(n.not_found, '宽松模式不区分是否已实测').toContain('宽松模式')
+    vi.unstubAllGlobals()
+  })
+
   it('图例本身不得再声称 path/header 通道（2026-11-04 自查的旧说法）', async () => {
     expect(await apiCommand(['schema', 'ticket.search'])).toBe(0)
     const n = notes()
@@ -171,7 +209,7 @@ describe('params[].in 图例与「本 CLI 只有 body 通道」的注册表不�
     expect(n['params[].in'], '不得再写「进路径占位符」这类通道承诺').not.toContain('进路径占位符')
     expect(n['params[].in'], '不得再写「进请求头」这类通道承诺').not.toContain('进请求头')
     expect(n['params[].in'], '必须点明本 CLI 不做占位符替换').toContain('不做占位符替换')
-    expect(n['params[].required'], 'required 的强制范围必须限定在 body 参数').toContain('只对 `in=body`')
-    expect(n['params[].type'], 'type 比对范围必须限定在 body 参数').toContain('只有 `in=body`')
+    expect(n['params[].required'], 'required 的强制范围必须限定在 body 参数').toContain('`body_kind=json` 且 `in=body`')
+    expect(n['params[].type'], 'type 比对范围必须限定在 body 参数').toContain('`body_kind=json`')
   })
 })

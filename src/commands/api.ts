@@ -284,8 +284,11 @@ function list(argv: string[]): number {
       // 旧文「false = 仅有文档依据」——但 settings.wxTemplates 实测时真调用过
       // （每次都 14004 appId not bind，错误模式有实测片段，只是成功路径没走通）。
       // 全局只当**索引**：true/false 各自测到/没测到什么，以该行 note 为准。
-      verified: 'true = 已实测（实测范围以该行 note 为准，各不相同）；' +
-        'false = 成功路径未实测（已知的实测片段同样以该行 note 为准）',
+      verified: 'true = 至少观测到一次成功响应（信封形状按 envelope 登记解析）；' +
+        'false = 成功路径未实测（可能只有错误响应或纯文档依据）。' +
+        '⚠️ 这只是一句话的事实标签：**具体实测范围只在该行有 note 时才有说明** —— ' +
+        '没有 note 的行不要假定更多（如 export.* 这类文档外接口，缺 note 不代表成功路径未验证）。' +
+        '缺 note 时唯一的含义就是上面这句',
       dangerous: 'true = 危险操作，调用时需 --yes',
       // ⚠️ direction 也必须解释 —— 它是 Agent 判断「我方能调它」还是「它回调我方」
       // 的唯一依据。只输出 `outbound`/`inbound` 两个英文词，Agent 无从知道哪个
@@ -316,8 +319,10 @@ function list(argv: string[]): number {
       // 必须点明：`null` = 路径未收录（数据缺口），不是"方向未知"也不是"不存在"。
       path:
         '本行 path 的两种不可用形态含义不同：' +
-        '`null` = **路径未收录**（文档页未提供可用路径，是数据缺口；不代表接口不存在，' +
-        '也不影响 direction 判定 —— 该接口仍可能是本方可主动调用的）；' +
+        '`null` = **路径未收录**（文档页未提供可用路径，是数据缺口；不代表接口不存在）。' +
+        '⚠️ 本注册表里 null 路径**必然伴随 callable=false**（加载器强制：callable 但无路径' +
+        '会直接拒绝加载，避免拼出 `…/null?appKey=`），即结构上不可主动调用；' +
+        'direction 仍可为 outbound —— 方向描述协议流向，不是可调用性；' +
         '`"/"` = **入站推送的占位符**（path 是占位符不是真实路径，见 direction 说明）。' +
         '两种情况都**不可**据此拼 URL 调用。',
       // ⚠️ `max_window_days` 的语义必须解释 —— 它是最容易被误读的字段。
@@ -430,7 +435,11 @@ async function schema(argv: string[]): Promise<number> {
           '⚠️ 限频桶是**进程内**的，跨 `qiyu api call` 不共享状态 —— 本表只用于告诉调用方' +
           '「撞上限流后该等多久」，不承诺 CLI 会替你排队',
         has_body_schema: 'true = 本接口有可比对的 body 参数表（body_kind 为 json 且 body 参数数 > 0）；不代表本次请求已校验，也不代表其余 bodyKind。本次校验结果见 api call 的 meta.warnings',
-        body_kind: '只有 json 会被 api call 比对字段，其余（none/xml/multipart/text/form）原样透传不校验',
+        body_kind: '只有 json 会被 api call 比对字段；其余（none/xml/multipart/text/form）不做字段校验。' +
+          '⚠️ 但传输层**恒为 JSON**：请求体一律 `JSON.stringify`、Content-Type 恒 `application/json` —— ' +
+          '`--body` 必须是合法 JSON，xml/multipart/text 的原始字节（如 `<xml>...</xml>`）无法通过本 CLI 表达。' +
+          '需要此类编码的接口经 api call 实际不可用；传 JSON 对象给它们只会发出 JSON 字节，' +
+          '别把「返回成功」当成「字段按接口文档生效了」',
         'params[].auto': 'true = 仅对 callable 且 auth 为 checksum 的接口，CLI 自填鉴权 query 参数（appKey/time/checksum）；入站/eventType 接口由回调方提供，不标 auto，调用方不要也不能通过 --body 传',
         // ⚠️ params[] 的元素键此前只解释了 `auto`，其余六个全裸奔（2026-11-04 反向 sweep 实测）。
         // ⚠️⚠️ 2026-11-04 自查修正：`in` 的初版写成「该参数放哪里：path = 进路径占位符、
@@ -446,10 +455,15 @@ async function schema(argv: string[]): Promise<number> {
           + '⚠️ 不要把非 body 参数塞进 --body —— 只有该接口有 JSON body 参数表（has_body_schema=true）'
           + '且未加 --no-validate 时才会得到 unknown_field 提示；其余情形它会被原样发出、服务端大概率忽略'
           + '（别把「返回成功」当成「字段生效了」）',
-        'params[].type': '参数类型（string/integer/array/object/boolean/number）。⚠️ 只有 `in=body` 且本次传入的字段会被 api call 比对：'
-          + '类型不符是软告警，--strict 下升级为拒绝；非 body 参数不做类型校验',
-        'params[].required': '上游文档声明必填。⚠️ 本 CLI 只对 `in=body` 的必填做校验：缺了拒绝（退出码 2；--no-validate 时不校验）。'
-          + 'query 的鉴权三件套（required=true）与 header 的 content-type 由 CLI 自填、不用你传；path 参数只出现在不可主动调用的接口上。'
+        'params[].type': '参数类型（string/integer/array/object/boolean/number）。⚠️ 只有该接口 `body_kind=json`、'
+          + '`in=body` 且本次传入的字段会被 api call 比对：类型不符是软告警（integer 要求整数，1.5 也判不符），'
+          + '--strict 下升级为拒绝；非 body 参数与非 json body_kind 都不做类型校验',
+        'params[].required': '上游文档声明必填。⚠️ 本 CLI 只对 **`body_kind=json` 且 `in=body`** 的必填做校验：'
+          + '缺了拒绝（退出码 2；--no-validate 时不校验）。非 json bodyKind（xml/multipart/text/form）**不做任何必填检查**，'
+          + '缺字段照样发出。'
+          + 'query 的鉴权三件套（required=true）与 header 的 content-type 由 CLI 自填、不用你传 —— '
+          + '⚠️ 这只对 callable 且 `auth=checksum` 的接口成立；入站接口的 required=true 鉴权字段没有任何自动填充，'
+          + '本 CLI 也没有它们的传参通道。path 参数只出现在不可主动调用的接口上。'
           + '⚠️ false 有两种含义：普通可选；或它在某个 one_of 组里（组内任一存在即可，不是「可省」）—— 看 one_of 判断',
         'params[].name': '参数名。⚠️ 只有 `in=body` 的字段能作为 `--body` 的键传入：'
           + 'in=query 的鉴权三件套由 CLI 自填，in=path 只出现在不可主动调用的接口上，in=header 由 CLI 固定发送 —— 本 CLI 没有这三者的传参通道',
