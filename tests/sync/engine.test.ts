@@ -137,6 +137,8 @@ describe('红线 2：配对核对', () => {
     expect(r.windows.failed).toBe(1)
     expect(r.windows.succeeded).toBe(1)
     expect(r.gaps.filter((g) => g.reason === 'fetch_failed').length).toBe(1)
+    // fetch_failed 窗没有「应写行数」→ 不计入 written（图例里这句话的出处）。
+    expect(r.rows, 'fetch_failed 失败窗不得把行计入 written').toEqual({ fetched: 1, written: 1 })
     // 关键是这一条：没有任何「重切/降宽」的行为痕迹——fetch 恰好多调一次而已。
     expect(r.status).toBe('partial')
     await store.close()

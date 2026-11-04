@@ -70,8 +70,8 @@ export const RUN_STATUS_NOTES = {
   partial: '至少一个窗口失败。⚠️ 它也覆盖「一行都没落」的全窗失败（succeeded=0）——'
     + '不要按这个字面判断结果。两个字段分开读：windows.succeeded = 成功窗数'
     + '（空窗也算成功，所以它大于 0 不代表有行）。rows.written = 写入行数'
-    + '（成功窗记实际写入，失败窗记「应写行数」、已随事务回滚 —— 有失败窗时它偏大。'
-    + '为 0 也可能是「窗口都成功、只是上游没数据」）',
+    + '（成功窗记实际写入，count_mismatch / write_failed 的失败窗记「应写行数」、已随事务回滚 '
+    + '—— 这两类失败窗存在时它偏大。fetch_failed / rate_limit_local 的失败窗没有应写行数，不计入）',
   failed: '快照任务的失败路径（快照没有窗口循环，所以不会出现 partial）：本地限频闸门拦截、'
     + '上游取数失败、落库失败或行数核对不符。windowed 任务不会给出 failed —— 全窗失败也是'
     + ' partial（见上一条）',
@@ -141,9 +141,10 @@ export function runFieldNotes(): Record<string, string> {
     // count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」（kept），
     // 那批行已随事务回滚、实际没落库（sync/engine.ts 的 catch 分支与 brief 钉死用例）。
     'tasks[].rows.fetched': '本轮从上游取回的行数（enrich 过滤之前）。与 written 不等通常说明有行被本地决策淘汰；'
-      + '失败窗也会把「应写行数」计入 written（见该字段），判断前先看 windows.failed',
+      + 'count_mismatch / write_failed 的失败窗也会把「应写行数」计入 written（见该字段），判断前先看 windows.failed',
     'tasks[].rows.written': '本轮写入的行数。⚠️ 记法：成功窗记实际写入；count_mismatch / write_failed 的失败窗记'
-      + '「参与核对的应写行数」—— 那批行已随事务回滚、实际没落库（有失败窗时它偏大）。'
+      + '「参与核对的应写行数」—— 那批行已随事务回滚、实际没落库（这两类失败窗存在时它偏大；'
+      + 'fetch_failed / rate_limit_local 的失败窗没有应写行数，不计入）。'
       + '为 0 可能是「窗口都成功、只是上游没数据」',
     'tasks[].notes': '本任务的逐条说明（恒在、可为空数组）。当前唯一生产者是「请求区间早于接口下界」——'
       + '把「区间不可得」与「同步故障」分开，看到它不代表本轮失败',
