@@ -203,6 +203,10 @@ describe('params[].in 图例与「本 CLI 只有 body 通道」的注册表不�
     expect(n.warnings).toContain('永远不会出现在这里')
     expect(n.not_found, 'message 载体（形状 C / 宽松模式）必须写进判据').toContain('message 能解析成 JSON')
     expect(n.not_found, '宽松模式不区分是否已实测').toContain('宽松模式')
+    // 形状 C 的「无 message」在 normalize 里是失败（C 分支先解析 message、走不到末尾兜底），
+    // 不能被列进「整条 200 无载荷键 → not_found」的接口族。
+    expect(n.not_found, 'C 不得出现在末尾兜底的接口族里').toContain('形状 C 不在此列')
+    expect(n.not_found).not.toContain('A/B/C/D-nf')
     vi.unstubAllGlobals()
   })
 

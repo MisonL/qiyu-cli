@@ -158,7 +158,8 @@
     错误信封），永远不进 warnings。示例改为 `unknown_field` / `type_mismatch` /
     `alias_normalized`，并显式声明它不会出现。
   · **`not_found` 图例漏掉 message 载体与宽松模式**：形状 C 或 envelope 未登记时，
-    message 能解析成 JSON 且解析结果为空同样置位。判据按实现写全。
+    message 能解析成 JSON 且解析结果为空同样置位。判据按实现写全（形状 C 的「无
+    message」是失败、走不到末尾兜底，故不在「整条 200 无载荷键」的接口族里）。
 
   守卫同步加硬：`specs.json` 与 `overrides` 表的一致性（生成物不得陈旧于事实源）、
   生成器必须产出 export 参数表、信封矩阵覆盖 M、export 集成用例断言 key/链接不再丢、

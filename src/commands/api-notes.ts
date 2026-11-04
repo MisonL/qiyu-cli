@@ -34,7 +34,10 @@ export function callFieldNotes(): Record<string, string> {
       + 'data / result 形状下是 {} / []。形状 C 且 message 能解析成 JSON 时，'
       + '解析出的 {} / [] 同样置位（message 缺失或解析失败是失败，不是 not_found）。'
       + 'envelope 未登记的宽松模式下，message 能解析成 JSON 且结果为空同样置位。'
-      + '整条 200 响应没有载荷键时，只有信封已实测且不是 D 族（A/B/C/D-nf）的接口判为查无此物'
+      + '整条 200 响应没有载荷键时，只有信封已实测且不是 D 族（A/B/D-nf）的接口判为查无此物'
+      // ⚠️ 形状 C **不在**这个列表里：C 分支对任何响应都会先尝试解析 message，
+      // `{code:200}`（无 message）在 C 上直接判失败，根本走不到末尾兜底。
+      + '（形状 C 不在此列：它的无 message 是失败，不是查无此物）'
       + '（envelope 为 null 不在此断言。形状 M 的空 message 判失败，不判 not_found）。'
       + 'staffInfo 形状恒不置位。'
       + '⚠️ 只覆盖结构性为空：业务为空（如 ticket.search 查到 0 条返回 {total:0,tickets:[]}）'
