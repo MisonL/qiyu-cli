@@ -122,6 +122,43 @@
 
 ### 修复
 
+- **#63 新增图例的自查修正：params 的「通道」谎言、recorded_at 形态说反、rows.written 记法（2026-11-04）**：
+
+  PR #63 补齐反向图例覆盖后，我逐条把**每条新图例当成事实断言**回到实现里核对，发现
+  七处与实现不符 —— 全是「图例写得像真的、代码不是这么干的」：
+
+  · **`params[].in` 声称了不存在的传参通道（最重）**：初版写「`path` = 进路径占位符、
+    `header` = 进请求头」，读起来像调用方有四个通道；而 `api call` 的 URL 是
+    `${BASE}${spec.path}?${q}`（**不做**占位符替换），headers 只有硬编码的
+    `Content-Type`。这正是本仓库在 `http.ts` 自己警告过的「不要写到不存在的通道上」。
+    实际只有 `in=body` 能经 `--body` 传；query 鉴权三件套由 CLI 自填；非鉴权 query 与
+    path 参数只出现在不可主动调用的接口上；header 只有 content-type、由 CLI 固定发送。
+    `params[].type` / `params[].required` / `params[].name` / `params[].example` 同步把
+    强制范围收窄到 body 参数（`validateBody` 只校验 `in=body`，此前写成了普适承诺）。
+    CodeRabbit 首轮又抓到一处同类收窄：初版结尾写「不要把非 body 参数塞进 --body
+    （会得到 unknown_field 提示）」——该提示只在接口有 JSON body 参数表且未加
+    `--no-validate` 时产生，其余情形会被原样发出，已限定条件。
+  · **`sync status` 的 `gaps[].recorded_at` 形态说反**：初版写「epoch 毫秒数」，
+    实际落库值是 `new Date(...).toISOString()`（实测 `"2026-11-04T02:29:50.268Z"`，
+    ISO 8601 UTC 字符串）—— 反倒是同条目的 `range` 才是 epoch 毫秒字符串。
+    初版的守卫还只查「图例含『毫秒』二字」，等于把错误说法钉住了；现改为**双向**：
+    数据必须匹配 ISO 形态 + 图例必须写 ISO + 旧说法不得复活。
+  · **`sync run` 的 `rows.written` 不是「真正落库的行数」**：引擎对 `count_mismatch` /
+    `write_failed` 的失败窗记的是「参与核对的应写行数」（已随事务回滚，见
+    `sync/engine.ts` 的 catch 分支与 brief 钉死用例）—— 图例说成恒为实际落库会把回滚掉的
+    行当成已入库。`tasks[].status` 的 partial 释义里有同一句错话，两处一起改
+    （单一计数在空态与非空路径各写一遍的老形态）。
+  · **`sync tasks` 的 `maxWindowDays` 声称了不存在的逻辑**：初版说「撞上游 14501 时也按它
+    判断是不是切宽了」—— 引擎没有这段逻辑，14501 走与普通取数失败同一条
+    `fetch_failed` gap 路径。新增引擎用例真跑钉住：首窗 14501 → 该窗失败记 gap、
+    不自动重切、其余窗照跑。
+
+  守卫同步加硬：`api-legend-paths` 新增注册表不变量（可主动调用接口的非 body 参数只能是
+  鉴权 query 三件套或 content-type；path 参数只出现在不可调用接口上）——谁破坏了它，
+  「非 body 参数没有人工通道」这句图例就不再为真。变异 4 处全红（旧 `in` 措辞、旧
+  `recorded_at` 说法、`rows.written` 说法、14501 行为）。全量 **2326** 用例 2 分片通过
+  （片 1 1136 + 片 2 1190；此前记录的「1189」只是**片 2 的用例数**，误当成全量）。
+
 - **反向图例覆盖：18 个带图例的命令补齐「输出 ⊆ 图例 ∪ 自明键」，下沉到元素层（HANDOFF #38 挂账，2026-11-04）**：
 
   此前全仓图例守卫（`command-legends-complete` / `api-legend-paths` / `stats-field-notes`）

@@ -112,6 +112,37 @@ describe('红线 2：配对核对', () => {
     expect(r.gaps).toEqual([])
     await store.close()
   })
+
+  // 自查（2026-11-04）：`sync tasks` 的 maxWindowDays 图例一度写成「撞上游 14501 时
+  // 也按它判断是不是切宽了」—— 引擎里没有这段逻辑，14501 走的是与普通取数失败同一条
+  // `fetch_failed` gap 路径（`withRetries` 后仍抛 → catch → failed++）。图例已改为
+  // 如实描述；本用例钉住这个行为，图例将来若再声称「自动重切」就会与它矛盾。
+  it('上游 14501（窗口过宽）不会自动重切：记 fetch_failed gap、该窗失败，其余窗照跑', async () => {
+    const store = await fresh()
+    let calls = 0
+    const err = Object.assign(new Error('14501 endTime is invalid'), {
+      code: 'window_too_large', kind: 'window_too_large', retryable: false,
+    })
+    const t = fakeTask({
+      maxWindowDays: 1, // 2 天区间 → 2 个 1 天窗
+      fetch: async () => {
+        calls++
+        if (calls === 1) throw err
+        return { rows: [{ id: 'ok', name: 'O', color: '#444444' }], apiCount: 1 }
+      },
+    })
+    // 两个窗：首窗 14501、次窗成功。
+    const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 2 * DAY } }))
+    expect(r.windows.total).toBe(2)
+    expect(r.windows.failed).toBe(1)
+    expect(r.windows.succeeded).toBe(1)
+    expect(r.gaps.filter((g) => g.reason === 'fetch_failed').length).toBe(1)
+    // fetch_failed 窗没有「应写行数」→ 不计入 written（图例里这句话的出处）。
+    expect(r.rows, 'fetch_failed 失败窗不得把行计入 written').toEqual({ fetched: 1, written: 1 })
+    // 关键是这一条：没有任何「重切/降宽」的行为痕迹——fetch 恰好多调一次而已。
+    expect(r.status).toBe('partial')
+    await store.close()
+  })
 })
 
 describe('假空重试（spec 5.2）', () => {

@@ -314,7 +314,15 @@ describe('两个 data 形状特殊、需生产构造函数或预置数据才有�
       expect(Object.keys(notes2).some((n) => n === `tasks[].gaps[].${k}`),
         `sync status 缺口元素键 gaps[].${k} 没有释义`).toBe(true)
     }
-    expect(notes2['tasks[].gaps[].recorded_at'], 'recorded_at 必须点明是落库时的 epoch 毫秒').toContain('毫秒')
+    // ⚠️ recorded_at 的**真实形态**是 `new Date(...).toISOString()`（sync/state.ts 的
+    // recordGap）—— ISO 8601 UTC `Z` 字符串，不是 epoch 毫秒数（2026-11-04 自查：
+    // 初版图例与这里的断言都把形态说反了，测试只查「含毫秒」等于钉住了错误说法）。
+    // 两个方向都钉：数据是 ISO 形态 + 图例这么写、且旧的错误说法不得复活。
+    expect(g.recorded_at, 'recorded_at 是落库时刻的 ISO 字符串')
+      .toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+    expect(notes2['tasks[].gaps[].recorded_at'], '图例必须点明 ISO 8601 UTC 形态').toContain('ISO 8601')
+    expect(notes2['tasks[].gaps[].recorded_at'], '旧错误说法（epoch 毫秒数）不得复活')
+      .not.toContain('epoch 毫秒数')
   })
 
   it('sync install：四个形态各自只解释该形态真实存在的键（含 commands 元素）', async () => {
