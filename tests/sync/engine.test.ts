@@ -597,6 +597,27 @@ describe('snapshot 任务', () => {
     expect(r2.rows).toEqual({ fetched: 1, written: 1 })
     await store.close()
   })
+
+  it('apiCount 是配对核对基准（与 windowed / verify 同一口径）：声明多于实际 → count_mismatch', async () => {
+    // ⚠️ 此前快照只用 kept.length，apiCount 被静默忽略 —— 三条路径对同一字段三种读法，
+    // 上游声明 5 行而解析出 2 行时，只有快照不会报不符（其余两条都会）。
+    const store = await fresh()
+    const t = fakeTask({
+      kind: 'snapshot',
+      fetch: async () => ({
+        rows: [{ id: '1', name: 'A', color: '#111111' }, { id: '2', name: 'B', color: '#222222' }],
+        apiCount: 5,
+      }),
+    })
+    const r = await runTask(t, ctx(store))
+    expect(r.status).toBe('failed')
+    expect(r.rows).toEqual({ fetched: 2, written: 0 })
+    const gaps = await listGaps(store, t.id)
+    expect(gaps.map((g) => g.reason)).toEqual(['count_mismatch'])
+    // 失败窗整体回滚：表里不留任何行
+    expect(await store.count('tags')).toBe(0)
+    await store.close()
+  })
 })
 
 describe('快照 gap 清除与计数（C 高-1 / E 高-2）', () => {

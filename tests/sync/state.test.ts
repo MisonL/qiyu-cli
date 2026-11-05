@@ -113,13 +113,21 @@ describe('sync/state —— 水位与缺口', () => {
     await store.close()
   })
 
-  it('gap 记录/清除往返（同 range_start 幂等覆盖）', async () => {
+  it('gap 记录/清除往返：同 (起点, reason) 幂等覆盖、不同 reason 并存、clear 按起点清全部', async () => {
     const store = await fresh()
     await store.transaction(async (tx) => {
       await recordGap(tx, 't', 'a', 'b', 'count_mismatch', 'fetched 3 written 2')
+      // 同一 (dataset, range_start, reason) 再写一次 → 覆盖（range_end/detail 以最新为准）
+      await recordGap(tx, 't', 'a', 'b2', 'count_mismatch', 'fetched 4 written 3')
+      // ⚠️ v10 起 reason 进主键：同一窗的**不同原因**必须并存 —— 否则消费方按 reason
+      // 分支时永远漏一类（此前这里断言 length 1，钉的是「互相覆盖」的旧契约）。
       await recordGap(tx, 't', 'a', 'b2', 'window_too_large', 'x')
     })
-    expect((await listGaps(store, 't')).length).toBe(1) // 同主键覆盖
+    const gaps = await listGaps(store, 't')
+    expect(gaps.length).toBe(2)
+    expect(gaps.map((g) => g.reason).sort()).toEqual(['count_mismatch', 'window_too_large'])
+    expect(gaps.find((g) => g.reason === 'count_mismatch')!.detail).toBe('fetched 4 written 3')
+    // clearGap 按 (dataset, range_start) 清 —— 成功重跑时该窗的全部提示一并清掉
     await store.transaction(async (tx) => { await clearGap(tx, 't', 'a') })
     expect((await listGaps(store, 't')).length).toBe(0)
     await store.close()

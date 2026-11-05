@@ -1432,6 +1432,46 @@ describe('sync uninstall', () => {
     expect((data().removed as string[])).toEqual([])
     expect(runMock).not.toHaveBeenCalled()
   })
+
+  it('linux：先 disable --now 停定时器，再删两个 unit 文件，最后 daemon-reload', async () => {
+    __setPlatform(() => 'linux')
+    const svc = join(dir, '.config', 'systemd', 'user', 'qiyu-sync.service')
+    const tmr = join(dir, '.config', 'systemd', 'user', 'qiyu-sync.timer')
+    mkdirSync(dirname(svc), { recursive: true })
+    writeFileSync(svc, '[Unit]')
+    writeFileSync(tmr, '[Timer]')
+    // 记录每条外部命令执行时「unit 文件是否还在」：disable 时必须在（要停的是它），
+    // daemon-reload 时必须在删完之后（否则 reload 的仍是即将消失的 unit，等于白跑）。
+    const seen: Array<{ cmd: string[]; svcExists: boolean }> = []
+    const run = vi.fn((argv: string[]) => { seen.push({ cmd: argv, svcExists: existsSync(svc) }) })
+    __setRun(run)
+    const code = await syncCommand(['uninstall', '--yes'])
+    expect(code).toBe(0)
+    expect(seen.map((s) => s.cmd)).toEqual([
+      ['systemctl', '--user', 'disable', '--now', 'qiyu-sync.timer'],
+      ['systemctl', '--user', 'daemon-reload'],
+    ])
+    expect(seen[0]!.svcExists, 'disable 执行时 unit 文件必须还在').toBe(true)
+    expect(seen[1]!.svcExists, 'daemon-reload 必须在删除之后（此时文件应已不存在）').toBe(false)
+    expect(existsSync(svc)).toBe(false)
+    expect(existsSync(tmr)).toBe(false)
+    expect((data().removed as string[]).sort()).toEqual([svc, tmr].sort())
+  })
+
+  it('linux dry-run：post_remove_commands 出现在计划里（否则 Agent 无从知道 reload 在删之后）', async () => {
+    __setPlatform(() => 'linux')
+    mkdirSync(join(dir, '.config', 'systemd', 'user'), { recursive: true })
+    expect(await syncCommand(['uninstall'])).toBe(0)
+    const d = data()
+    expect(d.post_remove_commands).toEqual([
+      { command: 'systemctl --user daemon-reload', executed: false, ok: null, error: null },
+    ])
+    // 条件键：darwin 没有这一档
+    __setPlatform(() => 'darwin')
+    out = ''   // 同一用例内第二次调用前清空 stdout（多次 run 会追加）
+    expect(await syncCommand(['uninstall'])).toBe(0)
+    expect('post_remove_commands' in data()).toBe(false)
+  })
 })
 
 // ————————————————————————————————————————————————————————————————
