@@ -384,10 +384,21 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // `SELECT userPhone, COUNT(*) … GROUP BY userPhone` 对 3 个不同手机号输出 3 行同一个
   // `138****1111`、每行 count=1 —— Agent 会读成「只有 1 个手机号」或「数据坏了」，而
   // 输出里没有任何提示。`--table --group-by` 直接拒绝敏感列正是为了这个，`--sql` 只能声明。
+  //
+  // ⚠️ 触发条件不能只看 `matchedSensitive`（= 输出列名命中）：`SELECT userPhone AS p,
+  // COUNT(*) … GROUP BY p` 的输出列叫 `p`，脱敏走的仍是列名级（列名 `p` 不敏感 →
+  // 实际走值级，手机号照常被打码），但 `p` 不在 matchedSensitive 里，于是**分组失真
+  // 一条警告都没有**（2026-11-05 审查实测）。判据改为「SQL 文本按词边界引用了敏感列
+  // **或**输出列名命中」—— 与下面缺口警告同一来源的 `referencedSensitive`。
+  // 大小写不敏感是有意的（DuckDB 标识符不分大小写，`username AS n` 同样漏）。
+  const referencedSensitive = sensitiveNames
+    .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(mode.sql))
+  const referencesSensitive = referencedSensitive.length > 0
+  const groupedSensitive = new Set([...matchedSensitive, ...referencedSensitive])
   const grouped = /\bGROUP\s+BY\b|\bDISTINCT\b/i.test(mode.sql)
-  if (grouped && matchedSensitive.size > 0) {
+  if (grouped && groupedSensitive.size > 0) {
     warnings.push(
-      `SQL 对脱敏列做了 GROUP BY / DISTINCT（${[...matchedSensitive].join('、')}）：`
+      `SQL 对脱敏列做了 GROUP BY / DISTINCT（${[...groupedSensitive].join('、')}）：`
       + '不同原值会映射成同一个脱敏值，分组结果与计数可能失真。'
       + '需要准确分组请用 `--no-mask`（并自行承担 PII 风险），或改用不敏感列分组')
   }
@@ -399,7 +410,6 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // ⚠️ 只在 SQL **完全没有引用任何敏感列**时提示：`SELECT userPhone AS p` 的 p 也是
   // 「非敏感列名」，但它显然来自敏感列，上面已有缺口警告，再报一条就是噪音。
   // payload 同理（它有自己的缺口警告，且刻意不在 sensitiveNames 里）。
-  const referencesSensitive = sensitiveNames.some((n) => new RegExp(`\\b${n}\\b`, 'i').test(mode.sql))
   const falsePositive = referencesSensitive
     ? []
     : [...changed].filter((n) =>

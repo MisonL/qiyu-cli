@@ -152,6 +152,19 @@ describe('图例本身：键集、形态与「不撒谎」的措辞', () => {
     expect(n.resolved_range, 'resolved_range 是过滤边界不是数据范围').toContain('过滤边界')
   })
 
+  it('mask_warnings 图例必须覆盖该键的**全部**实际来源（缺口 + 分析副作用），且声明不穷举', () => {
+    // 2026-11-05 审查：图例只列了「没脱敏的敏感数据」三类，而该键实际还装
+    // GROUP BY/DISTINCT 压平、query()/query_table()/COLUMNS() 嵌套、非敏感列按值形态被误改
+    // —— Agent 照图例理解，会把这三类警告当成别的含义。
+    const v = queryFieldNotes().mask_warnings
+    expect(v, '必须声明列表不穷举').toContain('包括但不限于')
+    expect(v, '必须点明 GROUP BY / DISTINCT 会压平分组与计数').toContain('GROUP BY / DISTINCT')
+    expect(v, '必须点明嵌套 SQL 构造').toContain('query()/query_table()/COLUMNS()')
+    expect(v, '必须点明值形态误改').toContain('按值形态')
+    expect(v, '必须保留三类缺口来源').toContain('表定义之外的列')
+    expect(v).toContain('payload 里的 JSON 内 PII')
+  })
+
   it('README 与 skill 正文同步（人读版与 stdout 图例不得互相矛盾）', () => {
     const md = read('README.md')
     expect(md, 'README 必须点明 data_coverage 看不见内部缺口').toContain('看不见内部缺口')

@@ -11,8 +11,10 @@
   `--limit` 或缩小时间窗口重查，不要拿样本当全量。
 - `warnings`：非空必须逐条读。它们点名「窗口内部有缺口」「区间天数不足」这类**静默失败**；
   忽略 warnings 的 Agent 会把残缺数据当事实汇报。
-- `masked` / `masked_columns` / `mask_warnings`：输出默认脱敏；`mask_warnings` 非空说明
-  脱敏可能不完整，含敏感列的结论要额外小心。两个**字面陷阱**：`masked: true` 只表示
+- `masked` / `masked_columns` / `mask_warnings`：输出默认脱敏；`mask_warnings` 非空时**逐条读**——
+  它装两类事：**脱敏缺口**（敏感值没被打码）与**脱敏对结果的副作用**（`GROUP BY`/`DISTINCT`
+  把不同原值压成同一个脱敏值，分组与计数会失真，别名分组也照样报警；非敏感列按手机号形态
+  被误改）。含敏感列的结论要额外小心。两个**字面陷阱**：`masked: true` 只表示
   脱敏开关开着，**不代表有值被改写**（那看 `masked_columns`，为空是常态）；`--no-mask`
   时 `mask_warnings` **恒为空**——空不等于脱敏完整，那是「根本没脱敏」，风险警告在
   `warnings` 里。

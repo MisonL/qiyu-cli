@@ -529,6 +529,49 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).toContain('分组结果与计数可能失真')
   })
 
+  it('GROUP BY 的是**别名列** → 分组失真警告照发（输出列名不再叫 userPhone）', () => {
+    // 2026-11-05 审查实测：`SELECT userPhone AS p, COUNT(*) … GROUP BY p` 的输出列叫 `p`，
+    // matchedSensitive 为空 → 旧判据只发「别名缺口」一条，分组把不同号码压成同一行这件事
+    // 一个字都不提。Agent 会拿 `n` 当真。
+    const out = maskQueryRows({
+      rows: [
+        { p: '13800001111', n: 1 },
+        { p: '13899991111', n: 1 },
+        { p: '13812341111', n: 1 },
+      ],
+      columns: ['p', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone AS p, COUNT(*) AS n FROM sessions GROUP BY p',
+        tables: TABLES,
+      },
+    })
+    expect(new Set(out.rows.map((r) => r.p)).size).toBe(1)   // 确实被压平
+    const w = out.warnings.join('\n')
+    expect(w).toContain('GROUP BY / DISTINCT')
+    expect(w, '警告里要点名的是 SQL 引用的敏感列').toContain('userPhone')
+    // 大小写不敏感：DuckDB 标识符不分大小写（`username AS n` 同样漏出）
+    const lower = maskQueryRows({
+      rows: [{ n: 2 }],
+      columns: ['n'],
+      mode: { kind: 'sql', sql: 'SELECT username AS n, COUNT(*) AS c FROM sessions GROUP BY n', tables: TABLES },
+    })
+    expect(lower.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('反证：GROUP BY 完全不碰敏感列时不得发出分组失真警告（避免噪音淹没真警告）', () => {
+    const out = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 7 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT session_type, COUNT(*) AS n FROM sessions GROUP BY session_type',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
   it('值级兜底命中非敏感列 → 警告「可能是业务数字被误改」（11 位订单号）', () => {
     const out = maskQueryRows({
       rows: [{ order_id: '13800138000' }],
