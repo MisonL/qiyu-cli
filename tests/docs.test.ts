@@ -964,59 +964,92 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
  * 判据只覆盖标题形如「…的<数字>处契约修正…」的条目：这类条目的约定就是「一条一 bullet」。
  * 其它条目（如「另外两个载体 + 一处文案分档」）的 N 指代子集，不能套用 —— 如实记录边界。
  */
+/**
+ * 中文数词 → 整数（支持「十/百」的组合，如 十三 / 二十 / 二十一 / 一百零五）。
+ *
+ * ⚠️ 不能用枚举表（Codex PR #68 第八轮 P3）：表写到「二十」就停，将来出现
+ * 「二十一处契约修正」时查表得到 `undefined`，即使 bullet 数刚好对上也红。
+ */
+const CN_DIGITS: Record<string, number> = {
+  零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+}
+function cnNumber(raw: string): number {
+  if (/^\d+$/.test(raw)) return Number(raw)
+  let total = 0
+  let cur = 0
+  for (const ch of raw) {
+    if (ch === '十' || ch === '百') {
+      const unit = ch === '十' ? 10 : 100
+      total += (cur === 0 ? 1 : cur) * unit
+      cur = 0
+      continue
+    }
+    const d = CN_DIGITS[ch]
+    if (d === undefined) return Number.NaN
+    cur = d
+  }
+  return total + cur
+}
+
+/**
+ * 扫描 CHANGELOG 里「…的<N>处契约修正…」条目，返回「声明数 ≠ bullet 数」的描述。
+ *
+ * ⚠️ 标题里的**字符类**必须与 `cnNumber` 支持的范围一致（Codex PR #68 第九轮 P2）：
+ * 只写 `[一二三四五六七八九十]+` 时，「一百零五处契约修正」会从「五」开始匹配、
+ * 被当成 5 —— 守卫按错误的小数字比对，反而更危险（它自称守住了这一批）。
+ */
+function changelogCountMismatches(md: string): { bad: string[]; checked: number; badTitle: string[] } {
+  const lines = md.split('\n')
+  const bad: string[] = []
+  const badTitle: string[] = []
+  let checked = 0
+  for (let i = 0; i < lines.length; i++) {
+    const head = /^- \*\*(.+?)\*\*/.exec(lines[i]!)
+    if (head === null) continue
+    const declared = /([零一二三四五六七八九十百]+|\d+)\s*处契约修正/.exec(head[1]!)
+    if (declared === null) continue
+    const n = cnNumber(declared[1]!)
+    if (Number.isNaN(n)) badTitle.push(head[1]!)
+    let bullets = 0
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j]!
+      if (l.startsWith('- ') || l.startsWith('## ') || l.startsWith('### ')) break
+      if (l.startsWith('  · ')) bullets++
+    }
+    checked++
+    if (!Number.isNaN(n) && n !== bullets) {
+      bad.push(`${head[1]!.slice(0, 40)}… 声明 ${n} / 实际 ${bullets}`)
+    }
+  }
+  return { bad, checked, badTitle }
+}
+
 describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () => {
-  /**
-   * 中文数词 → 整数（支持「十/百」的组合，如 十三 / 二十 / 二十一 / 一百零五）。
-   *
-   * ⚠️ 不能用枚举表（Codex PR #68 第八轮 P3）：表写到「二十」就停，将来出现
-   * 「二十一处契约修正」时 `CN['二十一']` 是 `undefined`，即使 bullet 数刚好对上也
-   * 会让守卫红 —— 守卫变成阻断合法更新的噪音，而它本该只在计数真的不一致时红。
-   */
-  const cnDigits: Record<string, number> = {
-    零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
-  }
-  const cnNumber = (raw: string): number => {
-    if (/^\d+$/.test(raw)) return Number(raw)
-    let total = 0
-    let cur = 0
-    for (const ch of raw) {
-      if (ch === '十' || ch === '百') {
-        const unit = ch === '十' ? 10 : 100
-        total += (cur === 0 ? 1 : cur) * unit
-        cur = 0
-        continue
-      }
-      const d = cnDigits[ch]
-      if (d === undefined) return Number.NaN
-      cur = d
-    }
-    return total + cur
-  }
   it('「N 处契约修正」批的 bullet 数 == 标题里的 N', () => {
-    const lines = read('CHANGELOG.md').split('\n')
-    const bad: string[] = []
-    let checked = 0
-    for (let i = 0; i < lines.length; i++) {
-      const head = /^- \*\*(.+?)\*\*/.exec(lines[i]!)
-      if (head === null) continue
-      const declared = /([一二三四五六七八九十]+|\d+)\s*处契约修正/.exec(head[1]!)
-      if (declared === null) continue
-      const raw = declared[1]!
-      const n = cnNumber(raw)
-      expect(Number.isNaN(n), `标题里的数词解析不了：${head[1]!.slice(0, 40)}…`).toBe(false)
-      let bullets = 0
-      for (let j = i + 1; j < lines.length; j++) {
-        const l = lines[j]!
-        if (l.startsWith('- ') || l.startsWith('## ') || l.startsWith('### ')) break
-        if (l.startsWith('  · ')) bullets++
-      }
-      checked++
-      if (n !== bullets) bad.push(`${head[1]!.slice(0, 40)}… 声明 ${n} / 实际 ${bullets}`)
-    }
-    // 解析器自检：枚举表写不全时（如只到「二十」）这里先红，而不是等到将来某批条目
-    expect([cnNumber('九'), cnNumber('十三'), cnNumber('二十'), cnNumber('二十一'),
-      cnNumber('一百零五'), cnNumber('21')]).toEqual([9, 13, 20, 21, 105, 21])
+    const { bad, checked, badTitle } = changelogCountMismatches(read('CHANGELOG.md'))
+    expect(badTitle, '标题里的数词解析不了').toEqual([])
     expect(checked, '一个「N 处契约修正」条目都没找到 = 守卫空转').toBeGreaterThan(0)
     expect(bad).toEqual([])
+  })
+
+  it('反例集：扫描路径按标题里的**完整**数词校验（一百零五不能被截成五）', () => {
+    // 解析器自检
+    expect([cnNumber('九'), cnNumber('十三'), cnNumber('二十'), cnNumber('二十一'),
+      cnNumber('一百零五'), cnNumber('21')]).toEqual([9, 13, 20, 21, 105, 21])
+    // 扫描路径自检：必须从**整串**数词取值，而不是从中间的「五」
+    const block = (n: number): string => '- **某某的一百零五处契约修正**：\n'
+      + Array.from({ length: n }, () => '  · x\n').join('')
+    expect(changelogCountMismatches(block(105)).bad, '105 条应对上').toEqual([])
+    // 最小反例：只有 5 条时，若标题被截成「五」就恰好相等而**漏报** —— 这里必须报
+    expect(changelogCountMismatches(block(5)).bad).toEqual([
+      expect.stringContaining('声明 105 / 实际 5'),
+    ])
+    // 同理覆盖「二十一」「二十」这类两位数
+    const block21 = (n: number): string => '- **某某的二十一处契约修正**：\n'
+      + Array.from({ length: n }, () => '  · y\n').join('')
+    expect(changelogCountMismatches(block21(21)).bad).toEqual([])
+    expect(changelogCountMismatches(block21(2)).bad).toEqual([
+      expect.stringContaining('声明 21 / 实际 2'),
+    ])
   })
 })
