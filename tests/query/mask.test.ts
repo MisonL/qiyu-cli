@@ -850,6 +850,33 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
   })
 
+  it('`DISTINCT ON (非敏感列)` 投影敏感列 → 不报警；`DISTINCT ON (敏感列)` → 报警（Codex 2026-11-05 第五轮核实）', () => {
+    // 去重键是 ON (...) 里的列，不是整张选择列表 —— 正则在 execTopLevel 改写后必须仍保留
+    // 捕获组（`distinct[1]`），否则会把整个投影当去重键、对 `DISTINCT ON (session_type)` 误报。
+    // 实测 DuckDB：`SELECT DISTINCT ON (session_type) userPhone …` 按 session_type 去重，
+    // 每个会话类型只留一行，手机号本身并不参与去重。
+    const byType = maskQueryRows({
+      rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+      columns: ['userPhone', 'session_type'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT DISTINCT ON (session_type) userPhone FROM sessions ORDER BY session_type',
+        tables: TABLES,
+      },
+    })
+    expect(byType.warnings.join('\n'), '去重键是 session_type').not.toContain('GROUP BY / DISTINCT')
+    const byPhone = maskQueryRows({
+      rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+      columns: ['userPhone', 'session_type'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT DISTINCT ON (userPhone) userPhone, session_type FROM sessions ORDER BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(byPhone.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
   it('反证：子查询里的 DISTINCT 不是本层的去重 → 不报警（DISTINCT 判据同样按作用域）', () => {
     // 外层只是把子查询的原值行投影出来，脱敏不合并行；把内层 DISTINCT 当成外层去重
     // 会对外层投影的敏感列谎报「分组失真」（2026-11-05 第四轮自查，同族缺陷）。
