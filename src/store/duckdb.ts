@@ -102,10 +102,15 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       conn = r.conn; inst = r.inst
     } catch (e) {
       if (isLockError(e)) {
-        const err = new Error(`数据库被写进程占用：${cfg.path}`)
+        // ⚠️ 写者撞锁时**持有者不一定是写进程**（2026-11-05 审查实测）：DuckDB 是
+        // 「写者独占 / 读者共享」——一个以 READ_ONLY 打开的进程同样会挡住写者。
+        // 旧文案「数据库被写进程占用 / 另一个进程持有写锁」把只读持有者说成了写者，
+        // Agent 会按错误的原因去等一个并不存在的同步任务。持有者身份不在这条错误里
+        // 猜测，只如实说「被其他进程占用」并给出可执行的排查动作。
+        const err = new Error(`数据库被其他进程占用：${cfg.path}`)
         ;(err as { kind?: string }).kind = 'store_locked'
         ;(err as { retryable?: boolean }).retryable = true
-        ;(err as { hint?: string }).hint = '另一个进程持有数据库写锁。请等该进程退出后重试'
+        ;(err as { hint?: string }).hint = '另一个进程正持有该数据库写锁（持有者不一定是写进程：只读会话同样会挡住写者）。请等它退出后重试；可用 lsof 该库文件查看持库进程'
         throw err
       }
       throw e
