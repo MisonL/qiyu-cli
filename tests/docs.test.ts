@@ -1013,15 +1013,21 @@ function changelogCountMismatches(md: string): {
   let checked = 0
   let entries = 0
   for (let i = 0; i < lines.length; i++) {
-    const head = /^- \*\*(.+?)\*\*/.exec(lines[i]!)
-    if (head === null) continue
-    if (!head[1]!.includes('处契约修正')) continue
+    // ⚠️ 条目按**顶层列表项**识别，不是按「粗体标题」（Codex PR #68 第十二轮 P2）：
+    // 以 `^\*\*` 为门槛时，标题一旦少个 `**`，这条就被静默跳过 —— `entries` 与
+    // `checked` 同步漏掉它，`entries === checked` 反而成立。
+    const item = /^- (.*)$/.exec(lines[i]!)
+    if (item === null) continue
+    const itemText = item[1]!
+    if (!itemText.includes('处契约修正')) continue
     entries++
+    // 标题文本优先取粗体内部；没有粗体就用整行 —— 只影响取词位置，不影响「被统计到」。
+    const title = /^\*\*(.+?)\*\*/.exec(itemText)?.[1] ?? itemText
     // 数词取「的」与「处契约修正」之间不含空白的整段：`的十三处契约修正` → `十三`
-    const declared = /的([^\s]*?)处契约修正/.exec(head[1]!)
+    const declared = /的([^\s]*?)处契约修正/.exec(title)
     const raw = declared?.[1]
     const n = raw === undefined || raw === '' ? Number.NaN : cnNumber(raw)
-    if (Number.isNaN(n)) badTitle.push(head[1]!)
+    if (Number.isNaN(n)) badTitle.push(itemText)
     let bullets = 0
     for (let j = i + 1; j < lines.length; j++) {
       const l = lines[j]!
@@ -1030,7 +1036,7 @@ function changelogCountMismatches(md: string): {
     }
     checked++
     if (!Number.isNaN(n) && n !== bullets) {
-      bad.push(`${head[1]!.slice(0, 40)}… 声明 ${n} / 实际 ${bullets}`)
+      bad.push(`${itemText.slice(0, 40)}… 声明 ${n} / 实际 ${bullets}`)
     }
   }
   return { bad, checked, entries, badTitle }
@@ -1089,5 +1095,9 @@ describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () =>
     // 没有「的<数词>」形态的标题也不许静默跳过：进 badTitle，且 entries 与 checked 都算到它
     const noNumeral = changelogCountMismatches('- **某某处契约修正**：\n  · a\n')
     expect([noNumeral.entries, noNumeral.checked, noNumeral.badTitle.length]).toEqual([1, 1, 1])
+    // 标题**没有粗体**也照样被统计与校验（Codex 第十二轮 P2：以 `**` 为门槛会静默跳过）
+    const noBold = changelogCountMismatches('- 某某的四处契约修正：\n  · a\n  · b\n  · c\n')
+    expect([noBold.entries, noBold.checked, noBold.badTitle.length]).toEqual([1, 1, 0])
+    expect(noBold.bad).toEqual([expect.stringContaining('声明 4 / 实际 3')])
   })
 })
