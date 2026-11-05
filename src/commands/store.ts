@@ -6,7 +6,7 @@ import { openStore } from '../store/index.js'
 import {
   ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty, storeInitCommand, describeArgs,
 } from '../output.js'
-import { classifyOpenFailure, NOT_DUCKDB_HINT, PERMISSION_HINT } from '../store/retry.js'
+import { classifyOpenFailure, openFailureHint } from '../store/retry.js'
 import { parseStoreFlags } from './store-flags.js'
 import {
   statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables, storeTablesWarnings,
@@ -71,13 +71,9 @@ export function thrownToExit(e: unknown): number {
   // （一个说「检查读写权限」、一个说「请确认文件存在且由本 CLI 创建，跑 store init」）。
   // 判据本身的形态要求（DuckDB 原生报文、strerror 在句尾、锚 `$` 不能子串搜）见那里的注释。
   const openFailure = classifyOpenFailure(e)
-  if (openFailure?.cause === 'permission') {
+  if (openFailure !== null) {
     return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `无法打开 ${msg}`, hint: PERMISSION_HINT })
-  }
-  if (openFailure?.cause === 'not_duckdb') {
-    return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-      message: `无法打开 ${msg}`, hint: NOT_DUCKDB_HINT })
+      message: `无法打开 ${msg}`, hint: openFailureHint(openFailure) })
   }
   // ⚠️ internal 兜底（第四轮 I 组 H1/M8 修）：spec §8.2 禁止把 DuckDB 英文原文裸透
   // 给 Agent —— 必须中文包装 + 底层原文；hint 中性化（status 只读路径也会走到这里，

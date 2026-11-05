@@ -318,6 +318,27 @@ describe('store 命令面与 help', () => {
     expect(readFileSync(p).equals(before)).toBe(true)
   })
 
+  it('--db 指向已损坏的库（截断 / 页校验和不对）→ 1 + store_not_initialized + 「先备份再重建」hint，不进 internal 兜底', { timeout: 60_000 }, async () => {
+    // 2026-11-05 审查修：两类损坏报文（`Could not read enough bytes…` / `Corrupt database
+    // file: computed checksum…`）此前既不匹配权限也不匹配「非 DuckDB 文件」，落进 internal
+    // 兜底 —— hint 是「请用 qiyu store status 检查数据库状态」，拿自己查自己。
+    const { makeCorruptDb } = await import('../fixtures/corrupt-db.js')
+    for (const kind of ['truncated', 'checksum'] as const) {
+      const p = await makeCorruptDb(dir, kind)
+      const before = readFileSync(p)
+      out = ''
+      expect(await storeCommand(['init', '--db', p]), kind).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind, kind).toBe('store_not_initialized')
+      expect(e.hint, kind).toMatch(/已损坏/)
+      expect(e.hint, kind).toMatch(/备份/)
+      // 损坏 ≠ 非 DuckDB 文件：不得说成「换 --db 路径」了事（文件是 CLI 自己建的，数据在里面）
+      expect(e.hint, kind).not.toMatch(/不是 DuckDB 数据库/)
+      // init 失败不得动用户的文件（备份前先别破坏唯一一份数据）
+      expect(readFileSync(p).equals(before), kind).toBe(true)
+    }
+  })
+
   it('--db 是符号链接 → init 拒绝（lstat，hint 逐字），status 跟随打开真实库', async () => {
     const real = join(dir, 'real.db')
     expect(await storeCommand(['init', '--db', real])).toBe(0)

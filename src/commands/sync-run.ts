@@ -30,7 +30,7 @@ import { callPaced } from '../sync/tasks/pace.js'
 import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
-import { classifyOpenFailure, NOT_DUCKDB_HINT } from '../store/retry.js'
+import { classifyOpenFailure, openFailureHint } from '../store/retry.js'
 import { storeNotInitializedHint } from './store-precheck.js'
 import { runFieldNotes } from './sync-notes.js'
 import type { Store } from '../store/types.js'
@@ -234,12 +234,13 @@ function storeInitFail(e: unknown, path: string): number {
   // 单一实现点）—— 此前这里自己写了一份 `/not a valid DuckDB database/i` 子串判据，
   // 与 `commands/store.ts`、`query/sandbox.ts` 三处各写各的。判据的形态要求（DuckDB 原生报文、
   // 句尾锚定）见那里的注释。
-  const notDuckdb = classifyOpenFailure(e)?.cause === 'not_duckdb'
-  if (err.kind === 'store_not_initialized' || notDuckdb) {
-    // 成因优先于缺省建议：底层 hint（依赖缺失 / 他人库 / 权限）原样保留；
-    // 「路径存在但不是 DuckDB 文件」由 DuckDB 原文判定（与 store.ts 同一份文案）。
-    const hint = err.hint ?? (notDuckdb
-      ? NOT_DUCKDB_HINT
+  const openFailure = classifyOpenFailure(e)
+  if (err.kind === 'store_not_initialized' || openFailure !== null) {
+    // 成因优先于缺省建议：底层 hint（依赖缺失 / 他人库 / 权限 / 已损坏）原样保留；
+    // 无底层 hint 的打开失败按 `classifyOpenFailure` 的成因取**同一份**文案
+    //（与 store.ts、sandbox.ts 共用 `openFailureHint`，不再各写各的）。
+    const hint = err.hint ?? (openFailure !== null
+      ? openFailureHint(openFailure)
       : storeNotInitializedHint(path))
     return fail({
       code: 'store_not_initialized', kind: 'store_not_initialized',

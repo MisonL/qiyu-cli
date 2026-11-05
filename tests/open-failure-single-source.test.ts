@@ -45,6 +45,7 @@ const stripCommentLines = (text: string): string =>
 const PREDICATES: Array<[string, RegExp]> = [
   ['权限 strerror 判据', /Permission denied|Operation not permitted|Read-only file system/],
   ['非 DuckDB 文件判据', /not a valid DuckDB database/i],
+  ['文件损坏判据', /Could not read enough bytes from file "|Corrupt database file:/],
 ]
 
 /**
@@ -145,6 +146,10 @@ describe('打开失败的成因判据必须只有一处实现（classifyOpenFail
       ['旧子串判据', "  if (/Permission denied|Operation not permitted|Read-only file system/.test(msg)) {", 1],
       // 事故 3：`sync-run.ts` 自己写的那份「非 DuckDB 文件」子串判据
       ['旧 not-duckdb 判据', "  if (/not a valid DuckDB database/i.test(msg)) {", 1],
+      // 事故 4（2026-11-05）：命令层自己抄一份「文件已损坏」判据 —— 同一个损坏文件
+      // 在 store/query/sync 三个命令上会给出三种说法（其中两种把它当「不存在/非本库」）
+      ['旧 corrupt 判据', "  if (/Corrupt database file:/.test(msg)) return { cause: 'corrupt' }", 1],
+      ['旧 corrupt 判据（截断）', "  if (msg.startsWith('IO Error: Could not read enough bytes from file \"')) {", 1],
       // 合法：调用唯一实现
       ['合法 调用', "  const f = classifyOpenFailure(e)", 0],
       ['合法 用结果', "  if (classifyOpenFailure(e)?.cause === 'permission') {", 0],

@@ -18,7 +18,7 @@
 // M-4 后下沉，让 query/ 的依赖面与 spec 白名单逐字一致），两条路径的 hint 逐字一致由它保证。
 //
 // ⚠️ 依赖加载：`@duckdb/node-api` 只经 dynamic import（与 store/duckdb.ts 同款惰性边界）。
-import { isLockError, retryWithBackoff, isModuleNotFound, classifyOpenFailure, NOT_DUCKDB_HINT, PERMISSION_HINT } from '../store/retry.js'
+import { isLockError, retryWithBackoff, isModuleNotFound, classifyOpenFailure, openFailureHint } from '../store/retry.js'
 import type { ErrorKind } from '../core/errors.js'
 import type { StoreConfig } from '../store/types.js'
 import { storeInitCommand } from '../output.js'
@@ -455,7 +455,7 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
       throw sandboxError(
         'store_not_initialized',
         `无法打开数据库：${e instanceof Error ? e.message : String(e)}`,
-        { hint: openFailure.cause === 'permission' ? PERMISSION_HINT : NOT_DUCKDB_HINT },
+        { hint: openFailureHint(openFailure) },
       )
     }
     throw sandboxError(
