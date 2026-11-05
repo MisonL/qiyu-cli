@@ -451,7 +451,7 @@
     "dangerous": true,
     "auth": "checksum",
     "verified": true,
-    "envelope": "A",
+    "envelope": "M",
     "maxWindowDays": 6
   },
   {
@@ -464,7 +464,7 @@
     "dangerous": false,
     "auth": "checksum",
     "verified": true,
-    "envelope": "A"
+    "envelope": "M"
   },
   {
     "id": "export.session.one",
@@ -669,14 +669,15 @@
     "pageId": "api-10845511",
     "title": "呼叫团队历史总览数据",
     "method": "POST",
-    "path": "/openapi/ipcc/history/seat",
+    "path": "/openapi/ipcc/history/team",
     "direction": "outbound",
     "callable": true,
     "dangerous": false,
     "auth": "checksum",
-    "verified": true,
-    "envelope": "C",
-    "category": "呼叫系统/数据接口"
+    "verified": false,
+    "envelope": null,
+    "category": "呼叫系统/数据接口",
+    "note": "路径与信封均未实测（2026-11-04 修正）：此前本行被登记成与 `icoutcall.history.seat` **相同的路径** `/openapi/ipcc/history/seat`、信封 C（数组）—— 而设计稿两处记载 team 是**独立路径** `/ipcc/history/team`、载荷是**对象**（55 字段）。那份「已验证」实际验证的是 seat，按旧登记调用会把 team 的 body 发到 seat 路由、静默拿到坐席数组。本账号未取得 team 的成功样本（同模块部分子服务返回 14500 Service Offline），故路径按设计稿修正、信封与 verified 降为未实测。⚠️ 不要把 seat 的数组形状套用到本接口。"
   },
   {
     "id": "icoutcall.job.create",

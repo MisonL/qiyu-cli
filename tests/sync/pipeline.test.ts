@@ -375,7 +375,7 @@ describe('runExportPipeline —— 四步流水线 mock', () => {
 
   it('D 中-2：create 载荷无可用 message（形态漂移）→ 显式失败', async () => {
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({
-      code: 200, message: 'OK',   // 无 data、message 是 'OK'（占位）→ messageOf 无可用载荷
+      code: 200, message: 'OK',   // 无 data、message 是 'OK'（占位）→ 归一化层即判失败
     }), { status: 200, headers: { 'content-type': 'application/json' } }))))
     try {
       const store = await fresh()
@@ -383,7 +383,7 @@ describe('runExportPipeline —— 四步流水线 mock', () => {
         credentials: { appKey: APP_KEY, appSecret: 'test-secret' },
         fetchZip: async () => new Uint8Array(),
         pollIntervalMs: 0,
-      }))).rejects.toThrow(/message 载荷/)
+      }))).rejects.toThrow(/占位符|message 载荷/)
       await store.close()
     } finally {
       vi.unstubAllGlobals()

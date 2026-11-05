@@ -122,6 +122,56 @@
 
 ### 修复
 
+- **注册表与 api 图例的七处契约修正（2026-11-04 独立审查）**：
+
+  · **`export.session` / `export.session.check` 的唯一载荷被丢弃并谎报「无数据」**：
+    设计稿 §7.5 实测两者的成功载荷就是 message 原文（任务 key / 下载链接），
+    同步流水线也按此实现；但注册表把它们登记成形状 A（载荷在 data），而响应里没有
+    data —— `api call` 输出 `"data":null, "not_found":true, "warning":"接口返回成功但无数据"`，
+    Agent 完成导出创建后拿不到 key。新增信封形状 **M**（成功载荷 = message 原文；
+    非 200 或无 message 判失败，空 message 不判 not_found），两个接口改登记为 M，
+    并补矩阵/信封/集成测试与流水线占位符守卫（'OK' 不得当链接）。判据一律作用在
+    **trim 后**的 message 上（`'   '` 是空载荷、`' OK '` 是占位符，都不放行；
+    payload 取 trim 值），且**裸数组不是 M 的合法形态** —— 若落到「裸数组一律成功」的
+    前置分支，形态漂移会被报成成功、数组被当成任务 key / 下载链接交给调用方。
+  · **`export.*` 四个文档外接口的 body 参数表是空的**：生成器对它们硬编码
+    `params: []`、`body_kind: 'none'`，而 create/check 的 body 是必需的、流水线就在发。
+    Agent 按 `api schema` 会看到「没有参数」，照着发出空 body。在 `EXTERNAL_ENDPOINTS`
+    声明实测字段集（`{start,end}` / `{key}` / `{sessionId}` / `{sessionId,mTypes}`），
+    生成器与产物同步补齐。
+  · **`icoutcall.history.team` 的路径与 seat 完全相同**：设计稿两处记载 team 是独立路径
+    `/ipcc/history/team`、载荷为对象（55 字段），而注册表沿用了文档页重复项（与 seat
+    同路径、信封 C 数组）—— 按旧登记调用会把 team 的 body 发到 seat 路由、静默拿到坐席
+    数组。经 `paths.json` 修正路径，envelope/verified 降为未实测并写明原因；
+    限频行的 20 秒同步从 `observed` 降为 `doc`（那次「观测」打在 seat 上）。
+  · **`api list` 的 `verified` 图例把「实测范围」全指给每行 note**：53 条 verified:true
+    里 42 条没有 note，Agent 无从判断。改为「true = 该接口被真实观测过，不等于成功路径
+    一定走通过（receive.message 只验证了不可调用）；具体范围只在该行有 note 时才有
+    说明，没有 note 不要假定更多」。
+  · **`path` 图例说 null 路径「仍可能是本方可主动调用的」**：加载器强制
+    `callable:true` 必有 path，该组合不可达。改为点明「null 必然伴随 callable=false，
+    direction 仍可为 outbound」。
+  · **`body_kind` 图例说非 json「原样透传」**：实现恒 `JSON.stringify` +
+    `application/json`，xml/multipart/text 的原始字节无法表达（`--body '<xml>'` 直接
+    退出码 2）。改口并点明「传 JSON 对象给它们 ≠ 字段按接口文档生效」。
+  · **`params[].type/required` 的强制范围漏了 body_kind**：`validateBody` 对
+    `bodyKind !== 'json'` 直接早返回，`kefu.add`（xml）传 `{}` 不报缺必填；图例却承诺
+    「缺必填拒绝」。两处限定为「`body_kind=json` 且 `in=body`」，并点明入站接口的
+    required=true 鉴权字段没有任何自动填充/传参通道。
+  · **`warnings` 图例把 `missing_required` 列为告警 kind**：它是硬拒绝（退出码 2、
+    错误信封），永远不进 warnings。示例改为 `unknown_field` / `type_mismatch` /
+    `alias_normalized`，并显式声明它不会出现。
+  · **`not_found` 图例漏掉 message 载体与宽松模式**：形状 C 或 envelope 未登记时，
+    message 能解析成 JSON 且解析结果为空同样置位。判据按实现写全（形状 C 的「无
+    message」是失败、走不到末尾兜底，故不在「整条 200 无载荷键」的接口族里）。
+
+  守卫同步加硬：`specs.json` 与 `overrides` 表的一致性（生成物不得陈旧于事实源）、
+  生成器必须产出 export 参数表、信封矩阵覆盖 M、export 集成用例断言 key/链接不再丢、
+  图例字符约束（无 `**`、无分隔符 `；`）。变异 13 处全红（M 分支、M payload、生成器
+  params、path 漂移、verified 名单、messageOf 占位符、矩阵覆盖；CodeRabbit 首轮追加的
+  M 的 'OK' 占位符、team 按文档值 300 秒、verified 图例反例、not_found 措辞；
+  第 3 轮追加的 M 的 trim 后判空/占位；第 4 轮追加的 M 的裸数组形态）。
+
 - **核心请求/错误/存储写入的九处契约修正（2026-11-04 独立审查）**：
 
   · **配置文件解析失败会回显文件内容（安全红线）**：`readConfigRaw` 把 V8 的

@@ -1,7 +1,7 @@
 // src/core/envelope.ts
 
 /** 注册表按接口记录的解析策略。见设计稿 §9.0。 */
-export type EnvelopeShape = 'A' | 'B' | 'C' | 'D' | 'D-nf'
+export type EnvelopeShape = 'A' | 'B' | 'C' | 'D' | 'D-nf' | 'M'
 
 export interface Normalized {
   ok: boolean
@@ -74,7 +74,15 @@ function isEmptyPayload(v: unknown): boolean {
  */
 export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
   // 裸数组：ipcc.customfield.template.get 完全没有信封
+  // ⚠️ 形状 M 必须排除在外（CodeRabbit PR #66 第 4 轮）：M 的契约是「载荷 = message
+  // 原文」，裸数组不是该契约的任何一种合法形态。若不排除，数组会在下面的 M 判定**之前**
+  // 被无条件当成功返回 —— 一次形态漂移被报成成功，调用方把数组当任务 key / 下载链接。
   if (Array.isArray(raw)) {
+    if (envelope === 'M') {
+      return { ok: false, code: 'unknown', payload: undefined,
+               messageText: '形状漂移：该接口应返回 {code, message} 信封（载荷在 message），实际是裸数组',
+               notFound: false }
+    }
     return { ok: true, code: '200', payload: raw, messageText: '', notFound: false }
   }
 
@@ -99,6 +107,40 @@ export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
   const code = String(o.code ?? 'unknown')
   const codeOk = code === '200'
   const messageText = typeof o.message === 'string' ? o.message : ''
+
+  // 形状 M：**成功载荷就是 message 原文**（纯文本，不是 JSON）。实测两处：
+  //   `export.session`       create → `{code:200, message:"<task key>"}`
+  //   `export.session.check` check  → 完成时 `{code:200, message:"<download link>"}`
+  // 设计稿 §7.5 逐字记载，同步流水线也按此实现（`pipeline.messageOf`）。
+  //
+  // ⚠️ 此前这两个接口被登记成形状 A（载荷在 data），而响应里**根本没有 data** ——
+  // 信封层落到末尾兜底：payload=undefined、`notFound:true`，stdout 里是
+  // `"data":null, "not_found":true, "warning":"接口返回成功但无数据"`，
+  // 而任务 key/下载链接（唯一有用的载荷）整条丢失。Agent 完成导出创建后拿不到 key，
+  // 还被明确告知"返回成功但无数据"—— 把一次成功描述成空操作。
+  //
+  // 判据：code 非 200 → 失败（message 是错误文本）；message 缺失/空 → 失败（无载荷可用，
+  // 与形状 C 同理：不知道这是成功还是异常）；否则 payload = message 原文。
+  // message 为空串**不**判 notFound —— 形状 M 的"空"是缺载荷，不是"查无此物"。
+  if (envelope === 'M') {
+    const nf = { notFound: false }
+    if (!codeOk) return { ok: false, code, payload: undefined, messageText, ...nf }
+    // ⚠️ 判据必须作用在 **trim 后**的副本上（CodeRabbit PR #66）：`'   '` 是空载荷、
+    // `'OK '` 是占位符 —— 原样比对会把它们放行，下游拿它当 key/链接去下载。
+    // 返回的 payload 也用 trim 后的值（带空白的 key/链接必然用不了）。
+    const trimmed = messageText.trim()
+    if (!trimmed) {
+      return { ok: false, code, payload: undefined, messageText: '响应缺少 message', ...nf }
+    }
+    // 'OK' 是占位符：拿它当任务 key / 下载链接会让下游去下载 /openapi/export/session/OK。
+    // `x 校验`（流水线）与 `api call` 都必须把同一形态判为失败 —— 归一化层挡掉，
+    // 两边共用同一判据，不再各写一份。
+    if (trimmed === 'OK') {
+      return { ok: false, code, payload: undefined,
+               messageText: '响应 message 是占位符 `OK`（形态漂移），不是可用的载荷', ...nf }
+    }
+    return { ok: true, code, payload: trimmed, messageText, ...nf }
+  }
 
   // 形状 C：数据藏在 message 里的 JSON 字符串。
   // 解析成功 → 成功；解析失败 → **错误**（见上方说明），即便 code 是 200。

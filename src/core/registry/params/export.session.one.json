@@ -1,7 +1,15 @@
 {
-  "params": [],
+  "params": [
+    {
+      "name": "sessionId",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "会话 id（单条查询，无需 code）"
+    }
+  ],
   "responseShape": {
     "kind": "none"
   },
-  "bodyKind": "none"
+  "bodyKind": "json"
 }
