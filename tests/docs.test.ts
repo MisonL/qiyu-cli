@@ -971,24 +971,34 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
  * 「二十一处契约修正」时查表得到 `undefined`，即使 bullet 数刚好对上也红。
  */
 const CN_DIGITS: Record<string, number> = {
-  零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+  零: 0, 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
 }
+const CN_UNITS: Record<string, number> = { 十: 10, 百: 100, 千: 1000 }
+const CN_SECTIONS: Record<string, number> = { 万: 1e4, 亿: 1e8 }
+/**
+ * CHANGELOG 数词里可能出现的**全部**字符（含解析器不认的 `两/廿/卅`）。
+ *
+ * ⚠️ 字符类必须覆盖到「任何一个可能出现在数词里的字符」，否则正则会在数词**中间**
+ * 起匹配：`一千零五处契约修正` 曾经被截成后缀 `零五` → 按 5 校验；若 bullet 恰好
+ * 也是 5，守卫反而放行（Codex PR #68 第十轮 P2）。不认的字符由 `cnNumber` 返回
+ * NaN、进 `badTitle` 报红 —— 拒绝猜，而不是猜一个更小的数。
+ */
+const CN_CHARS = '〇零一二三四五六七八九十百千万亿两廿卅'
 function cnNumber(raw: string): number {
   if (/^\d+$/.test(raw)) return Number(raw)
   let total = 0
+  let section = 0
   let cur = 0
   for (const ch of raw) {
-    if (ch === '十' || ch === '百') {
-      const unit = ch === '十' ? 10 : 100
-      total += (cur === 0 ? 1 : cur) * unit
-      cur = 0
-      continue
-    }
     const d = CN_DIGITS[ch]
-    if (d === undefined) return Number.NaN
-    cur = d
+    if (d !== undefined) { cur = d; continue }
+    const u = CN_UNITS[ch]
+    if (u !== undefined) { section += (cur === 0 ? 1 : cur) * u; cur = 0; continue }
+    const sec = CN_SECTIONS[ch]
+    if (sec !== undefined) { total += (section + cur) * sec; section = 0; cur = 0; continue }
+    return Number.NaN
   }
-  return total + cur
+  return total + section + cur
 }
 
 /**
@@ -1006,7 +1016,14 @@ function changelogCountMismatches(md: string): { bad: string[]; checked: number;
   for (let i = 0; i < lines.length; i++) {
     const head = /^- \*\*(.+?)\*\*/.exec(lines[i]!)
     if (head === null) continue
-    const declared = /([零一二三四五六七八九十百]+|\d+)\s*处契约修正/.exec(head[1]!)
+    // ⚠️ 「不从数词中间起匹配」靠的是**字符类的完整性 + 贪婪**，不是左边界（Codex 第十轮 P2）。
+    // 实测：`一千零五处契约修正` 被截成后缀 `零五` 按 5 校验。加左边界 `(?<![...])` 只有在
+    // 字符类**已经**覆盖全部数词字符时才成立 —— 而那时贪婪匹配本就从最早位置吃掉整串，
+    // 左边界不承重（变异实测：去掉它，全部用例仍绿）。真正的机制是 `CN_CHARS` 覆盖到
+    // 任何可能出现在数词里的字符（含解析器不认的 `两/廿/卅`，它们由 `cnNumber` 判 NaN
+    // 进 `badTitle` 报红 —— 拒绝猜一个更小的数）。
+    const declared = new RegExp(
+      `([${CN_CHARS}]+|\\d+)\\s*处契约修正`).exec(head[1]!)
     if (declared === null) continue
     const n = cnNumber(declared[1]!)
     if (Number.isNaN(n)) badTitle.push(head[1]!)
@@ -1035,7 +1052,8 @@ describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () =>
   it('反例集：扫描路径按标题里的**完整**数词校验（一百零五不能被截成五）', () => {
     // 解析器自检
     expect([cnNumber('九'), cnNumber('十三'), cnNumber('二十'), cnNumber('二十一'),
-      cnNumber('一百零五'), cnNumber('21')]).toEqual([9, 13, 20, 21, 105, 21])
+      cnNumber('一百零五'), cnNumber('一千零五'), cnNumber('一万零五'), cnNumber('21')])
+      .toEqual([9, 13, 20, 21, 105, 1005, 10005, 21])
     // 扫描路径自检：必须从**整串**数词取值，而不是从中间的「五」
     const block = (n: number): string => '- **某某的一百零五处契约修正**：\n'
       + Array.from({ length: n }, () => '  · x\n').join('')
@@ -1051,5 +1069,15 @@ describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () =>
     expect(changelogCountMismatches(block21(2)).bad).toEqual([
       expect.stringContaining('声明 21 / 实际 2'),
     ])
+    // 千位形态：`一千零五` 绝不能被截成后缀 `零五` 按 5 校验（Codex 第十轮 P2 的最小反例）
+    const block1005 = (n: number): string => '- **某某的一千零五处契约修正**：\n'
+      + Array.from({ length: n }, () => '  · z\n').join('')
+    expect(changelogCountMismatches(block1005(1005)).bad).toEqual([])
+    expect(changelogCountMismatches(block1005(5)).bad).toEqual([
+      expect.stringContaining('声明 1005 / 实际 5'),
+    ])
+    // 解析器不认的字符（如「两」）→ 拒绝猜：报 badTitle 而不是取一个更小的数
+    const blockLiang = '- **某某的两处契约修正**：\n  · a\n  · b\n'
+    expect(changelogCountMismatches(blockLiang).badTitle.length).toBe(1)
   })
 })
