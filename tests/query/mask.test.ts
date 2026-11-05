@@ -687,6 +687,74 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
   })
 
+  it('分组键没被投影出来 → 不报警（脱敏不改可见输出，Codex 2026-11-05 第二轮 P2）', () => {
+    // 实测 `SELECT COUNT(*) … GROUP BY userPhone` 返回 [{n:1},{n:1}]：分组键不在输出里，
+    // 脱敏前后输出完全一样，报「分组失真」并建议 --no-mask 是纯误报。
+    const hidden = maskQueryRows({
+      rows: [{ n: 1 }, { n: 1 }],
+      columns: ['n'],
+      mode: { kind: 'sql', sql: 'SELECT COUNT(*) AS n FROM sessions GROUP BY userPhone', tables: TABLES },
+    })
+    expect(hidden.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+    // GROUP BY ALL + 聚合别名（`max(userPhone) AS userPhone`）同理：那一项是聚合值不是分组键
+    const agg = maskQueryRows({
+      rows: [{ userPhone: '13899991111', n: 2 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT max(userPhone) AS userPhone, COUNT(*) AS n FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(agg.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('GROUP BY 的是字符串字面量 → 按常量分组，不算分组键（Codex 2026-11-05 第二轮 P3）', () => {
+    // 实测 `SELECT COUNT(*) … GROUP BY 'userPhone'` 返回一行 n=2（按常量分组）。
+    const out = maskQueryRows({
+      rows: [{ n: 2 }],
+      columns: ['n'],
+      mode: {
+        kind: 'sql',
+        // `session_type AS k`：让 k 成为一个**非敏感**的可见分组键 —— 否则选择列表里
+        // 只有聚合项，visible(userPhone) 直接不成立，字面量那一档根本到不了。
+        sql: "SELECT session_type AS k, COUNT(*) AS n FROM sessions GROUP BY k, 'userPhone'",
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+    // ⚠️ 诚实记录：合法 SQL 里「敏感列可见却只被字面量提及」的组合几乎不存在（可见的
+    // 非聚合选择项必须同时出现在 GROUP BY 里），所以**分组**这一档对字面量抹除是等价变异；
+    // 真正靠它挡住的是下面的缺口警告用例。
+  })
+
+  it('字符串字面量里的列名不算「引用了敏感列」（缺口警告同样不得被字面量触发）', () => {
+    const out = maskQueryRows({
+      rows: [{ session_type: 'userPhone' }],
+      columns: ['session_type'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT session_type FROM sessions WHERE session_type = 'userPhone'",
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings, `字面量不是列引用：${String(out.warnings)}`).toEqual([])
+  })
+
+  it('带双引号的别名（`AS "p"` + `GROUP BY p`）→ 必须报警（Codex 2026-11-05 第二轮 P2 漏报）', () => {
+    // 实测 DuckDB 接受该写法并按 userPhone 分成两组；`GROUP BY p` 引用的是 "p"。
+    const out = maskQueryRows({
+      rows: [{ p: '138****1111', n: 1 }, { p: '138****1111', n: 1 }],
+      columns: ['p', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone AS "p", COUNT(*) AS n FROM sessions GROUP BY p',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
   it('值级兜底命中非敏感列 → 警告「可能是业务数字被误改」（11 位订单号）', () => {
     const out = maskQueryRows({
       rows: [{ order_id: '13800138000' }],

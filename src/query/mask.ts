@@ -228,6 +228,62 @@ const SQL_KEYWORDS = new Set([
   'in', 'between', 'over', 'partition', 'filter', 'cast', 'collate',
 ])
 
+/** 聚合函数（判断「这个 SELECT 项是聚合值还是分组键」用，DuckDB 常用集）。 */
+const AGGREGATE_FUNCS = new Set([
+  'count', 'sum', 'avg', 'mean', 'min', 'max', 'median', 'product', 'list', 'array_agg',
+  'string_agg', 'group_concat', 'first', 'last', 'any_value', 'any', 'every', 'bool_and',
+  'bool_or', 'bit_and', 'bit_or', 'bit_xor', 'approx_count_distinct', 'approx_quantile',
+  'quantile', 'quantile_cont', 'quantile_disc', 'mode', 'histogram', 'stddev', 'stddev_pop',
+  'stddev_samp', 'variance', 'var_pop', 'var_samp', 'corr', 'covar_pop', 'covar_samp',
+  'skewness', 'kurtosis', 'entropy', 'arg_min', 'arg_max', 'min_by', 'max_by',
+  'regr_avgx', 'regr_avgy', 'regr_count', 'regr_intercept', 'regr_r2', 'regr_slope',
+  'regr_sxx', 'regr_sxy', 'regr_syy',
+])
+
+/**
+ * SELECT 项是否以**聚合函数**开头（`max(userPhone) AS userPhone` 是聚合值，不是分组键）。
+ * 只看开头：`userPhone || '-x'` 这类表达式是投影出来的分组键（会被打码），不能当成聚合。
+ */
+function isAggregateItem(item: string): boolean {
+  const m = /^\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*\(/.exec(item)
+  return m !== null && AGGREGATE_FUNCS.has((m[1] ?? m[2] ?? '').toLowerCase())
+}
+
+/**
+ * 抹掉单引号字符串字面量与 SQL 注释（判据只看标识符，不看字面量/注释里的文本）。
+ *
+ * ⚠️ Codex 2026-11-05 第二轮 P3 实测：`SELECT COUNT(*) … GROUP BY 'userPhone'` 是
+ * **按常量分组**（实测一行 `n=2`），但字面量里恰好写着列名时，按原文本搜索会谎报分组失真。
+ * 双引号是**标识符**（`"userPhone"` 就是那一列），不抹。
+ */
+function withoutLiterals(text: string): string {
+  let out = ''
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (ch === "'") {
+      out += ' '
+      for (i++; i < text.length; i++) {
+        if (text[i] === "'") { if (text[i + 1] !== "'") break; i++ }
+      }
+      continue
+    }
+    if (ch === '-' && text[i + 1] === '-') {
+      out += ' '
+      while (i < text.length && text[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      out += ' '
+      i += 2
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
+      i++
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
 /** 顶层逗号切分（括号与引号内不算），用于 SELECT 列表与 GROUP BY 的项。 */
 function splitTopLevel(text: string): string[] {
   const out: string[] = []
@@ -259,18 +315,24 @@ function splitTopLevel(text: string): string[] {
 function aliasesOf(selectList: string, name: string): string[] {
   const out: string[] = []
   const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  // ⚠️ 两个条件缺一不可（误报方向也要守住 —— 分组失真警告建议 --no-mask）：
-  //   ① 候选别名是标识符、且不是 SQL 关键字（`SELECT userPhone FROM` 里的 FROM 不算别名）；
+  const ident = '([A-Za-z_][A-Za-z0-9_]*|"[^"]+")'
+  // ⚠️ 三个条件缺一不可（误报/漏报两个方向都要守住 —— 分组失真警告建议 --no-mask）：
+  //   ① 候选别名是标识符（含**双引号标识符** `AS "p"`，Codex 2026-11-05 P2：DuckDB 里
+  //      `GROUP BY p` 能引用 `"p"` 定义的别名，不认它就漏报）、且不是 SQL 关键字
+  //      （`SELECT userPhone FROM` 里的 FROM 不算别名）；
   //   ② 候选别名后面紧跟逗号 / 子句关键字 / 结尾 —— `SELECT userPhone AS p, …` 是的，
-  //      而 `SELECT userPhone = 'x' FROM …` 里的 `x` 不是。
+  //      而 `SELECT userPhone = 'x' FROM …` 里的 `x` 不是；
+  //   ③ 匹配目标是被选中的**那一列本身**，不是它的字符串字面量（先抹字面量与注释）。
   const re = new RegExp(
-    `(?:\\b[A-Za-z_][A-Za-z0-9_]*\\s*\\.\\s*)?\\b${esc}\\b\\s+(?:AS\\s+)?([A-Za-z_][A-Za-z0-9_]*)`
+    `(?:\\b[A-Za-z_][A-Za-z0-9_]*\\s*\\.\\s*)?\\b${esc}\\b\\s+(?:AS\\s+)?${ident}`
     + '(?=\\s*(?:,|$|\\bFROM\\b|\\bWHERE\\b|\\bGROUP\\b|\\bORDER\\b|\\bLIMIT\\b|\\bHAVING\\b))',
     'gi',
   )
-  for (const m of selectList.matchAll(re)) {
-    const alias = m[1]
-    if (alias !== undefined && !SQL_KEYWORDS.has(alias.toLowerCase()) && !out.includes(alias)) out.push(alias)
+  for (const m of withoutLiterals(selectList).matchAll(re)) {
+    const raw = m[1]
+    if (raw === undefined) continue
+    const alias = raw.startsWith('"') ? raw.slice(1, -1) : raw
+    if (!SQL_KEYWORDS.has(alias.toLowerCase()) && !out.includes(alias)) out.push(alias)
   }
   return out
 }
@@ -445,7 +507,9 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       return typeof parsed === 'object' && parsed !== null
     } catch { return false }
   }))
-  const payloadReferenced = columns.includes('payload') || /\bpayload\b/i.test(mode.sql)
+  // 判据作用在抹掉字面量/注释后的 SQL 上（字面量里写着列名不是引用）。
+  const sqlPlain = withoutLiterals(mode.sql)
+  const payloadReferenced = columns.includes('payload') || /\bpayload\b/i.test(sqlPlain)
   // ⚠️ 第四类绕过（安全审查 Major，2026-10-20 实测）：`query()` 表函数把内层 SQL 当作
   // **字符串**执行，外层文本与输出列名都看不到内层标识符——
   //   `SELECT * FROM query('SELECT userName AS n, userAddress AS a FROM sessions')`
@@ -492,42 +556,65 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 而非分组，打码不会改变计数。分组列是否敏感由上面的分组键判据决定。
   // 都是词边界 + 大小写不敏感（DuckDB 标识符不分大小写）。
   //
+  // ⚠️ 再加一个条件「**可见**」（Codex 2026-11-05 第二轮 P2 实测）：脱敏只会把**输出里**
+  // 被投影的分组值压平，计数不变。`SELECT COUNT(*) FROM sessions GROUP BY userPhone`
+  // 只输出计数，分组键根本没投影 —— 两张不同手机号各计 1 条，脱敏前后输出完全一样，
+  // 报「分组失真」并建议 --no-mask 是纯粹的误报（实测该 SQL 返回 `n=1, n=1`）。
+  // 所以分组键命中后还要看它有没有作为**非聚合**选择项被投影出来
+  // （`SELECT userPhone, COUNT(*) … GROUP BY userPhone`、`SELECT userPhone AS p … GROUP BY p`
+  // 都是可见的；`SELECT max(userPhone) AS userPhone … GROUP BY ALL` 里那一项是聚合值，不可见）。
+  //
+  // ⚠️ 字面量与注释先抹掉（Codex 第二轮 P3 实测）：`GROUP BY 'userPhone'` 是按**常量**分组
+  //（实测一行 `n=2`），字面量里写着列名不该算命中。双引号是标识符，不抹。
+  //
   // ⚠️ 边界如实记录：SELECT 列表的切片要求语句**以 SELECT 开头**（`WITH … SELECT` 取不到），
-  // 此时别名与 `DISTINCT` 两档判据不触发 —— 方向是**少报一条副作用提示**，不是漏脱敏
+  // 此时别名、`DISTINCT` 与「可见性」三档判据不触发 —— 方向是**少报一条副作用提示**，不是漏脱敏
   // （缺口警告与列名级/值级脱敏都不依赖这段解析）。判据是启发式，不是 SQL 解析器。
   const referencedSensitive = sensitiveNames
-    .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(mode.sql))
+    .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(sqlPlain))
   const referencesSensitive = referencedSensitive.length > 0
-  const wordHit = (text: string, names: readonly string[]): boolean =>
-    names.some((n) => new RegExp(`\\b${n}\\b`, 'i').test(text))
+  const wordHit = (text: string, names: readonly string[]): boolean => {
+    const plain = withoutLiterals(text)
+    return names.some((n) => new RegExp(`\\b${n}\\b`, 'i').test(plain))
+  }
   const groupedSensitive = new Set<string>()
-  const selectList = sliceClause(
-    mode.sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\s+(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b')
+  const selectList = withoutLiterals(sliceClause(
+    mode.sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\s+(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b'))
   const selectItems = splitTopLevel(selectList)
+  const projected = selectItems.filter((it) => it.trim() !== '' && !isAggregateItem(it))
+  const projectedPlain = projected.join(',')
+  /** 分组键是否**被投影出来**（可见）：按列名、其别名或裸表达式出现于非聚合选择项。 */
+  const visible = (n: string): boolean =>
+    wordHit(projectedPlain, [n]) || aliasesOf(selectList, n).some((a) => wordHit(projectedPlain, [a]))
   const groupByClause = sliceClause(mode.sql, /\bGROUP\s+BY\b/i)
   if (groupByClause !== '') {
-    const keys = splitTopLevel(groupByClause)
-    // `GROUP BY ALL`（DuckDB）= 按**全部非聚合选择项**分组 —— 选择列表里出现敏感列就是分组键。
-    // 把它当成普通键 `ALL` 来匹配，敏感列一个都命中不了，分组压平就一条提示都没有。
-    const groupByAll = keys.length === 1 && /^\s*ALL\s*$/i.test(keys[0]!)
+    let keys = splitTopLevel(groupByClause)
+    // 字面量先抹掉（`GROUP BY 'x'` 是按常量分组，不是列 —— Codex 第二轮 P3 实测），
+    // 抹完的键只含标识符，再参与列名匹配。
+    const plainKeys = keys.map((k) => withoutLiterals(k))
+    // `GROUP BY ALL`（DuckDB）= 按**全部非聚合选择项**分组 —— 选择项里出现敏感列就是分组键
+    //（聚合项如 `max(userPhone) AS userPhone` 不是分组键，见上面的聚合判定）。
+    const groupByAll = plainKeys.length === 1 && /^\s*ALL\s*$/i.test(plainKeys[0]!)
     for (const n of sensitiveNames) {
-      const viaKey = keys.some((k) => wordHit(k, [n])) || (groupByAll && wordHit(selectList, [n]))
-      const viaAlias = aliasesOf(selectList, n).some((a) => keys.some((k) => wordHit(k, [a])))
-      const viaOrdinal = keys.some((k) => {
+      if (!visible(n)) continue
+      const viaKey = plainKeys.some((k) => wordHit(k, [n])) || (groupByAll && wordHit(projectedPlain, [n]))
+      const viaAlias = aliasesOf(selectList, n).some((a) => plainKeys.some((k) => wordHit(k, [a])))
+      const viaOrdinal = plainKeys.some((k) => {
         const t = k.trim()
         if (!/^\d+$/.test(t)) return false
         const target = selectItems[Number(t) - 1]
-        return target !== undefined && wordHit(target, [n])
+        return target !== undefined && !isAggregateItem(target) && wordHit(target, [n])
       })
       if (viaKey || viaAlias || viaOrdinal) groupedSensitive.add(n)
     }
   }
   const distinct = /\bSELECT\s+(?:ALL\s+)?DISTINCT\s+(ON\s*\()?/i.exec(mode.sql)
   if (distinct !== null) {
-    // `DISTINCT ON (a, b) …` 的分组键是括号里的列；普通 `DISTINCT` 是整张选择列表。
+    // `DISTINCT ON (a, b) …` 的分组键是括号里的列；普通 `DISTINCT` 是整张选择列表
+    //（DISTINCT 的选择项本身就是可见分组键；聚合项不会出现在 DISTINCT 列表里，但仍排除）。
     const list = distinct[1] === undefined
-      ? selectList
-      : (() => {
+      ? projectedPlain
+      : withoutLiterals((() => {
           const open = distinct.index + distinct[0].length
           let depth = 1
           for (let i = open; i < mode.sql.length; i++) {
@@ -535,9 +622,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
             else if (mode.sql[i] === ')') { depth--; if (depth === 0) return mode.sql.slice(open, i) }
           }
           return mode.sql.slice(open)
-        })()
+        })())
     for (const n of sensitiveNames) {
-      if (wordHit(list, [n]) || aliasesOf(list, n).some((a) => wordHit(list, [a]))) {
+      if (!visible(n)) continue
+      if (wordHit(list, [n]) || aliasesOf(selectList, n).some((a) => wordHit(list, [a]))) {
         groupedSensitive.add(n)
       }
     }
@@ -560,7 +648,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     // 列名是 `n`，列名级够不着、值级无法检测姓名 → 大小写敏感时**零警告静默漏出**。
     // 代价是 `SELECT username FROM staff`（staff.username 不是敏感列）会多一条误报 ——
     // spec 明确要求这个方向。
-    if (!new RegExp(`\\b${name}\\b`, 'i').test(mode.sql)) continue
+    // ⚠️ 匹配的是**抹掉字面量/注释后**的 SQL（`sqlPlain`）：字符串常量里写着列名不是
+    // 引用（`WHERE session_type = 'userPhone'` 实测曾被报成「引用了敏感列 userPhone」，
+    // 而输出里根本没有它）。双引号是标识符，保留。
+    if (!new RegExp(`\\b${name}\\b`, 'i').test(sqlPlain)) continue
     warnings.push(
       `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，` +
       '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样')
