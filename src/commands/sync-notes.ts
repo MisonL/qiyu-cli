@@ -353,6 +353,11 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
           + '即 daemon-reload —— 先 reload 只会重新加载即将被删的 unit）。'
           + '执行次序是：commands → 删除 remove[] → post_remove_commands。'
           + '--yes 的结果里全部按这个次序汇总进 commands[]',
+        // 元素形状与 commands[] 完全相同（command/executed/ok/error）：释义从同一份常量
+        // 派生，避免两处各写一份文案、改一边漏一边。差异只在「什么时候执行」，由上面的
+        // 顶层键说明。
+        ...Object.fromEntries(Object.entries(SYNC_COMMAND_NOTES).map(([k, v]) =>
+          [k.replace(/^commands\[\]\./, 'post_remove_commands[].'), v])),
         notes: '给人读的说明。darwin/linux 含卸载次序（先停调度器，再删文件），win32 说明 schtasks 的行为',
       }
     case 'uninstall-real':
