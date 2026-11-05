@@ -965,10 +965,32 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
  * 其它条目（如「另外两个载体 + 一处文案分档」）的 N 指代子集，不能套用 —— 如实记录边界。
  */
 describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () => {
-  const CN: Record<string, number> = {
-    一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
-    十: 10, 十一: 11, 十二: 12, 十三: 13, 十四: 14, 十五: 15, 十六: 16,
-    十七: 17, 十八: 18, 十九: 19, 二十: 20,
+  /**
+   * 中文数词 → 整数（支持「十/百」的组合，如 十三 / 二十 / 二十一 / 一百零五）。
+   *
+   * ⚠️ 不能用枚举表（Codex PR #68 第八轮 P3）：表写到「二十」就停，将来出现
+   * 「二十一处契约修正」时 `CN['二十一']` 是 `undefined`，即使 bullet 数刚好对上也
+   * 会让守卫红 —— 守卫变成阻断合法更新的噪音，而它本该只在计数真的不一致时红。
+   */
+  const cnDigits: Record<string, number> = {
+    零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+  }
+  const cnNumber = (raw: string): number => {
+    if (/^\d+$/.test(raw)) return Number(raw)
+    let total = 0
+    let cur = 0
+    for (const ch of raw) {
+      if (ch === '十' || ch === '百') {
+        const unit = ch === '十' ? 10 : 100
+        total += (cur === 0 ? 1 : cur) * unit
+        cur = 0
+        continue
+      }
+      const d = cnDigits[ch]
+      if (d === undefined) return Number.NaN
+      cur = d
+    }
+    return total + cur
   }
   it('「N 处契约修正」批的 bullet 数 == 标题里的 N', () => {
     const lines = read('CHANGELOG.md').split('\n')
@@ -980,7 +1002,8 @@ describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () =>
       const declared = /([一二三四五六七八九十]+|\d+)\s*处契约修正/.exec(head[1]!)
       if (declared === null) continue
       const raw = declared[1]!
-      const n = /^\d+$/.test(raw) ? Number(raw) : CN[raw]
+      const n = cnNumber(raw)
+      expect(Number.isNaN(n), `标题里的数词解析不了：${head[1]!.slice(0, 40)}…`).toBe(false)
       let bullets = 0
       for (let j = i + 1; j < lines.length; j++) {
         const l = lines[j]!
@@ -990,6 +1013,9 @@ describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () =>
       checked++
       if (n !== bullets) bad.push(`${head[1]!.slice(0, 40)}… 声明 ${n} / 实际 ${bullets}`)
     }
+    // 解析器自检：枚举表写不全时（如只到「二十」）这里先红，而不是等到将来某批条目
+    expect([cnNumber('九'), cnNumber('十三'), cnNumber('二十'), cnNumber('二十一'),
+      cnNumber('一百零五'), cnNumber('21')]).toEqual([9, 13, 20, 21, 105, 21])
     expect(checked, '一个「N 处契约修正」条目都没找到 = 守卫空转').toBeGreaterThan(0)
     expect(bad).toEqual([])
   })
