@@ -519,6 +519,13 @@ describe('恢复命令的漂移守卫（源码文本）', () => {
       expect(code, `${rel} 未把元数据会话包装进 withTimeoutHint`)
         .toMatch(/withTimeoutHint\(opened\.session,\s*metadataTimeoutHint\(storeLocationOf\(opened\.dbPath/)
     }
+    // ⚠️ 前置检查（`schema_version` 探测）发生在调用方包装**之前** —— 那里漏注入的话，
+    // 同一条命令在探测阶段与正式阶段给出互相矛盾的 hint（Codex 2026-11-05 第四轮 P3）。
+    const dbCode = stripCommentLines(readFileSync(join(SRC, 'commands', 'db.ts'), 'utf8'))
+    expect(dbCode, '前置探测未注入元数据超时 hint（会回落到 query 口径的死路建议）')
+      .toMatch(/const metaHint = withTimeoutHint\(session,\s*metadataTimeoutHint\(storeLocationOf\(config\.path/)
+    expect(dbCode, '前置探测必须经 metaHint 会话执行')
+      .toMatch(/metaHint\.run\(\s*"SELECT table_name FROM information_schema/)
     // 文案本身：不得沿用 query 的口径、必须指向本次的库、占位符替换契约必须一并带上
     const hint = metadataTimeoutHint({ db: '/tmp/x/q.duckdb' })
     expect(hint).not.toContain('缩小时间范围')

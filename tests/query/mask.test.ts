@@ -850,6 +850,71 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
   })
 
+  it('表达式别名（`lower(userPhone) AS p` + `GROUP BY p`）→ 必须报警（Codex 2026-11-05 第四轮 P2 漏报）', () => {
+    // 实测 DuckDB：`SELECT lower(userPhone) AS p, COUNT(*) … GROUP BY p` 返回两行 ——
+    // 按 lower(userPhone) 分组，脱敏后两个号码塌成同一行。整串正则只认「列名紧跟别名」，漏了。
+    const out = maskQueryRows({
+      rows: [
+        { p: '13800138000', n: 1 },
+        { p: '13800138000', n: 1 },
+        { p: '13900139000', n: 1 },
+      ],
+      columns: ['p', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT lower(userPhone) AS p, COUNT(*) AS n FROM sessions GROUP BY p',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('反证：表达式别名不为敏感列分组时不报警（别名属于其它列 / 是聚合项）', () => {
+    // 反方向两条：`session_type` 的别名与敏感列无关；`max(userPhone) AS m` 是聚合值。
+    for (const sql of [
+      "SELECT lower(session_type) AS p, userPhone FROM sessions GROUP BY p",
+      'SELECT max(userPhone) AS m, session_type FROM sessions GROUP BY session_type',
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ p: 'chat', userPhone: '138****8000', m: '138****8000', session_type: 'chat' }],
+        columns: ['p', 'userPhone', 'm', 'session_type'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).not.toContain('GROUP BY / DISTINCT')
+    }
+  })
+
+  it('子查询里先出现 GROUP BY，外层才是真分组 → 必须报警（Codex 2026-11-05 第四轮 P2）', () => {
+    // 实测 DuckDB：外层按 userPhone 分成两组。取「第一个 GROUP BY」会落在子查询上
+    //（那里按 session_type 分组），于是漏掉把手机号压平的那一次分组。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }, { userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone, COUNT(*) AS n FROM (SELECT any_value(userPhone) AS userPhone '
+          + 'FROM sessions GROUP BY session_type) t GROUP BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('只有子查询按敏感列分组、外层不分组 → 不报警（子句归属按括号层级判定）', () => {
+    // 反方向：切片起点必须落在**本层**。外层没有 GROUP BY，内层的分组不改变外层输出。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '138****1111' }],
+      columns: ['userPhone'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone FROM (SELECT any_value(userPhone) AS userPhone '
+          + 'FROM sessions GROUP BY userPhone) t',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n'), '内层 GROUP BY 不是本层的分组').not.toContain('GROUP BY / DISTINCT')
+  })
+
   it('带双引号的别名（`AS "p"` + `GROUP BY p`）→ 必须报警（Codex 2026-11-05 第二轮 P2 漏报）', () => {
     // 实测 DuckDB 接受该写法并按 userPhone 分成两组；`GROUP BY p` 引用的是 "p"。
     const out = maskQueryRows({

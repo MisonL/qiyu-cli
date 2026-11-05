@@ -170,6 +170,32 @@ function sqlSensitiveNames(tables: TableDef[]): string[] {
 }
 
 /**
+ * 只在**顶层**（括号外、字面量/注释已被抹成空格）执行正则，返回的 `index` 是**绝对**下标。
+ *
+ * 用于定位子句起点与 `DISTINCT` 关键字：子查询里的同名子句不算本层的。
+ */
+function execTopLevel(scan: string, re: RegExp): RegExpExecArray | null {
+  let depth = 0
+  let inDouble = false
+  for (let i = 0; i < scan.length; i++) {
+    const ch = scan[i]!
+    if (inDouble) { if (ch === '"') { if (scan[i + 1] === '"') i++; else inDouble = false } continue }
+    if (ch === '"') { inDouble = true; continue }
+    if (ch === '(') { depth++; continue }
+    if (ch === ')') { depth = Math.max(0, depth - 1); continue }
+    if (depth !== 0 || !/[A-Za-z]/.test(ch)) continue
+    if (i > 0 && /[A-Za-z0-9_$]/.test(scan[i - 1]!)) continue
+    // ⚠️ 必须要求 `m.index === 0`：起点正则有的带 `^` 有的不带（`GROUP BY` 那条没有）。
+    // 不校验就会把「切片里任意位置」的匹配错误地改写成「起始于 i」—— 于是第一个字母
+    // 位置就「命中」，切片从错误处开始（实测：所有普通 GROUP BY 查询都不再告警）。
+    // 校验通过后再把下标改写成**绝对**下标 i（调用方按 `m.index + m[0].length` 定位）。
+    const m = new RegExp(re.source, re.flags.replace(/[gy]/g, '')).exec(scan.slice(i))
+    if (m !== null && m.index === 0) { m.index = i; return m }
+  }
+  return null
+}
+
+/**
  * 顶层子句切片：从 `startRe` 匹配处之后切到下一个**顶层**子句关键字（或在结尾）。
  *
  * ⚠️ 为什么需要（Codex 2026-11-05 P2）：分组失真的判据必须看**分组键**本身，
@@ -190,7 +216,10 @@ function sliceClause(
 ): string {
   // 定位作用在「抹掉字面量/注释但等长」的文本上，切片仍取原文（偏移逐位对齐）。
   const scan = withoutLiterals(sql)
-  const m = startRe.exec(scan)
+  // ⚠️ 起点必须找**顶层**的那个（括号外）：`SELECT userPhone … FROM (SELECT … GROUP BY
+  // session_type) t GROUP BY userPhone` 里第一个 `GROUP BY` 在子查询里，取它就会漏掉
+  // 外层真正决定分组的那一个（Codex 2026-11-05 第四轮 P2 实测：漏报分组失真）。
+  const m = execTopLevel(scan, startRe)
   if (m === null) return ''
   const from = m.index + m[0].length
   let depth = 0
@@ -331,26 +360,31 @@ function splitTopLevel(text: string): string[] {
   return out
 }
 
-/** SELECT 列表里「敏感列 [AS] 别名」的别名（用于 `GROUP BY <别名>` 这种写法）。 */
+/**
+ * SELECT 列表里「引用了敏感列的输出项」的别名（用于 `GROUP BY <别名>` 这种写法）。
+ *
+ * ⚠️ 按**选择项**（顶层逗号切分）而不是整串正则来解析（Codex 2026-11-05 第四轮 P2）：
+ * 整串正则只认「列名紧跟别名」，`SELECT lower(userPhone) AS p … GROUP BY p` 这种
+ * **表达式别名**会漏报 —— 实测 DuckDB 按 `lower(userPhone)` 分成两组，脱敏后照样塌成一行。
+ * 逐项解析也让「别名必须属于该项的结尾」这件事由切分本身保证，不需要再拿子句关键字
+ * 做前瞻（`userPhone = 'x'` 这类项不以标识符结尾，自然不产生别名）。
+ *
+ * 判据：
+ *   ① 项形如 `<表达式> [AS] <标识符>`，`<表达式>` 里**引用**敏感列（词边界；字面量已抹掉）；
+ *   ② 别名可以是双引号标识符（`AS "p"`，DuckDB 里 `GROUP BY p` 能引用它），去引号后比较；
+ *   ③ 聚合项不算（`max(userPhone) AS worst` 是聚合值，DuckDB 也不接受按它分组）。
+ */
 function aliasesOf(selectList: string, name: string): string[] {
   const out: string[] = []
-  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const ident = '([A-Za-z_][A-Za-z0-9_]*|"[^"]+")'
-  // ⚠️ 三个条件缺一不可（误报/漏报两个方向都要守住 —— 分组失真警告建议 --no-mask）：
-  //   ① 候选别名是标识符（含**双引号标识符** `AS "p"`，Codex 2026-11-05 P2：DuckDB 里
-  //      `GROUP BY p` 能引用 `"p"` 定义的别名，不认它就漏报）、且不是 SQL 关键字
-  //      （`SELECT userPhone FROM` 里的 FROM 不算别名）；
-  //   ② 候选别名后面紧跟逗号 / 子句关键字 / 结尾 —— `SELECT userPhone AS p, …` 是的，
-  //      而 `SELECT userPhone = 'x' FROM …` 里的 `x` 不是；
-  //   ③ 匹配目标是被选中的**那一列本身**，不是它的字符串字面量（先抹字面量与注释）。
-  const re = new RegExp(
-    `(?:\\b[A-Za-z_][A-Za-z0-9_]*\\s*\\.\\s*)?\\b${esc}\\b\\s+(?:AS\\s+)?${ident}`
-    + '(?=\\s*(?:,|$|\\bFROM\\b|\\bWHERE\\b|\\bGROUP\\b|\\bORDER\\b|\\bLIMIT\\b|\\bHAVING\\b))',
-    'gi',
-  )
-  for (const m of withoutLiterals(selectList).matchAll(re)) {
-    const raw = m[1]
-    if (raw === undefined) continue
+  const nameRe = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+  const aliasRe = /^([\s\S]*\S)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*|"[^"]+")\s*$/i
+  for (const item of splitTopLevel(withoutLiterals(selectList))) {
+    if (isAggregateItem(item)) continue
+    const m = aliasRe.exec(item)
+    const expr = m?.[1]
+    const raw = m?.[2]
+    if (expr === undefined || raw === undefined) continue
+    if (!nameRe.test(expr)) continue
     const alias = raw.startsWith('"') ? raw.slice(1, -1) : raw
     if (!SQL_KEYWORDS.has(alias.toLowerCase()) && !out.includes(alias)) out.push(alias)
   }

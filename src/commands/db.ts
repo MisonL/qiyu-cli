@@ -220,13 +220,19 @@ export async function openGuardedSession(
   try {
     session = await openSandbox(config)
   } catch (e) { return { exit: thrownToQueryExit(e, TABLES, false, storeLocationOf(config.path, profileFlag)) } }
+  // ⚠️ 这次探测同样会超时，而它的超时**先于**调用方的 `withTimeoutHint` 包装发生 ——
+  // 不在这里注入的话，前置检查超时拿到的是 `query` 口径的「缩小时间范围或加过滤条件」，
+  // 而 `db tables` / `db describe` / `stats fields` 根本没有这些参数（Codex 2026-11-05
+  // 第四轮 P3 实测：同一命令在探测阶段与正式阶段给出互相矛盾的 hint）。
+  const metaHint = withTimeoutHint(session,
+    metadataTimeoutHint(storeLocationOf(config.path, profileFlag)))
 
   try {
     // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
     // 口径与实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
     // ⚠️ 成因分形与文案走 `store-precheck.ts` 的 `schemaVersionMissing`（**唯一实现点**，
     // 2026-10-31 收敛；此前 store/db/sync 三份已漂移出不同说法）。
-    const tables = await session.run(
+    const tables = await metaHint.run(
       "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
     const names = tables.rows.map((r) => String(r.table_name))
     const missing = schemaVersionMissing(config.path, names)
