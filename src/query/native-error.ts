@@ -97,6 +97,37 @@ export function isParserError(msg: string): boolean {
 }
 
 /**
+ * 去掉 DuckDB OOM 报文里那段「Possible solutions」。
+ *
+ * 实测原文（2026-11-05，沙箱同款配置 1GB + lock_configuration）：
+ * ```
+ * Out of Memory Error: failed to allocate data of size 16.0 MiB (944.5 MiB/953.6 MiB used)
+ *
+ * Possible solutions:
+ * * Reducing the number of threads (SET threads=X)
+ * * Disabling insertion-order preservation (SET preserve_insertion_order=false)
+ * * Increasing the memory limit (SET memory_limit='...GB')
+ *
+ * See also https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads
+ * ```
+ * 这三条 SET 在 `query` 的只读沙箱里**一条都跑不了**：建连时已 `SET
+ * lock_configuration=true`，实测 `SET memory_limit='8GB'` 报
+ * `Invalid Input Error: Cannot change configuration option "memory_limit" - the
+ * configuration has been locked`。原样透出等于给 Agent 一串「照做必然失败」的命令，
+ * 而 `--sql` 通道又会把这段当成一条可执行语句再吃一次错。
+ *
+ * 截到**最后一个**标记（而不是第一个）：报文会被用户 SQL/列值污染（同族「报文回声」），
+ * 前面出现同样的字面不该让我们少留半句真原因。截掉后 message 只剩成因那行，
+ * 可执行建议由 hint 统一给（两处出口共用 `OOM_HINT`）。
+ */
+export function stripOomSolutions(msg: string): string {
+  const marker = /\n\s*Possible solutions:/gi
+  let cut = -1
+  for (const m of msg.matchAll(marker)) cut = m.index ?? -1
+  return cut === -1 ? msg : msg.slice(0, cut)
+}
+
+/**
  * DuckDB **自己**说内存不足（`Out of Memory Error: failed to allocate …`，探针实测）。
  *
  * ⚠️ 同样不能只搜子串（2026-11-01 审查实测）：`Conversion Error` 会回显列值，

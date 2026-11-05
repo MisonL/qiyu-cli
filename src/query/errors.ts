@@ -22,8 +22,19 @@ import type { StoreLocation } from '../output.js'
 import type { TableDef } from '../store/schema.js'
 import {
   isLayer2Blocked, duckDbSaysMissingName, isOutOfMemory, isBinderOrCatalogError,
-  isParserError, withoutSqlEcho,
+  isParserError, withoutSqlEcho, stripOomSolutions,
 } from './native-error.js'
+
+/**
+ * OOM 的可操作 hint（2026-11-05：两处出口共用一份，避免同一成因两种说法）。
+ *
+ * ⚠️ 不能照抄 DuckDB 报文里的「Possible solutions」：那三条 SET 在只读沙箱里**必然失败**
+ * （`lock_configuration=true`，实测报 `configuration has been locked`）—— 建议一串
+ * 跑不动的命令比不给建议更糟。给的是本通道真能做的动作。
+ */
+export const OOM_HINT = '缩小时间范围、加过滤条件或减少排序/分组的列再试。'
+  + '⚠️ 只读沙箱锁定了配置，DuckDB 报错里建议的 SET memory_limit / threads 等在这里会以 '
+  + 'configuration has been locked 失败，不要照做'
 
 export interface QueryFailure {
   code: string
@@ -309,9 +320,11 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
         }
       }
       // R11：sandbox 的执行期 catch 把 OOM 包成 internal 且（修复后）挂 cause ——
-      // message 保持 sandbox 原文，只补可操作 hint。
+      // message 保持 sandbox 原文，只补可操作 hint。⚠️ 原文里那段「Possible solutions」
+      // 的 SET 在只读沙箱里必然失败（见 `stripOomSolutions` 与 `OOM_HINT`），必须剥掉。
       if (classified.kind === 'internal' && isOutOfMemory(causeMsg)) {
-        f.hint = '缩小时间范围或加过滤条件'
+        f.message = stripOomSolutions(f.message)
+        f.hint = OOM_HINT
       }
     }
     return f
@@ -376,8 +389,8 @@ export function classifyDuckDbError(e: unknown, tables: readonly TableDef[], loc
   if (isOutOfMemory(msg)) {
     return {
       kind: 'internal', code: 'internal', retryable: false,
-      message: `查询内存不足（${msg}）`,
-      hint: '缩小时间范围或加过滤条件',
+      message: `查询内存不足（${stripOomSolutions(msg)}）`,
+      hint: OOM_HINT,
     }
   }
 

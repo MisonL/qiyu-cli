@@ -22,7 +22,7 @@ import { isLockError, retryWithBackoff, isModuleNotFound, classifyOpenFailure, o
 import type { ErrorKind } from '../core/errors.js'
 import type { StoreConfig } from '../store/types.js'
 import { storeInitCommand } from '../output.js'
-import { isInterrupt, isLayer2Blocked, isExtensionAutoloadBlocked } from './native-error.js'
+import { isInterrupt, isLayer2Blocked, isExtensionAutoloadBlocked, isOutOfMemory, stripOomSolutions } from './native-error.js'
 
 export interface SandboxResult {
   columns: string[]
@@ -641,7 +641,11 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
         // 的文件访问发生在执行期，报文与 prepare 期同形 —— 见 `layer2BlockedError`。
         if (isLayer2Blocked(msg)) throw layer2BlockedError()
         if (isExtensionAutoloadBlocked(msg)) throw extensionBlockedError()
-        throw sandboxError('internal', `查询执行失败：${msg}`, {
+        // OOM 报文里那段「Possible solutions」的 SET 在只读沙箱里必然失败
+        // （lock_configuration=true）—— 入口处就剥掉，别让「照做必然失败」的命令流到
+        // stdout（`errors.ts` 的两条 OOM 出口也各剥一次，见 `stripOomSolutions`）。
+        const cleanMsg = isOutOfMemory(msg) ? stripOomSolutions(msg) : msg
+        throw sandboxError('internal', `查询执行失败：${cleanMsg}`, {
           code: 'internal',
           hint: '请检查查询条件；若反复出现请报告此问题',
           cause: e,

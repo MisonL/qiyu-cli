@@ -14,6 +14,7 @@ import { describe, it, expect } from 'vitest'
 import {
   isInterrupt, isLayer2Blocked, isExtensionAutoloadBlocked, withoutSqlEcho,
   duckDbSaysMissingName, isBinderOrCatalogError, isOutOfMemory, isParserError,
+  stripOomSolutions,
 } from '../../src/query/native-error.js'
 
 describe('withoutSqlEcho —— 剥掉 DuckDB 的 SQL 回显', () => {
@@ -197,6 +198,35 @@ describe('分类判据同样只认 DuckDB 自己那句话（回显/列值里的�
     expect(isOutOfMemory(
       "Conversion Error: Could not convert string 'Out of Memory Error: fake' to INT32 when casting from source column x"))
       .toBe(false)
+  })
+})
+
+describe('stripOomSolutions —— 剥掉沙箱里跑不通的「Possible solutions」', () => {
+  // 2026-11-05 探针逐字原文（memory_limit=1GB + lock_configuration=true 真跑）：
+  // 三条 SET 在只读沙箱里全部报 `Cannot change configuration option "…" - the configuration
+  // has been locked`。原样透出 = 给 Agent 一串照做必然失败的命令。
+  const REAL = 'Out of Memory Error: failed to allocate data of size 16.0 MiB (944.5 MiB/953.6 MiB used)\n'
+    + '\nPossible solutions:\n'
+    + '* Reducing the number of threads (SET threads=X)\n'
+    + '* Disabling insertion-order preservation (SET preserve_insertion_order=false)\n'
+    + "* Increasing the memory limit (SET memory_limit='...GB')\n"
+    + '\nSee also https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads'
+
+  it('真报文：截到成因行，建议段与 See also 链接一起剥掉', () => {
+    expect(stripOomSolutions(REAL)).toBe(
+      'Out of Memory Error: failed to allocate data of size 16.0 MiB (944.5 MiB/953.6 MiB used)')
+  })
+  it('没有标记时原样返回（幂等：已剥过的报文再过一次不变）', () => {
+    const head = 'Out of Memory Error: failed to allocate data of size 8.0 GiB'
+    expect(stripOomSolutions(head)).toBe(head)
+    expect(stripOomSolutions(stripOomSolutions(REAL))).toBe(stripOomSolutions(REAL))
+  })
+  it('标记出现在报文前半段（用户 SQL/列值回声）→ 截到**最后一个**标记，不吞掉真原因', () => {
+    // 边界如实记录：判据是字面标记，用户文本里出现同一句时，最后一处之前的内容都会保留
+    const polluted = 'Out of Memory Error: bad value "Possible solutions: x"\n'
+      + 'still duckdb explaining\n\nPossible solutions:\n* SET memory_limit=x'
+    expect(stripOomSolutions(polluted)).toBe(
+      'Out of Memory Error: bad value "Possible solutions: x"\nstill duckdb explaining')
   })
 })
 

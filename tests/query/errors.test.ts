@@ -107,18 +107,30 @@ describe('原生报错 → 中文 + 候选（spec §十一）', () => {
     expect(wrapped.message.startsWith('SQL 语法错误')).toBe(true)
   })
 
-  it('Out of Memory Error → internal + 缩小范围 hint', () => {
+  it('Out of Memory Error → internal + 可操作 hint（不照抄沙箱里跑不通的 SET 建议）', () => {
+    // 2026-11-05 探针逐字原文：报文自带「Possible solutions」三条 SET，而只读沙箱
+    // lock_configuration=true —— 实测 `SET memory_limit='8GB'` 报 configuration has been locked。
     const e = new Error(
-      'Out of Memory Error: failed to allocate data of size 8.0 GiB (1.0 GiB/1.0 GiB used)',
+      'Out of Memory Error: failed to allocate data of size 16.0 MiB (944.5 MiB/953.6 MiB used)\n'
+      + '\nPossible solutions:\n'
+      + '* Reducing the number of threads (SET threads=X)\n'
+      + '* Disabling insertion-order preservation (SET preserve_insertion_order=false)\n'
+      + "* Increasing the memory limit (SET memory_limit='...GB')\n"
+      + '\nSee also https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads',
     )
     const f = classifyDuckDbError(e, TABLES)
     expect(f.kind).toBe('internal')
     expect(f.code).toBe('internal')
     expect(f.retryable).toBe(false)
-    expect(f.hint).toBe('缩小时间范围或加过滤条件')
+    expect(f.hint).toContain('缩小时间范围')
+    expect(f.hint, '必须点破 SET 在沙箱里跑不通').toContain('configuration has been locked')
     // 不裸透：中文开头，原文在括号里
     expect(f.message.startsWith('查询内存不足')).toBe(true)
     expect(f.message).toContain('Out of Memory Error')
+    // 建议段落必须剥掉（含 See also 链接）—— 原样透出就是给 Agent 一串照做必然失败的命令
+    expect(f.message).not.toContain('Possible solutions')
+    expect(f.message).not.toContain('SET memory_limit')
+    expect(f.message).not.toContain('See also')
   })
 
   it('无原生候选时从 TABLES 计算前缀/编辑距离候选', () => {
@@ -364,16 +376,22 @@ describe('sandbox 包装错误：cause 带原生表/列错误时补算中文消�
     })
   })
 
-  it('R11：internal + cause 含 Out of Memory Error → 补「缩小范围」hint，message 不变', () => {
-    const e = Object.assign(new Error('查询执行失败：Out of Memory Error: failed to allocate 8.0 GiB'), {
+  it('R11：internal + cause 含 Out of Memory Error → 补可操作 hint，message 剥掉 SET 建议', () => {
+    const e = Object.assign(new Error(
+      '查询执行失败：Out of Memory Error: failed to allocate 8.0 GiB\n\nPossible solutions:\n'
+      + '* Increasing the memory limit (SET memory_limit=\'...GB\')',
+    ), {
       kind: 'internal', code: 'internal', retryable: false,
       cause: native('Out of Memory Error: failed to allocate data of size 8.0 GiB'),
     })
-    expect(classifyDuckDbError(e, TABLES)).toEqual({
+    const f = classifyDuckDbError(e, TABLES)
+    expect(f).toMatchObject({
       kind: 'internal', code: 'internal', retryable: false,
       message: '查询执行失败：Out of Memory Error: failed to allocate 8.0 GiB',
-      hint: '缩小时间范围或加过滤条件',
     })
+    expect(f.hint).toContain('缩小时间范围')
+    expect(f.hint).toContain('configuration has been locked')
+    expect(f.message).not.toContain('Possible solutions')
   })
 })
 
@@ -427,8 +445,9 @@ describe('thrownToQueryExit：usage 双通道退出码 2，其余 fail 退出码
     expect(j.ok).toBe(false)
     expect(j.error).toMatchObject({
       code: 'internal', kind: 'internal', retryable: false,
-      hint: '缩小时间范围或加过滤条件',
     })
+    expect(String(j.error.hint)).toContain('缩小时间范围')
+    expect(String(j.error.hint)).toContain('configuration has been locked')
     expect(j.error.message.startsWith('查询内存不足')).toBe(true)
     expect(err).toBe('')
   })
