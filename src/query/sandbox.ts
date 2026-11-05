@@ -34,6 +34,30 @@ export interface SandboxRunOptions {
   params?: unknown[]
   limit?: number
   timeoutMs?: number
+  /**
+   * 超时时的 hint。默认是 `query` 通道的可执行建议（缩小时间范围/加过滤条件）；
+   * `db tables` / `db describe` / `stats fields` 不接受任何过滤参数，由 `withTimeoutHint`
+   * 注入它们自己的说法 —— 让它们共用 `query` 的文案等于给一条走不通的路（2026-11-05 审查）。
+   */
+  timeoutHint?: string
+}
+
+/** 超时的默认 hint（`query` 两个通道的可执行建议；其余命令经 `withTimeoutHint` 覆盖）。 */
+export const DEFAULT_TIMEOUT_HINT = '请缩小时间范围或加过滤条件，把查询收窄到能在超时内完成'
+
+/**
+ * 把同一个超时 hint 注入到会话的**每一次**查询（元数据命令没有可调过滤参数）。
+ *
+ * 用包装而不是在每个 `session.run` 上逐个传参：`db tables` 一次要跑十几条内部查询，
+ * 漏传任何一条，那条超时就会拿到 `query` 口径的假建议 —— 也就是本包装要修的那个缺陷。
+ */
+export function withTimeoutHint(session: SandboxSession, hint: string): SandboxSession {
+  return {
+    run: (sql, opts) => session.run(sql, {
+      ...opts, ...(opts?.timeoutHint === undefined ? { timeoutHint: hint } : {}),
+    }),
+    close: () => session.close(),
+  }
 }
 
 export interface SandboxSession {
@@ -627,12 +651,14 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
         // 形态与边界见那里的注释。
         if (isInterrupt(msg)) {
           // 实测：interrupt 约 300ms 生效，中断后连接仍可用（探针 6/9）。
-          // ⚠️ hint 不得点名 `--timeout`（审查 I-4）：只有 `query` 接受该 flag，
+          // ⚠️ 默认 hint 不得点名 `--timeout`（审查 I-4）：只有 `query` 接受该 flag，
           // `db tables` / `db describe` / `stats fields` 共用本出口，建议一个它们
           // 不认的参数等于给一条走不通的路（`未知参数：--timeout`，退出码 2）。
+          // ⚠️ 「缩小时间范围或加过滤条件」对元数据命令同样走不通（2026-11-05 审查）：
+          // 它们没有 --since/--limit —— 调用方经 `withTimeoutHint` 换成自己的说法。
           throw sandboxError('query_timeout', `查询超过 ${timeoutMs}ms 未完成，已中断`, {
             code: 'query_timeout',
-            hint: '请缩小时间范围或加过滤条件，把查询收窄到能在超时内完成',
+            hint: opts.timeoutHint ?? DEFAULT_TIMEOUT_HINT,
           })
         }
         // 裁决 R11：执行期原生错误也挂 cause —— errors.ts 从原文补 OOM 的可操作 hint

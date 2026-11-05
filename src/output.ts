@@ -242,6 +242,19 @@ export function querySqlCommand(loc?: StoreLocation): string {
 }
 
 /**
+ * `db tables` / `db describe` / `stats fields` 的超时 hint（2026-11-05 审查修）。
+ *
+ * 这三个命令的查询是**整表统计**，不接受 `--since`/`--until`/`--limit` —— `query` 那句
+ * 「缩小时间范围或加过滤条件」对它们是一条走不通的路。可执行的替代只有：稍后重试，
+ * 或改用 `query --sql`（它才有 `--timeout`）。渲染器指向本次的库，占位符替换契约一并带上。
+ */
+export function metadataTimeoutHint(loc?: StoreLocation): string {
+  return '本命令的统计按整表进行，没有可调的过滤参数；可稍后重试，或改用 `'
+    + querySqlCommand(loc) + '` 单独执行同类统计（该通道支持 --timeout 调整超时预算，'
+    + '0 = 不限时；' + SQL_ARG_REPLACE_NOTE + '）'
+}
+
+/**
  * 单个参数值的 shell 渲染：安全集内裸渲染，其余单引号包裹。
  * POSIX 安全集取自 Python `shlex.quote`（`[A-Za-z0-9_@%+=:,./-]`）；**win32 安全集更窄**
  *（去掉 `@` `%` `,`）—— PowerShell 下裸 `a,b` 会变成 `Object[]`、前导 `@` 是 splatting、

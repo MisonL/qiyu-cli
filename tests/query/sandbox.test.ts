@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { openSandbox, memoryLimitBytes, type SandboxSession } from '../../src/query/sandbox.js'
+import { openSandbox, memoryLimitBytes, withTimeoutHint, type SandboxSession } from '../../src/query/sandbox.js'
 import type { StoreConfig } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s，与 tests/store/duckdb.test.ts 同款放宽到 15s。
@@ -637,6 +637,35 @@ describe('白名单与截断', () => {
       expect((await s.run('SELECT 1 AS x')).rows).toEqual([{ x: 1 }])
     } finally {
       await s.close()
+    }
+  })
+})
+
+describe('withTimeoutHint —— 元数据命令的超时 hint 不得沿用 query 的说法', () => {
+  // 2026-11-05 审查：`db tables` / `db describe` / `stats fields` 没有 --since/--limit，
+  // query 的「缩小时间范围或加过滤条件」对它们是一条走不通的路，而三者共用同一个超时出口。
+  it('包装后每条查询都拿到自定义 hint；单条显式值优先；未包装仍是默认', async () => {
+    const { path } = await mkDb()
+    const s = await openSandbox(cfgFor(path))
+    const wrapped = withTimeoutHint(s, '本命令的统计按整表进行')
+    try {
+      const e = await expectReject(
+        wrapped.run('SELECT COUNT(*) FROM range(100000000000)', { timeoutMs: 50 }),
+        { kind: 'query_timeout', code: 'query_timeout' })
+      expect(e.hint).toBe('本命令的统计按整表进行')
+      // 单条显式 timeoutHint 优先（包装只补缺省，不覆盖调用方）
+      const e2 = await expectReject(
+        wrapped.run('SELECT COUNT(*) FROM range(100000000000)', { timeoutMs: 50, timeoutHint: '自定义建议' }),
+        { kind: 'query_timeout' })
+      expect(e2.hint).toBe('自定义建议')
+      // 未包装：默认仍是 query 口径（缩小过滤条件）
+      const e3 = await expectReject(
+        s.run('SELECT COUNT(*) FROM range(100000000000)', { timeoutMs: 50 }), { kind: 'query_timeout' })
+      expect(e3.hint).toContain('缩小时间范围')
+      // 包装不改变正常查询的结果
+      expect((await wrapped.run('SELECT 1 AS x')).rows).toEqual([{ x: 1 }])
+    } finally {
+      await wrapped.close()
     }
   })
 })

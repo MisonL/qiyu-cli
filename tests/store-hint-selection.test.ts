@@ -27,6 +27,7 @@ import { syncCommand } from '../src/commands/sync.js'
 import { storeInitCommand, syncRunCommand, shellArg } from '../src/output.js'
 import {
   dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand, querySqlCommand,
+  metadataTimeoutHint,
 } from '../src/output.js'
 import { createDuckDbStore } from '../src/store/duckdb.js'
 import { markPending } from '../src/sync/state.js'
@@ -508,6 +509,24 @@ describe('恢复命令的漂移守卫（源码文本）', () => {
     ['output.ts', '诊断命令渲染器本身（唯一实现点）'],
     [join('commands', 'api.ts'), 'api call 不吃 --db/--profile，裸命令即本次解析结果'],
   ])
+
+  it('db tables/describe 与 stats fields 的会话必须注入元数据超时 hint（否则超时给出 query 口径的死路建议）', () => {
+    // 2026-11-05 审查：三个元数据命令没有 --since/--limit，超时出口却与 query 共用
+    // 「缩小时间范围或加过滤条件」。`withTimeoutHint` 是注入点 —— 任何一处漏了，
+    // 那条内部查询超时就会给出照做必然失败的建议（db tables 一次要跑十几条）。
+    for (const rel of [join('commands', 'db.ts'), join('commands', 'stats.ts')]) {
+      const code = stripCommentLines(readFileSync(join(SRC, rel), 'utf8'))
+      expect(code, `${rel} 未把元数据会话包装进 withTimeoutHint`)
+        .toMatch(/withTimeoutHint\(opened\.session,\s*metadataTimeoutHint\(storeLocationOf\(opened\.dbPath/)
+    }
+    // 文案本身：不得沿用 query 的口径、必须指向本次的库、占位符替换契约必须一并带上
+    const hint = metadataTimeoutHint({ db: '/tmp/x/q.duckdb' })
+    expect(hint).not.toContain('缩小时间范围')
+    expect(hint).not.toContain('加过滤条件')
+    expect(hint).toContain('qiyu query --sql')
+    expect(hint, '恢复命令必须指向本次的库').toContain('/tmp/x/q.duckdb')
+    expect(hint, '占位符在引号里，替换契约必须一并说明').toContain('整段替换')
+  })
 
   it('源码里不得再出现裸的只读诊断命令（必须经 dbTablesCommand 等渲染器）', () => {
     const offenders: string[] = []
