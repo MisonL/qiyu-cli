@@ -97,6 +97,15 @@ describe('图例本身：键集、形态与枚举双向', () => {
       expect(Object.keys(describeFieldNotes()), `columns 条目字段 ${k} 没有释义`)
         .toContain(`columns[].${k}`)
     }
+    // 嵌套层同理：`time_column` 是 `{name, kind}` 或 null，key 的枚举释义必须挂在
+    // `time_column.kind` 上（2026-11-05 审查：此前枚举直接挂在 `time_column` 上，
+    // 反向解析会读成「time_column 本身有三个取值」；null 的含义也没有出处）。
+    const tc = data().time_column as Record<string, unknown>
+    for (const k of Object.keys(tc)) {
+      if (k === 'name') continue
+      expect(Object.keys(describeFieldNotes()), `time_column 字段 ${k} 没有释义`)
+        .toContain(`time_column.${k}`)
+    }
   })
 
   it('tables 的图例键集 == 真实 meta 键集（含 field_notes 必须存在）', async () => {
@@ -124,19 +133,24 @@ describe('图例本身：键集、形态与枚举双向', () => {
   it('time_column.kind 枚举 ⊆ 图例、图例 ⊆ 枚举（双向）', () => {
     expect([...TIME_COLUMN_KINDS].sort()).toEqual(['epoch-ms', 'iso-day', 'iso-instant'])
     expect(Object.keys(TIME_COLUMN_KIND_NOTES).sort()).toEqual([...TIME_COLUMN_KINDS].sort())
-    const cell = describeFieldNotes().time_column!
+    // 枚举挂在 `time_column.kind` 上（路径即事实：取值在 kind 字段里，不在 time_column 上）
+    const cell = describeFieldNotes()['time_column.kind']!
     for (const v of TIME_COLUMN_KINDS) expect(cell, `图例缺 ${v}`).toContain(`${v} = `)
     // 单元格必须是**纯枚举**（`a = 释义；b = 释义`）—— 混入前缀说明会让反向解析
     // 少一个取值（本文件初版就踩过：前缀句与 iso-day 粘成一段）。
     const keys = cell.split('；').map((seg) => seg.split(' = ')[0]!.trim())
     expect(keys.sort()).toEqual([...TIME_COLUMN_KINDS].sort())
+    // `time_column` 本身不再是枚举单元格：它要讲字段形态与 null 的唯一含义
+    const field = describeFieldNotes().time_column!
+    expect(field, 'time_column 必须说明 null 的含义').toContain('没有声明时间列')
+    expect(field, 'time_column 必须把枚举指向 kind').toContain('time_column.kind')
   })
 
   it('field_notes 不带 `**`、正文不含分隔符 `；`（枚举单元格除外）', () => {
     for (const [name, fn] of [['describe', describeFieldNotes], ['tables', tablesFieldNotes]] as const) {
       for (const [k, v] of Object.entries(fn())) {
         expect(v, `${name}.${k} 含 **`).not.toContain('**')
-        if (k !== 'time_column') expect(v, `${name}.${k} 含分隔符 ；`).not.toContain('；')
+        if (k !== 'time_column.kind') expect(v, `${name}.${k} 含分隔符 ；`).not.toContain('；')
       }
     }
     for (const [k, v] of Object.entries(TIME_COLUMN_KIND_NOTES)) {

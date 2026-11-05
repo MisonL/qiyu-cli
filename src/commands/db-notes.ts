@@ -59,10 +59,15 @@ export function describeFieldNotes(): Record<string, string> {
       + '⚠️ query --table 默认按列精确脱敏（--no-mask 可关闭，关闭后就是原始 PII），'
       + '而 query --sql 不走列白名单、只有列名级与值级兜底——不要把 --sql 的输出当成已脱敏。'
       + '一律不要 SELECT *',
+    // ⚠️ 枚举释义挂在 `time_column.kind` 上（2026-11-05 审查修）：枚举值属于 kind 字段，
+    // 挂在 `time_column` 上会被反向解析读成「time_column 本身有三个取值」，而它实际是
+    // `{name, kind}` 或 null。本键只讲字段本身与 null 的含义。
+    time_column: '声明里的时间列（{name, kind}，来自本 CLI 的表定义，不是库里的实况）。'
+      + 'null = 该表没有声明时间列（此时 time_range 也为 null，不能按时间过滤）。'
+      + 'kind 的三个取值见 time_column.kind',
     // ⚠️ 本单元格必须是**纯枚举**（`a = 释义；b = 释义`）：反向解析靠这个形状。
-    // 「它也是声明」这条已写进 columns 的释义，别塞回这里（塞进来会让 iso-day 与
-    // 前缀句粘成一段，反向解析少一个取值 —— 本文件初版就是这么错的）。
-    time_column: renderNotes(TIME_COLUMN_KIND_NOTES),
+    // 「它也是声明」这条已写进 columns 与 time_column 的释义，别塞回这里。
+    'time_column.kind': renderNotes(TIME_COLUMN_KIND_NOTES),
     row_count: '库中该表的真实行数（COUNT(*)，不是估算）。null = 表不在库中，'
       + '这是唯一的 null 成因。此时 columns 等字段仍是声明元数据，不要当成库里有这张表',
     time_range: '时间列在整表范围内的 MIN/MAX（+08:00 ISO，只算形态合法的行）。'
