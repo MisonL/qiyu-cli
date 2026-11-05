@@ -122,6 +122,53 @@
 
 ### 修复
 
+- **同步与调度的九处契约修正（2026-11-05 独立审查）**：
+
+  · **launchd 的 Weekday 被整体后移一天**：cron 与 launchd 是**同一套**周几编号
+    （man launchd.plist：「0 and 7 are Sunday」，1 = 周一），旧代码 `v + 1` 让
+    「周一执行」装成周日，**每条按周计划都错一天**；而测试把错误行为钉成了期望值
+    （断言 cron 1 → launchd 2）。去掉偏移并改正两处断言。
+  · **`sessions.export` 的缺 id 行造成整窗回滚**：缺 id 行此前留到 enrich 才丢，而
+    `apiCount` 按**丢弃前**的行数取好 —— written < expected → 整窗 count_mismatch
+    回滚（连正常行一起丢），gap 只说「应写 N 实际 M」不点名成因。改为 fetch 侧过滤、
+    apiCount 取过滤后行数、丢弃记 `row_missing_key` gap（与 reports 族同一口径）。
+    键取值同时收敛到单一实现点 `sessionKeyOf`：此前 fetch 用 `session_id ?? id`、
+    投影用 `id ?? session_id`，写反时 `{id:'', session_id:'x'}` 会在 fetch 判「有键」、
+    在 enrich 判「缺键」，又回到整窗回滚。
+  · **cron 分隔符只接受空格与 Tab**：`trim()` / `split(/\s+/)` 会把 CR/LF/U+00A0/
+    U+2028 当空白放过，而 schedule 原文又原样进 crontab 兜底行与回显 —— 实测
+    `0 0 *\r* *` 解析成合法 5 段、兜底行里是字面 CR（cron 整行失效），
+    `0 0 * * *\n` 把一条计划劈成两行。与 `assertSchedulable` 同族：显式拒绝不清洗。
+  · **linux 卸载把 daemon-reload 跑在删文件之前**：命令层是「跑完 commands 再删文件」，
+    于是 reload 的仍是即将被删的 unit，删完后没人让 systemd 忘掉它（notes 却写着
+    「再删除 unit 文件并 daemon-reload」）。`UninstallPlan` 拆出 `postRemoveCommands`，
+    删完后执行；dry-run 输出 `post_remove_commands`（条件键，只有 linux 有），
+    `--yes` 的 `commands[]` 按真实次序汇总。
+  · **schtasks 分钟计划的相位漂移**：`/SC MINUTE /MO N` 缺 `/ST` 时起始时刻取
+    「本机当前时刻」，`*/30` 会装成「安装那一刻 + 30 分」的相位（14:07 装 →
+    :07/:37），而 cron 是 :00/:30。补 `/ST 00:MM`（与 HOURLY 支同款锚相位）。
+  · **schtasks 每月计划用多日 `/D`**：`/SC MONTHLY /D` 只接受一个日期（文档原文），
+    `0 0 1,15 * *` 此前被 join 成 `/D 1,15`，dry-run 先给出一个装了也会被拒的计划。
+    多日显式落 `unmappable`。
+  · **systemd `ExecStart=` 孤立一个 `;` 未转义**：裸 `;` 是命令分隔符，会把一条
+    ExecStart 劈成两条命令（systemd.service(5)：「An argument solely consisting of
+    ";" must be escaped, i.e. specified as "\;"」）。`a;b` 这类值不受影响。
+  · **快照任务不用 `apiCount`**：windowed 与 `sync verify` 都把它当配对核对基准，快照
+    只用 `kept.length` —— 同一字段三条路径三种读法，上游声明多于解析结果时只有快照
+    静默吞掉。统一为 `apiCount ?? kept.length`（当前所有快照任务取过滤后行数，行为
+    零漂移）。
+  · **四处图例口径**：`rows.written` 补「快照的 count_mismatch / write_failed 记 0
+    （偏小而非偏大）」并修正 README「落库行数」的绝对说法；`rows.fetched` 改为
+    「进入引擎的行数」并点明 fetch 侧丢弃行不计入；`range_status.pending` 的「每轮
+    开跑就置 pending」收窄为「有可执行窗口的轮次」；`commands[].command` 点明是 argv
+    空格拼接、不能直接粘进 shell（win32 的 `/TR` 本身就是命令串）。
+
+  守卫同步：`assertLegendMatches` 的条件键豁免改为按前缀匹配（`post_remove_commands`
+  派生的元素键一并豁免），并新增 linux 正向用例 —— 条件键在它真正的平台上必须出现，
+  否则「标成条件键」会变成让守卫闭嘴的借口；元素释义从同一份 `SYNC_COMMAND_NOTES`
+  派生，避免两处文案漂移。变异 11 处全红（launchd 偏移、sessionKeyOf、fetch 侧丢弃、
+  分隔符守卫、卸载次序、`/ST`、多日 `/D`、孤立 `;`、快照 apiCount、图例字符、图例键）。
+
 - **注册表与 api 图例的七处契约修正（2026-11-04 独立审查）**：
 
   · **`export.session` / `export.session.check` 的唯一载荷被丢弃并谎报「无数据」**：
