@@ -201,7 +201,14 @@ function depError(e: unknown): SandboxError {
   )
 }
 
-/** ro 撞写锁退避超限 → store_locked（消息/hint 与 store/duckdb.ts 同款，spec §5.2）。 */
+/**
+ * ro 撞锁退避超限 → store_locked（spec §5.2）。
+ *
+ * ⚠️ 与 `store/duckdb.ts` 的写者撞锁**有意不同措辞**（此前注释写「同款」，已不成立）：
+ * DuckDB 是「写者独占 / 读者共享」—— 只读打开被挡时持有者**必然是写者**，说「被写进程
+ * 占用」是准确的；而写者撞锁时持有者可能是只读会话，那边必须说「被其他进程占用」
+ *（CodeRabbit PR #68 第十三轮）。
+ */
 function lockedError(cfg: StoreConfig): SandboxError {
   return sandboxError(
     'store_locked',

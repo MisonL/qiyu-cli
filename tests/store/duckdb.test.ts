@@ -562,7 +562,7 @@ describe('duckdb —— init 与关闭', () => {
           expect(err).toMatchObject({
             kind: 'store_locked',
             retryable: true,
-            hint: expect.stringMatching(/写锁/),
+            hint: expect.stringMatching(/另一个进程正持有该数据库的锁/),
           })
           expect(sleep).not.toHaveBeenCalled()   // 写者不退避（spec §5.2）
           asserted = true
@@ -661,8 +661,11 @@ describe('duckdb —— init 与关闭', () => {
             message: expect.stringMatching(/被其他进程占用/),
             hint: expect.stringMatching(/只读会话同样会挡住写者/),
           })
-          // 归因必须正确：不能说成「被写进程占用」
+          // 归因必须正确：不能说成「被写进程占用」；提示里也不能出现「写锁」——
+          // READ_ONLY 持有的是共享锁，说「写锁」等于把同一句的后半段（持有者可能是只读
+          // 会话）自我否定，Agent 照样会去等一个并不存在的写进程（CodeRabbit 第十三轮 minor）
           expect(err.message).not.toMatch(/被写进程占用/)
+          expect(err.hint).not.toMatch(/写锁/)
           asserted = true
         }
         if (opened) continue   // 锁落盘竞态窗口，换轮重来

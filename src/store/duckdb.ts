@@ -110,7 +110,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         const err = new Error(`数据库被其他进程占用：${cfg.path}`)
         ;(err as { kind?: string }).kind = 'store_locked'
         ;(err as { retryable?: boolean }).retryable = true
-        ;(err as { hint?: string }).hint = '另一个进程正持有该数据库写锁（持有者不一定是写进程：只读会话同样会挡住写者）。请等它退出后重试；可用 lsof 该库文件查看持库进程'
+        ;(err as { hint?: string }).hint = '另一个进程正持有该数据库的锁（持有者不一定是写进程：只读会话同样会挡住写者）。请等它退出后重试；可用 lsof 该库文件查看持库进程'
         throw err
       }
       throw e
