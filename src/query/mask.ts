@@ -297,6 +297,18 @@ function isAggregateItem(item: string): boolean {
  * **按常量分组**（实测一行 `n=2`），但字面量里恰好写着列名时，按原文本搜索会谎报分组失真。
  * 双引号是**标识符**（`"userPhone"` 就是那一列），不抹。
  */
+/**
+ * 把用户/元数据给出的标识符转义成可安全拼进 `RegExp` 的字面量。
+ *
+ * ⚠️ 别名由用户提供（`SELECT userPhone AS "p("`），DuckDB 实测接受带正则元字符的别名；
+ * 不转义时 `new RegExp('\\bp(\\b')` 直接抛 `SyntaxError` —— 查询本身**已经成功**，
+ * 却因为脱敏阶段崩掉而让整条命令报 internal、一行数据都拿不回来
+ *（CodeRabbit PR #68 第六轮 minor，实测 `"p("`/`"[x"` 两种形态都抛）。
+ */
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 function withoutLiterals(text: string): string {
   let out = ''
   // ⚠️ 被抹掉的字符一律换成等长空格：下标与原文**逐位对齐**，`sliceClause` 才能在抹过的
@@ -376,7 +388,7 @@ function splitTopLevel(text: string): string[] {
  */
 function aliasesOf(selectList: string, name: string): string[] {
   const out: string[] = []
-  const nameRe = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+  const nameRe = new RegExp(`(?<![A-Za-z0-9_$])${escapeRe(name)}(?![A-Za-z0-9_$])`, 'i')
   const aliasRe = /^([\s\S]*\S)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*|"[^"]+")\s*$/i
   for (const item of splitTopLevel(withoutLiterals(selectList))) {
     if (isAggregateItem(item)) continue
@@ -627,11 +639,15 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 方向按 spec §十五.4：缺口警告宁多勿少（`WHERE session_type = 'userPhone'` 会多报一条，
   // 这是可接受的代价）。
   const referencedSensitive = sensitiveNames
-    .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(mode.sql))
+    .filter((n) => new RegExp(`(?<![A-Za-z0-9_$])${escapeRe(n)}(?![A-Za-z0-9_$])`, 'i').test(mode.sql))
   const referencesSensitive = referencedSensitive.length > 0
+  // 边界用「前后不是标识符字符」而不是 `\\b`：别名可以带标点（`"p("`），
+  // 而 `\\b` 只在词字符与非词字符之间成立 —— `\\bp(\\b` 即使不抛也永远匹配不上
+  // `GROUP BY "p("` 里的 `p(`。转义 + lookaround 两个方向都对（CodeRabbit 第六轮 minor）。
   const wordHit = (text: string, names: readonly string[]): boolean => {
     const plain = withoutLiterals(text)
-    return names.some((n) => new RegExp(`\\b${n}\\b`, 'i').test(plain))
+    return names.some((n) => new RegExp(
+      `(?<![A-Za-z0-9_$])${escapeRe(n)}(?![A-Za-z0-9_$])`, 'i').test(plain))
   }
   const groupedSensitive = new Set<string>()
   const selectList = withoutLiterals(sliceClause(

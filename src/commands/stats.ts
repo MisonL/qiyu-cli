@@ -285,7 +285,7 @@ async function statsFields(argv: string[]): Promise<number> {
 
   const opened = await openGuardedSession({
     db: flags.db, profile: flags.profile, backend: flags.backend,
-  })
+  }, metadataTimeoutHint)
   if ('exit' in opened) return opened.exit
   // 超时 hint 换成元数据命令的说法（本命令没有可调过滤参数，query 那句对它是死路）。
   const session = withTimeoutHint(opened.session,

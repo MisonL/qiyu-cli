@@ -613,6 +613,10 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
   // 配置解析 → 库前置检查 → 打开沙箱 → schema_version 探测：E 族三个命令共用同一条
   // 路径（db.ts 的 openGuardedSession）。合并的理由见那里的注释：探测口径与文案
   // 一旦三处各写一份，Agent 会在不同命令上得到互相矛盾的解释（架构审查 Important #2）。
+  // ⚠️ 不传探测超时 hint：本命令**有** --since/--until/--limit/--timeout，探测也用
+  // `DEFAULT_TIMEOUT_HINT`（「缩小时间范围或加过滤条件」）才对。传元数据口径会让
+  // 探测超时时建议用户改用 `qiyu query --sql` —— 正是他正在跑的命令
+  //（CodeRabbit 2026-11-05 第六轮 minor）。
   const opened = await openGuardedSession({
     db: flags.db, profile: flags.profile, backend: flags.backend,
   })

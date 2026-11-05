@@ -196,6 +196,7 @@ function dirtyTimeWarning(
  */
 export async function openGuardedSession(
   flags: StoreFlags,
+  probeTimeoutHint?: (loc: StoreLocation) => string,
 ): Promise<{ session: SandboxSession; dbPath: string; profileFlag?: string } | { exit: number }> {
   let config: StoreConfig
   let profileFlag: string | undefined
@@ -224,8 +225,11 @@ export async function openGuardedSession(
   // 不在这里注入的话，前置检查超时拿到的是 `query` 口径的「缩小时间范围或加过滤条件」，
   // 而 `db tables` / `db describe` / `stats fields` 根本没有这些参数（Codex 2026-11-05
   // 第四轮 P3 实测：同一命令在探测阶段与正式阶段给出互相矛盾的 hint）。
-  const metaHint = withTimeoutHint(session,
-    metadataTimeoutHint(storeLocationOf(config.path, profileFlag)))
+  // ⚠️ 但 hint 由**调用方**决定（CodeRabbit 2026-11-05 第六轮 minor）：`query` 也走本函数，
+  // 它**有** --since/--limit/--timeout，探测超时沿用 `DEFAULT_TIMEOUT_HINT` 才对 ——
+  // 无脑注入元数据口径，会让 `query` 探测超时时建议「改用 qiyu query --sql」这条它正在跑的路。
+  const loc = storeLocationOf(config.path, profileFlag)
+  const metaHint = probeTimeoutHint === undefined ? session : withTimeoutHint(session, probeTimeoutHint(loc))
 
   try {
     // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
@@ -262,7 +266,7 @@ async function dbTables(argv: string[]): Promise<number> {
   try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
   if (flags.rest.length > 0) return usageFail(`未知参数：${describeArgs(flags.rest)}`)
 
-  const opened = await openGuardedSession(flags)
+  const opened = await openGuardedSession(flags, metadataTimeoutHint)
   if ('exit' in opened) return opened.exit
   // 超时 hint 换成元数据命令的说法（本命令没有可调过滤参数，query 那句对它是死路）。
   const session = withTimeoutHint(opened.session,
@@ -401,7 +405,7 @@ async function dbDescribe(argv: string[]): Promise<number> {
         : '用 `' + dbTablesCommand(storeLocationFromFlags(flags)) + '` 查看可用表')
   }
 
-  const opened = await openGuardedSession(flags)
+  const opened = await openGuardedSession(flags, metadataTimeoutHint)
   if ('exit' in opened) return opened.exit
   // 超时 hint 换成元数据命令的说法（本命令没有可调过滤参数，query 那句对它是死路）。
   const session = withTimeoutHint(opened.session,

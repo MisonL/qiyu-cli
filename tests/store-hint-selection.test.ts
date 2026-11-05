@@ -521,11 +521,22 @@ describe('恢复命令的漂移守卫（源码文本）', () => {
     }
     // ⚠️ 前置检查（`schema_version` 探测）发生在调用方包装**之前** —— 那里漏注入的话，
     // 同一条命令在探测阶段与正式阶段给出互相矛盾的 hint（Codex 2026-11-05 第四轮 P3）。
+    // 但 hint 必须由**调用方**给（CodeRabbit 2026-11-05 第六轮 minor）：`query` 也走这里，
+    // 它自己就有 --since/--limit/--timeout，探测沿用 `DEFAULT_TIMEOUT_HINT` 才对。
     const dbCode = stripCommentLines(readFileSync(join(SRC, 'commands', 'db.ts'), 'utf8'))
-    expect(dbCode, '前置探测未注入元数据超时 hint（会回落到 query 口径的死路建议）')
-      .toMatch(/const metaHint = withTimeoutHint\(session,\s*metadataTimeoutHint\(storeLocationOf\(config\.path/)
+    expect(dbCode, '前置探测未接入调用方给的 hint（会回落到 query 口径的死路建议）')
+      .toMatch(/const metaHint = probeTimeoutHint === undefined \? session : withTimeoutHint\(session, probeTimeoutHint\(loc\)\)/)
     expect(dbCode, '前置探测必须经 metaHint 会话执行')
       .toMatch(/metaHint\.run\(\s*"SELECT table_name FROM information_schema/)
+    // 元数据命令必须把渲染器传进去；query 不得传（否则探测给出「改用 qiyu query --sql」）
+    expect(dbCode, 'db tables/describe 未把元数据 hint 传给前置探测')
+      .toMatch(/openGuardedSession\(flags, metadataTimeoutHint\)/)
+    const statsCode = stripCommentLines(readFileSync(join(SRC, 'commands', 'stats.ts'), 'utf8'))
+    expect(statsCode, 'stats fields 未把元数据 hint 传给前置探测')
+      .toMatch(/openGuardedSession\(\{[\s\S]{0,200}?\}, metadataTimeoutHint\)/)
+    const queryCode = stripCommentLines(readFileSync(join(SRC, 'commands', 'query.ts'), 'utf8'))
+    expect(queryCode, 'query 不得给自己套元数据口径的探测 hint')
+      .not.toMatch(/openGuardedSession\(\{[\s\S]{0,200}?\}, metadataTimeoutHint\)/)
     // 文案本身：不得沿用 query 的口径、必须指向本次的库、占位符替换契约必须一并带上
     const hint = metadataTimeoutHint({ db: '/tmp/x/q.duckdb' })
     expect(hint).not.toContain('缩小时间范围')

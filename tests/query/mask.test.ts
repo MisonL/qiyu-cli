@@ -850,6 +850,33 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
   })
 
+  it('带正则元字符的别名（`AS "p("` / `AS "[x"`）→ 照常报警且不得抛 SyntaxError（CodeRabbit 第六轮 minor）', () => {
+    // 实测 DuckDB 接受这两种别名并按它分组；旧实现把别名直接拼进 `new RegExp`，
+    // `\bp(\b` / `\b[x\b` 直接抛 SyntaxError —— 查询已成功，脱敏阶段却让整条命令报 internal。
+    for (const [sql, alias] of [
+      ['SELECT userPhone AS "p(", COUNT(*) AS n FROM sessions GROUP BY "p("', 'p('],
+      ['SELECT userPhone AS "[x", COUNT(*) AS n FROM sessions GROUP BY "[x"', '[x'],
+    ] as const) {
+      const out = maskQueryRows({
+        rows: [{ [alias]: '138****1111', n: 1 }],
+        columns: [alias, 'n'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).toContain('GROUP BY / DISTINCT')
+    }
+    // 反证：不参与分组的标点别名不报警（分组键是 session_type）
+    const noGroup = maskQueryRows({
+      rows: [{ 'p(': '138****1111', session_type: 'chat' }],
+      columns: ['p(', 'session_type'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone AS "p(", session_type FROM sessions GROUP BY session_type',
+        tables: TABLES,
+      },
+    })
+    expect(noGroup.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
   it('`DISTINCT ON (非敏感列)` 投影敏感列 → 不报警；`DISTINCT ON (敏感列)` → 报警（Codex 2026-11-05 第五轮核实）', () => {
     // 去重键是 ON (...) 里的列，不是整张选择列表 —— 正则在 execTopLevel 改写后必须仍保留
     // 捕获组（`distinct[1]`），否则会把整个投影当去重键、对 `DISTINCT ON (session_type)` 误报。
