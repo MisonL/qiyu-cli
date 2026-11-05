@@ -117,8 +117,29 @@ function parseField(src: string, def: FieldDef): CronField {
   return { values: sorted, wildcard }
 }
 
+/**
+ * 分隔符只接受空格与 Tab。
+ *
+ * ⚠️ `trim()` 与 `split(/\s+/)` 都会把 CR / LF / 垂直制表 / 不换行空格（U+00A0）/
+ * 行分隔符（U+2028）当成空白放过 —— 解析能通过，但**同一个原文字符串**会原样进入
+ * 逐行格式的产物（crontab 兜底行、`schedule` 回显）：实测 `0 0 *\r* *` 解析成合法
+ * 5 段，产出的兜底行里是一个字面的 CR（cron 的字段分隔只认空格/Tab，整行失效）；
+ * `0 0 * * *\n` 更会把一条条目劈成两条物理行。与 `assertSchedulable` 同族：
+ * 不可表达的输入显式拒绝，不替用户清洗（清洗会改变「用户到底装了什么」的事实）。
+ */
+function assertPlainSeparators(expr: string): void {
+  const bad = /[^\S \t]/.exec(expr)
+  if (!bad) return
+  const ch = bad[0]
+  const cp = ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')
+  throw usageError(`无法解析的 cron 表达式：含不允许的空白字符 U+${cp}（${JSON.stringify(ch)}），`
+    + '分隔符只接受空格与 Tab —— 换行/回车等字符会原样进入逐行的调度条目（crontab 兜底行、'
+    + `schedule 回显），把一条计划拆成两条或让整行失效：${JSON.stringify(expr)}`)
+}
+
 /** 解析 5 段 cron；解析失败抛 usage（契约诚实性：绝不静默装错时刻的计划）。 */
 export function parseCron(expr: string): CronSpec {
+  assertPlainSeparators(expr)
   const parts = expr.trim().split(/\s+/)
   if (parts.length !== 5) {
     // ⚠️ describeArgs 渲染取值：`--schedule ''` 此前报「实际 1 段：」冒号后空白，
@@ -227,8 +248,10 @@ function launchdCalendarXml(spec: CronSpec): string {
   const dicts: string[] = []
   if (dayR) dicts.push(base(launchdKey('Day', spec.day)))
   if (wdR) {
-    // cron 0=周日 → launchd Weekday 1=周日 … 7=周六；多值 → 键内数组（launchd 键内 OR）
-    const wd: CronField = { values: spec.weekday.values.map((v) => v + 1), wildcard: false }
+    // ⚠️ launchd 的 Weekday 与 cron **同一套编号**（man launchd.plist：0 和 7 都是
+    // 周日、1 是周一），不是 1 起算 —— 此前这里 `v + 1` 把所有任务整体后移了一天
+    // （cron 周一 → 周日执行）。多值 → 键内数组（launchd 键内 OR）。
+    const wd: CronField = { values: [...spec.weekday.values], wildcard: false }
     dicts.push(base(launchdKey('Weekday', wd)))
   }
   if (dicts.length === 0) return base('')

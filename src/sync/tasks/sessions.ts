@@ -25,6 +25,19 @@ const strOrNull = (v: unknown): string | null =>
 /** 空串主键/键列拒绝（C 低-7）：`''` 是合法的 VARCHAR 值，会写出一行能被反复覆盖的同键行。 */
 const isEmptyKey = (v: unknown): boolean => v === null || v === undefined || v === ''
 
+/**
+ * 会话行的主键取值：导出原生字段是 `id`，已投影行是 `session_id`。
+ * ⚠️ 规则**只在这里定义一份**：fetch 侧的丢弃判据与 `sessionRow` 的投影必须同源 ——
+ * 两处各写一份 `a ?? b` 时，写反了次序（fetch 用 `session_id ?? id`、投影用
+ * `id ?? session_id`）会让 `{id:'', session_id:'x'}` 在 fetch 被判「有键」、在 enrich
+ * 被判「缺键」，又回到「written < expected → 整窗 count_mismatch 回滚」的老路。
+ * 语义：取**第一个非空**候选 —— 空串不是键，但别名里有值就说明这行有键可用。
+ */
+function sessionKeyOf(src: Record<string, unknown>): unknown {
+  for (const v of [src.id, src.session_id]) if (!isEmptyKey(v)) return v
+  return undefined
+}
+
 /** categoryDetail 归一化："a / b / c / d" → "a/b/c/d"（导出 " / " 带空格 → /one 无空格）。 */
 export function normalizeCategoryDetail(v: unknown): string | null {
   if (v === null || v === undefined || v === '') return null
@@ -54,7 +67,7 @@ export function deriveSessionType(staffId: unknown): string | null {
  * ⚠️ 本函数是纯投影（红线 1：同输入同输出）—— synchronized_at 从输入行透传
  *（fetch 在进 enrich 前统一盖章，enrich 直测两调用相等）；输入无戳则为 null（列可空）。 */
 function sessionRow(src: Record<string, unknown>): Record<string, unknown> | null {
-  const id = src.id ?? src.session_id
+  const id = sessionKeyOf(src)
   // 键缺失/空串行：丢弃且不计入 fetched（与 apiCount 口径一致；C 低-7）
   if (isEmptyKey(id)) return null
   return {
@@ -101,10 +114,24 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
     gate: ctx.gate,
     clock: ctx.clock,
   })
+  // ⚠️ 缺 id 的行必须在 fetch 侧就丢弃并计数（2026-11-04 修）。此前它们留到 enrich
+  // 才被 `sessionRow` 丢掉，而 `apiCount` 已经按**丢弃前**的行数取好 —— 引擎的配对
+  // 基线于是包含永远不会落库的行：written < expected → 整窗 count_mismatch 回滚，
+  // 且 gap 只说「应写 N 行、实际写入 M 行」，不点名真正的原因（缺 id）。
+  // 现在与 reports 族同一口径：先过滤、apiCount 取过滤后行数、丢弃记 row_missing_key。
+  const withId: Record<string, unknown>[] = []
+  let dropped = 0
+  for (const r of sessions) {
+    if (isEmptyKey(r.session_id ?? r.id)) dropped++
+    else withId.push(r)
+  }
   // synchronized_at 在 fetch 侧按窗统一盖章（单值、确定性于本窗）——enrich 是纯投影
   //（红线 1：同输入行永远同输出），只透传该戳；原始行直出（session.id 键、未投影）。
-  const stamped = sessions.map((r) => ({ ...r, synchronized_at: nowIso }))
-  const base: FetchResult = { rows: stamped, apiCount: sessions.length }
+  const stamped = withId.map((r) => ({ ...r, synchronized_at: nowIso }))
+  const base: FetchResult = { rows: stamped, apiCount: withId.length }
+  const dropNote = dropped > 0
+    ? `${dropped} 行缺 id（主键列，缺键或空串）被丢弃、未落库（已从上文的行数统计中扣除）`
+    : ''
 
   // —— C-8：尾部标记行（fixture）= 导出自己的窗口声明，与请求窗口核对 ——
   // 实测形态（private/raw/session.txt，4687 行样本）：**完整导出必然带这一行**，恰好一行、
@@ -128,10 +155,12 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
     return {
       ...base,
       gapHint: {
-        reason: 'export_fixture_unreported',
+        // 同时有丢弃行时，缺失档让位给「真的少了行」的 row_missing_key（更重的信号）。
+        reason: dropped > 0 ? 'row_missing_key' : 'export_fixture_unreported',
         detail: `导出流未上报尾部标记行（完整导出末尾应有一行 startTime=…,endTime=… 声明导出窗口）：` +
-          `本窗 ${sessions.length} 行数据的窗口覆盖无从核对 —— 空窗可能确实是空，也可能是导出流被截断在行边界。` +
-          `请求窗口 [${isoOf(w.start)}, ${isoOf(w.end)}]`,
+          `本窗 ${withId.length} 行数据的窗口覆盖无从核对 —— 空窗可能确实是空，也可能是导出流被截断在行边界。` +
+          `请求窗口 [${isoOf(w.start)}, ${isoOf(w.end)}]` +
+          (dropNote ? `；另有 ${dropNote}` : ''),
       },
     }
   }
@@ -141,10 +170,21 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
     return {
       ...base,
       gapHint: {
-        reason: 'export_window_mismatch',
+        reason: dropped > 0 ? 'row_missing_key' : 'export_window_mismatch',
         detail: `导出声明的窗口 [${isoOf(declared.start)}, ${isoOf(declared.end)}] 宽于请求窗口 ` +
-          `[${isoOf(w.start)}, ${isoOf(w.end)}]（重叠行由 session_id 幂等吸收）`,
+          `[${isoOf(w.start)}, ${isoOf(w.end)}]（重叠行由 session_id 幂等吸收）` +
+          (dropNote ? `；另有 ${dropNote}` : ''),
         fixture,
+      },
+    }
+  }
+  if (dropped > 0) {
+    return {
+      ...base,
+      gapHint: {
+        reason: 'row_missing_key',
+        detail: `sessions.export: ${dropNote} —— 上游响应形态漂移（正常导出每行都带 id），` +
+          '请核对接口返回；本次按已落库的行覆盖窗口',
       },
     }
   }
@@ -171,8 +211,9 @@ export function assertFixtureGranularity(task: SyncTask): void {
 
 /**
  * enrich：投影 + 确定性派生（红线 1 推论：同输入行永远同输出）。
- * 派生 session_type（staffId 数字判别）+ categoryDetail 归一化；缺 id 行返回 null
- *（丢弃且不计入 fetched——与 apiCount 口径一致）。synchronized_at 从输入行透传
+ * 派生 session_type（staffId 数字判别）+ categoryDetail 归一化。缺 id 行在 **fetch 侧**
+ * 已丢弃并记 row_missing_key（此前留到这里才丢，与 apiCount 口径不一致会导致整窗
+ * count_mismatch 回滚）；这里保留 null 兜底，正常输入不会触发。synchronized_at 从输入行透传
  *（fetch 已统一盖章），无戳直测时为 null —— 本函数不含任何时钟读取。
  */
 function enrichSession(src: Record<string, unknown>): Record<string, unknown> | null {

@@ -1,5 +1,7 @@
 # 依赖
-node_modules/
+# 不带尾部斜杠：worktree 里的 node_modules 是指向主检出目录的**符号链接**，
+# `node_modules/`（目录型模式）匹配不到符号链接 —— 实测 `git add -A` 会把它加进提交。
+node_modules
 .pnpm-store/
 
 # 构建产物

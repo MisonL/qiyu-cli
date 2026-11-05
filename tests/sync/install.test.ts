@@ -49,6 +49,19 @@ describe('parseCron', () => {
     expect(() => parseCron('*/0 * * * *')).toThrow(/minute/)
   })
 
+  it('分隔符只接受空格与 Tab：CR/LF/异常空白显式拒绝（不得流进逐行产物）', () => {
+    // ⚠️ 实测（修前）：`0 0 *\r* *` 被 `\s+` 当分隔符拆成合法 5 段，而 schedule 原文
+    // 又原样进了 crontab 兜底行与回显 —— 那一行里的 CR 让 cron 整行失效；
+    // `0 0 * * *\n` 则把一条计划劈成两条物理行。判据：拒绝，不静默清洗。
+    expect(() => parseCron('0 0 * * *\r')).toThrow(/U\+000D/)
+    expect(() => parseCron('0 0 *\r* *')).toThrow(/U\+000D/)
+    expect(() => parseCron('0 0 * * *\n')).toThrow(/U\+000A/)
+    expect(() => parseCron('0 0 * * * ')).toThrow(/U\+00A0/)
+    // 空格与 Tab 仍是合法分隔符（不得误伤）
+    expect(() => parseCron('0\t0 * * *')).not.toThrow()
+    expect(() => parseCron('0  0 * * *')).not.toThrow()
+  })
+
   it('空/空白表达式：消息把取值渲染成可见形式（此前冒号后空白）', () => {
     // ⚠️ 2026-10-29：`sync install --schedule ''` 此前报「…实际 1 段：」冒号后什么都没有，
     // Agent 看不出「表达式是空串」还是「消息渲染坏了」。describeArgs 把空串渲染成 `''`。
@@ -85,7 +98,9 @@ describe('planInstall darwin —— launchd plist', () => {
     const c = p.entries[0]!.content
     expect(c).toMatch(/<key>StartCalendarInterval<\/key><array>/)
     expect(c).toMatch(/<key>Day<\/key><integer>1<\/integer>/)
-    expect(c).toMatch(/<key>Weekday<\/key><integer>2<\/integer>/)   // cron 1(周一) → launchd 2
+    // ⚠️ launchd 与 cron 同一套 Weekday 编号（0/7=周日、1=周一）——
+    // 此前断言「cron 1 → launchd 2」把整体后移一天的错误行为钉住了。
+    expect(c).toMatch(/<key>Weekday<\/key><integer>1<\/integer>/)   // cron 1(周一) → launchd 1
   })
   it('exec 路径含 XML 特殊字符时转义', () => {
     const p = planInstall('darwin', '0 2 * * *', { home: HOME, exec: ['/usr/local/bin/node&', '/a<b>.js'] })
@@ -116,7 +131,7 @@ describe('planInstall darwin —— launchd plist', () => {
     const c = p.entries[0]!.content
     expect(c).toMatch(/<key>Day<\/key><array><integer>1<\/integer><integer>15<\/integer><\/array>/)
     expect(c).toMatch(/<key>Hour<\/key><integer>9<\/integer>/)
-    expect(c).toMatch(/<key>Weekday<\/key><array><integer>2<\/integer><integer>6<\/integer><\/array>/)
+    expect(c).toMatch(/<key>Weekday<\/key><array><integer>1<\/integer><integer>5<\/integer><\/array>/)
   })
 })
 
@@ -313,5 +328,16 @@ describe('planUninstall', () => {
     const cmd = p.commands[0]!
     expect(cmd).toContain('/Delete')
     expect(cmd).toContain('qiyu-cli-sync')
+  })
+})
+
+describe('planInstall linux —— crontab 兜底分隔符', () => {
+  it('schedule 原文含 CR/LF 时整条拒绝（此前 `\\s+` 放过且原样进兜底行）', () => {
+    // 直接喂 crontab 派生用的原 `schedule` 原文（不含在 planInstall 内部被 parseCron 拦下的
+    // 情况）：`parseCron('0 0 * * *\r')` 已在 parseCron 组拦下，这里验证**命令层链路**
+    // 是否在任何入口都拦得住 —— planInstall 入口本身就 parseCron，因此必然拒绝。
+    for (const s of ['0 0 * * *\r', '0 0 *\r* *', '0 0 * * *\n']) {
+      expect(() => planInstall('linux', s, { home: HOME, exec: EXEC })).toThrow(/U\+/)
+    }
   })
 })
