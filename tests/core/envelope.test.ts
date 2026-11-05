@@ -71,6 +71,15 @@ describe('信封归一化', () => {
     expect(normalize({ code: 200, message: '   ' }, 'M').ok).toBe(false)
     expect(normalize({ code: 200, message: ' OK ' }, 'M').ok).toBe(false)
     expect(normalize({ code: 200, message: ' key-1 ' }, 'M')).toMatchObject({ ok: true, payload: 'key-1' })
+    // 裸数组不是 M 的合法形态：不能走「裸数组一律成功」的前置分支，
+    // 否则形态漂移被报成成功、数组被当成任务 key / 下载链接交给调用方。
+    const arr = normalize([{ id: 1 }], 'M')
+    expect(arr.ok).toBe(false)
+    expect(arr.payload).toBeUndefined()
+    expect(arr.messageText).toMatch(/裸数组/)
+    // 同一份裸数组在未登记/其它形状上仍是合法成功（ipcc.customfield.template.get）。
+    // 注意调用点（src/core/http.ts）传的是 `spec.envelope ?? undefined`，null 不进本函数。
+    expect(normalize([{ id: 1 }], undefined).ok).toBe(true)
   })
 
   it('形状 D：只有 code，无 message 也无 data', () => {

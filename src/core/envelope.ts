@@ -74,7 +74,15 @@ function isEmptyPayload(v: unknown): boolean {
  */
 export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
   // 裸数组：ipcc.customfield.template.get 完全没有信封
+  // ⚠️ 形状 M 必须排除在外（CodeRabbit PR #66 第 4 轮）：M 的契约是「载荷 = message
+  // 原文」，裸数组不是该契约的任何一种合法形态。若不排除，数组会在下面的 M 判定**之前**
+  // 被无条件当成功返回 —— 一次形态漂移被报成成功，调用方把数组当任务 key / 下载链接。
   if (Array.isArray(raw)) {
+    if (envelope === 'M') {
+      return { ok: false, code: 'unknown', payload: undefined,
+               messageText: '形状漂移：该接口应返回 {code, message} 信封（载荷在 message），实际是裸数组',
+               notFound: false }
+    }
     return { ok: true, code: '200', payload: raw, messageText: '', notFound: false }
   }
 

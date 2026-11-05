@@ -130,7 +130,10 @@
     data —— `api call` 输出 `"data":null, "not_found":true, "warning":"接口返回成功但无数据"`，
     Agent 完成导出创建后拿不到 key。新增信封形状 **M**（成功载荷 = message 原文；
     非 200 或无 message 判失败，空 message 不判 not_found），两个接口改登记为 M，
-    并补矩阵/信封/集成测试与流水线占位符守卫（'OK' 不得当链接）。
+    并补矩阵/信封/集成测试与流水线占位符守卫（'OK' 不得当链接）。判据一律作用在
+    **trim 后**的 message 上（`'   '` 是空载荷、`' OK '` 是占位符，都不放行；
+    payload 取 trim 值），且**裸数组不是 M 的合法形态** —— 若落到「裸数组一律成功」的
+    前置分支，形态漂移会被报成成功、数组被当成任务 key / 下载链接交给调用方。
   · **`export.*` 四个文档外接口的 body 参数表是空的**：生成器对它们硬编码
     `params: []`、`body_kind: 'none'`，而 create/check 的 body 是必需的、流水线就在发。
     Agent 按 `api schema` 会看到「没有参数」，照着发出空 body。在 `EXTERNAL_ENDPOINTS`
@@ -164,9 +167,10 @@
 
   守卫同步加硬：`specs.json` 与 `overrides` 表的一致性（生成物不得陈旧于事实源）、
   生成器必须产出 export 参数表、信封矩阵覆盖 M、export 集成用例断言 key/链接不再丢、
-  图例字符约束（无 `**`、无分隔符 `；`）。变异 11 处全红（M 分支、M payload、生成器
+  图例字符约束（无 `**`、无分隔符 `；`）。变异 13 处全红（M 分支、M payload、生成器
   params、path 漂移、verified 名单、messageOf 占位符、矩阵覆盖；CodeRabbit 首轮追加的
-  M 的 'OK' 占位符、team 按文档值 300 秒、verified 图例反例、not_found 措辞）。
+  M 的 'OK' 占位符、team 按文档值 300 秒、verified 图例反例、not_found 措辞；
+  第 3 轮追加的 M 的 trim 后判空/占位；第 4 轮追加的 M 的裸数组形态）。
 
 - **核心请求/错误/存储写入的九处契约修正（2026-11-04 独立审查）**：
 
