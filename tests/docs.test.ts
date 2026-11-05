@@ -952,3 +952,45 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(md).toMatch(/对\s*\n?\s*Agent 没有增益|对 Agent 没有增益/)
   })
 })
+
+/**
+ * CHANGELOG 的「声明 N 处 ↔ 实际 N 条」一致性守卫（CodeRabbit PR #68 第七轮 minor）。
+ *
+ * 修复批的标题写「的九处契约修正」，正文用 `  · ` 逐条列出 —— 两个数一旦分叉，
+ * 读者无法判断「是漏写了某条，还是标题没跟着加」。这不是假想：2026-11-04/05 的三批
+ * 里有**三批**在收敛轮次补充条目后忘了改标题（查询/存储/元数据批、同步与调度批、
+ * 注册表批），都是 CodeRabbit / Codex 逐轮点名才发现的。
+ *
+ * 判据只覆盖标题形如「…的<数字>处契约修正…」的条目：这类条目的约定就是「一条一 bullet」。
+ * 其它条目（如「另外两个载体 + 一处文案分档」）的 N 指代子集，不能套用 —— 如实记录边界。
+ */
+describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () => {
+  const CN: Record<string, number> = {
+    一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+    十: 10, 十一: 11, 十二: 12, 十三: 13, 十四: 14, 十五: 15, 十六: 16,
+    十七: 17, 十八: 18, 十九: 19, 二十: 20,
+  }
+  it('「N 处契约修正」批的 bullet 数 == 标题里的 N', () => {
+    const lines = read('CHANGELOG.md').split('\n')
+    const bad: string[] = []
+    let checked = 0
+    for (let i = 0; i < lines.length; i++) {
+      const head = /^- \*\*(.+?)\*\*/.exec(lines[i]!)
+      if (head === null) continue
+      const declared = /([一二三四五六七八九十]+|\d+)\s*处契约修正/.exec(head[1]!)
+      if (declared === null) continue
+      const raw = declared[1]!
+      const n = /^\d+$/.test(raw) ? Number(raw) : CN[raw]
+      let bullets = 0
+      for (let j = i + 1; j < lines.length; j++) {
+        const l = lines[j]!
+        if (l.startsWith('- ') || l.startsWith('## ') || l.startsWith('### ')) break
+        if (l.startsWith('  · ')) bullets++
+      }
+      checked++
+      if (n !== bullets) bad.push(`${head[1]!.slice(0, 40)}… 声明 ${n} / 实际 ${bullets}`)
+    }
+    expect(checked, '一个「N 处契约修正」条目都没找到 = 守卫空转').toBeGreaterThan(0)
+    expect(bad).toEqual([])
+  })
+})
