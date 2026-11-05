@@ -15,7 +15,7 @@
 // 列投影按 TABLES sessions 列集（payload 收敛 + 键列/时间列/PII 敏感列提升）。
 import { runExportPipeline, parseExportFixture } from './pipeline.js'
 import { nowIsoOf } from './pace.js'
-import type { SyncTask, FetchResult, FetchCtx } from '../types.js'
+import type { SyncTask, FetchResult, FetchCtx, FetchGapHint } from '../types.js'
 
 const isoOf = (ms: number): string => new Date(ms).toISOString()
 
@@ -155,31 +155,33 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
     // 完整导出应带尾部标记（见上）；缺失 = 导出流没有声明它覆盖到哪 —— 空窗可能是真空、
     // 也可能是流被截断在行边界（逐行 JSON 解析对截断在行中间的情况已显式失败）。
     // 不判失败（历史样本可能无），但绝不静默：记一条 gap，让两类空窗可区分。
-    return {
-      ...base,
-      gapHint: {
-        // 同时有丢弃行时，缺失档让位给「真的少了行」的 row_missing_key（更重的信号）。
-        reason: dropped > 0 ? 'row_missing_key' : 'export_fixture_unreported',
-        detail: `导出流未上报尾部标记行（完整导出末尾应有一行 startTime=…,endTime=… 声明导出窗口）：` +
-          `本窗 ${withId.length} 行数据的窗口覆盖无从核对 —— 空窗可能确实是空，也可能是导出流被截断在行边界。` +
-          `请求窗口 [${isoOf(w.start)}, ${isoOf(w.end)}]` +
-          (dropNote ? `；另有 ${dropNote}` : ''),
-      },
+    // ⚠️ 两条提示用**数组**带出（CodeRabbit PR #67）：丢弃行（row_missing_key，真的少了）
+    // 与缺 fixture（export_fixture_unreported，覆盖无从核对）互不覆盖 —— 压成一条会让
+    // 消费方按 reason 分支时永远漏掉另一类信号。引擎逐条落 sync_gaps、逐条可分支。
+    const hints: FetchGapHint[] = [{
+      reason: 'export_fixture_unreported',
+      detail: `导出流未上报尾部标记行（完整导出末尾应有一行 startTime=…,endTime=… 声明导出窗口）：` +
+        `本窗 ${withId.length} 行数据的窗口覆盖无从核对 —— 空窗可能确实是空，也可能是导出流被截断在行边界。` +
+        `请求窗口 [${isoOf(w.start)}, ${isoOf(w.end)}]`,
+    }]
+    if (dropped > 0) {
+      hints.push({ reason: 'row_missing_key', detail: `sessions.export: ${dropNote} —— 上游响应形态漂移（正常导出每行都带 id），请核对接口返回` })
     }
+    return { ...base, gapHint: hints }
   }
   if (declared !== null && (declared.start < w.start || declared.end > w.end)) {
     // 覆盖成立但宽于请求：多出来的行由 session_id 幂等 upsert 吸收（与 overlapDays 同机制），
     // 数据不受损 —— 但「服务端改了窗口」这件事必须可见，记 gap 并带上标记行原文。
-    return {
-      ...base,
-      gapHint: {
-        reason: dropped > 0 ? 'row_missing_key' : 'export_window_mismatch',
-        detail: `导出声明的窗口 [${isoOf(declared.start)}, ${isoOf(declared.end)}] 宽于请求窗口 ` +
-          `[${isoOf(w.start)}, ${isoOf(w.end)}]（重叠行由 session_id 幂等吸收）` +
-          (dropNote ? `；另有 ${dropNote}` : ''),
-        fixture,
-      },
+    const hints: FetchGapHint[] = [{
+      reason: 'export_window_mismatch',
+      detail: `导出声明的窗口 [${isoOf(declared.start)}, ${isoOf(declared.end)}] 宽于请求窗口 ` +
+        `[${isoOf(w.start)}, ${isoOf(w.end)}]（重叠行由 session_id 幂等吸收）`,
+      fixture,
+    }]
+    if (dropped > 0) {
+      hints.push({ reason: 'row_missing_key', detail: `sessions.export: ${dropNote} —— 上游响应形态漂移（正常导出每行都带 id），请核对接口返回` })
     }
+    return { ...base, gapHint: hints }
   }
   if (dropped > 0) {
     return {

@@ -651,9 +651,12 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       // —— gapHint（如 order_performance 的 orders:null 筛选失败，spec §5.2）：成功窗也落提示 ——
       // T5 裁定（T7 接线）：透传 hint 的原始 reason（filter_matched_no_staff 等），
       // 不压成统一 fetch_failed——缺口原因在 sync_gaps 里必须可分派。
-      if (fetchRes.gapHint) {
-        await storeGap(ctx, task, w, fetchRes.gapHint.reason,
-          gapHintDetail(fetchRes.gapHint), gaps)
+      // ⚠️ 单条或**多条**（CodeRabbit PR #67）：同一窗可能既缺行（row_missing_key）又缺
+      // fixture（export_fixture_unreported），压成一条会让消费方永远漏掉另一类信号。
+      const hints = Array.isArray(fetchRes.gapHint) ? fetchRes.gapHint : [fetchRes.gapHint]
+      for (const h of hints) {
+        if (h === undefined) continue
+        await storeGap(ctx, task, w, h.reason, gapHintDetail(h), gaps)
       }
 
       succeeded++
@@ -768,9 +771,9 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     // gapHint（如 dim.staff_group_members 的 staffIdList 形态漂移）：成功快照也落提示。
     // T5 裁定（T7 接线）：透传 hint 的原始 reason，不压成统一 fetch_failed ——
     // 缺口原因在 sync_gaps 里必须可分派（与 runWindowed 的 gapHint 路径同口径）。
-    if (fetchRes.gapHint) {
-      await storeGap(ctx, task, resolvedRange, fetchRes.gapHint.reason,
-        gapHintDetail(fetchRes.gapHint), gaps)
+    for (const h of (Array.isArray(fetchRes.gapHint) ? fetchRes.gapHint : [fetchRes.gapHint])) {
+      if (h === undefined) continue
+      await storeGap(ctx, task, resolvedRange, h.reason, gapHintDetail(h), gaps)
     }
     progress(`[${task.id}] 快照完成：拉取 ${fetchRes.rows.length} 行，写入 ${written} 行`)
     return snapshotResult(task, resolvedRange, gaps, fetchRes.rows.length, written, 1, 0,
@@ -975,9 +978,9 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
             isMismatch ? (e as Error).message : failDetail('落库失败', e), plan.gaps)
           continue
         }
-        if (fetchRes.gapHint) {
-          await storeGap(ctx, task, w, fetchRes.gapHint.reason,
-            gapHintDetail(fetchRes.gapHint), plan.gaps)
+        for (const h of (Array.isArray(fetchRes.gapHint) ? fetchRes.gapHint : [fetchRes.gapHint])) {
+          if (h === undefined) continue
+          await storeGap(ctx, task, w, h.reason, gapHintDetail(h), plan.gaps)
         }
         progress(`[${task.id}] 轮转 round ${round + 1}/${maxRounds} 完成：拉取 ${fetchRes.rows.length} 行，写入 ${kept.length} 行`)
       }

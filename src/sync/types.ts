@@ -140,24 +140,35 @@ export const TASK_GAP_LOSSY_REASONS = [
   'row_missing_key',
 ] as const
 
+/** 任务层能记的一条「成功窗提示」缺口（reason 取值见 `TaskGapReason`）。 */
+export interface FetchGapHint {
+  reason: TaskGapReason
+  detail: string
+  /**
+   * 会话导出尾部标记行原文（C-8）：`startTime=…,endTime=…`，**导出自己的窗口声明**，
+   * 实测样本里恰好一行、紧随全部 JSON 行之后（4687 行 + 1 行；声明 24h 窗口）。
+   * 引擎落 `sync_gaps` 前把它追加进 detail（`（fixture：…）`）——「为什么可疑」与
+   * 「可疑的那行原文」在同一条缺口里可见。该行只有两个整数时间戳、不含 PII，
+   * 长度由形态限死（≤16 位十进制 × 2 + 常量 ≈ 54 字符）。
+   */
+  fixture?: string
+}
+
 /** fetch 结果：rows 是未 enrich 的原始行；apiCount 是 API 侧声称的行数（配对核对基准）。 */
 export interface FetchResult {
   rows: Record<string, unknown>[]
   /** API 侧行数（配对核对基准）；缺省取 enrich 过滤后的应写行数。 */
   apiCount?: number
-  /** 引擎可在此窗口记一条 gap（如 order_performance 的 orders:null 筛选失败，spec §5.2）。 */
-  gapHint?: {
-    reason: TaskGapReason
-    detail: string
-    /**
-     * 会话导出尾部标记行原文（C-8）：`startTime=…,endTime=…`，**导出自己的窗口声明**，
-     * 实测样本里恰好一行、紧随全部 JSON 行之后（4687 行 + 1 行；声明 24h 窗口）。
-     * 引擎落 `sync_gaps` 前把它追加进 detail（`（fixture：…）`）——「为什么可疑」与
-     * 「可疑的那行原文」在同一条缺口里可见。该行只有两个整数时间戳、不含 PII，
-     * 长度由形态限死（≤16 位十进制 × 2 + 常量 ≈ 54 字符）。
-     */
-    fixture?: string
-  }
+  /**
+   * 引擎可在此窗口记 gap（如 order_performance 的 orders:null 筛选失败，spec §5.2）。
+   *
+   * ⚠️ 单条或**数组**（2026-11-05，CodeRabbit PR #67）：同一个窗口可能存在**互不覆盖**
+   * 的两类提示 —— 例如会话导出既「缺行」（row_missing_key，数据真的少了）又「没有尾部
+   * 标记行」（export_fixture_unreported，窗口覆盖无从核对）。消费方按 `gaps[].reason`
+   * 分支，把两类压成一条会让其中一类**成体系地消失**（此前取「丢行优先」，于是有丢行的
+   * 窗口永远看不到「窗口覆盖未核对」）。引擎按条落 `sync_gaps`，一个 reason 一条。
+   */
+  gapHint?: FetchGapHint | FetchGapHint[]
 }
 
 /** 窗口引用：fetch 的入参（半开区间毫秒时间戳）。 */

@@ -748,6 +748,31 @@ describe('C-8：尾部标记行（导出窗口声明）与请求窗口核对', (
     }
   })
 
+  it('缺 fixture + 缺 id 行同窗 → 两条 gap 并存（压成一条会让按 reason 分派的消费方漏一类）', async () => {
+    // ⚠️ CodeRabbit PR #67：此前的实现让 row_missing_key「让位」于 fixture 缺失，
+    // 于是有丢行的窗口永远看不到 export_fixture_unreported（窗口覆盖未核对）。
+    // 两类提示互不覆盖，必须各自成条。
+    stubCreateCheck()
+    try {
+      const store = await fresh()
+      const bad = { ...SESSION_ROW, id: '', session_id: '' }
+      // 只写数据行、不写尾标记 → fixture 缺失；同时 bad 行缺 id → row_missing_key
+      const t = withContent(sessionsById('sessions.export')!, `${JSON.stringify(SESSION_ROW)}\n${JSON.stringify(bad)}\n`)
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: DAY } }))
+      expect(r.status).toBe('complete')
+      expect(r.rows).toMatchObject({ fetched: 1, written: 1 })
+      const reasons = r.gaps.map((g) => g.reason).sort()
+      expect(reasons).toEqual(['export_fixture_unreported', 'row_missing_key'])
+      // 两条都真的落进 sync_gaps（消费方查库同样要看到两类）
+      const rows = await store.query('SELECT reason FROM sync_gaps ORDER BY reason')
+      expect(rows.rows.map((x) => String(x.reason)))
+        .toEqual(['export_fixture_unreported', 'row_missing_key'])
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('fixture 检测面的粒度断言（C-8）：maxWindowDays ≤6 通过；≥7 或缺失 → 载入期失败并写明理由', () => {
     const t = sessionsById('sessions.export')!
     expect(() => assertFixtureGranularity(t)).not.toThrow()      // 声明的 6 天
