@@ -649,6 +649,44 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
   })
 
+  it('GROUP BY ALL（DuckDB）= 按全部非聚合选择项分组 → 敏感列照样要警告（CodeRabbit 2026-11-05 第二轮）', () => {
+    const all = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone, COUNT(*) AS n FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(all.warnings.join('\n'), 'ALL 是选择列表的缩写，不是普通键').toContain('GROUP BY / DISTINCT')
+    const clean = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 3 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT session_type, COUNT(*) AS n FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(clean.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('子查询里的 GROUP BY 不把外层 WHERE 吞进分组键（CodeRabbit 2026-11-05 第二轮）', () => {
+    // `sliceClause` 深度 0 遇到 `)` 必须收尾；否则外层 WHERE 里的 userPhone 会被读成分组键。
+    const out = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 1 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT * FROM (SELECT session_type, COUNT(*) AS n FROM sessions "
+          + "GROUP BY session_type) t WHERE userPhone = '13800001111'",
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
   it('值级兜底命中非敏感列 → 警告「可能是业务数字被误改」（11 位订单号）', () => {
     const out = maskQueryRows({
       rows: [{ order_id: '13800138000' }],

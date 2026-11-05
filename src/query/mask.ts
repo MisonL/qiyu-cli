@@ -207,7 +207,11 @@ function sliceClause(
     if (ch === "'") { inSingle = true; continue }
     if (ch === '"') { inDouble = true; continue }
     if (ch === '(') { depth++; continue }
-    if (ch === ')') { depth = Math.max(0, depth - 1); continue }
+    // ⚠️ 深度 0 遇到 `)` = 切片起点在子查询里、子查询到此结束 —— 必须就此收尾：
+    // `SELECT * FROM (… GROUP BY session_type) t WHERE userPhone = '1'` 里，越过这个
+    // 右括号会把外层 WHERE 并进分组子句，userPhone 就被误认成分组键并谎报分组失真
+    //（CodeRabbit PR #68 第二轮指出）。
+    if (ch === ')') { if (depth === 0) return sql.slice(from, i); depth--; continue }
     if (depth !== 0 || !/[A-Za-z]/.test(ch)) continue
     if (i > from && /[A-Za-z0-9_$]/.test(sql[i - 1]!)) continue
     if (new RegExp('^(?:' + stopSource + ')\\b', 'i').test(sql.slice(i))) return sql.slice(from, i)
@@ -487,6 +491,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // AS userPhone … GROUP BY session_type` 的分组键不含敏感列，输出列名却命中 —— 那是聚合
   // 而非分组，打码不会改变计数。分组列是否敏感由上面的分组键判据决定。
   // 都是词边界 + 大小写不敏感（DuckDB 标识符不分大小写）。
+  //
+  // ⚠️ 边界如实记录：SELECT 列表的切片要求语句**以 SELECT 开头**（`WITH … SELECT` 取不到），
+  // 此时别名与 `DISTINCT` 两档判据不触发 —— 方向是**少报一条副作用提示**，不是漏脱敏
+  // （缺口警告与列名级/值级脱敏都不依赖这段解析）。判据是启发式，不是 SQL 解析器。
   const referencedSensitive = sensitiveNames
     .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(mode.sql))
   const referencesSensitive = referencedSensitive.length > 0
@@ -499,8 +507,11 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const groupByClause = sliceClause(mode.sql, /\bGROUP\s+BY\b/i)
   if (groupByClause !== '') {
     const keys = splitTopLevel(groupByClause)
+    // `GROUP BY ALL`（DuckDB）= 按**全部非聚合选择项**分组 —— 选择列表里出现敏感列就是分组键。
+    // 把它当成普通键 `ALL` 来匹配，敏感列一个都命中不了，分组压平就一条提示都没有。
+    const groupByAll = keys.length === 1 && /^\s*ALL\s*$/i.test(keys[0]!)
     for (const n of sensitiveNames) {
-      const viaKey = keys.some((k) => wordHit(k, [n]))
+      const viaKey = keys.some((k) => wordHit(k, [n])) || (groupByAll && wordHit(selectList, [n]))
       const viaAlias = aliasesOf(selectList, n).some((a) => keys.some((k) => wordHit(k, [a])))
       const viaOrdinal = keys.some((k) => {
         const t = k.trim()
