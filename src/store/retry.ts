@@ -81,12 +81,20 @@ export function isModuleNotFound(e: unknown): { missing: string } | null {
  *   · 非 DuckDB 文件：`IO Error: The file "…" exists, but it is not a valid DuckDB database file!`
  *   · 权限不足：      `IO Error: Cannot open file "…": Permission denied`
  *                     （`Operation not permitted` = EPERM / `Read-only file system` = EROFS）
+ *   · 文件已损坏：    `IO Error: Could not read enough bytes from file "…": attempted to read
+ *                     74432 bytes from location 200000`（被截断 —— 元数据块在文件尾部）
+ *                     `IO Error: Corrupt database file: computed checksum 5381 does not
+ *                     match stored checksum 0 in block at location 8192`（页校验和不对）
+ *                     —— 两条都是 2026-11-05 在本机真跑出来的原文（rw/ro 两种打开方式相同）。
  * 判据**锚句尾的真因**（`:` + 原因 + 结尾），不能子串搜索 —— 路径里可能恰好含这些词
  * （`/tmp/Permission denied.db` 报 `No such file or directory` 会被子串判误命中）。
+ * 损坏的两条锚**句首**：路径由用户给出且被原文嵌入，句首的 `IO Error: ` 骨架只有 DuckDB
+ * 自己的报错会有，路径再花哨也伪装不出来。
  */
 export type OpenFailure =
   | { cause: 'not_duckdb' }
   | { cause: 'permission' }
+  | { cause: 'corrupt' }
 
 /** 「不是 DuckDB 数据库文件」的 hint（单一文案，store/query 共用）。 */
 export const NOT_DUCKDB_HINT = '该路径已存在且不是 DuckDB 数据库，请换 --db 路径'
@@ -97,12 +105,36 @@ export const NOT_DUCKDB_HINT = '该路径已存在且不是 DuckDB 数据库，�
  */
 export const PERMISSION_HINT = '请检查路径与所在目录的读写权限（磁盘只读也会导致无法打开）'
 
+/**
+ * 「文件已损坏」的 hint（单一文案，store/query/sync 共用）。
+ *
+ * ⚠️ 2026-11-05 审查修：此前「截断 / 页校验和不对」两类报文既不匹配权限、也不匹配
+ * 「非 DuckDB 文件」，落进各命令自己的兜底 —— `store status` 说「数据库执行期错误，
+ * 请用 store status 检查」（拿自己查自己），`query` 说「请确认文件存在且由本 CLI 创建
+ * （store init）」—— 而对已损坏的文件原地跑 `store init` 打开同样失败，是条死路。
+ * hint 必须先给备份（文件里是用户已同步的数据），再给可执行的恢复路径（新路径重建）。
+ */
+export const CORRUPT_HINT = '该文件已损坏（写入中断、磁盘写满、复制不完整都会造成），原地跑 store init 修不好，查询也会失败。请先备份该文件留档，再用 --db 指向一个新路径跑 store init 重建 —— 本地库只是缓存，之后带同一个 --db <新路径> 跑 qiyu sync run 重新拉取（不带 --db 的 sync run 仍会读到这个损坏的文件）'
+
+const OPEN_FAILURE_HINTS: Record<OpenFailure['cause'], string> = {
+  not_duckdb: NOT_DUCKDB_HINT,
+  permission: PERMISSION_HINT,
+  corrupt: CORRUPT_HINT,
+}
+
+/** 成因 → hint 的唯一映射点（`Record` 保证新增成因时编译期就漏不掉）。 */
+export function openFailureHint(f: OpenFailure): string {
+  return OPEN_FAILURE_HINTS[f.cause]
+}
+
 export function classifyOpenFailure(e: unknown): OpenFailure | null {
   const msg = e instanceof Error ? e.message : String(e)
   if (/is not a valid DuckDB database file!?$/.test(msg)) return { cause: 'not_duckdb' }
   if (/:\s*(Permission denied|Operation not permitted|Read-only file system)\s*$/.test(msg)) {
     return { cause: 'permission' }
   }
+  if (/^IO Error: Could not read enough bytes from file "/.test(msg)) return { cause: 'corrupt' }
+  if (/^IO Error: Corrupt database file:/.test(msg)) return { cause: 'corrupt' }
   return null
 }
 

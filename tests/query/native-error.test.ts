@@ -12,8 +12,9 @@
 // 修法：判据集中到 `query/native-error.ts`，锚 DuckDB 自己的类别前缀，并在判定前剥 SQL 回显。
 import { describe, it, expect } from 'vitest'
 import {
-  isInterrupt, isLayer2Blocked, withoutSqlEcho,
+  isInterrupt, isLayer2Blocked, isExtensionAutoloadBlocked, withoutSqlEcho,
   duckDbSaysMissingName, isBinderOrCatalogError, isOutOfMemory, isParserError,
+  stripOomSolutions,
 } from '../../src/query/native-error.js'
 
 describe('withoutSqlEcho —— 剥掉 DuckDB 的 SQL 回显', () => {
@@ -126,6 +127,38 @@ describe('isLayer2Blocked —— 只认真 layer2 拦截（实测五形态）', 
   })
 })
 
+describe('isExtensionAutoloadBlocked —— 扩展自动安装被沙箱拦下的独立形态', () => {
+  // 2026-11-05 审查实测（`delta_scan` / `iceberg_scan` / `postgres_scan`）：
+  // 前缀是 `Extension Autoloading Error:`，**不是** `Permission Error:` ——
+  // 旧实现落到 query_error +「请检查表名、列名与 SQL 语法」，把「这个函数在这里
+  // 用不了」说成「SQL 写错了」。
+  const REAL = 'Extension Autoloading Error: An error occurred while trying to automatically '
+    + "install the required extension 'delta':\n"
+    + 'Cannot access directory "/Users/x/.duckdb/extensions/v1.5.6/osx_amd64" '
+    + '- file system operations are disabled by configuration'
+  it('真实报文 → true', () => {
+    expect(isExtensionAutoloadBlocked(REAL)).toBe(true)
+  })
+  it('带 SQL 回显仍 → true', () => {
+    expect(isExtensionAutoloadBlocked(REAL + "\n\nLINE 1: SELECT * FROM delta_scan('/tmp/x')")).toBe(true)
+  })
+  it('与 isLayer2Blocked 互斥：两者都不该命中对方的报文', () => {
+    expect(isLayer2Blocked(REAL)).toBe(false)
+    expect(isExtensionAutoloadBlocked(
+      'Permission Error: Cannot access file "/etc/passwd" - file system operations are disabled by configuration'))
+      .toBe(false)
+  })
+  it('前缀在 SQL 回显里 → false（不认回显里的仿冒前缀）', () => {
+    const fake = 'Failed to extract statements: Parser Error: syntax error\n\n'
+      + "LINE 1: SELECT 'Extension Autoloading Error: x - file system operations are disabled by configuration'"
+    expect(isExtensionAutoloadBlocked(fake)).toBe(false)
+  })
+  it('句尾不是特征句（扩展安装因网络失败）→ false（不得说成沙箱拦截）', () => {
+    const net = "Extension Autoloading Error: An error occurred while trying to automatically install the required extension 'delta': HTTP GET error"
+    expect(isExtensionAutoloadBlocked(net)).toBe(false)
+  })
+})
+
 // —— 2026-11-01 审查（第二轮，同族第三个落点）——
 // 表/列不存在、Binder/Catalog、Out of Memory、未绑参四条**分类判据**此前都是裸子串判，
 // 与 isInterrupt/isLayer2Blocked 同一形态。用户数据（Conversion Error 回显列值）与用户
@@ -165,6 +198,35 @@ describe('分类判据同样只认 DuckDB 自己那句话（回显/列值里的�
     expect(isOutOfMemory(
       "Conversion Error: Could not convert string 'Out of Memory Error: fake' to INT32 when casting from source column x"))
       .toBe(false)
+  })
+})
+
+describe('stripOomSolutions —— 剥掉沙箱里跑不通的「Possible solutions」', () => {
+  // 2026-11-05 探针逐字原文（memory_limit=1GB + lock_configuration=true 真跑）：
+  // 三条 SET 在只读沙箱里全部报 `Cannot change configuration option "…" - the configuration
+  // has been locked`。原样透出 = 给 Agent 一串照做必然失败的命令。
+  const REAL = 'Out of Memory Error: failed to allocate data of size 16.0 MiB (944.5 MiB/953.6 MiB used)\n'
+    + '\nPossible solutions:\n'
+    + '* Reducing the number of threads (SET threads=X)\n'
+    + '* Disabling insertion-order preservation (SET preserve_insertion_order=false)\n'
+    + "* Increasing the memory limit (SET memory_limit='...GB')\n"
+    + '\nSee also https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads'
+
+  it('真报文：截到成因行，建议段与 See also 链接一起剥掉', () => {
+    expect(stripOomSolutions(REAL)).toBe(
+      'Out of Memory Error: failed to allocate data of size 16.0 MiB (944.5 MiB/953.6 MiB used)')
+  })
+  it('没有标记时原样返回（幂等：已剥过的报文再过一次不变）', () => {
+    const head = 'Out of Memory Error: failed to allocate data of size 8.0 GiB'
+    expect(stripOomSolutions(head)).toBe(head)
+    expect(stripOomSolutions(stripOomSolutions(REAL))).toBe(stripOomSolutions(REAL))
+  })
+  it('标记出现在报文前半段（用户 SQL/列值回声）→ 截到**最后一个**标记，不吞掉真原因', () => {
+    // 边界如实记录：判据是字面标记，用户文本里出现同一句时，最后一处之前的内容都会保留
+    const polluted = 'Out of Memory Error: bad value "Possible solutions: x"\n'
+      + 'still duckdb explaining\n\nPossible solutions:\n* SET memory_limit=x'
+    expect(stripOomSolutions(polluted)).toBe(
+      'Out of Memory Error: bad value "Possible solutions: x"\nstill duckdb explaining')
   })
 })
 

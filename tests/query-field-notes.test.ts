@@ -152,6 +152,19 @@ describe('图例本身：键集、形态与「不撒谎」的措辞', () => {
     expect(n.resolved_range, 'resolved_range 是过滤边界不是数据范围').toContain('过滤边界')
   })
 
+  it('mask_warnings 图例必须覆盖该键的**全部**实际来源（缺口 + 分析副作用），且声明不穷举', () => {
+    // 2026-11-05 审查：图例只列了「没脱敏的敏感数据」三类，而该键实际还装
+    // GROUP BY/DISTINCT 压平、query()/query_table()/COLUMNS() 嵌套、非敏感列按值形态被误改
+    // —— Agent 照图例理解，会把这三类警告当成别的含义。
+    const v = queryFieldNotes().mask_warnings
+    expect(v, '必须声明列表不穷举').toContain('包括但不限于')
+    expect(v, '必须点明 GROUP BY / DISTINCT 会压平分组与计数').toContain('GROUP BY / DISTINCT')
+    expect(v, '必须点明嵌套 SQL 构造').toContain('query()/query_table()/COLUMNS()')
+    expect(v, '必须点明值形态误改').toContain('按值形态')
+    expect(v, '必须保留三类缺口来源').toContain('表定义之外的列')
+    expect(v).toContain('payload 里的 JSON 内 PII')
+  })
+
   it('README 与 skill 正文同步（人读版与 stdout 图例不得互相矛盾）', () => {
     const md = read('README.md')
     expect(md, 'README 必须点明 data_coverage 看不见内部缺口').toContain('看不见内部缺口')
@@ -249,12 +262,25 @@ describe('data_coverage 的三种 null 成因', () => {
     ])
   })
 
-  it('③c 有行但时间列全是脏值：null 且没有任何警告（三条子路径里最隐蔽的）', async () => {
+  it('③c 有行但时间列全是脏值：没有时间过滤时 null 且没有警告（脏值行照常返回）', async () => {
     await seed()
     await q('--table', 'staff_quality')
     expect(meta().rows, '主查询（无过滤）照常返回该行 —— 与 data_coverage 为 null 并存').toBe(1)
     expect(meta().data_coverage, '形态谓词把脏值排除 → 没有 MIN/MAX 可报').toBeNull()
-    expect(meta().warnings, '这一种不会触发任何警告，Agent 只能靠图例知道它存在').toEqual([])
+    expect(meta().warnings, '没有时间过滤：脏值行没有被丢弃，不必警告').toEqual([])
+  })
+
+  it('③d 给了时间过滤：脏时间值被静默丢掉 → warnings 点名数量（不再与 db tables 两套说法）', async () => {
+    // 2026-11-05 审查：时间过滤的 WHERE 里同时挂着形态谓词，脏值行不进 rows、不进
+    // data_coverage，此前零警告；而 db tables 对同一张表报「时间列有 N 个值不符合约定形态」。
+    await seed()
+    await q('--table', 'staff_quality', '--since', '2020-01-01')
+    expect(meta().rows).toBe(0)
+    expect(meta().data_coverage).toBeNull()
+    const w = meta().warnings as string[]
+    expect(w.some((x) => x.includes('有 1 个值不符合约定形态')), `warnings 必须点名脏值数量：${w.join(' | ')}`)
+      .toBe(true)
+    expect(w.join('\n'), '要说明它们被排除在 rows 与 data_coverage 之外').toContain('已把它们排除')
   })
 })
 

@@ -529,6 +529,500 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).toContain('分组结果与计数可能失真')
   })
 
+  it('GROUP BY 的是**别名列** → 分组失真警告照发（输出列名不再叫 userPhone）', () => {
+    // 2026-11-05 审查实测：`SELECT userPhone AS p, COUNT(*) … GROUP BY p` 的输出列叫 `p`，
+    // matchedSensitive 为空 → 旧判据只发「别名缺口」一条，分组把不同号码压成同一行这件事
+    // 一个字都不提。Agent 会拿 `n` 当真。
+    const out = maskQueryRows({
+      rows: [
+        { p: '13800001111', n: 1 },
+        { p: '13899991111', n: 1 },
+        { p: '13812341111', n: 1 },
+      ],
+      columns: ['p', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone AS p, COUNT(*) AS n FROM sessions GROUP BY p',
+        tables: TABLES,
+      },
+    })
+    expect(new Set(out.rows.map((r) => r.p)).size).toBe(1)   // 确实被压平
+    const w = out.warnings.join('\n')
+    expect(w).toContain('GROUP BY / DISTINCT')
+    expect(w, '警告里要点名的是 SQL 引用的敏感列').toContain('userPhone')
+    // 大小写不敏感：DuckDB 标识符不分大小写（`username AS n` 同样漏出）
+    const lower = maskQueryRows({
+      rows: [{ n: 2 }],
+      columns: ['n'],
+      mode: { kind: 'sql', sql: 'SELECT username AS n, COUNT(*) AS c FROM sessions GROUP BY n', tables: TABLES },
+    })
+    expect(lower.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('反证：GROUP BY 完全不碰敏感列时不得发出分组失真警告（避免噪音淹没真警告）', () => {
+    const out = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 7 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT session_type, COUNT(*) AS n FROM sessions GROUP BY session_type',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('反证：敏感列只出现在 WHERE / HAVING（过滤而非分组键）→ 不得发分组失真警告', () => {
+    // Codex 2026-11-05 P2：按「SQL 里出现过敏感列」判会把这些查询谎报成分组失真，
+    // 而那条警告还建议 --no-mask —— 等于诱导用户白关脱敏。
+    const where = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 3 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT session_type, COUNT(*) AS n FROM sessions WHERE userPhone = '13800001111' "
+          + 'GROUP BY session_type',
+        tables: TABLES,
+      },
+    })
+    expect(where.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+    const having = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 3 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT session_type, COUNT(*) AS n FROM sessions GROUP BY session_type "
+          + "HAVING max(userPhone) = '13800001111'",
+        tables: TABLES,
+      },
+    })
+    expect(having.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+    const distinct = maskQueryRows({
+      rows: [{ session_type: 'chat' }],
+      columns: ['session_type'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT DISTINCT session_type FROM sessions WHERE userPhone = '13800001111'",
+        tables: TABLES,
+      },
+    })
+    expect(distinct.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('正例：DISTINCT 直接作用在敏感列（含别名）上 → 仍要警告分组失真', () => {
+    const direct = maskQueryRows({
+      rows: [{ userPhone: '13800138000' }],
+      columns: ['userPhone'],
+      mode: { kind: 'sql', sql: 'SELECT DISTINCT userPhone FROM sessions', tables: TABLES },
+    })
+    expect(direct.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    const aliased = maskQueryRows({
+      rows: [{ p: '13800138000' }],
+      columns: ['p'],
+      mode: { kind: 'sql', sql: 'SELECT DISTINCT userPhone AS p FROM sessions', tables: TABLES },
+    })
+    expect(aliased.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    // WHERE 里的敏感列不影响：DISTINCT 的键是选择列表
+    const other = maskQueryRows({
+      rows: [{ p: '138****8000' }],
+      columns: ['p'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT DISTINCT userEmail AS p FROM sessions WHERE userPhone = '1'",
+        tables: TABLES,
+      },
+    })
+    expect(other.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('GROUP BY 引用的是字面量/字符串里的词 → 不算分组键（不被子句切片骗过）', () => {
+    const out = maskQueryRows({
+      rows: [{ k: 'x', n: 1 }],
+      columns: ['k', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT session_type AS k, COUNT(*) AS n FROM sessions GROUP BY session_type "
+          + "ORDER BY 'userPhone'",
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('GROUP BY ALL（DuckDB）= 按全部非聚合选择项分组 → 敏感列照样要警告（CodeRabbit 2026-11-05 第二轮）', () => {
+    const all = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone, COUNT(*) AS n FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(all.warnings.join('\n'), 'ALL 是选择列表的缩写，不是普通键').toContain('GROUP BY / DISTINCT')
+    const clean = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 3 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT session_type, COUNT(*) AS n FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(clean.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('子查询里的 GROUP BY 不把外层 WHERE 吞进分组键（CodeRabbit 2026-11-05 第二轮）', () => {
+    // `sliceClause` 深度 0 遇到 `)` 必须收尾；否则外层 WHERE 里的 userPhone 会被读成分组键。
+    const out = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 1 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT * FROM (SELECT session_type, COUNT(*) AS n FROM sessions "
+          + "GROUP BY session_type) t WHERE userPhone = '13800001111'",
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('分组键没被投影出来 → 不报警（脱敏不改可见输出，Codex 2026-11-05 第二轮 P2）', () => {
+    // 实测 `SELECT COUNT(*) … GROUP BY userPhone` 返回 [{n:1},{n:1}]：分组键不在输出里，
+    // 脱敏前后输出完全一样，报「分组失真」并建议 --no-mask 是纯误报。
+    const hidden = maskQueryRows({
+      rows: [{ n: 1 }, { n: 1 }],
+      columns: ['n'],
+      mode: { kind: 'sql', sql: 'SELECT COUNT(*) AS n FROM sessions GROUP BY userPhone', tables: TABLES },
+    })
+    expect(hidden.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+    // GROUP BY ALL + 聚合别名（`max(userPhone) AS userPhone`）同理：那一项是聚合值不是分组键
+    const agg = maskQueryRows({
+      rows: [{ userPhone: '13899991111', n: 2 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT max(userPhone) AS userPhone, COUNT(*) AS n FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(agg.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('GROUP BY 的是字符串字面量 → 按常量分组，不算分组键（Codex 2026-11-05 第二轮 P3）', () => {
+    // 实测 `SELECT COUNT(*) … GROUP BY 'userPhone'` 返回一行 n=2（按常量分组）。
+    const out = maskQueryRows({
+      rows: [{ n: 2 }],
+      columns: ['n'],
+      mode: {
+        kind: 'sql',
+        // `session_type AS k`：让 k 成为一个**非敏感**的可见分组键 —— 否则选择列表里
+        // 只有聚合项，visible(userPhone) 直接不成立，字面量那一档根本到不了。
+        sql: "SELECT session_type AS k, COUNT(*) AS n FROM sessions GROUP BY k, 'userPhone'",
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+    // ⚠️ 诚实记录：合法 SQL 里「敏感列可见却只被字面量提及」的组合几乎不存在（可见的
+    // 非聚合选择项必须同时出现在 GROUP BY 里），所以**分组**这一档对字面量抹除是等价变异；
+    // 真正靠它挡住的是下面的缺口警告用例。
+  })
+
+  it('列名只以字面量出现的引用（struct_extract / row_to_json）→ 缺口警告必须照发', () => {
+    // CodeRabbit PR #68 第三轮 major：`struct_extract(t, 'userName')`、`row_to_json(t)->>'userName'`
+    // 里列名**只**以字符串字面量出现，而姓名/地址没有值级检测 —— 抹掉字面量会让这类查询
+    // 静默零警告（实测两者都返回 `"n":"张三"`）。方向按 spec §十五.4：缺口警告宁多勿少。
+    for (const sql of [
+      "SELECT struct_extract(t, 'userName') AS n FROM sessions t",
+      "SELECT row_to_json(t)->>'userName' AS n FROM sessions t",
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ n: '张三' }], columns: ['n'], mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).toContain('引用了敏感列 userName')
+    }
+    // 代价如实记录：`WHERE x = 'userPhone'` 这种纯字面量也会多报一条（可接受）
+    const over = maskQueryRows({
+      rows: [{ session_type: 'userPhone' }],
+      columns: ['session_type'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT session_type FROM sessions WHERE session_type = 'userPhone'",
+        tables: TABLES,
+      },
+    })
+    expect(over.warnings.join('\n'), '过报方向，spec §十五.4 允许').toContain('引用了敏感列 userPhone')
+  })
+
+  it('选择列表解析不了 / 是 `*` 时，退回输出列名命中（保住旧警告，CodeRabbit 2026-11-05 第三轮）', () => {
+    // `SELECT DISTINCT *` 实测输出全部敏感列，去重后打码仍可能把两行压成同一行。
+    const star = maskQueryRows({
+      rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+      columns: ['userPhone', 'session_type'],
+      mode: { kind: 'sql', sql: 'SELECT DISTINCT * FROM sessions', tables: TABLES },
+    })
+    expect(star.warnings.join('\n'), 'DISTINCT * 覆盖全部敏感列').toContain('GROUP BY / DISTINCT')
+    // `WITH … SELECT` 取不到选择列表 → 与 `SELECT *` 同样退回列名命中
+    const cte = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'WITH x AS (SELECT * FROM sessions) SELECT userPhone, COUNT(*) AS n FROM x GROUP BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(cte.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    // 反证：解析得出来时不退回 —— 聚合别名是聚合值，不该被当成可见分组键
+    const agg = maskQueryRows({
+      rows: [{ userPhone: '13899991111', n: 2 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT max(userPhone) AS userPhone, COUNT(*) AS n FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(agg.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('字面量里的 GROUP BY / DISTINCT 不算查询结构（Codex 2026-11-05 第三轮 P2）', () => {
+    const gb = maskQueryRows({
+      rows: [{ userPhone: '138****1111', label: 'GROUP BY userPhone' }],
+      columns: ['userPhone', 'label'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT userPhone, 'GROUP BY userPhone' AS label FROM sessions",
+        tables: TABLES,
+      },
+    })
+    expect(gb.warnings.join('\n'), '字面量不是分组子句').not.toContain('GROUP BY / DISTINCT')
+    const dist = maskQueryRows({
+      rows: [{ userPhone: '138****1111', label: 'SELECT DISTINCT' }],
+      columns: ['userPhone', 'label'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT userPhone, 'SELECT DISTINCT' AS label FROM sessions",
+        tables: TABLES,
+      },
+    })
+    expect(dist.warnings.join('\n'), '字面量不是 DISTINCT').not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('被标量函数包裹的聚合项不是分组键（Codex 2026-11-05 第三轮 P2）', () => {
+    // 实测 `SELECT coalesce(max(userPhone), NULL) AS userPhone, COUNT(*) … GROUP BY ALL`
+    // 返回一行 —— 是聚合值，不是分组键。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '13899991111', n: 2 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT coalesce(max(userPhone), NULL) AS userPhone, COUNT(*) AS n '
+          + 'FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    // ⚠️ 必须配一条**真有非敏感分组键**的组：`userPhone AS userPhone` 的聚合别名会让
+    // `visible(userPhone)` 直接不成立，聚合识别的变异因此一直是绿的（本用例初版如此）。
+    // 这里 `session_type` 是可见分组键，`userPhone` 以裸列名出现在选择项里 —— 只有
+    // 「整个表达式里搜聚合函数」才能挡住误报。
+    const mixed = maskQueryRows({
+      rows: [{ session_type: 'chat', userPhone: '13899991111', n: 2 }],
+      columns: ['session_type', 'userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT session_type, coalesce(max(userPhone), NULL) AS userPhone, COUNT(*) AS n '
+          + 'FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(mixed.warnings.join('\n'), '聚合表达式不是分组键').not.toContain('GROUP BY / DISTINCT')
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('`SELECT * … GROUP BY ALL` → 星号列退回输出列名，分组失真照报（Codex 2026-11-05 第三轮 P2）', () => {
+    // 实测输出全部敏感列并按它们分组：不同手机号打码后可能合并。
+    const out = maskQueryRows({
+      rows: [{ session_type: 'chat', userPhone: '138****1111' }],
+      columns: ['session_type', 'userPhone'],
+      mode: { kind: 'sql', sql: 'SELECT * FROM sessions GROUP BY ALL', tables: TABLES },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('带正则元字符的别名（`AS "p("` / `AS "[x"`）→ 照常报警且不得抛 SyntaxError（CodeRabbit 第六轮 minor）', () => {
+    // 实测 DuckDB 接受这两种别名并按它分组；旧实现把别名直接拼进 `new RegExp`，
+    // `\bp(\b` / `\b[x\b` 直接抛 SyntaxError —— 查询已成功，脱敏阶段却让整条命令报 internal。
+    for (const [sql, alias] of [
+      ['SELECT userPhone AS "p(", COUNT(*) AS n FROM sessions GROUP BY "p("', 'p('],
+      ['SELECT userPhone AS "[x", COUNT(*) AS n FROM sessions GROUP BY "[x"', '[x'],
+    ] as const) {
+      const out = maskQueryRows({
+        rows: [{ [alias]: '138****1111', n: 1 }],
+        columns: [alias, 'n'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).toContain('GROUP BY / DISTINCT')
+    }
+    // 反证：不参与分组的标点别名不报警（分组键是 session_type）
+    const noGroup = maskQueryRows({
+      rows: [{ 'p(': '138****1111', session_type: 'chat' }],
+      columns: ['p(', 'session_type'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone AS "p(", session_type FROM sessions GROUP BY session_type',
+        tables: TABLES,
+      },
+    })
+    expect(noGroup.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('`DISTINCT ON (非敏感列)` 投影敏感列 → 不报警；`DISTINCT ON (敏感列)` → 报警（Codex 2026-11-05 第五轮核实）', () => {
+    // 去重键是 ON (...) 里的列，不是整张选择列表 —— 正则在 execTopLevel 改写后必须仍保留
+    // 捕获组（`distinct[1]`），否则会把整个投影当去重键、对 `DISTINCT ON (session_type)` 误报。
+    // 实测 DuckDB：`SELECT DISTINCT ON (session_type) userPhone …` 按 session_type 去重，
+    // 每个会话类型只留一行，手机号本身并不参与去重。
+    const byType = maskQueryRows({
+      rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+      columns: ['userPhone', 'session_type'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT DISTINCT ON (session_type) userPhone FROM sessions ORDER BY session_type',
+        tables: TABLES,
+      },
+    })
+    expect(byType.warnings.join('\n'), '去重键是 session_type').not.toContain('GROUP BY / DISTINCT')
+    const byPhone = maskQueryRows({
+      rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+      columns: ['userPhone', 'session_type'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT DISTINCT ON (userPhone) userPhone, session_type FROM sessions ORDER BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(byPhone.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('无空格写法 `SELECT DISTINCT(userPhone)` 同样要报警（CodeRabbit PR #68 第十四轮 minor）', () => {
+    // 实测 DuckDB 接受该写法并去重（3 行 → 2 行）；两处 DISTINCT 正则若要求 `\s+`，
+    // 这条查询会一条警告都没有 —— 比改动前的判据（任何 DISTINCT + 命中列名即报）还退步。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '138****1111' }, { userPhone: '138****1111' }],
+      columns: ['userPhone'],
+      mode: { kind: 'sql', sql: 'SELECT DISTINCT(userPhone) FROM sessions', tables: TABLES },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    // 反证：作用域仍然要守住 —— 子查询里的无空格 DISTINCT 不算本层
+    const inner = maskQueryRows({
+      rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+      columns: ['userPhone', 'session_type'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone, session_type FROM sessions '
+          + 'WHERE session_type IN (SELECT DISTINCT(session_type) FROM sessions)',
+        tables: TABLES,
+      },
+    })
+    expect(inner.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('反证：子查询里的 DISTINCT 不是本层的去重 → 不报警（DISTINCT 判据同样按作用域）', () => {
+    // 外层只是把子查询的原值行投影出来，脱敏不合并行；把内层 DISTINCT 当成外层去重
+    // 会对外层投影的敏感列谎报「分组失真」（2026-11-05 第四轮自查，同族缺陷）。
+    for (const sql of [
+      'SELECT userPhone, session_type FROM sessions '
+      + 'WHERE session_type IN (SELECT DISTINCT session_type FROM sessions)',
+      'SELECT userPhone FROM (SELECT DISTINCT userPhone FROM sessions) t',
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+        columns: ['userPhone', 'session_type'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).not.toContain('GROUP BY / DISTINCT')
+    }
+  })
+
+  it('表达式别名（`lower(userPhone) AS p` + `GROUP BY p`）→ 必须报警（Codex 2026-11-05 第四轮 P2 漏报）', () => {
+    // 实测 DuckDB：`SELECT lower(userPhone) AS p, COUNT(*) … GROUP BY p` 返回两行 ——
+    // 按 lower(userPhone) 分组，脱敏后两个号码塌成同一行。整串正则只认「列名紧跟别名」，漏了。
+    const out = maskQueryRows({
+      rows: [
+        { p: '13800138000', n: 1 },
+        { p: '13800138000', n: 1 },
+        { p: '13900139000', n: 1 },
+      ],
+      columns: ['p', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT lower(userPhone) AS p, COUNT(*) AS n FROM sessions GROUP BY p',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('反证：表达式别名不为敏感列分组时不报警（别名属于其它列 / 是聚合项）', () => {
+    // 反方向两条：`session_type` 的别名与敏感列无关；`max(userPhone) AS m` 是聚合值。
+    for (const sql of [
+      "SELECT lower(session_type) AS p, userPhone FROM sessions GROUP BY p",
+      'SELECT max(userPhone) AS m, session_type FROM sessions GROUP BY session_type',
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ p: 'chat', userPhone: '138****8000', m: '138****8000', session_type: 'chat' }],
+        columns: ['p', 'userPhone', 'm', 'session_type'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).not.toContain('GROUP BY / DISTINCT')
+    }
+  })
+
+  it('子查询里先出现 GROUP BY，外层才是真分组 → 必须报警（Codex 2026-11-05 第四轮 P2）', () => {
+    // 实测 DuckDB：外层按 userPhone 分成两组。取「第一个 GROUP BY」会落在子查询上
+    //（那里按 session_type 分组），于是漏掉把手机号压平的那一次分组。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }, { userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone, COUNT(*) AS n FROM (SELECT any_value(userPhone) AS userPhone '
+          + 'FROM sessions GROUP BY session_type) t GROUP BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('只有子查询按敏感列分组、外层不分组 → 不报警（子句归属按括号层级判定）', () => {
+    // 反方向：切片起点必须落在**本层**。外层没有 GROUP BY，内层的分组不改变外层输出。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '138****1111' }],
+      columns: ['userPhone'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone FROM (SELECT any_value(userPhone) AS userPhone '
+          + 'FROM sessions GROUP BY userPhone) t',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n'), '内层 GROUP BY 不是本层的分组').not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('带双引号的别名（`AS "p"` + `GROUP BY p`）→ 必须报警（Codex 2026-11-05 第二轮 P2 漏报）', () => {
+    // 实测 DuckDB 接受该写法并按 userPhone 分成两组；`GROUP BY p` 引用的是 "p"。
+    const out = maskQueryRows({
+      rows: [{ p: '138****1111', n: 1 }, { p: '138****1111', n: 1 }],
+      columns: ['p', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone AS "p", COUNT(*) AS n FROM sessions GROUP BY p',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
   it('值级兜底命中非敏感列 → 警告「可能是业务数字被误改」（11 位订单号）', () => {
     const out = maskQueryRows({
       rows: [{ order_id: '13800138000' }],

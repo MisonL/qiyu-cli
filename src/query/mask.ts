@@ -170,6 +170,240 @@ function sqlSensitiveNames(tables: TableDef[]): string[] {
 }
 
 /**
+ * 只在**顶层**（括号外、字面量/注释已被抹成空格）执行正则，返回的 `index` 是**绝对**下标。
+ *
+ * 用于定位子句起点与 `DISTINCT` 关键字：子查询里的同名子句不算本层的。
+ */
+function execTopLevel(scan: string, re: RegExp): RegExpExecArray | null {
+  let depth = 0
+  let inDouble = false
+  for (let i = 0; i < scan.length; i++) {
+    const ch = scan[i]!
+    if (inDouble) { if (ch === '"') { if (scan[i + 1] === '"') i++; else inDouble = false } continue }
+    if (ch === '"') { inDouble = true; continue }
+    if (ch === '(') { depth++; continue }
+    if (ch === ')') { depth = Math.max(0, depth - 1); continue }
+    if (depth !== 0 || !/[A-Za-z]/.test(ch)) continue
+    if (i > 0 && /[A-Za-z0-9_$]/.test(scan[i - 1]!)) continue
+    // ⚠️ 必须要求 `m.index === 0`：起点正则有的带 `^` 有的不带（`GROUP BY` 那条没有）。
+    // 不校验就会把「切片里任意位置」的匹配错误地改写成「起始于 i」—— 于是第一个字母
+    // 位置就「命中」，切片从错误处开始（实测：所有普通 GROUP BY 查询都不再告警）。
+    // 校验通过后再把下标改写成**绝对**下标 i（调用方按 `m.index + m[0].length` 定位）。
+    const m = new RegExp(re.source, re.flags.replace(/[gy]/g, '')).exec(scan.slice(i))
+    if (m !== null && m.index === 0) { m.index = i; return m }
+  }
+  return null
+}
+
+/**
+ * 顶层子句切片：从 `startRe` 匹配处之后切到下一个**顶层**子句关键字（或在结尾）。
+ *
+ * ⚠️ 为什么需要（Codex 2026-11-05 P2）：分组失真的判据必须看**分组键**本身，
+ * 而不是「SQL 里出现过敏感列」—— `SELECT session_type, COUNT(*) … WHERE userPhone = '…'
+ * GROUP BY session_type` 里敏感列只用于过滤，脱敏不会改变分组键或计数；按整条 SQL 判
+ * 会把这类查询谎报成「分组失真」，警告还建议 `--no-mask`，等于诱导用户白关脱敏。
+ *
+ * 扫描规则（启发式，边界如实记录）：
+ *   · 单/双引号内的内容跳过（`` 'FROM' `` 这种字面量不算子句边界）；
+ *   · 括号内不算边界（`GROUP BY (CASE …)` 里的关键字不截断）；
+ *   · 只认裸词边界（前面不是标识符字符）。SQL 注释里的关键字仍可能被误认 ——
+ *     `--sql` 是单条语句、注释罕见，且误判方向只影响要不要发提示。
+ */
+function sliceClause(
+  sql: string,
+  startRe: RegExp,
+  stopSource = 'ORDER\\s+BY|LIMIT|HAVING|QUALIFY|WINDOW|UNION|EXCEPT|INTERSECT|FROM',
+): string {
+  // 定位作用在「抹掉字面量/注释但等长」的文本上，切片仍取原文（偏移逐位对齐）。
+  const scan = withoutLiterals(sql)
+  // ⚠️ 起点必须找**顶层**的那个（括号外）：`SELECT userPhone … FROM (SELECT … GROUP BY
+  // session_type) t GROUP BY userPhone` 里第一个 `GROUP BY` 在子查询里，取它就会漏掉
+  // 外层真正决定分组的那一个（Codex 2026-11-05 第四轮 P2 实测：漏报分组失真）。
+  const m = execTopLevel(scan, startRe)
+  if (m === null) return ''
+  const from = m.index + m[0].length
+  let depth = 0
+  let inSingle = false
+  let inDouble = false
+  for (let i = from; i < sql.length; i++) {
+    const ch = sql[i]!
+    if (inSingle) {
+      if (ch === "'") { if (sql[i + 1] === "'") i++; else inSingle = false }
+      continue
+    }
+    if (inDouble) {
+      if (ch === '"') { if (sql[i + 1] === '"') i++; else inDouble = false }
+      continue
+    }
+    if (ch === "'") { inSingle = true; continue }
+    if (ch === '"') { inDouble = true; continue }
+    if (ch === '(') { depth++; continue }
+    // ⚠️ 深度 0 遇到 `)` = 切片起点在子查询里、子查询到此结束 —— 必须就此收尾：
+    // `SELECT * FROM (… GROUP BY session_type) t WHERE userPhone = '1'` 里，越过这个
+    // 右括号会把外层 WHERE 并进分组子句，userPhone 就被误认成分组键并谎报分组失真
+    //（CodeRabbit PR #68 第二轮指出）。
+    if (ch === ')') { if (depth === 0) return sql.slice(from, i); depth--; continue }
+    if (depth !== 0 || !/[A-Za-z]/.test(ch)) continue
+    if (i > from && /[A-Za-z0-9_$]/.test(sql[i - 1]!)) continue
+    if (new RegExp('^(?:' + stopSource + ')\\b', 'i').test(scan.slice(i))) return sql.slice(from, i)
+  }
+  return sql.slice(from)
+}
+
+/** SQL 关键字：解析 `SELECT userPhone FROM t` 时别把 `FROM` 当成别名。 */
+const SQL_KEYWORDS = new Set([
+  'as', 'from', 'where', 'group', 'order', 'by', 'limit', 'having', 'on', 'join', 'left',
+  'right', 'inner', 'outer', 'full', 'cross', 'using', 'union', 'except', 'intersect',
+  'qualify', 'window', 'select', 'distinct', 'and', 'or', 'not', 'is', 'null', 'case',
+  'when', 'then', 'else', 'end', 'asc', 'desc', 'nulls', 'first', 'last', 'like', 'ilike',
+  'in', 'between', 'over', 'partition', 'filter', 'cast', 'collate',
+])
+
+/** 聚合函数（判断「这个 SELECT 项是聚合值还是分组键」用，DuckDB 常用集）。 */
+const AGGREGATE_FUNCS = new Set([
+  'count', 'sum', 'avg', 'mean', 'min', 'max', 'median', 'product', 'list', 'array_agg',
+  'string_agg', 'group_concat', 'first', 'last', 'any_value', 'any', 'every', 'bool_and',
+  'bool_or', 'bit_and', 'bit_or', 'bit_xor', 'approx_count_distinct', 'approx_quantile',
+  'quantile', 'quantile_cont', 'quantile_disc', 'mode', 'histogram', 'stddev', 'stddev_pop',
+  'stddev_samp', 'variance', 'var_pop', 'var_samp', 'corr', 'covar_pop', 'covar_samp',
+  'skewness', 'kurtosis', 'entropy', 'arg_min', 'arg_max', 'min_by', 'max_by',
+  'regr_avgx', 'regr_avgy', 'regr_count', 'regr_intercept', 'regr_r2', 'regr_slope',
+  'regr_sxx', 'regr_sxy', 'regr_syy',
+])
+
+/**
+ * SELECT 项是否以**聚合函数**开头（`max(userPhone) AS userPhone` 是聚合值，不是分组键）。
+ * 只看开头：`userPhone || '-x'` 这类表达式是投影出来的分组键（会被打码），不能当成聚合。
+ */
+const AGGREGATE_CALL = new RegExp(
+  `\\b(?:${[...AGGREGATE_FUNCS].join('|')})\\s*\\(`, 'i')
+
+/**
+ * SELECT 项是不是**聚合表达式**（`max(userPhone)`、`coalesce(max(userPhone), NULL)` 都算）。
+ *
+ * ⚠️ 必须搜**整个表达式**，不能只看开头（Codex 2026-11-05 第三轮 P2 实测）：
+ * `SELECT coalesce(max(userPhone), NULL) AS userPhone … GROUP BY ALL` 实测返回一行 ——
+ * 它明明是聚合值，开头是 coalesce，只看函数名会被当成非聚合项 → 误报分组失真并建议 --no-mask。
+ * 覆盖整个表达式是安全的方向：含聚合函数的项不可能同时是分组键（DuckDB 会拒绝）。
+ */
+function isAggregateItem(item: string): boolean {
+  return AGGREGATE_CALL.test(withoutLiterals(item))
+}
+
+/**
+ * 抹掉单引号字符串字面量与 SQL 注释（判据只看标识符，不看字面量/注释里的文本）。
+ *
+ * ⚠️ Codex 2026-11-05 第二轮 P3 实测：`SELECT COUNT(*) … GROUP BY 'userPhone'` 是
+ * **按常量分组**（实测一行 `n=2`），但字面量里恰好写着列名时，按原文本搜索会谎报分组失真。
+ * 双引号是**标识符**（`"userPhone"` 就是那一列），不抹。
+ */
+/**
+ * 把用户/元数据给出的标识符转义成可安全拼进 `RegExp` 的字面量。
+ *
+ * ⚠️ 别名由用户提供（`SELECT userPhone AS "p("`），DuckDB 实测接受带正则元字符的别名；
+ * 不转义时 `new RegExp('\\bp(\\b')` 直接抛 `SyntaxError` —— 查询本身**已经成功**，
+ * 却因为脱敏阶段崩掉而让整条命令报 internal、一行数据都拿不回来
+ *（CodeRabbit PR #68 第六轮 minor，实测 `"p("`/`"[x"` 两种形态都抛）。
+ */
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function withoutLiterals(text: string): string {
+  let out = ''
+  // ⚠️ 被抹掉的字符一律换成等长空格：下标与原文**逐位对齐**，`sliceClause` 才能在抹过的
+  // 文本上定位 `GROUP BY`/`DISTINCT` 而不会命中字符串字面量里的同一串词（Codex 2026-11-05
+  // 第三轮 P2：`SELECT userPhone, 'GROUP BY userPhone' AS label …` 曾被误判成分组查询）。
+  const blank = (n: number): string => ' '.repeat(n)
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (ch === "'") {
+      const start = i
+      for (i++; i < text.length; i++) {
+        if (text[i] === "'") { if (text[i + 1] !== "'") break; i++ }
+      }
+      out += blank(i - start + 1)
+      continue
+    }
+    if (ch === '-' && text[i + 1] === '-') {
+      // 行注释抹到行尾（**不含**换行符）：`\n` 原样保留，保证与原文等长。
+      while (i < text.length && text[i] !== '\n') { out += ' '; i++ }
+      if (i < text.length) out += '\n'
+      else i--
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const start = i
+      i += 2
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
+      i++   // 越过 `/`
+      out += blank(Math.min(i, text.length - 1) - start + 1)
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+/** 顶层逗号切分（括号与引号内不算），用于 SELECT 列表与 GROUP BY 的项。 */
+function splitTopLevel(text: string): string[] {
+  const out: string[] = []
+  let depth = 0
+  let inSingle = false
+  let inDouble = false
+  let start = 0
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (inSingle) {
+      if (ch === "'") { if (text[i + 1] === "'") i++; else inSingle = false }
+      continue
+    }
+    if (inDouble) {
+      if (ch === '"') { if (text[i + 1] === '"') i++; else inDouble = false }
+      continue
+    }
+    if (ch === "'") { inSingle = true; continue }
+    if (ch === '"') { inDouble = true; continue }
+    if (ch === '(') { depth++; continue }
+    if (ch === ')') { depth = Math.max(0, depth - 1); continue }
+    if (ch === ',' && depth === 0) { out.push(text.slice(start, i)); start = i + 1 }
+  }
+  out.push(text.slice(start))
+  return out
+}
+
+/**
+ * SELECT 列表里「引用了敏感列的输出项」的别名（用于 `GROUP BY <别名>` 这种写法）。
+ *
+ * ⚠️ 按**选择项**（顶层逗号切分）而不是整串正则来解析（Codex 2026-11-05 第四轮 P2）：
+ * 整串正则只认「列名紧跟别名」，`SELECT lower(userPhone) AS p … GROUP BY p` 这种
+ * **表达式别名**会漏报 —— 实测 DuckDB 按 `lower(userPhone)` 分成两组，脱敏后照样塌成一行。
+ * 逐项解析也让「别名必须属于该项的结尾」这件事由切分本身保证，不需要再拿子句关键字
+ * 做前瞻（`userPhone = 'x'` 这类项不以标识符结尾，自然不产生别名）。
+ *
+ * 判据：
+ *   ① 项形如 `<表达式> [AS] <标识符>`，`<表达式>` 里**引用**敏感列（词边界；字面量已抹掉）；
+ *   ② 别名可以是双引号标识符（`AS "p"`，DuckDB 里 `GROUP BY p` 能引用它），去引号后比较；
+ *   ③ 聚合项不算（`max(userPhone) AS worst` 是聚合值，DuckDB 也不接受按它分组）。
+ */
+function aliasesOf(selectList: string, name: string): string[] {
+  const out: string[] = []
+  const nameRe = new RegExp(`(?<![A-Za-z0-9_$])${escapeRe(name)}(?![A-Za-z0-9_$])`, 'i')
+  const aliasRe = /^([\s\S]*\S)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*|"[^"]+")\s*$/i
+  for (const item of splitTopLevel(withoutLiterals(selectList))) {
+    if (isAggregateItem(item)) continue
+    const m = aliasRe.exec(item)
+    const expr = m?.[1]
+    const raw = m?.[2]
+    if (expr === undefined || raw === undefined) continue
+    if (!nameRe.test(expr)) continue
+    const alias = raw.startsWith('"') ? raw.slice(1, -1) : raw
+    if (!SQL_KEYWORDS.has(alias.toLowerCase()) && !out.includes(alias)) out.push(alias)
+  }
+  return out
+}
+
+/**
  * 对一次查询的输出行脱敏（spec §7.2）。纯函数：输入行不被就地改写；
  * `noMask` 时直接返回入参数组（不拷贝，因为一个字节都不会改）。
  */
@@ -339,6 +573,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       return typeof parsed === 'object' && parsed !== null
     } catch { return false }
   }))
+  // ⚠️ 这一段（payload 引用）作用在**原始** SQL 上：`row_to_json(t)->>'payload'`、
+  // `json_extract(payload, '$.x')` 这类构造里字典键/列名只以字面量出现。
   const payloadReferenced = columns.includes('payload') || /\bpayload\b/i.test(mode.sql)
   // ⚠️ 第四类绕过（安全审查 Major，2026-10-20 实测）：`query()` 表函数把内层 SQL 当作
   // **字符串**执行，外层文本与输出列名都看不到内层标识符——
@@ -363,6 +599,143 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       + queryTableCommand('<表>', loc) + '`')
   }
 
+  // 分组 / 去重会把不同原值压成同一个脱敏值（场景审查 7.3，2026-10-20 实测）：
+  // `SELECT userPhone, COUNT(*) … GROUP BY userPhone` 对 3 个不同手机号输出 3 行同一个
+  // `138****1111`、每行 count=1 —— Agent 会读成「只有 1 个手机号」或「数据坏了」，而
+  // 输出里没有任何提示。`--table --group-by` 直接拒绝敏感列正是为了这个，`--sql` 只能声明。
+  //
+  // ⚠️ 触发条件不能只看 `matchedSensitive`（= 输出列名命中）：`SELECT userPhone AS p,
+  // COUNT(*) … GROUP BY p` 的输出列叫 `p`，脱敏走的仍是列名级（列名 `p` 不敏感 →
+  // 实际走值级，手机号照常被打码），但 `p` 不在 matchedSensitive 里，于是**分组失真
+  // 一条警告都没有**（2026-11-05 审查实测）。
+  //
+  // ⚠️ 但也不能按「SQL 里出现过敏感列」判（Codex 2026-11-05 P2 实测）：
+  // `SELECT session_type, COUNT(*) … WHERE userPhone = '…' GROUP BY session_type` 里
+  // 敏感列只用于**过滤**，脱敏不会改变分组键或计数 —— 按整条 SQL 判会谎报「分组失真」，
+  // 而这条警告建议 `--no-mask`，等于诱导用户白关脱敏。判据只看**分组键本身**：
+  //   ① `GROUP BY` 的项里按词边界出现敏感列名（`GROUP BY userPhone`）；
+  //   ② `GROUP BY <别名>`，而该别名是 SELECT 列表里某个敏感列的别名（`userPhone AS p`）；
+  //   ③ `GROUP BY <序号>`（`GROUP BY 1`）指向的 SELECT 项引用了敏感列；
+  //   ④ `SELECT DISTINCT` 的选择列表（`DISTINCT ON (…)` 只取括号内的列）里出现敏感列。
+  // ⚠️ `matchedSensitive`（输出列名命中）本身**不再**算作分组证据：`SELECT max(userPhone)
+  // AS userPhone … GROUP BY session_type` 的分组键不含敏感列，输出列名却命中 —— 那是聚合
+  // 而非分组，打码不会改变计数。分组列是否敏感由上面的分组键判据决定。
+  // 都是词边界 + 大小写不敏感（DuckDB 标识符不分大小写）。
+  //
+  // ⚠️ 再加一个条件「**可见**」（Codex 2026-11-05 第二轮 P2 实测）：脱敏只会把**输出里**
+  // 被投影的分组值压平，计数不变。`SELECT COUNT(*) FROM sessions GROUP BY userPhone`
+  // 只输出计数，分组键根本没投影 —— 两张不同手机号各计 1 条，脱敏前后输出完全一样，
+  // 报「分组失真」并建议 --no-mask 是纯粹的误报（实测该 SQL 返回 `n=1, n=1`）。
+  // 所以分组键命中后还要看它有没有作为**非聚合**选择项被投影出来
+  // （`SELECT userPhone, COUNT(*) … GROUP BY userPhone`、`SELECT userPhone AS p … GROUP BY p`
+  // 都是可见的；`SELECT max(userPhone) AS userPhone … GROUP BY ALL` 里那一项是聚合值，不可见）。
+  //
+  // ⚠️ 字面量与注释先抹掉（Codex 第二轮 P3 实测）：`GROUP BY 'userPhone'` 是按**常量**分组
+  //（实测一行 `n=2`），字面量里写着列名不该算命中。双引号是标识符，不抹。
+  //
+  // ⚠️ 引用判定作用在**原始** SQL 上（含字面量）：`struct_extract(t, 'userName')`、
+  // `row_to_json(t)->>'userName'` 里列名**只**以字符串字面量出现，而姓名/地址没有值级
+  // 检测 —— 抹掉字面量会让这类查询静默零警告（CodeRabbit PR #68 第三轮 major 实测）。
+  // 方向按 spec §十五.4：缺口警告宁多勿少（`WHERE session_type = 'userPhone'` 会多报一条，
+  // 这是可接受的代价）。
+  const referencedSensitive = sensitiveNames
+    .filter((n) => new RegExp(`(?<![A-Za-z0-9_$])${escapeRe(n)}(?![A-Za-z0-9_$])`, 'i').test(mode.sql))
+  const referencesSensitive = referencedSensitive.length > 0
+  // 边界用「前后不是标识符字符」而不是 `\\b`：别名可以带标点（`"p("`），
+  // 而 `\\b` 只在词字符与非词字符之间成立 —— `\\bp(\\b` 即使不抛也永远匹配不上
+  // `GROUP BY "p("` 里的 `p(`。转义 + lookaround 两个方向都对（CodeRabbit 第六轮 minor）。
+  const wordHit = (text: string, names: readonly string[]): boolean => {
+    const plain = withoutLiterals(text)
+    return names.some((n) => new RegExp(
+      `(?<![A-Za-z0-9_$])${escapeRe(n)}(?![A-Za-z0-9_$])`, 'i').test(plain))
+  }
+  const groupedSensitive = new Set<string>()
+  // ⚠️ `DISTINCT` 后面是 `\s*` 不是 `\s+`（CodeRabbit PR #68 第十四轮 minor）：
+  // DuckDB 接受 `SELECT DISTINCT(userPhone) FROM sessions`（实测去重生效，3 行 → 2 行），
+  // 要求空白会把 `DISTINCT(userPhone)` 整个当成一个选择项留在列表里。
+  // 如实记录：这一处**不单独承重** —— 把下面 distinct 检测正则修好后，前缀剥不剥都
+  // 会报警（`projectedPlain` 里照样含列名），变异实测用例仍绿。保留是因为它让选择项的
+  // 文本语义正确，但不算进变异数。
+  const selectList = withoutLiterals(sliceClause(
+    mode.sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\b\s*(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b'))
+  const selectItems = splitTopLevel(selectList)
+  const projected = selectItems.filter((it) => it.trim() !== '' && !isAggregateItem(it))
+  const projectedPlain = projected.join(',')
+  // ⚠️ 选择列表解析不了（`WITH … SELECT`、前导注释、`SELECT *` / `t.*`）时无法判断「哪一列被
+  // 投影出来」—— 退回输出列名命中（matchedSensitive），保住旧行为里的警告
+  //（`SELECT DISTINCT * FROM sessions` 实测会输出全部敏感列；CodeRabbit PR #68 第三轮 minor）。
+  // 解析得出来时不退回：`SELECT max(userPhone) AS userPhone … GROUP BY ALL` 的列名命中
+  // 是聚合值，不该当成可见分组键（Codex 第二轮 P2）。
+  const selectUnparsed = selectList.trim() === ''
+    || selectItems.some((it) => /\*\s*$/.test(it.trim()))
+  /** 分组键是否**被投影出来**（可见）：按列名、其别名或裸表达式出现于非聚合选择项。 */
+  const visible = (n: string): boolean =>
+    wordHit(projectedPlain, [n]) || aliasesOf(selectList, n).some((a) => wordHit(projectedPlain, [a]))
+    || (selectUnparsed && matchedSensitive.has(n))
+  const groupByClause = sliceClause(mode.sql, /\bGROUP\s+BY\b/i)
+  if (groupByClause !== '') {
+    let keys = splitTopLevel(groupByClause)
+    // 字面量先抹掉（`GROUP BY 'x'` 是按常量分组，不是列 —— Codex 第二轮 P3 实测），
+    // 抹完的键只含标识符，再参与列名匹配。
+    const plainKeys = keys.map((k) => withoutLiterals(k))
+    // `GROUP BY ALL`（DuckDB）= 按**全部非聚合选择项**分组 —— 选择项里出现敏感列就是分组键
+    //（聚合项如 `max(userPhone) AS userPhone` 不是分组键，见上面的聚合判定）。
+    const groupByAll = plainKeys.length === 1 && /^\s*ALL\s*$/i.test(plainKeys[0]!)
+    for (const n of sensitiveNames) {
+      if (!visible(n)) continue
+      // `GROUP BY ALL` + `SELECT *`：选择项是星号，projectedPlain 里没有列名 —— 退回输出列名命中
+      //（`SELECT * … GROUP BY ALL` 实测输出全部敏感列并按它们分组，Codex 第三轮 P2）。
+      const viaKey = plainKeys.some((k) => wordHit(k, [n]))
+        || (groupByAll && (wordHit(projectedPlain, [n]) || (selectUnparsed && matchedSensitive.has(n))))
+      const viaAlias = aliasesOf(selectList, n).some((a) => plainKeys.some((k) => wordHit(k, [a])))
+      const viaOrdinal = plainKeys.some((k) => {
+        const t = k.trim()
+        if (!/^\d+$/.test(t)) return false
+        const target = selectItems[Number(t) - 1]
+        return target !== undefined && !isAggregateItem(target) && wordHit(target, [n])
+      })
+      if (viaKey || viaAlias || viaOrdinal) groupedSensitive.add(n)
+    }
+  }
+  // 判据作用在抹掉字面量/注释但等长的文本上：`SELECT userPhone, 'SELECT DISTINCT' AS label` 不是
+  // DISTINCT 查询（Codex 第三轮 P2）。切片偏移与原 SQL 逐位对齐。
+  const sqlBlank = withoutLiterals(mode.sql)
+  // 只在顶层找 DISTINCT：`… WHERE x IN (SELECT DISTINCT x …)` 的去重发生在子查询、且去重的是
+  // 该子查询的原值行，脱敏不过多合并行；误把它当外层 DISTINCT 会对外层投影列误报（第四轮）。
+  // `DISTINCT\b\s*`：`DISTINCT(userPhone)` 这种无空格写法同样算一次去重
+  const distinct = execTopLevel(sqlBlank, /\bSELECT\s+(?:ALL\s+)?DISTINCT\b\s*(ON\s*\()?/i)
+  if (distinct !== null) {
+    // `DISTINCT ON (a, b) …` 的分组键是括号里的列；普通 `DISTINCT` 是整张选择列表
+    //（DISTINCT 的选择项本身就是可见分组键；聚合项不会出现在 DISTINCT 列表里，但仍排除）。
+    // 括号配对走抹过字面量的 `sqlBlank`：字面量里的 `(`/`)` 不参与配对（等长，偏移对齐）。
+    const list = distinct[1] === undefined
+      ? projectedPlain
+      : (() => {
+          const open = distinct.index + distinct[0].length
+          let depth = 1
+          for (let i = open; i < sqlBlank.length; i++) {
+            if (sqlBlank[i] === '(') depth++
+            else if (sqlBlank[i] === ')') { depth--; if (depth === 0) return sqlBlank.slice(open, i) }
+          }
+          return sqlBlank.slice(open)
+        })()
+    for (const n of sensitiveNames) {
+      if (!visible(n)) continue
+      // 选择列表是 `*` / 解析不了时，`DISTINCT` 去重的就是**整行输出**（含全部敏感列）——
+      // 按 matchedSensitive 报，方向宁多勿少（CodeRabbit PR #68 第三轮 minor）。
+      if (selectUnparsed && matchedSensitive.has(n)) { groupedSensitive.add(n); continue }
+      if (wordHit(list, [n]) || aliasesOf(selectList, n).some((a) => wordHit(list, [a]))) {
+        groupedSensitive.add(n)
+      }
+    }
+  }
+  if (groupedSensitive.size > 0) {
+    warnings.push(
+      `SQL 对脱敏列做了 GROUP BY / DISTINCT（${[...groupedSensitive].join('、')}）：`
+      + '不同原值会映射成同一个脱敏值，分组结果与计数可能失真。'
+      + '需要准确分组请用 `--no-mask`（并自行承担 PII 风险），或改用不敏感列分组')
+  }
+
   for (const name of sensitiveNames) {
     if (warnings.length >= WARNING_LIMIT) break
     if (matchedSensitive.has(name)) continue
@@ -380,18 +753,6 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样')
   }
 
-  // 分组 / 去重会把不同原值压成同一个脱敏值（场景审查 7.3，2026-10-20 实测）：
-  // `SELECT userPhone, COUNT(*) … GROUP BY userPhone` 对 3 个不同手机号输出 3 行同一个
-  // `138****1111`、每行 count=1 —— Agent 会读成「只有 1 个手机号」或「数据坏了」，而
-  // 输出里没有任何提示。`--table --group-by` 直接拒绝敏感列正是为了这个，`--sql` 只能声明。
-  const grouped = /\bGROUP\s+BY\b|\bDISTINCT\b/i.test(mode.sql)
-  if (grouped && matchedSensitive.size > 0) {
-    warnings.push(
-      `SQL 对脱敏列做了 GROUP BY / DISTINCT（${[...matchedSensitive].join('、')}）：`
-      + '不同原值会映射成同一个脱敏值，分组结果与计数可能失真。'
-      + '需要准确分组请用 `--no-mask`（并自行承担 PII 风险），或改用不敏感列分组')
-  }
-
   // 值级兜底命中了**非敏感列**（场景审查 7.2）：11 位、以 1 开头的订单号/聚合值会被
   // 当成手机号打码，而 `--table` 通道对同一列返回原值。规则本身不能放宽（放宽就漏 PII），
   // 但必须告诉 Agent「这一列不是声明上的 PII，是形态命中，值可能被误改」。
@@ -399,7 +760,6 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // ⚠️ 只在 SQL **完全没有引用任何敏感列**时提示：`SELECT userPhone AS p` 的 p 也是
   // 「非敏感列名」，但它显然来自敏感列，上面已有缺口警告，再报一条就是噪音。
   // payload 同理（它有自己的缺口警告，且刻意不在 sensitiveNames 里）。
-  const referencesSensitive = sensitiveNames.some((n) => new RegExp(`\\b${n}\\b`, 'i').test(mode.sql))
   const falsePositive = referencesSensitive
     ? []
     : [...changed].filter((n) =>

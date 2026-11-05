@@ -122,7 +122,94 @@
 
 ### 修复
 
-- **同步与调度的九处契约修正（2026-11-05 独立审查）**：
+- **查询 / 存储 / 元数据命令的十五处契约修正（2026-11-05 第二路独立审查，三路探子 + 探针实测 + 十余轮双路收敛）**：
+
+  · **执行期的文件访问与扩展加载被误报成「internal，请报告此问题」**：layer2 拦截
+    （`sniff_csv` 这类在执行期才碰文件的函数）与 `Extension Autoloading Error` 只判在
+    prepare 期，执行期 catch 一律包成 internal —— 用户拿到的是「请报告此问题」，而真相是
+    「沙箱拦截了它，换个写法就能跑」。执行期同样归 `sandbox_blocked` 并给出替代做法。
+  · **写者撞锁把持有者说成「写进程」**：实测 DuckDB 是「写者独占 / 读者共享」，一个
+    READ_ONLY 会话同样挡住写者；旧文案让 Agent 去等一个并不存在的同步任务。改为
+    「被其他进程占用」，hint 讲明只读会话也会挡住写者并给出 `lsof` 排查动作。
+  · **库文件已损坏没有归因**：截断（`Could not read enough bytes from file`）与页校验和
+    （`Corrupt database file: computed checksum` 不同）两类报文此前既不匹配权限、也不匹配
+    「非 DuckDB 文件」，落进各命令的兜底 —— `store status` 说「请用 store status 检查」
+    （拿自己查自己）、`query` 说「跑 store init」（对损坏文件同样打不开）。新增第三种成因
+    `corrupt`，三个出口共用一份 hint：先备份，再用 `--db` 指向新路径重建（之后 `sync run`
+    必须带同一个 `--db <新路径>`，否则仍读到损坏的原文件）。
+  · **`mask_warnings` 图例只讲了一半来源**：该键还装 `GROUP BY` / `DISTINCT` 压平、
+    `query()`/`query_table()`/`COLUMNS()` 嵌套、非敏感列按值形态误改 —— 图例改为按
+    「缺口 / 副作用」两组穷举并声明「包括但不限于」。
+  · **`GROUP BY` 别名列漏掉分组失真警告（判据只看分组键）**：`SELECT userPhone AS p … GROUP BY p` 的输出列
+    不叫 `userPhone`，判据只看输出列名 → 只剩「别名缺口」一条，而「3 个号码被压成 1 行」一个字
+    不提。判据改为只看**分组键**：GROUP BY 项里的敏感列、别名（`GROUP BY p`）、序号（`GROUP BY 1`）
+    以及 `DISTINCT` 的选择列表。⚠️ 不用「SQL 里出现过敏感列」判 —— 敏感列只出现在 `WHERE`/`HAVING`
+    里时脱敏不改变分组与计数，那样判会谎报分组失真（Codex PR #68 P2 指出，已补反例）。
+    判据再收窄到「**可见且非聚合**」：分组键没被投影出来（`SELECT COUNT(*) … GROUP BY userPhone`）、
+    或被标量函数包裹的聚合别名（`coalesce(max(userPhone), NULL) AS userPhone … GROUP BY ALL`）
+    都不报；`GROUP BY ALL` 按全部非聚合选择项理解（`ALL` 本身不是键）；`SELECT *` / `WITH … SELECT`
+    解析不出选择列表时退回输出列名命中（宁多勿少）。字面量与注释不参与关键字/列名判定
+    （`'GROUP BY userPhone'`、`GROUP BY 'userPhone'` 都不算分组），但 `struct_extract(t, 'userName')`
+    这类「列名只在字面量里」的构造**照样**发缺口警告（§十五.4 方向，过报可接受）。
+  · **`db describe` 的 `time_column` 图例路径错位**：枚举翻译挂在 `time_column` 上（实际
+    在 `time_column.kind`），而 `time_column: null`（没有声明时间列）没有释义。枚举挪到
+    `time_column.kind`，`time_column` 讲形态与 null 含义；守卫下沉到该对象的每个字段。
+  · **OOM 报文透出沙箱里必然失败的 `SET` 建议**：DuckDB 的「Possible solutions」三条 SET
+    在只读沙箱（`lock_configuration=true`）里全部报 `configuration has been locked`。
+    报文截到成因行（最后一个标记处，避开用户文本回声），hint 改为可执行动作并点破这一点。
+  · **时间过滤静默丢掉脏时间值**：`query --table --since/--until` 的 WHERE 里带形态谓词，
+    脏值行不进 `rows`、不进 `data_coverage`，而 `db tables` 对同一张表会报数量 —— 现在
+    `query` 也点名数量并说明它们被排除（没有时间过滤时不报：那时脏值行照常返回）。
+    这次计数是**诊断性**的：失败/超时只降级为一条警告，不会把已成功的查询变成失败。
+  · **元数据命令的超时 hint 建议了它们没有的参数**：`db tables` / `db describe` /
+    `stats fields` 共用 `query` 的「缩小时间范围或加过滤条件」，而它们不接受任何过滤参数。
+    超时 hint 改为按调用方注入（`withTimeoutHint` 覆盖会话的所有内部查询）。⚠️ 前置检查
+    （`schema_version` 探测）跑在调用方包装**之前**，同一条命令因此在探测阶段给 `query`
+    口径、在正式阶段给元数据口径 —— 探测改为经同一个注入点（Codex 第四轮 P3 实测）。
+    ⚠️ 但探测 hint 必须由**调用方**决定，不能无脑注入元数据口径：`query` 也走这条路径，
+    而它**有** `--since/--until/--limit/--timeout` —— 探测超时时沿用 query 自己的说法才
+    对；套上元数据口径会让它建议「改用 `qiyu query --sql`」，正是用户正在跑的命令
+    （CodeRabbit 第六轮 minor，两个方向各配源码守卫）。
+  · **带正则元字符的别名会让脱敏阶段崩掉**：`SELECT userPhone AS "p(" … GROUP BY "p("`
+    的查询本身已成功，`wordHit` 却把别名直接拼进 `new RegExp`，`\bp(\b` 抛 SyntaxError ——
+    整条命令报 internal、一行数据都拿不回来（`AS "[x"` 同）。转义统一收口到 `escapeRe`，
+    边界改用「前后不是标识符字符」的 lookaround（`\b` 对带标点的别名本就匹配不上）。
+  · **分组判据不认子句的作用域**：`GROUP BY` / `DISTINCT` 的起点取的是**第一个**匹配，
+    而它可能在子查询里 —— `SELECT userPhone … FROM (SELECT any_value(userPhone) …
+    GROUP BY session_type) t GROUP BY userPhone` 只看到内层那次分组，外层真正把手机号
+    压平的那一次反而漏报（Codex 第四轮 P2）。起点改在**括号外**定位：只有本层的子句
+    才算本层的分组，内层的分组不改变本层输出（反方向同样有用例守着）。
+  · **表达式别名不产生分组警告**：别名解析只认「列名紧跟别名」，`SELECT lower(userPhone)
+    AS p, COUNT(*) … GROUP BY p` 实测按 `lower(userPhone)` 分组、脱敏后两个号码塌成一行，
+    却一条警告都没有（Codex 第四轮 P2）。解析改为按**选择项**（顶层逗号切分）逐项做：
+    项形如 `<表达式> [AS] <标识符>` 且表达式里引用了敏感列即算，聚合项除外。
+  · **`DISTINCT` 判据既不看作用域、也丢了过去重键**（两个方向都错）：`WHERE x IN
+    (SELECT DISTINCT x …)` 里的内层去重被当成外层 `DISTINCT`，拿外层选择列表判完就对外层
+    投影的敏感列谎报分组失真（CodeRabbit 第五轮 minor）；而 `DISTINCT ON (…)` 的去重键是
+    `ON (…)` 里的**列**、不是整张选择列表 —— 收敛作用域时把 `(ON\s*\()` 的捕获组写成
+    非捕获组，于是 `SELECT DISTINCT ON (session_type) userPhone …`（实测按 session_type
+    去重）被误报（Codex 第五轮 P2）。两处都配正/反方向用例。
+  · **撞锁提示里残留「写锁」自我否定**：写者撞锁的 hint 前半句写「正持有该数据库**写锁**」，
+    后半句又说持有者可能是只读会话 —— READ_ONLY 持有的是共享锁，前半句把同一个错误归因
+    带了回来（CodeRabbit 第十三轮 minor；测试只锚后半句，所以一直没发现）。改为「持有该
+    数据库的锁」，用例补「hint 不得出现『写锁』」；同时把 `sandbox.ts` 那条「与 duckdb.ts
+    同款」的注释改成如实说明两条**有意分叉**（只读被挡时持有者必是写者，说「写进程」是对的），
+    并给存储 spec 里的旧样例加注。
+  · **`SELECT DISTINCT(userPhone)` 无空格写法零警告**：两处 `DISTINCT` 正则都要求 `\s+`，
+    而 DuckDB 实测接受无空格写法并去重（3 行 → 2 行）—— 这条查询会一条警告都没有，比
+    改动前的判据（任何 DISTINCT + 命中列名即报）还退步（CodeRabbit 第十四轮 minor）。
+    两处正则改为 `DISTINCT\b\s*`；配正/反方向用例（本层报、子查询里的不报）。
+
+  守卫：`classifyOpenFailure` 的漂移扫描补「文件损坏判据」两档与两条事故形态自检；
+  元数据超时 hint 的包装形态与文案另加源码漂移守卫（含前置探测的注入形态）；OOM 剥除、
+  `withTimeoutHint`、`time_column` 元素层覆盖各配行为用例；子句作用域（内/外两个方向）
+  与表达式别名（正/反两个方向）、`DISTINCT` 作用域、标点别名（不崩且照报）各配行为用例。
+  另加一条**「声明 N 处 ↔ 实际 N 条」的守卫**（`tests/docs.test.ts`）：修复批的标题写数字、
+  正文用 bullet 逐条列，收敛轮次补条目后忘改标题已经发生过三次（本批 + 同步与调度批 +
+  注册表批，后两处计数一并改正）；数词改为**结构取段**（取「的」与「处契约修正」之间的整段交给解析器，认不出的字形判 NaN 报红）而不是枚举字形 —— 枚举没有终点（先漏「百/零」、补上又漏繁体「兩」）。当前共 **15 条**修复、**40 处**变异验证
+  （各方向均已实测变红后恢复绿；含审查收敛轮次里补的判据收窄与诊断降级）。
+
+- **同步与调度的十处契约修正（2026-11-05 独立审查）**：
 
   · **launchd 的 Weekday 被整体后移一天**：cron 与 launchd 是**同一套**周几编号
     （man launchd.plist：「0 and 7 are Sunday」，1 = 周一），旧代码 `v + 1` 让
@@ -178,7 +265,7 @@
   分隔符守卫、卸载次序、`/ST`、多日 `/D`、孤立 `;`、快照 apiCount、图例字符、图例键、
   gapHint 折叠回单条、`sync_gaps` 主键退回两列）。
 
-- **注册表与 api 图例的七处契约修正（2026-11-04 独立审查）**：
+- **注册表与 api 图例的九处契约修正（2026-11-04 独立审查）**：
 
   · **`export.session` / `export.session.check` 的唯一载荷被丢弃并谎报「无数据」**：
     设计稿 §7.5 实测两者的成功载荷就是 message 原文（任务 key / 下载链接），

@@ -27,8 +27,8 @@
 | `kind: network` | 网络层故障（退出码 3）。检查网络后退避重试 |
 | `kind: unknown` | 未分类错误。按 message 判断，不要盲目重试 |
 | `kind: needs_confirmation` | 危险操作等待确认（退出码 4）。**停下**，向人类复述该操作及其目标；**绝不自动追加 `--yes`** |
-| `kind: store_locked` | 本地库正被写进程持锁（例如同步进行中）。退避后重试；期间可以先用已有数据做分析 |
-| `kind: store_not_initialized` | 本地库不可用（不存在 / 缺表 / 不是本 CLI 的库 / 依赖未安装）。**按 `hint` 行动**：只有 hint 指向 `qiyu store init` 时才跑它，再跑 `qiyu sync run`；其余成因换 `--db` 路径或按 hint 安装依赖，原样重跑 `store init` 无效 |
+| `kind: store_locked` | 本地库正被其他进程持有（同步进行中，或另一个只读会话；DuckDB 的读者共享锁同样会挡住写者）。退避后重试；期间可以先用已有数据做分析 |
+| `kind: store_not_initialized` | 本地库不可用（不存在 / 缺表 / 不是本 CLI 的库 / 文件已损坏 / 依赖未安装）。**按 `hint` 行动**：只有 hint 指向 `qiyu store init` 时才跑它，再跑 `qiyu sync run`；**文件已损坏**时 hint 要求先备份该文件、再用 `--db` 指向新路径重建（对损坏文件原地跑 `store init` 修不好）；其余成因换 `--db` 路径或按 hint 安装依赖，原样重跑 `store init` 无效 |
 | `kind: query_timeout` | 查询超时。缩小时间窗口、减少分组列或降低 `--limit` 后重试 |
 | `kind: sync_not_run` | 还没有成功同步过。这个 kind **只由 `sync install` 的前置探测产出**（`sync status` 不产出它，水位全为 null 时按 `SKILL.md` 的开场协议处理）：先跑一次 `qiyu sync run` 让至少一个任务真正同步成功，再装调度 |
 

@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { queryCommand } from '../../src/commands/query.js'
+import { queryCommand, runDiagnosticCount } from '../../src/commands/query.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { NO_MASK_WARNING } from '../../src/query/mask.js'
 import type { Store } from '../../src/store/types.js'
@@ -512,6 +512,22 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(String(e.hint), '不得再引导向 store init（对非 DuckDB 文件是死路）').not.toContain('store init')
   })
 
+  it('文件已损坏（截断 / 页校验和不对）→ 同一份「已损坏」hint，且不把损坏说成「不是 DuckDB 文件」', { timeout: 60_000 }, async () => {
+    // 2026-11-05：损坏是第三种成因 —— 此前落进 sandbox 的兜底「请确认文件存在且由本 CLI
+    // 创建（store init）」，而对损坏文件原地跑 store init 同样打不开。
+    const { makeCorruptDb } = await import('../fixtures/corrupt-db.js')
+    for (const kind of ['truncated', 'checksum'] as const) {
+      const p = await makeCorruptDb(dir, kind)
+      out = ''; err = ''
+      expect(await queryCommand(['--sql', 'SELECT 1', '--db', p]), kind).toBe(1)
+      const e = errorOf()
+      expect(e.kind, kind).toBe('store_not_initialized')
+      expect(String(e.hint), kind).toMatch(/已损坏/)
+      expect(String(e.hint), kind).toMatch(/备份/)
+      expect(String(e.hint), kind).not.toMatch(/不是 DuckDB 数据库/)
+    }
+  })
+
   it('权限不足 → 与 store 同口径的「读写权限」hint（同一成因不在两个命令族给两种说法）', async () => {
     if (process.platform === 'win32' || process.getuid?.() === 0) return  // root 下 chmod 不拦读取
     const { chmodSync } = await import('node:fs')
@@ -526,6 +542,18 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
       expect(String(e.hint)).toMatch(/读写权限/)
       expect(String(e.hint), '权限问题不得说成「文件不存在/不是本 CLI 创建」').not.toContain('store init')
     } finally { chmodSync(p, 0o600) }
+  })
+})
+
+describe('runDiagnosticCount —— 诊断计数失败不得拖红已成功的查询（Codex PR #68 第三轮 P2）', () => {
+  it('成功 → 返回计数；抛错（超时/中断）→ 返回 null，不向上抛', async () => {
+    const ok = await runDiagnosticCount({ run: async () => ({ columns: ['n'], rows: [{ n: '3' }], truncated: false }) },
+      'SELECT 1', [], 1000)
+    expect(ok).toBe(3)
+    const failed = await runDiagnosticCount({
+      run: async () => { throw Object.assign(new Error('查询超过 50ms 未完成，已中断'), { kind: 'query_timeout' }) },
+    }, 'SELECT 1', [], 50)
+    expect(failed, '诊断失败降级为 null，由调用方出一条警告').toBeNull()
   })
 })
 

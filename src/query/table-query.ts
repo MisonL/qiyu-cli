@@ -189,6 +189,8 @@ interface TimeFilter {
   params: unknown[]
   resolvedRange: [number, number] | null
   warnings: string[]
+  /** 有时间过滤时为 true —— 脏时间值计数只在这种情况下才与本次结果相关。 */
+  timeFiltered: boolean
 }
 
 /**
@@ -198,7 +200,7 @@ interface TimeFilter {
 function buildTimeFilter(input: TableQueryInput): TimeFilter {
   const { table, since, until } = input
   const tc = table.timeColumn
-  const empty: TimeFilter = { clauses: [], params: [], resolvedRange: null, warnings: [] }
+  const empty: TimeFilter = { clauses: [], params: [], resolvedRange: null, warnings: [], timeFiltered: false }
   if (tc === undefined) {
     if (since !== undefined || until !== undefined) {
       throw new TableQueryUsageError(`表 ${table.name} 没有时间列，不支持 --since/--until`)
@@ -267,8 +269,36 @@ function buildTimeFilter(input: TableQueryInput): TimeFilter {
     clauses.push(`${expr} <= ${boundPlaceholder(tc.kind)}`)
     params.push(boundParam(tc.kind, upper))
   }
-  return { clauses, params, resolvedRange, warnings }
+  return { clauses, params, resolvedRange, warnings, timeFiltered: true }
 }
+
+/**
+ * 「本次过滤会静默丢掉的脏时间值」计数 SQL（2026-11-05 审查修）。
+ *
+ * 事实：`buildTimeFilter` 把**形态谓词**与时间谓词放进同一个 WHERE（正确性 F8），于是
+ * 时间列里的脏值（`not-a-date`、非数字的 epoch-ms）在给了 `--since/--until` 时被
+ * **静默排除**——`rows` 少了它们、`data_coverage` 也不算它们、`warnings` 一个字不说。
+ * `db tables` / `db describe` 对同一张表会报「时间列有 N 个值不符合约定形态」，
+ * 两条命令对同一个库给出两种说法。
+ *
+ * 没有时间过滤时返回 null：那时脏值行照常出现在 rows 里（没有被丢弃），
+ * `data_coverage` 为 null 这条事实由图例说明，不必每次查询都多跑一次全表计数。
+ *
+ * ⚠️ 谓词与 `commands/db.ts` 的 `dirtyTimeValues` 逐字同形（`NOT COALESCE(shape, false)`），
+ * 两处都构造自 `shapeClause` 这一份形态定义 —— 只有 SQL 外壳各自拼（表名单引号 vs 双引号、
+ * 参数形态不同），判据本身仍是一处。
+ */
+export function buildDirtyTimeQuery(input: TableQueryInput): { sql: string; params: unknown[] } | null {
+  const { table } = input
+  const tc = table.timeColumn
+  if (tc === undefined) return null
+  if (!buildTimeFilter(input).timeFiltered) return null
+  const col = quote(tc.name)
+  const bad = `NOT COALESCE((${shapeClause(tc).join(' AND ')}), false)`
+  return {
+    sql: `SELECT COUNT(*) AS n FROM ${quote(table.name)} WHERE ${col} IS NOT NULL AND ${bad}`,
+    params: [],
+  }}
 
 /**
  * 构造 `query --table` 的 SQL（契约 A–F）。

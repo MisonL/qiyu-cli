@@ -45,6 +45,34 @@ describe('classifyOpenFailure —— 打开失败的成因分类（2026-10-31 �
     expect(classifyOpenFailure(new Error('Constraint Error: NOT NULL constraint failed'))).toBeNull()
     expect(classifyOpenFailure(new Error('x'))).toBeNull()
   })
+  it('文件已损坏 → corrupt（两条都是 2026-11-05 探针逐字原文；rw/ro 打开相同）', () => {
+    // 截断：元数据块在文件尾部，读到一半就 EOF（探针：536KB 的库截到 200KB）
+    expect(classifyOpenFailure(new Error(
+      'IO Error: Could not read enough bytes from file "/private/tmp/corruptprobe/trunc.db": '
+      + 'attempted to read 74432 bytes from location 200000')))
+      .toEqual({ cause: 'corrupt' })
+    // 页校验和不对（探针：把第 8192 字节起的 4KB 清零）
+    expect(classifyOpenFailure(new Error(
+      'IO Error: Corrupt database file: computed checksum 5381 does not match stored '
+      + 'checksum 0 in block at location 8192')))
+      .toEqual({ cause: 'corrupt' })
+  })
+  it('损坏判据的条件：**句首**锚定 + 与其它成因互斥（路径里含这些词不算）', () => {
+    // 路径里恰好抄了损坏报文的原句 —— 真因是「文件不存在」 → 不归类，更不能归 corrupt
+    expect(classifyOpenFailure(new Error(
+      'IO Error: Cannot open file "/tmp/Corrupt database file:/x.db": No such file or directory')))
+      .toBeNull()
+    expect(classifyOpenFailure(new Error(
+      'IO Error: Cannot open file "/tmp/Could not read enough bytes from file /q.db": Permission denied')))
+      .toEqual({ cause: 'permission' })
+    // 同一个词出现在报文中段（执行期错误拼接了别的库消息）→ 仍须句首锚定，不归类
+    expect(classifyOpenFailure(new Error(
+      'Invalid Input Error: COPY failed: IO Error: Corrupt database file: computed checksum 1')))
+      .toBeNull()
+    // 反向：句首形态必须真命中（上面两条反例若写成永不命中，这里补最小正例）
+    expect(classifyOpenFailure(new Error('IO Error: Corrupt database file: x')))
+      .toEqual({ cause: 'corrupt' })
+  })
 })
 
 describe('isLockError —— 锁错误识别', () => {

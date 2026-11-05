@@ -18,7 +18,7 @@
 //     该表应该有什么列，以便核对列漂移。缺表的成因不是「未同步或未建库」（实测两个都
 //     到不了该分支），唯一口径见 `missingTableCauses()`。
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
-import { openSandbox } from '../query/sandbox.js'
+import { openSandbox, withTimeoutHint } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
 import { statGuard, schemaVersionMissing, storeTablesWarnings } from './store-precheck.js'
@@ -29,7 +29,7 @@ import type { StoreConfig } from '../store/types.js'
 import { msToShanghaiIso, MAX_SHANGHAI_SAFE_MS } from '../core/time.js'
 import {
   ok, fail, usageFail, failFromTagged, sanitizeControlChars, describeArgs, setPretty,
-  dbTablesCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE,
+  dbTablesCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE, metadataTimeoutHint,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
@@ -196,6 +196,7 @@ function dirtyTimeWarning(
  */
 export async function openGuardedSession(
   flags: StoreFlags,
+  probeTimeoutHint?: (loc: StoreLocation) => string,
 ): Promise<{ session: SandboxSession; dbPath: string; profileFlag?: string } | { exit: number }> {
   let config: StoreConfig
   let profileFlag: string | undefined
@@ -220,13 +221,22 @@ export async function openGuardedSession(
   try {
     session = await openSandbox(config)
   } catch (e) { return { exit: thrownToQueryExit(e, TABLES, false, storeLocationOf(config.path, profileFlag)) } }
+  // ⚠️ 这次探测同样会超时，而它的超时**先于**调用方的 `withTimeoutHint` 包装发生 ——
+  // 不在这里注入的话，前置检查超时拿到的是 `query` 口径的「缩小时间范围或加过滤条件」，
+  // 而 `db tables` / `db describe` / `stats fields` 根本没有这些参数（Codex 2026-11-05
+  // 第四轮 P3 实测：同一命令在探测阶段与正式阶段给出互相矛盾的 hint）。
+  // ⚠️ 但 hint 由**调用方**决定（CodeRabbit 2026-11-05 第六轮 minor）：`query` 也走本函数，
+  // 它**有** --since/--limit/--timeout，探测超时沿用 `DEFAULT_TIMEOUT_HINT` 才对 ——
+  // 无脑注入元数据口径，会让 `query` 探测超时时建议「改用 qiyu query --sql」这条它正在跑的路。
+  const loc = storeLocationOf(config.path, profileFlag)
+  const metaHint = probeTimeoutHint === undefined ? session : withTimeoutHint(session, probeTimeoutHint(loc))
 
   try {
     // 库结构校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）。
     // 口径与实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
     // ⚠️ 成因分形与文案走 `store-precheck.ts` 的 `schemaVersionMissing`（**唯一实现点**，
     // 2026-10-31 收敛；此前 store/db/sync 三份已漂移出不同说法）。
-    const tables = await session.run(
+    const tables = await metaHint.run(
       "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
     const names = tables.rows.map((r) => String(r.table_name))
     const missing = schemaVersionMissing(config.path, names)
@@ -256,9 +266,11 @@ async function dbTables(argv: string[]): Promise<number> {
   try { flags = parseStoreFlags(argv) } catch (e) { return usageFail(sanitizeControlChars((e as Error).message)) }
   if (flags.rest.length > 0) return usageFail(`未知参数：${describeArgs(flags.rest)}`)
 
-  const opened = await openGuardedSession(flags)
+  const opened = await openGuardedSession(flags, metadataTimeoutHint)
   if ('exit' in opened) return opened.exit
-  const session = opened.session
+  // 超时 hint 换成元数据命令的说法（本命令没有可调过滤参数，query 那句对它是死路）。
+  const session = withTimeoutHint(opened.session,
+    metadataTimeoutHint(storeLocationOf(opened.dbPath, opened.profileFlag)))
 
   try {
     // 实际表集 → 与声明比对（spec §8.1「声明与实况的差异不得静默」）。
@@ -393,9 +405,11 @@ async function dbDescribe(argv: string[]): Promise<number> {
         : '用 `' + dbTablesCommand(storeLocationFromFlags(flags)) + '` 查看可用表')
   }
 
-  const opened = await openGuardedSession(flags)
+  const opened = await openGuardedSession(flags, metadataTimeoutHint)
   if ('exit' in opened) return opened.exit
-  const session = opened.session
+  // 超时 hint 换成元数据命令的说法（本命令没有可调过滤参数，query 那句对它是死路）。
+  const session = withTimeoutHint(opened.session,
+    metadataTimeoutHint(storeLocationOf(opened.dbPath, opened.profileFlag)))
 
   try {
     // 表名来自 `TABLES` 闭集（代码内常量），拼进字面量安全；用户输入只用于上面的闭集查找。

@@ -562,7 +562,7 @@ describe('duckdb —— init 与关闭', () => {
           expect(err).toMatchObject({
             kind: 'store_locked',
             retryable: true,
-            hint: expect.stringMatching(/写锁/),
+            hint: expect.stringMatching(/另一个进程正持有该数据库的锁/),
           })
           expect(sleep).not.toHaveBeenCalled()   // 写者不退避（spec §5.2）
           asserted = true
@@ -570,6 +570,107 @@ describe('duckdb —— init 与关闭', () => {
         if (opened) continue   // 锁落盘竞态窗口（CONFLICT 后仍打开），换轮重来
       }
       expect(asserted, '5 轮内未取得「锁生效且写者撞锁」——锁落盘竞态超预期').toBe(true)
+    } finally {
+      holder?.kill('SIGKILL')
+    }
+  })
+
+  it('只读持有者同样挡住写者 —— 报错不得把持有者说成「写进程」', { timeout: 180_000 }, async () => {
+    // 2026-11-05 审查实测：DuckDB 是「写者独占 / 读者共享」—— 一个以 READ_ONLY 打开的
+    // 进程同样会让写者拿到 `Conflicting lock`。旧文案「数据库被写进程占用 / 另一个进程
+    // 持有数据库写锁」把只读持有者说成写者，Agent 会去等一个并不存在的同步任务。
+    //
+    // ⚠️ 与同文件另外两条撞锁用例同款的三段式，缺一段就会间歇红：
+    // ① 每轮换全新路径（@duckdb/node-api 进程内实例缓存会绕过文件锁）；
+    // ② 持有者打印 ready 后，用独立子进程校验 CONFLICT（锁可能尚未落盘）；
+    // ③ 极少数情况下校验通过后写者仍能打开（锁落盘竞态窗口）→ 换轮重来。
+    const { spawn } = await import('node:child_process')
+    const { writeFileSync } = await import('node:fs')
+    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
+    // 只读实例要求文件已存在 → 先由**子进程**建一个合法的空 DuckDB 文件
+    // （种子放本进程会命中实例缓存，后续持有者/写者都绕开文件锁）。
+    const seed = async (dbPath: string, round: number) => {
+      const seedScript = join(dir, `ro-seed-${round}.mjs`)
+      writeFileSync(seedScript, `
+        const { DuckDBInstance } = await import(${JSON.stringify(pkgUrl.href)})
+        const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
+        inst.closeSync()
+      `)
+      await new Promise<void>((resolve, reject) => {
+        const ch = spawn(process.execPath, [seedScript], { stdio: ['ignore', 'ignore', 'pipe'] })
+        let e = ''
+        ch.stderr?.on('data', (d) => { e += String(d) })
+        ch.on('close', (code) => { code === 0 ? resolve() : reject(new Error(`种子失败：${e.slice(0, 300)}`)) })
+      })
+    }
+    // ⚠️ 子进程用**脚本文件**而非 `-e`：`-e` 里的动态 import 在部分 shell 引号组合下会
+    // 被截断（锁持有者静默不启动，用例只会红成「持有者未能启动」）。
+    const spawnRoHolder = async (dbPath: string, round: number) => {
+      const script = join(dir, `ro-holder-${round}.mjs`)
+      writeFileSync(script, `
+        const { DuckDBInstance } = await import(${JSON.stringify(pkgUrl.href)})
+        const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)}, { access_mode: 'READ_ONLY' })
+        const c = await inst.connect()
+        await c.run('SELECT 1')
+        console.log('ready')
+        setInterval(() => {}, 1 << 30)
+      `)
+      const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let o = ''
+      child.stdout?.on('data', (d) => { o += String(d) })
+      const ok = await new Promise<boolean>((resolve) => {
+        const iv = setInterval(() => { if (o.includes('ready')) { clearInterval(iv); resolve(true) } }, 100)
+        setTimeout(() => { clearInterval(iv); resolve(false) }, 30_000)
+      })
+      if (!ok) { child.kill('SIGKILL'); throw new Error(`只读持有者未能启动：${o.slice(0, 200)}`) }
+      return child
+    }
+    // 独立子进程校验锁已真正落盘（写者视角：能被打开 = 锁未生效）。
+    const lockVerdict = async (dbPath: string): Promise<string> => {
+      const chk = spawn(process.execPath, ['-e', `
+        import(${JSON.stringify(pkgUrl.href)}).then(({ DuckDBInstance }) =>
+          DuckDBInstance.create(${JSON.stringify(dbPath)}))
+          .then(() => console.log('OPENED'))
+          .catch(() => console.log('CONFLICT'))`], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let co = ''
+      chk.stdout?.on('data', (d) => { co += String(d) })
+      return await new Promise<string>((resolve) => {
+        chk.on('close', () => resolve(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
+        setTimeout(() => { chk.kill('SIGKILL'); resolve('TIMEOUT') }, 10000)
+      })
+    }
+    let holder: import('node:child_process').ChildProcess | undefined
+    try {
+      let asserted = false
+      for (let round = 0; round < 5 && !asserted; round++) {
+        const p = join(dir, `ro-lock-${round}.db`)
+        if (holder) holder.kill('SIGKILL')
+        await seed(p, round)
+        holder = await spawnRoHolder(p, round)
+        if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        let opened = false
+        try {
+          await createDuckDbStore({ ...cfg, path: p }, 'rw', { sleep: async () => {} })
+          opened = true
+        } catch (e) {
+          const err = e as { kind?: string; message?: string; hint?: string }
+          if (err.kind !== 'store_locked') throw e   // 不是竞态也不是预期形态 —— 直接失败
+          expect(err).toMatchObject({
+            kind: 'store_locked',
+            retryable: true,
+            message: expect.stringMatching(/被其他进程占用/),
+            hint: expect.stringMatching(/只读会话同样会挡住写者/),
+          })
+          // 归因必须正确：不能说成「被写进程占用」；提示里也不能出现「写锁」——
+          // READ_ONLY 持有的是共享锁，说「写锁」等于把同一句的后半段（持有者可能是只读
+          // 会话）自我否定，Agent 照样会去等一个并不存在的写进程（CodeRabbit 第十三轮 minor）
+          expect(err.message).not.toMatch(/被写进程占用/)
+          expect(err.hint).not.toMatch(/写锁/)
+          asserted = true
+        }
+        if (opened) continue   // 锁落盘竞态窗口，换轮重来
+      }
+      expect(asserted, '5 轮内未取得「RO 持有者生效且写者撞锁」——锁落盘竞态超预期').toBe(true)
     } finally {
       holder?.kill('SIGKILL')
     }

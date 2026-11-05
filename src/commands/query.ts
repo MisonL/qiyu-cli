@@ -23,14 +23,15 @@ import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } fr
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
 import {
-  buildCoverageQuery, buildMinQuery, buildTableQuery, effectiveBound, validateGroupBy,
+  buildCoverageQuery, buildDirtyTimeQuery, buildMinQuery, buildTableQuery, effectiveBound, validateGroupBy,
 } from '../query/table-query.js'
 import type { BuiltTableQuery } from '../query/table-query.js'
 import { openGuardedSession } from './db.js'
 import { queryFieldNotes } from './query-notes.js'
 import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
-  dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand,
+  dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand, querySqlCommand,
+  SQL_ARG_REPLACE_NOTE,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
@@ -326,6 +327,25 @@ interface TableRunInput {
 }
 
 /**
+ * 诊断性计数（best-effort）：**失败返回 null，绝不把已成功的查询拖红**。
+ *
+ * ⚠️ 2026-11-05 审查（Codex PR #68 第三轮 P2）：脏时间值计数是全表扫描，若它撞上
+ * `--timeout`，同步等待会把「主查询与覆盖统计都成功」的整条命令变成失败 —— 数据拿不到，
+ * 而这条计数只是为了补一条警告。诊断失败降级为警告，退出码与 rows 不受影响。
+ * 导出供单测直接验证成败两条分支（真实超时难以稳定构造）。
+ */
+export async function runDiagnosticCount(
+  session: Pick<SandboxSession, 'run'>, sql: string, params: unknown[], timeoutMs: number,
+): Promise<number | null> {
+  try {
+    const r = await session.run(sql, { params, timeoutMs })
+    return Number(r.rows[0]?.n ?? 0)
+  } catch {
+    return null
+  }
+}
+
+/**
  * `--table` 的执行路径（spec §六）：解析缺省下界 → 主查询 → 覆盖统计 → 脱敏 → 信封。
  * 所有 SQL 由 `query/table-query.ts` 的纯函数构造（表/列已过闭集）。
  */
@@ -381,6 +401,31 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
       }
     }
     if (row.days !== null && row.days !== undefined) coveredDays = Number(row.days)
+  }
+
+  // 脏时间值不得静默丢掉（2026-11-05 审查修）：时间过滤的 WHERE 里同时挂着形态谓词
+  //（正确性 F8），脏值行不会出现在 rows、也不进 data_coverage —— 此前没有任何 warning，
+  // 而 `db tables` / `db describe` 对同一张表会报「时间列有 N 个值不符合约定形态」。
+  // 没有时间过滤时不报（脏值行照常返回，没有被丢弃）。
+  if (tc !== undefined) {
+    const dirtyQuery = buildDirtyTimeQuery({
+      table, since: input.since, until: input.until, tableMin, now: input.now,
+    })
+    if (dirtyQuery !== null) {
+      // ⚠️ 这是**诊断性**计数（全表扫描），不得成为本次查询成功的前置条件（Codex 2026-11-05
+      // 第三轮 P2）：主查询与覆盖统计都已成功返回，若这次计数撞上 --timeout，整条命令会失败、
+      // 已算出的数据也拿不到。失败/超时只降级为一条警告，不改变退出码。
+      const n = await runDiagnosticCount(session, dirtyQuery.sql, dirtyQuery.params, input.timeoutMs)
+      if (n === null) {
+        warnings.push(`表 ${table.name} 的时间列 ${tc.name} 的脏值统计未能完成（诊断查询超时或被中断），`
+          + '本次时间过滤可能排除了不符合约定形态的值 —— 需要确认时请单独查询该列')
+      } else if (n > 0) {
+        warnings.push(`表 ${table.name} 的时间列 ${tc.name} 有 ${n} 个值不符合约定形态`
+          + '（可能来自旧版 CLI、外部工具或库损坏），本次时间过滤已把它们排除在 rows 与 '
+          + 'data_coverage 之外；用 `' + querySqlCommand(loc) + '` 单独查看它们以确认成因（'
+          + SQL_ARG_REPLACE_NOTE + '）')
+      }
+    }
   }
 
   // 脱敏唯一出口（spec §7.2）；--table 通道按列精确命中（mode.kind='table'）。
@@ -568,6 +613,10 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
   // 配置解析 → 库前置检查 → 打开沙箱 → schema_version 探测：E 族三个命令共用同一条
   // 路径（db.ts 的 openGuardedSession）。合并的理由见那里的注释：探测口径与文案
   // 一旦三处各写一份，Agent 会在不同命令上得到互相矛盾的解释（架构审查 Important #2）。
+  // ⚠️ 不传探测超时 hint：本命令**有** --since/--until/--limit/--timeout，探测也用
+  // `DEFAULT_TIMEOUT_HINT`（「缩小时间范围或加过滤条件」）才对。传元数据口径会让
+  // 探测超时时建议用户改用 `qiyu query --sql` —— 正是他正在跑的命令
+  //（CodeRabbit 2026-11-05 第六轮 minor）。
   const opened = await openGuardedSession({
     db: flags.db, profile: flags.profile, backend: flags.backend,
   })

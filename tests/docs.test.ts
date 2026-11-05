@@ -952,3 +952,152 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(md).toMatch(/对\s*\n?\s*Agent 没有增益|对 Agent 没有增益/)
   })
 })
+
+/**
+ * CHANGELOG 的「声明 N 处 ↔ 实际 N 条」一致性守卫（CodeRabbit PR #68 第七轮 minor）。
+ *
+ * 修复批的标题写「的九处契约修正」，正文用 `  · ` 逐条列出 —— 两个数一旦分叉，
+ * 读者无法判断「是漏写了某条，还是标题没跟着加」。这不是假想：2026-11-04/05 的三批
+ * 里有**三批**在收敛轮次补充条目后忘了改标题（查询/存储/元数据批、同步与调度批、
+ * 注册表批），都是 CodeRabbit / Codex 逐轮点名才发现的。
+ *
+ * 判据只覆盖标题形如「…的<数字>处契约修正…」的条目：这类条目的约定就是「一条一 bullet」。
+ * 其它条目（如「另外两个载体 + 一处文案分档」）的 N 指代子集，不能套用 —— 如实记录边界。
+ */
+/**
+ * 中文数词 → 整数（支持「十/百」的组合，如 十三 / 二十 / 二十一 / 一百零五）。
+ *
+ * ⚠️ 不能用枚举表（Codex PR #68 第八轮 P3）：表写到「二十」就停，将来出现
+ * 「二十一处契约修正」时查表得到 `undefined`，即使 bullet 数刚好对上也红。
+ */
+const CN_DIGITS: Record<string, number> = {
+  零: 0, 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+}
+const CN_UNITS: Record<string, number> = { 十: 10, 百: 100, 千: 1000 }
+const CN_SECTIONS: Record<string, number> = { 万: 1e4, 亿: 1e8 }
+function cnNumber(raw: string): number {
+  if (/^\d+$/.test(raw)) return Number(raw)
+  let total = 0
+  let section = 0
+  let cur = 0
+  for (const ch of raw) {
+    const d = CN_DIGITS[ch]
+    if (d !== undefined) { cur = d; continue }
+    const u = CN_UNITS[ch]
+    if (u !== undefined) { section += (cur === 0 ? 1 : cur) * u; cur = 0; continue }
+    const sec = CN_SECTIONS[ch]
+    if (sec !== undefined) { total += (section + cur) * sec; section = 0; cur = 0; continue }
+    return Number.NaN
+  }
+  return total + section + cur
+}
+
+/**
+ * 扫描 CHANGELOG 里「…的<N>处契约修正…」条目，返回「声明数 ≠ bullet 数」的描述。
+ *
+ * ⚠️ **不枚举数词字符**（Codex PR #68 第八/九/十/十一轮连续四轮都打在这里）：只要判据是
+ * 「在标题里找一个数词字符类」，就得穷举所有字形 —— 漏了「百/零」会把「一百零五」截成
+ * 「五」，补上之后又漏繁体「兩」把「兩百零五」截成「百零五」。枚举没有终点。
+ *
+ * 改成**结构**判据：取标题里「的」与「处契约修正」之间的**整段 token**（不含空白），
+ * 原样交给 `cnNumber`。认不出的字形一律 `NaN` → 进 `badTitle` 报红 —— 拒绝猜一个更小的数。
+ * 覆盖范围由「所有含 `处契约修正` 的条目标题都必须被解析成功」这条断言兜住
+ *（`checked === entries`），所以「标题换个形态导致守卫静默跳过」也会红。
+ */
+function changelogCountMismatches(md: string): {
+  bad: string[]; checked: number; entries: number; badTitle: string[]
+} {
+  const lines = md.split('\n')
+  const bad: string[] = []
+  const badTitle: string[] = []
+  let checked = 0
+  let entries = 0
+  for (let i = 0; i < lines.length; i++) {
+    // ⚠️ 条目按**顶层列表项**识别，不是按「粗体标题」（Codex PR #68 第十二轮 P2）：
+    // 以 `^\*\*` 为门槛时，标题一旦少个 `**`，这条就被静默跳过 —— `entries` 与
+    // `checked` 同步漏掉它，`entries === checked` 反而成立。
+    const item = /^- (.*)$/.exec(lines[i]!)
+    if (item === null) continue
+    const itemText = item[1]!
+    if (!itemText.includes('处契约修正')) continue
+    entries++
+    // 标题文本优先取粗体内部；没有粗体就用整行 —— 只影响取词位置，不影响「被统计到」。
+    const title = /^\*\*(.+?)\*\*/.exec(itemText)?.[1] ?? itemText
+    // 数词取「的」与「处契约修正」之间不含空白的整段：`的十三处契约修正` → `十三`
+    const declared = /的([^\s]*?)处契约修正/.exec(title)
+    const raw = declared?.[1]
+    const n = raw === undefined || raw === '' ? Number.NaN : cnNumber(raw)
+    if (Number.isNaN(n)) badTitle.push(itemText)
+    let bullets = 0
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j]!
+      if (l.startsWith('- ') || l.startsWith('## ') || l.startsWith('### ')) break
+      if (l.startsWith('  · ')) bullets++
+    }
+    checked++
+    if (!Number.isNaN(n) && n !== bullets) {
+      bad.push(`${itemText.slice(0, 40)}… 声明 ${n} / 实际 ${bullets}`)
+    }
+  }
+  return { bad, checked, entries, badTitle }
+}
+
+describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () => {
+  it('「N 处契约修正」批的 bullet 数 == 标题里的 N', () => {
+    const { bad, checked, entries, badTitle } = changelogCountMismatches(read('CHANGELOG.md'))
+    expect(badTitle, '标题里的数词解析不了').toEqual([])
+    expect(checked, '一个「N 处契约修正」条目都没找到 = 守卫空转').toBeGreaterThan(0)
+    expect(checked, '有「处契约修正」条目没走到计数校验 = 守卫静默跳过').toBe(entries)
+    expect(bad).toEqual([])
+  })
+
+  it('反例集：扫描路径按标题里的**完整**数词校验（一百零五不能被截成五）', () => {
+    // 解析器自检
+    expect([cnNumber('九'), cnNumber('十三'), cnNumber('二十'), cnNumber('二十一'),
+      cnNumber('一百零五'), cnNumber('一千零五'), cnNumber('一万零五'), cnNumber('21')])
+      .toEqual([9, 13, 20, 21, 105, 1005, 10005, 21])
+    // 扫描路径自检：必须从**整串**数词取值，而不是从中间的「五」
+    const block = (n: number): string => '- **某某的一百零五处契约修正**：\n'
+      + Array.from({ length: n }, () => '  · x\n').join('')
+    expect(changelogCountMismatches(block(105)).bad, '105 条应对上').toEqual([])
+    // 最小反例：只有 5 条时，若标题被截成「五」就恰好相等而**漏报** —— 这里必须报
+    expect(changelogCountMismatches(block(5)).bad).toEqual([
+      expect.stringContaining('声明 105 / 实际 5'),
+    ])
+    // 同理覆盖「二十一」「二十」这类两位数
+    const block21 = (n: number): string => '- **某某的二十一处契约修正**：\n'
+      + Array.from({ length: n }, () => '  · y\n').join('')
+    expect(changelogCountMismatches(block21(21)).bad).toEqual([])
+    expect(changelogCountMismatches(block21(2)).bad).toEqual([
+      expect.stringContaining('声明 21 / 实际 2'),
+    ])
+    // 千位形态：`一千零五` 绝不能被截成后缀 `零五` 按 5 校验（Codex 第十轮 P2 的最小反例）
+    const block1005 = (n: number): string => '- **某某的一千零五处契约修正**：\n'
+      + Array.from({ length: n }, () => '  · z\n').join('')
+    expect(changelogCountMismatches(block1005(1005)).bad).toEqual([])
+    expect(changelogCountMismatches(block1005(5)).bad).toEqual([
+      expect.stringContaining('声明 1005 / 实际 5'),
+    ])
+    // ⚠️ 判据不再枚举字形（Codex 第十一轮 P2）：繁体 `兩百零五` 也必须整段取到、判 NaN 报红，
+    // 而不是从 `百零五` 起匹配、按 105 校验后静默放行。用「105 条 bullet」构造最小反例 ——
+    // 一旦退化成后缀匹配，声明值与 bullet 数恰好相等，`bad` 会空、这条断言就红。
+    const block205 = (title: string, n: number): string => `- **某某的${title}处契约修正**：\n`
+      + Array.from({ length: n }, () => '  · w\n').join('')
+    const trad = changelogCountMismatches(block205('兩百零五', 105))
+    expect(trad.bad, '繁体数词不得被截成后缀后静默放行').toEqual([])
+    expect(trad.badTitle.length, '繁体数词必须进 badTitle（拒绝猜）').toBe(1)
+    // 同样覆盖解析器不认的简体字形（「两」）
+    expect(changelogCountMismatches(block205('两', 2)).badTitle.length).toBe(1)
+    // 反向：搞错数量的标题必须被抓住（真值 3 写成 4）
+    expect(changelogCountMismatches(block205('四', 3)).bad).toEqual([
+      expect.stringContaining('声明 4 / 实际 3'),
+    ])
+    // 没有「的<数词>」形态的标题也不许静默跳过：进 badTitle，且 entries 与 checked 都算到它
+    const noNumeral = changelogCountMismatches('- **某某处契约修正**：\n  · a\n')
+    expect([noNumeral.entries, noNumeral.checked, noNumeral.badTitle.length]).toEqual([1, 1, 1])
+    // 标题**没有粗体**也照样被统计与校验（Codex 第十二轮 P2：以 `**` 为门槛会静默跳过）
+    const noBold = changelogCountMismatches('- 某某的四处契约修正：\n  · a\n  · b\n  · c\n')
+    expect([noBold.entries, noBold.checked, noBold.badTitle.length]).toEqual([1, 1, 0])
+    expect(noBold.bad).toEqual([expect.stringContaining('声明 4 / 实际 3')])
+  })
+})

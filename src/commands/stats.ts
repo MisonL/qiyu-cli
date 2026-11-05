@@ -18,9 +18,10 @@ import { openGuardedSession } from './db.js'
 import { parseStoreFlags } from './store-flags.js'
 import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
-  dbTablesCommand, dbDescribeCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE,
+  dbTablesCommand, dbDescribeCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE, metadataTimeoutHint,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
+import { withTimeoutHint } from '../query/sandbox.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
@@ -284,9 +285,11 @@ async function statsFields(argv: string[]): Promise<number> {
 
   const opened = await openGuardedSession({
     db: flags.db, profile: flags.profile, backend: flags.backend,
-  })
+  }, metadataTimeoutHint)
   if ('exit' in opened) return opened.exit
-  const session = opened.session
+  // 超时 hint 换成元数据命令的说法（本命令没有可调过滤参数，query 那句对它是死路）。
+  const session = withTimeoutHint(opened.session,
+    metadataTimeoutHint(storeLocationOf(opened.dbPath, opened.profileFlag)))
 
   try {
     // 目标表存在性校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）：
