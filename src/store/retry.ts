@@ -114,7 +114,7 @@ export const PERMISSION_HINT = '请检查路径与所在目录的读写权限（
  * （store init）」—— 而对已损坏的文件原地跑 `store init` 打开同样失败，是条死路。
  * hint 必须先给备份（文件里是用户已同步的数据），再给可执行的恢复路径（新路径重建）。
  */
-export const CORRUPT_HINT = '该文件已损坏（写入中断、磁盘写满、复制不完整都会造成），原地跑 store init 修不好，查询也会失败。请先备份该文件留档，再用 --db 指向一个新路径跑 store init 重建 —— 本地库只是缓存，可用 qiyu sync run 重新拉取'
+export const CORRUPT_HINT = '该文件已损坏（写入中断、磁盘写满、复制不完整都会造成），原地跑 store init 修不好，查询也会失败。请先备份该文件留档，再用 --db 指向一个新路径跑 store init 重建 —— 本地库只是缓存，之后带同一个 --db <新路径> 跑 qiyu sync run 重新拉取（不带 --db 的 sync run 仍会读到这个损坏的文件）'
 
 const OPEN_FAILURE_HINTS: Record<OpenFailure['cause'], string> = {
   not_duckdb: NOT_DUCKDB_HINT,

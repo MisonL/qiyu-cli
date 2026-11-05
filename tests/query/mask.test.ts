@@ -728,8 +728,21 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     // 真正靠它挡住的是下面的缺口警告用例。
   })
 
-  it('字符串字面量里的列名不算「引用了敏感列」（缺口警告同样不得被字面量触发）', () => {
-    const out = maskQueryRows({
+  it('列名只以字面量出现的引用（struct_extract / row_to_json）→ 缺口警告必须照发', () => {
+    // CodeRabbit PR #68 第三轮 major：`struct_extract(t, 'userName')`、`row_to_json(t)->>'userName'`
+    // 里列名**只**以字符串字面量出现，而姓名/地址没有值级检测 —— 抹掉字面量会让这类查询
+    // 静默零警告（实测两者都返回 `"n":"张三"`）。方向按 spec §十五.4：缺口警告宁多勿少。
+    for (const sql of [
+      "SELECT struct_extract(t, 'userName') AS n FROM sessions t",
+      "SELECT row_to_json(t)->>'userName' AS n FROM sessions t",
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ n: '张三' }], columns: ['n'], mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).toContain('引用了敏感列 userName')
+    }
+    // 代价如实记录：`WHERE x = 'userPhone'` 这种纯字面量也会多报一条（可接受）
+    const over = maskQueryRows({
       rows: [{ session_type: 'userPhone' }],
       columns: ['session_type'],
       mode: {
@@ -738,7 +751,39 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
         tables: TABLES,
       },
     })
-    expect(out.warnings, `字面量不是列引用：${String(out.warnings)}`).toEqual([])
+    expect(over.warnings.join('\n'), '过报方向，spec §十五.4 允许').toContain('引用了敏感列 userPhone')
+  })
+
+  it('选择列表解析不了 / 是 `*` 时，退回输出列名命中（保住旧警告，CodeRabbit 2026-11-05 第三轮）', () => {
+    // `SELECT DISTINCT *` 实测输出全部敏感列，去重后打码仍可能把两行压成同一行。
+    const star = maskQueryRows({
+      rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+      columns: ['userPhone', 'session_type'],
+      mode: { kind: 'sql', sql: 'SELECT DISTINCT * FROM sessions', tables: TABLES },
+    })
+    expect(star.warnings.join('\n'), 'DISTINCT * 覆盖全部敏感列').toContain('GROUP BY / DISTINCT')
+    // `WITH … SELECT` 取不到选择列表 → 与 `SELECT *` 同样退回列名命中
+    const cte = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'WITH x AS (SELECT * FROM sessions) SELECT userPhone, COUNT(*) AS n FROM x GROUP BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(cte.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    // 反证：解析得出来时不退回 —— 聚合别名是聚合值，不该被当成可见分组键
+    const agg = maskQueryRows({
+      rows: [{ userPhone: '13899991111', n: 2 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT max(userPhone) AS userPhone, COUNT(*) AS n FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(agg.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
   })
 
   it('带双引号的别名（`AS "p"` + `GROUP BY p`）→ 必须报警（Codex 2026-11-05 第二轮 P2 漏报）', () => {

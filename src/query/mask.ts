@@ -507,9 +507,9 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       return typeof parsed === 'object' && parsed !== null
     } catch { return false }
   }))
-  // 判据作用在抹掉字面量/注释后的 SQL 上（字面量里写着列名不是引用）。
-  const sqlPlain = withoutLiterals(mode.sql)
-  const payloadReferenced = columns.includes('payload') || /\bpayload\b/i.test(sqlPlain)
+  // ⚠️ 这一段（payload 引用）作用在**原始** SQL 上：`row_to_json(t)->>'payload'`、
+  // `json_extract(payload, '$.x')` 这类构造里字典键/列名只以字面量出现。
+  const payloadReferenced = columns.includes('payload') || /\bpayload\b/i.test(mode.sql)
   // ⚠️ 第四类绕过（安全审查 Major，2026-10-20 实测）：`query()` 表函数把内层 SQL 当作
   // **字符串**执行，外层文本与输出列名都看不到内层标识符——
   //   `SELECT * FROM query('SELECT userName AS n, userAddress AS a FROM sessions')`
@@ -567,11 +567,13 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // ⚠️ 字面量与注释先抹掉（Codex 第二轮 P3 实测）：`GROUP BY 'userPhone'` 是按**常量**分组
   //（实测一行 `n=2`），字面量里写着列名不该算命中。双引号是标识符，不抹。
   //
-  // ⚠️ 边界如实记录：SELECT 列表的切片要求语句**以 SELECT 开头**（`WITH … SELECT` 取不到），
-  // 此时别名、`DISTINCT` 与「可见性」三档判据不触发 —— 方向是**少报一条副作用提示**，不是漏脱敏
-  // （缺口警告与列名级/值级脱敏都不依赖这段解析）。判据是启发式，不是 SQL 解析器。
+  // ⚠️ 引用判定作用在**原始** SQL 上（含字面量）：`struct_extract(t, 'userName')`、
+  // `row_to_json(t)->>'userName'` 里列名**只**以字符串字面量出现，而姓名/地址没有值级
+  // 检测 —— 抹掉字面量会让这类查询静默零警告（CodeRabbit PR #68 第三轮 major 实测）。
+  // 方向按 spec §十五.4：缺口警告宁多勿少（`WHERE session_type = 'userPhone'` 会多报一条，
+  // 这是可接受的代价）。
   const referencedSensitive = sensitiveNames
-    .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(sqlPlain))
+    .filter((n) => new RegExp(`\\b${n}\\b`, 'i').test(mode.sql))
   const referencesSensitive = referencedSensitive.length > 0
   const wordHit = (text: string, names: readonly string[]): boolean => {
     const plain = withoutLiterals(text)
@@ -583,9 +585,17 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const selectItems = splitTopLevel(selectList)
   const projected = selectItems.filter((it) => it.trim() !== '' && !isAggregateItem(it))
   const projectedPlain = projected.join(',')
+  // ⚠️ 选择列表解析不了（`WITH … SELECT`、前导注释、`SELECT *` / `t.*`）时无法判断「哪一列被
+  // 投影出来」—— 退回输出列名命中（matchedSensitive），保住旧行为里的警告
+  //（`SELECT DISTINCT * FROM sessions` 实测会输出全部敏感列；CodeRabbit PR #68 第三轮 minor）。
+  // 解析得出来时不退回：`SELECT max(userPhone) AS userPhone … GROUP BY ALL` 的列名命中
+  // 是聚合值，不该当成可见分组键（Codex 第二轮 P2）。
+  const selectUnparsed = selectList.trim() === ''
+    || selectItems.some((it) => /\*\s*$/.test(it.trim()))
   /** 分组键是否**被投影出来**（可见）：按列名、其别名或裸表达式出现于非聚合选择项。 */
   const visible = (n: string): boolean =>
     wordHit(projectedPlain, [n]) || aliasesOf(selectList, n).some((a) => wordHit(projectedPlain, [a]))
+    || (selectUnparsed && matchedSensitive.has(n))
   const groupByClause = sliceClause(mode.sql, /\bGROUP\s+BY\b/i)
   if (groupByClause !== '') {
     let keys = splitTopLevel(groupByClause)
@@ -625,6 +635,9 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
         })())
     for (const n of sensitiveNames) {
       if (!visible(n)) continue
+      // 选择列表是 `*` / 解析不了时，`DISTINCT` 去重的就是**整行输出**（含全部敏感列）——
+      // 按 matchedSensitive 报，方向宁多勿少（CodeRabbit PR #68 第三轮 minor）。
+      if (selectUnparsed && matchedSensitive.has(n)) { groupedSensitive.add(n); continue }
       if (wordHit(list, [n]) || aliasesOf(selectList, n).some((a) => wordHit(list, [a]))) {
         groupedSensitive.add(n)
       }
@@ -648,10 +661,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     // 列名是 `n`，列名级够不着、值级无法检测姓名 → 大小写敏感时**零警告静默漏出**。
     // 代价是 `SELECT username FROM staff`（staff.username 不是敏感列）会多一条误报 ——
     // spec 明确要求这个方向。
-    // ⚠️ 匹配的是**抹掉字面量/注释后**的 SQL（`sqlPlain`）：字符串常量里写着列名不是
-    // 引用（`WHERE session_type = 'userPhone'` 实测曾被报成「引用了敏感列 userPhone」，
-    // 而输出里根本没有它）。双引号是标识符，保留。
-    if (!new RegExp(`\\b${name}\\b`, 'i').test(sqlPlain)) continue
+    if (!new RegExp(`\\b${name}\\b`, 'i').test(mode.sql)) continue
     warnings.push(
       `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，` +
       '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样')

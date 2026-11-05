@@ -135,7 +135,8 @@
     （`Corrupt database file: computed checksum` 不同）两类报文此前既不匹配权限、也不匹配
     「非 DuckDB 文件」，落进各命令的兜底 —— `store status` 说「请用 store status 检查」
     （拿自己查自己）、`query` 说「跑 store init」（对损坏文件同样打不开）。新增第三种成因
-    `corrupt`，三个出口共用一份 hint：先备份，再用 `--db` 指向新路径重建。
+    `corrupt`，三个出口共用一份 hint：先备份，再用 `--db` 指向新路径重建（之后 `sync run`
+    必须带同一个 `--db <新路径>`，否则仍读到损坏的原文件）。
   · **`mask_warnings` 图例只讲了一半来源**：该键还装 `GROUP BY` / `DISTINCT` 压平、
     `query()`/`query_table()`/`COLUMNS()` 嵌套、非敏感列按值形态误改 —— 图例改为按
     「缺口 / 副作用」两组穷举并声明「包括但不限于」。
