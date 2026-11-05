@@ -850,6 +850,23 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
   })
 
+  it('反证：子查询里的 DISTINCT 不是本层的去重 → 不报警（DISTINCT 判据同样按作用域）', () => {
+    // 外层只是把子查询的原值行投影出来，脱敏不合并行；把内层 DISTINCT 当成外层去重
+    // 会对外层投影的敏感列谎报「分组失真」（2026-11-05 第四轮自查，同族缺陷）。
+    for (const sql of [
+      'SELECT userPhone, session_type FROM sessions '
+      + 'WHERE session_type IN (SELECT DISTINCT session_type FROM sessions)',
+      'SELECT userPhone FROM (SELECT DISTINCT userPhone FROM sessions) t',
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+        columns: ['userPhone', 'session_type'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).not.toContain('GROUP BY / DISTINCT')
+    }
+  })
+
   it('表达式别名（`lower(userPhone) AS p` + `GROUP BY p`）→ 必须报警（Codex 2026-11-05 第四轮 P2 漏报）', () => {
     // 实测 DuckDB：`SELECT lower(userPhone) AS p, COUNT(*) … GROUP BY p` 返回两行 ——
     // 按 lower(userPhone) 分组，脱敏后两个号码塌成同一行。整串正则只认「列名紧跟别名」，漏了。

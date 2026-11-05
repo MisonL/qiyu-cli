@@ -678,7 +678,9 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 判据作用在抹掉字面量/注释但等长的文本上：`SELECT userPhone, 'SELECT DISTINCT' AS label` 不是
   // DISTINCT 查询（Codex 第三轮 P2）。切片偏移与原 SQL 逐位对齐。
   const sqlBlank = withoutLiterals(mode.sql)
-  const distinct = /\bSELECT\s+(?:ALL\s+)?DISTINCT\s+(ON\s*\()?/i.exec(sqlBlank)
+  // 只在顶层找 DISTINCT：`… WHERE x IN (SELECT DISTINCT x …)` 的去重发生在子查询、且去重的是
+  // 该子查询的原值行，脱敏不过多合并行；误把它当外层 DISTINCT 会对外层投影列误报（第四轮）。
+  const distinct = execTopLevel(sqlBlank, /\bSELECT\s+(?:ALL\s+)?DISTINCT\s+(ON\s*\()?/i)
   if (distinct !== null) {
     // `DISTINCT ON (a, b) …` 的分组键是括号里的列；普通 `DISTINCT` 是整张选择列表
     //（DISTINCT 的选择项本身就是可见分组键；聚合项不会出现在 DISTINCT 列表里，但仍排除）。
