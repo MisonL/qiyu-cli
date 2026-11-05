@@ -162,12 +162,21 @@
     「进入引擎的行数」并点明 fetch 侧丢弃行不计入；`range_status.pending` 的「每轮
     开跑就置 pending」收窄为「有可执行窗口的轮次」；`commands[].command` 点明是 argv
     空格拼接、不能直接粘进 shell（win32 的 `/TR` 本身就是命令串）。
+  · **同一窗的两类缺口互相覆盖**：`sessions.export` 既可能缺行（`row_missing_key`）
+    又可能缺尾部标记行（`export_fixture_unreported`），旧实现让后者「让位」，消费方按
+    `gaps[].reason` 分支时永远漏一类；而 `sync_gaps` 主键 `(dataset, range_start)` 也
+    让两条提示在落库时互相覆盖。`FetchResult.gapHint` 改为「单条或数组」，引擎按条落库；
+    新增 **v10 迁移**把 `sync_gaps` 主键扩为 `(dataset, range_start, reason)`（DuckDB
+    不能改主键 → COPY→DROP→RENAME，历史 NULL reason 补 `unknown`），`clearGap` 仍按
+    起点清全部 reason。存储层 spec 里「主键是 C1 假设、设计稿未给依据」的两处记录就地
+    补状态注。
 
   守卫同步：`assertLegendMatches` 的条件键豁免改为按前缀匹配（`post_remove_commands`
   派生的元素键一并豁免），并新增 linux 正向用例 —— 条件键在它真正的平台上必须出现，
   否则「标成条件键」会变成让守卫闭嘴的借口；元素释义从同一份 `SYNC_COMMAND_NOTES`
-  派生，避免两处文案漂移。变异 11 处全红（launchd 偏移、sessionKeyOf、fetch 侧丢弃、
-  分隔符守卫、卸载次序、`/ST`、多日 `/D`、孤立 `;`、快照 apiCount、图例字符、图例键）。
+  派生，避免两处文案漂移。变异 13 处全红（launchd 偏移、sessionKeyOf、fetch 侧丢弃、
+  分隔符守卫、卸载次序、`/ST`、多日 `/D`、孤立 `;`、快照 apiCount、图例字符、图例键、
+  gapHint 折叠回单条、`sync_gaps` 主键退回两列）。
 
 - **注册表与 api 图例的七处契约修正（2026-11-04 独立审查）**：
 
