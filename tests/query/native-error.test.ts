@@ -12,7 +12,7 @@
 // 修法：判据集中到 `query/native-error.ts`，锚 DuckDB 自己的类别前缀，并在判定前剥 SQL 回显。
 import { describe, it, expect } from 'vitest'
 import {
-  isInterrupt, isLayer2Blocked, withoutSqlEcho,
+  isInterrupt, isLayer2Blocked, isExtensionAutoloadBlocked, withoutSqlEcho,
   duckDbSaysMissingName, isBinderOrCatalogError, isOutOfMemory, isParserError,
 } from '../../src/query/native-error.js'
 
@@ -123,6 +123,38 @@ describe('isLayer2Blocked —— 只认真 layer2 拦截（实测五形态）', 
     const real = 'Failed to extract statements: Parser Error: syntax error\n\n'
       + 'LINE 1: SELECT \'Permission Error: Cannot access file "/etc/passwd" - file system operations are disabled by configuration\''
     expect(isLayer2Blocked(real)).toBe(false)
+  })
+})
+
+describe('isExtensionAutoloadBlocked —— 扩展自动安装被沙箱拦下的独立形态', () => {
+  // 2026-11-05 审查实测（`delta_scan` / `iceberg_scan` / `postgres_scan`）：
+  // 前缀是 `Extension Autoloading Error:`，**不是** `Permission Error:` ——
+  // 旧实现落到 query_error +「请检查表名、列名与 SQL 语法」，把「这个函数在这里
+  // 用不了」说成「SQL 写错了」。
+  const REAL = 'Extension Autoloading Error: An error occurred while trying to automatically '
+    + "install the required extension 'delta':\n"
+    + 'Cannot access directory "/Users/x/.duckdb/extensions/v1.5.6/osx_amd64" '
+    + '- file system operations are disabled by configuration'
+  it('真实报文 → true', () => {
+    expect(isExtensionAutoloadBlocked(REAL)).toBe(true)
+  })
+  it('带 SQL 回显仍 → true', () => {
+    expect(isExtensionAutoloadBlocked(REAL + "\n\nLINE 1: SELECT * FROM delta_scan('/tmp/x')")).toBe(true)
+  })
+  it('与 isLayer2Blocked 互斥：两者都不该命中对方的报文', () => {
+    expect(isLayer2Blocked(REAL)).toBe(false)
+    expect(isExtensionAutoloadBlocked(
+      'Permission Error: Cannot access file "/etc/passwd" - file system operations are disabled by configuration'))
+      .toBe(false)
+  })
+  it('前缀在 SQL 回显里 → false（不认回显里的仿冒前缀）', () => {
+    const fake = 'Failed to extract statements: Parser Error: syntax error\n\n'
+      + "LINE 1: SELECT 'Extension Autoloading Error: x - file system operations are disabled by configuration'"
+    expect(isExtensionAutoloadBlocked(fake)).toBe(false)
+  })
+  it('句尾不是特征句（扩展安装因网络失败）→ false（不得说成沙箱拦截）', () => {
+    const net = "Extension Autoloading Error: An error occurred while trying to automatically install the required extension 'delta': HTTP GET error"
+    expect(isExtensionAutoloadBlocked(net)).toBe(false)
   })
 })
 

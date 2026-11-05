@@ -141,3 +141,26 @@ export function isLayer2Blocked(msg: string): boolean {
   return /^Permission Error:/i.test(head)
     && / - file system operations are disabled by configuration\s*$/i.test(head)
 }
+
+/**
+ * Extension Autoloading 被沙箱拦截时的报文识别。
+ *
+ * 报文形如：
+ * ```
+ * Extension Autoloading Error: An error occurred while trying to automatically install
+ * the required extension 'delta':
+ * Cannot access directory "…/.duckdb/extensions/v1.5.6/osx_amd64" - file system operations
+ * are disabled by configuration
+ * ```
+ *
+ * ⚠️ 报文前缀是 `Extension Autoloading Error:` 而非 `Permission Error:`，因此独立于
+ * `isLayer2Blocked` 之外 —— `isLayer2Blocked` 需要的是 `^Permission Error:`，本前缀
+ * 走不到它。但后半句特征 `file system operations are disabled by configuration` 与
+ * layer2 同源（同一原因的不同展现形态），所以本判据锚头部前缀 + 尾部特征句。
+ * 注意去掉 SQL 回显（`SELEC 'Extension Autoloading Error: ... x is disabled ...'`）。
+ */
+export function isExtensionAutoloadBlocked(msg: string): boolean {
+  const head = withoutSqlEcho(msg)
+  return /^Extension Autoloading Error:/i.test(head)
+    && / - file system operations are disabled by configuration\s*$/i.test(head)
+}

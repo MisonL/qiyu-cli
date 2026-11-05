@@ -22,7 +22,7 @@ import { isLockError, retryWithBackoff, isModuleNotFound, classifyOpenFailure, N
 import type { ErrorKind } from '../core/errors.js'
 import type { StoreConfig } from '../store/types.js'
 import { storeInitCommand } from '../output.js'
-import { isInterrupt, isLayer2Blocked } from './native-error.js'
+import { isInterrupt, isLayer2Blocked, isExtensionAutoloadBlocked } from './native-error.js'
 
 export interface SandboxResult {
   columns: string[]
@@ -353,6 +353,40 @@ function hasAnalyzeToken(sql: string): boolean {
  * ⚠️ 只认 layer2 的两个特征串，不能把泛化的 `Permission Error` 也算进来 ——
  * 读库文件本身的 OS 权限错误也带这个前缀，误报成「沙箱拦截」会误导用户。
  */
+/**
+ * layer2 拦截的统一渲染 —— prepare 期与执行期共用**同一句**。
+ *
+ * ⚠️ 执行期也会撞上 layer2（2026-11-05 审查实测）：`sniff_csv('/etc/passwd')` 的签名
+ * 推断发生在**执行**阶段（探针 stage=execute），报文与 prepare 期完全同形。此前
+ * `runAndReadUntil` 的 catch 只判 `isInterrupt`，其余一律落 `internal` +
+ * 「请检查查询条件；若反复出现请报告此问题」—— 同一成因在 prepare 期报
+ * `sandbox_blocked`、在执行期报 `internal`，Agent 会以为是自己 SQL 写坏了。
+ * 判断依据（何时发生）不该决定归因（是谁拒绝的），所以两处都走这一个构造点。
+ */
+function layer2BlockedError(): SandboxError {
+  return sandboxError('usage', '该语句尝试访问文件或网络，已被只读沙箱拦截', {
+    code: 'sandbox_blocked',
+    hint: '沙箱只允许读取数据库内的数据：read_csv / read_text / glob / COPY TO / ATTACH / EXPORT / INSTALL 均不可用',
+  })
+}
+
+/**
+ * Extension Autoloading 被拦截的统一渲染（prepare 与执行两期同句）。
+ *
+ * ⚠️ 2026-11-05 审查实测：`delta_scan` / `iceberg_scan` / `postgres_scan` 需要自动安装
+ * 扩展，而只读沙箱禁用了扩展安装/LOAD/INSTALL —— 报文前缀是
+ * `Extension Autoloading Error:`（**不是** `Permission Error:`），旧实现落到
+ * `query_error` + 「请检查表名、列名与 SQL 语法」：把「这个函数在这里用不了」说成
+ * 「你 SQL 写错了」，Agent 会反复改名重试。单独一档、给可执行的动作。
+ */
+function extensionBlockedError(): SandboxError {
+  return sandboxError('usage', '该函数需要安装 DuckDB 扩展，已被只读沙箱拦截', {
+    code: 'sandbox_blocked',
+    hint: '只读沙箱禁用了扩展的安装与加载（INSTALL / LOAD / autoload），delta_scan、'
+      + 'iceberg_scan、postgres_scan 等依赖扩展的函数在这里不可用；请改用库内的表与内置函数',
+  })
+}
+
 function mapPrepareError(e: unknown): SandboxError {
   const msg = e instanceof Error ? e.message : String(e)
   // 判据走 `query/native-error.ts` 的 `isLayer2Blocked`（**唯一实现点**，2026-11-01），
@@ -360,12 +394,8 @@ function mapPrepareError(e: unknown): SandboxError {
   // 剥掉 SQL 回显：Parser Error 会把出错行 SQL 全文附在 `LINE n:` 之后，SQL 里恰好
   // 含特征句时（`SELEC 'file system operations are disabled by configuration'`，
   // 实测）会被谎报成「已被沙箱拦截」（真实成因是语法错，exit 同为 2 但归因是假的）。
-  if (isLayer2Blocked(msg)) {
-    return sandboxError('usage', '该语句尝试访问文件或网络，已被只读沙箱拦截', {
-      code: 'sandbox_blocked',
-      hint: '沙箱只允许读取数据库内的数据：read_csv / read_text / glob / COPY TO / ATTACH / EXPORT / INSTALL 均不可用',
-    })
-  }
+  if (isLayer2Blocked(msg)) return layer2BlockedError()
+  if (isExtensionAutoloadBlocked(msg)) return extensionBlockedError()
   // 裁决 R9：把原生错误挂在 cause 上，Task 5 从原文补算表/列候选（message 格式保持不变）。
   return sandboxError('usage', `SQL 无法执行：${msg}`, {
     code: 'query_error',
@@ -607,6 +637,10 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
         }
         // 裁决 R11：执行期原生错误也挂 cause —— errors.ts 从原文补 OOM 的可操作 hint
         //（不挂的话「Out of Memory Error → 缩小时间范围」在生产路径永远不触发）。
+        // ⚠️ 但 layer2 拦截必须先于 internal 判定（2026-11-05 审查实测）：`sniff_csv`
+        // 的文件访问发生在执行期，报文与 prepare 期同形 —— 见 `layer2BlockedError`。
+        if (isLayer2Blocked(msg)) throw layer2BlockedError()
+        if (isExtensionAutoloadBlocked(msg)) throw extensionBlockedError()
         throw sandboxError('internal', `查询执行失败：${msg}`, {
           code: 'internal',
           hint: '请检查查询条件；若反复出现请报告此问题',
