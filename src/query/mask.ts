@@ -188,7 +188,9 @@ function sliceClause(
   startRe: RegExp,
   stopSource = 'ORDER\\s+BY|LIMIT|HAVING|QUALIFY|WINDOW|UNION|EXCEPT|INTERSECT|FROM',
 ): string {
-  const m = startRe.exec(sql)
+  // 定位作用在「抹掉字面量/注释但等长」的文本上，切片仍取原文（偏移逐位对齐）。
+  const scan = withoutLiterals(sql)
+  const m = startRe.exec(scan)
   if (m === null) return ''
   const from = m.index + m[0].length
   let depth = 0
@@ -214,7 +216,7 @@ function sliceClause(
     if (ch === ')') { if (depth === 0) return sql.slice(from, i); depth--; continue }
     if (depth !== 0 || !/[A-Za-z]/.test(ch)) continue
     if (i > from && /[A-Za-z0-9_$]/.test(sql[i - 1]!)) continue
-    if (new RegExp('^(?:' + stopSource + ')\\b', 'i').test(sql.slice(i))) return sql.slice(from, i)
+    if (new RegExp('^(?:' + stopSource + ')\\b', 'i').test(scan.slice(i))) return sql.slice(from, i)
   }
   return sql.slice(from)
 }
@@ -244,9 +246,19 @@ const AGGREGATE_FUNCS = new Set([
  * SELECT 项是否以**聚合函数**开头（`max(userPhone) AS userPhone` 是聚合值，不是分组键）。
  * 只看开头：`userPhone || '-x'` 这类表达式是投影出来的分组键（会被打码），不能当成聚合。
  */
+const AGGREGATE_CALL = new RegExp(
+  `\\b(?:${[...AGGREGATE_FUNCS].join('|')})\\s*\\(`, 'i')
+
+/**
+ * SELECT 项是不是**聚合表达式**（`max(userPhone)`、`coalesce(max(userPhone), NULL)` 都算）。
+ *
+ * ⚠️ 必须搜**整个表达式**，不能只看开头（Codex 2026-11-05 第三轮 P2 实测）：
+ * `SELECT coalesce(max(userPhone), NULL) AS userPhone … GROUP BY ALL` 实测返回一行 ——
+ * 它明明是聚合值，开头是 coalesce，只看函数名会被当成非聚合项 → 误报分组失真并建议 --no-mask。
+ * 覆盖整个表达式是安全的方向：含聚合函数的项不可能同时是分组键（DuckDB 会拒绝）。
+ */
 function isAggregateItem(item: string): boolean {
-  const m = /^\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*\(/.exec(item)
-  return m !== null && AGGREGATE_FUNCS.has((m[1] ?? m[2] ?? '').toLowerCase())
+  return AGGREGATE_CALL.test(withoutLiterals(item))
 }
 
 /**
@@ -258,25 +270,33 @@ function isAggregateItem(item: string): boolean {
  */
 function withoutLiterals(text: string): string {
   let out = ''
+  // ⚠️ 被抹掉的字符一律换成等长空格：下标与原文**逐位对齐**，`sliceClause` 才能在抹过的
+  // 文本上定位 `GROUP BY`/`DISTINCT` 而不会命中字符串字面量里的同一串词（Codex 2026-11-05
+  // 第三轮 P2：`SELECT userPhone, 'GROUP BY userPhone' AS label …` 曾被误判成分组查询）。
+  const blank = (n: number): string => ' '.repeat(n)
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]!
     if (ch === "'") {
-      out += ' '
+      const start = i
       for (i++; i < text.length; i++) {
         if (text[i] === "'") { if (text[i + 1] !== "'") break; i++ }
       }
+      out += blank(i - start + 1)
       continue
     }
     if (ch === '-' && text[i + 1] === '-') {
-      out += ' '
-      while (i < text.length && text[i] !== '\n') i++
+      // 行注释抹到行尾（**不含**换行符）：`\n` 原样保留，保证与原文等长。
+      while (i < text.length && text[i] !== '\n') { out += ' '; i++ }
+      if (i < text.length) out += '\n'
+      else i--
       continue
     }
     if (ch === '/' && text[i + 1] === '*') {
-      out += ' '
+      const start = i
       i += 2
       while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
-      i++
+      i++   // 越过 `/`
+      out += blank(Math.min(i, text.length - 1) - start + 1)
       continue
     }
     out += ch
@@ -607,7 +627,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     const groupByAll = plainKeys.length === 1 && /^\s*ALL\s*$/i.test(plainKeys[0]!)
     for (const n of sensitiveNames) {
       if (!visible(n)) continue
-      const viaKey = plainKeys.some((k) => wordHit(k, [n])) || (groupByAll && wordHit(projectedPlain, [n]))
+      // `GROUP BY ALL` + `SELECT *`：选择项是星号，projectedPlain 里没有列名 —— 退回输出列名命中
+      //（`SELECT * … GROUP BY ALL` 实测输出全部敏感列并按它们分组，Codex 第三轮 P2）。
+      const viaKey = plainKeys.some((k) => wordHit(k, [n]))
+        || (groupByAll && (wordHit(projectedPlain, [n]) || (selectUnparsed && matchedSensitive.has(n))))
       const viaAlias = aliasesOf(selectList, n).some((a) => plainKeys.some((k) => wordHit(k, [a])))
       const viaOrdinal = plainKeys.some((k) => {
         const t = k.trim()
@@ -618,21 +641,25 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       if (viaKey || viaAlias || viaOrdinal) groupedSensitive.add(n)
     }
   }
-  const distinct = /\bSELECT\s+(?:ALL\s+)?DISTINCT\s+(ON\s*\()?/i.exec(mode.sql)
+  // 判据作用在抹掉字面量/注释但等长的文本上：`SELECT userPhone, 'SELECT DISTINCT' AS label` 不是
+  // DISTINCT 查询（Codex 第三轮 P2）。切片偏移与原 SQL 逐位对齐。
+  const sqlBlank = withoutLiterals(mode.sql)
+  const distinct = /\bSELECT\s+(?:ALL\s+)?DISTINCT\s+(ON\s*\()?/i.exec(sqlBlank)
   if (distinct !== null) {
     // `DISTINCT ON (a, b) …` 的分组键是括号里的列；普通 `DISTINCT` 是整张选择列表
     //（DISTINCT 的选择项本身就是可见分组键；聚合项不会出现在 DISTINCT 列表里，但仍排除）。
+    // 括号配对走抹过字面量的 `sqlBlank`：字面量里的 `(`/`)` 不参与配对（等长，偏移对齐）。
     const list = distinct[1] === undefined
       ? projectedPlain
-      : withoutLiterals((() => {
+      : (() => {
           const open = distinct.index + distinct[0].length
           let depth = 1
-          for (let i = open; i < mode.sql.length; i++) {
-            if (mode.sql[i] === '(') depth++
-            else if (mode.sql[i] === ')') { depth--; if (depth === 0) return mode.sql.slice(open, i) }
+          for (let i = open; i < sqlBlank.length; i++) {
+            if (sqlBlank[i] === '(') depth++
+            else if (sqlBlank[i] === ')') { depth--; if (depth === 0) return sqlBlank.slice(open, i) }
           }
-          return mode.sql.slice(open)
-        })())
+          return sqlBlank.slice(open)
+        })()
     for (const n of sensitiveNames) {
       if (!visible(n)) continue
       // 选择列表是 `*` / 解析不了时，`DISTINCT` 去重的就是**整行输出**（含全部敏感列）——

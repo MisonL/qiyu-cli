@@ -145,6 +145,12 @@
     不提。判据改为只看**分组键**：GROUP BY 项里的敏感列、别名（`GROUP BY p`）、序号（`GROUP BY 1`）
     以及 `DISTINCT` 的选择列表。⚠️ 不用「SQL 里出现过敏感列」判 —— 敏感列只出现在 `WHERE`/`HAVING`
     里时脱敏不改变分组与计数，那样判会谎报分组失真（Codex PR #68 P2 指出，已补反例）。
+    判据再收窄到「**可见且非聚合**」：分组键没被投影出来（`SELECT COUNT(*) … GROUP BY userPhone`）、
+    或被标量函数包裹的聚合别名（`coalesce(max(userPhone), NULL) AS userPhone … GROUP BY ALL`）
+    都不报；`GROUP BY ALL` 按全部非聚合选择项理解（`ALL` 本身不是键）；`SELECT *` / `WITH … SELECT`
+    解析不出选择列表时退回输出列名命中（宁多勿少）。字面量与注释不参与关键字/列名判定
+    （`'GROUP BY userPhone'`、`GROUP BY 'userPhone'` 都不算分组），但 `struct_extract(t, 'userName')`
+    这类「列名只在字面量里」的构造**照样**发缺口警告（§十五.4 方向，过报可接受）。
   · **`db describe` 的 `time_column` 图例路径错位**：枚举翻译挂在 `time_column` 上（实际
     在 `time_column.kind`），而 `time_column: null`（没有声明时间列）没有释义。枚举挪到
     `time_column.kind`，`time_column` 讲形态与 null 含义；守卫下沉到该对象的每个字段。
@@ -154,6 +160,7 @@
   · **时间过滤静默丢掉脏时间值**：`query --table --since/--until` 的 WHERE 里带形态谓词，
     脏值行不进 `rows`、不进 `data_coverage`，而 `db tables` 对同一张表会报数量 —— 现在
     `query` 也点名数量并说明它们被排除（没有时间过滤时不报：那时脏值行照常返回）。
+    这次计数是**诊断性**的：失败/超时只降级为一条警告，不会把已成功的查询变成失败。
   · **元数据命令的超时 hint 建议了它们没有的参数**：`db tables` / `db describe` /
     `stats fields` 共用 `query` 的「缩小时间范围或加过滤条件」，而它们不接受任何过滤参数。
     超时 hint 改为按调用方注入（`withTimeoutHint` 覆盖会话的所有内部查询）。

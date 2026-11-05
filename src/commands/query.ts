@@ -327,6 +327,25 @@ interface TableRunInput {
 }
 
 /**
+ * 诊断性计数（best-effort）：**失败返回 null，绝不把已成功的查询拖红**。
+ *
+ * ⚠️ 2026-11-05 审查（Codex PR #68 第三轮 P2）：脏时间值计数是全表扫描，若它撞上
+ * `--timeout`，同步等待会把「主查询与覆盖统计都成功」的整条命令变成失败 —— 数据拿不到，
+ * 而这条计数只是为了补一条警告。诊断失败降级为警告，退出码与 rows 不受影响。
+ * 导出供单测直接验证成败两条分支（真实超时难以稳定构造）。
+ */
+export async function runDiagnosticCount(
+  session: Pick<SandboxSession, 'run'>, sql: string, params: unknown[], timeoutMs: number,
+): Promise<number | null> {
+  try {
+    const r = await session.run(sql, { params, timeoutMs })
+    return Number(r.rows[0]?.n ?? 0)
+  } catch {
+    return null
+  }
+}
+
+/**
  * `--table` 的执行路径（spec §六）：解析缺省下界 → 主查询 → 覆盖统计 → 脱敏 → 信封。
  * 所有 SQL 由 `query/table-query.ts` 的纯函数构造（表/列已过闭集）。
  */
@@ -393,10 +412,14 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
       table, since: input.since, until: input.until, tableMin, now: input.now,
     })
     if (dirtyQuery !== null) {
-      const n = Number((await session.run(dirtyQuery.sql, {
-        params: dirtyQuery.params, timeoutMs: input.timeoutMs,
-      })).rows[0]?.n ?? 0)
-      if (n > 0) {
+      // ⚠️ 这是**诊断性**计数（全表扫描），不得成为本次查询成功的前置条件（Codex 2026-11-05
+      // 第三轮 P2）：主查询与覆盖统计都已成功返回，若这次计数撞上 --timeout，整条命令会失败、
+      // 已算出的数据也拿不到。失败/超时只降级为一条警告，不改变退出码。
+      const n = await runDiagnosticCount(session, dirtyQuery.sql, dirtyQuery.params, input.timeoutMs)
+      if (n === null) {
+        warnings.push(`表 ${table.name} 的时间列 ${tc.name} 的脏值统计未能完成（诊断查询超时或被中断），`
+          + '本次时间过滤可能排除了不符合约定形态的值 —— 需要确认时请单独查询该列')
+      } else if (n > 0) {
         warnings.push(`表 ${table.name} 的时间列 ${tc.name} 有 ${n} 个值不符合约定形态`
           + '（可能来自旧版 CLI、外部工具或库损坏），本次时间过滤已把它们排除在 rows 与 '
           + 'data_coverage 之外；用 `' + querySqlCommand(loc) + '` 单独查看它们以确认成因（'

@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { queryCommand } from '../../src/commands/query.js'
+import { queryCommand, runDiagnosticCount } from '../../src/commands/query.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { NO_MASK_WARNING } from '../../src/query/mask.js'
 import type { Store } from '../../src/store/types.js'
@@ -542,6 +542,18 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
       expect(String(e.hint)).toMatch(/读写权限/)
       expect(String(e.hint), '权限问题不得说成「文件不存在/不是本 CLI 创建」').not.toContain('store init')
     } finally { chmodSync(p, 0o600) }
+  })
+})
+
+describe('runDiagnosticCount —— 诊断计数失败不得拖红已成功的查询（Codex PR #68 第三轮 P2）', () => {
+  it('成功 → 返回计数；抛错（超时/中断）→ 返回 null，不向上抛', async () => {
+    const ok = await runDiagnosticCount({ run: async () => ({ columns: ['n'], rows: [{ n: '3' }], truncated: false }) },
+      'SELECT 1', [], 1000)
+    expect(ok).toBe(3)
+    const failed = await runDiagnosticCount({
+      run: async () => { throw Object.assign(new Error('查询超过 50ms 未完成，已中断'), { kind: 'query_timeout' }) },
+    }, 'SELECT 1', [], 50)
+    expect(failed, '诊断失败降级为 null，由调用方出一条警告').toBeNull()
   })
 })
 

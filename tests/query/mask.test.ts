@@ -786,6 +786,70 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(agg.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
   })
 
+  it('字面量里的 GROUP BY / DISTINCT 不算查询结构（Codex 2026-11-05 第三轮 P2）', () => {
+    const gb = maskQueryRows({
+      rows: [{ userPhone: '138****1111', label: 'GROUP BY userPhone' }],
+      columns: ['userPhone', 'label'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT userPhone, 'GROUP BY userPhone' AS label FROM sessions",
+        tables: TABLES,
+      },
+    })
+    expect(gb.warnings.join('\n'), '字面量不是分组子句').not.toContain('GROUP BY / DISTINCT')
+    const dist = maskQueryRows({
+      rows: [{ userPhone: '138****1111', label: 'SELECT DISTINCT' }],
+      columns: ['userPhone', 'label'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT userPhone, 'SELECT DISTINCT' AS label FROM sessions",
+        tables: TABLES,
+      },
+    })
+    expect(dist.warnings.join('\n'), '字面量不是 DISTINCT').not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('被标量函数包裹的聚合项不是分组键（Codex 2026-11-05 第三轮 P2）', () => {
+    // 实测 `SELECT coalesce(max(userPhone), NULL) AS userPhone, COUNT(*) … GROUP BY ALL`
+    // 返回一行 —— 是聚合值，不是分组键。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '13899991111', n: 2 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT coalesce(max(userPhone), NULL) AS userPhone, COUNT(*) AS n '
+          + 'FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    // ⚠️ 必须配一条**真有非敏感分组键**的组：`userPhone AS userPhone` 的聚合别名会让
+    // `visible(userPhone)` 直接不成立，聚合识别的变异因此一直是绿的（本用例初版如此）。
+    // 这里 `session_type` 是可见分组键，`userPhone` 以裸列名出现在选择项里 —— 只有
+    // 「整个表达式里搜聚合函数」才能挡住误报。
+    const mixed = maskQueryRows({
+      rows: [{ session_type: 'chat', userPhone: '13899991111', n: 2 }],
+      columns: ['session_type', 'userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT session_type, coalesce(max(userPhone), NULL) AS userPhone, COUNT(*) AS n '
+          + 'FROM sessions GROUP BY ALL',
+        tables: TABLES,
+      },
+    })
+    expect(mixed.warnings.join('\n'), '聚合表达式不是分组键').not.toContain('GROUP BY / DISTINCT')
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('`SELECT * … GROUP BY ALL` → 星号列退回输出列名，分组失真照报（Codex 2026-11-05 第三轮 P2）', () => {
+    // 实测输出全部敏感列并按它们分组：不同手机号打码后可能合并。
+    const out = maskQueryRows({
+      rows: [{ session_type: 'chat', userPhone: '138****1111' }],
+      columns: ['session_type', 'userPhone'],
+      mode: { kind: 'sql', sql: 'SELECT * FROM sessions GROUP BY ALL', tables: TABLES },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
   it('带双引号的别名（`AS "p"` + `GROUP BY p`）→ 必须报警（Codex 2026-11-05 第二轮 P2 漏报）', () => {
     // 实测 DuckDB 接受该写法并按 userPhone 分成两组；`GROUP BY p` 引用的是 "p"。
     const out = maskQueryRows({
