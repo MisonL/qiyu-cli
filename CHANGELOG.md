@@ -122,6 +122,43 @@
 
 ### 修复
 
+- **查询 / 存储 / 元数据命令的八处契约修正（2026-11-05 第二路独立审查，三路探子 + 探针实测）**：
+
+  · **执行期的文件访问与扩展加载被误报成「internal，请报告此问题」**：layer2 拦截
+    （`sniff_csv` 这类在执行期才碰文件的函数）与 `Extension Autoloading Error` 只判在
+    prepare 期，执行期 catch 一律包成 internal —— 用户拿到的是「请报告此问题」，而真相是
+    「沙箱拦截了它，换个写法就能跑」。执行期同样归 `sandbox_blocked` 并给出替代做法。
+  · **写者撞锁把持有者说成「写进程」**：实测 DuckDB 是「写者独占 / 读者共享」，一个
+    READ_ONLY 会话同样挡住写者；旧文案让 Agent 去等一个并不存在的同步任务。改为
+    「被其他进程占用」，hint 讲明只读会话也会挡住写者并给出 `lsof` 排查动作。
+  · **库文件已损坏没有归因**：截断（`Could not read enough bytes from file`）与页校验和
+    （`Corrupt database file: computed checksum` 不同）两类报文此前既不匹配权限、也不匹配
+    「非 DuckDB 文件」，落进各命令的兜底 —— `store status` 说「请用 store status 检查」
+    （拿自己查自己）、`query` 说「跑 store init」（对损坏文件同样打不开）。新增第三种成因
+    `corrupt`，三个出口共用一份 hint：先备份，再用 `--db` 指向新路径重建。
+  · **`mask_warnings` 图例只讲了一半来源**：该键还装 `GROUP BY` / `DISTINCT` 压平、
+    `query()`/`query_table()`/`COLUMNS()` 嵌套、非敏感列按值形态误改 —— 图例改为按
+    「缺口 / 副作用」两组穷举并声明「包括但不限于」。
+  · **`GROUP BY` 别名列漏掉分组失真警告**：`SELECT userPhone AS p … GROUP BY p` 的输出列
+    不叫 `userPhone`，判据只看输出列名 → 只剩「别名缺口」一条，而「3 个号码被压成 1 行」一个字
+    不提。判据改为「SQL 引用了敏感列 ∪ 输出列名命中」（大小写不敏感）。
+  · **`db describe` 的 `time_column` 图例路径错位**：枚举翻译挂在 `time_column` 上（实际
+    在 `time_column.kind`），而 `time_column: null`（没有声明时间列）没有释义。枚举挪到
+    `time_column.kind`，`time_column` 讲形态与 null 含义；守卫下沉到该对象的每个字段。
+  · **OOM 报文透出沙箱里必然失败的 `SET` 建议**：DuckDB 的「Possible solutions」三条 SET
+    在只读沙箱（`lock_configuration=true`）里全部报 `configuration has been locked`。
+    报文截到成因行（最后一个标记处，避开用户文本回声），hint 改为可执行动作并点破这一点。
+  · **时间过滤静默丢掉脏时间值**：`query --table --since/--until` 的 WHERE 里带形态谓词，
+    脏值行不进 `rows`、不进 `data_coverage`，而 `db tables` 对同一张表会报数量 —— 现在
+    `query` 也点名数量并说明它们被排除（没有时间过滤时不报：那时脏值行照常返回）。
+  · **元数据命令的超时 hint 建议了它们没有的参数**：`db tables` / `db describe` /
+    `stats fields` 共用 `query` 的「缩小时间范围或加过滤条件」，而它们不接受任何过滤参数。
+    超时 hint 改为按调用方注入（`withTimeoutHint` 覆盖会话的所有内部查询）。
+
+  守卫：`classifyOpenFailure` 的漂移扫描补「文件损坏判据」两档与两条事故形态自检；
+  元数据超时 hint 的包装形态与文案另加源码漂移守卫；OOM 剥除、`withTimeoutHint`、
+  `time_column` 元素层覆盖各配行为用例。当前共 **8 条**修复、**8 处**变异验证（各方向均已实测变红后恢复绿）。
+
 - **同步与调度的九处契约修正（2026-11-05 独立审查）**：
 
   · **launchd 的 Weekday 被整体后移一天**：cron 与 launchd 是**同一套**周几编号
