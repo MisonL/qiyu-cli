@@ -122,7 +122,10 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
   const withId: Record<string, unknown>[] = []
   let dropped = 0
   for (const r of sessions) {
-    if (isEmptyKey(r.session_id ?? r.id)) dropped++
+    // ⚠️ 必须走 `sessionKeyOf`，不能就地写 `r.session_id ?? r.id`（CodeRabbit PR #67 抓到）：
+    // 两处各写一份时次序写反，`{id: 7, session_id: ''}` 会在 fetch 判「缺键」而
+    // `sessionRow` 判「有键」—— 合法行被丢弃、水位照常推进，且这条路径绕过 enrich 单测。
+    if (isEmptyKey(sessionKeyOf(r))) dropped++
     else withId.push(r)
   }
   // synchronized_at 在 fetch 侧按窗统一盖章（单值、确定性于本窗）——enrich 是纯投影

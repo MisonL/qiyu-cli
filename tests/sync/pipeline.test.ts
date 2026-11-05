@@ -606,6 +606,29 @@ describe('sessions 任务全链路（重叠去重按 session.id）', () => {
     }
   })
 
+  it('键取第一个非空候选：{id:7, session_id:""} 必须落库为 7，不得在 fetch 侧被误丢', async () => {
+    // ⚠️ 只测 enrich 会漏（CodeRabbit PR #67 抓到）：fetch 的丢弃判据与 sessionRow 的投影
+    // 各写一份 `a ?? b` 时次序写反 —— `{id:7, session_id:''}` 在 fetch 判「缺键」被丢、
+    // 水位照常推进，而 enrich 单测（直接喂行）根本看不到这条路径。走 runTask 全链路。
+    const fetchMock = mocksFor()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const row = { ...SESSION_ROW, id: 7, session_id: '' }
+      const t = withZip(sessionsById('sessions.export')!, [row])
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 6 * DAY } }))
+      expect(r.status).toBe('complete')
+      expect(r.rows).toMatchObject({ fetched: 1, written: 1 })
+      const q = await store.query('SELECT session_id FROM sessions')
+      expect(q.rows.map((x) => String(x.session_id))).toEqual(['7'])
+      expect(r.gaps.find((g) => g.reason === 'row_missing_key'),
+        '有键的行不得被记成缺键').toBeUndefined()
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('流水线行落库：session.id → session_id VARCHAR 主键、派生 session_type 落库', async () => {
     const fetchMock = mocksFor()
     vi.stubGlobal('fetch', fetchMock)
