@@ -49,6 +49,39 @@ describe('信封归一化', () => {
     expect(normalize({ code: 200, message: '101596' }).payload).toBe(101596)
   })
 
+  it('形状 M：成功载荷就是 message 原文（export.session 的 key / check 的链接）', () => {
+    // 设计稿 §7.5 实测：create → `{code:200, message:"<task key>"}`，
+    // check 完成 → `{code:200, message:"<download link>"}`。此前按形状 A 解析，
+    // payload=undefined、notFound=true —— 唯一有用的载荷被丢掉还谎报"无数据"。
+    const r = normalize({ code: 200, message: 'abc123-task-key' }, 'M')
+    expect(r).toMatchObject({ ok: true, payload: 'abc123-task-key', notFound: false })
+    // 非 200 → 失败（message 是错误文本，不是载荷）
+    expect(normalize({ code: 14403, message: 'Wait...' }, 'M')).toMatchObject({ ok: false, code: '14403' })
+    // 空 message → 失败（无载荷可用），不判 not_found
+    const empty = normalize({ code: 200, message: '' }, 'M')
+    expect(empty.ok).toBe(false)
+    expect(empty.notFound).toBe(false)
+    // message 不是纯文本形状（缺失）同样失败
+    expect(normalize({ code: 200 }, 'M').ok).toBe(false)
+    // 'OK' 是占位符：拿它当 key/链接会把下游送去下载 /openapi/export/session/OK。
+    const ok = normalize({ code: 200, message: 'OK' }, 'M')
+    expect(ok.ok).toBe(false)
+    expect(ok.messageText).toMatch(/占位符/)
+    // 带空白/纯空白的形态同样不得放行；payload 取 trim 后的值。
+    expect(normalize({ code: 200, message: '   ' }, 'M').ok).toBe(false)
+    expect(normalize({ code: 200, message: ' OK ' }, 'M').ok).toBe(false)
+    expect(normalize({ code: 200, message: ' key-1 ' }, 'M')).toMatchObject({ ok: true, payload: 'key-1' })
+    // 裸数组不是 M 的合法形态：不能走「裸数组一律成功」的前置分支，
+    // 否则形态漂移被报成成功、数组被当成任务 key / 下载链接交给调用方。
+    const arr = normalize([{ id: 1 }], 'M')
+    expect(arr.ok).toBe(false)
+    expect(arr.payload).toBeUndefined()
+    expect(arr.messageText).toMatch(/裸数组/)
+    // 同一份裸数组在未登记/其它形状上仍是合法成功（ipcc.customfield.template.get）。
+    // 注意调用点（src/core/http.ts）传的是 `spec.envelope ?? undefined`，null 不进本函数。
+    expect(normalize([{ id: 1 }], undefined).ok).toBe(true)
+  })
+
   it('形状 D：只有 code，无 message 也无 data', () => {
     const r = normalize({ code: 200 })
     expect(r).toMatchObject({ ok: true, code: '200', messageText: '' })

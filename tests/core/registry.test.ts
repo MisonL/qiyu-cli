@@ -3,6 +3,9 @@ import { allEndpoints, byId, assertCallable, assertConfirmed, loadSpecs } from '
 // 令牌桶按 path 缓存而限频行按 id 查，两者靠"同路径限频一致"这条不变量兜住，
 // 所以这条断言放在注册表测试里。
 import { limitFor, RATE_LIMITS } from '../../src/core/ratelimit.js'
+import { loadParams } from '../../src/core/registry/params.js'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 describe('注册表', () => {
   it('每条记录都有唯一 id', () => {
@@ -100,6 +103,55 @@ describe('注册表', () => {
     expect(() => byId('不存在的接口')).toThrow(/api list --all/)
   })
 
+  it('specs.json 与 overrides 表一致 —— 生成物不得陈旧于事实源', () => {
+    // attrs.json / paths.json 是事实源，specs.json 是生成物。生成器缺席的机器上
+    // （registry-src/pages 不随仓库分发）只能手工同步 —— 这条守卫保证两者不漂移：
+    // 改了 override 却忘了同步 specs，运行时行为与「登记的形状」就会各说各话。
+    const read = (n: string) => JSON.parse(readFileSync(
+      fileURLToPath(new URL(`../../src/core/registry/overrides/${n}`, import.meta.url)), 'utf8'))
+    const paths = read('paths.json') as Record<string, string | null>
+    const attrs = read('attrs.json') as Record<string, Record<string, unknown>>
+    for (const e of allEndpoints()) {
+      if (e.pageId && Object.hasOwn(paths, e.pageId)) {
+        expect(e.path, `${e.id} 的 path 与 paths.json 不一致（specs.json 陈旧）`).toBe(paths[e.pageId])
+      }
+      const a = attrs[e.id]
+      if (!a) continue
+      if (Object.hasOwn(a, 'envelope')) expect(e.envelope, `${e.id} 的 envelope 与 attrs.json 不一致`).toBe(a.envelope)
+      if (Object.hasOwn(a, 'verified')) expect(e.verified, `${e.id} 的 verified 与 attrs.json 不一致`).toBe(a.verified)
+    }
+  })
+
+  it('export.session 一族的 body 参数表不再是空 —— 同步流水线发的字段必须能被 api schema 看到', () => {
+    // 此前 4 个文档外接口一律产出 `params: []`、`body_kind: 'none'`，而 create/check
+    // 的 body 是必需的、同步流水线就在发 —— Agent 按 schema 会发出空 body。
+    for (const id of ['export.session', 'export.session.check', 'export.session.one', 'export.session.one.message']) {
+      const f = loadParams(id)
+      expect(f.bodyKind, id).toBe('json')
+      expect(f.params.length, id).toBeGreaterThan(0)
+      expect(f.params.every((p) => p.in === 'body'), id).toBe(true)
+    }
+    expect(loadParams('export.session').params.map((p) => p.name).sort()).toEqual(['code', 'end', 'start'])
+    expect(loadParams('export.session.check').params.map((p) => p.name).sort()).toEqual(['code', 'key'])
+  })
+
+  it('icoutcall.history.team 走独立路径，不与 seat 共用；信封与 verified 降为未实测', () => {
+    // 设计稿两处记载 team 是 `/ipcc/history/team`、载荷为对象；此前注册表沿用了
+    // 文档页重复项（与 seat 同路径、信封 C 数组）—— 调用会静默拿到坐席数据。
+    const team = byId('icoutcall.history.team')
+    const seat = byId('icoutcall.history.seat')
+    expect(seat.path).toBe('/openapi/ipcc/history/seat')
+    expect(team.path).toBe('/openapi/ipcc/history/team')
+    expect(team.verified).toBe(false)
+    expect(team.envelope).toBeNull()
+    expect(team.note ?? '').toMatch(/独立路径/)
+  })
+
+  it('M 信封只登记在「成功载荷就是 message 原文」的接口上', () => {
+    expect(allEndpoints().filter((e) => e.envelope === 'M').map((e) => e.id).sort())
+      .toEqual(['export.session', 'export.session.check'])
+  })
+
   it('工单检索的窗口上限是 31 天，不是文档写的 90 天', () => {
     // opStart 被服务端静默钳到 now-31d：按 90 天切片每片少取约 58 天且不报错
     expect(byId('ticket.search').maxWindowDays).toBe(31)
@@ -165,7 +217,7 @@ describe('注册表', () => {
         'data.overview.ipcc',
         'data.overview.session', 'evaluation.setting.get', 'export.session',
         'export.session.check', 'export.session.one', 'export.session.one.message',
-        'icoutcall.history.seat', 'icoutcall.history.team',
+        'icoutcall.history.seat',
         'ipcc.calltaskdetail.get', 'ipcc.customfield.template.get', 'kefu.v2.query',
         'online.session.category.list', 'online.session.customfield.template',
         'receive.message', 'robot.data.getQuestionsByCategoryName', 'robot.data.knowledge',

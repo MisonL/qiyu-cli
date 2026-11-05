@@ -29,7 +29,7 @@ export interface EndpointSpec {
    * 前者是正常成功，后者是查无此物。生成脚本不得因为"设计稿把这两个接口
    * 写在同一行"就把两者都填成 `'D'`，那样 msgAssociate 的 not-found 会静默变成成功。
    */
-  envelope: 'A' | 'B' | 'C' | 'D' | 'D-nf' | null
+  envelope: 'A' | 'B' | 'C' | 'D' | 'D-nf' | 'M' | null
   /**
    * 时间跨度上限（天）。**这是上界，按"精确比较"理解** —— 调用方必须
    * 保证 `span <= maxWindowDays * 86400000` 毫秒。
@@ -191,7 +191,7 @@ export function loadSpecs(raw: unknown): EndpointSpec[] {
     // message 里的 JSON 字符串**当成载荷原样返回**，Agent 拿到的是一段字符串
     // 而不是解析后的对象 —— 而它无从知道这是因为注册表拼错了字。
     // 与 dangerous 同理：枚举值必须在加载时校验，不能靠运行时兜底。
-    const ENVELOPES = new Set(['A', 'B', 'C', 'D', 'D-nf'])
+    const ENVELOPES = new Set(['A', 'B', 'C', 'D', 'D-nf', 'M'])
     if (o.envelope !== null && !ENVELOPES.has(o.envelope as string)) {
       throw new Error(
         `specs.json[${o.id}] 的 envelope 取值非法：${JSON.stringify(o.envelope)}。` +

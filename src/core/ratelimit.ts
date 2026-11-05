@@ -47,7 +47,11 @@ export const RATE_LIMITS: Record<string, RateLimit | null> = {
 
   // 呼叫坐席/团队历史：实测约 20 秒冷却，超限返回 14402（设计稿 §4.3）
   'icoutcall.history.seat':        { limit: 1, windowSeconds: 20, source: 'observed', scope: 'endpoint' },
-  'icoutcall.history.team':        { limit: 1, windowSeconds: 20, source: 'observed', scope: 'endpoint' },
+  // ⚠️ team 的行来自文档值，不是对 team 路径实测的（2026-11-04 修）：此前的 20 秒登记
+  // 与 seat 共用路径，"观测"实际打在 seat 上。设计稿把 team 的冷却记为「间隔 ≥5 分钟」——
+  // 那是文档值，实测数据只有 seat 的 20 秒。team 尚未实测，按**文档值**填 300 秒
+  // （source:'doc'），避免拿"未实测的 20 秒"当实测定去诱导 Agent 在真实冷却前重试。
+  'icoutcall.history.team':        { limit: 1, windowSeconds: 300, source: 'doc', scope: 'endpoint' },
 
   // 报表域：ipcc 是 10 次/60 秒滚动窗口（与其余报表的 30 秒不同）
   'data.overview.ipcc':            { limit: 10, windowSeconds: 60, source: 'observed', scope: 'endpoint' },

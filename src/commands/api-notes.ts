@@ -20,17 +20,26 @@ export function callFieldNotes(): Record<string, string> {
       // ⚠️ `field` **不保证**存在（Sourcery 指出）：`non_json_body`（body_kind 非 json 时
       // 照原样发字面量）是**整条请求**级的提示，没有单一字段可归因 —— 它只带 `kind` 与
       // `message`。消费者按 `w.field` 取值会拿到 `undefined`。
-      + '`field` 仅在告警属于某个具体字段时出现（如 `missing_required` / `unknown_field` / '
-      + '`type_mismatch`），`non_json_body` 这类整条请求级的提示没有它，'
+      + '`field` 仅在告警属于某个具体字段时出现（如 `unknown_field` / '
+      + '`type_mismatch` / `alias_normalized`），`non_json_body` 这类整条请求级的提示没有它，'
       + '② CLI 级的安装态提示（如 skill 未安装）——'
       + '同一次输出里已有 ① 时它被包成 `{kind:"skill_drift", message}`，否则是裸字符串。'
       + '故按 `w.kind` 取值前先判元素类型，别假定它一定是对象。'
       + '⚠️ 键不出现 ≠ body 正确：它只在「没有软告警且没有 CLI 提示」时不出现，'
       + '--no-validate 只保证不产生 ①（body 未校验），② 照旧出现。'
+      + '⚠️ `missing_required` 永远不会出现在这里 —— 缺必填是硬拒绝（退出码 2、错误信封），'
+      + '不要写「在 warnings 里找 missing_required」的分支。'
       + '它是本 CLI 的提示，不是上游的业务告警',
     not_found: 'true = 解包后的载荷为空。判据作用在解包后的 payload 上：'
-      + 'data / result 形状下是 {} / []，或整条 200 响应没有载荷键（仅已实测信封，'
-      + 'envelope 为 null 的接口不断言）。staffInfo 形状恒不置位。'
+      + 'data / result 形状下是 {} / []。形状 C 且 message 能解析成 JSON 时，'
+      + '解析出的 {} / [] 同样置位（message 缺失或解析失败是失败，不是 not_found）。'
+      + 'envelope 未登记的宽松模式下，message 能解析成 JSON 且结果为空同样置位。'
+      + '整条 200 响应没有载荷键时，只有信封已实测且不是 D 族（A/B/D-nf）的接口判为查无此物'
+      // ⚠️ 形状 C **不在**这个列表里：C 分支对任何响应都会先尝试解析 message，
+      // `{code:200}`（无 message）在 C 上直接判失败，根本走不到末尾兜底。
+      + '（形状 C 不在此列：它的无 message 是失败，不是查无此物）'
+      + '（envelope 为 null 不在此断言。形状 M 的空 message 判失败，不判 not_found）。'
+      + 'staffInfo 形状恒不置位。'
       + '⚠️ 只覆盖结构性为空：业务为空（如 ticket.search 查到 0 条返回 {total:0,tickets:[]}）'
       + '不会置位 —— 没有 not_found 不等于有数据',
     warning: '与 not_found 同时出现的一句话说明（固定文案）',

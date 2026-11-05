@@ -1,7 +1,22 @@
 {
-  "params": [],
+  "params": [
+    {
+      "name": "key",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "create 返回的任务 key"
+    },
+    {
+      "name": "code",
+      "in": "body",
+      "required": false,
+      "type": "string",
+      "description": "（可选，实测不校验）"
+    }
+  ],
   "responseShape": {
     "kind": "none"
   },
-  "bodyKind": "none"
+  "bodyKind": "json"
 }

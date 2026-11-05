@@ -1,7 +1,22 @@
 {
-  "params": [],
+  "params": [
+    {
+      "name": "sessionId",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "会话 id"
+    },
+    {
+      "name": "mTypes",
+      "in": "body",
+      "required": true,
+      "type": "string",
+      "description": "消息类型，逗号分隔字符串（传数组 → 14500）"
+    }
+  ],
   "responseShape": {
     "kind": "none"
   },
-  "bodyKind": "none"
+  "bodyKind": "json"
 }

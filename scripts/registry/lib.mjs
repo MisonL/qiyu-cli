@@ -184,7 +184,7 @@ export function deriveId(path) {
   return p
 }
 
-const ENVELOPES = ['A', 'B', 'C', 'D', 'D-nf']
+const ENVELOPES = ['A', 'B', 'C', 'D', 'D-nf', 'M']
 
 /**
  * 校验三张 override 表与当前页面集合一致。**未知键一律抛错** —— 静默忽略
@@ -232,7 +232,7 @@ const FIELD_ORDER = ['id','pageId','title','method','path','direction','callable
  * @property {boolean} dangerous
  * @property {'checksum'|'eventType'|'none'} auth
  * @property {boolean} verified
- * @property {'A'|'B'|'C'|'D'|'D-nf'|null} envelope
+ * @property {'A'|'B'|'C'|'D'|'D-nf'|'M'|null} envelope
  * @property {number} [maxWindowDays]
  * @property {string|null} [category]
  * @property {string} [note]

@@ -134,13 +134,17 @@ describe('限频表', () => {
     })
   })
 
-  it('呼叫历史是实测的 20 秒，而不是文档写的 5 分钟', () => {
-    // ⚠️ 文档写"间隔 ≥5 分钟"，实测是约 20 秒冷却（超限返回 14402，设计稿 §4.3）。
-    // 按文档填 300 秒会让 CLI 白白等待 15 倍的时间 —— 而 source 会从
-    // 'observed' 退回 'doc'，那条断言又抓不到具体数值，所以这里必须钉住数字。
-    for (const id of ['icoutcall.history.seat', 'icoutcall.history.team']) {
-      expect(limitFor(id), id).toMatchObject({ limit: 1, windowSeconds: 20, source: 'observed' })
-    }
+  it('呼叫历史 seat 是实测的 20 秒；team 的 20 秒只是文档值（路径此前登记错）', () => {
+    // ⚠️ 文档写"间隔 ≥5 分钟"，seat 实测约 20 秒冷却（超限返回 14402，设计稿 §4.3）。
+    // 按文档填 300 秒会让 CLI 白白等待 15 倍的时间 —— 所以数值必须钉住。
+    // ⚠️ team 此前与 seat 共用路径，20 秒的"实测"实际打在 seat 上；路径修正为
+    // /ipcc/history/team 后，team 尚未实测 → source 必须是 doc（2026-11-04）。
+    expect(limitFor('icoutcall.history.seat'))
+      .toMatchObject({ limit: 1, windowSeconds: 20, source: 'observed' })
+    // team 未实测：按文档值 300 秒（source:'doc'）——不要拿"未实测的 20 秒"诱导
+    // Agent 在真实冷却前重试。
+    expect(limitFor('icoutcall.history.team'))
+      .toMatchObject({ limit: 1, windowSeconds: 300, source: 'doc' })
   })
 
   it('知识库 5 个写接口的限频已登记 —— 三个 1/s、两个 10/s', () => {

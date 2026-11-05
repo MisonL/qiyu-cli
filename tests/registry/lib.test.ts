@@ -190,9 +190,14 @@ describe('validateOverrides', () => {
       .toThrow(/paths.json/)
   })
 
-  it('envelope 必须是 A/B/C/D/D-nf 之一', () => {
+  it('envelope 必须是 A/B/C/D/D-nf/M 之一（合法值放行、非法值拒绝）', () => {
     expect(() => validateOverrides({ ids: {}, paths: {}, attrs: { x: { envelope: 'E' } } }, pages))
       .toThrow(/envelope/)
+    // M 已是合法取值（export.* 两接口实测登记）：不得被白名单误拒。
+    expect(() => validateOverrides(
+      { ids: { 'api-1': 'a.b' }, paths: {}, attrs: { 'a.b': { dangerous: false, envelope: 'M', verified: true } } },
+      new Set(['api-1']),
+    )).not.toThrow()
   })
 
   it('envelope 非 null 时 verified 必须为 true', () => {
