@@ -52,6 +52,7 @@ export function queryFieldNotes(): Record<string, string> {
       + '任何情况下都没有兜底，必须自己按自然日 GROUP BY 数行。'
       + 'null 有三种成因：--sql 通道、表没有时间列、范围内没有一行的时间值能过形态谓词'
       + '（空表、过滤后 0 行、时间列全是脏值或 NULL）。第三种最隐蔽：rows 可能大于 0'
-      + '（无过滤时脏值行照常返回）而 data_coverage 为 null，且不保证有警告',
+      + '（无过滤时脏值行照常返回，给了时间过滤时它们被排除、改由 warnings 报数量）'
+      + '而 data_coverage 为 null，没有时间过滤时这份响应里不会有关于它的警告',
   }
 }

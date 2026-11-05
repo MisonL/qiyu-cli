@@ -23,14 +23,15 @@ import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } fr
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
 import {
-  buildCoverageQuery, buildMinQuery, buildTableQuery, effectiveBound, validateGroupBy,
+  buildCoverageQuery, buildDirtyTimeQuery, buildMinQuery, buildTableQuery, effectiveBound, validateGroupBy,
 } from '../query/table-query.js'
 import type { BuiltTableQuery } from '../query/table-query.js'
 import { openGuardedSession } from './db.js'
 import { queryFieldNotes } from './query-notes.js'
 import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
-  dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand,
+  dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand, querySqlCommand,
+  SQL_ARG_REPLACE_NOTE,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
@@ -381,6 +382,27 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
       }
     }
     if (row.days !== null && row.days !== undefined) coveredDays = Number(row.days)
+  }
+
+  // 脏时间值不得静默丢掉（2026-11-05 审查修）：时间过滤的 WHERE 里同时挂着形态谓词
+  //（正确性 F8），脏值行不会出现在 rows、也不进 data_coverage —— 此前没有任何 warning，
+  // 而 `db tables` / `db describe` 对同一张表会报「时间列有 N 个值不符合约定形态」。
+  // 没有时间过滤时不报（脏值行照常返回，没有被丢弃）。
+  if (tc !== undefined) {
+    const dirtyQuery = buildDirtyTimeQuery({
+      table, since: input.since, until: input.until, tableMin, now: input.now,
+    })
+    if (dirtyQuery !== null) {
+      const n = Number((await session.run(dirtyQuery.sql, {
+        params: dirtyQuery.params, timeoutMs: input.timeoutMs,
+      })).rows[0]?.n ?? 0)
+      if (n > 0) {
+        warnings.push(`表 ${table.name} 的时间列 ${tc.name} 有 ${n} 个值不符合约定形态`
+          + '（可能来自旧版 CLI、外部工具或库损坏），本次时间过滤已把它们排除在 rows 与 '
+          + 'data_coverage 之外；用 `' + querySqlCommand(loc) + '` 单独查看它们以确认成因（'
+          + SQL_ARG_REPLACE_NOTE + '）')
+      }
+    }
   }
 
   // 脱敏唯一出口（spec §7.2）；--table 通道按列精确命中（mode.kind='table'）。
