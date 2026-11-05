@@ -67,6 +67,10 @@ describe('信封归一化', () => {
     const ok = normalize({ code: 200, message: 'OK' }, 'M')
     expect(ok.ok).toBe(false)
     expect(ok.messageText).toMatch(/占位符/)
+    // 带空白/纯空白的形态同样不得放行；payload 取 trim 后的值。
+    expect(normalize({ code: 200, message: '   ' }, 'M').ok).toBe(false)
+    expect(normalize({ code: 200, message: ' OK ' }, 'M').ok).toBe(false)
+    expect(normalize({ code: 200, message: ' key-1 ' }, 'M')).toMatchObject({ ok: true, payload: 'key-1' })
   })
 
   it('形状 D：只有 code，无 message 也无 data', () => {

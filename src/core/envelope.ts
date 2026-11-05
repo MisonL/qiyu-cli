@@ -117,18 +117,21 @@ export function normalize(raw: unknown, envelope?: EnvelopeShape): Normalized {
   if (envelope === 'M') {
     const nf = { notFound: false }
     if (!codeOk) return { ok: false, code, payload: undefined, messageText, ...nf }
-    if (!messageText) {
+    // ⚠️ 判据必须作用在 **trim 后**的副本上（CodeRabbit PR #66）：`'   '` 是空载荷、
+    // `'OK '` 是占位符 —— 原样比对会把它们放行，下游拿它当 key/链接去下载。
+    // 返回的 payload 也用 trim 后的值（带空白的 key/链接必然用不了）。
+    const trimmed = messageText.trim()
+    if (!trimmed) {
       return { ok: false, code, payload: undefined, messageText: '响应缺少 message', ...nf }
     }
-    // ⚠️ 'OK' 是占位符（CodeRabbit PR #66）：服务端把占位塞进 message 时，
-    // 拿它当任务 key / 下载链接会让下游去下载 /openapi/export/session/OK。
+    // 'OK' 是占位符：拿它当任务 key / 下载链接会让下游去下载 /openapi/export/session/OK。
     // `x 校验`（流水线）与 `api call` 都必须把同一形态判为失败 —— 归一化层挡掉，
     // 两边共用同一判据，不再各写一份。
-    if (messageText === 'OK') {
+    if (trimmed === 'OK') {
       return { ok: false, code, payload: undefined,
                messageText: '响应 message 是占位符 `OK`（形态漂移），不是可用的载荷', ...nf }
     }
-    return { ok: true, code, payload: messageText, messageText, ...nf }
+    return { ok: true, code, payload: trimmed, messageText, ...nf }
   }
 
   // 形状 C：数据藏在 message 里的 JSON 字符串。

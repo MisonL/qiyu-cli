@@ -142,8 +142,9 @@
     数组。经 `paths.json` 修正路径，envelope/verified 降为未实测并写明原因；
     限频行的 20 秒同步从 `observed` 降为 `doc`（那次「观测」打在 seat 上）。
   · **`api list` 的 `verified` 图例把「实测范围」全指给每行 note**：53 条 verified:true
-    里 42 条没有 note，Agent 无从判断。改为「true = 至少观测到一次成功响应；具体范围
-    只在该行有 note 时才有说明，没有 note 不要假定更多」。
+    里 42 条没有 note，Agent 无从判断。改为「true = 该接口被真实观测过，不等于成功路径
+    一定走通过（receive.message 只验证了不可调用）；具体范围只在该行有 note 时才有
+    说明，没有 note 不要假定更多」。
   · **`path` 图例说 null 路径「仍可能是本方可主动调用的」**：加载器强制
     `callable:true` 必有 path，该组合不可达。改为点明「null 必然伴随 callable=false，
     direction 仍可为 outbound」。
