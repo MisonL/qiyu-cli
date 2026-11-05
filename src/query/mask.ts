@@ -650,8 +650,14 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       `(?<![A-Za-z0-9_$])${escapeRe(n)}(?![A-Za-z0-9_$])`, 'i').test(plain))
   }
   const groupedSensitive = new Set<string>()
+  // ⚠️ `DISTINCT` 后面是 `\s*` 不是 `\s+`（CodeRabbit PR #68 第十四轮 minor）：
+  // DuckDB 接受 `SELECT DISTINCT(userPhone) FROM sessions`（实测去重生效，3 行 → 2 行），
+  // 要求空白会把 `DISTINCT(userPhone)` 整个当成一个选择项留在列表里。
+  // 如实记录：这一处**不单独承重** —— 把下面 distinct 检测正则修好后，前缀剥不剥都
+  // 会报警（`projectedPlain` 里照样含列名），变异实测用例仍绿。保留是因为它让选择项的
+  // 文本语义正确，但不算进变异数。
   const selectList = withoutLiterals(sliceClause(
-    mode.sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\s+(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b'))
+    mode.sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\b\s*(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b'))
   const selectItems = splitTopLevel(selectList)
   const projected = selectItems.filter((it) => it.trim() !== '' && !isAggregateItem(it))
   const projectedPlain = projected.join(',')
@@ -696,7 +702,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const sqlBlank = withoutLiterals(mode.sql)
   // 只在顶层找 DISTINCT：`… WHERE x IN (SELECT DISTINCT x …)` 的去重发生在子查询、且去重的是
   // 该子查询的原值行，脱敏不过多合并行；误把它当外层 DISTINCT 会对外层投影列误报（第四轮）。
-  const distinct = execTopLevel(sqlBlank, /\bSELECT\s+(?:ALL\s+)?DISTINCT\s+(ON\s*\()?/i)
+  // `DISTINCT\b\s*`：`DISTINCT(userPhone)` 这种无空格写法同样算一次去重
+  const distinct = execTopLevel(sqlBlank, /\bSELECT\s+(?:ALL\s+)?DISTINCT\b\s*(ON\s*\()?/i)
   if (distinct !== null) {
     // `DISTINCT ON (a, b) …` 的分组键是括号里的列；普通 `DISTINCT` 是整张选择列表
     //（DISTINCT 的选择项本身就是可见分组键；聚合项不会出现在 DISTINCT 列表里，但仍排除）。

@@ -904,6 +904,29 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(byPhone.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
   })
 
+  it('无空格写法 `SELECT DISTINCT(userPhone)` 同样要报警（CodeRabbit PR #68 第十四轮 minor）', () => {
+    // 实测 DuckDB 接受该写法并去重（3 行 → 2 行）；两处 DISTINCT 正则若要求 `\s+`，
+    // 这条查询会一条警告都没有 —— 比改动前的判据（任何 DISTINCT + 命中列名即报）还退步。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '138****1111' }, { userPhone: '138****1111' }],
+      columns: ['userPhone'],
+      mode: { kind: 'sql', sql: 'SELECT DISTINCT(userPhone) FROM sessions', tables: TABLES },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    // 反证：作用域仍然要守住 —— 子查询里的无空格 DISTINCT 不算本层
+    const inner = maskQueryRows({
+      rows: [{ userPhone: '138****1111', session_type: 'chat' }],
+      columns: ['userPhone', 'session_type'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone, session_type FROM sessions '
+          + 'WHERE session_type IN (SELECT DISTINCT(session_type) FROM sessions)',
+        tables: TABLES,
+      },
+    })
+    expect(inner.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
   it('反证：子查询里的 DISTINCT 不是本层的去重 → 不报警（DISTINCT 判据同样按作用域）', () => {
     // 外层只是把子查询的原值行投影出来，脱敏不合并行；把内层 DISTINCT 当成外层去重
     // 会对外层投影的敏感列谎报「分组失真」（2026-11-05 第四轮自查，同族缺陷）。
