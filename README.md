@@ -336,7 +336,7 @@ qiyu --version                       包版本 + skill_contract_version
 | status | 含义 | 该做什么 |
 |---|---|---|
 | `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗**或整窗晚于末端上限**被跳过），判实际覆盖要看 `windows.skipped` |
-| `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 才是落库行数（为 0 也可能是「窗口都成功、只是上游没数据」） |
+| `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 是写入行数（为 0 也可能是「窗口都成功、只是上游没数据」；⚠️ count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」——那批行已回滚、实际没落库，这两类失败窗存在时它**偏大**） |
 | `failed` | 快照任务的失败（本地限频闸门拦截 / 上游取数失败 / 落库失败或行数核对不符） | 快照没有窗口循环，所以不会出现 `partial`；反过来 windowed 任务也**不会**给出 `failed` —— 全窗失败同样是 `partial` |
 
 `sync status` 的 `data` 是 `{tasks:[…]}`（图例键即该路径下的字段，如 `tasks[].range_status`），

@@ -504,6 +504,12 @@ describe('SESSIONS_TASKS 任务声明', () => {
     // 空串/缺 id 行：丢弃且不计入 fetched（返回 null）
     expect(e({ session_id: '', staffId: '1000002' })).toBeNull()
     expect(e({ staffId: '1000002' })).toBeNull()
+    // ⚠️ 别名一边为空串、另一边有值时必须取有值的那一边 —— fetch 的丢弃判据与 enrich 的
+    // 投影共用同一个 sessionKeyOf（此前两处各写一份 `a ?? b` 且次序相反：fetch 用
+    // `session_id ?? id`、投影用 `id ?? session_id`，`{id:'', session_id:'x'}` 会在
+    // fetch 判「有键」、在 enrich 判「缺键」→ written < expected → 整窗回滚）。
+    expect(e({ id: '', session_id: '6', staffId: '1000002' })).toMatchObject({ session_id: '6' })
+    expect(e({ id: 7, session_id: '', staffId: '1000002' })).toMatchObject({ session_id: '7' })
   })
 
   it('enrich：categoryDetail "a / b / c / d" → "a/b/c/d"（归一化），且同输入同输出（确定性）', async () => {
@@ -571,6 +577,52 @@ describe('sessions 任务全链路（重叠去重按 session.id）', () => {
       expect(r1.gaps).toEqual([])
       expect(r2.gaps).toEqual([])
       expect(await store.count('sessions')).toBe(1)   // 同 id 两窗口重叠 → 1 行
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('缺 id 的行在 fetch 侧丢弃并记 row_missing_key：整窗不回滚、apiCount 不含它', async () => {
+    // 旧行为：缺 id 行留到 enrich 才丢，而 apiCount 已按丢弃前取好 → written < expected
+    // → 整窗 count_mismatch 回滚（连正常行一起丢），gap 只说「应写 N 实际 M」不点名成因。
+    const fetchMock = mocksFor()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const good = { ...SESSION_ROW }
+      const bad = { ...SESSION_ROW, id: '', session_id: '' }   // 缺 id（空串）
+      const t = withZip(sessionsById('sessions.export')!, [good, bad])
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 6 * DAY } }))
+      expect(r.status).toBe('complete')
+      expect(r.rows).toMatchObject({ fetched: 1, written: 1 })
+      expect(await store.count('sessions')).toBe(1)
+      const gap = r.gaps.find((g) => g.reason === 'row_missing_key')
+      expect(gap, '丢弃必须留痕').toBeDefined()
+      expect(gap!.detail).toMatch(/1 行缺 id/)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('键取第一个非空候选：{id:7, session_id:""} 必须落库为 7，不得在 fetch 侧被误丢', async () => {
+    // ⚠️ 只测 enrich 会漏（CodeRabbit PR #67 抓到）：fetch 的丢弃判据与 sessionRow 的投影
+    // 各写一份 `a ?? b` 时次序写反 —— `{id:7, session_id:''}` 在 fetch 判「缺键」被丢、
+    // 水位照常推进，而 enrich 单测（直接喂行）根本看不到这条路径。走 runTask 全链路。
+    const fetchMock = mocksFor()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const row = { ...SESSION_ROW, id: 7, session_id: '' }
+      const t = withZip(sessionsById('sessions.export')!, [row])
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 6 * DAY } }))
+      expect(r.status).toBe('complete')
+      expect(r.rows).toMatchObject({ fetched: 1, written: 1 })
+      const q = await store.query('SELECT session_id FROM sessions')
+      expect(q.rows.map((x) => String(x.session_id))).toEqual(['7'])
+      expect(r.gaps.find((g) => g.reason === 'row_missing_key'),
+        '有键的行不得被记成缺键').toBeUndefined()
       await store.close()
     } finally {
       vi.unstubAllGlobals()
@@ -690,6 +742,31 @@ describe('C-8：尾部标记行（导出窗口声明）与请求窗口核对', (
       expect(r.gaps[0]!.detail).toMatch(/宽于请求窗口/)
       // 引擎侧 fixture 拼接（gapHintDetail）：原文在 detail 尾部可见
       expect(r.gaps[0]!.detail).toContain(`（fixture：${wider}）`)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('缺 fixture + 缺 id 行同窗 → 两条 gap 并存（压成一条会让按 reason 分派的消费方漏一类）', async () => {
+    // ⚠️ CodeRabbit PR #67：此前的实现让 row_missing_key「让位」于 fixture 缺失，
+    // 于是有丢行的窗口永远看不到 export_fixture_unreported（窗口覆盖未核对）。
+    // 两类提示互不覆盖，必须各自成条。
+    stubCreateCheck()
+    try {
+      const store = await fresh()
+      const bad = { ...SESSION_ROW, id: '', session_id: '' }
+      // 只写数据行、不写尾标记 → fixture 缺失；同时 bad 行缺 id → row_missing_key
+      const t = withContent(sessionsById('sessions.export')!, `${JSON.stringify(SESSION_ROW)}\n${JSON.stringify(bad)}\n`)
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: DAY } }))
+      expect(r.status).toBe('complete')
+      expect(r.rows).toMatchObject({ fetched: 1, written: 1 })
+      const reasons = r.gaps.map((g) => g.reason).sort()
+      expect(reasons).toEqual(['export_fixture_unreported', 'row_missing_key'])
+      // 两条都真的落进 sync_gaps（消费方查库同样要看到两类）
+      const rows = await store.query('SELECT reason FROM sync_gaps ORDER BY reason')
+      expect(rows.rows.map((x) => String(x.reason)))
+        .toEqual(['export_fixture_unreported', 'row_missing_key'])
       await store.close()
     } finally {
       vi.unstubAllGlobals()

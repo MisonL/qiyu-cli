@@ -76,11 +76,13 @@ export const TABLES: TableDef[] = [
   {
     name: 'sync_gaps',
     columns: [col('dataset', 'VARCHAR', false), col('range_start', 'VARCHAR', false), col('range_end', 'VARCHAR'),
-      col('reason', 'VARCHAR'), col('recorded_at', 'VARCHAR'),
+      // reason 进主键（v10）：同一窗可能同时缺行（row_missing_key）与缺 fixture
+      // （export_fixture_unreported）—— 两类提示互不覆盖，一窗一行会互相覆盖。
+      col('reason', 'VARCHAR', false), col('recorded_at', 'VARCHAR'),
       // D-T3：缺口诊断详情（recordGap 的 detail 落点）。
       col('detail', 'VARCHAR')],
-    primaryKey: ['dataset', 'range_start'],
-    grain: '每个缺口区间一行',
+    primaryKey: ['dataset', 'range_start', 'reason'],
+    grain: '每个「缺口区间 × 原因」一行（同一窗可能有多条互不覆盖的提示）',
   },
   {
     name: 'tags',
@@ -457,6 +459,27 @@ export const MIGRATIONS: Migration[] = [
     up: async (exec) => {
       await exec('ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_start" VARCHAR')
       await exec('ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_end" VARCHAR')
+    },
+  },
+  // v10（2026-11-05，CodeRabbit PR #67）：sync_gaps 主键补 reason —— 同一窗可能同时
+  // 缺行（row_missing_key）与缺 fixture（export_fixture_unreported），两类提示互不
+  // 覆盖；旧主键 (dataset, range_start) 让后写的一条覆盖前一条，消费方按 reason 分支
+  // 时永远漏一类。DuckDB 不能 ALTER PRIMARY KEY → 重建表。
+  // ⚠️ 幂等性：新库的 v1 已按新主键建表，本迁移照常跑（copy → drop → rename 对同构
+  // 表是恒等变换）。reason 为 NULL 的历史行 COALESCE 成 'unknown'（缺 reason 的缺口行
+  // 对消费方本来就没有可分支的信息，且主键列不能为 NULL）。
+  {
+    version: 10,
+    up: async (exec) => {
+      await exec(`CREATE TABLE "sync_gaps_v10" (
+        "dataset" VARCHAR NOT NULL, "range_start" VARCHAR NOT NULL, "range_end" VARCHAR,
+        "reason" VARCHAR NOT NULL, "recorded_at" VARCHAR, "detail" VARCHAR,
+        PRIMARY KEY ("dataset", "range_start", "reason"))`)
+      await exec(`INSERT INTO "sync_gaps_v10" ("dataset", "range_start", "range_end", "reason", "recorded_at", "detail")
+        SELECT "dataset", "range_start", "range_end", COALESCE("reason", 'unknown'), "recorded_at", "detail"
+        FROM "sync_gaps"`)
+      await exec('DROP TABLE "sync_gaps"')
+      await exec('ALTER TABLE "sync_gaps_v10" RENAME TO "sync_gaps"')
     },
   },
 ]

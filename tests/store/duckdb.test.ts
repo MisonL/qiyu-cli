@@ -329,7 +329,7 @@ describe('duckdb —— init 与关闭', () => {
       .mockReturnValue([...real, { version: 99, up: async () => { throw new Error('注入的迁移失败') } }] as never)
     const s1 = await createDuckDbStore(cfg, 'rw')
     await expect(s1.init()).rejects.toThrow('注入的迁移失败')
-    expect(await s1.count('schema_version')).toBe(9)   // v1..v9 已记、99 未记（失败不推进）
+    expect(await s1.count('schema_version')).toBe(10)  // v1..v10 已记、99 未记（失败不推进）
     await s1.close()
     // 恢复真实迁移，重新 init → 重放路径只补 99（真实清单无 99，MAX 保持 8）
     failingSpy.mockRestore()
@@ -342,8 +342,8 @@ describe('duckdb —— init 与关闭', () => {
     const s2 = await createDuckDbStore(cfg, 'rw')
     await s2.init()
     const v = await s2.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-    // v1..v9（v9=修复批 2 的 G2 区间两列）：MAX=9
-    expect(Number(v.rows[0].v)).toBe(9)
+    // v1..v10（v9=G2 区间两列；v10=sync_gaps 主键补 reason）：MAX=10
+    expect(Number(v.rows[0].v)).toBe(10)
     await s2.close()
   })
 

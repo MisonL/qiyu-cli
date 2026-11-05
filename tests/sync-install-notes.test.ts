@@ -74,7 +74,9 @@ function assertLegendMatches(mode: Parameters<typeof syncInstallFieldNotes>[0], 
     return Array.isArray(arr) && arr.length > 0 ? Object.keys(arr[0] as Record<string, unknown>) : []
   }
   for (const k of legend) {
-    if (conditional.includes(k)) continue
+    // 条件键按**前缀**匹配：`post_remove_commands` 声明为条件键时，它派生的元素键
+    // `post_remove_commands[].command` 也要一并豁免（否则每加一个元素键就要回来改一次）
+    if (conditional.some((c) => k === c || k.startsWith(`${c}[].`) || k.startsWith(`${c}.`))) continue
     const m = /^([a-z_]+)\[\]\.(.+)$/.exec(k)
     if (m !== null) {
       // 数组必须存在；元素键只在数组非空时可核对（空数组没有元素形状可查 ——
@@ -132,9 +134,24 @@ describe('四种模式的图例与真实输出一一对应', () => {
     // ⚠️ `sync uninstall` 只接受 `--yes` —— 它的业务 flag 里没有存储定位参数
     // （见 sync.ts 里 UNINSTALL_BOOL_FLAGS 的说明：uninstall 不读库，只按平台路径删条目）。
     expect(await syncCommand(['uninstall']), out.slice(0, 300)).toBe(0)
-    assertLegendMatches('uninstall-dry')
+    // `post_remove_commands` 是条件键：只有 linux 有「删完之后」的命令（daemon-reload）。
+    // 这里跑在 darwin 上，它的存在性由下面的 linux 用例正向钉住。
+    assertLegendMatches('uninstall-dry', ['post_remove_commands'])
     expect(data().dry_run).toBe(true)
     expect(notes()['remove[].exists'], 'exists 必须点明是计划生成时的探测快照').toContain('探测快照')
+  })
+
+  it('uninstall dry-run（linux）：post_remove_commands 出现在输出里且被图例解释', async () => {
+    // 反向守卫的形状：条件键在它真正的平台上必须真的出现 —— 否则「标成条件键」就成了
+    // 让守卫闭嘴的借口（该键永远不出现，图例写什么都无所谓）。
+    __setPlatform(() => 'linux')
+    await seedSynced()
+    expect(await syncCommand(['install', '--schedule', '0 3 * * *', '--yes', '--db', dbPath()])).toBe(0)
+    out = ''
+    expect(await syncCommand(['uninstall']), out.slice(0, 300)).toBe(0)
+    assertLegendMatches('uninstall-dry')
+    expect((data().post_remove_commands as Array<{ command: string }>).map((c) => c.command))
+      .toEqual(['systemctl --user daemon-reload'])
   })
 
   it('uninstall --yes（absent 是条件键，图例仍要解释它）', async () => {

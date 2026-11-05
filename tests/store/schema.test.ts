@@ -30,8 +30,10 @@ describe('TABLES —— 表定义', () => {
     expect(t.primaryKey).toEqual(['dataset'])
   })
 
-  it('sync_gaps 主键为 (dataset, range_start)', () => {
-    expect(tableByName('sync_gaps')!.primaryKey).toEqual(['dataset', 'range_start'])
+  it('sync_gaps 主键为 (dataset, range_start, reason)：一窗可有多条互不覆盖的提示', () => {
+    // v10：同一窗可能既缺行（row_missing_key）又缺 fixture（export_fixture_unreported），
+    // 旧主键 (dataset, range_start) 会让后写的一条覆盖前一条。
+    expect(tableByName('sync_gaps')!.primaryKey).toEqual(['dataset', 'range_start', 'reason'])
   })
 
   it('全部 ID 列为 VARCHAR（无 BIGINT）', () => {
@@ -140,7 +142,8 @@ describe('ddlFor —— 生成建表语句', () => {
   })
 
   it('复合主键正确渲染', () => {
-    expect(ddlFor(tableByName('sync_gaps')!)).toMatch(/PRIMARY KEY \("dataset", "range_start"\)/)
+    expect(ddlFor(tableByName('sync_gaps')!))
+      .toMatch(/PRIMARY KEY \("dataset", "range_start", "reason"\)/)
   })
 })
 
@@ -182,5 +185,15 @@ describe('MIGRATIONS —— 迁移', () => {
     expect(ran.length).toBe(2)
     expect(ran[0]).toMatch(/ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_start" VARCHAR/)
     expect(ran[1]).toMatch(/ALTER TABLE "sync_state" ADD COLUMN IF NOT EXISTS "resolved_range_end" VARCHAR/)
+  })
+
+  it('v10 重建 sync_gaps：主键加 reason、历史 NULL reason 补成 unknown、按序 copy→drop→rename', async () => {
+    const ran: string[] = []
+    const m10 = MIGRATIONS.find((m) => m.version === 10)!
+    await m10.up(async (sql) => { ran.push(sql) })
+    expect(ran[0]).toMatch(/CREATE TABLE "sync_gaps_v10"[\s\S]*"reason" VARCHAR NOT NULL/)
+    expect(ran[1]).toMatch(/COALESCE\("reason", 'unknown'\)/)
+    expect(ran[2]).toMatch(/DROP TABLE "sync_gaps"/)
+    expect(ran[3]).toMatch(/ALTER TABLE "sync_gaps_v10" RENAME TO "sync_gaps"/)
   })
 })

@@ -49,6 +49,19 @@ describe('parseCron', () => {
     expect(() => parseCron('*/0 * * * *')).toThrow(/minute/)
   })
 
+  it('分隔符只接受空格与 Tab：CR/LF/异常空白显式拒绝（不得流进逐行产物）', () => {
+    // ⚠️ 实测（修前）：`0 0 *\r* *` 被 `\s+` 当分隔符拆成合法 5 段，而 schedule 原文
+    // 又原样进了 crontab 兜底行与回显 —— 那一行里的 CR 让 cron 整行失效；
+    // `0 0 * * *\n` 则把一条计划劈成两条物理行。判据：拒绝，不静默清洗。
+    expect(() => parseCron('0 0 * * *\r')).toThrow(/U\+000D/)
+    expect(() => parseCron('0 0 *\r* *')).toThrow(/U\+000D/)
+    expect(() => parseCron('0 0 * * *\n')).toThrow(/U\+000A/)
+    expect(() => parseCron('0 0 * * * ')).toThrow(/U\+00A0/)
+    // 空格与 Tab 仍是合法分隔符（不得误伤）
+    expect(() => parseCron('0\t0 * * *')).not.toThrow()
+    expect(() => parseCron('0  0 * * *')).not.toThrow()
+  })
+
   it('空/空白表达式：消息把取值渲染成可见形式（此前冒号后空白）', () => {
     // ⚠️ 2026-10-29：`sync install --schedule ''` 此前报「…实际 1 段：」冒号后什么都没有，
     // Agent 看不出「表达式是空串」还是「消息渲染坏了」。describeArgs 把空串渲染成 `''`。
@@ -85,7 +98,9 @@ describe('planInstall darwin —— launchd plist', () => {
     const c = p.entries[0]!.content
     expect(c).toMatch(/<key>StartCalendarInterval<\/key><array>/)
     expect(c).toMatch(/<key>Day<\/key><integer>1<\/integer>/)
-    expect(c).toMatch(/<key>Weekday<\/key><integer>2<\/integer>/)   // cron 1(周一) → launchd 2
+    // ⚠️ launchd 与 cron 同一套 Weekday 编号（0/7=周日、1=周一）——
+    // 此前断言「cron 1 → launchd 2」把整体后移一天的错误行为钉住了。
+    expect(c).toMatch(/<key>Weekday<\/key><integer>1<\/integer>/)   // cron 1(周一) → launchd 1
   })
   it('exec 路径含 XML 特殊字符时转义', () => {
     const p = planInstall('darwin', '0 2 * * *', { home: HOME, exec: ['/usr/local/bin/node&', '/a<b>.js'] })
@@ -116,7 +131,7 @@ describe('planInstall darwin —— launchd plist', () => {
     const c = p.entries[0]!.content
     expect(c).toMatch(/<key>Day<\/key><array><integer>1<\/integer><integer>15<\/integer><\/array>/)
     expect(c).toMatch(/<key>Hour<\/key><integer>9<\/integer>/)
-    expect(c).toMatch(/<key>Weekday<\/key><array><integer>2<\/integer><integer>6<\/integer><\/array>/)
+    expect(c).toMatch(/<key>Weekday<\/key><array><integer>1<\/integer><integer>5<\/integer><\/array>/)
   })
 })
 
@@ -222,10 +237,22 @@ describe('planInstall linux —— systemd unit + timer（crontab 兜底在 note
     expect(spaced.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!.content)
       .toContain('--db "C:\\\\a b\\\\q.db"')
   })
+
+  it('systemd ExecStart：孤立一个 `;` 的参数必须转义（否则被当成命令分隔符）', () => {
+    // systemd.service(5)：「An argument solely consisting of ";" must be escaped, i.e.
+    // specified as "\;"」—— 裸 `;` 会把一条 ExecStart 劈成两条命令，静默执行别的东西。
+    const p = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', ';'] })
+    const svc = p.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!
+    expect(svc.content).toContain('--db \\;')
+    // 反向：`;` 在值中间（`a;b`）不是独立参数，文档没有要求转义 → 保持原样
+    const inner = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/a;b.db'] })
+    expect(inner.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!.content)
+      .toContain('--db /tmp/a;b.db')
+  })
 })
 
 describe('planInstall win32 —— schtasks 命令行', () => {
-  it('*/30 * * * * → /SC MINUTE /MO 30；无文件条目', () => {
+  it('*/30 * * * * → /SC MINUTE /MO 30 /ST 00:00；无文件条目', () => {
     const p = planInstall('win32', '*/30 * * * *', { home: HOME, exec: EXEC })
     expect(p.entries).toEqual([])
     const cmd = p.commands[0]!
@@ -233,6 +260,10 @@ describe('planInstall win32 —— schtasks 命令行', () => {
     expect(cmd).toContain('/SC')
     expect(cmd.indexOf('/MO')).toBeGreaterThan(-1)
     expect(cmd[cmd.indexOf('/MO') + 1]).toBe('30')
+    // ⚠️ /ST 必须给：schtasks 缺省 /ST = 「本机当前时刻」，MINUTE 计划是「从起始时刻起每
+    // N 分钟」—— 缺了它 `*/30` 会装成「安装那一刻 + 30 分」的相位（14:07 装 → :07/:37），
+    // 而 cron 是 :00/:30。与 HOURLY 支的 /ST 锚相位同理。
+    expect(cmd[cmd.indexOf('/ST') + 1]).toBe('00:00')
     expect(cmd).toContain('/Create')
     expect(cmd.join(' ')).toMatch(/sync run/)
   })
@@ -282,6 +313,15 @@ describe('planInstall win32 —— schtasks 命令行', () => {
     expect(() => planInstall('win32', '0,30 2,4 * * *', { home: HOME, exec: EXEC }))
       .toThrow(/schtasks/)
   })
+  it('/SC MONTHLY 只接受一个日期：多日 cron 显式拒绝（不产出注定失败的计划）', () => {
+    // schtasks 文档：「you can specify only one day in the schedule」——此前把
+    // `0 0 1,15 * *` 直接 join 成 `/D 1,15`，dry-run 先给出一个装了也会被拒的计划。
+    const one = planInstall('win32', '0 0 1 * *', { home: HOME, exec: EXEC }).commands[0]!
+    expect(one[one.indexOf('/SC') + 1]).toBe('MONTHLY')
+    expect(one[one.indexOf('/D') + 1]).toBe('1')
+    expect(() => planInstall('win32', '0 0 1,15 * *', { home: HOME, exec: EXEC }))
+      .toThrow(/schtasks/)
+  })
   it('修复批 4 #4：storeArgs 透传进 /TR 命令（未给出时不追加）', () => {
     const withArgs = planInstall('win32', '0 2 * * *',
       { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/q.db'] }).commands[0]!
@@ -313,5 +353,16 @@ describe('planUninstall', () => {
     const cmd = p.commands[0]!
     expect(cmd).toContain('/Delete')
     expect(cmd).toContain('qiyu-cli-sync')
+  })
+})
+
+describe('planInstall linux —— crontab 兜底分隔符', () => {
+  it('schedule 原文含 CR/LF 时整条拒绝（此前 `\\s+` 放过且原样进兜底行）', () => {
+    // 直接喂 crontab 派生用的原 `schedule` 原文（不含在 planInstall 内部被 parseCron 拦下的
+    // 情况）：`parseCron('0 0 * * *\r')` 已在 parseCron 组拦下，这里验证**命令层链路**
+    // 是否在任何入口都拦得住 —— planInstall 入口本身就 parseCron，因此必然拒绝。
+    for (const s of ['0 0 * * *\r', '0 0 *\r* *', '0 0 * * *\n']) {
+      expect(() => planInstall('linux', s, { home: HOME, exec: EXEC })).toThrow(/U\+/)
+    }
   })
 })
