@@ -656,6 +656,10 @@ async function syncUninstall(argv: string[]): Promise<number> {
       platform, dry_run: true,
       remove: plan.remove,
       commands: plan.commands.map((c) => ({ command: commandText(c), executed: false, ok: null, error: null })),
+      // 条件键：只有 linux 有「删完之后」的命令（daemon-reload），其余平台不出现。
+      ...(plan.postRemoveCommands.length > 0
+        ? { post_remove_commands: plan.postRemoveCommands.map((c) => ({ command: commandText(c), executed: false, ok: null, error: null })) }
+        : {}),
       notes: [...plan.notes, '这是 dry-run：未删除任何文件、未执行任何命令。加 --yes 实际卸载。'],
     }, { field_notes: syncInstallFieldNotes('uninstall-dry') })
   }
@@ -667,16 +671,17 @@ async function syncUninstall(argv: string[]): Promise<number> {
   const anyInstalled = plan.remove.some((r) => r.exists)
   const willRun = anyInstalled || platform === 'win32'
   const cmdResults: Array<{ command: string; executed: boolean; ok: boolean; error: string | null }> = []
-  if (willRun) {
-    // 卸载次序：先停调度器（unload/disable），再删文件
-    for (const c of plan.commands) {
-      try {
-        runScheduleCommand(c)
-        cmdResults.push({ command: commandText(c), executed: true, ok: true, error: null })
-      } catch (e) {
-        cmdResults.push({ command: commandText(c), executed: true, ok: false, error: e instanceof Error ? e.message : String(e) })
-      }
+  const runOne = (c: string[]): void => {
+    try {
+      runScheduleCommand(c)
+      cmdResults.push({ command: commandText(c), executed: true, ok: true, error: null })
+    } catch (e) {
+      cmdResults.push({ command: commandText(c), executed: true, ok: false, error: e instanceof Error ? e.message : String(e) })
     }
+  }
+  if (willRun) {
+    // 卸载次序：先停调度器（unload/disable），再删文件，最后跑「删完之后」的命令。
+    for (const c of plan.commands) runOne(c)
   }
   const removed: string[] = []
   const absent: string[] = []
@@ -684,6 +689,11 @@ async function syncUninstall(argv: string[]): Promise<number> {
     rmSync(r.path, { force: true })
     if (r.exists) removed.push(r.path)
     else absent.push(r.path)
+  }
+  if (willRun) {
+    // ⚠️ postRemoveCommands（linux 的 daemon-reload）必须在删除之后 —— 见 planUninstall
+    // 的注释：提前跑等于重新加载即将被删的 unit，删完后再没人让 systemd 忘掉它。
+    for (const c of plan.postRemoveCommands) runOne(c)
   }
   const code = ok({
     platform, dry_run: false, removed,

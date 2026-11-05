@@ -41,8 +41,9 @@ function renderNotes(notes: Record<string, string>): string {
  *   3. 空 gaps 是否意味着完整？→ 不一定！若 skipped > 0 或有其他未完成路径，仍是残缺。
  */
 export const RANGE_STATUS_NOTES = {
-  pending: '最近一次运行没有成功推进水位（引擎每轮开跑就把状态置 pending，只有成功窗才推回'
-    + ' complete）。⚠️ 三种误读都要避免。① 不代表库里没有数据：首窗失败时后续成功窗照常落库、'
+  pending: '最近一次运行没有成功推进水位（有可执行窗口的轮次开跑就把状态置 pending，只有成功窗才推回'
+    + ' complete。无可执行窗口的轮次——全部窗都是残段被跳过或被上限丢弃——不置 pending）。'
+    + '⚠️ 三种误读都要避免。① 不代表库里没有数据：首窗失败时后续成功窗照常落库、'
     + '只是不推水位（实测 3 窗首窗失败 → pending 且表里有 2 行）。② 不代表「从未同步过」：'
     + '先成功一轮、再跑一轮首窗失败，同样回到 pending 而 watermark 保留着上一轮的值'
     + '（实测 watermark 仍是上一轮的 1970-01-04）。③ 不代表「正在同步」：运行中的写者会让'
@@ -140,11 +141,14 @@ export function runFieldNotes(): Record<string, string> {
     // ⚠️ 2026-11-04 自查修正：初版把 written 说成「真正落库的行数」—— 而引擎对
     // count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」（kept），
     // 那批行已随事务回滚、实际没落库（sync/engine.ts 的 catch 分支与 brief 钉死用例）。
-    'tasks[].rows.fetched': '本轮从上游取回的行数（enrich 过滤之前）。与 written 不等通常说明有行被本地决策淘汰；'
-      + 'count_mismatch / write_failed 的失败窗也会把「应写行数」计入 written（见该字段），判断前先看 windows.failed',
+    'tasks[].rows.fetched': '本轮进入引擎的行数（fetch 内部投影/丢行之后、enrich 之前）——'
+      + '不是「上游返回的行数」：fetch 侧丢掉的键缺失行不计入这里，它们由 gaps 的 detail 报规模；'
+      + '与 written 不等通常说明有行被本地决策淘汰',
     'tasks[].rows.written': '本轮写入的行数。⚠️ 记法：成功窗记实际写入；count_mismatch / write_failed 的失败窗记'
       + '「参与核对的应写行数」—— 那批行已随事务回滚、实际没落库（这两类失败窗存在时它偏大；'
       + 'fetch_failed / rate_limit_local 的失败窗没有应写行数，不计入）。'
+      + '⚠️ 快照任务（tasks[].windows.total 恒为 1）的这两类失败窗记 0 —— 快照失败即整体回滚，'
+      + '没有「部分写入」可言，所以它偏小而不是偏大。'
       + '为 0 可能是「窗口都成功、只是上游没数据」',
     'tasks[].notes': '本任务的逐条说明（恒在、可为空数组）。当前唯一生产者是「请求区间早于接口下界」——'
       + '把「区间不可得」与「同步故障」分开，看到它不代表本轮失败',
@@ -293,7 +297,9 @@ export type SyncInstallMode = typeof SYNC_INSTALL_MODES[number]
 
 /** 四个分支共用的命令条目释义（`commands[]` 的每一项）。 */
 const SYNC_COMMAND_NOTES: Record<string, string> = {
-  'commands[].command': '将要执行（dry-run）或已执行（--yes）的命令原文',
+  'commands[].command': '将要执行（dry-run）或已执行（--yes）的命令：argv 按单个空格拼接的可读形式，'
+    + '内含空格或引号的值没有加外层引号 —— 不能直接粘进 shell 执行（真实执行走 argv 数组，'
+    + '见该条的 executed/ok）。win32 的 /TR 值本身就是一条命令串，转述给人类时要按目标 shell 自行引号化',
   'commands[].executed': '是否真的执行了这条命令。dry-run 恒为 false。--yes 下每条被列出的都执行了'
     + '（uninstall 在 darwin/linux「从未安装」时整条 commands 为空数组 —— 没有可停的调度器，'
     + '不是执行失败。win32 没有文件条目可探测，卸载命令总是执行：任务不存在时 schtasks 自己报错，'
@@ -343,6 +349,10 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
         'remove[].exists': '计划生成那一刻探测到的存在性（true = 当时文件在）。'
           + '这是探测快照不是承诺：--yes 会重新探测一次，删除动作对所有条目都执行'
           + '（rmSync force，不存在也不报错），removed 与 absent 按那一次探测的 exists 划分',
+        post_remove_commands: '必须在「删除条目文件之后」执行的命令（条件键：只有 linux 有，'
+          + '即 daemon-reload —— 先 reload 只会重新加载即将被删的 unit）。'
+          + '执行次序是：commands → 删除 remove[] → post_remove_commands。'
+          + '--yes 的结果里全部按这个次序汇总进 commands[]',
         notes: '给人读的说明。darwin/linux 含卸载次序（先停调度器，再删文件），win32 说明 schtasks 的行为',
       }
     case 'uninstall-real':
@@ -351,6 +361,8 @@ export function syncInstallFieldNotes(mode: SyncInstallMode): Record<string, str
         removed: '计划探测时存在、且删除调用未报错的文件路径',
         absent: '计划探测时就不存在、因此没删的文件路径。⚠️ 这是条件键：为空时整个键不出现 ——'
           + '不出现就是「没有这类路径」，不是字段缺失（win32 无文件条目，恒不出现）',
+        commands: '已执行的卸载命令，按真实执行次序排列：先停调度器（unload/disable），'
+          + '再删除 remove[] 里的文件，最后是 linux 的 daemon-reload（删完之后才 reload）',
         notes: '给人读的说明。darwin/linux 从未安装（探测不到条目文件）时只有一条'
           + '「未安装（无条目文件）：未执行任何命令」，此时 commands 为空数组。'
           + 'win32 没有文件条目可探测，无法在卸载前判断装没装，notes 恒为计划里的说明',

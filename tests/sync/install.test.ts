@@ -237,10 +237,22 @@ describe('planInstall linux —— systemd unit + timer（crontab 兜底在 note
     expect(spaced.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!.content)
       .toContain('--db "C:\\\\a b\\\\q.db"')
   })
+
+  it('systemd ExecStart：孤立一个 `;` 的参数必须转义（否则被当成命令分隔符）', () => {
+    // systemd.service(5)：「An argument solely consisting of ";" must be escaped, i.e.
+    // specified as "\;"」—— 裸 `;` 会把一条 ExecStart 劈成两条命令，静默执行别的东西。
+    const p = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', ';'] })
+    const svc = p.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!
+    expect(svc.content).toContain('--db \\;')
+    // 反向：`;` 在值中间（`a;b`）不是独立参数，文档没有要求转义 → 保持原样
+    const inner = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--db', '/tmp/a;b.db'] })
+    expect(inner.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!.content)
+      .toContain('--db /tmp/a;b.db')
+  })
 })
 
 describe('planInstall win32 —— schtasks 命令行', () => {
-  it('*/30 * * * * → /SC MINUTE /MO 30；无文件条目', () => {
+  it('*/30 * * * * → /SC MINUTE /MO 30 /ST 00:00；无文件条目', () => {
     const p = planInstall('win32', '*/30 * * * *', { home: HOME, exec: EXEC })
     expect(p.entries).toEqual([])
     const cmd = p.commands[0]!
@@ -248,6 +260,10 @@ describe('planInstall win32 —— schtasks 命令行', () => {
     expect(cmd).toContain('/SC')
     expect(cmd.indexOf('/MO')).toBeGreaterThan(-1)
     expect(cmd[cmd.indexOf('/MO') + 1]).toBe('30')
+    // ⚠️ /ST 必须给：schtasks 缺省 /ST = 「本机当前时刻」，MINUTE 计划是「从起始时刻起每
+    // N 分钟」—— 缺了它 `*/30` 会装成「安装那一刻 + 30 分」的相位（14:07 装 → :07/:37），
+    // 而 cron 是 :00/:30。与 HOURLY 支的 /ST 锚相位同理。
+    expect(cmd[cmd.indexOf('/ST') + 1]).toBe('00:00')
     expect(cmd).toContain('/Create')
     expect(cmd.join(' ')).toMatch(/sync run/)
   })
@@ -295,6 +311,15 @@ describe('planInstall win32 —— schtasks 命令行', () => {
   it('无法映射的 cron 显式抛错（不静默装错计划）', () => {
     // 两个小时点 + 两个分钟点 → schtasks 无对应形态
     expect(() => planInstall('win32', '0,30 2,4 * * *', { home: HOME, exec: EXEC }))
+      .toThrow(/schtasks/)
+  })
+  it('/SC MONTHLY 只接受一个日期：多日 cron 显式拒绝（不产出注定失败的计划）', () => {
+    // schtasks 文档：「you can specify only one day in the schedule」——此前把
+    // `0 0 1,15 * *` 直接 join 成 `/D 1,15`，dry-run 先给出一个装了也会被拒的计划。
+    const one = planInstall('win32', '0 0 1 * *', { home: HOME, exec: EXEC }).commands[0]!
+    expect(one[one.indexOf('/SC') + 1]).toBe('MONTHLY')
+    expect(one[one.indexOf('/D') + 1]).toBe('1')
+    expect(() => planInstall('win32', '0 0 1,15 * *', { home: HOME, exec: EXEC }))
       .toThrow(/schtasks/)
   })
   it('修复批 4 #4：storeArgs 透传进 /TR 命令（未给出时不追加）', () => {

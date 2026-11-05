@@ -735,7 +735,12 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     }
 
     const { kept } = applyEnrich(task, fetchRes.rows)
-    const expected = kept.length
+    // ⚠️ 与 windowed（`engine.ts` 的 `expected = apiCount ?? kept.length`）和 `sync verify`
+    // （`apiCount ?? rows.length`）**同一口径**：`apiCount` 是 fetch 声明的配对核对基准，
+    // 快照此前只用 `kept.length` —— 三条路径对同一字段三种读法，上游声明的行数与实际
+    // 解析出的行数不等时，只有快照会把它静默吞掉（`types.ts` 的字段注释写着「配对核对
+    // 基准」）。当前所有快照任务都把 apiCount 取成过滤后的行数，故行为零漂移。
+    const expected = fetchRes.apiCount !== undefined ? fetchRes.apiCount : kept.length
     let written = 0
     try {
       written = await withStoreRetries(ctx, () => store.transaction(async (tx) => {

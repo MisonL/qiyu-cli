@@ -180,7 +180,15 @@ export interface InstallPlan {
 export interface UninstallPlan {
   platform: Platform
   remove: Array<{ path: string; exists: boolean }>
+  /** 必须在**删除条目文件之前**执行的命令（先停调度器）。 */
   commands: string[][]
+  /**
+   * 必须在**删除条目文件之后**执行的命令。
+   * ⚠️ 单独一个字段而不是往 commands 里加一条：命令层是「先跑完 commands、再删文件」，
+   * 塞进 commands 会让 `systemctl daemon-reload` 跑在**删除之前** —— 那样 systemd
+   * 重新加载的仍是旧 unit，删完后再没有人让它忘掉（note 里写的次序也会变成谎话）。
+   */
+  postRemoveCommands: string[][]
   notes: string[]
 }
 
@@ -223,7 +231,13 @@ function systemdArg(v: string): string {
   // ⚠️ 必须用**函数式替换**：替换串里的 `$` 有特殊含义（`$$` → 字面 `$`、`$&` 等），
   // 写 `v.replace(/\$/g, '$$')` 实测产出**一个** `$`（转义被自身吃掉）。函数返回值
   // 不做这种解析。
-  return shellQuote(v.replace(/\\/g, () => '\\\\').replace(/%/g, () => '%%').replace(/\$/g, () => '$$'))
+  const escaped = v.replace(/\\/g, () => '\\\\').replace(/%/g, () => '%%').replace(/\$/g, () => '$$')
+  const quoted = shellQuote(escaped)
+  // ④ systemd.service(5)：「An argument solely consisting of ";" must be escaped, i.e.
+  // specified as "\;"」—— 裸 `;` 是**命令分隔符**，会把一条 ExecStart 劈成两条命令
+  //（`sync install --db ';'` 这种值罕见，但静默执行别的东西比报错更糟）。文档只对
+  // 「整体就是一个 `;`」的参数规定这条，`a;b` 这类值不受影响。
+  return quoted === ';' ? '\\;' : quoted
 }
 
 function launchdKey(key: string, f: CronField): string {
@@ -310,7 +324,11 @@ function schtasksScheduleArgs(spec: CronSpec): string[] {
 
   if (dateRestricted && !spec.day.wildcard && spec.month.wildcard
     && spec.weekday.wildcard && spec.minute.values.length === 1 && spec.hour.values.length === 1) {
-    return ['/SC', 'MONTHLY', '/D', spec.day.values.join(','), '/ST', time]
+    // ⚠️ `/SC MONTHLY /D` 只接受**一个**日期（schtasks 文档：「you can specify only one day
+    // in the schedule」）——`0 0 1,15 * *` 直接 join 成 `/D 1,15` 会产出一个注定失败的
+    // 计划（dry-run 就先给了它）。多日显式落 unmappable，不赌真实 schtasks 的容忍度。
+    if (spec.day.values.length !== 1) throw unmappable()
+    return ['/SC', 'MONTHLY', '/D', String(spec.day.values[0]!), '/ST', time]
   }
   if (!spec.weekday.wildcard && spec.day.wildcard && spec.month.wildcard
     && spec.minute.values.length === 1 && spec.hour.values.length === 1) {
@@ -334,7 +352,11 @@ function schtasksScheduleArgs(spec: CronSpec): string[] {
     if (spec.minute.wildcard && !spec.hour.wildcard) throw unmappable()
     if (!spec.minute.wildcard && spec.hour.wildcard) {
       const step = progressionStep(spec.minute.values, 59)
-      if (step !== null) return ['/SC', 'MINUTE', '/MO', String(step)]
+      // ⚠️ `/ST` 必须给：schtasks 的 `/ST` 缺省值是「本机当前时刻」，而 `/SC MINUTE /MO N`
+      // 是「从起始时刻起每 N 分钟」——不给 /ST 的话 `*/30` 会被装成「安装那一刻 + 30 分的
+      // 相位」（14:07 安装 → :07/:37），而 cron 是 :00/:30。与上面 HOURLY 支同理（它补了
+      // /ST 锚相位），也与本模块红线「绝不静默装出错误时刻的计划」冲突。
+      if (step !== null) return ['/SC', 'MINUTE', '/MO', String(step), '/ST', `00:${pad2(spec.minute.values[0]!)}`]
       throw unmappable()
     }
     if (!spec.minute.wildcard && !spec.hour.wildcard
@@ -364,7 +386,8 @@ function unmappable(): Error {
  *
  * ⚠️ 未覆盖边界：值里**同时**含 `\` 与 `%` 时不保证（cron 对 `\\` 的处理本机无法实测，
  * 只核实了文档写明的 `\%` 一条规则）。这类路径极罕见，如实记在这里、不假装已覆盖。
- * ⚠️ 换行/回车在任何情况下都拒绝（见 `assertSchedulable`）：逐行格式放不下它。
+ * ⚠️ 换行/回车由两个守卫各管一半：**run 参数**走 `assertSchedulable`（三个平台一致），
+ * **--schedule 原文**走 `assertPlainSeparators`（它在 `parseCron` 里，先于任何产物生成）。
  *
  * `shellQuote`（本文件）保留给**不经 shell 也不做替换**的消费方：launchd 的 plist 走
  * `xmlEscape`；schtasks 的 `/TR` 存的是任务动作，由 Task Scheduler 直接 CreateProcess
@@ -497,6 +520,7 @@ export function planUninstall(platform: Platform,
     return {
       platform, remove: [{ path, exists: exists(path) }],
       commands: [['launchctl', 'unload', path]],
+      postRemoveCommands: [],
       notes: ['卸载次序：先 launchctl unload（停止已加载的代理），文件随后删除。'],
     }
   }
@@ -505,16 +529,18 @@ export function planUninstall(platform: Platform,
     const paths = [`${dir}/${SYSTEMD_NAMES.service}`, `${dir}/${SYSTEMD_NAMES.timer}`]
     return {
       platform, remove: paths.map((path) => ({ path, exists: exists(path) })),
-      commands: [
-        ['systemctl', '--user', 'disable', '--now', SYSTEMD_NAMES.timer],
-        ['systemctl', '--user', 'daemon-reload'],
-      ],
-      notes: ['卸载次序：先 disable --now（停定时器），再删除 unit 文件并 daemon-reload。'],
+      commands: [['systemctl', '--user', 'disable', '--now', SYSTEMD_NAMES.timer]],
+      // ⚠️ daemon-reload 必须在**删完文件之后**：先 reload 只会重新加载即将被删的 unit，
+      // 删完之后没有命令再让 systemd 忘掉它（旧定时器条目会留在内存里直到下次 reload）。
+      // 注意不要写成 `disable --now` 之后的第二键 —— 命令层是「跑完 commands 再删文件」。
+      postRemoveCommands: [['systemctl', '--user', 'daemon-reload']],
+      notes: ['卸载次序：先 disable --now（停定时器），再删除 unit 文件，最后 daemon-reload。'],
     }
   }
   return {
     platform, remove: [],
     commands: [['schtasks', '/Delete', '/TN', SCHTASKS_TASK_NAME, '/F']],
+    postRemoveCommands: [],
     notes: ['Windows：卸载即执行 schtasks /Delete（--yes 时执行）。'],
   }
 }
