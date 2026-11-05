@@ -139,9 +139,11 @@
   · **`mask_warnings` 图例只讲了一半来源**：该键还装 `GROUP BY` / `DISTINCT` 压平、
     `query()`/`query_table()`/`COLUMNS()` 嵌套、非敏感列按值形态误改 —— 图例改为按
     「缺口 / 副作用」两组穷举并声明「包括但不限于」。
-  · **`GROUP BY` 别名列漏掉分组失真警告**：`SELECT userPhone AS p … GROUP BY p` 的输出列
+  · **`GROUP BY` 别名列漏掉分组失真警告（判据只看分组键）**：`SELECT userPhone AS p … GROUP BY p` 的输出列
     不叫 `userPhone`，判据只看输出列名 → 只剩「别名缺口」一条，而「3 个号码被压成 1 行」一个字
-    不提。判据改为「SQL 引用了敏感列 ∪ 输出列名命中」（大小写不敏感）。
+    不提。判据改为只看**分组键**：GROUP BY 项里的敏感列、别名（`GROUP BY p`）、序号（`GROUP BY 1`）
+    以及 `DISTINCT` 的选择列表。⚠️ 不用「SQL 里出现过敏感列」判 —— 敏感列只出现在 `WHERE`/`HAVING`
+    里时脱敏不改变分组与计数，那样判会谎报分组失真（Codex PR #68 P2 指出，已补反例）。
   · **`db describe` 的 `time_column` 图例路径错位**：枚举翻译挂在 `time_column` 上（实际
     在 `time_column.kind`），而 `time_column: null`（没有声明时间列）没有释义。枚举挪到
     `time_column.kind`，`time_column` 讲形态与 null 含义；守卫下沉到该对象的每个字段。

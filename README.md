@@ -502,8 +502,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   改写**（那看 `masked_columns`，为空是常态）；`mask_warnings: []` 在 `--no-mask` 时**恒为空**，
   空**不等于**脱敏完整——那是「根本没脱敏」，风险警告在 `warnings` 里。⚠️ `mask_warnings`
   非空也**不只**意味着「脱敏不完整」：它还装脱敏对**分析结果**的影响——`GROUP BY` / `DISTINCT`
-  把不同原值压成同一个脱敏值（分组与计数会失真，`SELECT userPhone AS p … GROUP BY p` 也照样
-  报警），以及非敏感列按手机号/邮箱/IPv4 形态被误改。逐条读，不要只按一种含义理解。
+  的**分组键**是敏感列时，不同原值会被压成同一个脱敏值（分组与计数会失真，
+  `SELECT userPhone AS p … GROUP BY p` 也照样报警；敏感列只出现在 WHERE 里不算），
+  以及非敏感列按手机号/邮箱/IPv4 形态被误改。逐条读，不要只按一种含义理解。
 - **`--sql` 通道的数值是 JSON 安全形态的字符串**：`COUNT(*)` / `SUM` / `BIGINT` / `HUGEINT` /
   `DECIMAL` 一律输出字符串（如 `"n":"12"`、`"d":"1.50"`），这是驱动为避免精度丢失的取舍。
   做算术或比较前先转数字（`Number(x)`）；`--table --group-by` 的 `count`、`db describe` 的

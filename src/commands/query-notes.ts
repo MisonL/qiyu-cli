@@ -33,8 +33,9 @@ export function queryFieldNotes(): Record<string, string> {
     mask_warnings: '脱敏缺口与副作用警告（字符串数组，非空必须逐条读），包括但不限于：'
       + '① 声明为敏感、却没能被脱敏的数据 —— 表定义之外的列、SQL 里被别名或表达式改名的敏感列、'
       + 'payload 里的 JSON 内 PII。'
-      + '② 脱敏本身对分析结果的影响 —— GROUP BY / DISTINCT 把不同原值压成同一个脱敏值'
-      + '（分组与计数会失真）、用了 query()/query_table()/COLUMNS() 之类嵌套 SQL 构造'
+      + '② 脱敏本身对分析结果的影响 —— GROUP BY / DISTINCT 的「分组键」是敏感列时，'
+      + '不同原值被压成同一个脱敏值（分组与计数会失真，别名分组与 GROUP BY 序号也认）、'
+      + '用了 query()/query_table()/COLUMNS() 之类嵌套 SQL 构造'
       + '（内层敏感列无法识别）、非敏感列按值形态（手机号/邮箱/IPv4）被误改。'
       + '⚠️ --no-mask 时恒为空数组——空不等于脱敏完整，那是「根本没脱敏」，风险警告在 warnings 里',
     warnings: '非空必须逐条读——0 行成因、截断、窗口内部缺口、库漂移缺列、--no-mask 风险、'

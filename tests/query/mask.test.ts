@@ -572,6 +572,83 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
   })
 
+  it('反证：敏感列只出现在 WHERE / HAVING（过滤而非分组键）→ 不得发分组失真警告', () => {
+    // Codex 2026-11-05 P2：按「SQL 里出现过敏感列」判会把这些查询谎报成分组失真，
+    // 而那条警告还建议 --no-mask —— 等于诱导用户白关脱敏。
+    const where = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 3 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT session_type, COUNT(*) AS n FROM sessions WHERE userPhone = '13800001111' "
+          + 'GROUP BY session_type',
+        tables: TABLES,
+      },
+    })
+    expect(where.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+    const having = maskQueryRows({
+      rows: [{ session_type: 'chat', n: 3 }],
+      columns: ['session_type', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT session_type, COUNT(*) AS n FROM sessions GROUP BY session_type "
+          + "HAVING max(userPhone) = '13800001111'",
+        tables: TABLES,
+      },
+    })
+    expect(having.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+    const distinct = maskQueryRows({
+      rows: [{ session_type: 'chat' }],
+      columns: ['session_type'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT DISTINCT session_type FROM sessions WHERE userPhone = '13800001111'",
+        tables: TABLES,
+      },
+    })
+    expect(distinct.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('正例：DISTINCT 直接作用在敏感列（含别名）上 → 仍要警告分组失真', () => {
+    const direct = maskQueryRows({
+      rows: [{ userPhone: '13800138000' }],
+      columns: ['userPhone'],
+      mode: { kind: 'sql', sql: 'SELECT DISTINCT userPhone FROM sessions', tables: TABLES },
+    })
+    expect(direct.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    const aliased = maskQueryRows({
+      rows: [{ p: '13800138000' }],
+      columns: ['p'],
+      mode: { kind: 'sql', sql: 'SELECT DISTINCT userPhone AS p FROM sessions', tables: TABLES },
+    })
+    expect(aliased.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    // WHERE 里的敏感列不影响：DISTINCT 的键是选择列表
+    const other = maskQueryRows({
+      rows: [{ p: '138****8000' }],
+      columns: ['p'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT DISTINCT userEmail AS p FROM sessions WHERE userPhone = '1'",
+        tables: TABLES,
+      },
+    })
+    expect(other.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('GROUP BY 引用的是字面量/字符串里的词 → 不算分组键（不被子句切片骗过）', () => {
+    const out = maskQueryRows({
+      rows: [{ k: 'x', n: 1 }],
+      columns: ['k', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT session_type AS k, COUNT(*) AS n FROM sessions GROUP BY session_type "
+          + "ORDER BY 'userPhone'",
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
+
   it('值级兜底命中非敏感列 → 警告「可能是业务数字被误改」（11 位订单号）', () => {
     const out = maskQueryRows({
       rows: [{ order_id: '13800138000' }],
