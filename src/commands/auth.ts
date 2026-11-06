@@ -3,7 +3,8 @@ import { dirname } from 'node:path'
 import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty, EXIT } from '../output.js'
 import {
-  configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions, nonEmptyValue,
+  configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions,
+  isWhitespaceOnly, nonEmptyValue,
   resolveProfileName, shellPath,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
@@ -43,13 +44,14 @@ const AUTH_USAGE = `用法：qiyu auth <whoami|login> [参数]
    第一次真实调用才是唯一的验证。
 
 auth login 从环境变量读取凭证（不接受 --app-key/--app-secret：命令行参数会
-留在 shell 历史与进程列表里）。写入 ~/.config/qiyu/config.json，目录 0700、文件 0600。
+留在 shell 历史与进程列表里）。写入 ~/.config/qiyu/config.json：新建的目录 0700、文件 0600；
+已存在的目录不改动，但 group/other 可写（能整体替换文件）时拒绝写入。
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
      数字码（如 14009），也可能是本 CLI 合成的词（usage / network / internal /
      auth_missing / config_insecure / confirm_required / store_locked / store_not_initialized /
-     local_rate_limit / unknown）。合成词查不到官方错误码表。
+     local_rate_limit / sync_not_run / unknown）。合成词查不到官方错误码表。
 
 退出码：0 成功 · 1 业务错误 · 2 用法错误 · 3 网络错误 · 4 需要 --yes
 `
@@ -118,7 +120,7 @@ export async function authCommand(argv: string[]): Promise<number> {
   const KNOWN = new Set(GLOBAL_FLAG_NAMES)
   const unknown = argv.slice(1).filter((a) => a.startsWith('-') && !KNOWN.has(a))
   if (unknown.length > 0) {
-    return usageFail(`未知参数：${describeArgs(unknown)}。auth whoami 不接受任何参数`)
+    return usageFail(`未知参数：${describeArgs(unknown)}。auth whoami 只接受 --help / --pretty，不接受其他参数`)
   }
   // ⚠️ `whoami` **不接受任何位置参数**，多出来的必须报错，不能静默忽略。
   // 实测此前 `qiyu auth whoami extra` / `--bod` / `--pretty` / `--yes`
@@ -130,7 +132,7 @@ export async function authCommand(argv: string[]): Promise<number> {
   // 三个子命令的参数校验必须一致 —— 只在两个上做，第三个就是漏网。
   const positional = argv.slice(1).filter((a) => !a.startsWith('-'))
   if (positional.length > 0) {
-    return usageFail(`未知参数：${describeArgs(positional)}。auth whoami 不接受任何参数`)
+    return usageFail(`未知参数：${describeArgs(positional)}。auth whoami 只接受 --help / --pretty，不接受其他参数`)
   }
   // 命令行已证明合法 —— 现在 help 优先于 `--pretty`（与 `list()` 的 ② 同源）。
   if (argv.includes('--help') || argv.includes('-h')) {
@@ -212,6 +214,18 @@ async function login(argv: string[]): Promise<number> {
   // 与 credentials-source.ts 的口径一致 —— 两层对"空"的判定不能分叉）。
   const envKey = process.env.QIYU_APP_KEY
   const envSecret = process.env.QIYU_APP_SECRET
+  // ⚠️ 纯空白不是「缺」也不是「有」（A12，2026-11-06）：`' '` 会穿过 nonEmptyValue，
+  // 此前被**原样写进配置文件**，之后每条命令都拿它去签名。拒绝并点名变量。
+  const blankEnv = [
+    ...(isWhitespaceOnly(envKey) ? ['QIYU_APP_KEY'] : []),
+    ...(isWhitespaceOnly(envSecret) ? ['QIYU_APP_SECRET'] : []),
+  ]
+  if (blankEnv.length > 0) {
+    return usageFail(
+      `环境变量 ${blankEnv.join('、')} 只有空白字符（不是有效凭证），未写入配置文件`,
+      `请把它们设为真实值；若本意是不设置，用 \`unset ${blankEnv.join(' ')}\` 删除变量后再运行 auth login`,
+    )
+  }
   const appKey = nonEmptyValue(envKey)
   const appSecret = nonEmptyValue(envSecret)
   // ⚠️ 缺任一即 usage（退出码 2）：这是"调用方式"问题（shell 里少 export 一个），
@@ -269,7 +283,11 @@ async function login(argv: string[]): Promise<number> {
     return fail({
       code: 'config_insecure', kind: 'config_insecure', retryable: false,
       message: `无法写入配置文件 ${configPath}：${msg}`,
-      hint: '请检查路径权限（父目录可写、非符号链接），或换到 HOME 下可写的位置',
+      // A11（2026-11-06 审查）：原文案建议「换到 HOME 下可写的位置」，但配置路径**没有通道**
+      // （没有 --config/环境变量可改，见 configPathFor）——那是一个做不到的动作。
+      hint: `请检查 ${shellPath(dirname(configPath))} 的权限：目录可写、config.json 不是符号链接。`
+        + '配置路径固定为 ~/.config/qiyu/config.json（由 HOME 决定），CLI 不提供改路径的参数，'
+        + '所以不要去找「别的路径」，先把这一处的权限修好',
     })
   }
   // 权限自检：写出的文件必须 0600，否则这次"成功"是假的（凭证已落盘且可被他人读）。
@@ -294,7 +312,9 @@ async function login(argv: string[]): Promise<number> {
         + '（拼错的 appKey 同样返回 true）。⚠️ auth whoami 也只查「有没有配」，'
         + '不能验证有效性 —— 要验证只能发一次真实请求',
       profile: '写入的配置档名。选择顺序：--profile > 环境变量 QIYU_PROFILE > '
-        + '配置文件里声明的默认档名 > default。⚠️ 不要假定是 default',
+        + '配置文件里声明的默认档名 > default。⚠️ 不要假定是 default；'
+        + '写入非 default 档不会改动顶层的默认档名 —— 之后的命令仍须用 --profile 或 '
+        + 'QIYU_PROFILE 指向它，否则读不到这份凭证',
       config_path: '写入的配置文件路径',
       source: '恒为 file —— 表示本次把凭据写进了文件。'
         + '⚠️ 它不表示「下次会从文件读」：环境变量 QIYU_APP_KEY / QIYU_APP_SECRET 仍在时，'
@@ -322,6 +342,21 @@ function whoami(): number {
   const envKey = process.env.QIYU_APP_KEY
   const envSecret = process.env.QIYU_APP_SECRET
   const envProfile = process.env.QIYU_PROFILE
+  // ⚠️ A12（2026-11-06）：纯空白是 truthy，此前报 `configured: true`、source=env ——
+  // 而 api/sync 的凭证合流现在会拒绝它。whoami 必须与它们同答，否则又是一份
+  // 「谁都说配好了、只有真调用失败」的分叉。
+  const blankEnv = [
+    ...(isWhitespaceOnly(envKey) ? ['QIYU_APP_KEY'] : []),
+    ...(isWhitespaceOnly(envSecret) ? ['QIYU_APP_SECRET'] : []),
+  ]
+  if (blankEnv.length > 0) {
+    return fail({
+      code: 'auth_missing', kind: 'auth_missing', retryable: false,
+      message: `环境变量 ${blankEnv.join('、')} 只有空白字符（不是有效凭证）`,
+      hint: `请把它们设为真实值；若本意是不设置，用 \`unset ${blankEnv.join(' ')}\``
+        + ' 删除变量，让配置文件的凭证生效',
+    })
+  }
   // ⚠️ 档名解析**必须走共用点**（2026-10-29 实测）：此前这里是 `envProfile ?? defaultProfile ?? 'default'`，
   // 而 `''` 不是 null/undefined、`??` 会把它放行 —— `QIYU_PROFILE=`（变量未设的典型形态）
   // 于是选中一个名叫空串的档，报 `auth_missing`，而同一台机器上的 `api call` 按

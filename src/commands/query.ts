@@ -35,7 +35,7 @@ import {
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, helpExtraArgs, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /**
@@ -86,8 +86,6 @@ const USAGE = `用法：qiyu query <查询方式> [参数]
 
 只接受单条 SELECT / DESCRIBE / SHOW / EXPLAIN；写操作、多语句、文件与网络访问一律被沙箱拦截。
 `
-
-const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 /**
  * 值位参数（缺值或值以 `--` 开头 → 报缺值，防止把下一个 flag 当取值）。
@@ -544,8 +542,14 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
   if (argv.includes('--help') || argv.includes('-h')) {
     // --help 不吞额外参数；--pretty 豁免（同族惯例）。
     // 措辞不用「未知参数」：`--sql` 是已知参数、只是不能与 --help 同时出现（同一条闸门）。
-    const extra = argv.filter((a) => !KNOWN.has(a))
-    if (extra.length > 0) return usageFail(`--help 不接受额外参数：${extra.join(' ')}`)
+    // ⚠️ 判据与其他命令族同源（spec 的完整接受集），不是只看全局 flag：`query --table
+    // sessions --help` 是合法的帮助请求，此前被判「--help 不接受额外参数：--table sessions」
+    // 退 2。`--sql` 的取值可能以 `--` 开头，但那不影响「未知 flag 判定」—— 取值一律跳过。
+    const extra = helpExtraArgs(argv, QUERY_SPECS.flatMap((sp) => sp.flags))
+    // ⚠️ `describeArgs` 而不是 `join(' ')`（2026-11-06 审查）：空串/纯空白参数要渲染成
+    // `''`/`' '`，否则消息是「--help 不接受额外参数：」冒号后空白 —— 全仓唯一一处在
+    // query 这里自拼字符串，Agent 读不出自己传了什么。
+    if (extra.length > 0) return usageFail(`--help 不接受额外参数：${describeArgs(extra)}`)
     process.stdout.write(USAGE)
     return 0
   }

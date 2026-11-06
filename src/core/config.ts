@@ -179,7 +179,7 @@ export function shellPath(p: string): string {
 export function insecureConfigError(configPath: string, reason: 'file' | 'dir'): Error {
   const dir = dirname(configPath)
   const what = reason === 'file'
-    ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 可访问，其他用户可读到 appSecret）`
+    ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 有权限位；可读时其他用户就能读到 appSecret）`
     : `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
   const fix = reason === 'file' ? `chmod 600 ${shellPath(configPath)}` : `chmod 700 ${shellPath(dir)}`
   return Object.assign(
@@ -301,12 +301,29 @@ export interface ProfileNameChoice {
  * `credentials-source` / `auth login`。新增环境变量读取一律用它，不要手写
  * `x !== undefined && x !== ''`（`tests/empty-string-single-source.test.ts` 会红）。
  *
- * ⚠️ 只有**恰好**空串算未设置；空白串（`'   '`）仍是非法值，由各调用方按自己的规则拒绝。
+ * ⚠️ 只有**恰好**空串算未设置；空白串（`'   '`）是非法值，凭证路径用
+ * `isWhitespaceOnly` 拒绝并点名来源（2026-11-06 审查：此前没有一处拒绝）。
  * ⚠️ **显式 flag**（`--db ''`）不走这里：把用户明确给出的空值悄悄换成另一份资源，
  * 是「静默回落」缺陷本体，不是修复。
  */
 export function nonEmptyValue(v: string | undefined): string | undefined {
   return v !== undefined && v !== '' ? v : undefined
+}
+
+/**
+ * 「值只有空白字符」的**唯一实现**（2026-11-06 审查 A12）。
+ *
+ * 与 `nonEmptyValue`（只认**恰好**空串）分工：空串 = 未设置（回落下一层），
+ * 纯空白 = 用户确实给了值、但那个值不可能是凭证（`export QIYU_APP_KEY=" "`、
+ * 复制粘贴带上了空格）。此前注释说「由各调用方按自己的规则拒绝」，而凭证路径
+ * **一处都没拒绝** —— `auth whoami` 报 `configured: true`、`api call` 拿它去签名，
+ * 直到服务端 14001 才暴露。
+ *
+ * 凭证路径统一用它**拒绝并点名来源**（谁给的坏值修谁）；路径类参数不要用它
+ * （`--db '   '` 有自己的报错，见 store/config.ts）。
+ */
+export function isWhitespaceOnly(v: string | undefined): boolean {
+  return v !== undefined && v !== '' && v.trim() === ''
 }
 
 /**
@@ -350,23 +367,29 @@ export function resolveProfileName(opts: {
  * ⚠️ 畸形配置**不抛**（只记 `warn`）：环境变量齐备时 `api call` 仍应能工作 ——
  * 把一个坏掉的配置文件升级成"所有命令都不可用"是过度反应。
  * 但**缺凭证**的最终判定仍由 `resolveCredentials` 做，本函数不越权下结论。
+ *
+ * ⚠️ `flagProfile` 是命令行的 `--profile`，必须与 store 侧 `resolveStoreConfig`
+ * 走同一个 `resolveProfileName`：`QIYU_PROFILE=staging qiyu sync run --profile prod`
+ * 若凭证据 env 选档、库按 flag 选档，就会拿 staging 的凭证往 prod 的库里写。
+ * 优先级 flag > env > defaultProfile 由 `resolveProfileName` 保证（唯一实现）。
  */
 export function fileProfile(
   configPath: string = configPathFor(),
   envProfile: string | undefined = process.env.QIYU_PROFILE,
+  flagProfile?: string | undefined,
 ): FileProfileResult {
   let file: QiyuConfigFile
   try {
     file = loadConfigChecked(configPath).file
   } catch (e) {
-    // 配置读不出来时只能按 env 判档名（defaultProfile 也读不到）—— 空串口径与下面同源。
-    const name = resolveProfileName({ envProfile }).name
+    // 配置读不出来时只能按 flag/env 判档名（defaultProfile 也读不到）—— 空串口径与下面同源。
+    const name = resolveProfileName({ flag: flagProfile, envProfile }).name
     // 权限拒绝带 kind（`config_insecure`）→ 致命；畸形配置无 kind → 非致命。
     return (e as { kind?: string }).kind !== undefined
       ? { profileName: name, fatal: e }
       : { profileName: name, warn: (e as Error).message }
   }
-  const profileName = resolveProfileName({ envProfile, defaultProfile: file.defaultProfile }).name
+  const profileName = resolveProfileName({ flag: flagProfile, envProfile, defaultProfile: file.defaultProfile }).name
   const profile = file.profiles[profileName]
   return profile === undefined ? { profileName } : { profileName, profile }
 }
@@ -375,13 +398,18 @@ export function fileProfile(
 export function fileCredentials(
   configPath?: string,
   envProfile?: string,
+  flagProfile?: string,
 ): FileProfileResult & { creds?: CredentialsBlock } {
-  const r = fileProfile(configPath, envProfile)
+  const r = fileProfile(configPath, envProfile, flagProfile)
   return r.profile?.credentials === undefined ? r : { ...r, creds: r.profile.credentials }
 }
 
 /**
- * 原子写配置文件：0700 目录 + 0600 临时文件 + rename 换入。
+ * 原子写配置文件：**新建**目录 0700 + 0600 临时文件 + rename 换入。
+ *
+ * ⚠️ 已存在的目录**不改权限**（0755 是常规 umask 产物）：含凭证时真正的门禁是
+ * 「文件 0600 + 目录不可 group/other 写」（`checkPermissions`），目录位宽只暴露文件名、
+ * 读不到 appSecret。文档里「目录 0700」的措辞已按此收窄。
  *
  * ⚠️ **绝不用 writeFileSync 直写**：写一半崩溃会留下一个被截断的 config.json，
  * 下一次任何命令都起不来。临时文件与目标同目录（rename 跨文件系统才原子）。

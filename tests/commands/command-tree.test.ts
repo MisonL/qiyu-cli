@@ -110,15 +110,20 @@ describe('COMMAND_TREE', () => {
   // `return usageFail(\`未知参数：${describeArgs(unknown)}。可用：…\`)` —— 早先只写
   // `/可用：(--body[^\n]*)`/，命中的是 api.ts 顶部**注释**里的同一句话：删掉运行时文案里的
   // `--no-validate` 时全量 1162 条仍绿，断言等于空转（复审实测）。
-  it('api call 的运行时「可用：」文案点名的 flag 与 spec 接受集完全一致', () => {
+  it('api call 的运行时「可用：」文案点名的 flag 与 spec 接受集一致（除 --help/-h）', () => {
+    // C7（2026-11-06）：文案现在也列 `--pretty`（三条 api 子命令都接受它，同一拼错
+    // 此前得到三种答案）。它属于 GLOBAL_FLAGS，但**确实是可用 flag** —— 所以判据是
+    // 「列出的 ⊆ 接受集且 = 接受集去掉 help 两项」，而不是「去掉全部全局 flag」。
     const apiSrc = readFileSync(join(srcRoot, 'api.ts'), 'utf8')
     const m = apiSrc.match(/return usageFail\(`未知参数：\$\{describeArgs\(unknown\)\}。可用：(--body[^`\n]*)`\)/)
     expect(m, 'api.ts 里必须能找到 api call 的运行时「可用：」文案（而不是注释里的同款句子）').not.toBeNull()
     // 剥掉 `--body` 的取值占位符（`<JSON>`），只留 flag 名。
     const listed = m![1]!.split('、').map((s) => s.trim().split(' ')[0])
     const call = COMMAND_TREE.find((s) => s.path.join(' ') === 'api call')!
-    const accepted = call.flags.map((f) => f.name).filter((n) => !GLOBAL_FLAGS.some((g) => g.name === n))
-    expect(listed).toEqual(accepted)
+    const accepted = call.flags.map((f) => f.name).filter((n) => n !== '--help' && n !== '-h')
+    // 集合比较：文案按「业务 flag 在前、--pretty 在后」排列，spec 里 --pretty 来自
+    // GLOBAL_FLAGS 排在前面 —— 顺序不是契约，**集合**才是（此前用顺序断言，C7 后必假红）。
+    expect([...listed].sort()).toEqual([...accepted].sort())
   })
   // ⚠️ 与 brief 表格的一处刻意偏离，钉住以免被「改回去」：
   // brief 给 `sync uninstall` 列了 `STORE_FLAGS`，理由是「CLI 接受它们」——但实测不然：

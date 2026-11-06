@@ -69,6 +69,31 @@ describe('环境变量 > 配置文件', () => {
     const r = resolveCredentialsUsingFile({}, { configPath: cfgPath() })
     expect(r).toEqual({ ok: true, creds: { appKey: 'sk', appSecret: 'ss' } })
   })
+
+  it('--profile 压过 QIYU_PROFILE 与 defaultProfile（凭证与 store 必须同档）', () => {
+    // 事故形态：QIYU_PROFILE=staging 且 defaultProfile=staging，命令行 --profile prod
+    // 却按 staging 读凭证、按 prod 选库 → staging 的数据写进 prod 的库。
+    writeCfg({ defaultProfile: 'staging', profiles: {
+      prod: { credentials: { appKey: 'pk', appSecret: 'ps' } },
+      staging: { credentials: { appKey: 'sk', appSecret: 'ss' } },
+    } })
+    vi.stubEnv('QIYU_PROFILE', 'staging')
+    const opts = { configPath: cfgPath(), envProfile: 'staging' }
+    expect(resolveCredentialsUsingFile({}, opts))
+      .toEqual({ ok: true, creds: { appKey: 'sk', appSecret: 'ss' } })
+    expect(resolveCredentialsUsingFile({}, { ...opts, profile: 'prod' }))
+      .toEqual({ ok: true, creds: { appKey: 'pk', appSecret: 'ps' } })
+  })
+
+  it('--profile 为空串不改变 env/default 选档（与 resolveProfileName 的空串口径同源）', () => {
+    writeCfg({ defaultProfile: 'prod', profiles: {
+      prod: { credentials: { appKey: 'pk', appSecret: 'ps' } },
+      staging: { credentials: { appKey: 'sk', appSecret: 'ss' } },
+    } })
+    const opts = { configPath: cfgPath(), envProfile: '' }
+    expect(resolveCredentialsUsingFile({}, { ...opts, profile: '' }))
+      .toEqual({ ok: true, creds: { appKey: 'pk', appSecret: 'ps' } })
+  })
 })
 
 describe('失败路径', () => {
@@ -102,5 +127,30 @@ describe('失败路径', () => {
     expect(e.kind).toBe('auth_missing')
     // 只说"请设置环境变量"的话，用户照做后仍然可能被坏文件挡住，而它无从知道原因。
     expect(e.message).toMatch(/配置文件/)
+  })
+})
+
+describe('纯空白凭证（A12，2026-11-06）', () => {
+  it('env 纯空白 → auth_missing 并点名变量，**不回落**到配置文件', () => {
+    // `' '` 是 truthy：此前被当成已配置 —— 既不读文件也不报缺凭证，
+    // 直到服务端 14001。它也不是「未设置」：用户确实给了值，给错了。
+    writeCfg(FILE_OK)
+    const r = resolveCredentialsUsingFile({ appKey: '   ' }, { configPath: cfgPath() })
+    expect(r.ok).toBe(false)
+    const e = (r as { error: { kind: string; message: string; hint: string } }).error
+    expect(e.kind).toBe('auth_missing')
+    expect(e.message).toContain('QIYU_APP_KEY')
+    expect(e.message).toContain('空白')
+    // 不能悄悄用文件里的 fk/fs —— 那会让用户以为 export 生效了
+    expect(e.message).not.toContain('appSecret')
+    expect(e.hint).toContain('unset QIYU_APP_KEY')
+  })
+
+  it('appSecret 纯空白同样拒绝，且两个变量都为空白时一起点名', () => {
+    const one = resolveCredentialsUsingFile({ appKey: 'ek', appSecret: '\t' }, { configPath: cfgPath() })
+    expect((one as { error: { message: string } }).error.message).toContain('QIYU_APP_SECRET')
+    const both = resolveCredentialsUsingFile({ appKey: ' ', appSecret: ' ' }, { configPath: cfgPath() })
+    const m = (both as { error: { message: string } }).error.message
+    expect(m).toContain('QIYU_APP_KEY、QIYU_APP_SECRET')
   })
 })

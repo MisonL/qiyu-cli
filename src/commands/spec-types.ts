@@ -173,6 +173,34 @@ export function valueFlagNames(flags: readonly FlagSpec[]): string[] {
 }
 
 /**
+ * `--help` 模式下真正算「未知参数」的 token（唯一实现点，2026-11-06 审查）。
+ *
+ * 帮助请求不该因为**合法参数**而失败：`qiyu db describe tickets --help` 是 Agent 想
+ * 看帮助的常规写法，而此前各命令的 help 分支拿 `KNOWN = GLOBAL_FLAG_NAMES` 过滤 argv，
+ * 于是 `tickets` / `--db` / `--schedule 0 3 * * *` 全被判成「未知参数」并退出 2；
+ * 同一命令行在 `api list` / `sync run` / `skill *` 上却退出 0（它们的 KNOWN 来自 spec）。
+ * 更重的是：`skill check` 按 `CommandSpec.flags` 判这些命令**合法**，检查器与运行时的
+ * 「合法调用集」因此互斥。
+ *
+ * 判据：只把**不在完整接受集里的 flag** 当错误；位置参数与 flag 取值在帮助模式下忽略
+ * （`tickets`、`0 3 * * *` 都是取值/位置参数，不是要检查的对象）。取值以 `-` 开头时会被
+ * 当成 flag 误报 —— 如实记录这条边界（既有解析器同样拒绝以 `--` 开头的取值）。
+ */
+export function helpExtraArgs(argv: readonly string[], flags: readonly FlagSpec[]): string[] {
+  const known = new Set(flags.map((f) => f.name))
+  const values = new Set(valueFlagNames(flags))
+  const extra: string[] = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!
+    if (a === '--help' || a === '-h') continue
+    if (!a.startsWith('-')) continue
+    if (!known.has(a)) { extra.push(a); continue }
+    if (values.has(a)) i++   // 跳过它的取值（取值本身不是参数）
+  }
+  return extra
+}
+
+/**
  * 按最长前缀匹配命令路径：`['sync','run']` 优先于 `['sync']`。
  *
  * 用**原始 argv** 逐位比较，不预先滤掉 flag：真实分派取 argv[0] 当子命令

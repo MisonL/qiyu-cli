@@ -69,6 +69,15 @@ const COMMANDS: Record<string, (argv: string[]) => Promise<number>> = {
  * ⚠️ 全局约束承诺了「CLI 的 `--help` 一律中文」，所以这里必须实现它，
  * 不能让它落到「未知子命令」分支（实测那会输出「未知子命令：--help」，退出码 2）。
  */
+/**
+ * 分派层三条伪命令（`--help` / `--version` / `--pretty`）共同接受的 token。
+ *
+ * ⚠️ **一份**清单而不是三份（2026-11-06 审查）：此前三条分支各写各的豁免，缺少对方
+ * 的 token，于是 `--help --version` / `--pretty --version` 会把另一个合法全局选项
+ * 说成「未知参数」——同一命令行换个顺序就换一种结果（`--version --help` 是 0）。
+ */
+const PSEUDO_TOKENS = new Set(['--help', '-h', '--version', '--pretty'])
+
 const USAGE = `用法：qiyu <子命令> [参数]
 
 全局选项：
@@ -80,7 +89,9 @@ const USAGE = `用法：qiyu <子命令> [参数]
                            Agent 解析不需要它）
 
 子命令：
-  auth whoami              检查凭证是否已配置
+  auth whoami              检查凭证是否已配置（只查存在性，不校验有效性）
+  auth login [--profile <name>]
+                           把环境变量里的凭证写入配置文件（新建目录 0700、文件 0600）
   api list [--all]         列出接口（默认只列可主动调用的出站接口）
   api call <id> [--body <JSON>] [--yes] [--no-validate] [--strict]
                            调用接口；危险接口必须加 --yes
@@ -120,7 +131,7 @@ const USAGE = `用法：qiyu <子命令> [参数]
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
      数字码（如 14009），也可能是本 CLI 合成的词（usage / network / internal /
      auth_missing / config_insecure / confirm_required / store_locked / store_not_initialized /
-     local_rate_limit / query_error / sandbox_blocked / query_timeout / unknown）。
+     local_rate_limit / query_error / sandbox_blocked / query_timeout / sync_not_run / unknown）。
      合成词查不到官方错误码表。
 
 退出码：0 成功 · 1 业务错误 · 2 用法错误 · 3 网络错误 · 4 需要 --yes
@@ -171,7 +182,10 @@ export async function run(argv: string[]): Promise<number> {
     // （与 `api list --help --help` 同答 —— 都不算"额外参数"）。
     // ⚠️ `--pretty` 同样豁免（2026-10-08；G1 起已实现为缩进开关）：它是**合法 flag**，
     // 不是"额外参数"—— `qiyu --help --pretty` 给帮助（与 `api list --help --pretty` 同答）。
-    const extra = rest.filter((a) => a !== '--help' && a !== '-h' && a !== '--pretty')
+    // ⚠️ 三条伪命令的豁免清单必须**互相包含**（2026-11-06 审查）：此前各写各的，
+    // 于是 `--help --version` 退 2 并说 `--version` 是「未知参数」——一个就在这张帮助里
+    // 列着的全局选项被自己的 CLI 称作未知，取决于书写顺序（`--version --help` 却是 0）。
+    const extra = rest.filter((a) => !PSEUDO_TOKENS.has(a))
     if (extra.length > 0) {
       return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     }
@@ -190,7 +204,7 @@ export async function run(argv: string[]): Promise<number> {
   // 输出走 `ok()`（而非自己写 stdout）：skill 安装态提示要能经 `meta.warnings`
   // 合并进来，且成功信封的形态由 output.ts 一处统一。
   if (sub === '--version') {
-    const extra = rest.filter((a) => a !== '--help' && a !== '-h' && a !== '--pretty')
+    const extra = rest.filter((a) => !PSEUDO_TOKENS.has(a))
     if (extra.length > 0) {
       return usageFail(`未知参数：${describeArgs(extra)}。--version 不接受额外参数`)
     }
@@ -208,7 +222,12 @@ export async function run(argv: string[]): Promise<number> {
   // G1：--pretty 已实现，但它必须写在具体子命令之后（`qiyu api list --pretty`）。
   // 写在顶层时没有任何可修饰的输出（帮助是裸文本、version 是另一条伪命令）。
   if (sub === '--pretty') {
-    const unknown = rest.filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
+    // `--version` 是合法全局选项，但它必须写在 `--pretty` **之前**（`qiyu --version
+    // --pretty`）—— 报「未知参数：--version」是事实错误（2026-11-06 审查）。
+    if (rest.includes('--version')) {
+      return usageFail('--version 必须写在 --pretty 之前：`qiyu --version --pretty`')
+    }
+    const unknown = rest.filter((a) => a.startsWith('-') && !PSEUDO_TOKENS.has(a))
     const positional = rest.filter((a) => !a.startsWith('-'))
     const extra = [...unknown, ...positional]
     if (extra.length > 0) {

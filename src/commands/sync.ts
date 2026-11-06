@@ -47,7 +47,7 @@ import {
 } from '../schedule/install.js'
 import type { Platform } from '../schedule/install.js'
 import type { Store } from '../store/types.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
+import { GLOBAL_FLAGS, helpExtraArgs, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 import { STORE_VALUE_FLAG_NAMES } from './store-flags.js'
 import { nonEmptyValue } from '../core/config.js'
@@ -147,8 +147,6 @@ win32=schtasks。安装前置：库已初始化且至少成功同步过一次（
 range_status=complete 或 last_synced_at 非空的行；全败的 run 只留 pending，不算跑通）。
 `
 
-const KNOWN = new Set(GLOBAL_FLAG_NAMES)
-
 // —— 通用 flag 解析（store.ts 同族：值位守卫，--开头算缺值）——
 
 interface ParsedFlags {
@@ -183,10 +181,16 @@ function parseSubFlags(argv: string[], valueFlags: string[], boolFlags: string[]
   return out
 }
 
-/** 子命令的 --help 分流：--help 在则打 USAGE；带非 KNOWN 额外参数 → usage。 */
-function subHelp(argv: string[]): number | null {
+/**
+ * 子命令的 --help 分流：--help 在则打 USAGE；只有**未知 flag** 才算额外参数。
+ *
+ * ⚠️ 此前拿 `GLOBAL_FLAG_NAMES` 过滤 argv：`sync install --schedule "0 3 * * *" --help`
+ * 退 2 并说「未知参数：--schedule、0 3 * * *」—— 一个帮助请求被自己的合法参数判了死刑
+ *（2026-11-06 审查；`api list --all --help` 却退 0）。完整接受集从 spec 取。
+ */
+function subHelp(argv: string[], sub: string): number | null {
   if (!argv.includes('--help') && !argv.includes('-h')) return null
-  const extra = argv.filter((a) => !KNOWN.has(a))
+  const extra = helpExtraArgs(argv, SYNC_SPECS.find((sp) => sp.path[1] === sub)?.flags ?? GLOBAL_FLAGS)
   if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
   process.stdout.write(USAGE)
   return 0
@@ -258,7 +262,7 @@ function resolvedRangeOut(st: { resolvedRangeStart?: string | null; resolvedRang
 }
 
 async function syncStatus(argv: string[]): Promise<number> {
-  const help = subHelp(argv)
+  const help = subHelp(argv, 'status')
   if (help !== null) return help
   let parsed: ParsedFlags
   try {
@@ -343,7 +347,7 @@ export type DriftKind = typeof DRIFT_KINDS[number]
 interface DriftEntry { kind: DriftKind; detail: string }
 
 async function syncVerify(argv: string[]): Promise<number> {
-  const help = subHelp(argv)
+  const help = subHelp(argv, 'verify')
   if (help !== null) return help
   let parsed: ParsedFlags
   try {
@@ -359,7 +363,7 @@ async function syncVerify(argv: string[]): Promise<number> {
   const needsUpstream = tasks.some((t) => t.kind === 'snapshot')
   let creds: { appKey: string; appSecret: string } | undefined
   if (needsUpstream) {
-    const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv())
+    const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv(), { profile: parsed.values['--profile'] })
     if (!credOutcome.ok) return fail(credOutcome.error)
     creds = credOutcome.creds
   }
@@ -539,7 +543,7 @@ async function probeSynced(
 const commandText = (argv: string[]): string => argv.join(' ')
 
 async function syncInstall(argv: string[]): Promise<number> {
-  const help = subHelp(argv)
+  const help = subHelp(argv, 'install')
   if (help !== null) return help
   let parsed: ParsedFlags
   try {
@@ -633,7 +637,7 @@ async function syncInstall(argv: string[]): Promise<number> {
 }
 
 async function syncUninstall(argv: string[]): Promise<number> {
-  const help = subHelp(argv)
+  const help = subHelp(argv, 'uninstall')
   if (help !== null) return help
   let parsed: ParsedFlags
   try {
@@ -707,15 +711,19 @@ export async function syncCommand(argv: string[]): Promise<number> {
   setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
   if (sub === undefined || sub === '--help' || sub === '-h') {
-    const extra = rest.filter((a) => !KNOWN.has(a))
+    const extra = helpExtraArgs(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
     if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
   }
   // G1：--pretty 是输出开关，必须写在具体子命令之后（`sync status --pretty`）。
   if (sub === '--pretty') {
-    const unknown = rest.filter((a) => a.startsWith('-') && !KNOWN.has(a))
-    const positional = rest.filter((a) => !a.startsWith('-'))
+    const unknown = helpExtraArgs(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
+    // 非 flag 的 token 在 `--pretty` 分支仍然是错误（没有子命令时它们是孤立参数）；
+    // 但 `--help` 存在时放行（帮助请求，见下一条判断）。
+    const positional = rest.includes('--help') || rest.includes('-h')
+      ? []
+      : rest.filter((a) => !a.startsWith('-'))
     if (unknown.length + positional.length > 0) {
       return usageFail(`未知参数：${describeArgs([...unknown, ...positional])}。--pretty 不接受额外参数`)
     }
@@ -736,7 +744,7 @@ export async function syncCommand(argv: string[]): Promise<number> {
   if (sub === 'uninstall') return syncUninstall(rest)
   // —— tasks ——
   if (rest.includes('--help') || rest.includes('-h')) {
-    const rawRest = rest.filter((a) => !KNOWN.has(a))
+    const rawRest = helpExtraArgs(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
     if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
     process.stdout.write(USAGE)
     return 0

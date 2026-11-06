@@ -429,15 +429,20 @@ describe('skill install --dry-run 与真实安装同判据（审查 I1）', () =
     expect(readFileSync(join(entity, 'SKILL.md'), 'utf8')).toBe(before)
   })
 
-  it('D. 正文一致、用户新增一个文件：dry-run 说 skip + --force 警告，真实安装 skipped + 同样警告', async () => {
+  it('D. 正文一致、用户新增一个文件：dry-run 说 skip，真实安装 skipped（内容一致；不推 --force）', async () => {
+    // ⚠️ 2026-11-06 改判据：额外文件不属于「正文被改过」——旧断言钉的是整目录总哈希
+    // 时代的形态（报「可能被手工修改」+ 推 --force），而 --force 刻意保留额外文件，
+    // 于是每次安装都原样再报、永远不收敛（用户自己的文件还把 --force 引向覆盖真改动）。
     await installed()
     writeFileSync(join(entity, 'my-notes.md'), '用户自己的笔记\n')
     const dry = await dryRun()
     expect(dry).toMatchObject({ action: 'skip', planned: 'skipped' })
-    expect(dry.warnings).toContain('--force')
+    // dry-run 的 plan 在「受管正文一致」时不再产生警告（旧实现在这里报「可能被手工修改」+ --force）
+    expect(dry.warnings, '额外文件推 --force 也修不好').not.toContain('--force')
+    expect(dry.warnings).not.toContain('手工修改')
     const real = await realInstall()
     expect(real.status).toBe(dry.planned)
-    expect(real.warnings).toContain('--force')
+    expect(real.warnings).toContain('内容一致')
     expect(readFileSync(join(entity, 'my-notes.md'), 'utf8')).toBe('用户自己的笔记\n')
   })
 
@@ -650,6 +655,44 @@ describe('skill where', () => {
     expect(w).not.toContain('content_hash 不一致')
   })
 
+  it('实体里多了用户自己的文件 → install 幂等 skipped（不推 --force）、check --compare 退 0（2026-11-06 审查）', async () => {
+    // 实测（旧实现）：多一个 my-notes.md → install 报「可能与手工修改不同…可用 --force 覆盖」，
+    // 而 --force 刻意保留额外文件 → 下次原样再报，永远不收敛；`where` 却明说额外文件
+    // 「不影响正文判定」，`check --compare` 也因此无端退 1。三处必须同口径（受管文件集）。
+    // 变异「planInstall 回到整目录 contentHash」→ 本用例红（status 变 skipped+手工修改警告 /
+    // check 退 1）。
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    writeFileSync(join(entity, 'my-notes.md'), '用户自己的笔记\n')
+    out = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    expect(data().status).toBe('skipped')
+    expect(metaWarnings()).toContain('内容一致')
+    expect(metaWarnings(), '额外文件不是「正文被改过」').not.toContain('手工修改')
+    expect(metaWarnings(), '额外文件推 --force 也修不好').not.toContain('--force')
+    out = ''
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(0)
+  })
+
+  it('受管文件真被改过 → install 报「可能被手工修改」且 --force 收敛、check --compare 退 1（上一条的反向对照）', async () => {
+    // 守卫不能恒为「内容一致」：真漂移必须照报，且 --force 之后要真的收敛（不再重复告警）。
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    const doc = join(entity, 'SKILL.md')
+    writeFileSync(doc, readFileSync(doc, 'utf8') + '\n手工追加的一行\n')
+    out = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    expect(data().status).toBe('skipped')
+    expect(metaWarnings()).toContain('手工修改')
+    out = ''
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+    out = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link', '--force'])).toBe(0)
+    expect(data().status).toBe('updated')
+    out = ''
+    expect(await skillCommand(['install', '--dir', entity, '--no-link'])).toBe(0)
+    expect(data().status, '--force 之后必须收敛').toBe('skipped')
+    expect(metaWarnings()).toContain('内容一致')
+  })
+
   it('旧清单（无受管文件列表）+ 额外文件 → compatible:null，警告如实说「分不出成因」', async () => {
     // 旧清单只能比总哈希：额外文件会让它「不一致」，但它根本分不出「正文被改」与
     // 「多了个用户文件」。报错必须点名真正给的来源，或如实说分不出来 —— 变异
@@ -776,6 +819,17 @@ describe('skill where', () => {
     expect(metaWarnings()).toContain('QIYU_SKILL_DIR')
   })
 
+  it('[S3] where --dir 时提示改说「启动探测未定位」，不再自相矛盾地要用户给 --dir', async () => {
+    // 实测（2026-11-06 审查）：`skill where --dir X` 在测试进程里输出的警告是
+    // 「…且没有显式给出 --dir 或 QIYU_SKILL_DIR…要定位实体请显式给出 --dir 或 QIYU_SKILL_DIR」
+    // —— 用户刚给了 --dir。启动探测确实看不到命令行 flag，但文案必须指明那是探测。
+    expect(await skillCommand(['where', '--dir', entity])).toBe(0)
+    const w = metaWarnings()
+    expect(w).toContain('启动探测未定位实体目录')
+    expect(w).toContain('本命令的实体来自 --dir')
+    expect(w).not.toContain('没有显式给出 --dir')
+  })
+
   it('[57] 显式给了 QIYU_SKILL_DIR 时门不生效：实体照常报告、且不报「未确定」', async () => {
     // 启动探测只认 env 级显式来源（`--dir` 是逐命令参数，cli.run() 的探测看不到它）。
     // 变异「门无条件生效」→ 本用例红（QIYU_SKILL_DIR 是显式来源，必须照常报告）。
@@ -853,6 +907,18 @@ describe('skill check', () => {
     expect(violations.length).toBeGreaterThan(0)
     expect(violations[0]).toMatchObject({ rule: 'unknown_command' })
     expect(String(violations[0]?.detail)).toContain('qiyu nope')
+    // ⚠️ 退出码 1 + `{ok:true}` + **没有 error**（2026-11-06 审查）：这是「结果里有问题」
+    // 的表达，不是失败信封 —— 文档此前只承认 sync 的两处，Agent 会去读 `error.kind` 拿到
+    // undefined，把「有违规」误判成「输出损坏」。`field_notes.exit_code` 必须一起给出。
+    expect(envelope().ok).toBe(true)
+    expect(envelope()).not.toHaveProperty('error')
+    const meta = envelope().meta as Record<string, unknown>
+    // C4 修订（2026-11-06 下午）：退出码是**机器事实**，meta 里必须有真字段；
+    // 图例键必须对应真实存在的字段（反向守卫不容许解释一个不存在的键）。
+    expect(meta.exit_code).toBe(1)
+    const notes = meta.field_notes as Record<string, string>
+    expect(notes.exit_code).toContain('ok:true')
+    expect(notes.exit_code).toContain('没有 `error`')
   })
 
   // ⚠️ 这条用例存在的唯一理由：**消费生产接线**。`tests/skill/check.test.ts` 的 `ctx`
@@ -1162,18 +1228,29 @@ describe('skill check', () => {
   })
   it('--compare 内容哈希失败 → 退出 1（无法完成比较 ≠ 一致，审查 M3）', async () => {
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
-    // 非 .md 文件不参与 checkSkillDir，但参与 contentHash——把它变成不可读，
-    // 就能构造「两份都能校验、但内容哈希比较失败」的状态。
-    const bad = join(entity, 'notes.txt')
-    writeFileSync(bad, '私有内容\n')
-    chmodSync(bad, 0o000)
+    // ⚠️ 2026-11-06 起判据是**受管文件集**：构造「比较失败」要动受管文件。
+    // 删掉一个受管正文（errors.md）→ 读它时 ENOENT → 比较无法完成 → 退 1。
+    // （此前用「额外文件 notes.txt chmod 000」构造，那是整目录总哈希时代的产物；
+    //  额外文件现在不参与正文比较 —— 见下一条用例。）
+    rmSync(join(entity, 'errors.md'))
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+    const d = data()
+    expect((d.differences as string[]).join('\n')).toContain('内容哈希比较失败')
+  })
+
+  it('额外文件（含读不动的）不参与正文比较 → --compare 仍退 0（上一条的反向对照）', async () => {
+    // 变异「比较退回整目录 contentHash」→ 本用例红（chmod 000 的额外文件让比较抛错、退 1）。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const notes = join(entity, 'notes.txt')
+    writeFileSync(notes, '用户自己的笔记\n')
+    chmodSync(notes, 0o000)
     try {
       out = ''; err = ''
-      expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
-      const d = data()
-      expect((d.differences as string[]).join('\n')).toContain('内容哈希比较失败')
+      expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(0)
+      expect((data().differences as string[]).join('\n')).toBe('')
     } finally {
-      chmodSync(bad, 0o644)
+      chmodSync(notes, 0o644)
     }
   })
 })

@@ -1066,8 +1066,22 @@ export function planInstall(opts: {
   //     是目录写权限而不是该文件的读权限，--force 仍能修好（审查 I4 的既有用例）。
   let vacuous = false
   let targetHash: string | null = null
+  let sourceComparableHash: string | null = null
   let listError: unknown = null
   let hashError: unknown = null
+  // ⚠️ 「正文是否被改过」的判据基准是**受管文件集**（上一版清单的 `files`），不是整目录
+  // 总哈希（2026-11-06 审查实测）：用户往实体目录里放任何自己的文件（`where` 明确说
+  // 「不影响正文判定」）都会让总哈希不同 → 这里报「可能被手工修改」并推 `--force`，
+  // 而 `--force` 刻意保留额外文件 → 下一次原样再报，**永远不收敛**；照提示跑 `--force`
+  // 还会把用户真的手工改动覆盖掉。`where` 早就是受管文件口径（CodeRabbit #60），
+  // 这里与它统一。
+  let prevManifest: Manifest | null
+  try {
+    prevManifest = readManifestSafe(entityDir)
+  } catch {
+    prevManifest = null
+  }
+  const managedRels = prevManifest?.files
   try {
     vacuous = isVacuous(entityDir)
   } catch (err) {
@@ -1075,7 +1089,17 @@ export function planInstall(opts: {
   }
   if (listError === null && !vacuous) {
     try {
-      targetHash = contentHash(entityDir)
+      if (managedRels !== undefined && managedRels.length > 0) {
+        targetHash = contentHashOfFiles(entityDir, managedRels)
+        // 包内少了某个受管文件（上游删文件）也是「正文变了」，但两侧集合对不齐时没有
+        // 可比的哈希 —— 直接判不同，走 force / skipped 分支，而不是抛 ENOENT。
+        sourceComparableHash = managedRels.every((rel) => sourceFiles.includes(rel))
+          ? contentHashOfFiles(sourceDir, managedRels)
+          : null
+      } else {
+        targetHash = contentHash(entityDir)
+        sourceComparableHash = sourceHash
+      }
     } catch (err) {
       hashError = err
     }
@@ -1090,7 +1114,7 @@ export function planInstall(opts: {
     }
   }
 
-  if (targetHash === sourceHash) {
+  if (targetHash !== null && sourceComparableHash !== null && targetHash === sourceComparableHash) {
     const m = readManifestSafe(entityDir)
     if (
       m !== null

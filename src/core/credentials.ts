@@ -1,18 +1,35 @@
+import { isWhitespaceOnly } from './config.js'
+
 export interface Credentials { appKey: string; appSecret: string }
 
 type PartialCreds = Partial<Credentials>
 
 /**
- * 优先级：命令行参数 > 环境变量 > 配置文件。
+ * 优先级：环境变量 > 配置文件。
+ * ⚠️ **没有「命令行参数」这一层**，而且刻意不加：argv 会留在 shell 历史、`ps` 与 CI
+ * 日志里（`auth login --app-key` 被明确拒绝为未知参数，见 commands/auth.ts）。
+ * 2026-11-06 审查删除了旧的 `fromArgs` 形参 —— 它没有任何调用方传过非空值，
+ * 「预留的第三来源」只会让读代码的人以为凭证可以从命令行给。
  * 两者缺一即报错 —— 只给 appKey 就发请求必然拿 14001，不如在本地就说清楚。
  */
 export function resolveCredentials(
-  fromArgs: PartialCreds,
   env: PartialCreds = {},
   fromFile?: PartialCreds,
 ): Credentials {
-  const appKey = fromArgs.appKey ?? env.appKey ?? fromFile?.appKey
-  const appSecret = fromArgs.appSecret ?? env.appSecret ?? fromFile?.appSecret
+  const appKey = env.appKey ?? fromFile?.appKey
+  const appSecret = env.appSecret ?? fromFile?.appSecret
+
+  // ⚠️ 纯空白不是凭证（A12，2026-11-06）：`' '` 是 truthy，此前会一路穿到签名，
+  // 服务端回 14001 —— 报错点离真正给坏值的地方隔了一层命令。CLI 侧的调用方
+  // （credentials-source / auth login / whoami）已用 `isWhitespaceOnly` 点名变量，
+  // 这里兜住**配置文件**里的空白值。判据必须复用同一个函数：两处各写一遍
+  // （`v !== undefined && v !== '' && v.trim() === ''`）迟早会分叉。
+  if (isWhitespaceOnly(appKey)) {
+    throw new Error('appKey 的值只有空白字符（不是有效凭证）——请设置真实值，或删掉对应的环境变量/配置键')
+  }
+  if (isWhitespaceOnly(appSecret)) {
+    throw new Error('appSecret 的值只有空白字符（不是有效凭证）——请设置真实值，或删掉对应的环境变量/配置键')
+  }
 
   if (!appKey) {
     throw new Error(

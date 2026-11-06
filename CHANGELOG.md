@@ -122,6 +122,84 @@
 
 ### 修复
 
+- **skill / 凭证 / CLI 输出的二十三处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
+
+  · **`skill install` 与 `where` / `check` 对「受管文件集」的口径分叉**：install 把用户额外
+    放进 skill 目录的任意文件也算成「可能被手工修改」并建议 `--force`，而 `--force` 又不
+    管这些文件 —— 提示永远不收敛；`check --compare` 还会无端退 1。三处统一为**受管文件集**
+    口径，改掉 3 条把错误行为钉死的旧用例，补 2 条正/反用例 + 1 条反向对照。
+  · **三条检查规则的释义与实现不符**：`table_name` 是「写了就红」（不查表是否存在）、
+    `sql_sequence` 要求 SELECT 与 FROM 同时出现（`DROP TABLE` 不属这条）、
+    `unknown_positional` 按命令 spec 域判定。README 两处与 SKILL.md 删掉「检查表名是否
+    仍存在」的承诺，新增 3 条行为对拍用例（真实/编造表名、DROP 不触发、detail 点名域）。
+  · **`skill where --dir` 时把启动探测的结论套到本命令上**：启动探测不读命令行参数，
+    定位不到实体时说的是「未安装/已过期」，而本命令的实体根本不来自探测。新增
+    `explicitSource` 分支，改说「启动探测未定位实体（不读命令行参数），本命令实体来自
+    `--dir`，不受影响」，用例钉住旧文案不再出现。
+  · **清单被占用时 `--force` 的效果被写成单一状态**：实测两种状态 —— 正文被手工改过时
+    `--force` 只覆盖正文（status 报 updated），正文与包内一致时连 `--force` 也零写入
+    （status 报 skipped）。hint 与 SKILL.md 改为分状态表述，用例把文案与两条实测状态绑在一起。
+  · **`--profile` 不作用于凭证**：sync run / sync verify 的存储路径、机器人配置读的是
+    `--profile` 档，凭证却只按环境变量 / 默认档取 —— 多档用户会拿 A 档的 key 去开 B 档的库。
+    `resolveCredentialsUsingFile` 增 `profile` 槽位并由两个调用点传入，两条端到端用例
+    断言请求 URL 里的 appKey 来自 `--profile` 指定的档。
+  · **`auth login --profile` 写非 default 档后默认档名是否跟着改没说清**：行为（顶层默认
+    档名不变）是刻意的，但文档没写 —— README 与 login 的字段说明补上「之后的命令仍须用
+    `--profile` 或 `QIYU_PROFILE` 指向它」。
+  · **顶层 `--help` 漏列 `auth login`**，而测试还用「未实现」把它钉死 —— 帮助清单与
+    `command-tree` 用例同步补齐，测试改为按命令树集合对照。
+  · **`auth login` 对已存在的 0755 目录的处理被文档说过头**：实测已有目录原样保留（不改
+    权限，只对**新建**目录设 0700），文档 5 处收窄为「新建的目录 0700」，并新增用例钉住
+    「不改已存在目录」。
+  · **配置文件权限判据的文案窄于实现**：实现拒绝任何 group/other 权限位，文案只说
+    「group/other 可写」—— 0644（可读）能通过提示却同样会泄漏 appSecret。改为「含凭证
+    但权限过宽：group/other 有权限位；可读时其他用户就能读到 appSecret」，
+    0602/0601 两条用例钉住判据与措辞。
+  · **`resolveCredentials` 的 `fromArgs` 形参是死参数**：没有任何调用方传过非空值，
+    「预留的第三来源」只会让人以为凭证可以从命令行给。删除形参，设计稿 §4.2 同步注明
+    凭证只有环境变量与配置文件两层。
+  · **README 的脱敏承诺大于实现**：改写为「请求/响应链路」的输出都会脱敏，并明写边界 ——
+    不扫描用户自己敲进 argv 的凭证（`auth login` 拒收 `--app-key` 正是为了这个）。
+  · **配置文件权限警告的用例是空转**：原用例把 stderr 攒在内存变量里却断言别的东西，
+    警告删掉也不红。改为真实捕获 stderr 并断言警告在场（变异：置空 onWarn → 红）。
+  · **帮助与 README 的 error kind 清单漏 `sync_not_run`**：三个帮助入口补齐，README 改成
+    「常见值，不是穷举」并指向 `ERROR_KINDS` / skill `errors.md`，新增 `--help` 运行时断言。
+  · **`api call` 的「不接受任何参数」与事实相反**：它接受 `--help` / `--pretty`。改为
+    「只接受 `--help` / `--pretty`，不接受其他参数」，两处测试锚同步。
+  · **`auth login` 写盘失败的 hint 会把人引向不存在的路径**：配置路径由 `HOME` 固定、
+    CLI 没有改路径的参数，旧 hint 却让人「检查路径」。改为点名目录与文件（可写、不是
+    符号链接），并明写「路径固定、不要去找别的路径」，新增 EACCES 用例。
+  · **纯空白凭证被当成有效值**：`' '` 是 truthy，一路穿到签名，服务端回 14001 ——
+    报错点离真正给坏值的地方隔了一层命令。新增 `isWhitespaceOnly` 单一实现，
+    credentials-source / `auth whoami` / `auth login` / core 四处拒绝并**点名来源**
+    （环境变量名 vs 配置键：空白环境变量会遮蔽配置文件里的真值，所以必须先拒绝再读文件）。
+  · **控制台地址一处写成唯一形态**：两种写法都有（有无 `admin` 段），以后台真实页为准，
+    两处都列出；尝试浏览器核对未登录、无法实证，如实标注为未验证。
+  · **`--help` 与合法参数同现被判「未知参数」**（8 个命令族）：`--help` 是帮助请求，
+    追加的已知参数（如 `query --help --sql`）不该报未知。改为「`--help` 不接受额外参数」
+    并把额外参数逐个点名。
+  · **`--help` / `--version` / `--pretty` 三个伪命令互相不豁免**：`api list --pretty --help`
+    一类组合会被一侧判成未知参数，三处统一按「全局选项任意次序」处理。
+  · **退出码 1 但 stdout 仍是 `{ok:true,…}` 的路径没有机器可读标志**：skill check 两条
+    路径（单文件检查与 `--compare`）都补了**真实的** `meta.exit_code` 字段与图例，写明
+    「不要按 `error.kind` 分支、也不要用『有没有 error』判断检查是否通过，先看退出码」。
+  · **`output.test.ts` 的 kind 覆盖不全且集合断言自比较恒真**：旧表只钉 9 个 kind、
+    其对照组两边都是本文件常量（除自相矛盾外恒真）。改为与 `ERROR_KINDS` 对照，
+    新增 kind 必然变红，并覆盖全部 16 个 kind 的字面输出形态。
+  · **`query --help` 的额外参数列表是自拼字符串**：空串会渲染成「冒号后空白」，且不
+    点名取值。改为 `describeArgs` 统一渲染（全仓唯一实现）。
+  · **「可用：」清单一处列 `--pretty`、两处不列**：三处统一为同一份清单来源。
+
+  **验证**：`tests/commands/skill.test.ts`、`tests/commands/credentials-source.test.ts`、
+  `tests/commands/sync.test.ts`、`tests/commands/auth.test.ts`、`tests/core/config.test.ts`、
+  `tests/core/credentials.test.ts`、`tests/skill/check.test.ts`、`tests/skill/detect.test.ts`、
+  `tests/cli.test.ts`、`tests/commands/api.test.ts`、`tests/commands/command-tree.test.ts`
+  共新增/改写 **30 余条**用例。行为修复逐条做变异验证（A1 的三种透传形态、A4 对已存在目录
+  chmod、A5 权限判据放宽一位、A8 置空 onWarn、A11 恢复旧 hint、A12 四处空串判据、S3 去掉
+  explicitSource 分支、S4 退回单一 --force 表述），变异后对应用例全部转红、还原后转绿。
+  `skill check` 的 `exit_code` 图例还触发两条静态守卫（图例键必须有真实字段、
+  `field_notes` 不得含 `**`）：先补真实 `meta.exit_code` 再收敛文案。
+
 - **查询 / 存储 / 元数据命令的十五处契约修正（2026-11-05 第二路独立审查，三路探子 + 探针实测 + 十余轮双路收敛）**：
 
   · **执行期的文件访问与扩展加载被误报成「internal，请报告此问题」**：layer2 拦截

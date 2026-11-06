@@ -461,3 +461,52 @@ describe('whoami：配置读取失败必须在成功路径可见（2026-11-02 �
       .toContain('配置文件读取失败')
   })
 })
+
+describe('auth login 写盘失败（A11，2026-11-06 审查）', () => {
+  it('hint 不再建议「换路径」——配置路径没有通道，那是做不到的动作', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k-test')
+    vi.stubEnv('QIYU_APP_SECRET', 's-test')
+    const dir = join(home, '.config', 'qiyu')
+    // 先把目录建出来再收掉写位：login 走到 writeConfigFile 时 EACCES。
+    mkdirSync(dir, { recursive: true })
+    writeCfg({ profiles: {} })
+    chmodSync(dir, 0o500)
+    try {
+      expect(await authCommand(['login'])).toBe(1)
+      const e = JSON.parse(out).error as Record<string, unknown>
+      expect(String(e.hint)).toContain('固定为 ~/.config/qiyu/config.json')
+      expect(String(e.hint)).not.toContain('换到')
+    } finally {
+      chmodSync(dir, 0o700)   // 让 afterEach 的 rmSync 能删干净
+    }
+  })
+})
+
+describe('纯空白凭证（A12，2026-11-06）', () => {
+  it('whoami：env 纯空白 → 1 + auth_missing，点名变量（不再报 configured:true）', async () => {
+    // 此前 `' '` 是 truthy → configured:true / source:env，而 api call 拿它去签名。
+    vi.stubEnv('QIYU_APP_KEY', '   ')
+    vi.stubEnv('QIYU_APP_SECRET', 'sss')
+    expect(await authCommand(['whoami'])).toBe(1)
+    const e = JSON.parse(out).error as Record<string, unknown>
+    expect(e.kind).toBe('auth_missing')
+    expect(String(e.message)).toContain('QIYU_APP_KEY')
+    expect(String(e.message)).toContain('空白')
+  })
+
+  it('whoami：变量名带下标的空白 appSecret 也照样点名', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'kkk')
+    vi.stubEnv('QIYU_APP_SECRET', '\t')
+    expect(await authCommand(['whoami'])).toBe(1)
+    expect(String((JSON.parse(out).error as Record<string, unknown>).message)).toContain('QIYU_APP_SECRET')
+  })
+
+  it('login：env 纯空白 → 2（用法错误）+ 不写配置文件', async () => {
+    vi.stubEnv('QIYU_APP_KEY', ' ')
+    vi.stubEnv('QIYU_APP_SECRET', 'sss')
+    expect(await authCommand(['login'])).toBe(2)
+    expect(err).toContain('QIYU_APP_KEY')
+    expect(err).toContain('空白')
+    expect(existsSync(cfgPath()), '不得把空白值写进配置文件').toBe(false)
+  })
+})

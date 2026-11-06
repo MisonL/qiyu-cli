@@ -15,7 +15,7 @@
 
 import { resolveCredentials } from '../core/credentials.js'
 import type { Credentials } from '../core/credentials.js'
-import { fileCredentials, nonEmptyValue } from '../core/config.js'
+import { fileCredentials, isWhitespaceOnly, nonEmptyValue } from '../core/config.js'
 
 export interface CredEnv { appKey?: string; appSecret?: string }
 
@@ -40,14 +40,39 @@ const has = (v: string | undefined): boolean => nonEmptyValue(v) !== undefined
 
 export function resolveCredentialsUsingFile(
   env: CredEnv = currentCredentialEnv(),
-  opts: { configPath?: string } = {},
+  opts: { configPath?: string; profile?: string; envProfile?: string } = {},
 ): CredOutcome {
   const envKey = has(env.appKey)
   const envSecret = has(env.appSecret)
+  // ⚠️ 纯空白（A12，2026-11-06）：`' '` 是 truthy，此前被当成「已配置」，
+  // 于是既不读文件、也不报缺凭证，直到服务端 14001 才暴露。它也不是「未设置」——
+  // 用户确实给了值，只是给错了：**拒绝并点名变量**，而不是悄悄回落到配置文件。
+  const blank = [
+    ...(isWhitespaceOnly(env.appKey) ? ['QIYU_APP_KEY'] : []),
+    ...(isWhitespaceOnly(env.appSecret) ? ['QIYU_APP_SECRET'] : []),
+  ]
+  if (blank.length > 0) {
+    return {
+      ok: false,
+      error: {
+        code: 'auth_missing', kind: 'auth_missing', retryable: false,
+        message: `环境变量 ${blank.join('、')} 只有空白字符（不是有效凭证）`,
+        hint: `请把它们设为真实值；若本意是不设置，用 \`unset ${blank.join(' ')}\``
+          + ' 删除变量，让配置文件的凭证生效',
+      },
+    }
+  }
   let fromFile: Partial<Credentials> | undefined
   let configWarn: string | undefined
   if (!envKey || !envSecret) {
-    const r = fileCredentials(opts.configPath)
+    // ⚠️ `opts.profile` 是命令行的 `--profile`，必须传进来：只按 QIYU_PROFILE/defaultProfile
+    // 选档会让凭证与 store 选到不同的 profile（`QIYU_PROFILE=staging … --profile prod`
+    // → staging 的凭证写 prod 的库）。缺省 `undefined` 时行为与旧版逐字一致。
+    // `envProfile` 可注入只为测试不碰真实 `QIYU_PROFILE`（生产调用点一律走缺省）。
+    const envProfile = opts.envProfile !== undefined
+      ? opts.envProfile
+      : nonEmptyValue(process.env.QIYU_PROFILE)
+    const r = fileCredentials(opts.configPath, envProfile, opts.profile)
     if (r.fatal !== undefined) {
       // 权限拒绝带 kind（config_insecure）：如实透出 —— 退出码 1、hint 点名 chmod。
       const t = r.fatal as ErrorEnvelope & { message: string }
@@ -66,7 +91,6 @@ export function resolveCredentialsUsingFile(
     // 空串视为未设置传给 resolveCredentials：`??` 链会把 '' 当有效值放行，
     // 随后 `if (!appKey)` 又按缺失报错 —— 两层对"空"的判定不一致，先归一。
     const creds = resolveCredentials(
-      {},
       {
         appKey: has(env.appKey) ? env.appKey : undefined,
         appSecret: has(env.appSecret) ? env.appSecret : undefined,

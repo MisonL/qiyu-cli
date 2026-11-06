@@ -155,12 +155,18 @@ time     = current UTC second-level timestamp                 // 有效期 5 分
 
 ### 4.2 凭证管理
 
-优先级：**命令行参数 > 环境变量 > 配置文件**。
+优先级：**环境变量 > 配置文件**。
+
+> **⚠️ 措辞收窄（2026-11-06 回写）**：原文写的是「**命令行参数** > 环境变量 > 配置文件」。
+> CLI **从未接受过**凭证 flag，而且刻意不接受 —— argv 会留在 shell 历史、`ps` 与 CI 日志里
+> （`auth login --app-key` 被当作未知参数拒绝，退出码 2）。原 `resolveCredentials` 的
+> `fromArgs` 形参在全部调用点都传 `{}`，是一条不可达的「来源」。该形参已删除，
+> 文档按实现收窄。
 
 ```bash
 export QIYU_APP_KEY=xxx        # Agent / CI 场景
 export QIYU_APP_SECRET=yyy
-qiyu auth login --profile prod # 人工使用：写入 ~/.config/qiyu/config.json（目录 0700 / 文件 0600）
+qiyu auth login --profile prod # 人工使用：写入 ~/.config/qiyu/config.json（新建目录 0700 / 文件 0600）
 qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ source / robots）
 ```
 
@@ -189,6 +195,10 @@ qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ so
 > `auth login` 是唯一例外（重写为 0600 而非拒绝，因为它马上要写入新的 secret）。
 
 凭证从哪里来：七鱼管理后台 → “系统” → “扩展与集成” → 开发者 ID（`appSecret` 首次必须点击“重置”生成）。
+
+> **⚠️ 路径不唯一（2026-11-06 核对）**：README 曾写「设置 → 开放平台」。两种写法都留在仓库里，
+> 而无法从代码或文档确证哪个对应当前后台版本（本次尝试在浏览器里登录核对，未登录无法进入）。
+> 因此两处都**不再以单一路径为准**：以用户后台里真实出现的那一页为准（能生成 `appSecret` 的那页）。
 
 **凭证绝不能出现在 stdout / 日志中。** 这是 CLI 层的输出过滤，而不是 skill 里的一句提醒。
 

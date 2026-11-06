@@ -11,6 +11,7 @@ import { ERROR_KINDS } from '../../src/core/errors.js'
 import { REPORT_TABLES } from '../../src/query/metric-catalog.js'
 import { SYNC_TASKS } from '../../src/sync/registry.js'
 import { allEndpoints } from '../../src/core/registry/index.js'
+import { CHECK_RULE_NOTES } from '../../src/commands/skill.js'
 
 // 与 `commands/skill.ts` 的 `checkContext()` 同一份组装方式：五个取值域闭集从各自权威
 // 位置取，`check.ts` 自己不认识它们（终审 I1 的分层要求）。
@@ -632,5 +633,42 @@ describe('checkSkillDir', () => {
       fsState.readdir = realReaddir
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+// —— S2（2026-11-06 审查）：三条 rule 的释义必须能被实现复现 ——
+//
+// 事故形态：`CHECK_RULE_NOTES` 把三条规则讲反/讲成了别的规则 ——
+//   · `table_name` 写成「正文里出现了**不存在**的表名」（正好相反：实现是「出现 TABLES
+//     里的真实表名就违规」，包括否定句里的举例）；
+//   · `sql_sequence` 举例 `DROP TABLE`（实现只看独立词 SELECT + FROM，DROP 根本不触发）；
+//   · `unknown_positional` 举例「未知的 agent 名」（没有任何命令声明 agent 域）。
+// 释义是 Agent 的修法依据：照第一条去「把表名改成不存在的名字」会继续红，照第二条
+// 会以为危险语句被拦、照第三条会去找一个不存在的域。
+describe('CHECK_RULE_NOTES 的释义与实现一致（S2）', () => {
+  it('table_name 是「写了就红」：真实表名出现在否定句里也违规，编造的表名不触发', () => {
+    const hit = checkSkillDoc('不要写 `sessions` 表名。', ctx)
+    expect(hit.violations.some((v) => v.rule === 'table_name')).toBe(true)
+    const miss = checkSkillDoc('随便一个 `no_such_table_x`', ctx)
+    expect(miss.violations.some((v) => v.rule === 'table_name')).toBe(false)
+    expect(CHECK_RULE_NOTES.table_name).toMatch(/出现即违规/)
+    expect(CHECK_RULE_NOTES.table_name).not.toMatch(/不存在的表名/)
+  })
+
+  it('sql_sequence 只认 SELECT+FROM：DROP TABLE 不触发，释义不得拿 DROP 举例', () => {
+    const drop = checkSkillDoc('`DROP TABLE sessions`', ctx)
+    expect(drop.violations.some((v) => v.rule === 'sql_sequence')).toBe(false)
+    const select = checkSkillDoc('`SELECT id FROM staff`', ctx)
+    expect(select.violations.some((v) => v.rule === 'sql_sequence')).toBe(true)
+    expect(CHECK_RULE_NOTES.sql_sequence).toMatch(/SELECT/)
+    // 只禁「拿 DROP 当例子」的形态；释义末尾点名「DROP … 不属这条」是必要的澄清
+    expect(CHECK_RULE_NOTES.sql_sequence).not.toMatch(/如 DROP TABLE/)
+  })
+
+  it('unknown_positional 的域是命令 spec 的闭集（表/任务/接口 id），释义不得提 agent 域', () => {
+    const r = checkSkillDoc('`qiyu db describe no_such_table_x`', ctx)
+    const v = r.violations.find((x) => x.rule === 'unknown_positional')
+    expect(v?.detail).toContain('tables')
+    expect(CHECK_RULE_NOTES.unknown_positional).not.toMatch(/agent/)
   })
 })

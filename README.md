@@ -68,8 +68,9 @@ npm 无法确认可信版本、也就无法 pin 版本，`--allow-scripts` 同�
 `qiyu skill where` 报告实体目录与各 Agent 的链接状态（只读，不修复），并给出**已安装那份
 正文**的契约号与兼容判定（`data.entity.installed.compatible`，与 `data.cli_contract_version`
 比较；判定不了时为 `null`，不是 `false`——实体不可用、清单缺失/损坏，以及正文被手工改过
-（与清单记录的 `content_hash` 不一致）都属于判定不了）；`qiyu skill check`
-校验 skill 引用的命令/表/错误 kind 是否仍存在（有违规退出码 1，CI 可跑；`--compare` 模式下
+（与清单记录的 `content_hash` 不一致）都属于判定不了）；`qiyu skill check` 校验 skill 正文引用的命令、flag、位置参数取值与错误 `kind` 是否合 CLI 契约，
+并把正文里**出现表名/完整 SQL 序列**判为违规（表名是「写了就红」，不是「校验它是否还存在」；
+有违规退出码 1，CI 可跑；`--compare` 模式下
 两份正文内容不一致、或已安装那份不可用，同样退 1）。
 
 > 兜底提示：若 skill 未安装或已过期，`qiyu` 每次成功输出都会在 `meta.warnings` 里提醒
@@ -86,14 +87,17 @@ export QIYU_APP_KEY=你的AppKey
 export QIYU_APP_SECRET=你的AppSecret
 ```
 
-在七鱼控制台「设置 → 开放平台」可以找到这一对密钥。检查是否已配置：
+在七鱼管理后台里能查看/生成 `appKey` 与 `appSecret` 的那一页可以找到这一对密钥
+（不同版本后台的入口位置不同，仓库里记录过两种写法：`设置 → 开放平台` 与
+`系统 → 扩展与集成 → 开发者 ID`；`appSecret` 首次需要点「重置」才显示——以你后台里
+真实出现的那一页为准）。检查是否已配置：
 
 ```bash
 qiyu auth whoami
 # {"ok":true,"data":{"configured":true,"source":"env","profile":"default","robots":[]}}
 ```
 
-也可以把凭证**写进配置文件**，之后就不必每次 export：
+也可以把凭证**写进配置文件**；之后除非用 `--profile` 指定了非 default 档，否则不必每次 export：
 
 ```bash
 export QIYU_APP_KEY=... QIYU_APP_SECRET=...
@@ -101,8 +105,13 @@ qiyu auth login                      # 写入 default profile
 qiyu auth login --profile staging    # 写入指定 profile
 ```
 
+⚠️ `--profile staging` **只写该档，不改顶层的 `defaultProfile`**：写完之后不带 `--profile`
+的命令仍然按原顺序选档（`QIYU_PROFILE` > `defaultProfile` > 内置 `default`），所以要么在每条命令上
+写 `--profile staging`、要么 `export QIYU_PROFILE=staging`、要么手工把 `defaultProfile` 改成 `staging`。
+
 `auth login` 只从**环境变量**读凭证——不接受 `--app-key`/`--app-secret`（命令行参数会留在
-shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.json`（目录 `0700`、文件 `0600`），
+shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.json`（**新建**的目录 `0700`、文件 `0600`；
+已存在的目录不会被改动——`0755` 是常规 umask 产物，含凭证时的门禁是「文件 `0600` + 目录不可 group/other 写」，见下方「权限规则」），
 合并保留该 profile 下已有的 `store`/`robots` 键，且**绝不回显**凭证（连末四位都不）。
 配置文件是符号链接时拒绝写入（防止穿透到任意路径）。
 
@@ -153,10 +162,12 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
   `profiles` 里也不报错）。空串口径：`--profile ''` 是 usage 错误；`QIYU_PROFILE=` 与
   `"defaultProfile": ""` 视为未设置。
 
-**权限规则**：配置文件**含凭证**且 group/other 可读（如 `0644`）时，**任何读取配置的命令都会
-拒绝读取**（`kind: config_insecure`，退出码 1，hint 点名要执行的 `chmod`）——因为落盘的
-appSecret 对同机其他用户可读。不读配置的命令（`--version`、`api list`、`skill where`、
-`sync tasks` 等）不受影响，它们不碰凭证。不含凭证的文件维持「只在 stderr 警告、不阻断」。
+**权限规则**：配置文件**含凭证**且 group/other 有**任何**权限位（如 `0644` 可读、`0622` 只写、
+`0601` 仅 other 可执行）时，**任何读取配置的命令都会拒绝读取**（`kind: config_insecure`，
+退出码 1，hint 点名要执行的 `chmod`）——可读时落盘的 appSecret 对同机其他用户可读，
+其余组合也不该放宽，判据就是 `mode & 0o077 !== 0`。不读配置的命令（`--version`、
+`api list`、`skill where`、`sync tasks` 等）不受影响，它们不碰凭证。不含凭证的文件维持
+「只在 stderr 警告、不阻断」。
 父目录 group/other **可写**（文件可被整体替换）时同样拒绝。`auth login` 是**唯一的例外**：
 它不拒绝，而是把已有文件重写为 `0600`（马上要写入新的 secret，拒绝没有意义），写完自检
 不合格才报 `config_insecure`。Windows 上跳过这些检查。数据库正常关闭后 `.wal` 临时文件会
@@ -256,9 +267,12 @@ qiyu --version                       包版本 + skill_contract_version
 
 **请按 `kind` 分支，不要按 `code`。** `code` 只是个标签：它可能是服务端的数字码
 （如 `14009`），也可能是本 CLI 合成的词（`usage` / `network` / `internal` /
-`auth_missing` / `confirm_required` / `store_locked` / `store_not_initialized` /
-`local_rate_limit` / `query_error` / `sandbox_blocked` / `query_timeout` / `unknown`）。
-合成词在官方错误码表里查不到；完整清单见 `qiyu --help`。
+`auth_missing` / `config_insecure` / `confirm_required` / `store_locked` /
+`store_not_initialized` / `local_rate_limit` / `query_error` / `sandbox_blocked` /
+`query_timeout` / `sync_not_run` / `unknown`）。合成词在官方错误码表里查不到。
+⚠️ 上面与 `qiyu --help` 里的是一批**常见值**，不是穷举：`kind` 的单一事实源是
+`src/core/errors.ts` 的 `ERROR_KINDS`，逐条的成因与动作表见 skill 文档 `errors.md`
+（`qiyu skill install` 后随正文提供）。
 
 错误信封还可能有这几个**可选**键（缺省即不出现该键）：
 
@@ -328,8 +342,11 @@ qiyu --version                       包版本 + skill_contract_version
 见下）。
 
 **`ok` 与退出码的双轨语义**：`ok:true` 表示「命令已产出结果」，**退出码才是成败的权威
-判据**。全失败（退出码 1）与 `sync verify` 的 drift 非空（退出码 1）时 stdout 仍是
-`{ok:true,data:...}`——缺口/漂移就是它要报告的内容。请先看退出码，再看 `data`。
+判据**。以下五种情况 stdout 都是 `{ok:true,data:…}`（**没有** `error` 对象）而退出码为 1
+——「结果里有问题」就是它要报告的内容：`sync run` 全窗失败（`status:partial` 且
+`windows.succeeded = 0`）、`sync verify` 的 `drift` 非空、`sync install` / `sync uninstall
+--yes` 有命令执行失败、`skill check` 有违规、`skill check --compare` 两侧不一致。
+请先看退出码，再看 `data`；不要因为它们退出码 1 就去读 `error.kind`。
 
 **`tasks[].status` 的三个取值**（`sync run`；逐值动作见输出的 `meta.field_notes`）：
 
@@ -558,8 +575,11 @@ min/max **只能核对一致性、不是量纲证据** —— 量纲不明确时
 
 - **危险操作硬门禁**：标记为 `dangerous` 的接口在缺少 `--yes` 时，**绝不发出任何请求**：body 合法则返回退出码 4，body 缺必填/非对象则**先**报参数错误（退出码 2），并给出 `confirm_required` / `confirm_arg` / `risk` / `target` 四个字段。
   危险接口不可自动重试——避免人工确认过的不可逆操作被自动重放。
-- **凭证绝不外泄**：`appKey` / `appSecret` / `checksum` 在所有输出（含错误消息与 stderr）中
-  都会被抹成 `<已隐藏>`。`auth whoami` 连末尾四位都不回显。
+- **凭证不外泄（请求/响应链路的输出）**：从请求 URL、服务端 message、网络异常里出来的文本，
+  在透出前都会把当前 `appKey` / `appSecret` / `checksum` 抹成 `<已隐藏>`；`auth whoami`
+  连末尾四位都不回显。⚠️ 边界：CLI **不扫描你自己的命令行参数**——把凭证直接敲进 argv
+  （或把它设成 `--profile` / `QIYU_PROFILE` 的名字）会原样出现在用法错误的回显里，
+  这也正是 `auth login` 拒绝 `--app-key` 的原因。
 - **服务端内部信息过滤**：服务端偶发的错误消息里会泄漏 Java 包名/类名与请求 id，
   透出前一律替换为占位符。
 - **查询默认脱敏**：`query` 两条通道都默认脱敏（`sensitive: true` 的列），
@@ -599,8 +619,9 @@ min/max **只能核对一致性、不是量纲证据** —— 量纲不明确时
 查询与只读沙箱——`db tables` / `db describe` / `query --sql` / `query --table` / `stats fields`
 （三层只读沙箱、默认脱敏、时间列三形态语义化、`-1` 哨兵呈现、声明与观测分离）。
 Skill 化——`skill install`（复制正文 + 建 Agent 链接，幂等，`--dry-run` 只算计划）/
-`skill check`（校验正文引用的命令、表名、错误 `kind` 与位置参数取值是否仍存在；
-`--installed`/`--compare` 改基准；有违规退出码 1，`--compare` 下内容不一致也算失败）/
+`skill check`（校验正文引用的命令、flag、错误 `kind` 与位置参数取值是否与 CLI 契约一致，
+并拒绝正文里硬编码表名或完整 SQL 关键字序列；`--installed`/`--compare` 改基准；
+有违规退出码 1，`--compare` 下内容不一致也算失败）/
 `skill where`（只读报告实体目录与各 Agent 链接状态），
 外加 `qiyu --version`（输出包版本与 `skill_contract_version`）。
 

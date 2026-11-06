@@ -40,7 +40,7 @@ import { COMMAND_TREE } from './tree.js'
 import { prettyAfterSubcommand } from './spec-types.js'
 import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult, type ViolationRule } from '../skill/check.js'
-import { contentHash, fileHash, installSkill, listFiles, planInstall, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
+import { contentHash, contentHashOfFiles, fileHash, installSkill, listFiles, planInstall, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
 import {
   ENTITY_SOURCES, entityUndeterminedNote, npmRelativeBase, readInstalledManifestInfo,
   resetSkillDetectionCache, resolveEntityDirSources, resolveSkillSourceDir,
@@ -253,7 +253,7 @@ export function resolveEntity(flagDir: string | undefined): { dir: string; sourc
  *
  * npm 生命周期里 cwd 是包根，所以基准取 `INIT_CWD ?? cwd`（与 postinstall 同一条）。
  */
-function startupProbeStatus(): { dir: string | undefined; note: string | undefined } {
+function startupProbeStatus(explicitSource?: EntitySource): { dir: string | undefined; note: string | undefined } {
   const env = process.env
   const resolved = resolveEntityDirSources({
     env,
@@ -261,7 +261,7 @@ function startupProbeStatus(): { dir: string | undefined; note: string | undefin
     home: resolveHome(),
   })
   if (resolved.decided) return { dir: resolved.dir, note: undefined }
-  return { dir: undefined, note: entityUndeterminedNote(resolved, env) }
+  return { dir: undefined, note: entityUndeterminedNote(resolved, env, { explicitSource }) }
 }
 
 function isErrno(err: unknown, code: string): boolean {
@@ -483,19 +483,28 @@ export function installFieldNotes(mode: 'dry-run' | 'real'): Record<string, stri
  * `skill check` 的违规规则释义（10 值闭集）。
  *
  * ⚠️ 为什么逐值写：`violations[].rule` 是 Agent 要按值分支的机器值 ——
- * 「命令拼错」「flag 位置错」「正文里写了不存在的表名」对应完全不同的修法。
+ * 「命令拼错」「flag 位置错」「正文里写了表名」对应完全不同的修法。
  * `Record<ViolationRule, string>` 让 `check.ts` 加一条规则而不在这里补释义时**编译失败**。
+ *
+ * 释义必须回答「这条规则为什么红、怎么改」，不能拿另一条规则的例子凑数：
+ *  `table_name` 的红线是**正文任何位置出现表名**（包括否定句里的举例），不是「表名拼错」；
+ *  `sql_sequence` 只认同时含独立词 SELECT 与 FROM 的完整序列，DROP TABLE 不是例子；
+ *  `unknown_positional` 的点名域是命令 spec 声明的闭集（表/任务/接口 id），不是 agent 名。
  */
 export const CHECK_RULE_NOTES: Record<ViolationRule, string> = {
   unknown_command: '命令不在本 CLI 的命令树里（拼错，或该命令尚未实现）',
   unknown_flag: 'flag 没登记在该命令的参数表上',
-  unknown_positional: '位置参数的取值不在允许集合里（如未知的 agent 名）',
+  unknown_positional: '位置参数的字面取值不在该命令 spec 声明的取值域闭集里'
+    + '（如 db describe 的表名、sync run 的任务 id、api call 的接口 id），或位置参数数量超过声明',
   rejected_flag: '用了该命令显式拒绝的 flag',
   flag_before_subcommand: 'flag 写在子命令之前（如 qiyu --db x store init）',
-  flag_before_positional: 'flag 写在位置参数之前（如 qiyu api call --body … <id>）',
-  flag_missing_value: 'flag 后面缺少取值',
-  table_name: '正文里出现了不存在的表名',
-  sql_sequence: '正文里出现了危险 SQL 片段（如 DROP TABLE）',
+  flag_before_positional: 'flag 写在位置参数之前（只对 spec 标记 first 的命令，如 qiyu api call --body … <id>）',
+  flag_missing_value: '值位 flag 后面缺少取值',
+  table_name: '正文代码面出现了 TABLES 里的表名（出现即违规，哪怕是否定句里的举例）——'
+    + '数据侧事实不得硬编码，删掉表名、改成 qiyu db tables 在运行时获取。'
+    + '⚠️ 它不查「表名是否仍存在」，查的是「有没有写」',
+  sql_sequence: '正文里出现了同时含独立词 SELECT 与 FROM 的完整 SQL 关键字序列'
+    + '（逐行或整个围栏块）——删掉完整查询，改用 qiyu query；DROP TABLE 等危险片段不属这条',
   unknown_kind: '正文里的 kind: x 不在 ERROR_KINDS 里',
 }
 
@@ -517,6 +526,12 @@ export function checkFieldNotes(mode: 'package' | 'installed' | 'compare'): Reco
       + '不是已安装那份的契约号',
     warnings: '无法静态判定的条目详情（与 unverifiable 同源）。没有时不出现',
   }
+  /** 退出码释义（三形态各自可能「有结果但退出码 1」）。 */
+  const exitCodeNote = {
+    exit_code: '本命令的退出码（0 = 无违规且两侧一致，1 = 有问题）。⚠️ 它是 1 时 stdout 仍是 '
+      + '`{ok:true,…}` 且没有 `error` 对象 —— 不要按 `error.kind` 分支，先看退出码再看 data。'
+      + '也不要用「有没有 error」判断检查是否通过',
+  }
   /** 违规 / 无法判定条目的元素释义（`prefix` 是它们在输出里的真实路径）。 */
   const elementDocs = (prefix: string): Record<string, string> => {
     const p = prefix === '' ? '' : `${prefix}.`
@@ -533,6 +548,7 @@ export function checkFieldNotes(mode: 'package' | 'installed' | 'compare'): Reco
     // 单基准：violations / unverifiable 在顶层
     return {
       ...common,
+      ...exitCodeNote,
       baseline: mode === 'package'
         ? '被检查的包内正文目录'
         : '被检查的已安装实体目录（--dir 可改）',
@@ -543,6 +559,7 @@ export function checkFieldNotes(mode: 'package' | 'installed' | 'compare'): Reco
   // 是真实路径（`violations[].x` 在 compare 输出里不存在）。
   return {
     ...common,
+    ...exitCodeNote,
     entity_source: `已安装目录的来源：${ENTITY_SOURCES.join(' > ')}（优先级即顺序）`,
     'package.dir': '包内正文目录',
     ...elementDocs('package'),
@@ -873,11 +890,18 @@ function reportSingle(
   dir: string,
   result: CheckResult,
 ): number {
+  const exit = result.violations.length > 0 ? 1 : 0
   const code = ok(
     { mode, baseline: dir, violations: result.violations, unverifiable: result.warnings },
-    { ...checkMeta(result.warnings.map((w) => w.detail)), field_notes: checkFieldNotes(mode) },
+    {
+      ...checkMeta(result.warnings.map((w) => w.detail)),
+      // C4（2026-11-06）：退出码是 Agent 必须与 ok:true 一起读的机器事实，放进 meta
+      // 而不是只写在图例里 —— 图例键必须对应真实字段（反向守卫钉着）。
+      exit_code: exit,
+      field_notes: checkFieldNotes(mode),
+    },
   )
-  return result.violations.length > 0 ? 1 : code
+  return exit === 1 ? 1 : code
 }
 
 interface DirProbe {
@@ -1024,7 +1048,14 @@ async function skillCheck(argv: string[]): Promise<number> {
         installedData.unverifiable = outcome.result.warnings
         // 内容哈希与违规数：前者回答「两份正文是否一致」，后者回答「判定结果是否一致」。
         try {
-          if (contentHash(pkgDir) !== contentHash(entityDir)) {
+          // ⚠️ 同 `where` 与 `install` 的受管文件口径（2026-11-06 审查）：整目录总哈希会把
+          // 用户放进实体的额外文件算成「正文不同」，让 CI 的 `--compare` 无端退 1 并把成因
+          // 写成「正文内容不同」。有受管清单时按受管文件逐个比，没有才退回总哈希。
+          const cmpInfo = readInstalledManifestInfo(entityDir)
+          const differs = cmpInfo?.files !== undefined && cmpInfo.files.length > 0
+            ? contentHashOfFiles(entityDir, cmpInfo.files) !== contentHashOfFiles(pkgDir, cmpInfo.files)
+            : contentHash(pkgDir) !== contentHash(entityDir)
+          if (differs) {
             // 「正文内容不同」计入 bad：`--compare` 的存在意义就是发现「装过旧版、包升级
             // 改了正文」（spec D2.1 的洞），而它在 CI 里唯一的信号就是退出码。同一
             // `differences` 数组里的其它成因（目录不存在 / 缺 SKILL.md / 读取失败 / 哈希
@@ -1050,6 +1081,9 @@ async function skillCheck(argv: string[]): Promise<number> {
     ...pkgOutcome.result.warnings.map((w) => `包内：${w.detail}`),
     ...installedUnverifiable.map((w) => `已安装：${w.detail}`),
   ]
+  const bad = installedFailed
+    || pkgOutcome.result.violations.length > 0
+    || installedViolations > 0
   const code = ok(
     {
       mode: 'compare',
@@ -1062,11 +1096,8 @@ async function skillCheck(argv: string[]): Promise<number> {
       installed: installedData,
       differences,
     },
-    { ...checkMeta(warnings), field_notes: checkFieldNotes('compare') },
+    { ...checkMeta(warnings), exit_code: bad ? 1 : 0, field_notes: checkFieldNotes('compare') },
   )
-  const bad = installedFailed
-    || pkgOutcome.result.violations.length > 0
-    || installedViolations > 0
   return bad ? 1 : code
 }
 
@@ -1151,7 +1182,12 @@ async function skillWhere(argv: string[]): Promise<number> {
 
   // 启动探测的门是否在这台机器/这个进程上关掉了（追加审查 [57]）：where 是排查命令，
   // 它要说清「为什么别的命令没有 meta.warnings」。显式来源不经过门，此时不会有这条。
-  const probe = startupProbeStatus()
+  // ⚠️ 本命令自己的显式来源要传进去（S3）：`skill where --dir X` 在测试进程里曾同时
+  // 报「没有显式给出 --dir」，与用户刚做的动作矛盾 —— 启动探测确实看不到 flag，
+  // 但文案必须说清那是**启动探测**，而不是本命令。
+  const probe = startupProbeStatus(
+    source === '--dir' || source === 'QIYU_SKILL_DIR' ? source : undefined,
+  )
   if (probe.note !== undefined) warnings.push(probe.note)
 
   // 实体状态：形态走共享判据 `dirShape`（唯一实现，审查 #9）。三态映射到 EntityState：

@@ -22,7 +22,7 @@ import {
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import { withTimeoutHint } from '../query/sandbox.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import { GLOBAL_FLAGS, helpExtraArgs, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -50,8 +50,6 @@ const USAGE = `用法：qiyu stats <子命令> [参数]
 
 存储定位：--db / --profile / --backend（store 命令同族）。
 `
-
-const KNOWN = new Set(GLOBAL_FLAG_NAMES)
 
 /**
  * -1 哨兵（spec §9.2，逐字）。设计稿 §6.2 用 A/B 实测证明：数据充足的 31 天窗口
@@ -234,7 +232,7 @@ interface Observed {
 async function statsFields(argv: string[]): Promise<number> {
   // 子命令级次序沿 db.ts：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
-    const extra = argv.filter((a) => !KNOWN.has(a))
+    const extra = helpExtraArgs(argv, STATS_SPECS.flatMap((sp) => sp.flags))
     if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
@@ -387,14 +385,14 @@ export async function statsCommand(argv: string[]): Promise<number> {
   const [sub, ...rest] = argv
   if (sub === undefined || sub === '--help' || sub === '-h') {
     // --help 不吞额外参数；--pretty 豁免（db.ts 同族惯例）
-    const extra = rest.filter((a) => !KNOWN.has(a))
+    const extra = helpExtraArgs(rest, STATS_SPECS.flatMap((sp) => sp.flags))
     if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
     process.stdout.write(USAGE)
     return 0
   }
   // G1：--pretty 是输出开关，必须写在具体子命令之后（`stats fields <表> --pretty`）。
   if (sub === '--pretty') {
-    const extra = rest.filter((a) => !KNOWN.has(a))
+    const extra = helpExtraArgs(rest, STATS_SPECS.flatMap((sp) => sp.flags))
     if (extra.length > 0)
       return usageFail(`未知参数：${describeArgs(extra)}。--pretty 不接受额外参数`)
     if (rest.includes('--help') || rest.includes('-h')) {

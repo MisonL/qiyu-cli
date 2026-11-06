@@ -25,7 +25,7 @@ const CALL_FLAGS: FlagSpec[] = [
   { name: '--no-validate', kind: 'bool' },
   { name: '--strict', kind: 'bool' },
 ]
-/** `api schema` 没有业务 flag——只有全局 flag（其中 `--pretty` 在 rejected 里）。 */
+/** `api schema` 没有业务 flag——只有全局 flag（`--pretty` 是可用的输出开关）。 */
 const SCHEMA_FLAGS: FlagSpec[] = []
 
 /**
@@ -68,13 +68,19 @@ const CALL_KNOWN = new Set([...GLOBAL_FLAGS, ...CALL_FLAGS].map((f) => f.name))
 const SCHEMA_KNOWN = new Set([...GLOBAL_FLAGS, ...SCHEMA_FLAGS].map((f) => f.name))
 
 /**
- * 「可用：…」文案里的 flag 清单。`api list` 只有 `--all`，从常量渲染即可。
+ * 「可用：…」文案里的 flag 清单。`api list` 从常量渲染即可。
+ *
+ * ⚠️ 三条命令都必须列 `--pretty`（2026-11-06 审查）：同一个拼错（`--prety`）此前得到
+ * 三种答案——`api list` 说「可用：--all」、`api call` 说「…--strict」、`api schema`
+ * 说「可用：--pretty」，而三条**都接受** `--pretty`。文案是给 Agent 的纠错依据，
+ * 漏列等于让它继续拼错。
  * ⚠️ `api call` / `api schema` 的文案保持**字面量**：`readme.test.ts:58` 按**源文本**
  * 钉着 `可用：--body <JSON>、--yes、--no-validate、--strict`，改成渲染会让它变红；
- * 而两处的运行时文案又被 `api.test.ts` 钉着，不能改。事实源仍是上面的 `FlagSpec` 常量
+ * 而两处的运行时文案又被 `api.test.ts` 钉着。事实源仍是上面的 `FlagSpec` 常量
  * ——`command-tree.test.ts` 有一条断言把文案里点名的 flag 与 spec 的接受集对齐。
  */
-const LIST_AVAILABLE = renderFlagNames(LIST_FLAGS)
+const PRETTY_FLAG = GLOBAL_FLAGS.find((f) => f.name === '--pretty')!
+const LIST_AVAILABLE = renderFlagNames([...LIST_FLAGS, PRETTY_FLAG])
 
 const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 
@@ -91,7 +97,7 @@ const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的
      数字码（如 14009），也可能是本 CLI 合成的词（usage / network / internal /
-     auth_missing / config_insecure / confirm_required / store_locked / store_not_initialized / local_rate_limit / unknown）。合成词查不到官方错误码表。
+     auth_missing / config_insecure / confirm_required / store_locked / store_not_initialized / local_rate_limit / sync_not_run / unknown）。合成词查不到官方错误码表。
 
 退出码：0 成功 · 1 业务错误 · 2 用法错误 · 3 网络错误 · 4 需要 --yes
 `
@@ -369,14 +375,15 @@ const SCHEMA_USAGE = `用法：qiyu api schema <接口id> [--pretty]\n\n  查看
 
 async function schema(argv: string[]): Promise<number> {
   const unknown = argv.filter((a) => a.startsWith('-') && !SCHEMA_KNOWN.has(a))
-  // ⚠️ 文案逐字保留 `可用：--pretty`：历史输出只列这一项（`--help`/`-h` 是帮助开关，
-  // 不进「可用参数」清单）；`--pretty` 本身在 spec 的 `rejected` 里，不能从 `flags` 派生。
+  // ⚠️ 文案逐字保留 `可用：--pretty`：`--help`/`-h` 是帮助开关、不进「可用参数」清单，
+  // `--pretty` 是唯一非业务的接受项（三条 api 子命令的清单口径一致，2026-11-06 审查）。
   if (unknown.length > 0) return usageFail(`未知参数：${describeArgs(unknown)}。可用：--pretty`)
   const positional = argv.filter((a) => !a.startsWith('-'))
   const help = argv.includes('--help') || argv.includes('-h')
-  // 3a/3b：help 优先于「缺 id」与「位置参数 > 1」，但自身检查位置参数
+  // 3a/3b：help 优先于「缺 id」与「位置参数 > 1」。⚠️ 帮助请求不再校验位置参数
+  // （2026-11-06 审查）：`api schema ticket.search --help` 是常规写法，此前被判
+  // 「未知参数：ticket.search」退 2 —— 而它正是用户想看帮助的那个 id。
   if (help) {
-    if (positional.length > 0) return usageFail(`未知参数：${describeArgs(positional)}。--help 不接受额外参数`)
     process.stdout.write(SCHEMA_USAGE)
     return EXIT.OK
   }
@@ -603,7 +610,7 @@ async function callOne(argv: string[]): Promise<number> {
     // ⚠️ 这一句保持**字面量**：`readme.test.ts:58` 按源文本逐字钉着它（含 `<JSON>` 占位符，
     // 渲染无法无参复现）。`command-tree.test.ts` 有一条断言把这里点名的 flag 与
     // `CALL_FLAGS` 对齐，所以它不会与 spec 漂移。
-    return usageFail(`未知参数：${describeArgs(unknown)}。可用：--body <JSON>、--yes、--no-validate、--strict`)
+    return usageFail(`未知参数：${describeArgs(unknown)}。可用：--body <JSON>、--yes、--no-validate、--strict、--pretty`)
   }
 
   // ⚠️ **位置参数同样必须报错** —— 上面那条只筛 `-` 开头的。`api call` 除接口 id

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { ok, fail, usageFail, failFromTagged, describeArgs, sanitizeControlChars, setSkillWarning, setPretty } from '../src/output.js'
+import { ERROR_KINDS } from '../src/core/errors.js'
 
 let out: string
 // ⚠️ 用法错误现在**双通道**（stderr 给人、stdout 给 Agent），所以 err 也要捕获。
@@ -234,6 +235,11 @@ describe('失败输出', () => {
     // `needs_confirmation` **不给** confirmRequired 时必须落 default → 1
     // （退出码 4 只由 confirmRequired 决定，见 `fail()`）——否则能构造出
     // "返回 4 却没告诉 Agent 确认什么"的输出，违反设计稿 §9.1 的「必须」。
+    // ⚠️ 2026-11-06 修：此前这张表只有 16 个 kind，断言又拿「表里的键」与「同文件写死的
+    // 字面量数组」比 —— 两边都是本文件常量，除自相矛盾外**恒真**。`ERROR_KINDS` 已经
+    // 21 个（`store_locked` / `store_not_initialized` / `query_timeout` / `sync_not_run` /
+    // `config_insecure` 五个只走 default，等于没测）。现在表键与 `ERROR_KINDS` 对照，
+    // 新增 kind 必须同步加进表里（且给出它期望的退出码）。
     const table: Array<[string, number]> = [
       ['network', 3],
       ['usage', 2],
@@ -241,23 +247,25 @@ describe('失败输出', () => {
       ['auth', 1],
       ['auth_missing', 1],
       ['bad_time', 1],
+      ['config_insecure', 1],
       ['internal', 1],
       ['module_offline', 1],
+      ['needs_confirmation', 1],
       ['not_in_queue', 1],
       ['param', 1],
       ['pending', 1],
+      ['query_timeout', 1],
       ['rate_limit', 1],
       ['route_not_found', 1],
+      ['store_locked', 1],
+      ['store_not_initialized', 1],
+      ['sync_not_run', 1],
       ['unknown', 1],
       ['window_misaligned', 1],
       ['window_too_large', 1],
-      ['needs_confirmation', 1],
     ]
-    expect(table.map(([k]) => k).sort(), 'kind 全集必须与本文件出现的 16 个一致')
-      .toEqual(['auth', 'auth_missing', 'bad_time', 'internal', 'module_offline',
-                'needs_confirmation', 'network', 'not_in_queue', 'param', 'pending',
-                'rate_limit', 'route_not_found', 'unknown', 'usage',
-                'window_misaligned', 'window_too_large'])
+    expect(table.map(([k]) => k).sort(), 'kind 表必须与 ERROR_KINDS 完全一致（新增 kind 会被这条抓住）')
+      .toEqual([...ERROR_KINDS].sort())
     for (const [kind, want] of table) {
       expect(fail({ code: 'x', kind, retryable: false, message: 'm' }), kind).toBe(want)
     }
