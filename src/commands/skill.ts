@@ -1052,15 +1052,28 @@ async function skillCheck(argv: string[]): Promise<number> {
           // 用户放进实体的额外文件算成「正文不同」，让 CI 的 `--compare` 无端退 1 并把成因
           // 写成「正文内容不同」。有受管清单时按受管文件逐个比，没有才退回总哈希。
           const cmpInfo = readInstalledManifestInfo(entityDir)
-          const differs = cmpInfo?.files !== undefined && cmpInfo.files.length > 0
-            ? contentHashOfFiles(entityDir, cmpInfo.files) !== contentHashOfFiles(pkgDir, cmpInfo.files)
-            : contentHash(pkgDir) !== contentHash(entityDir)
+          // ⚠️ 文件集必须一致才可比（Codex PR #69）：包在安装之后**新增**文件时，
+          // 清单里的仍是旧文件集 —— 只比这组旧路径会得出「一致」，CI 的 `--compare`
+          // 退 0，漏报「装的是旧包」。与 `planInstall` 的受管集判据同源（同一形态
+          // 在两处出现过，修一处必查另一处）。
+          let differs: boolean
+          let reason = '包内与已安装的正文内容不同（content_hash 不一致）'
+          if (cmpInfo?.files !== undefined && cmpInfo.files.length > 0) {
+            const pkgFiles = listFiles(pkgDir)
+            const sameSet = cmpInfo.files.length === pkgFiles.length
+              && cmpInfo.files.every((f) => pkgFiles.includes(f))
+            differs = !sameSet
+              || contentHashOfFiles(entityDir, cmpInfo.files) !== contentHashOfFiles(pkgDir, cmpInfo.files)
+            if (!sameSet) reason = '已安装的文件集与包内不同（包已增删文件）'
+          } else {
+            differs = contentHash(pkgDir) !== contentHash(entityDir)
+          }
           if (differs) {
             // 「正文内容不同」计入 bad：`--compare` 的存在意义就是发现「装过旧版、包升级
             // 改了正文」（spec D2.1 的洞），而它在 CI 里唯一的信号就是退出码。同一
             // `differences` 数组里的其它成因（目录不存在 / 缺 SKILL.md / 读取失败 / 哈希
             // 比较失败）一律退 1，唯独内容漂移退 0 = 检测到了却不报（终审 I3）。
-            differences.push('包内与已安装的正文内容不同（content_hash 不一致）')
+            differences.push(reason)
             installedFailed = true
           }
         } catch (e) {

@@ -1167,6 +1167,19 @@ describe('sync run/verify —— --profile 同时选中凭证与库（A1）', ()
       vi.unstubAllGlobals()
     }
   })
+  it('`--profile` 拼错 → 参数错误退 2 并点名现有档，不得报成 auth_missing（Codex PR #69）', async () => {
+    // 事故形态：凭证侧先按 `--profile` 选档 → 选不到凭证 → 报 auth_missing（退 1）
+    // 「缺少 appKey」，而真相是档名拼错（参数错误，退 2）。参数错误必须排在环境错误之前 ——
+    // 修法是先解析 store 配置（它已有「点名的档必须存在」守卫）。
+    fileCredentialsOnly()
+    expect(await syncCommand(['run', 'dim.staff', '--db', dbPath(), '--full', '--quiet',
+      '--profile', 'prodd'])).toBe(2)
+    expect(err).toContain('prodd')
+    expect(err, '不得把拼错的档报成缺凭证').not.toContain('缺少 appKey')
+    out = ''; err = ''
+    expect(await syncCommand(['verify', 'dim.staff', '--db', dbPath(), '--profile', 'prodd'])).toBe(2)
+    expect(err).toContain('prodd')
+  })
 })
 
 describe('sync install', () => {

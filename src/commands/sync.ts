@@ -358,6 +358,18 @@ async function syncVerify(argv: string[]): Promise<number> {
   const tasks = selectTasks(parsed.rest)
   if (typeof tasks === 'number') return tasks
 
+  // —— store 配置解析（**先于**凭证）——
+  // ⚠️ 次序即归因（Codex PR #69）：`--profile typo` 是参数错误（usage，退出码 2），
+  // 缺凭证是环境错误（auth_missing，退出码 1）。凭证侧按 `--profile` 选档后报
+  // 「缺少 appKey」会把拼错的档名说成「没配凭证」—— 参数错误必须排在环境错误之前。
+  let resolved
+  try {
+    resolved = resolveConfig({ db: parsed.values['--db'], profile: parsed.values['--profile'], backend: parsed.values['--backend'] })
+    // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
+    // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
+    // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
+  } catch (e) { return failFromTagged(e) }
+
   // 凭证惰性解析：快照任务需要上游 fetch；纯 windowed 选中时不碰凭证
   //（归因准确：本地核对不该因缺环境变量失败）。
   const needsUpstream = tasks.some((t) => t.kind === 'snapshot')
@@ -368,13 +380,6 @@ async function syncVerify(argv: string[]): Promise<number> {
     creds = credOutcome.creds
   }
 
-  let resolved
-  try {
-    resolved = resolveConfig({ db: parsed.values['--db'], profile: parsed.values['--profile'], backend: parsed.values['--backend'] })
-    // ⚠️ failFromTagged（不是 usageFail）：配置层会抛带 `kind: config_insecure` 的错误
-    // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
-    // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
-  } catch (e) { return failFromTagged(e) }
   const guarded = statGuard(resolved.path)
   if (guarded !== null) return guarded
   const opened = await openRo(resolved.config)

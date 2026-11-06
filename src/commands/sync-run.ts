@@ -338,15 +338,10 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       `未知任务：${describeArgs(unknown)}\n可用任务：${SYNC_TASKS.map((t) => t.id).join('、')}`)
   }
 
-  // —— 凭证前置（api.ts 同族：缺凭证是环境问题 → auth_missing 退出码 1）——
-  const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv(), { profile: flags['--profile'] })
-  if (!credOutcome.ok) return fail(credOutcome.error)
-  const creds = credOutcome.creds
-
-  // —— store 打开（rw 单写者）——
-  // ⚠️ close 覆盖 openStore 之后的**所有**路径（B 低-1，沿 store.ts 的 C1 形态）：
-  // 迁移失败 / 他人库 / 后续任何异常，连接与 DuckDB instance 都必须在 finally 释放 ——
-  // 此前 close 只挂在第二个 try 的 finally 上，第一个 try（open+init）失败即泄漏。
+  // —— store 配置解析（**先于**凭证）——
+  // ⚠️ 次序即归因（Codex PR #69）：`--profile typo` 是**参数错误**（usage，退出码 2），
+  // 而缺凭证是环境错误（auth_missing，退出码 1）。凭证侧按 `--profile` 选档后报
+  // 「缺少 appKey」会把拼错的档名说成「没配凭证」—— 参数错误必须排在环境错误之前。
   let resolved
   try {
     resolved = resolveStoreConfig({
@@ -357,6 +352,16 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     // （含凭证且权限过宽 —— 退出码 1、只能由人 chmod）。包成 usageFail 会把它降级成
     // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
   } catch (e) { return failFromTagged(e) }
+
+  // —— 凭证前置（api.ts 同族：缺凭证是环境问题 → auth_missing 退出码 1）——
+  const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv(), { profile: flags['--profile'] })
+  if (!credOutcome.ok) return fail(credOutcome.error)
+  const creds = credOutcome.creds
+
+  // —— store 打开（rw 单写者）——
+  // ⚠️ close 覆盖 openStore 之后的**所有**路径（B 低-1，沿 store.ts 的 C1 形态）：
+  // 迁移失败 / 他人库 / 后续任何异常，连接与 DuckDB instance 都必须在 finally 释放 ——
+  // 此前 close 只挂在第二个 try 的 finally 上，第一个 try（open+init）失败即泄漏。
   let store: Store | undefined
   try {
     try {

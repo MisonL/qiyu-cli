@@ -145,6 +145,11 @@ describe('命令行入口', () => {
     out = ''; err = ''
     expect(await run(['db', 'tables', '--bogus', '--help'])).toBe(2)
     expect(err).toContain('--bogus')
+    // Codex PR #69：值位 flag 后面紧跟**另一个 flag** 时不得被当成取值吞掉 ——
+    // `--db --bogus` 在正常解析里是「--db 缺少取值」（退 2），帮助模式不能更宽松。
+    out = ''; err = ''
+    expect(await run(['db', 'tables', '--db', '--bogus', '--help'])).toBe(2)
+    expect(err).toContain('--bogus')
   })
 
   it('三条伪命令的豁免清单互相包含：任一顺序都不得把另一个全局选项说成「未知参数」', async () => {

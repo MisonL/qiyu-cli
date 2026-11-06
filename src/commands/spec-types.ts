@@ -183,8 +183,14 @@ export function valueFlagNames(flags: readonly FlagSpec[]): string[] {
  * 「合法调用集」因此互斥。
  *
  * 判据：只把**不在完整接受集里的 flag** 当错误；位置参数与 flag 取值在帮助模式下忽略
- * （`tickets`、`0 3 * * *` 都是取值/位置参数，不是要检查的对象）。取值以 `-` 开头时会被
- * 当成 flag 误报 —— 如实记录这条边界（既有解析器同样拒绝以 `--` 开头的取值）。
+ * （`tickets`、`0 3 * * *` 都是取值/位置参数，不是要检查的对象）。
+ *
+ * ⚠️ 取值**只在它不以 `--` 开头时**才算取值，跟随 `parseStoreFlags` 的同一判据
+ * （Codex PR #69 实测）：无条件 `i++` 会让 `db tables --db --bogus --help` 打印帮助并
+ * **静默吞掉** `--bogus`，而正常解析器对同一输入判「`--db` 缺少取值」（退出码 2）——
+ * 帮助模式不该比正常解析更宽松。改成条件跳过后，`--bogus` 会被点名成未知参数。
+ * 边界如实记录：取值**本身**以 `--` 开头时这条判据分不出「取值」与「下一个 flag」，
+ * 既有解析器同样拒绝这种取值（报缺值）。
  */
 export function helpExtraArgs(argv: readonly string[], flags: readonly FlagSpec[]): string[] {
   const known = new Set(flags.map((f) => f.name))
@@ -195,7 +201,8 @@ export function helpExtraArgs(argv: readonly string[], flags: readonly FlagSpec[
     if (a === '--help' || a === '-h') continue
     if (!a.startsWith('-')) continue
     if (!known.has(a)) { extra.push(a); continue }
-    if (values.has(a)) i++   // 跳过它的取值（取值本身不是参数）
+    // 跳过它的取值（取值本身不是参数）—— 但下一 token 是 flag 时不跳（那是缺值）。
+    if (values.has(a) && i + 1 < argv.length && !argv[i + 1]!.startsWith('--')) i++
   }
   return extra
 }

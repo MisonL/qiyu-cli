@@ -1023,6 +1023,20 @@ describe('skill check', () => {
     expect((d.differences as string[]).join('\n')).toContain('内容不同')
   })
 
+  it('--compare 清单文件集是包内子集（装的是旧包）→ 退 1，不得因旧子集哈希相等而漏报（Codex PR #69）', async () => {
+    // 事故形态：只比清单里的那几个文件 → 包**新增**文件后，实体与包在旧子集上恰好
+    // 相等 → CI 的 --compare 退 0，漏报「装的是旧包」。这里把清单的 files 改成子集
+    // （模拟旧包装的文件集），实体里的文件一个没动。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const mp = join(entity, MANIFEST)
+    const m = JSON.parse(readFileSync(mp, 'utf8')) as { files: string[] }
+    m.files = m.files.slice(0, 1)
+    writeFileSync(mp, JSON.stringify(m))
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+    expect((data().differences as string[]).join('\n')).toContain('已安装的文件集与包内不同')
+  })
+
   it('--compare 在未安装时报告差异并退出 1（不抛 ENOENT）', async () => {
     expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
     const d = data()

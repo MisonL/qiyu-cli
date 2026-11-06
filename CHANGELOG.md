@@ -122,7 +122,7 @@
 
 ### 修复
 
-- **skill / 凭证 / CLI 输出的二十三处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
+- **skill / 凭证 / CLI 输出的二十七处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
 
   · **`skill install` 与 `where` / `check` 对「受管文件集」的口径分叉**：install 把用户额外
     放进 skill 目录的任意文件也算成「可能被手工修改」并建议 `--force`，而 `--force` 又不
@@ -197,11 +197,25 @@
   `tests/commands/sync.test.ts`、`tests/commands/auth.test.ts`、`tests/core/config.test.ts`、
   `tests/core/credentials.test.ts`、`tests/skill/check.test.ts`、`tests/skill/detect.test.ts`、
   `tests/cli.test.ts`、`tests/commands/api.test.ts`、`tests/commands/command-tree.test.ts`
-  共新增 **28** 条 `it`、改写或删除 **7** 条（净增 21）。行为修复逐条做变异验证（A1 的三种透传形态、A4 对已存在目录
+  共新增 **30** 条 `it`、改写或删除 **7** 条。行为修复逐条做变异验证（A1 的三种透传形态、A4 对已存在目录
   chmod、A5 权限判据放宽一位、A8 置空 onWarn、A11 恢复旧 hint、A12 四处空串判据、S3 去掉
   explicitSource 分支、S4 退回单一 --force 表述），变异后对应用例全部转红、还原后转绿。
   `skill check` 的 `exit_code` 图例还触发两条静态守卫（图例键必须有真实字段、
   `field_notes` 不得含 `**`）：先补真实 `meta.exit_code` 再收敛文案。
+
+  **收敛轮次追加修正（review 过程中发现的新形态，同样做了复现 + 变异验证）**：
+  · **`check --compare` 只比清单文件集**（Codex）：与 `install` 同款缺陷的第二处 ——
+    包新增文件后，实体与包在旧子集上相等 → CI 的 `--compare` 退 0 漏报「装的是旧包」。
+    改成文件集必须与包内一致，并给出独立原因（「已安装的文件集与包内不同」）；
+  · **`--profile` 拼错被报成缺凭证**（Codex）：凭证侧先按 flag 选档，拼错的档选不到
+    凭证 → `auth_missing`（退 1），而真相是参数错误（退 2）。`sync run` / `sync verify`
+    改为**先解析 store 配置**（它已有「点名的档必须存在」守卫）再取凭证 ——
+    参数错误排在环境错误之前；
+  · **帮助模式吞掉值位 flag 后面的未知 flag**（Codex）：`db tables --db --bogus --help`
+    曾打印帮助并静默吞掉 `--bogus`（无条件跳过「取值」），正常解析判「`--db` 缺少取值」
+    （退 2）。改为取值不以 `--` 开头才跳过；
+  · **EACCES 用例在 root / Windows 上假失败**（CodeRabbit）：收掉目录写位造不出
+    EACCES，改用 `it.skipIf`（仓库既有约定）。
 
 - **查询 / 存储 / 元数据命令的十五处契约修正（2026-11-05 第二路独立审查，三路探子 + 探针实测 + 十余轮双路收敛）**：
 
