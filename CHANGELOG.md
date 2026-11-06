@@ -194,7 +194,7 @@
   `tests/commands/sync.test.ts`、`tests/commands/auth.test.ts`、`tests/core/config.test.ts`、
   `tests/core/credentials.test.ts`、`tests/skill/check.test.ts`、`tests/skill/detect.test.ts`、
   `tests/cli.test.ts`、`tests/commands/api.test.ts`、`tests/commands/command-tree.test.ts`
-  共新增/改写 **30 余条**用例。行为修复逐条做变异验证（A1 的三种透传形态、A4 对已存在目录
+  共新增 **28** 条 `it`、改写或删除 **7** 条（净增 21）。行为修复逐条做变异验证（A1 的三种透传形态、A4 对已存在目录
   chmod、A5 权限判据放宽一位、A8 置空 onWarn、A11 恢复旧 hint、A12 四处空串判据、S3 去掉
   explicitSource 分支、S4 退回单一 --force 表述），变异后对应用例全部转红、还原后转绿。
   `skill check` 的 `exit_code` 图例还触发两条静态守卫（图例键必须有真实字段、

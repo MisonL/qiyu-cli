@@ -463,7 +463,10 @@ describe('whoami：配置读取失败必须在成功路径可见（2026-11-02 �
 })
 
 describe('auth login 写盘失败（A11，2026-11-06 审查）', () => {
-  it('hint 不再建议「换路径」——配置路径没有通道，那是做不到的动作', async () => {
+  // ⚠️ 收掉目录写位来造 EACCES 只在「非 root 的 POSIX」上成立：root 无视权限位，
+  // Windows 上 chmod 对目录基本无效 —— 这两种环境下 login 会成功，用例假失败。
+  // 仓库既有约定同款（`tests/commands/config-insecure.test.ts` 的 posixOnly）。
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('hint 不再建议「换路径」——配置路径没有通道，那是做不到的动作', async () => {
     vi.stubEnv('QIYU_APP_KEY', 'k-test')
     vi.stubEnv('QIYU_APP_SECRET', 's-test')
     const dir = join(home, '.config', 'qiyu')
