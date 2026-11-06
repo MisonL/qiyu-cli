@@ -36,7 +36,7 @@ import type { StoreLocation } from '../output.js'
 import { parseStoreFlags } from './store-flags.js'
 import { describeFieldNotes, tablesFieldNotes } from './db-notes.js'
 import type { StoreFlags } from './store-flags.js'
-import { GLOBAL_FLAGS, helpExtraArgs, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /**
@@ -73,7 +73,7 @@ const USAGE = `用法：qiyu db <子命令> [参数]
 // ⚠️ 运行时的「已知 token 集」现在**每个子命令各自取自己的完整接受集**（2026-11-06 审查）：
 // 只放全局 flag 会把合法业务 flag 判成「未知参数」——`db describe tickets --help` 退 2、
 // 而 `api list --all --help` 退 0，同一 CLI 两套答案；`skill check` 按 spec 又判它合法。
-// 见 `spec-types.ts` 的 `helpExtraArgs`。
+// 见 `spec-types.ts` 的 `helpArgsError`。
 const acceptSet = (sub: string): readonly FlagSpec[] =>
   DB_SPECS.find((sp) => sp.path[1] === sub)?.flags ?? GLOBAL_FLAGS
 
@@ -259,8 +259,8 @@ export async function openGuardedSession(
 async function dbTables(argv: string[]): Promise<number> {
   // 子命令级次序沿 store.ts：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 未知参数。
   if (argv.includes('--help') || argv.includes('-h')) {
-    const rawRest = helpExtraArgs(argv, acceptSet('tables'))
-    if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
+    const problem = helpArgsError(argv, acceptSet('tables'))
+    if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
     return 0
   }
@@ -379,8 +379,8 @@ function describeColumn(c: ColumnDef): {
 async function dbDescribe(argv: string[]): Promise<number> {
   // 子命令级次序沿 dbTables：--help 分流 → --pretty 开启缩进（G1） → parseStoreFlags → 位置参数。
   if (argv.includes('--help') || argv.includes('-h')) {
-    const rawRest = helpExtraArgs(argv, acceptSet('describe'))
-    if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
+    const problem = helpArgsError(argv, acceptSet('describe'))
+    if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
     return 0
   }
@@ -493,17 +493,18 @@ export async function dbCommand(argv: string[]): Promise<number> {
   if (sub === undefined || sub === '--help' || sub === '-h') {
     // --help 不吞未知参数；已知 flag 与非 flag token（子命令名、取值）一律放行
     //（`db --help describe --db /tmp/x` 是 Agent 的常见写法，此前会退 2）。
-    const extra = helpExtraArgs(rest, DB_SPECS.flatMap((sp) => sp.flags))
-    if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
+    const problem = helpArgsError(rest, DB_SPECS.flatMap((sp) => sp.flags), '。--help 不接受额外参数')
+    if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
     return 0
   }
   // G1：--pretty 是输出开关，必须写在具体子命令之后（`db tables --pretty`）。
   if (sub === '--pretty') {
-    const unknown = helpExtraArgs(rest, DB_SPECS.flatMap((sp) => sp.flags))
+    const problem = helpArgsError(rest, DB_SPECS.flatMap((sp) => sp.flags))
     const positional = rest.filter((a) => !a.startsWith('-'))
-    if (unknown.length + positional.length > 0)
-      return usageFail(`未知参数：${describeArgs([...unknown, ...positional])}。--pretty 不接受额外参数`)
+    if (problem !== undefined) return usageFail(`${problem}。--pretty 不接受额外参数`)
+    if (positional.length > 0)
+      return usageFail(`未知参数：${describeArgs(positional)}。--pretty 不接受额外参数`)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
       return 0

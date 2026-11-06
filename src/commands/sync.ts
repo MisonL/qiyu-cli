@@ -47,7 +47,7 @@ import {
 } from '../schedule/install.js'
 import type { Platform } from '../schedule/install.js'
 import type { Store } from '../store/types.js'
-import { GLOBAL_FLAGS, helpExtraArgs, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 import { STORE_VALUE_FLAG_NAMES } from './store-flags.js'
 import { nonEmptyValue } from '../core/config.js'
@@ -190,8 +190,8 @@ function parseSubFlags(argv: string[], valueFlags: string[], boolFlags: string[]
  */
 function subHelp(argv: string[], sub: string): number | null {
   if (!argv.includes('--help') && !argv.includes('-h')) return null
-  const extra = helpExtraArgs(argv, SYNC_SPECS.find((sp) => sp.path[1] === sub)?.flags ?? GLOBAL_FLAGS)
-  if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
+  const problem = helpArgsError(argv, SYNC_SPECS.find((sp) => sp.path[1] === sub)?.flags ?? GLOBAL_FLAGS, '。--help 不接受额外参数')
+  if (problem !== undefined) return usageFail(problem)
   process.stdout.write(USAGE)
   return 0
 }
@@ -716,21 +716,22 @@ export async function syncCommand(argv: string[]): Promise<number> {
   setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
   if (sub === undefined || sub === '--help' || sub === '-h') {
-    const extra = helpExtraArgs(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
-    if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
+    const problem = helpArgsError(rest, SYNC_SPECS.flatMap((sp) => sp.flags), '。--help 不接受额外参数')
+    if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
     return 0
   }
   // G1：--pretty 是输出开关，必须写在具体子命令之后（`sync status --pretty`）。
   if (sub === '--pretty') {
-    const unknown = helpExtraArgs(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
+    const problem = helpArgsError(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
     // 非 flag 的 token 在 `--pretty` 分支仍然是错误（没有子命令时它们是孤立参数）；
     // 但 `--help` 存在时放行（帮助请求，见下一条判断）。
     const positional = rest.includes('--help') || rest.includes('-h')
       ? []
       : rest.filter((a) => !a.startsWith('-'))
-    if (unknown.length + positional.length > 0) {
-      return usageFail(`未知参数：${describeArgs([...unknown, ...positional])}。--pretty 不接受额外参数`)
+    if (problem !== undefined) return usageFail(`${problem}。--pretty 不接受额外参数`)
+    if (positional.length > 0) {
+      return usageFail(`未知参数：${describeArgs(positional)}。--pretty 不接受额外参数`)
     }
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
@@ -749,8 +750,8 @@ export async function syncCommand(argv: string[]): Promise<number> {
   if (sub === 'uninstall') return syncUninstall(rest)
   // —— tasks ——
   if (rest.includes('--help') || rest.includes('-h')) {
-    const rawRest = helpExtraArgs(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
-    if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
+    const problem = helpArgsError(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
+    if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
     return 0
   }

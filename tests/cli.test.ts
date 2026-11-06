@@ -146,10 +146,23 @@ describe('命令行入口', () => {
     expect(await run(['db', 'tables', '--bogus', '--help'])).toBe(2)
     expect(err).toContain('--bogus')
     // Codex PR #69：值位 flag 后面紧跟**另一个 flag** 时不得被当成取值吞掉 ——
-    // `--db --bogus` 在正常解析里是「--db 缺少取值」（退 2），帮助模式不能更宽松。
+    // `--db --bogus` / `--db --help` 在正常解析里都是「--db 缺少取值」（退 2），
+    // 帮助模式不能更宽松，且文案与正常解析同源（点名缺值的是哪个 flag）。
     out = ''; err = ''
     expect(await run(['db', 'tables', '--db', '--bogus', '--help'])).toBe(2)
-    expect(err).toContain('--bogus')
+    expect(err).toContain('--db 缺少取值')
+    out = ''; err = ''
+    expect(await run(['db', 'tables', '--db', '--help'])).toBe(2)
+    expect(err).toContain('--db 缺少取值')
+    // 反向：`--sql` 的取值以 `--` 开头是**合法 SQL 行注释**，不得被判成未知 flag
+    //（Codex PR #69 第二轮；判据由 `FlagSpec.dashValue` 单点驱动）。
+    out = ''; err = ''
+    expect(await run(['query', '--sql', '-- 注释\nSELECT 1', '--help'])).toBe(0)
+    expect(out).toContain('用法：')
+    // 但取值**恰好是已知 flag** 时仍算缺值（与 query 自己的值位守卫同判据）
+    out = ''; err = ''
+    expect(await run(['query', '--sql', '--pretty', '--help'])).toBe(2)
+    expect(err).toContain('--sql 缺少取值')
   })
 
   it('三条伪命令的豁免清单互相包含：任一顺序都不得把另一个全局选项说成「未知参数」', async () => {

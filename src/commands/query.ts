@@ -35,7 +35,7 @@ import {
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, helpExtraArgs, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, helpArgsError, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /**
@@ -43,7 +43,10 @@ import type { CommandSpec, FlagSpec } from './spec-types.js'
  * 存储定位三件套直接用 `STORE_FLAGS`（与 `parseStoreFlags` 同一份事实源）。
  */
 const QUERY_FLAGS: FlagSpec[] = [
-  { name: '--sql', kind: 'value' },
+  // ⚠️ `dashValue`：`--sql` 的取值可以以 `--` 开头（SQL 的行注释 `-- …`）。
+  // 它同时驱动本文件的值位守卫与帮助模式检查（`spec-types.ts` 的 `helpArgsError`）——
+  // 一个字段两个消费者，不各写一份判据。
+  { name: '--sql', kind: 'value', dashValue: true },
   { name: '--table', kind: 'value' },
   { name: '--since', kind: 'value' },
   { name: '--until', kind: 'value' },
@@ -100,6 +103,9 @@ const VALUE_FLAGS = new Set(valueFlagNames(QUERY_FLAGS))
  * 「取值只是以 `--` 开头」（SQL 的行注释，合法输入）。
  */
 const FLAG_TOKENS = new Set([...VALUE_FLAGS, ...QUERY_FLAGS.map((f) => f.name), ...GLOBAL_FLAG_NAMES])
+
+/** 取值允许以 `--` 开头的值位 flag（`FlagSpec.dashValue`，唯一事实源）。 */
+const DASH_VALUE_FLAGS = new Set(QUERY_FLAGS.filter((f) => f.dashValue === true).map((f) => f.name))
 
 /**
  * 超时上界 = Node 定时器的最大延迟（2^31−1 ms）。超过它 setTimeout 会**溢出成 1ms**
@@ -202,8 +208,9 @@ function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
       // 否则 `query --sql --limit 2` 会把 --limit 当成 SQL 文本。
       // ⚠️ `--sql` 只拒绝「恰好是已知 flag」的值：SQL 以 `--` 开头是合法行注释
       // （`--sql '-- 注释\nSELECT 1'` 必须能跑）。路径/名字/数字/时间的合法取值不会以 `--`
-      // 开头，所以其余值位参数仍按前缀拒绝。
-      if (v === undefined || (a === '--sql' ? FLAG_TOKENS.has(v) : v.startsWith('--'))) {
+      // 开头，所以其余值位参数仍按前缀拒绝。两条分支由 `FlagSpec.dashValue` 选择
+      //（与帮助模式的 `helpArgsError` 同源，2026-11-06 Codex 审查）。
+      if (v === undefined || (DASH_VALUE_FLAGS.has(a) ? FLAG_TOKENS.has(v) : v.startsWith('--'))) {
         throw new Error(`${a} 缺少取值`)
       }
       if (a === '--sql') out.sql = v
@@ -545,11 +552,9 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     // ⚠️ 判据与其他命令族同源（spec 的完整接受集），不是只看全局 flag：`query --table
     // sessions --help` 是合法的帮助请求，此前被判「--help 不接受额外参数：--table sessions」
     // 退 2。`--sql` 的取值可能以 `--` 开头，但那不影响「未知 flag 判定」—— 取值一律跳过。
-    const extra = helpExtraArgs(argv, QUERY_SPECS.flatMap((sp) => sp.flags))
-    // ⚠️ `describeArgs` 而不是 `join(' ')`（2026-11-06 审查）：空串/纯空白参数要渲染成
-    // `''`/`' '`，否则消息是「--help 不接受额外参数：」冒号后空白 —— 全仓唯一一处在
-    // query 这里自拼字符串，Agent 读不出自己传了什么。
-    if (extra.length > 0) return usageFail(`--help 不接受额外参数：${describeArgs(extra)}`)
+    const problem = helpArgsError(argv, QUERY_SPECS.flatMap((sp) => sp.flags), '。--help 不接受额外参数')
+    // ⚠️ 渲染走 `describeArgs`（空串/纯空白要显示成 `''`/`' '`），不是 `join(' ')`。
+    if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
     return 0
   }

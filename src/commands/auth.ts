@@ -387,7 +387,7 @@ function whoami(): number {
       code: 'auth_missing', kind: 'auth_missing', retryable: false,
       message: `配置文件里 profile ${JSON.stringify(profileName)} 的 ${blankFile.join('、')}`
         + '只有空白字符（不是有效凭证）',
-      hint: `请在该档里设为真实值，或删掉这个键让环境变量生效：${configPathFor()}`,
+      hint: `请在该档里设为真实值；或删掉这个键、改用环境变量（环境变量优先于配置文件）：${configPathFor()}`,
     })
   }
 

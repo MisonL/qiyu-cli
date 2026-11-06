@@ -13,7 +13,7 @@ import {
 } from './store-precheck.js'
 import { TABLES } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
-import { GLOBAL_FLAGS, helpExtraArgs, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -86,8 +86,8 @@ export async function storeCommand(argv: string[]): Promise<number> {
   if (sub === undefined || sub === '--help' || sub === '-h') {
     // --help 不吞**未知**参数；已知 flag 与子命令名/取值一律放行（2026-11-06 审查：
     // `store status --db /tmp/x --help` 此前被 `GLOBAL_FLAG_NAMES` 判成「未知参数」退 2）。
-    const extra = helpExtraArgs(rest, STORE_SPECS.flatMap((sp) => sp.flags))
-    if (extra.length > 0) return usageFail(`未知参数：${describeArgs(extra)}。--help 不接受额外参数`)
+    const problem = helpArgsError(rest, STORE_SPECS.flatMap((sp) => sp.flags), '。--help 不接受额外参数')
+    if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
     return 0
   }
@@ -95,13 +95,14 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // store 级：--pretty 是合法**输出开关**，但它必须写在具体子命令之后（`store init --pretty`）。
     // 写在这里时没有任何子命令可修饰 —— 给出正确写法，而不是说成"未知子命令"（B 惯例）。
     if (sub === '--pretty') {
-      const unknown = helpExtraArgs(rest, STORE_SPECS.flatMap((sp) => sp.flags))
+      const problem = helpArgsError(rest, STORE_SPECS.flatMap((sp) => sp.flags))
       // `--help` 同时出现时按帮助处理（帮助请求不校验位置参数）
       const positional = rest.includes('--help') || rest.includes('-h')
         ? []
         : rest.filter((a) => !a.startsWith('-'))
-      if (unknown.length + positional.length > 0) {
-        return usageFail(`未知参数：${describeArgs([...unknown, ...positional])}。--pretty 不接受额外参数`)
+      if (problem !== undefined) return usageFail(`${problem}。--pretty 不接受额外参数`)
+      if (positional.length > 0) {
+        return usageFail(`未知参数：${describeArgs(positional)}。--pretty 不接受额外参数`)
       }
       if (rest.includes('--help') || rest.includes('-h')) {
         process.stdout.write(USAGE)
@@ -115,8 +116,8 @@ export async function storeCommand(argv: string[]): Promise<number> {
   // ⚠️ 次序不能反：若先过滤「未知 token」再 parseStoreFlags，`store init --db <path>` 的
   // --db 及其值会被当未知参数误拒（v1 计划的实测缺陷，D/F 组独立发现）。
   if (rest.includes('--help') || rest.includes('-h')) {
-    const rawRest = helpExtraArgs(rest, STORE_SPECS.flatMap((sp) => sp.flags))
-    if (rawRest.length > 0) return usageFail(`未知参数：${describeArgs(rawRest)}`)
+    const problem = helpArgsError(rest, STORE_SPECS.flatMap((sp) => sp.flags))
+    if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
     return 0
   }

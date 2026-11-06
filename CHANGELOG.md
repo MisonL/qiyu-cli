@@ -211,9 +211,12 @@
     凭证 → `auth_missing`（退 1），而真相是参数错误（退 2）。`sync run` / `sync verify`
     改为**先解析 store 配置**（它已有「点名的档必须存在」守卫）再取凭证 ——
     参数错误排在环境错误之前；
-  · **帮助模式吞掉值位 flag 后面的未知 flag**（Codex）：`db tables --db --bogus --help`
-    曾打印帮助并静默吞掉 `--bogus`（无条件跳过「取值」），正常解析判「`--db` 缺少取值」
-    （退 2）。改为取值不以 `--` 开头才跳过；
+  · **帮助模式的取值规则与正常解析不同源**（Codex 两轮）：`db tables --db --bogus --help`
+    曾打印帮助并静默吞掉 `--bogus`；改成「取值不以 `--` 开头才跳过」后又把
+    `query --sql "-- 注释…"` 的合法 SQL 判成未知 flag、且 `--db --help`（缺值）不报。
+    最终规则改为**每个 flag 自己的取值规则**：`FlagSpec.dashValue`（`--sql` 允许取值以
+    `--` 开头，只有恰好是已知 flag 才算缺值）驱动帮助检查与 query 解析器同一份判据；
+    缺值在帮助模式下照报（与正常解析同文案）；
   · **EACCES 用例在 root / Windows 上假失败**（CodeRabbit）：收掉目录写位造不出
     EACCES，改用 `it.skipIf`（仓库既有约定）；
   · **`whoami` 漏了配置文件里的空白凭证**（Codex）：只查环境变量时，文件里的 `" "`
