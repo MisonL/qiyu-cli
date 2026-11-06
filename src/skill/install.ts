@@ -1069,6 +1069,8 @@ export function planInstall(opts: {
   let sourceComparableHash: string | null = null
   let listError: unknown = null
   let hashError: unknown = null
+  // 受管文件集与包内不一致（包升级增/删了文件）—— 单独记账，用于给准原因。
+  let fileSetDiffers = false
   // ⚠️ 「正文是否被改过」的判据基准是**受管文件集**（上一版清单的 `files`），不是整目录
   // 总哈希（2026-11-06 审查实测）：用户往实体目录里放任何自己的文件（`where` 明确说
   // 「不影响正文判定」）都会让总哈希不同 → 这里报「可能被手工修改」并推 `--force`，
@@ -1090,12 +1092,17 @@ export function planInstall(opts: {
   if (listError === null && !vacuous) {
     try {
       if (managedRels !== undefined && managedRels.length > 0) {
-        targetHash = contentHashOfFiles(entityDir, managedRels)
-        // 包内少了某个受管文件（上游删文件）也是「正文变了」，但两侧集合对不齐时没有
-        // 可比的哈希 —— 直接判不同，走 force / skipped 分支，而不是抛 ENOENT。
-        sourceComparableHash = managedRels.every((rel) => sourceFiles.includes(rel))
-          ? contentHashOfFiles(sourceDir, managedRels)
-          : null
+        // ⚠️ 文件集必须**完全一致**才可比（2026-11-06 自查）：只比「清单里的文件」会把
+        // 「包升级新增了一个文件」误判成「正文一致」—— 随后走 rewrite-manifest 分支，
+        // 只重写清单、不复制新文件，status 却报 updated：实体里根本没有那个文件。
+        // 集合不同的成因是**包变了**，不是用户改动，所以原因文案也要分开。
+        const pkgSet = new Set(sourceFiles)
+        fileSetDiffers = managedRels.length !== sourceFiles.length
+          || managedRels.some((rel) => !pkgSet.has(rel))
+        if (!fileSetDiffers) {
+          targetHash = contentHashOfFiles(entityDir, managedRels)
+          sourceComparableHash = contentHashOfFiles(sourceDir, managedRels)
+        }
       } else {
         targetHash = contentHash(entityDir)
         sourceComparableHash = sourceHash
@@ -1155,9 +1162,11 @@ export function planInstall(opts: {
     }
   }
 
-  const reason = hashError !== null
-    ? `读取实体目录内容失败（${errMsg(hashError)}）`
-    : '实体目录内容与包内不同（可能被手工修改）'
+  const reason = fileSetDiffers
+    ? '包内的受管文件集与上次安装不同（包升级增/删了文件），未能逐文件比对'
+    : hashError !== null
+      ? `读取实体目录内容失败（${errMsg(hashError)}）`
+      : '实体目录内容与包内不同（可能被手工修改）'
   warnings.push(`${reason}，未覆盖；确认后可用 --force 覆盖：${entityDir}`)
   return { ...base, status: 'skipped', action: 'none', warnings }
 }

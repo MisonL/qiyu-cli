@@ -179,7 +179,12 @@ vi.mock('node:fs', async (importOriginal) => {
           actual.cpSync(from, to, { recursive: true, force: true })
           actual.writeFileSync(realTo + '/' + MANIFEST, JSON.stringify({
             version: '0.0.1', skill_contract_version: 0, content_hash: 'stale',
-            files: ['SKILL.md'], installed_at: new Date(0).toISOString(),
+            // ⚠️ `files` 必须是**当前包的完整文件集**（2026-11-06）：并发的赢家跑的是同一个
+            // CLI、装的是同一个包，不可能写出「文件集更少」的清单。写成 ['SKILL.md'] 是
+            // 自相矛盾的夹具 —— planInstall 的受管集比对看到「清单集 ⊂ 包内集」，只能
+            // 判定为包升级增删文件（而不是「只有清单落后」），这个用例就不再测它想测的东西。
+            files: ['SKILL.md', 'protocols.md', 'references/deep.md'],
+            installed_at: new Date(0).toISOString(),
           }))
         } else if (kind === 'ENOTEMPTY_MANIFEST_DIR') {
           // 并发赢家形态 B：正文与包内**逐字节一致**，但清单位置被一个目录占用。
@@ -365,6 +370,32 @@ describe('installSkill', () => {
     const m = readManifest(entity)
     expect(m.version).toBe('1.3.0')
     expect(m.content_hash).toBe(contentHash(src))
+  })
+
+  it('包升级新增了文件：未加 --force 如实 skipped、清单不得提前声称已安装；--force 后才真装上', async () => {
+    // 2026-11-06 自查回归：受管集比对的初版只比「清单里的那几个文件」，于是包升级
+    // 新增文件时两侧在旧子集上恰好相等 → 走 rewrite-manifest 分支，只重写清单
+    // （sourceFiles 含新文件）却**不复制**它们，status 还报 updated —— 实体里没有
+    // 那个文件，清单却说装了。文件集必须完全一致才可比。
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.2.3', force: false })
+    const entity = defaultEntityDir(home)
+    write(src, 'references/new.md', '新增引用\n')   // 新版包多一个文件
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.3.0', force: false })
+    expect(r.status, '未加 --force 不得声称 updated').toBe('skipped')
+    expect(existsSync(join(entity, 'references', 'new.md'))).toBe(false)
+    expect(r.warnings.join('\n')).toContain('受管文件集与上次安装不同')
+    expect(readManifest(entity).files, '清单不得提前声称新文件已安装')
+      .not.toContain('references/new.md')
+
+    const forced = await installSkill({ home, sourceDir: src, version: '1.3.0', force: true })
+    expect(forced.status).toBe('updated')
+    expect(readFileSync(join(entity, 'references', 'new.md'), 'utf8')).toBe('新增引用\n')
+    expect(readManifest(entity).files).toContain('references/new.md')
+    // --force 之后必须能回到幂等
+    expect((await installSkill({ home, sourceDir: src, version: '1.3.0', force: false })).status)
+      .toBe('skipped')
   })
 
   it('--force 清理上一版受管文件（按清单 files 界定），并如实警告', async () => {
