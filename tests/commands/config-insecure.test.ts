@@ -40,7 +40,7 @@ function writeWideConfig(mode = 0o644): string {
   writeFileSync(p, JSON.stringify({
     profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } },
   }, null, 2))
-  chmodSync(p, 0o644)
+  chmodSync(p, mode)
   return p
 }
 

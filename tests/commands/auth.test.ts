@@ -486,6 +486,25 @@ describe('auth login 写盘失败（A11，2026-11-06 审查）', () => {
 })
 
 describe('纯空白凭证（A12，2026-11-06）', () => {
+  it('whoami：配置文件里的纯空白凭证 → 1 + auth_missing，点名档名（Codex PR #69）', async () => {
+    // 事故形态：只查环境变量时，文件里的 `" "` 被 nonEmptyValue 当成「有」→ configured:true，
+    // 而 api/sync 的 resolveCredentials 会拒绝它 —— 「谁都说配好了、只有真调用失败」。
+    writeCfg({ profiles: { default: { credentials: { appKey: '   ', appSecret: 'sss' } } } })
+    expect(await authCommand(['whoami'])).toBe(1)
+    const e = JSON.parse(out).error as Record<string, unknown>
+    expect(e.kind).toBe('auth_missing')
+    expect(String(e.message)).toContain('appKey')
+    expect(String(e.message)).toContain('"default"')
+  })
+
+  it('whoami：env 已有值时文件里的空白不被选中 → 仍报 configured:true（逐字段优先级 env > file）', async () => {
+    // 反向对照：不要在没有影响时误报 —— api call 此刻用 env 的值照常成功。
+    writeCfg({ profiles: { default: { credentials: { appKey: '   ', appSecret: 'sss' } } } })
+    vi.stubEnv('QIYU_APP_KEY', 'envkey-123')
+    expect(await authCommand(['whoami'])).toBe(0)
+    expect(JSON.parse(out).data.configured).toBe(true)
+  })
+
   it('whoami：env 纯空白 → 1 + auth_missing，点名变量（不再报 configured:true）', async () => {
     // 此前 `' '` 是 truthy → configured:true / source:env，而 api call 拿它去签名。
     vi.stubEnv('QIYU_APP_KEY', '   ')

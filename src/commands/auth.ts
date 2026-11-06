@@ -373,6 +373,24 @@ function whoami(): number {
   const fromFileKey = nonEmptyValue(fileKey) !== undefined
   const fromFileSecret = nonEmptyValue(fileSecret) !== undefined
 
+  // ⚠️ 配置文件里同一档的纯空白值也要拒绝（Codex PR #69）：只查环境变量时，配置文件里
+  // `" "` 会被 `nonEmptyValue` 当成「有」，whoami 报 configured:true，而 api/sync 的
+  // `resolveCredentials` 会拒绝它 —— 又是「谁都说配好了、只有真调用失败」的分叉。
+  // ⚠️ 只在**该字段真的会取文件这一层**时才拒（逐字段优先级 env > file）：环境变量已给值时
+  // 文件里的空白不会被选中，`api call` 也照常成功 —— 那时报错就是把好状态说成坏的。
+  const blankFile = [
+    ...(!fromEnvKey && isWhitespaceOnly(fileKey) ? ['appKey'] : []),
+    ...(!fromEnvSecret && isWhitespaceOnly(fileSecret) ? ['appSecret'] : []),
+  ]
+  if (blankFile.length > 0) {
+    return fail({
+      code: 'auth_missing', kind: 'auth_missing', retryable: false,
+      message: `配置文件里 profile ${JSON.stringify(profileName)} 的 ${blankFile.join('、')}`
+        + '只有空白字符（不是有效凭证）',
+      hint: `请在该档里设为真实值，或删掉这个键让环境变量生效：${configPathFor()}`,
+    })
+  }
+
   const configured = (fromEnvKey || fromFileKey) && (fromEnvSecret || fromFileSecret)
 
   if (!configured) {
