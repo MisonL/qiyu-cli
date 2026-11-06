@@ -202,7 +202,10 @@ describe('原子写入（writeConfigFile）', () => {
   })
 
   it('已有 0755 目录能写入（writeConfigFile 不改变已存在目录的权限）', () => {
+    // ⚠️ `mkdirSync({ mode })` 会被进程 umask 收紧（`umask 077` 下得到 0700），
+    // 所以夹具必须显式 chmod —— 否则这条用例在 umask 077 的 shell 里假失败（Codex PR #69）。
     mkdirSync(join(home, '.config', 'qiyu'), { recursive: true, mode: 0o755 })
+    chmodSync(join(home, '.config', 'qiyu'), 0o755)
     writeConfigFile(cfgPath(), content)
     expect(statSync(cfgPath()).mode & 0o777).toBe(0o600)
     expect(statSync(join(home, '.config', 'qiyu')).mode & 0o777).toBe(0o755)

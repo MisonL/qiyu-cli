@@ -1182,6 +1182,25 @@ describe('sync run/verify —— --profile 同时选中凭证与库（A1）', ()
   })
 })
 
+describe('sync tasks —— --help 的参数作用域（Codex PR #69 第四轮）', () => {
+  it('兄弟命令的 flag 在 `sync tasks --help` 下同样非法（运行时与 spec 同答）', async () => {
+    // `sync tasks` 只接受全局 flag；并集会放过 run 的 --full / --db，
+    // 而正常解析与 `skill check` 都判非法。
+    expect(await syncCommand(['tasks', '--full', '--help'])).toBe(2)
+    expect(err).toContain('--full')
+    out = ''; err = ''
+    expect(await syncCommand(['tasks', '--db', '/tmp/x', '--help'])).toBe(2)
+    expect(err).toContain('--db')
+    // 反向：合法调用照样给帮助
+    out = ''; err = ''
+    expect(await syncCommand(['tasks', '--help'])).toBe(0)
+    expect(out).toContain('用法：')
+    // `--pretty` 是全局 flag，帮助模式下仍合法
+    out = ''; err = ''
+    expect(await syncCommand(['tasks', '--pretty', '--help'])).toBe(0)
+  })
+})
+
 describe('sync install', () => {
   /** 预置「已同步过」的库：sync_state 有真实数据集行（install 的前置探测）。 */
   async function seedSynced(): Promise<void> {

@@ -749,12 +749,11 @@ export async function syncCommand(argv: string[]): Promise<number> {
   if (sub === 'install') return syncInstall(rest)
   if (sub === 'uninstall') return syncUninstall(rest)
   // —— tasks ——
-  if (rest.includes('--help') || rest.includes('-h')) {
-    const problem = helpArgsError(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
-    if (problem !== undefined) return usageFail(problem)
-    process.stdout.write(USAGE)
-    return 0
-  }
+  // ⚠️ 用 `sync tasks` **自己**的 spec（`subHelp`），不是全族并集（Codex PR #69 第四轮）：
+  // 并集会把兄弟命令的 flag（`--full` / `--db`）当成合法参数，`sync tasks --full --help`
+  // 退 0 打印帮助，而正常解析与 `skill check` 都判它非法 —— 运行时与契约校验再次分叉。
+  const tasksHelp = subHelp(rest, 'tasks')
+  if (tasksHelp !== null) return tasksHelp
   // G1：--pretty 已实现 —— 原拒绝点开启缩进输出。
   if (rest.includes('--pretty')) setPretty(true)
 

@@ -1037,6 +1037,19 @@ describe('skill check', () => {
     expect((data().differences as string[]).join('\n')).toContain('已安装的文件集与包内不同')
   })
 
+  it('--compare 清单含重复条目且漏一个文件（长度恰好相等）→ 仍退 1（Codex PR #69 第四轮）', async () => {
+    // 「长度相等 + 逐个在包内」不是集合相等：把 errors.md 换成第二个 SKILL.md 后
+    // 长度不变、每个条目都在包内 —— 旧判据会误判「一致」并退 0。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const mp = join(entity, MANIFEST)
+    const m = JSON.parse(readFileSync(mp, 'utf8')) as { files: string[] }
+    m.files = m.files.map((f) => (f.endsWith('errors.md') ? 'SKILL.md' : f))
+    writeFileSync(mp, JSON.stringify(m))
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+    expect((data().differences as string[]).join('\n')).toContain('已安装的文件集与包内不同')
+  })
+
   it('--compare 在未安装时报告差异并退出 1（不抛 ENOENT）', async () => {
     expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
     const d = data()

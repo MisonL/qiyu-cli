@@ -40,7 +40,7 @@ import { COMMAND_TREE } from './tree.js'
 import { prettyAfterSubcommand } from './spec-types.js'
 import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult, type ViolationRule } from '../skill/check.js'
-import { contentHash, contentHashOfFiles, fileHash, installSkill, listFiles, planInstall, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
+import { contentHash, contentHashOfFiles, fileHash, installSkill, listFiles, planInstall, sameFileSet, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
 import {
   ENTITY_SOURCES, entityUndeterminedNote, npmRelativeBase, readInstalledManifestInfo,
   resetSkillDetectionCache, resolveEntityDirSources, resolveSkillSourceDir,
@@ -1060,8 +1060,7 @@ async function skillCheck(argv: string[]): Promise<number> {
           let reason = '包内与已安装的正文内容不同（content_hash 不一致）'
           if (cmpInfo?.files !== undefined && cmpInfo.files.length > 0) {
             const pkgFiles = listFiles(pkgDir)
-            const sameSet = cmpInfo.files.length === pkgFiles.length
-              && cmpInfo.files.every((f) => pkgFiles.includes(f))
+            const sameSet = sameFileSet(cmpInfo.files, pkgFiles)
             differs = !sameSet
               || contentHashOfFiles(entityDir, cmpInfo.files) !== contentHashOfFiles(pkgDir, cmpInfo.files)
             if (!sameSet) reason = '已安装的文件集与包内不同（包已增删文件）'

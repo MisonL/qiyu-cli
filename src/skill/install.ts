@@ -248,6 +248,21 @@ export function contentHashOfFiles(dir: string, rels: readonly string[]): string
   return hashFileSet([...rels].sort(), dir)
 }
 
+/**
+ * 两份文件清单是否是**同一个集合**（唯一判据，2026-11-06 Codex 第四轮）。
+ *
+ * ⚠️ 不能写成「长度相等 + 逐个在包内」：清单被手工编辑或损坏时可能**含重复条目**
+ * 并漏掉另一个文件（把 `errors.md` 换成第二个 `SKILL.md`）—— 长度恰好相等、每个条目
+ * 也都在包内，两处比对都会误判「一致」：`skill check --compare` 退 0，
+ * `planInstall` 还会走 rewrite-manifest 分支、`--force` 也跳过修复。
+ * 重复条目本身说明清单不可信，一律判「不同」。
+ */
+export function sameFileSet(a: readonly string[], b: readonly string[]): boolean {
+  const sa = new Set(a)
+  const sb = new Set(b)
+  return sa.size === a.length && sa.size === sb.size && [...sa].every((f) => sb.has(f))
+}
+
 function hashFileSet(rels: string[], dir: string): string {
   const hash = createHash('sha256')
   for (const rel of rels) {
@@ -1096,9 +1111,8 @@ export function planInstall(opts: {
         // 「包升级新增了一个文件」误判成「正文一致」—— 随后走 rewrite-manifest 分支，
         // 只重写清单、不复制新文件，status 却报 updated：实体里根本没有那个文件。
         // 集合不同的成因是**包变了**，不是用户改动，所以原因文案也要分开。
-        const pkgSet = new Set(sourceFiles)
-        fileSetDiffers = managedRels.length !== sourceFiles.length
-          || managedRels.some((rel) => !pkgSet.has(rel))
+        // 判据走 `sameFileSet`（同时拒绝重复条目），与 `check --compare` 同源。
+        fileSetDiffers = !sameFileSet(managedRels, sourceFiles)
         if (!fileSetDiffers) {
           targetHash = contentHashOfFiles(entityDir, managedRels)
           sourceComparableHash = contentHashOfFiles(sourceDir, managedRels)
