@@ -122,7 +122,7 @@
 
 ### 修复
 
-- **skill / 凭证 / CLI 输出的三十四处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
+- **skill / 凭证 / CLI 输出的三十六处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
 
   · **`skill install` 与 `where` / `check` 对「受管文件集」的口径分叉**：install 把用户额外
     放进 skill 目录的任意文件也算成「可能被手工修改」并建议 `--force`，而 `--force` 又不
@@ -240,9 +240,18 @@
     新增 `managedContentHash`：先验证每个条目是**实体目录内的普通文件**，不可比的形态
     给出点名原因（缺失 / 非普通文件 / 逃出实体）而不读取；
   · **README 的 `--profile` 建议对部分命令不可执行**（Codex 第五轮）：`api *` /
-    `auth whoami` / `sync tasks` 都**不接受** `--profile`（实测退 2），原文
+    `auth whoami` / `sync tasks` 都**不接受** `--profile`（逐个实测退 2），原文
     「在每条命令上写 `--profile staging`」是做不到的动作。按命令能力二分：接受它的
     命令写 flag，其余只能 `QIYU_PROFILE` 或改 `defaultProfile`；
+  · **接受清单里错列了 `sync uninstall`**（Codex 第六轮）：它只接受全局 flag 与 `--yes`
+    （实测 `sync uninstall --profile staging` 退 2）—— 照新文档执行必然失败。从接受清单
+    移除，并把守卫加强为「接受那一行不得出现 uninstall」；
+  · **清单文件自身是 FIFO 同样挂死**（Codex 第六轮）：上一处只挡住了受管正文，
+    `readManifestSafe` / `readManifestStrict` 仍直接 `readFileSync` 清单 —— 清单路径被
+    FIFO 占住时 `skill install` / `where` / `check --compare` 全部无限阻塞。新增
+    `assertPlainFile` / `readPlainTextFile`（读前验类型，唯一的普通文件判据），
+    三处读清单全部走它；判据用 `statSync`（跟随符号链接）以保留既有语义 ——
+    清单路径上的**断链**照旧读成「缺失」（stale），指向文件的链接照旧可读；
 
 - **查询 / 存储 / 元数据命令的十五处契约修正（2026-11-05 第二路独立审查，三路探子 + 探针实测 + 十余轮双路收敛）**：
 

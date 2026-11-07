@@ -1054,6 +1054,11 @@ describe('README 的 --profile 建议必须按命令能力限定（Codex PR #69 
     }
     // 正向：接受它的命令族也要点名（否则用户不知道哪些能写 flag）
     expect(s).toContain('接受 `--profile` 的命令')
+    // ⚠️ `sync uninstall` 不接受 `--profile`（实测退 2）——它曾被错列进接受清单，
+    // 照文档执行必然失败。断言它只出现在「不接受」那一条里。
+    const accepting = s.split('\n').find((l) => l.includes('接受 `--profile` 的命令')) ?? ''
+    expect(accepting).toContain('sync run|status|verify|install')
+    expect(accepting, 'uninstall 不接受 --profile，不得列进接受清单').not.toContain('uninstall')
   })
 })
 

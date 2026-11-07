@@ -318,6 +318,27 @@ describe('受管条目不是普通文件时不得读取（Codex PR #69 第五轮
     expect(w).toContain('非普通文件')
   })
 
+  it.skipIf(process.platform === 'win32')('清单文件本身是 FIFO：不阻塞，按「清单不可用」处理', async () => {
+    // `readManifestSafe` / `readManifestStrict` 都直接 readFileSync 清单 —— FIFO 会让
+    // 它们无限阻塞（同步调用打不断 testTimeout，Codex PR #69 第六轮）。判据：
+    // 读前先验普通文件（`assertPlainFile`，用 `statSync` 跟随符号链接）；非普通文件
+    // 按「清单不可用」降级（install 走 rewrite-manifest 的占用提示，where/check 按
+    // 「判定不了」处理）。
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    const entity = defaultEntityDir(home)
+    rmSync(join(entity, MANIFEST))
+    execFileSync('mkfifo', [join(entity, MANIFEST)])
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    // 正文与包内一致：计划在「写清单」那一步发现占用 → skipped + 点名清单
+    expect(r.status).toBe('skipped')
+    expect(r.warnings.join('\n')).toContain(MANIFEST)
+    // 再跑一次也不得挂死（幂等路径同样要读清单）
+    const r2 = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    expect(r2.status).toBe('skipped')
+  })
+
   it.skipIf(process.platform === 'win32')('受管路径是符号链接：不跟随读取、不得判「正文一致」', async () => {
     const src = makeSource()
     await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })

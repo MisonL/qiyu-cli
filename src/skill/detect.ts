@@ -45,7 +45,7 @@ import { readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { contentHash, MANIFEST, readManifestSafe, type Manifest } from './install.js'
+import { contentHash, MANIFEST, readManifestSafe, readPlainTextFile, type Manifest } from './install.js'
 import { defaultEntityDir, dirShape, readEnvByNormalizedKey } from './paths.js'
 import { nonEmptyValue } from '../core/config.js'
 
@@ -230,7 +230,10 @@ function probe(entityDir: string, sourceDir: string, currentVersion: string): Sk
 function readManifestStrict(entityDir: string): Manifest | null {
   let text: string
   try {
-    text = readFileSync(path.join(entityDir, MANIFEST), 'utf8')
+    // ⚠️ 走 `readPlainTextFile`（先验普通文件）：清单被 FIFO 占住时 `readFileSync` 会
+    // 无限阻塞（Codex PR #69 第六轮）。非普通文件抛 EINVAL —— 与 EACCES 同路，
+    // 落到下面的 rethrow（= 状态 unknown，静默），语义与「清单看不了」一致。
+    text = readPlainTextFile(path.join(entityDir, MANIFEST))
   } catch (err) {
     if (isErrno(err, 'ENOENT')) return null
     throw err

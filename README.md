@@ -108,8 +108,8 @@ qiyu auth login --profile staging    # 写入指定 profile
 ⚠️ `--profile staging` **只写该档，不改顶层的 `defaultProfile`**：写完之后不带 `--profile`
 的命令仍然按原顺序选档（`QIYU_PROFILE` > `defaultProfile` > 内置 `default`）。想固定用这一档，
 按命令能力二选一：
-- **接受 `--profile` 的命令**（`store *`、`db *`、`query`、`stats fields`、`sync run|status|verify|install|uninstall`）
-  —— 在每条命令上写 `--profile staging`；
+- **接受 `--profile` 的命令**（`store *`、`db *`、`query`、`stats fields`、`sync run|status|verify|install`）
+  —— 在每条命令上写 `--profile staging`（`sync uninstall` 不接受它，见下一条）；
 - **不接受 `--profile` 的命令**（`api *`、`auth whoami`、`sync tasks`、`skill *`）—— 只能用
   `export QIYU_PROFILE=staging`，或把配置顶层的 `defaultProfile` 改成 `staging`。
 

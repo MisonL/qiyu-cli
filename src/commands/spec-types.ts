@@ -28,6 +28,8 @@
 // 在 spec-types 里再写一遍就是第二事实源。无循环 —— `output.ts` 只 import
 // `core/sanitize.js`，不 import 本文件（`tests/store/layering.test.ts` 的分层规则也放行）。
 
+import { describeArgs } from '../output.js'
+
 /**
  * 位置参数的取值域——`skill check` 据此比对正文里出现的表名 / 报表表 / 任务 id / 接口 id。
  *
@@ -39,8 +41,6 @@
  *     接口运行时必然 exit 2（实测 `api call crm.modifyOrder` → 「接口不可主动调用」），
  *     用全集会让这条**必然失败**的调用被判合法（假阴性，正是 check 要防的）。
  */
-import { describeArgs } from '../output.js'
-
 export type Domain = 'tables' | 'report-tables' | 'task-ids' | 'endpoint-ids' | 'callable-endpoint-ids'
 
 export interface FlagSpec {

@@ -248,15 +248,6 @@ export function contentHashOfFiles(dir: string, rels: readonly string[]): string
   return hashFileSet([...rels].sort(), dir)
 }
 
-/**
- * 两份文件清单是否是**同一个集合**（唯一判据，2026-11-06 Codex 第四轮）。
- *
- * ⚠️ 不能写成「长度相等 + 逐个在包内」：清单被手工编辑或损坏时可能**含重复条目**
- * 并漏掉另一个文件（把 `errors.md` 换成第二个 `SKILL.md`）—— 长度恰好相等、每个条目
- * 也都在包内，两处比对都会误判「一致」：`skill check --compare` 退 0，
- * `planInstall` 还会走 rewrite-manifest 分支、`--force` 也跳过修复。
- * 重复条目本身说明清单不可信，一律判「不同」。
- */
 export type ManagedHashResult =
   | { hash: string }
   | { problem: 'missing' | 'not_plain' | 'escapes'; rel: string }
@@ -268,7 +259,7 @@ export type ManagedHashResult =
  * 第五轮实测）：清单里的一条被 FIFO 占住时 `readFileSync` **无限阻塞**（打开读端等写端），
  * `skill install` 与 `skill check --compare` 都会挂死；被换成指向目录外的符号链接时，
  * 读取会**跟随链接**拿到与包内相同的内容 → 误判「正文一致」，而入口文件必须是实体内的
- * 普通文件（skill spec §…）。旧的整目录哈希走 `listFiles`（只收普通文件），天然躲开了
+ * 普通文件（skill spec「`SKILL.md` … 不能是符号链接」）。旧的整目录哈希走 `listFiles`（只收普通文件），天然躲开了
  * 这两种形态 —— 换成受管集哈希后必须把这道筛选补回来。
  *
  * 读取**内容**时的 I/O 错误（EACCES 等）仍然抛给调用方（--force 能修好），这里只拦
@@ -292,6 +283,15 @@ export function managedContentHash(dir: string, rels: readonly string[]): Manage
   return { hash: contentHashOfFiles(dir, rels) }
 }
 
+/**
+ * 两份文件清单是否是**同一个集合**（唯一判据，2026-11-06 Codex 第四轮）。
+ *
+ * ⚠️ 不能写成「长度相等 + 逐个在包内」：清单被手工编辑或损坏时可能**含重复条目**
+ * 并漏掉另一个文件（把 `errors.md` 换成第二个 `SKILL.md`）—— 长度恰好相等、每个条目
+ * 也都在包内，两处比对都会误判「一致」：`skill check --compare` 退 0，
+ * `planInstall` 还会走 rewrite-manifest 分支、`--force` 也跳过修复。
+ * 重复条目本身说明清单不可信，一律判「不同」。
+ */
 export function sameFileSet(a: readonly string[], b: readonly string[]): boolean {
   const sa = new Set(a)
   const sb = new Set(b)
@@ -449,10 +449,44 @@ function copyTree(src: string, dest: string, isRoot = true): void {
 }
 
 /**
+ * 「必须存在且是普通文件」的类型断言（`readPlainTextFile` 的判据本体，2026-11-06 Codex 第六轮）。
+ *
+ * ⚠️ 直接用 `readFileSync` 打开一个**没有写端的 FIFO 会无限阻塞**（读端等写端），
+ * 而这是同步调用 —— vitest 的 `testTimeout`、`try/catch` 都拦不住，命令会硬挂死。
+ * 实体目录里的一条被 FIFO 占住（清单 `.qiyu-skill.json` 或受管正文）就是这种形态。
+ * 先 `statSync` 判类型再读：非普通文件（FIFO / 目录 / 设备）立刻抛 `EINVAL` 类错误，
+ * 由调用方按自己的策略处理（多数是「不可用 / 不可比」）。
+ *
+ * ENOENT 等 `statSync` 自身的错误原样抛出 —— 调用方需要区分「不存在」与「存在但不可读」。
+ */
+export function assertPlainFile(abs: string): void {
+  // ⚠️ 用 `statSync`（**跟随符号链接**）而不是 `lstatSync`：清单路径上的符号链接是既有
+  // 形态，断链要照旧读成 ENOENT（→ 「清单缺失」→ stale，提示照给），指向文件的链接
+  // 照旧读得到。要挡的只是**读取会阻塞或必定失败**的形态：FIFO（打开读端等写端）、
+  // 目录、设备节点 —— `statSync` 对它们在类型上就能判出来，不必真去读。
+  const st = statSync(abs)
+  if (!st.isFile()) {
+    throw Object.assign(new Error(`不是普通文件（目录/FIFO/设备等）：${abs}`), { code: 'EINVAL' })
+  }
+}
+
+/** 按 utf8 读一个必须是普通文件的路径（清单等文本场景）。 */
+export function readPlainTextFile(abs: string): string {
+  assertPlainFile(abs)
+  return readFileSync(abs, 'utf8')
+}
+
+/**
  * 单个文件的内容哈希：换行归一化后的 sha256（与 `contentHash` 里的逐文件口径一致）。
  * 清单用它记录「本工具当时写下的内容」，供下一次 --force 清理时核对（审查 #59）。
+ *
+ * ⚠️ 读前先验类型（`assertPlainFile`）：这个函数会被 `where` 直接用在实体文件上，
+ * FIFO 会挂死（Codex PR #69 第六轮）。调用方（清理 / 写入）都已自行筛过普通文件，
+ * 这里再筛一次是**兜底**，不改变既有行为。
  */
 export function fileHash(abs: string): string {
+  // 二进制读（与旧实现一致），但读前先验类型 —— 见上面 `assertPlainFile` 的理由。
+  assertPlainFile(abs)
   return createHash('sha256').update(normalizeNewlines(readFileSync(abs))).digest('hex')
 }
 
@@ -506,7 +540,9 @@ function writeManifest(
  */
 export function readManifestSafe(entityDir: string): Manifest | null {
   try {
-    const raw = JSON.parse(readFileSync(path.join(entityDir, MANIFEST), 'utf8')) as Partial<Manifest>
+    // 走 `readPlainTextFile`：清单被 FIFO 占住时不得阻塞（Codex PR #69 第六轮），
+    // 非普通文件 → 抛 EINVAL → 落到本函数的 catch → null（= 「清单不可用」）。
+    const raw = JSON.parse(readPlainTextFile(path.join(entityDir, MANIFEST))) as Partial<Manifest>
     if (
       typeof raw.version === 'string'
       && typeof raw.skill_contract_version === 'number'
