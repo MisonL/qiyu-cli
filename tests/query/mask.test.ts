@@ -1227,6 +1227,26 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     }
   })
 
+  it('P2b 词法反向：字符串/注释里的 SUMMARIZE 同名词不得触发形状（合法元数据查询）', () => {
+    // Codex 2026-11-08 第二轮 P2：关键字判据必须作用在剥除字面量/注释后的文本上。
+    // 否则 `SELECT 'SUMMARIZE' AS marker, column_name, MIN(ordinal_position) AS min …`
+    // 会被误判成 SUMMARIZE 输出，把元数据里的位置数字改成 <已脱敏>。
+    const base = {
+      rows: [{ column_name: 'userName', min: 3 }],
+      columns: ['column_name', 'min'],
+      tables: TABLES,
+    }
+    for (const sql of [
+      "SELECT 'SUMMARIZE' AS marker, column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name",
+      'SELECT column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name -- SUMMARIZE sessions',
+      "SELECT $$SUMMARIZE sessions$$ AS marker, column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name",
+    ]) {
+      const out = maskQueryRows({ ...base, mode: { kind: 'sql', sql, tables: TABLES } })
+      expect(out.rows[0]!.min, sql).toBe(3)
+      expect(out.warnings.join('\n'), sql).not.toContain('SUMMARIZE')
+    }
+  })
+
   it('P families：SUMMARIZE 的 avg/std 也是 PII 派生值，一并替换', () => {
     const out = maskQueryRows({
       rows: [{ column_name: 'userPhone', min: null, max: null, avg: '13800138000.5', std: '3' }],

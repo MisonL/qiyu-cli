@@ -302,6 +302,9 @@ describe('错误分类', () => {
     expect(r.retryable).toBe(false)
     expect(r.hint).toMatch(/严格小于/)
     expect(r.hint).toMatch(/max_window_days/)
+    // ⚠️ 三成因共码（设计稿 §7.5）：不得把成因说死成「跨度超限」——
+    // start >= end 的用户照 hint 切片后仍会撞同一个码。
+    expect(r.hint).toMatch(/start\s*>=\s*end/)
     // 反向：报文大小写变化不得漏判（真实报文的 T 大写，但别把判据钉在大小写上）
     expect(classify(14004, 'timestamp interval limit').kind).toBe('window_too_large')
   })

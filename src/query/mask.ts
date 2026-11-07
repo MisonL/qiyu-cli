@@ -544,18 +544,26 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // （输出列名、SQL 文本、payload）全部落空，`userName` / `userAddress` 的 min/max **原值
   // 静默输出**，且 `mask_warnings` 为空（实测：`min:"张三丰"`、`max:"李四光"`）。
   // 这是「声明敏感但可从一条只读语句拿到明文」的完整绕过，必须在行级补一道判据。
-  //   · 形状判据：**SQL 文本出现 SUMMARIZE 关键字** + 输出含 `column_name` 且含
-  //     `min`/`max`。⚠️ 只看列名不够（Codex 2026-11-08 P2 实测）：
+  //   · 形状判据：**SQL 词法上的 SUMMARIZE 关键字**（不是字符串/注释里的同名词）+ 输出含
+  //     `column_name` 且含 `min`/`max`。⚠️ 只看列名不够（Codex 2026-11-08 P2 实测）：
   //     `SELECT column_name, MIN(ordinal_position) AS min FROM information_schema.columns
   //     GROUP BY column_name` 输出同样的 `column_name/min`，min 是列位置数字而非客户数据，
   //     只按列名判会把 `min: 3` 误改成 `<已脱敏>`。
-  //     SQL 文本判据覆盖全部实测形态（`SUMMARIZE sessions`、`SELECT * FROM (SUMMARIZE …)`、
-  //     `query('SUMMARIZE …')` —— 后者另有一条 nestedSql 缺口警告）；残余边界：
-  //     `query('SUMM' || 'ARIZE …')` 这类**动态拼串**文本里没有关键字，取不到（已由
-  //     nestedSql 警告声明「内层无法分析」的缺口，方向与既有口径一致）。
+  //     ⚠️ 关键字判据必须作用在**剥除字面量与注释后**的文本上（Codex 2026-11-08 第二轮 P2
+  //     实测）：`SELECT 'SUMMARIZE' AS marker, column_name, MIN(ordinal_position) AS min …`
+  //     的字符串字面量里出现同名词，按原始 SQL 判会把这条合法元数据查询误判成 SUMMARIZE。
+  //     `withoutLiterals` 把单引号串/美元引号串/注释抹成空格、双引号标识符原样保留 —— 正好
+  //     是「词法上下文」判据。
+  //   · 嵌套形态 `query('SUMMARIZE …')` 的关键字在**字符串里**（query() 的实参），
+  //     withoutLiterals 会把它抹掉 —— 单独判：裸 SQL 里出现 `query('…SUMMARIZE…')` 即视为
+  //     内层 SQL 为 SUMMARIZE（内层执行本来就是 nestedSql 警告声明的「无法分析」缺口方向，
+  //     这里是对已知形态的补强）。残余边界：`query('SUMM' || 'ARIZE …')` 动态拼串取不到。
   //   · 命中判据：该行 `column_name` 的**基名**精确匹配敏感列清单（与列名级同一口径）；
   //   · 动作：命中行的统计列按该列规则脱敏。
-  const summarizeShape = mode.kind === 'sql' && /\bSUMMARIZE\b/i.test(mode.sql)
+  const nestedSummarize = mode.kind === 'sql'
+    && /\bquery\s*\(\s*'(?:[^']|'')*?\bSUMMARIZE\b/i.test(mode.sql)
+  const summarizeShape = mode.kind === 'sql'
+    && (/\bSUMMARIZE\b/i.test(withoutLiterals(mode.sql)) || nestedSummarize)
     && columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
   // avg/std 只对数值列出现：`SUMMARIZE SELECT userPhone::DOUBLE AS userPhone` 的均值/标准差

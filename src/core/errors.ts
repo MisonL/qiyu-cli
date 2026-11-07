@@ -219,10 +219,15 @@ export function classify(code: number | string, rawMessage: string): QiyuError {
       // 此前落到兜底 param（「核对字段名与类型」）：成因完全指错，Agent 会反复核对
       // 字段并原样重试。与「≤ 上界即可」的报表族不同，这个接口的边界是**开**的 ——
       // 只说"缩小窗口"会让 Agent 切回恰好 N 天再撞一次，必须写出「严格小于」。
+      // ⚠️ 不得把成因说死（CodeRabbit 2026-11-08 minor）：设计稿 §7.5 实测
+      // `start>end` / `start==end` / 窗口超限**三成因共用这个码且不可区分** ——
+      // 只写「跨度超限」时，start>=end 的用户会照着切片再撞一次。
       return { ...base, kind: 'window_too_large', retryable: false,
-               hint: '时间跨度超出该接口上限 —— 且**恰好等于**注册表上界也会被拒' +
+               hint: '最常见成因：时间跨度超出该接口上限 —— 且**恰好等于**注册表上界也会被拒' +
                      '（export.session 实测：跨度恰为 max_window_days×86400000 毫秒报本错，' +
-                     '减 1 毫秒即通过）。请按「严格小于 max_window_days 天」的跨度切片后重试' }
+                     '减 1 毫秒即通过）。请按「严格小于 max_window_days 天」的跨度切片后重试；' +
+                     '⚠️ 同一报文也用于 start >= end（设计稿 §7.5：三成因共码、无法从报文区分）' +
+                     '—— 若切片后仍报同一错误，先核对 start 严格小于 end' }
     return param('服务端拒绝了参数，请核对字段名与类型')
   }
 
