@@ -12,32 +12,31 @@ const ENV = { appKey: 'env-key', appSecret: 'env-secret' }
 const FILE = { appKey: 'file-key', appSecret: 'file-secret' }
 
 describe('凭证解析优先级', () => {
-  it('命令行参数优先于环境变量与配置文件', () => {
-    expect(resolveCredentials({ appKey: 'cli-k', appSecret: 'cli-s' }, ENV, FILE))
-      .toMatchObject({ appKey: 'cli-k', appSecret: 'cli-s' })
-  })
+  // ⚠️ 这里**没有**「命令行参数优先」用例（2026-11-06 审查删除）：CLI 从未接受过
+  // 凭证 flag（`auth login --app-key` 被拒绝为未知参数，见 tests/commands/auth.test.ts），
+  // 那个形参永远收到 `{}`。守一条不可达的分支，等于宣称了一条不存在的来源。
 
-  it('无命令行参数时用环境变量', () => {
-    expect(resolveCredentials({}, ENV, FILE)).toMatchObject({ appKey: 'env-key' })
+  it('环境变量优先于配置文件', () => {
+    expect(resolveCredentials(ENV, FILE)).toMatchObject({ appKey: 'env-key' })
   })
 
   it('都没有时用配置文件', () => {
-    expect(resolveCredentials({}, {}, FILE)).toMatchObject({ appKey: 'file-key' })
+    expect(resolveCredentials({}, FILE)).toMatchObject({ appKey: 'file-key' })
   })
 
   it('完全缺失时抛出带指引的错误', () => {
-    expect(() => resolveCredentials({}, {}, undefined)).toThrow(/QIYU_APP_KEY/)
+    expect(() => resolveCredentials({}, undefined)).toThrow(/QIYU_APP_KEY/)
   })
 
   it('只有 appKey 没有 appSecret 时也报错，而不是发出必然失败的请求', () => {
-    expect(() => resolveCredentials({}, { appKey: 'k' }, undefined)).toThrow(/QIYU_APP_SECRET/)
+    expect(() => resolveCredentials({ appKey: 'k' }, undefined)).toThrow(/QIYU_APP_SECRET/)
   })
 
   it('环境变量这一层真的生效 —— 删掉它测试必须失败', () => {
     // 上一条用例曾因夹具写错而形同虚设，这条用 A/B 把契约钉死：
     // 给了 env 就必须用 env，哪怕 file 也在场。
-    expect(resolveCredentials({}, ENV, FILE).appKey).toBe('env-key')
-    expect(resolveCredentials({}, ENV, FILE).appSecret).toBe('env-secret')
+    expect(resolveCredentials(ENV, FILE).appKey).toBe('env-key')
+    expect(resolveCredentials(ENV, FILE).appSecret).toBe('env-secret')
   })
 })
 
@@ -140,5 +139,45 @@ describe('凭证脱敏', () => {
     const creds = { appKey: 'a.c', appSecret: 'x(y' }
     expect(() => redact('value is a.c here', creds)).not.toThrow()
     expect(redact('value is a.c here', creds)).not.toContain('a.c')
+  })
+})
+
+describe('纯空白值（A12，2026-11-06）', () => {
+  it('配置文件里的空白 appKey / appSecret 被拒绝，并说明不是有效凭证', () => {
+    // 命令行侧（credentials-source / auth login / whoami）会点名环境变量；
+    // 这一层兜住**文件**里的空白值，避免它一路穿到签名。
+    expect(() => resolveCredentials({}, { appKey: '  ', appSecret: 's' })).toThrow(/只有空白字符/)
+    expect(() => resolveCredentials({}, { appKey: 'k', appSecret: '\t\t' })).toThrow(/只有空白字符/)
+  })
+
+  // ⚠️ 恢复动作必须按来源给（Codex PR #69 第七轮）：同一句「删掉对应的…键」对
+  // 环境变量成立（删掉后 api/sync 回落读文件），对**配置键不成立** —— credentials
+  // 块要求两个键同时在，只删一个键会让 parseConfig 拒绝整份配置（端到端实测见
+  // tests/commands/auth.test.ts 的「只删单键反成死路」用例）。
+  it('配置文件的空白值：给「整个 credentials 块」的动作，不得只让人删单个键', () => {
+    let msg = ''
+    try { resolveCredentials({}, { appKey: '  ', appSecret: 's' }) } catch (e) { msg = (e as Error).message }
+    expect(msg).toContain('整个 credentials 块')
+    expect(msg).toContain('只删单个键会让配置文件解析失败')
+  })
+
+  it('环境变量的空白值：给 unset 的动作（删掉后能回落文件）', () => {
+    let msg = ''
+    try { resolveCredentials({ appKey: ' ', appSecret: 's' }) } catch (e) { msg = (e as Error).message }
+    expect(msg).toContain('unset QIYU_APP_KEY')
+    expect(msg).not.toContain('整个 credentials 块')
+  })
+
+  it('两个字段都为空白时一起点名；来源不同时各给各的动作', () => {
+    let both = ''
+    try { resolveCredentials({ appKey: ' ', appSecret: '\t' }) } catch (e) { both = (e as Error).message }
+    expect(both).toContain('QIYU_APP_KEY')
+    expect(both).toContain('QIYU_APP_SECRET')
+    // 混合来源：appKey 来自 env（unset），appSecret 来自文件（整个块）。
+    // env 不给 appSecret，文件那份空白才会被选中。
+    let mixed = ''
+    try { resolveCredentials({ appKey: ' ' }, { appSecret: '  ' }) } catch (e) { mixed = (e as Error).message }
+    expect(mixed).toContain('unset')
+    expect(mixed).toContain('整个 credentials 块')
   })
 })

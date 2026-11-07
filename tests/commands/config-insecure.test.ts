@@ -32,15 +32,15 @@ let out = ''
 let err = ''
 const dbPath = (): string => join(home, 'q.db')
 
-/** 写一份**含凭证**且权限过宽（0644）的配置 —— 唯一的触发条件。 */
-function writeWideConfig(): string {
+/** 写一份**含凭证**且权限过宽的配置（默认 0644，可改判据覆盖的其他形态）。 */
+function writeWideConfig(mode = 0o644): string {
   const dir = join(home, '.config', 'qiyu')
   mkdirSync(dir, { recursive: true })
   const p = join(dir, 'config.json')
   writeFileSync(p, JSON.stringify({
     profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } },
   }, null, 2))
-  chmodSync(p, 0o644)
+  chmodSync(p, mode)
   return p
 }
 
@@ -129,6 +129,20 @@ posixOnly('含凭证且权限过宽（0644）→ 六条命令同一种行为', (
     chmodSync(p, 0o644)
     expect(await storeCommand(['status', '--db', dbPath()])).not.toBe(2)
     expect(errorOf().kind).not.toBe('config_insecure')
+  })
+
+  // A5（2026-11-06）：判据是「group/other 有任何位」，而文案曾把每一种形态都说成
+  // 「其他用户可读到 appSecret」——0602（只写）/0601（仅执行）根本读不到，这句是假的。
+  it.each([
+    ['0602（group/other 只写）', 0o602],
+    ['0601（仅 other 可执行）', 0o601],
+  ])('%s 也拒绝，但 message 不谎称可读到 appSecret', async (_name, mode) => {
+    writeWideConfig(mode)
+    expect(await storeCommand(['status'])).toBe(1)
+    const e = errorOf()
+    expect(e.kind).toBe('config_insecure')
+    expect(String(e.message)).toMatch(/group\/other 有权限位/)
+    expect(String(e.message)).not.toMatch(/其他用户可读到 appSecret/)
   })
 })
 

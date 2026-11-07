@@ -123,12 +123,22 @@ describe('权限裁决（loadConfigChecked）', () => {
 
   it('**无**凭证且 0644 → 只警告不阻断（C1 既有口径）', () => {
     writeCfg({ profiles: { default: { store: { batchSize: 5 } } } }, 0o644)
-    const msgs: string[] = []
-    const r = loadConfigChecked(cfgPath())
-    expect(r.exists).toBe(true)
-    // 直接调 checkPermissions 看警告：loadConfigChecked 把警告写到 stderr
-    // （这里用 fileProfile 的 warn 通道拿不到权限警告，所以单独断言行为没抛）
-    expect(msgs).toEqual([])
+    // A8（2026-11-06 审查）：此前的 `msgs` 数组从未被 push，`expect(msgs).toEqual([])`
+    // 恒真 —— 把警告整段删掉它也绿。警告走 stderr（loadConfigChecked 的 onWarn），
+    // 这里真的捕获它。
+    const written: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((s) => {
+      written.push(String(s)); return true
+    })
+    __resetPermissionWarnings()
+    try {
+      const r = loadConfigChecked(cfgPath())
+      expect(r.exists).toBe(true)
+      expect(written.join('')).toMatch(/权限过宽/)
+      expect(written.join('')).toMatch(/chmod 600/)
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   it('父目录 group/other 可写且含凭证 → 拒绝（文件可被整体替换）', () => {
@@ -183,12 +193,22 @@ describe('权限裁决（loadConfigChecked）', () => {
 describe('原子写入（writeConfigFile）', () => {
   const content = { profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } } }
 
-  it('文件 0600、目录 0700、内容为规范化 JSON + 尾换行', () => {
+  it('文件 0600、新建目录 0700、内容为规范化 JSON + 尾换行', () => {
     writeConfigFile(cfgPath(), content)
     expect(statSync(cfgPath()).mode & 0o777).toBe(0o600)
     expect(statSync(join(home, '.config', 'qiyu')).mode & 0o777).toBe(0o700)
     expect(readFileSync(cfgPath(), 'utf8')).toBe(serializeConfig(content))
     expect(readFileSync(cfgPath(), 'utf8').endsWith('\n')).toBe(true)
+  })
+
+  it('已有 0755 目录能写入（writeConfigFile 不改变已存在目录的权限）', () => {
+    // ⚠️ `mkdirSync({ mode })` 会被进程 umask 收紧（`umask 077` 下得到 0700），
+    // 所以夹具必须显式 chmod —— 否则这条用例在 umask 077 的 shell 里假失败（Codex PR #69）。
+    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true, mode: 0o755 })
+    chmodSync(join(home, '.config', 'qiyu'), 0o755)
+    writeConfigFile(cfgPath(), content)
+    expect(statSync(cfgPath()).mode & 0o777).toBe(0o600)
+    expect(statSync(join(home, '.config', 'qiyu')).mode & 0o777).toBe(0o755)
   })
 
   it('覆盖已有 0644 文件后权限收紧为 0600', () => {

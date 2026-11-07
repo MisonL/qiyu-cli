@@ -20,9 +20,15 @@
 //     的 `rejected_flag` 规则都在，将来若再出现"已知但显式拒绝"的 flag 直接登记），
 //     只是当前没有任何 flag 属于这一类。
 //
-// 本文件必须保持零依赖（只含类型、常量与几个纯函数）：`core/`、`query/`、`sync/`
+// 本文件保持「几乎零依赖」（只含类型、常量与几个纯函数）：`core/`、`query/`、`sync/`
 // 分层红线之外，它是 commands 层里最底层的一块，被各命令模块与 `tree.ts` 的
 // `COMMAND_TREE` 共同消费。
+// ⚠️ 唯一的外部依赖是 `output.ts` 的 `describeArgs`（2026-11-06 Codex 审查引入）：
+// 错误文案里的参数渲染必须只有一份实现（空串/纯空白要写成 `''`/`' '`），
+// 在 spec-types 里再写一遍就是第二事实源。无循环 —— `output.ts` 只 import
+// `core/sanitize.js`，不 import 本文件（`tests/store/layering.test.ts` 的分层规则也放行）。
+
+import { describeArgs } from '../output.js'
 
 /**
  * 位置参数的取值域——`skill check` 据此比对正文里出现的表名 / 报表表 / 任务 id / 接口 id。
@@ -41,6 +47,13 @@ export interface FlagSpec {
   name: string
   /** repeatable：可重复给（如 `query --group-by`），校验时只关心是否被接受。 */
   kind: 'value' | 'bool' | 'repeatable'
+  /**
+   * 取值**允许以 `--` 开头**（目前只有 `query --sql`：SQL 的行注释以 `-- ` 开始）。
+   *
+   * 值位守卫用它区分「取值恰好是下一个 flag（真缺值）」与「取值只是以 `--` 开头」——
+   * 帮助模式的检查（`helpArgsError`）与 `query` 自己的解析器都读这一个字段，不各写一份。
+   */
+  dashValue?: boolean
 }
 
 /**
@@ -170,6 +183,54 @@ export const STORE_FLAGS: FlagSpec[] = [
  */
 export function valueFlagNames(flags: readonly FlagSpec[]): string[] {
   return flags.filter((f) => f.kind === 'value' || f.kind === 'repeatable').map((f) => f.name)
+}
+
+/**
+ * `--help` 模式下的参数检查（唯一实现点，2026-11-06 审查）：只把**不在完整接受集里的
+ * flag** 与**缺值的值位 flag** 当错误；位置参数与被正确消费的取值在帮助模式下忽略
+ *（`tickets`、`0 3 * * *` 都是取值/位置参数，不是要检查的对象）。
+ *
+ * 帮助请求不该因为**合法参数**而失败：`qiyu db describe tickets --help` 是 Agent 想
+ * 看帮助的常规写法，而此前各命令的 help 分支拿 `KNOWN = GLOBAL_FLAG_NAMES` 过滤 argv，
+ * 于是 `tickets` / `--db` / `--schedule 0 3 * * *` 全被判成「未知参数」并退出 2；
+ * 同一命令行在 `api list` / `sync run` / `skill *` 上却退出 0（它们的 KNOWN 来自 spec）。
+ * 更重的是：`skill check` 按 `CommandSpec.flags` 判这些命令**合法**，检查器与运行时的
+ * 「合法调用集」因此互斥。
+ *
+ * ⚠️ **取值是否成立由该 flag 自己的规则决定**（Codex PR #69 两轮实测）：
+ *   · 默认：下一 token 以 `--` 开头 = 缺值（沿 `parseStoreFlags` 的判据）。无条件吞掉
+ *     下一个 token 会让 `db tables --db --bogus --help` 打印帮助并静默吞掉 `--bogus`，
+ *     而正常解析对同一输入判「`--db` 缺少取值」（退出码 2）—— 帮助模式不能更宽松；
+ *   · `FlagSpec.dashValue: true`（如 `query --sql` 的 SQL 行注释）：取值可以以 `--` 开头，
+ *     只有**恰好是已知 flag token** 才算缺值 —— 与 `query` 的 `FLAG_TOKENS` 判据同源，
+ *     否则 `query --sql "-- 注释\nSELECT 1" --help` 会把合法 SQL 判成「未知 flag」；
+ *   · 值位在末尾（没有下一 token）= 缺值，帮助模式同样要报 —— 正常解析也会报。
+ */
+export function helpArgsError(
+  argv: readonly string[],
+  flags: readonly FlagSpec[],
+  unknownSuffix = '',
+): string | undefined {
+  const known = new Set(flags.map((f) => f.name))
+  const values = new Set(valueFlagNames(flags))
+  const dashOk = new Set(flags.filter((f) => f.dashValue === true).map((f) => f.name))
+  const unknown: string[] = []
+  const missingValue: string[] = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!
+    if (a === '--help' || a === '-h') continue
+    if (!a.startsWith('-')) continue
+    if (!known.has(a)) { unknown.push(a); continue }
+    if (!values.has(a)) continue
+    const v = argv[i + 1]
+    if (v === undefined) { missingValue.push(a); continue }
+    const flagLike = dashOk.has(a) ? known.has(v) : v.startsWith('--')
+    if (flagLike) { missingValue.push(a); continue }
+    i++   // 消费它的取值（取值本身不是参数）
+  }
+  if (missingValue.length > 0) return `${missingValue.join('、')} 缺少取值`
+  if (unknown.length > 0) return `未知参数：${describeArgs(unknown)}${unknownSuffix}`
+  return undefined
 }
 
 /**

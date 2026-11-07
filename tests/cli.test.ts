@@ -67,6 +67,13 @@ describe('命令行入口', () => {
     expect(out).toContain('用法：')
   })
 
+  it('帮助里的「合成词」清单包含 sync_not_run（A9：README 指向 --help，不能漏真实出现过的 code）', async () => {
+    // `sync install` 的前置探测会真的产出 code/kind = sync_not_run，而三个帮助入口
+    // 此前都没列它 —— README 又写着「完整清单见 qiyu --help」，照做的人找不到。
+    expect(await run(['--help'])).toBe(0)
+    expect(out).toContain('sync_not_run')
+  })
+
   it('--help 不吞额外参数 —— 拼错的 flag / 多余的位置参数必须报出来（2026-10-08 修）', async () => {
     // ⚠️ 此前 `--help` 是"首个 token 特判且排在最前"：实测 `qiyu --help --bod` /
     // `qiyu --help extra` 都返回 0，把错误静默吞掉（而 `qiyu --bod` 单独跑是 2）——
@@ -110,11 +117,84 @@ describe('命令行入口', () => {
     expect(out, '必须点破合成词查不到官方错误码表').toMatch(/查不到|不在官方/)
   })
 
-  it('帮助文本里不出现未实现的子命令 —— 那会是一句指向不存在能力的指引', async () => {
-    // `auth login` 在「已知缺口」里明确未实现（会显式报错）。
-    // 把它写进 --help 等于向 Agent 承诺一个跑不通的命令。
+  it('--help 不因合法参数而失败：8 个命令族此前只认全局 flag，同一命令行两套答案', async () => {
+    // 2026-11-06 审查实测（修复前全部退 2「未知参数」）：`sync install --schedule … --help`、
+    // `db describe tickets --help`、`store status --db … --help`、`api schema <id> --help`、
+    // `query --table … --help`；对照 `api list --all --help` / `sync run --full --help` /
+    // `skill where --dir … --help` 一直退 0。而 `skill check` 按 `CommandSpec.flags` 又判
+    // 这些命令行合法 —— 检查器与运行时互斥。
+    // 变异「任一命令的 help 分支退回 GLOBAL_FLAG_NAMES 过滤」→ 本用例对应行红。
+    for (const argv of [
+      ['sync', 'install', '--schedule', '0 3 * * *', '--help'],
+      ['sync', 'status', 'dim.staff', '--help'],
+      ['db', 'describe', 'tickets', '--help'],
+      ['db', 'tables', '--db', '/tmp/x', '--help'],
+      ['store', 'status', '--db', '/tmp/x', '--help'],
+      ['api', 'schema', 'ticket.search', '--help'],
+      ['query', '--table', 'sessions', '--help'],
+      ['stats', 'fields', 'sessions', '--help'],
+      ['api', 'list', '--all', '--help'],
+      ['sync', 'run', '--full', '--help'],
+      ['skill', 'where', '--dir', '/tmp/x', '--help'],
+    ] as const) {
+      out = ''; err = ''
+      expect(await run([...argv]), argv.join(' ')).toBe(0)
+      expect(out, argv.join(' ')).toContain('用法：')
+    }
+    // 帮助请求不是万能豁免：真正的未知 flag 仍然要报（否则拼错被静默吞掉，回到 2026-10-08 的老坑）
+    out = ''; err = ''
+    expect(await run(['db', 'tables', '--bogus', '--help'])).toBe(2)
+    expect(err).toContain('--bogus')
+    // Codex PR #69：值位 flag 后面紧跟**另一个 flag** 时不得被当成取值吞掉 ——
+    // `--db --bogus` / `--db --help` 在正常解析里都是「--db 缺少取值」（退 2），
+    // 帮助模式不能更宽松，且文案与正常解析同源（点名缺值的是哪个 flag）。
+    out = ''; err = ''
+    expect(await run(['db', 'tables', '--db', '--bogus', '--help'])).toBe(2)
+    expect(err).toContain('--db 缺少取值')
+    out = ''; err = ''
+    expect(await run(['db', 'tables', '--db', '--help'])).toBe(2)
+    expect(err).toContain('--db 缺少取值')
+    // 反向：`--sql` 的取值以 `--` 开头是**合法 SQL 行注释**，不得被判成未知 flag
+    //（Codex PR #69 第二轮；判据由 `FlagSpec.dashValue` 单点驱动）。
+    out = ''; err = ''
+    expect(await run(['query', '--sql', '-- 注释\nSELECT 1', '--help'])).toBe(0)
+    expect(out).toContain('用法：')
+    // 但取值**恰好是已知 flag** 时仍算缺值（与 query 自己的值位守卫同判据）
+    out = ''; err = ''
+    expect(await run(['query', '--sql', '--pretty', '--help'])).toBe(2)
+    expect(err).toContain('--sql 缺少取值')
+  })
+
+  it('三条伪命令的豁免清单互相包含：任一顺序都不得把另一个全局选项说成「未知参数」', async () => {
+    // 2026-11-06 审查实测：`--version --help` → 0，而 `--help --version` → 2 且说
+    // 「--version」是未知参数；`--pretty --version` 同理。同一命令行换个顺序换一种结果。
+    // 变异「某条分支退回自写的豁免清单」→ 本用例红。
+    for (const [argv, want] of [
+      [['--help', '--version'], 0],
+      [['--version', '--help'], 0],
+      [['--version', '--pretty'], 0],
+      [['--help', '--pretty'], 0],
+    ] as const) {
+      out = ''; err = ''
+      expect(await run([...argv]), argv.join(' ')).toBe(want)
+    }
+    // `--pretty --version`：`--version` 是合法全局选项，措辞必须点出正确写法，
+    // 而不是把它称作「未知参数」（事实错误）。
+    out = ''; err = ''
+    expect(await run(['--pretty', '--version'])).toBe(2)
+    expect(err).toContain('--version 必须写在 --pretty 之前')
+    expect(err).not.toContain('未知参数')
+  })
+
+  it('帮助文本必须列出已实现的子命令，且不得列未实现的（2026-11-06 审查，双向）', async () => {
+    // ⚠️ 旧断言以「`auth login` 未实现」为由要求它**缺席** —— 那条理由早已失效：
+    // `auth login` 2026-10-25 已实现（`auth --help` 与 README 都列它），只剩顶层
+    // help 不列。Agent 只读 `qiyu --help` 时因此学不到这个能力。
+    // 双向：已实现必须列；未实现的仍不得列（`ticket`/`kb` 是挂账未交付的语义命令族）。
     await run(['--help'])
-    expect(out).not.toContain('auth login')
+    expect(out).toContain('auth login')
+    expect(out).toContain('auth whoami')
+    expect(out, '未交付的命令族不得出现在 help').not.toMatch(/^\s+(ticket|kb)\s/m)
   })
 
   it('原型链上的键（toString/constructor/valueOf…）按未知子命令处理，不是处理器', async () => {

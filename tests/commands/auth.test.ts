@@ -461,3 +461,106 @@ describe('whoami：配置读取失败必须在成功路径可见（2026-11-02 �
       .toContain('配置文件读取失败')
   })
 })
+
+describe('auth login 写盘失败（A11，2026-11-06 审查）', () => {
+  // ⚠️ 收掉目录写位来造 EACCES 只在「非 root 的 POSIX」上成立：root 无视权限位，
+  // Windows 上 chmod 对目录基本无效 —— 这两种环境下 login 会成功，用例假失败。
+  // 仓库既有约定同款（`tests/commands/config-insecure.test.ts` 的 posixOnly）。
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('hint 不再建议「换路径」——配置路径没有通道，那是做不到的动作', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k-test')
+    vi.stubEnv('QIYU_APP_SECRET', 's-test')
+    const dir = join(home, '.config', 'qiyu')
+    // 先把目录建出来再收掉写位：login 走到 writeConfigFile 时 EACCES。
+    mkdirSync(dir, { recursive: true })
+    writeCfg({ profiles: {} })
+    chmodSync(dir, 0o500)
+    try {
+      expect(await authCommand(['login'])).toBe(1)
+      const e = JSON.parse(out).error as Record<string, unknown>
+      expect(String(e.hint)).toContain('固定为 ~/.config/qiyu/config.json')
+      expect(String(e.hint)).not.toContain('换到')
+    } finally {
+      chmodSync(dir, 0o700)   // 让 afterEach 的 rmSync 能删干净
+    }
+  })
+})
+
+describe('纯空白凭证（A12，2026-11-06）', () => {
+  it('whoami：配置文件里的纯空白凭证 → 1 + auth_missing，点名档名（Codex PR #69）', async () => {
+    // 事故形态：只查环境变量时，文件里的 `" "` 被 nonEmptyValue 当成「有」→ configured:true，
+    // 而 api/sync 的 resolveCredentials 会拒绝它 —— 「谁都说配好了、只有真调用失败」。
+    writeCfg({ profiles: { default: { credentials: { appKey: '   ', appSecret: 'sss' } } } })
+    expect(await authCommand(['whoami'])).toBe(1)
+    const e = JSON.parse(out).error as Record<string, unknown>
+    expect(e.kind).toBe('auth_missing')
+    expect(String(e.message)).toContain('appKey')
+    expect(String(e.message)).toContain('"default"')
+    // hint 不得建议「删掉这个键」：credentials 块要求两个键同时在，只删一个键会让
+    // parseConfig 拒绝整份配置（实测：按旧 hint 操作后 whoami 变成「配置文件读取失败」）。
+    // 给出的可执行动作是「整个 credentials 块」。
+    const hint = String(e.hint)
+    expect(hint).toContain('整个 credentials 块')
+  })
+
+  it('whoami：按 hint 删整个 credentials 块 + 环境变量 → 能恢复（正向对照）；只删单键 → 反而更糟（旧 hint 的死路）', async () => {
+    // 双向钉住 hint 的两个分支：整个块删掉后 env 能接上；只删单键 parseConfig 拒整份文件
+    // —— 这正是旧文案（「删掉这个键」）把人引向的死路。
+    writeCfg({ profiles: { default: { credentials: { appKey: '   ', appSecret: 'sss' } } } })
+    // env 齐备（两个字段都给），文件才是那个被坏掉的 —— 这样坏文件只体现在 warnings 里
+    vi.stubEnv('QIYU_APP_KEY', 'envkey')
+    vi.stubEnv('QIYU_APP_SECRET', 'envsecret')
+    // 只删 appKey 键（照旧 hint 执行）→ 配置文件整体解析失败
+    writeCfg('{ "profiles": { "default": { "credentials": { "appSecret": "sss" } } } }')
+    expect(await authCommand(['whoami'])).toBe(0)   // env 接住了，但警告必须点名坏文件
+    expect((JSON.parse(out).meta.warnings ?? []).join('\n')).toContain('配置文件读取失败')
+    // 照新 hint 执行：删掉整个 credentials 块 → 文件恢复可读，env 与文件都不再报错
+    writeCfg({ profiles: { default: {} } })
+    out = ''   // out 在同一用例内累积，断言第二条输出前必须清空
+    const r = await authCommand(['whoami'])
+    expect(r).toBe(0)
+    expect(JSON.parse(out).meta.warnings ?? [], '整块删掉后不再有读取失败警告').toEqual([])
+    expect(JSON.parse(out).data.source).toBe('env')
+  })
+
+  it('whoami：env 已有值时文件里的空白不被选中 → 仍报 configured:true（逐字段优先级 env > file）', async () => {
+    // 反向对照：不要在没有影响时误报 —— api call 此刻用 env 的值照常成功。
+    writeCfg({ profiles: { default: { credentials: { appKey: '   ', appSecret: 'sss' } } } })
+    vi.stubEnv('QIYU_APP_KEY', 'envkey-123')
+    expect(await authCommand(['whoami'])).toBe(0)
+    expect(JSON.parse(out).data.configured).toBe(true)
+  })
+
+  it('whoami：env 纯空白 → 1 + auth_missing，点名变量（不再报 configured:true）', async () => {
+    // 此前 `' '` 是 truthy → configured:true / source:env，而 api call 拿它去签名。
+    vi.stubEnv('QIYU_APP_KEY', '   ')
+    vi.stubEnv('QIYU_APP_SECRET', 'sss')
+    expect(await authCommand(['whoami'])).toBe(1)
+    const e = JSON.parse(out).error as Record<string, unknown>
+    expect(e.kind).toBe('auth_missing')
+    expect(String(e.message)).toContain('QIYU_APP_KEY')
+    expect(String(e.message)).toContain('空白')
+  })
+
+  it('whoami：变量名带下标的空白 appSecret 也照样点名', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'kkk')
+    vi.stubEnv('QIYU_APP_SECRET', '\t')
+    expect(await authCommand(['whoami'])).toBe(1)
+    expect(String((JSON.parse(out).error as Record<string, unknown>).message)).toContain('QIYU_APP_SECRET')
+  })
+
+  it('login：env 纯空白 → 2（用法错误）+ 不写配置文件', async () => {
+    vi.stubEnv('QIYU_APP_KEY', ' ')
+    vi.stubEnv('QIYU_APP_SECRET', 'sss')
+    expect(await authCommand(['login'])).toBe(2)
+    expect(err).toContain('QIYU_APP_KEY')
+    expect(err).toContain('空白')
+    expect(existsSync(cfgPath()), '不得把空白值写进配置文件').toBe(false)
+    // hint 不得建议「unset 后直接重跑 login」（Codex PR #69 第七轮）：login 只读环境变量、
+    // 不回落配置文件，删掉变量后重跑必然是「缺少 …」退 2。恢复动作只有「设真实值」。
+    // ⚠️ hint 只出现在 stdout 的 JSON 里（usageFail 只把 message 写 stderr）。
+    const e = JSON.parse(out).error as Record<string, unknown>
+    expect(String(e.hint)).toContain('设为真实值')
+    expect(String(e.hint)).toContain('只从环境变量读取')
+    expect(String(e.hint)).not.toMatch(/unset/)
+  })
+})

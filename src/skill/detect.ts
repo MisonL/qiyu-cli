@@ -45,7 +45,7 @@ import { readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { contentHash, MANIFEST, readManifestSafe, type Manifest } from './install.js'
+import { contentHash, MANIFEST, readManifestSafe, readPlainTextFile, type Manifest } from './install.js'
 import { defaultEntityDir, dirShape, readEnvByNormalizedKey } from './paths.js'
 import { nonEmptyValue } from '../core/config.js'
 
@@ -230,7 +230,10 @@ function probe(entityDir: string, sourceDir: string, currentVersion: string): Sk
 function readManifestStrict(entityDir: string): Manifest | null {
   let text: string
   try {
-    text = readFileSync(path.join(entityDir, MANIFEST), 'utf8')
+    // ⚠️ 走 `readPlainTextFile`（先验普通文件）：清单被 FIFO 占住时 `readFileSync` 会
+    // 无限阻塞（Codex PR #69 第六轮）。非普通文件抛 EINVAL —— 与 EACCES 同路，
+    // 落到下面的 rethrow（= 状态 unknown，静默），语义与「清单看不了」一致。
+    text = readPlainTextFile(path.join(entityDir, MANIFEST))
   } catch (err) {
     if (isErrno(err, 'ENOENT')) return null
     throw err
@@ -301,7 +304,8 @@ export function skillWarning(
         + '——正文与包内一致时即收敛；正文被手工改过时它会跳过不覆盖、提示不会消失，'
         + '那种情况用 `qiyu skill install --force` 覆盖。'
         + '若清单路径被非普通文件（符号链接/目录）占用，清单写不进去、提示不会消失：'
-        + '`--force` 只会覆盖正文（状态报 updated），先清理该占用再跑'
+        + '正文被手工改过时 `--force` 只覆盖正文（状态报 updated），正文与包内一致时'
+        + '连 `--force` 也零写入（status 报 skipped）；无论哪种，先清理该占用再跑'
     }
     if (ctx?.currentVersion !== undefined && state.installedVersion === ctx.currentVersion) {
       return `已安装的 skill 内容与包内当前版本不一致（版本 ${state.installedVersion}）；运行 \`qiyu skill install --force\` 更新`
@@ -461,12 +465,30 @@ export function resolveEntityDirSources(opts: EntityDirOptions): EntityDirResolu
   return resolve(defaultEntityDir(opts.home ?? homedir()), 'default')
 }
 
-/** 实体未确定时给用户看的一句话（已确定返回 undefined）。 */
+/**
+ * 实体未确定时给用户看的一句话（已确定返回 undefined）。
+ *
+ * `opts.explicitSource`（2026-11-06 审查 S3）：调用方（`skill where`）**本命令**已经从
+ * `--dir`/`QIYU_SKILL_DIR` 定位到了实体，而启动探测看不到命令行参数。此时原文案
+ * 「且没有显式给出 --dir 或 QIYU_SKILL_DIR … 要定位实体请显式给出 --dir」与用户刚做的
+ * 动作**自相矛盾**（他还真给了）。这条分支改成：说清未定位的是**启动探测**、因此本次
+ * 没有「未安装/已过期」提示，并点名本命令实体来自哪里、不受影响。
+ */
 export function entityUndeterminedNote(
   resolution: EntityDirResolution,
   env: NodeJS.ProcessEnv = process.env,
+  opts: { explicitSource?: EntitySource } = {},
 ): string | undefined {
   if (resolution.decided) return undefined
+  const explicit = opts.explicitSource
+  if (explicit !== undefined) {
+    const why = resolution.reason === 'env'
+      ? `启动探测已被 ${DISABLE_PROBE_ENV} 显式关闭`
+      : `当前进程像 Node 测试（NODE_ENV=${env.NODE_ENV ?? ''}，VITEST=${env.VITEST ?? ''}）`
+    return `skill 启动探测未定位实体目录：${why} —— 启动探测不读命令行参数，`
+      + '所以本次不会有「未安装/已过期」提示。⚠️ 本命令的实体来自 '
+      + `${explicit}，不受影响`
+  }
   if (resolution.reason === 'env') {
     return `skill 实体目录未确定：探测已被 ${DISABLE_PROBE_ENV} 显式关闭；需要时显式给出 --dir 或 QIYU_SKILL_DIR`
   }

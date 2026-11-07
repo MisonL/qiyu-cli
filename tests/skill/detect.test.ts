@@ -567,8 +567,11 @@ describe('skillWarning —— 只在需要时给出一条可执行的提示', ()
     expect(msg).toContain('跳过不覆盖')
     // 清单被占用时**两个**动词都失效 —— 前提必须说全（2026-10-27 实测，见下一个用例）
     expect(msg).toContain('非普通文件')
-    // 清单被占用时清单写不进去；但 --force 仍会覆盖正文 —— 不能笼统说「都不会覆盖」
+    // 清单被占用时清单写不进去；但 --force 是否覆盖正文取决于正文状态 —— 不能笼统说
+    // 它「会覆盖正文」（S4：正文一致时 --force 也是 skipped 零写入，见下一个用例）
     expect(msg).toContain('清单写不进去')
+    expect(msg).toContain('正文被手工改过时')
+    expect(msg).toContain('也零写入')
     expect(msg).toContain('先清理该占用')
   })
 
@@ -621,6 +624,11 @@ describe('skillWarning —— 只在需要时给出一条可执行的提示', ()
     expect(bare.warnings.join('\n'), 'warning 必须点名被占用的路径').toContain(MANIFEST)
     resetSkillDetectionCache()
     expect(detectSkillState(entity, src, '1.0.0').kind, '提示不会消失').toBe('stale')
+    // S4（2026-11-06）：这条状态下的提示曾无条件写「`--force` 只会覆盖正文（状态报 updated）」，
+    // 而实测两边都 skipped —— 文案与它自己上一条用例的断言相反。
+    const warn = skillWarning(detectSkillState(entity, src, '1.0.0'), { currentVersion: '1.0.0' })
+    expect(warn).toContain('也零写入')
+    expect(warn).not.toMatch(/`--force` 只会覆盖正文/)
   })
 
   it('清单路径被占用 + 正文漂移：--force 只覆盖正文，清单仍写不进去、提示不会消失（CodeRabbit）', async () => {

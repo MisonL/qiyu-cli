@@ -744,6 +744,10 @@ describe('api list', () => {
       ['call 缺接口 id', ['call'], apiCommand, /用法：qiyu api call </],
       ['call 接口 id 以 - 开头', ['call', '--yes'], apiCommand, /必须是第一个参数/],
       ['call --body 重复', ['call', 'ticket.search', '--body', '{}', '--body', '{}'], apiCommand, /--body 只能出现一次/],
+      // 同一个拼错在三条命令上必须给出同一种可用清单（都含 --pretty）——事实源是 spec 的接受集
+      ['call 拼错 --pretty', ['call', 'ticket.search', '--prety'], apiCommand, /可用：.*--pretty/],
+      ['list 拼错 --pretty', ['list', '--prety'], apiCommand, /可用：.*--pretty/],
+      ['schema 拼错 --pretty', ['schema', '--prety'], apiCommand, /可用：.*--pretty/],
       ['call 未知参数', ['call', 'ticket.search', '--bod'], apiCommand, /未知参数：--bod。可用：--body/],
       ['call 位置参数（本条的实测来源）', ['call', 'ticket.search', '{"a":1}'], apiCommand, /接口 id 之后的参数必须写成 --body/],
       ['call --body 缺值', ['call', 'ticket.search', '--body'], apiCommand, /--body 后面缺少 JSON 值/],
@@ -764,7 +768,10 @@ describe('api list', () => {
       // 把**每一个** `usageFail(...)` 的 message 换成 `'**MUT**'` 再跑本文件，
       // 下面这 4 个调用点**从未被任何用例走到** —— 哨兵表声称"按调用点清单逐个点名"，
       // 实际漏了它们，等于这 4 条文案改动时没有任何东西会红。
-      ['schema --help 不吞额外参数', ['schema', '--help', 'x'], apiCommand, /--help 不接受额外参数/],
+      // ⚠️ 2026-11-06：`schema --help <id>` 不再报错（帮助请求不校验位置参数 ——
+      // `api schema ticket.search --help` 是常规写法）。这条 message 已不存在，
+      // 哨兵行随之删除；「未知 flag 仍要报」由下面的 `schema --bad --help` 用例守着。
+
       ['schema 位置参数 > 1', ['schema', 'a.b', 'c.d'], apiCommand, /api schema 只接受一个接口 id/],
       ['schema 缺接口 id', ['schema'], apiCommand, /用法：qiyu api schema/],
       // `--profile ''` 不是"缺值"（空串不以 `--` 开头，值位那关放行）—— 它落到
@@ -785,10 +792,10 @@ describe('api list', () => {
       ['auth login 缺环境变量', ['login'], authCommand, /需要从环境变量读取凭证/],
       ['auth 无子命令', [], authCommand, /用法：qiyu auth </],
       ['auth 未知子命令', ['未知子命令'], authCommand, /未知子命令：未知子命令/],
-      ['auth whoami 多余参数', ['whoami', 'extra'], authCommand, /不接受任何参数/],
+      ['auth whoami 多余参数', ['whoami', 'extra'], authCommand, /只接受 --help \/ --pretty/],
       // ⚠️ 2026-10-08 补**缺口 B**：`whoami` 的**未知 flag** 分支此前从未进表 ——
       // 上面那条 `['whoami','extra']` 走的是**位置参数**分支，两条的 message 逐字相同
-      // （都是「未知参数：X。auth whoami 不接受任何参数」），锚字符串看着对得上、
+      // （都是「未知参数：X。auth whoami 只接受 --help / --pretty…」），锚字符串看着对得上、
       // 实则 unknown 那条从未被走到。变异证明：给它加 `**` 全量 286 条全绿。
       // 输入用 `--bod`（只有 unknown 分支会接住它；`extra` 走 positional）。
       ['auth whoami 未知 flag（与上一行是两条分支，消息相同）', ['whoami', '--bod'], authCommand, /未知参数：--bod。auth whoami/],
@@ -1699,9 +1706,12 @@ describe('api schema', () => {
     expect(await apiCommand(['schema', 'crm.modifyOrder'])).toBe(0)
     expect(JSON.parse(out).data.callable).toBe(false)
   })
-  it('位置参数规则：schema --help extra → 2；schema a --help → 2；schema a b → 2；schema --help → 0', async () => {
-    expect(await apiCommand(['schema', '--help', 'extra'])).toBe(2)
-    expect(await apiCommand(['schema', 'ai.knowledge.search', '--help'])).toBe(2)
+  it('位置参数规则：help 请求不校验位置参数（0）；非 help 时 > 1 个位置参数 → 2', async () => {
+    // ⚠️ 2026-11-06 改判据：`schema <id> --help` 此前退 2 并说「未知参数：<id>」——
+    // 而那个 id 正是用户想看帮助的对象（与 `db describe <表> --help` 同一条修复）。
+    // 未知 **flag** 仍然优先于 help 报出（见下一条）。
+    expect(await apiCommand(['schema', '--help', 'extra'])).toBe(0)
+    expect(await apiCommand(['schema', 'ai.knowledge.search', '--help'])).toBe(0)
     expect(await apiCommand(['schema', 'a', 'b'])).toBe(2)
     expect(await apiCommand(['schema', '--help'])).toBe(0)
   })

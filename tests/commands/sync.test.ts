@@ -1105,6 +1105,102 @@ describe('sync verify', () => {
   })
 })
 
+// —— A1（2026-11-06 审查）：`--profile` 必须同时选中凭证与库 ——
+//
+// 事故形态：`QIYU_PROFILE=staging` / `defaultProfile=staging`，命令行 `--profile prod`。
+// 存储按 flag 选 prod，凭证却按 env 选 staging → staging 的租户凭证把数据写进 prod 的库，
+// 而输出里没有任何字段能看出这件事。
+// ⚠️ 断言必须看**网络请求里的 appKey**（凭证真的被用上了），不能只看 store 路径 ——
+// 只看路径的话，「凭证根本没被检查」也能绿。
+describe('sync run/verify —— --profile 同时选中凭证与库（A1）', () => {
+  /** 写一份两份凭证的配置，并清掉环境变量凭证（env 齐备时根本不读文件）。 */
+  function fileCredentialsOnly(): void {
+    mkdirSync(join(dir, '.config', 'qiyu'), { recursive: true })
+    const p = join(dir, '.config', 'qiyu', 'config.json')
+    writeFileSync(p, JSON.stringify({ defaultProfile: 'prod', profiles: {
+      prod: { credentials: { appKey: 'prod-key', appSecret: 'prod-secret' } },
+      staging: { credentials: { appKey: 'staging-key', appSecret: 'staging-secret' } },
+    } }))
+    chmodSync(p, 0o600)
+    vi.stubEnv('QIYU_APP_KEY', '')
+    vi.stubEnv('QIYU_APP_SECRET', '')
+    vi.stubEnv('QIYU_PROFILE', '')
+  }
+  const staffRows = () => [{ id: 1000001, realname: '甲', nickname: '甲', username: 'a', role: 1,
+    roleId: 1, status: 1, createtime: 1690000000000, updateTime: 1690000000000, email: null,
+    phone: null, workNumber: 'W1', maxServiceCount: 6, skillScoreChat: 0, skillScoreIpcc: 0,
+    groupInfo: [] }]
+
+  it('sync run --profile staging 用 staging 的凭证（不是 defaultProfile 的）', async () => {
+    fileCredentialsOnly()
+    const seen: string[] = []
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: unknown) => {
+      seen.push(String(url)); return okA(staffRows())
+    }))
+    try {
+      await fresh().then((s) => s.close())
+      expect(await syncCommand(['run', 'dim.staff', '--db', dbPath(), '--full', '--quiet',
+        '--profile', 'staging'])).toBe(0)
+      expect(seen.length).toBeGreaterThan(0)
+      expect(seen.every((u) => u.includes('appKey=staging-key'))).toBe(true)
+      expect(seen.join('\n')).not.toContain('prod-key')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('sync verify --profile staging 用 staging 的凭证（快照核对的上游请求同档）', async () => {
+    fileCredentialsOnly()
+    const seen: string[] = []
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: unknown) => {
+      seen.push(String(url)); return okA(staffRows())
+    }))
+    try {
+      await fresh().then((s) => s.close())
+      // 本地无 sync_state → drift not_synced 退 1；凭证选择仍必须发生在上游请求里
+      expect(await syncCommand(['verify', 'dim.staff', '--db', dbPath(),
+        '--profile', 'staging'])).toBe(1)
+      expect(seen.length).toBeGreaterThan(0)
+      expect(seen.every((u) => u.includes('appKey=staging-key'))).toBe(true)
+      expect(seen.join('\n')).not.toContain('prod-key')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+  it('`--profile` 拼错 → 参数错误退 2 并点名现有档，不得报成 auth_missing（Codex PR #69）', async () => {
+    // 事故形态：凭证侧先按 `--profile` 选档 → 选不到凭证 → 报 auth_missing（退 1）
+    // 「缺少 appKey」，而真相是档名拼错（参数错误，退 2）。参数错误必须排在环境错误之前 ——
+    // 修法是先解析 store 配置（它已有「点名的档必须存在」守卫）。
+    fileCredentialsOnly()
+    expect(await syncCommand(['run', 'dim.staff', '--db', dbPath(), '--full', '--quiet',
+      '--profile', 'prodd'])).toBe(2)
+    expect(err).toContain('prodd')
+    expect(err, '不得把拼错的档报成缺凭证').not.toContain('缺少 appKey')
+    out = ''; err = ''
+    expect(await syncCommand(['verify', 'dim.staff', '--db', dbPath(), '--profile', 'prodd'])).toBe(2)
+    expect(err).toContain('prodd')
+  })
+})
+
+describe('sync tasks —— --help 的参数作用域（Codex PR #69 第四轮）', () => {
+  it('兄弟命令的 flag 在 `sync tasks --help` 下同样非法（运行时与 spec 同答）', async () => {
+    // `sync tasks` 只接受全局 flag；并集会放过 run 的 --full / --db，
+    // 而正常解析与 `skill check` 都判非法。
+    expect(await syncCommand(['tasks', '--full', '--help'])).toBe(2)
+    expect(err).toContain('--full')
+    out = ''; err = ''
+    expect(await syncCommand(['tasks', '--db', '/tmp/x', '--help'])).toBe(2)
+    expect(err).toContain('--db')
+    // 反向：合法调用照样给帮助
+    out = ''; err = ''
+    expect(await syncCommand(['tasks', '--help'])).toBe(0)
+    expect(out).toContain('用法：')
+    // `--pretty` 是全局 flag，帮助模式下仍合法
+    out = ''; err = ''
+    expect(await syncCommand(['tasks', '--pretty', '--help'])).toBe(0)
+  })
+})
+
 describe('sync install', () => {
   /** 预置「已同步过」的库：sync_state 有真实数据集行（install 的前置探测）。 */
   async function seedSynced(): Promise<void> {

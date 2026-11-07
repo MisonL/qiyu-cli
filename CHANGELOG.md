@@ -122,6 +122,147 @@
 
 ### 修复
 
+- **skill / 凭证 / CLI 输出的三十八处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
+
+  · **`skill install` 与 `where` / `check` 对「受管文件集」的口径分叉**：install 把用户额外
+    放进 skill 目录的任意文件也算成「可能被手工修改」并建议 `--force`，而 `--force` 又不
+    管这些文件 —— 提示永远不收敛；`check --compare` 还会无端退 1。三处统一为**受管文件集**
+    口径，改掉 3 条把错误行为钉死的旧用例，补 2 条正/反用例 + 1 条反向对照。
+    比对还要求**文件集与包内完全一致**：包升级增删文件时，只比清单子集会得出「正文一致」，
+    随后只重写清单、不复制新文件却报 updated —— 现在如实报「文件集与上次安装不同」并要求
+    `--force`（新增用例钉住「清单不得提前声称新文件已安装」）。
+  · **三条检查规则的释义与实现不符**：`table_name` 是「写了就红」（不查表是否存在）、
+    `sql_sequence` 要求 SELECT 与 FROM 同时出现（`DROP TABLE` 不属这条）、
+    `unknown_positional` 按命令 spec 域判定。README 两处与 SKILL.md 删掉「检查表名是否
+    仍存在」的承诺，新增 3 条行为对拍用例（真实/编造表名、DROP 不触发、detail 点名域）。
+  · **`skill where --dir` 时把启动探测的结论套到本命令上**：启动探测不读命令行参数，
+    定位不到实体时说的是「未安装/已过期」，而本命令的实体根本不来自探测。新增
+    `explicitSource` 分支，改说「启动探测未定位实体（不读命令行参数），本命令实体来自
+    `--dir`，不受影响」，用例钉住旧文案不再出现。
+  · **清单被占用时 `--force` 的效果被写成单一状态**：实测两种状态 —— 正文被手工改过时
+    `--force` 只覆盖正文（status 报 updated），正文与包内一致时连 `--force` 也零写入
+    （status 报 skipped）。hint 与 SKILL.md 改为分状态表述，用例把文案与两条实测状态绑在一起。
+  · **`--profile` 不作用于凭证**：sync run / sync verify 的存储路径、机器人配置读的是
+    `--profile` 档，凭证却只按环境变量 / 默认档取 —— 多档用户会拿 A 档的 key 去开 B 档的库。
+    `resolveCredentialsUsingFile` 增 `profile` 槽位并由两个调用点传入，两条端到端用例
+    断言请求 URL 里的 appKey 来自 `--profile` 指定的档。
+  · **`auth login --profile` 写非 default 档后默认档名是否跟着改没说清**：行为（顶层默认
+    档名不变）是刻意的，但文档没写 —— README 与 login 的字段说明补上「之后的命令仍须用
+    `--profile` 或 `QIYU_PROFILE` 指向它」。
+  · **顶层 `--help` 漏列 `auth login`**，而测试还用「未实现」把它钉死 —— 帮助清单与
+    `command-tree` 用例同步补齐，测试改为按命令树集合对照。
+  · **`auth login` 对已存在的 0755 目录的处理被文档说过头**：实测已有目录原样保留（不改
+    权限，只对**新建**目录设 0700），文档 5 处收窄为「新建的目录 0700」，并新增用例钉住
+    「不改已存在目录」。
+  · **配置文件权限判据的文案窄于实现**：实现拒绝任何 group/other 权限位，文案只说
+    「group/other 可写」—— 0644（可读）能通过提示却同样会泄漏 appSecret。改为「含凭证
+    但权限过宽：group/other 有权限位；可读时其他用户就能读到 appSecret」，
+    0602/0601 两条用例钉住判据与措辞。
+  · **`resolveCredentials` 的 `fromArgs` 形参是死参数**：没有任何调用方传过非空值，
+    「预留的第三来源」只会让人以为凭证可以从命令行给。删除形参，设计稿 §4.2 同步注明
+    凭证只有环境变量与配置文件两层。
+  · **README 的脱敏承诺大于实现**：改写为「请求/响应链路」的输出都会脱敏，并明写边界 ——
+    不扫描用户自己敲进 argv 的凭证（`auth login` 拒收 `--app-key` 正是为了这个）。
+  · **配置文件权限警告的用例是空转**：原用例把 stderr 攒在内存变量里却断言别的东西，
+    警告删掉也不红。改为真实捕获 stderr 并断言警告在场（变异：置空 onWarn → 红）。
+  · **帮助与 README 的 error kind 清单漏 `sync_not_run`**：三个帮助入口补齐，README 改成
+    「常见值，不是穷举」并指向 `ERROR_KINDS` / skill `errors.md`，新增 `--help` 运行时断言。
+  · **`api call` 的「不接受任何参数」与事实相反**：它接受 `--help` / `--pretty`。改为
+    「只接受 `--help` / `--pretty`，不接受其他参数」，两处测试锚同步。
+  · **`auth login` 写盘失败的 hint 会把人引向不存在的路径**：配置路径由 `HOME` 固定、
+    CLI 没有改路径的参数，旧 hint 却让人「检查路径」。改为点名目录与文件（可写、不是
+    符号链接），并明写「路径固定、不要去找别的路径」，新增 EACCES 用例。
+  · **纯空白凭证被当成有效值**：`' '` 是 truthy，一路穿到签名，服务端回 14001 ——
+    报错点离真正给坏值的地方隔了一层命令。新增 `isWhitespaceOnly` 单一实现，
+    credentials-source / `auth whoami` / `auth login` / core 四处拒绝并**点名来源**
+    （环境变量名 vs 配置键：空白环境变量会遮蔽配置文件里的真值，所以必须先拒绝再读文件）。
+  · **控制台地址一处写成唯一形态**：两种写法都有（有无 `admin` 段），以后台真实页为准，
+    两处都列出；尝试浏览器核对未登录、无法实证，如实标注为未验证。
+  · **`--help` 与合法参数同现被判「未知参数」**（8 个命令族）：`--help` 是帮助请求，
+    追加的已知参数（如 `query --help --sql`）不该报未知。改为「`--help` 不接受额外参数」
+    并把额外参数逐个点名。
+  · **`--help` / `--version` / `--pretty` 三个伪命令互相不豁免**：`api list --pretty --help`
+    一类组合会被一侧判成未知参数，三处统一按「全局选项任意次序」处理。
+  · **退出码 1 但 stdout 仍是 `{ok:true,…}` 的路径没有机器可读标志**：skill check 两条
+    路径（单文件检查与 `--compare`）都补了**真实的** `meta.exit_code` 字段与图例，写明
+    「不要按 `error.kind` 分支、也不要用『有没有 error』判断检查是否通过，先看退出码」。
+  · **`output.test.ts` 的 kind 覆盖不全且集合断言自比较恒真**：旧表只钉 9 个 kind、
+    其对照组两边都是本文件常量（除自相矛盾外恒真）。改为与 `ERROR_KINDS` 对照，
+    新增 kind 必然变红，并覆盖全部 16 个 kind 的字面输出形态。
+  · **`query --help` 的额外参数列表是自拼字符串**：空串会渲染成「冒号后空白」，且不
+    点名取值。改为 `describeArgs` 统一渲染（全仓唯一实现）。
+  · **「可用：」清单一处列 `--pretty`、两处不列**：三处统一为同一份清单来源。
+
+  **验证**：`tests/commands/skill.test.ts`、`tests/commands/credentials-source.test.ts`、
+  `tests/commands/sync.test.ts`、`tests/commands/auth.test.ts`、`tests/core/config.test.ts`、
+  `tests/core/credentials.test.ts`、`tests/skill/check.test.ts`、`tests/skill/detect.test.ts`、
+  `tests/cli.test.ts`、`tests/commands/api.test.ts`、`tests/commands/command-tree.test.ts`
+  共新增 **30** 条 `it`、改写或删除 **7** 条。行为修复逐条做变异验证（A1 的三种透传形态、A4 对已存在目录
+  chmod、A5 权限判据放宽一位、A8 置空 onWarn、A11 恢复旧 hint、A12 四处空串判据、S3 去掉
+  explicitSource 分支、S4 退回单一 --force 表述），变异后对应用例全部转红、还原后转绿。
+  `skill check` 的 `exit_code` 图例还触发两条静态守卫（图例键必须有真实字段、
+  `field_notes` 不得含 `**`）：先补真实 `meta.exit_code` 再收敛文案。
+
+  **收敛轮次追加修正（review 过程中发现的新形态，同样做了复现 + 变异验证）**：
+  · **`check --compare` 只比清单文件集**（Codex）：与 `install` 同款缺陷的第二处 ——
+    包新增文件后，实体与包在旧子集上相等 → CI 的 `--compare` 退 0 漏报「装的是旧包」。
+    改成文件集必须与包内一致，并给出独立原因（「已安装的文件集与包内不同」）；
+  · **`--profile` 拼错被报成缺凭证**（Codex）：凭证侧先按 flag 选档，拼错的档选不到
+    凭证 → `auth_missing`（退 1），而真相是参数错误（退 2）。`sync run` / `sync verify`
+    改为**先解析 store 配置**（它已有「点名的档必须存在」守卫）再取凭证 ——
+    参数错误排在环境错误之前；
+  · **帮助模式的取值规则与正常解析不同源**（Codex 两轮）：`db tables --db --bogus --help`
+    曾打印帮助并静默吞掉 `--bogus`；改成「取值不以 `--` 开头才跳过」后又把
+    `query --sql "-- 注释…"` 的合法 SQL 判成未知 flag、且 `--db --help`（缺值）不报。
+    最终规则改为**每个 flag 自己的取值规则**：`FlagSpec.dashValue`（`--sql` 允许取值以
+    `--` 开头，只有恰好是已知 flag 才算缺值）驱动帮助检查与 query 解析器同一份判据；
+    缺值在帮助模式下照报（与正常解析同文案）；
+  · **EACCES 用例在 root / Windows 上假失败**（CodeRabbit）：收掉目录写位造不出
+    EACCES，改用 `it.skipIf`（仓库既有约定）；
+  · **`whoami` 漏了配置文件里的空白凭证**（Codex）：只查环境变量时，文件里的 `" "`
+    被 `nonEmptyValue` 当成「有」→ `configured: true`，而 api/sync 会拒绝它。
+    改为按**逐字段优先级**判定（env 已给值时文件那一层根本不会被选中，此时不得误报）；
+  · **`writeWideConfig(mode)` 的 `mode` 没被用上**（CodeRabbit）：0602 / 0601 两条
+    用例实际跑在 0644 上 —— 上面 A5 那条「两条用例钉住判据与措辞」在修复前是**假的**。
+    修好后用变异复核（把判据从 `0o077` 放宽到 `0o044`）两条用例必须变红；
+  · **文件集比对把「重复条目」当相等**（Codex 第四轮）：清单含重复条目并漏一个文件时
+    长度恰好相等 → `check --compare` 退 0、`install` 的 `--force` 也跳过修复。
+    判据收口到 `sameFileSet`（去重后比较，重复条目一律判「不同」），两处同源；
+  · **`sync tasks --help` 用全族并集校验参数**（Codex 第四轮）：兄弟命令的
+    `--full` / `--db` 被当成合法参数（退 0 打印帮助），而正常解析与 `skill check`
+    都判非法 —— 运行时与契约校验又一次分叉。改为走该子命令自己的 spec；
+  · **umask 077 下的夹具假失败**（Codex 第四轮）：`mkdirSync({ mode: 0o755 })` 会被
+    进程 umask 收紧成 0700，断言 0755 的用例假失败 —— 夹具改为显式 `chmodSync`；
+  · **受管条目直接 `readFileSync` 会挂死**（Codex 第五轮）：换成受管集哈希后，
+    清单里一条被 **FIFO** 占住 → `readFileSync` 打开读端等写端 → `install` 与
+    `check --compare` **无限阻塞**（实测去掉筛选后进程跑满 600s、`testTimeout`
+    打不断同步读取）；被换成**指向目录外的符号链接**则读取跟随、可能误判「正文一致」。
+    新增 `managedContentHash`：先验证每个条目是**实体目录内的普通文件**，不可比的形态
+    给出点名原因（缺失 / 非普通文件 / 逃出实体）而不读取；
+  · **README 的 `--profile` 建议对部分命令不可执行**（Codex 第五轮）：`api *` /
+    `auth whoami` / `sync tasks` 都**不接受** `--profile`（逐个实测退 2），原文
+    「在每条命令上写 `--profile staging`」是做不到的动作。按命令能力二分：接受它的
+    命令写 flag，其余只能 `QIYU_PROFILE` 或改 `defaultProfile`；
+  · **接受清单里错列了 `sync uninstall`**（Codex 第六轮）：它只接受全局 flag 与 `--yes`
+    （实测 `sync uninstall --profile staging` 退 2）—— 照新文档执行必然失败。从接受清单
+    移除，并把守卫加强为「接受那一行不得出现 uninstall」；
+  · **清单文件自身是 FIFO 同样挂死**（Codex 第六轮）：上一处只挡住了受管正文，
+    `readManifestSafe` / `readManifestStrict` 仍直接 `readFileSync` 清单 —— 清单路径被
+    FIFO 占住时 `skill install` / `where` / `check --compare` 全部无限阻塞。新增
+    `assertPlainFile` / `readPlainTextFile`（读前验类型，唯一的普通文件判据），
+    三处读清单全部走它；判据用 `statSync`（跟随符号链接）以保留既有语义 ——
+    清单路径上的**断链**照旧读成「缺失」（stale），指向文件的链接照旧可读；
+  · **`auth login` 的空白变量 hint 建议 `unset` 后重跑**（Codex 第七轮）：
+    login 只从环境变量读、不回落配置文件（实测：`unset` 后重跑必然是「缺少 …」退 2）
+    —— 照 hint 执行解决不了问题。恢复动作改为「设为真实值后重跑」，并写明 login 的
+    读取范围；
+  · **whoami 的空白配置键 hint 建议「删掉这个键」**（Codex 第七轮）：`credentials`
+    块要求 appKey / appSecret 同时是非空字符串，只删一个键会让 `parseConfig` 拒绝
+    **整份配置**（实测：按旧 hint 操作后 whoami 变成「配置文件读取失败」，api/sync
+    也读不到其它档）。改为「删掉该档的整个 credentials 块」，并补一条正向对照用例
+    （整个块删掉 → 文件恢复可读）钉住这条死路。`resolveCredentials` 的兜底错误同样
+    按**值来源**给动作（环境变量 → `unset`；配置文件 → 整个块），两个字段都坏时一起点名；
+
 - **查询 / 存储 / 元数据命令的十五处契约修正（2026-11-05 第二路独立审查，三路探子 + 探针实测 + 十余轮双路收敛）**：
 
   · **执行期的文件访问与扩展加载被误报成「internal，请报告此问题」**：layer2 拦截

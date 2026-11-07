@@ -52,7 +52,8 @@ qiyu sync status
   提示里只有 `--force` 时（版本不一致 / 正文漂移）：**正文可能被手工改过**，`--force`
   会丢掉那些改动——先问人类是否允许覆盖，得到允许再执行。
   若 install 的 `meta.warnings` 说清单路径被非普通文件占用，**先清理那个占用**（那是人该做的事）：
-  两个动词都写不进清单，`--force` 还会只覆盖正文、留下「状态 updated 但提示仍在」的半截结果。
+  两个动词都写不进清单；正文被改过时 `--force` 还会只覆盖正文、留下「状态 updated 但提示仍在」的
+  半截结果，正文与包内一致时连 `--force` 也零写入（status 报 `skipped`）。
 - **`qiyu --version`**：输出包版本（`data.version`）与 `data.skill_contract_version`
   （**这份 CLI** 的正文契约号）。
 - **`qiyu skill where`**：报告实体目录与各 Agent 链接状态，并给出**已安装那份正文**的
@@ -66,8 +67,9 @@ qiyu sync status
   `links[].state` 的 `foreign` 表示**那个路径上是别人的东西**（不是本 CLI 建的链接）——
   install 会跳过它，**不要删、不要覆盖**；`unknown` 是「判定不了」，不是「不存在」。
   各状态的完整含义见该命令输出里的 `meta.field_notes`（每个值都带释义与动作）。
-- **`qiyu skill check`**：正文自身的防漂移校验（命令、表名、错误 `kind`、位置参数取值是否
-  仍存在于当前 CLI）。默认校验包内那份；`--installed` 校验已安装的那份，`--compare` 比对
+- **`qiyu skill check`**：正文自身的防漂移校验（命令、flag、错误 `kind` 与位置参数取值是否
+  符合当前 CLI 契约；正文里**出现表名或完整 SQL 序列**也算违规——这类事实必须运行时获取）。
+  默认校验包内那份；`--installed` 校验已安装的那份，`--compare` 比对
   两份并报告差异。有违规时退出码 1。
 - **不要手工编辑已安装的正文**：手工改过之后，`qiyu skill install`（不带 `--force`）
   会判定「内容与包内不同」而**跳过不覆盖**，你改的那份会一直留着、也一直与包内不一致。
@@ -100,6 +102,10 @@ qiyu sync status
   `{"ok":false,"error":…}`；日志与进度走 stderr，不要把 stderr 当数据。
 - 出错时按 `error.kind` 分支，不要按 `code`（见 errors.md）。
 - 退出码：`0` 成功 · `1` 业务错误 · `2` 用法错误 · `3` 网络错误 · `4` 需要人工确认。
+- ⚠️ 退出码 `1` 但 stdout 仍是 `{ok:true,data:…}`（**没有** `error`）的五种情况：
+  `sync run` 全窗失败、`sync verify` 的 `drift` 非空、`sync install`/`sync uninstall --yes`
+  有命令执行失败、`skill check` 有违规、`skill check --compare` 两侧不一致。这时按 `data`
+  读问题，不要去找 `error.kind`。
 
 ## 其余五份协议（按需阅读）
 
