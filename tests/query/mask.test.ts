@@ -1178,4 +1178,120 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     expect(out.rows[0].min).toBe('张三丰')
     expect(out.rows[0].max).toBe('李四光')
   })
+
+  // —— Codex 2026-11-08 四条回归（P1 泄漏 / 三条 P2 误改、误判、漏警告）——
+  it('P1：值级兜底已整段替换的 JSON 不得被列规则降级覆盖（@ 后内容重新可见）', () => {
+    // `SUMMARIZE SELECT row_to_json(t) AS userEmail FROM sessions t`：min 是紧凑 JSON，
+    // 无空白且恰含一个 @ → EMAIL_RE 整串命中。旧实现用 row[stat] 原本重算，把 FULL 覆盖成
+    // `{***@x.com","secret":"z"}` —— 不是邮箱的值被当成邮箱打码，@ 后的字段（含 secret）明文回归。
+    const json = '{"userEmail":"a@x.com","secret":"z"}'
+    const out = maskQueryRows({
+      rows: [{ column_name: 'userEmail', min: json, max: json }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SUMMARIZE SELECT row_to_json(t) AS userEmail FROM sessions t', tables: TABLES },
+    })
+    expect(out.rows[0]!.min).toBe(FULL)
+    expect(out.rows[0]!.max).toBe(FULL)
+  })
+
+  it('P2b：形状判据必须看 SQL 里的 SUMMARIZE —— 元数据查询的 min 数字不得改写', () => {
+    // SELECT column_name, MIN(ordinal_position) AS min FROM information_schema.columns
+    // GROUP BY column_name —— 输出列与 SUMMARIZE 同形（column_name/min），min 却是列位置。
+    // 只按输出列名判形状会把 `min: 3` 改成 <已脱敏>，让此前正确的元数据查询返回错误值。
+    const out = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 3 }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name',
+        tables: TABLES,
+      },
+    })
+    expect(out.rows[0]!.min).toBe(3)
+    expect(out.warnings.join('\n')).not.toContain('SUMMARIZE')
+  })
+
+  it('P2b 反向：SUMMARIZE 的三种实测形态都要命中（含嵌套与 query() 包装）', () => {
+    for (const sql of [
+      'SUMMARIZE sessions',
+      'SELECT * FROM (SUMMARIZE sessions)',
+      "SELECT * FROM query('SUMMARIZE sessions')",
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+        columns: ['column_name', 'min', 'max'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.rows[0]!.min, sql).toBe(FULL)
+      expect(out.rows[0]!.max, sql).toBe(FULL)
+    }
+  })
+
+  it('P families：SUMMARIZE 的 avg/std 也是 PII 派生值，一并替换', () => {
+    const out = maskQueryRows({
+      rows: [{ column_name: 'userPhone', min: null, max: null, avg: '13800138000.5', std: '3' }],
+      columns: ['column_name', 'min', 'max', 'avg', 'std'],
+      mode: { kind: 'sql', sql: "SUMMARIZE SELECT userPhone::DOUBLE AS userPhone FROM sessions", tables: TABLES },
+    })
+    expect(out.rows[0]!.avg).toBe(FULL)
+    expect(out.rows[0]!.std).toBe(FULL)
+  })
+
+  it('P2c：混合结果里非敏感行被值级兜底改写时，误伤警告必须保留', () => {
+    // SUMMARIZE sessions：userPhone 行是**有意**脱敏；session_id 行的 min 恰好是手机号形态
+    //（真实客户数据的样子）—— 被值级兜底改写时必须仍报「列 min 不在敏感列清单里」。
+    // 旧实现把 min 加进列级 structuralMasked，非敏感行的改写就再也到不了告警。
+    const out = maskQueryRows({
+      rows: [
+        { column_name: 'userPhone', min: '13800138000', max: '13900139000' },
+        { column_name: 'session_id', min: '13800123456', max: '13900123457' },
+      ],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SUMMARIZE sessions', tables: TABLES },
+    })
+    // 敏感行：按列规则（phone）脱敏
+    expect(out.rows[0]!.min).toBe('138****8000')
+    // 非敏感行：值级兜底改写
+    expect(out.rows[1]!.min).toBe('138****3456')
+    expect(out.warnings.join('\n'), '值形态误伤告警').toContain('按**值形态**')
+  })
+
+  it('P2c 基线保持：纯 SUMMARIZE 里被值级兜底改写的统计列仍按基线告警（不因有意脱敏而静默）', () => {
+    // 基线行为（SUMMARIZE 行规则落地之前）：`min` 被值级兜底改写 → falsePositive 告警。
+    // 本判据只要求**不回归**这条基线告警（方向安全、多警告）；有意脱敏的残余缺口另有一条。
+    const out = maskQueryRows({
+      rows: [{ column_name: 'userPhone', min: '13800138000', max: '13900139000' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SUMMARIZE sessions', tables: TABLES },
+    })
+    expect(out.warnings.join('\n'), '与基线一致的误伤告警').toContain('按**值形态**')
+    expect(out.warnings.join('\n'), '残余缺口声明（有意脱敏确实发生了）').toContain('别名/表达式列')
+  })
+
+  it('P2a：标识符里的 $q$ 不得被当成美元引号字符串（分组失真警告必须保留）', () => {
+    const sql = 'SELECT userPhone, 1 AS marker$q$, COUNT(*) AS n FROM sessions GROUP BY userPhone, marker$q$'
+    const out = maskQueryRows({
+      rows: [{ userPhone: '13800138000', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: { kind: 'sql', sql, tables: TABLES },
+    })
+    expect(out.warnings.join('\n'), '分组键含敏感列，警告必须在场').toContain('GROUP BY / DISTINCT')
+    // 对照：同样的查询去掉 $ 别名 → 也必须有警告（判据看的确实是 GROUP BY，不是别的）
+    const ctrl = maskQueryRows({
+      rows: [{ userPhone: '13800138000', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: { kind: 'sql', sql: 'SELECT userPhone, COUNT(*) AS n FROM sessions GROUP BY userPhone', tables: TABLES },
+    })
+    expect(ctrl.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('P2a 反向：真正的美元引号字面量仍被抹掉（边界修复不得回退字面量处理）', () => {
+    // 字面量里写着 GROUP BY userPhone —— 不是子句，不得触发分组失真警告
+    const out = maskQueryRows({
+      rows: [{ marker: 'x' }],
+      columns: ['marker'],
+      mode: { kind: 'sql', sql: "SELECT $q$GROUP BY userPhone$q$ AS marker FROM sessions", tables: TABLES },
+    })
+    expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
+  })
 })

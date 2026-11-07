@@ -339,7 +339,15 @@ function withoutLiterals(text: string): string {
     }
     // 美元引号字符串（`$$…$$` / `$tag$…$tag$`，DuckDB 实测支持）是**字面量** → 抹掉。
     // `$` 在标识符里也合法，形似引号却找不到配对结束符时按普通字符放行。
+    // ⚠️ 必须先判**标识符边界**（Codex 2026-11-08 P2 实测）：PostgreSQL/DuckDB 规定
+    // 美元引号必须与前一个关键字/标识符用空白分隔 —— 紧跟在标识符字符后的 `$` 属于该
+    // 标识符。`SELECT userPhone, 1 AS marker$q$, COUNT(*) AS n FROM … GROUP BY …,
+    // marker$q$` 是合法 SQL，不做边界判据会把两个别名里的 `$q$` 当成一对引号，把中间的
+    // `GROUP BY` 整段抹掉 → 分组失真警告静默丢失（实测判据双边：去掉 alias 的对照组
+    // 警告在场）。字母/数字/下划线/`$` 与本文件其它词边界正则的字符类一致。
     if (ch === '$') {
+      const prev = i > 0 ? text[i - 1]! : ''
+      if (i > 0 && /[A-Za-z0-9_$]/.test(prev)) { out += ch; continue }
       const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i))
       if (m !== null) {
         const end = text.indexOf(m[0], i + m[0].length)
@@ -523,20 +531,37 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const changed = new Set<string>()
   // 整行/STRUCT/LIST 命中的列：那是「整值替换」而不是「按值形态误判业务数字」，
   // 不进下面的误伤提示（场景审查 7.2 只针对字符串形态命中）。
-  const structuralMasked = new Set<string>()
+  /**
+   * 值级兜底真正改写过的列（形态命中或 JSON 整段）——「值形态误伤」告警的唯一依据。
+   * ⚠️ 只有**字符串**被改写才记账：对象/数组（STRUCT/LIST 整行）走 S1 整值替换，
+   * 那是安全动作而非「值形态误判业务数字」，不该触发误伤警告（Codex 2026-11-08 P2）。
+   */
+  const valueFormMasked = new Set<string>()
+  /** SUMMARIZE 行规则改写过统计单元格的列（有意的按列脱敏，不单独构成误伤告警）。 */
+  const summarizeMasked = new Set<string>()
   // ⚠️ SUMMARIZE 形态（**严重**，2026-11-07 审查实测）：`SUMMARIZE sessions` 的输出列是
   // 通用的 `column_name / min / max / q25 / …`，真正的列名在**行值**里 —— 三条列名级启发式
   // （输出列名、SQL 文本、payload）全部落空，`userName` / `userAddress` 的 min/max **原值
   // 静默输出**，且 `mask_warnings` 为空（实测：`min:"张三丰"`、`max:"李四光"`）。
   // 这是「声明敏感但可从一条只读语句拿到明文」的完整绕过，必须在行级补一道判据。
-  //   · 形状判据：输出含 `column_name` 且含 `min`/`max`（本 CLI 的表没有叫 column_name 的列，
-  //     不会误伤普通查询）；
+  //   · 形状判据：**SQL 文本出现 SUMMARIZE 关键字** + 输出含 `column_name` 且含
+  //     `min`/`max`。⚠️ 只看列名不够（Codex 2026-11-08 P2 实测）：
+  //     `SELECT column_name, MIN(ordinal_position) AS min FROM information_schema.columns
+  //     GROUP BY column_name` 输出同样的 `column_name/min`，min 是列位置数字而非客户数据，
+  //     只按列名判会把 `min: 3` 误改成 `<已脱敏>`。
+  //     SQL 文本判据覆盖全部实测形态（`SUMMARIZE sessions`、`SELECT * FROM (SUMMARIZE …)`、
+  //     `query('SUMMARIZE …')` —— 后者另有一条 nestedSql 缺口警告）；残余边界：
+  //     `query('SUMM' || 'ARIZE …')` 这类**动态拼串**文本里没有关键字，取不到（已由
+  //     nestedSql 警告声明「内层无法分析」的缺口，方向与既有口径一致）。
   //   · 命中判据：该行 `column_name` 的**基名**精确匹配敏感列清单（与列名级同一口径）；
-  //   · 动作：命中行的统计列按该列规则脱敏，并计入 `structuralMasked`，
-  //     使其不被下面的「值形态误伤」警告说成「业务数字被误改」。
-  const summarizeShape = columns.includes('column_name')
+  //   · 动作：命中行的统计列按该列规则脱敏。
+  const summarizeShape = mode.kind === 'sql' && /\bSUMMARIZE\b/i.test(mode.sql)
+    && columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
-  const SUMMARIZE_STATS = ['min', 'max', 'q25', 'q50', 'q75'] as const
+  // avg/std 只对数值列出现：`SUMMARIZE SELECT userPhone::DOUBLE AS userPhone` 的均值/标准差
+  // 同样是 PII 派生值，一并整值替换。count 是行数、approx_unique 是去重计数，单看它们
+  // 恢复不出任何一个原值，不在此列。
+  const SUMMARIZE_STATS = ['min', 'max', 'avg', 'std', 'q25', 'q50', 'q75'] as const
   const outRows = rows.map((row) => {
     const out = { ...row }
     for (const name of columns) {
@@ -557,8 +582,11 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
           : maskValue(before, ruleForColumn(baseName(name)))
       } else {
         out[name] = maskCellByValue(before)
-        if (out[name] !== before && (Array.isArray(before) || (before !== null && typeof before === 'object'))) {
-          structuralMasked.add(name)
+        if (out[name] !== before && typeof before === 'string') {
+          // 字符串被值级兜底改写（手机号/邮箱/IPv4 形态或 JSON 整段）：这是「值形态误伤」
+          // 告警的依据，按列记账。与 `changed` 的区别：`changed` 还包含有意脱敏
+          // （列名级 / SUMMARIZE 行规则 / 对象整值替换），那些不该触发误伤告警。
+          valueFormMasked.add(name)
         }
       }
       if (out[name] !== before) changed.add(name)
@@ -568,15 +596,25 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       if (sensitiveNames.includes(col)) {
         for (const stat of SUMMARIZE_STATS) {
           if (!(stat in row)) continue
-          // ⚠️ 必须从**原始行**取值：`out[stat]` 可能已被值级兜底改过一次，
-          // 再按列规则跑一遍会把 `138****8000` 判成「形态不符」而退化成整值替换。
           const before = row[stat]
           if (before === null || before === undefined) continue
-          // 非字符串（数值列 min/max 被 DuckDB 输出成数字）整值替换 —— 与列名级同一条 S1 规则。
-          out[stat] = typeof before !== 'string' ? FULL : maskValue(before, ruleForColumn(col))
+          // ⚠️ 值级兜底的**整值替换必须保留**（Codex 2026-11-08 P1 实测）：`out[stat]` 若已被
+          // `maskCellByValue` 判成 FULL（JSON 含 PII 叶子 / 畸形 JSON / STRUCT），这里再用列规则
+          // 重算会把 `<已脱敏>` 降级 —— 紧凑 JSON（`{"userEmail":"a@x.com","secret":"z"}` 无空白、
+          // 恰含一个 `@`）会整串命中邮箱正则，变成 `{***@x.com","secret":"z"}`，`@` 之后的内容
+          // 重新可见。规则：已是 FULL → 保持；否则按该列规则脱敏（非字符串与列名级同一条 S1 规则）。
+          // 强度关系：能过 EMAIL/PHONE/IPV4 正则的值，值级判出的规则就是列规则本身，两者逐字相等；
+          // 值级是 FULL 而列规则给出弱形态的唯一路径就是上面这种 JSON 整串误配 —— 故 FULL 优先。
+          out[stat] = out[stat] === FULL || typeof before !== 'string'
+            ? FULL
+            : maskValue(before, ruleForColumn(col))
           if (out[stat] !== before) {
             changed.add(stat)
-            structuralMasked.add(stat)
+            summarizeMasked.add(stat)
+            // ⚠️ 不写 `structuralMasked`（Codex 2026-11-08 P2 实测）：它是一个**列级**集合，
+            // 任一敏感行把它塞进去，后面「值形态误伤」的判据就会跳过该列的全部单元格 ——
+            // 混合结果里非敏感行（如 session_id 的 min 恰好是手机号形态）被值级兜底改写时
+            // 的告警会一起消失。这里是**有意**脱敏，按 SUMMARIZE 来源单独记账。
           }
         }
       }
@@ -703,7 +741,11 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // SUMMARIZE 的残余缺口（2026-11-07 审查）：行级判据只认 `column_name` **恰好**是敏感列名；
   // `SUMMARIZE SELECT userName AS n …` 的 column_name 是 `n`，脱敏不命中。与 query()/
   // COLUMNS() 同属「无法可靠分析」，按既有口径**声明缺口而不拒绝**（只读、不越权）。
-  if (summarizeShape && changed.size > 0) {
+  // ⚠️ 触发条件用 `summarizeMasked`（SUMMARIZE 行级判据**真命中过**）而非 `changed.size > 0`
+  //（Codex 2026-11-08 P2 实测）：changed 含值级兜底的改写 —— `SUMMARIZE sessions` 里只有
+  // 非敏感列 min 恰为手机号形态时，本警告会凭空声称「已按 column_name 精确匹配脱敏」，而
+  // 实际一条 SUMMARIZE 规则都没跑。范围收敛到「本判据确实改写过单元格」。
+  if (summarizeMasked.size > 0) {
     warnings.push(
       'SUMMARIZE 的统计值（min/max/分位数）可能来自敏感列：本次已按输出里的 column_name '
       + '精确匹配脱敏；**别名/表达式列**（如 `SUMMARIZE SELECT userName AS n …`）不在其列。'
@@ -830,8 +872,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // payload 同理（它有自己的缺口警告，且刻意不在 sensitiveNames 里）。
   const falsePositive = referencesSensitive
     ? []
-    : [...changed].filter((n) =>
-      n !== 'payload' && !structuralMasked.has(n) && !sensitiveNames.includes(baseName(n)))
+    : [...valueFormMasked].filter((n) =>
+      n !== 'payload' && !sensitiveNames.includes(baseName(n)))
   if (falsePositive.length > 0) {
     warnings.push(
       `列 ${falsePositive.join('、')} 不在敏感列清单里，是按**值形态**（手机号/邮箱/IPv4）`
