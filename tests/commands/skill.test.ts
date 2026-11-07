@@ -1050,6 +1050,20 @@ describe('skill check', () => {
     expect((data().differences as string[]).join('\n')).toContain('已安装的文件集与包内不同')
   })
 
+  it('--compare 受管文件被换成指向目录外的符号链接（内容相同）→ 退 1（Codex PR #69 第五轮）', async () => {
+    // 读取会跟随符号链接拿到与包内相同的内容 → 旧实现误判「正文一致」退 0；
+    // 入口文件必须是实体目录内的普通文件，不可比就报差异（不读）。
+    expect(await skillCommand(['install', '--dir', entity])).toBe(0)
+    const doc = join(entity, 'SKILL.md')
+    const outside = join(home, 'outside-skill.md')
+    writeFileSync(outside, readFileSync(doc, 'utf8'))
+    rmSync(doc)
+    symlinkSync(outside, doc)
+    out = ''; err = ''
+    expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
+    expect((data().differences as string[]).join('\n')).toContain('不可比')
+  })
+
   it('--compare 在未安装时报告差异并退出 1（不抛 ENOENT）', async () => {
     expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
     const d = data()
@@ -1253,17 +1267,17 @@ describe('skill check', () => {
     const rules = (data().violations as Array<Record<string, unknown>>).map((v) => v.rule)
     expect(rules).toEqual(['unknown_flag', 'unknown_positional'])
   })
-  it('--compare 内容哈希失败 → 退出 1（无法完成比较 ≠ 一致，审查 M3）', async () => {
+  it('--compare 受管文件缺失 → 退出 1（无法完成比较 ≠ 一致，审查 M3）', async () => {
     expect(await skillCommand(['install', '--dir', entity])).toBe(0)
     // ⚠️ 2026-11-06 起判据是**受管文件集**：构造「比较失败」要动受管文件。
-    // 删掉一个受管正文（errors.md）→ 读它时 ENOENT → 比较无法完成 → 退 1。
-    // （此前用「额外文件 notes.txt chmod 000」构造，那是整目录总哈希时代的产物；
-    //  额外文件现在不参与正文比较 —— 见下一条用例。）
+    // 删掉一个受管正文（errors.md）→ lstat 返回 ENOENT → managedContentHash 返回 {problem:'missing'}
+    // → compare 退 1。文案点名缺失的那个文件，Agent 知道哪个文件不见了。
     rmSync(join(entity, 'errors.md'))
     out = ''; err = ''
     expect(await skillCommand(['check', '--compare', '--dir', entity])).toBe(1)
     const d = data()
-    expect((d.differences as string[]).join('\n')).toContain('内容哈希比较失败')
+    expect((d.differences as string[]).join('\n')).toContain('errors.md')
+    expect((d.differences as string[]).join('\n')).toContain('缺失')
   })
 
   it('额外文件（含读不动的）不参与正文比较 → --compare 仍退 0（上一条的反向对照）', async () => {

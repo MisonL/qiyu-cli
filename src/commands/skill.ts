@@ -40,7 +40,7 @@ import { COMMAND_TREE } from './tree.js'
 import { prettyAfterSubcommand } from './spec-types.js'
 import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult, type ViolationRule } from '../skill/check.js'
-import { contentHash, contentHashOfFiles, fileHash, installSkill, listFiles, planInstall, sameFileSet, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
+import { contentHash, contentHashOfFiles, fileHash, installSkill, listFiles, managedContentHash, planInstall, sameFileSet, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
 import {
   ENTITY_SOURCES, entityUndeterminedNote, npmRelativeBase, readInstalledManifestInfo,
   resetSkillDetectionCache, resolveEntityDirSources, resolveSkillSourceDir,
@@ -1061,9 +1061,22 @@ async function skillCheck(argv: string[]): Promise<number> {
           if (cmpInfo?.files !== undefined && cmpInfo.files.length > 0) {
             const pkgFiles = listFiles(pkgDir)
             const sameSet = sameFileSet(cmpInfo.files, pkgFiles)
-            differs = !sameSet
-              || contentHashOfFiles(entityDir, cmpInfo.files) !== contentHashOfFiles(pkgDir, cmpInfo.files)
-            if (!sameSet) reason = '已安装的文件集与包内不同（包已增删文件）'
+            if (!sameSet) {
+              differs = true
+              reason = '已安装的文件集与包内不同（包已增删文件）'
+            } else {
+              // ⚠️ 受管条目先筛「实体内的普通文件」再读（Codex PR #69 第五轮）：FIFO 会让
+              // `readFileSync` 无限阻塞，符号链接会被跟随、可能拿到与包内相同的内容。
+              const h = managedContentHash(entityDir, cmpInfo.files)
+              if ('hash' in h) {
+                differs = h.hash !== contentHashOfFiles(pkgDir, cmpInfo.files)
+              } else {
+                differs = true
+                reason = `已安装的 ${h.rel} 不可比（${h.problem === 'missing' ? '缺失'
+                  : h.problem === 'not_plain' ? '非普通文件（符号链接/目录/FIFO 等）'
+                    : '真实路径不在实体目录内'}）`
+              }
+            }
           } else {
             differs = contentHash(pkgDir) !== contentHash(entityDir)
           }
@@ -1077,6 +1090,11 @@ async function skillCheck(argv: string[]): Promise<number> {
           }
         } catch (e) {
           // 审查 M3：无法完成内容比较 = 无法完成比较，退出码必须为 1。
+          // ⚠️ 可读性提示（2026-11-06 Codex 第五轮复核）：`managedContentHash` 已把
+          // 「缺失 / 非普通文件 / 逃出实体」三种形态归成有名字的差异，**读取错误**
+          // （EACCES 等）才落到这里 —— 而那种文件通常更早被上面的 `runCheck` 拦成
+          // 「已安装目录读取失败」。本分支因此是**竞态兜底**（检查通过之后、比较之前
+          // 文件变得不可读），没有能稳定触达它的用例，如实记录而不是假装有覆盖。
           differences.push(`内容哈希比较失败：${errMsg(e)}`)
           installedFailed = true
         }

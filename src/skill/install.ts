@@ -257,6 +257,41 @@ export function contentHashOfFiles(dir: string, rels: readonly string[]): string
  * `planInstall` 还会走 rewrite-manifest 分支、`--force` 也跳过修复。
  * 重复条目本身说明清单不可信，一律判「不同」。
  */
+export type ManagedHashResult =
+  | { hash: string }
+  | { problem: 'missing' | 'not_plain' | 'escapes'; rel: string }
+
+/**
+ * 对**实体目录里的受管文件集**算内容哈希，且先验证每个条目是「实体目录内的普通文件」。
+ *
+ * ⚠️ 不能直接把清单里的相对路径交给 `contentHashOfFiles` 去 `readFileSync`（Codex PR #69
+ * 第五轮实测）：清单里的一条被 FIFO 占住时 `readFileSync` **无限阻塞**（打开读端等写端），
+ * `skill install` 与 `skill check --compare` 都会挂死；被换成指向目录外的符号链接时，
+ * 读取会**跟随链接**拿到与包内相同的内容 → 误判「正文一致」，而入口文件必须是实体内的
+ * 普通文件（skill spec §…）。旧的整目录哈希走 `listFiles`（只收普通文件），天然躲开了
+ * 这两种形态 —— 换成受管集哈希后必须把这道筛选补回来。
+ *
+ * 读取**内容**时的 I/O 错误（EACCES 等）仍然抛给调用方（--force 能修好），这里只拦
+ * 「不可比」的形态：缺失 / 非普通文件 / 真实路径逃出实体目录。
+ */
+export function managedContentHash(dir: string, rels: readonly string[]): ManagedHashResult {
+  for (const rel of rels) {
+    const abs = joinRel(dir, rel)
+    const parents = verifyPlainParents(dir, rel)
+    if (parents === 'unsafe') return { problem: 'escapes', rel }
+    let st
+    try {
+      st = lstatSync(abs)
+    } catch (err) {
+      if (isErrno(err, 'ENOENT')) return { problem: 'missing', rel }
+      throw err
+    }
+    if (!st.isFile()) return { problem: 'not_plain', rel }   // FIFO / 目录 / 符号链接：不读
+    if (!isRealpathContained(dir, abs)) return { problem: 'escapes', rel }
+  }
+  return { hash: contentHashOfFiles(dir, rels) }
+}
+
 export function sameFileSet(a: readonly string[], b: readonly string[]): boolean {
   const sa = new Set(a)
   const sb = new Set(b)
@@ -1086,6 +1121,8 @@ export function planInstall(opts: {
   let hashError: unknown = null
   // 受管文件集与包内不一致（包升级增/删了文件）—— 单独记账，用于给准原因。
   let fileSetDiffers = false
+  // 受管条目「不可比」（缺失 / 非普通文件 / 逃出实体目录）—— 与「文件集不同」分开归因。
+  let managedProblem: Extract<ManagedHashResult, { problem: string }> | null = null
   // ⚠️ 「正文是否被改过」的判据基准是**受管文件集**（上一版清单的 `files`），不是整目录
   // 总哈希（2026-11-06 审查实测）：用户往实体目录里放任何自己的文件（`where` 明确说
   // 「不影响正文判定」）都会让总哈希不同 → 这里报「可能被手工修改」并推 `--force`，
@@ -1114,8 +1151,15 @@ export function planInstall(opts: {
         // 判据走 `sameFileSet`（同时拒绝重复条目），与 `check --compare` 同源。
         fileSetDiffers = !sameFileSet(managedRels, sourceFiles)
         if (!fileSetDiffers) {
-          targetHash = contentHashOfFiles(entityDir, managedRels)
-          sourceComparableHash = contentHashOfFiles(sourceDir, managedRels)
+          // 受管条目可能是 FIFO / 符号链接等「不可比」形态 —— 由 `managedContentHash`
+          // 先筛（旧实现读 FIFO 会无限阻塞、跟符号链接会误判一致，Codex PR #69 第五轮）。
+          const h = managedContentHash(entityDir, managedRels)
+          if ('hash' in h) {
+            targetHash = h.hash
+            sourceComparableHash = contentHashOfFiles(sourceDir, managedRels)
+          } else {
+            managedProblem = h
+          }
         }
       } else {
         targetHash = contentHash(entityDir)
@@ -1176,11 +1220,18 @@ export function planInstall(opts: {
     }
   }
 
+  const managedProblemText = managedProblem === null ? '' : ({
+    missing: '受管文件缺失（可能被手工删除）',
+    not_plain: '受管文件被替换成了非普通文件（符号链接/目录/FIFO 等）',
+    escapes: '受管文件的真实路径不在实体目录内',
+  } as const)[managedProblem.problem]
   const reason = fileSetDiffers
     ? '包内的受管文件集与上次安装不同（包升级增/删了文件），未能逐文件比对'
-    : hashError !== null
-      ? `读取实体目录内容失败（${errMsg(hashError)}）`
-      : '实体目录内容与包内不同（可能被手工修改）'
+    : managedProblem !== null
+      ? `上一版安装的 ${managedProblem.rel} 不可比（${managedProblemText}），未能判定正文是否一致`
+      : hashError !== null
+        ? `读取实体目录内容失败（${errMsg(hashError)}）`
+        : '实体目录内容与包内不同（可能被手工修改）'
   warnings.push(`${reason}，未覆盖；确认后可用 --force 覆盖：${entityDir}`)
   return { ...base, status: 'skipped', action: 'none', warnings }
 }

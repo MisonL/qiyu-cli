@@ -20,6 +20,7 @@ import { dirname, join } from 'node:path'
 import {
   contentHash, installSkill, MANIFEST, planInstall, STAGING_MARKER_CONTENT, type Manifest,
 } from '../../src/skill/install.js'
+import { execFileSync } from 'node:child_process'
 import { defaultEntityDir, linkState, linkTarget } from '../../src/skill/paths.js'
 import { SKILL_CONTRACT_VERSION } from '../../src/core/edition.js'
 
@@ -271,6 +272,69 @@ describe('contentHash', () => {
     write(a, 'a', 'bc')
     write(b, 'ab', 'c')
     expect(contentHash(a)).not.toBe(contentHash(b))
+  })
+})
+
+// —— Codex PR #69 第五轮：受管条目是 FIFO / 指向目录外的符号链接 ——
+// `contentHashOfFiles` 直接 `readFileSync`：FIFO 打开读端会等写端（**无限阻塞**），
+// 符号链接会被跟随、拿到与包内相同的内容（误判「正文一致」）。旧的整目录哈希走
+// `listFiles`（只收普通文件），换成受管集哈希后这道筛选必须补回来。
+// ⚠️ 判据落在 `managedContentHash`；`execFileSync('mkfifo')` 是唯一能造 FIFO 的办法
+// （Node 没有 mkfifoSync），POSIX only。
+describe('受管条目不是普通文件时不得读取（Codex PR #69 第五轮）', () => {
+  it.skipIf(process.platform === 'win32')('FIFO 占住受管路径：不阻塞、如实判「不可比」', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    const entity = defaultEntityDir(home)
+    rmSync(join(entity, 'references', 'deep.md'))
+    execFileSync('mkfifo', [join(entity, 'references', 'deep.md')])
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    expect(r.status).toBe('skipped')
+    expect(r.warnings.join('\n')).toContain('不可比')
+    expect(r.warnings.join('\n')).toContain('deep.md')
+    expect(r.warnings.join('\n')).toContain('FIFO')
+    // --force 仍能修好（写盘走 isSafeWriteTarget，不读那个 FIFO）
+    const forced = await installSkill({ home, sourceDir: src, version: '1.0.0', force: true, noLink: true })
+    expect(forced.status).toBe('updated')
+  })
+
+  // ⚠️ 上面那条 FIFO 用例**变异时是挂死而不是变红**（实测：去掉 `!st.isFile()` 筛选后
+  // 进程跑满 600s 未退，`testTimeout` 打不断同步的 `readFileSync`）—— 这条记录本身就是
+  // 该守卫的价值：没被拦住的 FIFO 会让 CI 永久挂起。下面这条用**目录**占位：读取会立刻
+  // 抛 EISDIR，于是「去掉类型筛选」这类变异会**快速变红**，可作为可验证的回归。
+  it('受管路径被目录占住：不读取、如实判「不可比」', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    const entity = defaultEntityDir(home)
+    rmSync(join(entity, 'references', 'deep.md'))
+    mkdirSync(join(entity, 'references', 'deep.md'))
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    expect(r.status).toBe('skipped')
+    const w = r.warnings.join('\n')
+    expect(w).toContain('不可比')
+    expect(w).toContain('deep.md')
+    expect(w).toContain('非普通文件')
+  })
+
+  it.skipIf(process.platform === 'win32')('受管路径是符号链接：不跟随读取、不得判「正文一致」', async () => {
+    const src = makeSource()
+    await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    const entity = defaultEntityDir(home)
+    // 内容与包内**逐字节相同**、只是放在实体目录之外 —— 读到了也一样算「不可比」，
+    // 入口文件必须是实体内的普通文件。
+    const outside = join(home, 'outside-deep.md')
+    writeFileSync(outside, readFileSync(join(entity, 'references', 'deep.md'), 'utf8'))
+    rmSync(join(entity, 'references', 'deep.md'))
+    symlinkSync(outside, join(entity, 'references', 'deep.md'))
+
+    const r = await installSkill({ home, sourceDir: src, version: '1.0.0', force: false, noLink: true })
+    expect(r.status).toBe('skipped')
+    const w = r.warnings.join('\n')
+    expect(w).toContain('不可比')
+    expect(w).toContain('deep.md')
+    expect(w).toContain('非普通文件')
   })
 })
 

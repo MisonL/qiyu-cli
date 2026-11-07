@@ -1042,6 +1042,21 @@ function changelogCountMismatches(md: string): {
   return { bad, checked, entries, badTitle }
 }
 
+describe('README 的 --profile 建议必须按命令能力限定（Codex PR #69 第五轮）', () => {
+  it('不得再写「在每条命令上写 --profile」；必须点名不接受它的命令族', () => {
+    const s = read('README.md')
+    // 事故形态：api call / auth whoami / sync tasks 都不接受 --profile（实测退 2），
+    // 「每条命令上写 --profile」对它们是做不到的动作。
+    expect(s, '旧的无条件建议不得回归').not.toContain('所以要么在每条命令上')
+    expect(s).toContain('不接受 `--profile` 的命令')
+    for (const fam of ['`api *`', '`auth whoami`', '`sync tasks`']) {
+      expect(s, `必须点名 ${fam}`).toContain(fam)
+    }
+    // 正向：接受它的命令族也要点名（否则用户不知道哪些能写 flag）
+    expect(s).toContain('接受 `--profile` 的命令')
+  })
+})
+
 describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () => {
   it('「N 处契约修正」批的 bullet 数 == 标题里的 N', () => {
     const { bad, checked, entries, badTitle } = changelogCountMismatches(read('CHANGELOG.md'))
