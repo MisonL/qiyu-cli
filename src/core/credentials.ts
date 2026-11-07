@@ -24,11 +24,28 @@ export function resolveCredentials(
   // （credentials-source / auth login / whoami）已用 `isWhitespaceOnly` 点名变量，
   // 这里兜住**配置文件**里的空白值。判据必须复用同一个函数：两处各写一遍
   // （`v !== undefined && v !== '' && v.trim() === ''`）迟早会分叉。
-  if (isWhitespaceOnly(appKey)) {
-    throw new Error('appKey 的值只有空白字符（不是有效凭证）——请设置真实值，或删掉对应的环境变量/配置键')
+  //
+  // ⚠️ 恢复动作必须按**来源**给（Codex PR #69 第七轮）：同一条「删掉对应的…键」对
+  // 环境变量成立（删掉后 api/sync 回落读文件），对**配置键不成立** —— credentials
+  // 块要求 appKey/appSecret 同时是非空字符串，只删一个键会让整份配置被 parseConfig
+  // 拒绝（实测：此后 whoami 报「配置文件读取失败」、api/sync 也读不到其它档）。
+  const problems: string[] = []
+  for (const [field, envVar, fromEnv, bad] of [
+    ['appKey', 'QIYU_APP_KEY', env.appKey !== undefined, isWhitespaceOnly(appKey)],
+    ['appSecret', 'QIYU_APP_SECRET', env.appSecret !== undefined, isWhitespaceOnly(appSecret)],
+  ] as const) {
+    if (!bad) continue
+    problems.push(fromEnv
+      // 环境变量层：删掉变量后本命令会回落到配置文件 —— 前提是文件里有这一档的凭证，
+      // 没有的话只是把错误挪到「缺少 …」。两条出路都写出来，不替用户假定文件里有什么。
+      ? `${field}（环境变量 ${envVar}）只有空白字符 —— 设为真实值，或 \`unset ${envVar}\``
+        + ' 改用配置文件里的凭证（文件里没有的话仍会报缺少）'
+      // 配置文件层：不能只删单个键（整份配置会被拒）。要移除就移除整个 credentials 块。
+      : `${field}（配置文件）只有空白字符 —— 设为真实值，或删掉该 profile 的整个 credentials 块`
+        + '（只删单个键会让配置文件解析失败）')
   }
-  if (isWhitespaceOnly(appSecret)) {
-    throw new Error('appSecret 的值只有空白字符（不是有效凭证）——请设置真实值，或删掉对应的环境变量/配置键')
+  if (problems.length > 0) {
+    throw new Error(`${problems.join('；')}。这些值都不是有效凭证`)
   }
 
   if (!appKey) {

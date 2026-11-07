@@ -495,6 +495,31 @@ describe('纯空白凭证（A12，2026-11-06）', () => {
     expect(e.kind).toBe('auth_missing')
     expect(String(e.message)).toContain('appKey')
     expect(String(e.message)).toContain('"default"')
+    // hint 不得建议「删掉这个键」：credentials 块要求两个键同时在，只删一个键会让
+    // parseConfig 拒绝整份配置（实测：按旧 hint 操作后 whoami 变成「配置文件读取失败」）。
+    // 给出的可执行动作是「整个 credentials 块」。
+    const hint = String(e.hint)
+    expect(hint).toContain('整个 credentials 块')
+  })
+
+  it('whoami：按 hint 删整个 credentials 块 + 环境变量 → 能恢复（正向对照）；只删单键 → 反而更糟（旧 hint 的死路）', async () => {
+    // 双向钉住 hint 的两个分支：整个块删掉后 env 能接上；只删单键 parseConfig 拒整份文件
+    // —— 这正是旧文案（「删掉这个键」）把人引向的死路。
+    writeCfg({ profiles: { default: { credentials: { appKey: '   ', appSecret: 'sss' } } } })
+    // env 齐备（两个字段都给），文件才是那个被坏掉的 —— 这样坏文件只体现在 warnings 里
+    vi.stubEnv('QIYU_APP_KEY', 'envkey')
+    vi.stubEnv('QIYU_APP_SECRET', 'envsecret')
+    // 只删 appKey 键（照旧 hint 执行）→ 配置文件整体解析失败
+    writeCfg('{ "profiles": { "default": { "credentials": { "appSecret": "sss" } } } }')
+    expect(await authCommand(['whoami'])).toBe(0)   // env 接住了，但警告必须点名坏文件
+    expect((JSON.parse(out).meta.warnings ?? []).join('\n')).toContain('配置文件读取失败')
+    // 照新 hint 执行：删掉整个 credentials 块 → 文件恢复可读，env 与文件都不再报错
+    writeCfg({ profiles: { default: {} } })
+    out = ''   // out 在同一用例内累积，断言第二条输出前必须清空
+    const r = await authCommand(['whoami'])
+    expect(r).toBe(0)
+    expect(JSON.parse(out).meta.warnings ?? [], '整块删掉后不再有读取失败警告').toEqual([])
+    expect(JSON.parse(out).data.source).toBe('env')
   })
 
   it('whoami：env 已有值时文件里的空白不被选中 → 仍报 configured:true（逐字段优先级 env > file）', async () => {
@@ -530,5 +555,12 @@ describe('纯空白凭证（A12，2026-11-06）', () => {
     expect(err).toContain('QIYU_APP_KEY')
     expect(err).toContain('空白')
     expect(existsSync(cfgPath()), '不得把空白值写进配置文件').toBe(false)
+    // hint 不得建议「unset 后直接重跑 login」（Codex PR #69 第七轮）：login 只读环境变量、
+    // 不回落配置文件，删掉变量后重跑必然是「缺少 …」退 2。恢复动作只有「设真实值」。
+    // ⚠️ hint 只出现在 stdout 的 JSON 里（usageFail 只把 message 写 stderr）。
+    const e = JSON.parse(out).error as Record<string, unknown>
+    expect(String(e.hint)).toContain('设为真实值')
+    expect(String(e.hint)).toContain('只从环境变量读取')
+    expect(String(e.hint)).not.toMatch(/unset/)
   })
 })

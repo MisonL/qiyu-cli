@@ -149,4 +149,35 @@ describe('纯空白值（A12，2026-11-06）', () => {
     expect(() => resolveCredentials({}, { appKey: '  ', appSecret: 's' })).toThrow(/只有空白字符/)
     expect(() => resolveCredentials({}, { appKey: 'k', appSecret: '\t\t' })).toThrow(/只有空白字符/)
   })
+
+  // ⚠️ 恢复动作必须按来源给（Codex PR #69 第七轮）：同一句「删掉对应的…键」对
+  // 环境变量成立（删掉后 api/sync 回落读文件），对**配置键不成立** —— credentials
+  // 块要求两个键同时在，只删一个键会让 parseConfig 拒绝整份配置（端到端实测见
+  // tests/commands/auth.test.ts 的「只删单键反成死路」用例）。
+  it('配置文件的空白值：给「整个 credentials 块」的动作，不得只让人删单个键', () => {
+    let msg = ''
+    try { resolveCredentials({}, { appKey: '  ', appSecret: 's' }) } catch (e) { msg = (e as Error).message }
+    expect(msg).toContain('整个 credentials 块')
+    expect(msg).toContain('只删单个键会让配置文件解析失败')
+  })
+
+  it('环境变量的空白值：给 unset 的动作（删掉后能回落文件）', () => {
+    let msg = ''
+    try { resolveCredentials({ appKey: ' ', appSecret: 's' }) } catch (e) { msg = (e as Error).message }
+    expect(msg).toContain('unset QIYU_APP_KEY')
+    expect(msg).not.toContain('整个 credentials 块')
+  })
+
+  it('两个字段都为空白时一起点名；来源不同时各给各的动作', () => {
+    let both = ''
+    try { resolveCredentials({ appKey: ' ', appSecret: '\t' }) } catch (e) { both = (e as Error).message }
+    expect(both).toContain('QIYU_APP_KEY')
+    expect(both).toContain('QIYU_APP_SECRET')
+    // 混合来源：appKey 来自 env（unset），appSecret 来自文件（整个块）。
+    // env 不给 appSecret，文件那份空白才会被选中。
+    let mixed = ''
+    try { resolveCredentials({ appKey: ' ' }, { appSecret: '  ' }) } catch (e) { mixed = (e as Error).message }
+    expect(mixed).toContain('unset')
+    expect(mixed).toContain('整个 credentials 块')
+  })
 })

@@ -221,9 +221,11 @@ async function login(argv: string[]): Promise<number> {
     ...(isWhitespaceOnly(envSecret) ? ['QIYU_APP_SECRET'] : []),
   ]
   if (blankEnv.length > 0) {
+    // ⚠️ 不能建议 `unset` 后直接重跑（Codex PR #69 第七轮）：login 只从环境变量读、
+    // 不回落配置文件，删掉变量后重跑必然又是「缺少 …」退 2。恢复动作只有「设真实值」。
     return usageFail(
       `环境变量 ${blankEnv.join('、')} 只有空白字符（不是有效凭证），未写入配置文件`,
-      `请把它们设为真实值；若本意是不设置，用 \`unset ${blankEnv.join(' ')}\` 删除变量后再运行 auth login`,
+      `请把它们设为真实值后重新运行 auth login（login 只从环境变量读取，不会回落配置文件）`,
     )
   }
   const appKey = nonEmptyValue(envKey)
@@ -386,8 +388,13 @@ function whoami(): number {
     return fail({
       code: 'auth_missing', kind: 'auth_missing', retryable: false,
       message: `配置文件里 profile ${JSON.stringify(profileName)} 的 ${blankFile.join('、')}`
-        + '只有空白字符（不是有效凭证）',
-      hint: `请在该档里设为真实值；或删掉这个键、改用环境变量（环境变量优先于配置文件）：${configPathFor()}`,
+        + ' 只有空白字符（不是有效凭证）',
+      // ⚠️ 不能建议「删掉这个键」再改用环境变量（Codex PR #69 第七轮）：`credentials`
+      // 块要求 appKey / appSecret 同时是非空字符串，只删一个键会让 parseConfig 拒绝
+      // 整份配置（实测：随后 whoami 报「配置文件读取失败」，api/sync 也读不到其它档）。
+      // 要改用环境变量，删的必须是**整个 credentials 块**。
+      hint: `请在该档里把它设为真实值；若要改用环境变量（环境变量优先于配置文件），`
+        + `删掉该档的整个 credentials 块（只删单个键会让配置文件解析失败）：${configPathFor()}`,
     })
   }
 
