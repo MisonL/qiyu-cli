@@ -248,6 +248,26 @@ describe('命令行入口', () => {
     await run(['--help'])
     expect(() => JSON.parse(out)).toThrow()
   })
+
+  it('每个命令族「无子命令」都退 2 + stdout JSON（裸文本只留给 --help）', async () => {
+    // ⚠️ 2026-11-07 审查：本用例此前只覆盖 `[]` 与未知子命令两种形态，于是
+    // `qiyu store|sync|db|stats` 无子命令时**把用法文本写进 stdout、退 0** 的缺陷
+    // 活了很久 —— 与顶层及 api/auth/query/skill 的答案相反，而 cli.ts 的 USAGE 明写
+    // 「--help 是唯一以裸文本输出的情形」。`qiyu store | jq` 因此拿到 parse error。
+    // 判据：Agent 能 `| jq` 的前提 —— **除 --help 外 stdout 没有非 JSON 输出**。
+    const groups = ['auth', 'api', 'store', 'sync', 'db', 'query', 'stats', 'skill']
+    for (const g of groups) {
+      out = ''; err = ''
+      expect(await run([g]), `${g} 无子命令`).toBe(2)
+      expect(JSON.parse(out).error, `${g} 的 stdout 必须是错误信封`).toMatchObject({ code: 'usage' })
+      // stderr 要有人类可读说明（`query` 是叶子命令，无参报「缺少查询方式」而不是「用法：」）
+      expect(err, `${g} 的 stderr 要有说明`).not.toBe('')
+      // 反向：--help 仍是裸文本（唯一的例外，不能被顺手改成 JSON）
+      out = ''; err = ''
+      expect(await run([g, '--help']), `${g} --help`).toBe(0)
+      expect(() => JSON.parse(out), `${g} --help 必须是裸文本`).toThrow()
+    }
+  })
 })
 
 describe('分层约束（架构不变量）', () => {

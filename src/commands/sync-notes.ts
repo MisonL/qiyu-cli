@@ -271,7 +271,12 @@ export function tasksFieldNotes(): Record<string, string> {
       + '0 = 窗口首尾相接、不重叠',
     unsupported: '明确不做同步的数据集及原因（不是遗漏）。目前唯一取值 realtime = '
       + '实时快照，数据随推随逝、不可回放——这类数据只能走 api call 实时取，别去 sync run 里找',
-    'tasks[].watermark.field': '水位取自哪一列（任务声明的时间列名）。'
+    // ⚠️ 不得写成「任务声明的时间列名」（2026-11-07 审查）：tickets / ticket_logs 声明的
+    // 是 `op_end`，而这两张表只有 ticket_id / payload / 若干 PII 列 / synchronized_at ——
+    // 照着去 `query --table tickets` 里找 op_end 会扑空。它是**请求参数**的窗口端点。
+    'tasks[].watermark.field': '水位取自请求参数里的哪个时间端点（windowed 任务取窗口端点的 '
+      + 'opEnd / endTime，snapshot 任务取 synchronized_at），不是库表的列 —— tickets / '
+      + 'ticket_logs 的表里没有 op_end。'
       + '⚠️ 本命令的 `watermark` 是对象 `{field, initial}`，而 `sync run` / `sync status` 的'
       + ' `tasks[].watermark` 是字符串或 null（上次成功推进到的时刻，UTC `Z`；'
       + 'null = 从未成功推进）—— 同名字段形状随命令不同，'

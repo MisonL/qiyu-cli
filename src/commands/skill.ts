@@ -1411,15 +1411,14 @@ export async function skillCommand(argv: string[]): Promise<number> {
   // G1：--pretty 是输出开关，必须写在具体子命令之后（`skill check --pretty`）。
   if (sub === '--pretty') {
     const unknown = rest.filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
-    const positional = rest.filter((a) => !a.startsWith('-'))
-    const extra = [...unknown, ...positional]
-    if (extra.length > 0) {
-      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 不接受额外参数`)
+    if (unknown.length > 0) {
+      return usageFail(`未知参数：${describeArgs(unknown)}。--pretty 不接受额外参数`)
     }
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(SKILL_USAGE)
       return 0
     }
+    // ⚠️ 位置参数按「顺序写反」引导（2026-11-07 审查）—— 见 db.ts 同款注释。
     return usageFail(prettyAfterSubcommand('skill'))
   }
   if (sub !== 'install' && sub !== 'check' && sub !== 'where') {

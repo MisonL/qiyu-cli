@@ -130,8 +130,16 @@ function findEntry(zip: Uint8Array): ZipEntry {
 }
 
 /**
- * 中央目录里按名取条目：路径 EOCD（尾部 22 字节定长 + 可选注释，签名 0x06054b50）
- * → CD 起始偏移/条目数 → 逐条 CD 记录（46 字节定长 + 名 + 扩展 + 注释）按名匹配。
+ * 中央目录里取条目：路径 EOCD（尾部 22 字节定长 + 可选注释，签名 0x06054b50）
+ * → CD 起始偏移/条目数 → 逐条 CD 记录（46 字节定长 + 名 + 扩展 + 注释）匹配**基名**。
+ *
+ * ⚠️ 匹配的是**基名**（`name` 与末段相等），不是整段相等（2026-11-08 真实导出实测）：
+ * 线上 zip 的条目名带导出 id 目录前缀（`5411798/session.txt`、`5411798/message.txt`），
+ * 精确匹配 `session.txt` 会**永远找不到** —— 每个窗口都抛「没有 session.txt 条目」、
+ * 整窗 fetch_failed。前缀是不可预知的导出 id，只能按基名匹配。
+ * 基名匹配必须**恰好一条**：同基名多条目（`a/session.txt` + `b/session.txt`）→ 显式抛错，
+ * 不猜（形态漂移，宁可失败也不在两条里任选一条把别人的数据落库）。
+ *
  * 返回 CD 里的 crc / csize / 本地头偏移（偏移 42）。找不到/结构不符 → 显式抛错：
  * 宁可失败，也绝不在「无校验字节可对」的状态下把错密码的乱码当数据吐出去。
  * 修复批 4 #5：本函数从「bit3 的兜底补查」升格为**唯一定位来源**（原逐条目本地头
@@ -151,6 +159,7 @@ function centralDirectoryEntry(zip: Uint8Array, name: string):
   const count = u16(eocd + 10)
   let o = u32(eocd + 16)
   const decoder = new TextDecoder()
+  let found: { crc: number; csize: number; localOffset: number; entryName: string } | undefined
   for (let i = 0; i < count; i++) {
     if (o + 46 > zip.length || u32(o) !== 0x02014b50) {
       throw new Error('zip central directory 结构不符——无法校验解压密码，拒绝落库')
@@ -159,12 +168,21 @@ function centralDirectoryEntry(zip: Uint8Array, name: string):
     const elen = u16(o + 30)
     const clen = u16(o + 32)
     const entryName = decoder.decode(zip.subarray(o + 46, o + 46 + nlen))
-    if (entryName === name) {
-      return { crc: u32(o + 16), csize: u32(o + 20), localOffset: u32(o + 42) }
+    // 基名匹配：`dir/session.txt` 与 `session.txt` 都算（前缀是导出 id，不可预知）。
+    const base = entryName.split('/').pop() ?? entryName
+    if (base === name) {
+      if (found !== undefined) {
+        throw new Error(`zip 内有多个 ${name} 条目（${found.entryName}、${entryName}）`
+          + '——形态漂移，无法确定用哪一个，拒绝落库')
+      }
+      found = { crc: u32(o + 16), csize: u32(o + 20), localOffset: u32(o + 42), entryName }
     }
     o = o + 46 + nlen + elen + clen
   }
-  throw new Error(`zip central directory 内没有 ${name} 条目——无法校验解压密码，拒绝落库`)
+  if (found === undefined) {
+    throw new Error(`zip central directory 内没有 ${name} 条目——无法校验解压密码，拒绝落库`)
+  }
+  return { crc: found.crc, csize: found.csize, localOffset: found.localOffset }
 }
 
 /**

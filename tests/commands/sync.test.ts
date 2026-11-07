@@ -125,8 +125,18 @@ describe('sync 用法', () => {
     expect(await syncCommand(['run', '--help'])).toBe(0)
   })
 
-  it('无子命令输出用法、退出码 0（store.ts 同族惯例：无参数是请求帮助不是错误）', async () => {
-    expect(await syncCommand([])).toBe(0)
+  it('无子命令 → 用法错误退 2 + stdout JSON（与顶层/api/auth/query/skill 同答）', async () => {
+    // ⚠️ 2026-11-07 审查：此前本族（以及 store/db/stats）把 USAGE 写进 stdout、退 0，
+    // 与顶层 `run()` 和 api/auth/query/skill 相反；`cli.ts` 的 USAGE 还明写
+    // 「--help 是唯一以裸文本输出的情形」。原始裁决见计划 2026-09-30：「无参数是
+    // 用法错误，不是『用户请求帮助』」。裸文本让 `qiyu sync | jq` 直接 parse error。
+    out = ''; err = ''
+    expect(await syncCommand([])).toBe(2)
+    expect(JSON.parse(out).error).toMatchObject({ code: 'usage', kind: 'usage' })
+    expect(err).toMatch(/用法：qiyu sync/)
+    // --help 仍是裸文本帮助（唯一例外）
+    out = ''; err = ''
+    expect(await syncCommand(['--help'])).toBe(0)
     expect(out).toMatch(/用法：qiyu sync/)
   })
 })

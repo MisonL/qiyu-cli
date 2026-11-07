@@ -452,7 +452,8 @@
     "auth": "checksum",
     "verified": true,
     "envelope": "M",
-    "maxWindowDays": 6
+    "maxWindowDays": 6,
+    "note": "⚠️ 窗口边界是**开**的（2026-11-08 真实凭证实测）：跨度恰等于 6 × 86400000 = 518400000ms（144.0h）报 14004 Timestamp interval limit，518399999ms（143.9999h）通过 —— 必须**严格小于** 6 天；按 max_window_days 切到「恰好 6 天」必失败。`qiyu sync run sessions.export` 每窗发 end−1ms 正是为此（引擎的半开区间 → 本接口闭区间 [start, end] 的映射）。边界以下此前实测 143.5h 通过。"
   },
   {
     "id": "export.session.check",

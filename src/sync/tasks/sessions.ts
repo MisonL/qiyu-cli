@@ -1,7 +1,8 @@
 // src/sync/tasks/sessions.ts
 // D-T10：会话导出任务声明（spec §5.3）—— 唯一走四步流水线的 windowed 任务。
 // 实测事实（设计稿 §7.5）：
-//   ① 窗口 ≤6 天（143.5h 通过 / 144.0h 报 14004）→ maxWindowDays=6；
+//   ① 窗口跨度必须 **<** 6 天（恰 144.0h 报 14004，143.9999h 通过）→ maxWindowDays=6，
+//      且 fetch 把请求收成 end−1（跨度 6 天 − 1ms，见 fetchSessions 内注释）；
 //   ② 相邻窗口必须重叠 1 天（跨窗口长会话会漏，实测 5 会话/16 消息）→ overlapDays=1，
 //      重叠行由按 session.id 的 upsert 幂等吸收（**去重按 session.id，绝不能按导出任务 key**）；
 //   ③ **导出按 endTime 过滤**（判定式 window.start <= endTime <= window.end）→ 水位字段 endTime；
@@ -105,7 +106,18 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
     throw new Error('sessions.export 需要 fetchZip 注入（下载走 ZIP 二进制通道，与 JSON 信封层不同构）——生产接线归 sync run 编排层')
   }
   const nowIso = nowIsoOf(ctx)
-  const { sessions, fixture } = await runExportPipeline(w, {
+  // ⚠️ 引擎的 Range 是**半开**区间 [start, end)，导出接口的判定式却是**闭**区间
+  // `window.start <= endTime <= window.end`（本文件第 ③ 条实测）。把 `w.end` 原样发出去
+  // 有两处错：① 多覆盖 1ms —— endTime == w.end 的行该归下一窗（下一窗起点是
+  // end − overlap，重叠幂等会吸收，但请求窗口与实际覆盖对不上）；② 窗口跨度**恰好等于**
+  // maxWindowDays × 86400000 —— 实测服务端严格拒绝这个边界：跨度 518400000ms（144.0h）
+  // → `14004 Timestamp interval limit`，518399999ms（143.9999h）通过。2026-11-08 用真实
+  // 凭证复现：`sync run sessions.export` 每个 6 天窗都 fetch_failed（底层 Timestamp
+  // interval limit），水位冻结、一行不落。半开 → 闭区间的正确映射就是 `end − 1`，它同时
+  // 把跨度降到上限之内；1ms 窗保持原样（`end − 1 == start` 会撞 start==end 的 14004）。
+  // fixture 核对与 gap 文案一律用 `req`（服务端声明回显的是实际请求值），不用 `w`。
+  const req = { start: w.start, end: Math.max(w.start + 1, w.end - 1) }
+  const { sessions, fixture } = await runExportPipeline(req, {
     credentials: ctx.credentials,
     fetchZip: sctx.fetchZip,
     pollIntervalMs: sctx.pollIntervalMs,
@@ -143,13 +155,13 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
   // ⚠️ fixture 非空 ⇒ 必然可解析（parseJsonl 与这里共用 parseExportFixture 判形态，
   // 不会各写一套正则）——所以没有「fixture 解析不出」的分支，那是不可达代码。
   const declared = fixture === undefined ? null : parseExportFixture(fixture)
-  if (declared !== null && (declared.start > w.start || declared.end < w.end)) {
+  if (declared !== null && (declared.start > req.start || declared.end < req.end)) {
     // 声明的窗口不覆盖本窗请求 → 本窗数据可疑（服务端实测会按（企业,窗口）复用已计算的
     // 导出结果，同参数重复创建返回不同 key 相同数据）→ 宁可失败：fetch 抛错由引擎包装成
     // 中文 gap（failDetail）+ 水位冻结（contiguousBroken），绝不把来路不明的行写进库。
     throw new Error(`会话导出格式漂移（${fixture}）：导出声明的窗口 ` +
       `[${isoOf(declared.start)}, ${isoOf(declared.end)}] 未覆盖请求窗口 ` +
-      `[${isoOf(w.start)}, ${isoOf(w.end)}] —— 本窗数据可疑，拒绝落库`)
+      `[${isoOf(req.start)}, ${isoOf(req.end)}] —— 本窗数据可疑，拒绝落库`)
   }
   if (fixture === undefined) {
     // 完整导出应带尾部标记（见上）；缺失 = 导出流没有声明它覆盖到哪 —— 空窗可能是真空、
@@ -162,20 +174,20 @@ async function fetchSessions(w: { start: number; end: number }, ctx: FetchCtx): 
       reason: 'export_fixture_unreported',
       detail: `导出流未上报尾部标记行（完整导出末尾应有一行 startTime=…,endTime=… 声明导出窗口）：` +
         `本窗 ${withId.length} 行数据的窗口覆盖无从核对 —— 空窗可能确实是空，也可能是导出流被截断在行边界。` +
-        `请求窗口 [${isoOf(w.start)}, ${isoOf(w.end)}]`,
+        `请求窗口 [${isoOf(req.start)}, ${isoOf(req.end)}]`,
     }]
     if (dropped > 0) {
       hints.push({ reason: 'row_missing_key', detail: `sessions.export: ${dropNote} —— 上游响应形态漂移（正常导出每行都带 id），请核对接口返回` })
     }
     return { ...base, gapHint: hints }
   }
-  if (declared !== null && (declared.start < w.start || declared.end > w.end)) {
+  if (declared !== null && (declared.start < req.start || declared.end > req.end)) {
     // 覆盖成立但宽于请求：多出来的行由 session_id 幂等 upsert 吸收（与 overlapDays 同机制），
     // 数据不受损 —— 但「服务端改了窗口」这件事必须可见，记 gap 并带上标记行原文。
     const hints: FetchGapHint[] = [{
       reason: 'export_window_mismatch',
       detail: `导出声明的窗口 [${isoOf(declared.start)}, ${isoOf(declared.end)}] 宽于请求窗口 ` +
-        `[${isoOf(w.start)}, ${isoOf(w.end)}]（重叠行由 session_id 幂等吸收）`,
+        `[${isoOf(req.start)}, ${isoOf(req.end)}]（重叠行由 session_id 幂等吸收）`,
       fixture,
     }]
     if (dropped > 0) {

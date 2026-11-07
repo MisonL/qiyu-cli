@@ -325,10 +325,38 @@ function withoutLiterals(text: string): string {
       out += blank(i - start + 1)
       continue
     }
+    // 双引号是**标识符**（`SELECT "userPhone"` 是真实列引用，抹掉会漏判）→ 原样保留，
+    // 但必须整段跳过：标识符里可以带 `'`（DuckDB 实测接受 `"it's"`），只抹单引号会让
+    // 那个 `'` 被当成字符串起点、把后面的 GROUP BY 一起抹掉 → 分组失真警告静默丢失
+    //（2026-11-07 审查）。
+    if (ch === '"') {
+      const start = i
+      for (i++; i < text.length; i++) {
+        if (text[i] === '"') { if (text[i + 1] !== '"') break; i++ }
+      }
+      out += text.slice(start, Math.min(i, text.length - 1) + 1)
+      continue
+    }
+    // 美元引号字符串（`$$…$$` / `$tag$…$tag$`，DuckDB 实测支持）是**字面量** → 抹掉。
+    // `$` 在标识符里也合法，形似引号却找不到配对结束符时按普通字符放行。
+    if (ch === '$') {
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i))
+      if (m !== null) {
+        const end = text.indexOf(m[0], i + m[0].length)
+        if (end !== -1) {
+          out += blank(end + m[0].length - i)
+          i = end + m[0].length - 1
+          continue
+        }
+      }
+      out += ch
+      continue
+    }
     if (ch === '-' && text[i + 1] === '-') {
-      // 行注释抹到行尾（**不含**换行符）：`\n` 原样保留，保证与原文等长。
-      while (i < text.length && text[i] !== '\n') { out += ' '; i++ }
-      if (i < text.length) out += '\n'
+      // 行注释抹到行尾（**不含**换行符）：`\n` 与 `\r` 都算行尾 —— DuckDB 实测
+      // `--c\rGROUP BY …` 会按 `\r` 之后的内容分组，只认 `\n` 会把 GROUP BY 一起抹掉。
+      while (i < text.length && text[i] !== '\n' && text[i] !== '\r') { out += ' '; i++ }
+      if (i < text.length) out += text[i]
       else i--
       continue
     }
@@ -496,6 +524,19 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 整行/STRUCT/LIST 命中的列：那是「整值替换」而不是「按值形态误判业务数字」，
   // 不进下面的误伤提示（场景审查 7.2 只针对字符串形态命中）。
   const structuralMasked = new Set<string>()
+  // ⚠️ SUMMARIZE 形态（**严重**，2026-11-07 审查实测）：`SUMMARIZE sessions` 的输出列是
+  // 通用的 `column_name / min / max / q25 / …`，真正的列名在**行值**里 —— 三条列名级启发式
+  // （输出列名、SQL 文本、payload）全部落空，`userName` / `userAddress` 的 min/max **原值
+  // 静默输出**，且 `mask_warnings` 为空（实测：`min:"张三丰"`、`max:"李四光"`）。
+  // 这是「声明敏感但可从一条只读语句拿到明文」的完整绕过，必须在行级补一道判据。
+  //   · 形状判据：输出含 `column_name` 且含 `min`/`max`（本 CLI 的表没有叫 column_name 的列，
+  //     不会误伤普通查询）；
+  //   · 命中判据：该行 `column_name` 的**基名**精确匹配敏感列清单（与列名级同一口径）；
+  //   · 动作：命中行的统计列按该列规则脱敏，并计入 `structuralMasked`，
+  //     使其不被下面的「值形态误伤」警告说成「业务数字被误改」。
+  const summarizeShape = columns.includes('column_name')
+    && (columns.includes('min') || columns.includes('max'))
+  const SUMMARIZE_STATS = ['min', 'max', 'q25', 'q50', 'q75'] as const
   const outRows = rows.map((row) => {
     const out = { ...row }
     for (const name of columns) {
@@ -521,6 +562,24 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
         }
       }
       if (out[name] !== before) changed.add(name)
+    }
+    if (summarizeShape && typeof out.column_name === 'string') {
+      const col = baseName(out.column_name)
+      if (sensitiveNames.includes(col)) {
+        for (const stat of SUMMARIZE_STATS) {
+          if (!(stat in row)) continue
+          // ⚠️ 必须从**原始行**取值：`out[stat]` 可能已被值级兜底改过一次，
+          // 再按列规则跑一遍会把 `138****8000` 判成「形态不符」而退化成整值替换。
+          const before = row[stat]
+          if (before === null || before === undefined) continue
+          // 非字符串（数值列 min/max 被 DuckDB 输出成数字）整值替换 —— 与列名级同一条 S1 规则。
+          out[stat] = typeof before !== 'string' ? FULL : maskValue(before, ruleForColumn(col))
+          if (out[stat] !== before) {
+            changed.add(stat)
+            structuralMasked.add(stat)
+          }
+        }
+      }
     }
     return out
   })
@@ -641,6 +700,15 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const referencedSensitive = sensitiveNames
     .filter((n) => new RegExp(`(?<![A-Za-z0-9_$])${escapeRe(n)}(?![A-Za-z0-9_$])`, 'i').test(mode.sql))
   const referencesSensitive = referencedSensitive.length > 0
+  // SUMMARIZE 的残余缺口（2026-11-07 审查）：行级判据只认 `column_name` **恰好**是敏感列名；
+  // `SUMMARIZE SELECT userName AS n …` 的 column_name 是 `n`，脱敏不命中。与 query()/
+  // COLUMNS() 同属「无法可靠分析」，按既有口径**声明缺口而不拒绝**（只读、不越权）。
+  if (summarizeShape && changed.size > 0) {
+    warnings.push(
+      'SUMMARIZE 的统计值（min/max/分位数）可能来自敏感列：本次已按输出里的 column_name '
+      + '精确匹配脱敏；**别名/表达式列**（如 `SUMMARIZE SELECT userName AS n …`）不在其列。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
+  }
   // 边界用「前后不是标识符字符」而不是 `\\b`：别名可以带标点（`"p("`），
   // 而 `\\b` 只在词字符与非词字符之间成立 —— `\\bp(\\b` 即使不抛也永远匹配不上
   // `GROUP BY "p("` 里的 `p(`。转义 + lookaround 两个方向都对（CodeRabbit 第六轮 minor）。

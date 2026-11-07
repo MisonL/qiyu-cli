@@ -10,6 +10,7 @@ import {
 } from './skill/detect.js'
 import { apiCommand } from './commands/api.js'
 import { prettyAfterSubcommand } from './commands/spec-types.js'
+import { DB_PATH_HELP } from './commands/store-flags.js'
 import { wireLocalFallback } from './commands/local-fallback-wiring.js'
 import { storeCommand } from './commands/store.js'
 import { syncCommand } from './commands/sync.js'
@@ -126,6 +127,7 @@ const USAGE = `用法：qiyu <子命令> [参数]
                            行数上限 / 超时 / 关闭默认脱敏（细节见 qiyu query --help）
   --db <path> / --profile <name> / --backend <name>
                            db / query / stats 共用的存储定位（与 store / sync 同族）
+  ${DB_PATH_HELP}
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
   ⚠️ 请按 kind 分支，不要按 code —— code 只是个标签：它可能是服务端的

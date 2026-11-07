@@ -352,8 +352,13 @@ describe('db tables', () => {
     expect(await dbCommand(['bogus'])).toBe(2)
     expect(err).toMatch(/未知子命令/)
 
-    // 无子命令 / --help / tables --help / describe --help → USAGE 走 stdout、退出码 0
-    for (const argv of [[], ['--help'], ['tables', '--help'], ['describe', '--help']]) {
+    // 无子命令 = 用法错误（退 2 + JSON）；--help / tables --help / describe --help
+    // 才是裸文本帮助、退出码 0（2026-11-07 审查：此前无子命令也走裸文本退 0，
+    // 与顶层/api/auth/query/skill 相反）
+    out = ''; err = ''
+    expect(await dbCommand([])).toBe(2)
+    expect(JSON.parse(out).error).toMatchObject({ code: 'usage' })
+    for (const argv of [['--help'], ['tables', '--help'], ['describe', '--help']]) {
       out = ''; err = ''
       expect(await dbCommand(argv), argv.join(' ')).toBe(0)
       expect(out).toMatch(/db tables/)

@@ -104,8 +104,17 @@ describe('api call 的图例与真实输出', () => {
   })
 
   it('data 的释义必须点明是上游载荷、不要按其他命令的形状推断', () => {
-    expect(callFieldNotes().data).toContain('原样透传')
     expect(callFieldNotes().data).toContain('不要按其他命令 data 的形状推断')
+  })
+
+  it('data 不得承诺「原样透传」或指路 api schema 查响应字段（2026-11-07 审查：两条都与实现相反）', () => {
+    const d = callFieldNotes().data
+    // 实测：形状 M 的载荷过 trim()，形状 C 先经 repairUnquotedIntKeys 修复 —— 不是原样。
+    expect(d, '旧承诺「原样透传、不改写不脱敏」与 trim/修复相反，不得复活').not.toContain('原样透传')
+    expect(d, '必须点明 trim 改写').toContain('trim')
+    // 实测：api schema 只有请求侧 params 与 response_shape，没有任何响应字段表。
+    expect(d, 'api schema 没有响应字段表，不能让人去那里查字段含义').not.toMatch(/字段含义用 `qiyu api schema/)
+    expect(d, '必须如实说没有响应字段表').toContain('没有响应字段表')
   })
 
   it('图例不带 `**`、正文不含分隔符 `；`', () => {

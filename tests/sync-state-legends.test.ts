@@ -288,6 +288,13 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     // 推进），描述成「是字符串」会让消费者直接对它做字符串操作。两处都要写明。
     expect(tasksFieldNotes()['tasks[].watermark.field']!, '必须写明 run/status 侧可为 null')
       .toContain('字符串或 null')
+    // ⚠️ 2026-11-07 审查：初版说「任务声明的时间列名」—— tickets / ticket_logs 声明的
+    // `op_end` 根本不在表里（只有 ticket_id/payload/若干 PII 列/synchronized_at），
+    // 照着去 query --table tickets 找会扑空。必须点明是**请求参数**的端点。
+    const wf = tasksFieldNotes()['tasks[].watermark.field']!
+    expect(wf, '不得再声称水位字段是库表的列').not.toContain('任务声明的时间列名')
+    expect(wf, '必须点明取自请求参数、不是库表列').toContain('请求参数')
+    expect(wf, '必须点名 op_end 不在 tickets 表里').toContain('op_end')
     expect(note, 'WATERMARK_NOTE 必须写明 null 的含义').toContain('null = ')
   })
 

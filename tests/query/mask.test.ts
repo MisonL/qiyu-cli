@@ -649,6 +649,75 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings.join('\n')).not.toContain('GROUP BY / DISTINCT')
   })
 
+  it('词法边界：双引号标识符里的撇号（"it\'s"）不得把后面的 GROUP BY 一起吞掉', () => {
+    // DuckDB 实测接受带 `'` 的双引号标识符（`SELECT "it's" … GROUP BY "it's"`）；
+    // 旧实现只抹单引号，那个 `'` 被当成字符串起点，GROUP BY 整段被抹 → 警告静默丢失。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT "it's", userPhone, COUNT(*) AS n FROM sessions GROUP BY "it's", userPhone`,
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
+  it('词法边界：美元引号字符串（$$…$$ / $tag$…$tag$）里的撇号不得开启字符串字面量', () => {
+    // DuckDB 实测支持美元引号；`$$don't$$` 里的 `'` 是内容、不是引号。
+    // 若词法器不认美元引号，这个 `'` 会被当成字符串起点、一路吞到文末 ——
+    // 真的 `GROUP BY userPhone` 整段消失，分组失真警告静默丢失。
+    const plain = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT userPhone, $$it's userPhone$$ AS k, COUNT(*) AS n FROM sessions "
+          + 'GROUP BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(plain.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    const tagged = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT userPhone, $q$it's userPhone$q$ AS k, COUNT(*) AS n FROM sessions "
+          + 'GROUP BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(tagged.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    // 反证：美元引号里的 `GROUP BY …` 只是文本 —— 按常量分组时不误报
+    const constGroup = maskQueryRows({
+      rows: [{ k: 'x', n: 1 }],
+      columns: ['k', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT session_type AS k, COUNT(*) AS n FROM sessions '
+          + 'GROUP BY $$GROUP BY userPhone $$',
+        tables: TABLES,
+      },
+    })
+    expect(constGroup.warnings.join('\n'), '按常量分组不是按敏感列分组').not.toContain('GROUP BY / DISTINCT')
+  })
+
+  it('词法边界：-- 注释以 \\r 结尾时不能把其后的 GROUP BY 一起抹掉', () => {
+    // DuckDB 实测 `--c\rGROUP BY userPhone` 的 GROUP BY 生效（\r 也终止行注释）。
+    const out = maskQueryRows({
+      rows: [{ userPhone: '138****1111', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT userPhone, COUNT(*) AS n FROM sessions --note\rGROUP BY userPhone',
+        tables: TABLES,
+      },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+  })
+
   it('GROUP BY ALL（DuckDB）= 按全部非聚合选择项分组 → 敏感列照样要警告（CodeRabbit 2026-11-05 第二轮）', () => {
     const all = maskQueryRows({
       rows: [{ userPhone: '138****1111', n: 1 }],
@@ -1056,5 +1125,57 @@ describe('--sql 通道：脱敏对分析结果的副作用必须声明（场景�
     expect(out.warnings[0]).toBe(NO_MASK_WARNING)
     expect(out.warnings.join('\n')).toContain('extra_col')
     expect(out.warnings.join('\n')).toContain('表定义之外的列')
+  })
+})
+
+describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审查，严重）', () => {
+  // 实测事故形态：`query --sql "SUMMARIZE sessions"` 的输出列是通用的
+  // column_name/min/max/q25/q50/q75，真列名在**行值**里 —— 列名级、SQL 文本、payload
+  // 三条启发式全部落空，`userName`/`userAddress` 的 min/max 原值静默输出且
+  // `mask_warnings` 为空（完整绕过，README「默认脱敏」承诺被击穿）。
+  const summarizeRows = () => [
+    { column_name: 'session_id', min: 's1', max: 's2', q25: null, q50: null, q75: null },
+    { column_name: 'userName', min: '张三丰', max: '李四光', q25: null, q50: null, q75: null },
+    { column_name: 'userAddress', min: '北京市朝阳区', max: '上海市浦东新区', q25: null, q50: null, q75: null },
+    { column_name: 'userPhone', min: '13800138000', max: '13900139000', q25: null, q50: null, q75: null },
+    { column_name: 'staffId', min: '7', max: '8', q25: null, q50: null, q75: null },
+  ]
+  const columns = ['column_name', 'min', 'max', 'q25', 'q50', 'q75']
+
+  it('无格式敏感列整值替换；手机号按 phone 规则；非敏感列原样', () => {
+    const out = maskQueryRows({
+      rows: summarizeRows(), columns,
+      mode: { kind: 'sql', sql: 'SUMMARIZE sessions', tables: TABLES },
+    })
+    const byName = Object.fromEntries(out.rows.map((r) => [String(r.column_name), r]))
+    expect(byName.userName!.min).toBe(FULL)
+    expect(byName.userName!.max).toBe(FULL)
+    expect(byName.userAddress!.min).toBe(FULL)
+    expect(byName.userPhone!.min, '手机号按 138****8000 形态').toBe('138****8000')
+    expect(byName.session_id!.min, '非敏感列原样').toBe('s1')
+    expect(byName.staffId!.min).toBe('7')
+    expect(out.maskedColumns).toContain('min')
+    expect(out.maskedColumns).toContain('max')
+  })
+
+  it('脱敏发生时声明 SUMMARIZE 的残余缺口（别名/表达式列不在匹配范围）', () => {
+    const out = maskQueryRows({
+      rows: summarizeRows(), columns,
+      mode: { kind: 'sql', sql: 'SUMMARIZE sessions', tables: TABLES },
+    })
+    expect(out.warnings.join('\n')).toContain('SUMMARIZE')
+    expect(out.warnings.join('\n')).toContain('别名/表达式列')
+  })
+
+  it('反向：普通查询输出不含 column_name 形状时不受影响（不得误伤）', () => {
+    const out = maskQueryRows({
+      rows: [{ min: '张三丰', max: '李四光' }],
+      columns: ['min', 'max'],
+      mode: { kind: 'sql', sql: 'SELECT min(userName) AS min, max(userName) AS max FROM sessions', tables: TABLES },
+    })
+    // 普通查询里 min/max 是输出列名，按既有启发式（SQL 文本命中 userName → 缺口警告）
+    // 处理；这里只钉「不会因为列名叫 min/max 就被当成 SUMMARIZE 行去改写」。
+    expect(out.rows[0].min).toBe('张三丰')
+    expect(out.rows[0].max).toBe('李四光')
   })
 })

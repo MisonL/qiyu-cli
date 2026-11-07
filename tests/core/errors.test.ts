@@ -20,12 +20,14 @@ describe('错误分类', () => {
     // ⚠️ 这三个 case 此前**没有任何测试** —— 变异测试确认：逐个删掉，
     // 全量测试全绿。它们各自承载不同的**可执行动作**，合并成一个 case 或
     // 让某个掉进 default（unknown）都会让 Agent 失去行动依据：
-    //   14002 → 签名不匹配，是 CLI 内部缺陷（要报告，不是改凭证）
+    //   14002 → 先核对 appSecret（它参与 checksum）；确认无误才是 CLI 缺陷（要报告）
     //   14008 → 本机 IP 不在白名单（要加白名单，不是改 appKey）
     //   14515 → 该接口需单独申请权限（要申请，不是改任何本地配置）
     // ⚠️ 必须断言 hint —— 只断言 kind:'auth' 的话，三者互相顶替都能通过。
     expect(classify(14002, 'Bad checksum')).toMatchObject({ kind: 'auth', retryable: false })
-    expect(classify(14002, 'Bad checksum').hint).toMatch(/内部缺陷/)
+    // ⚠️ 不能只说「内部缺陷」（2026-11-07 审查）：appSecret 参与 checksum 计算，
+    // 配错同样报 14002 —— hint 必须先让 Agent 核对 QIYU_APP_SECRET，再谈报缺陷。
+    expect(classify(14002, 'Bad checksum').hint).toMatch(/QIYU_APP_SECRET/)
     expect(classify(14008, 'ip not allowed')).toMatchObject({ kind: 'auth', retryable: false })
     expect(classify(14008, 'ip not allowed').hint).toMatch(/白名单/)
     expect(classify(14515, 'no permission')).toMatchObject({ kind: 'auth', retryable: false })
@@ -244,6 +246,14 @@ describe('错误分类', () => {
     // 本计划没有自动切片（见「已知缺口」），hint 必须指向它自己能做的动作。
     expect(classify(14501, '(endTime-startTime)/millsADay > 31 is invalid').hint)
       .toMatch(/切片/)
+    // ⚠️ 报文不带数字时不能说「报文里的数字就是上限」（2026-11-07 审查实测：
+    // `x is invalid` 同样命中本分支，hint 却让 Agent 去找一个不存在的数字）。
+    const noNum = classify(14501, 'window config is invalid')
+    expect(noNum).toMatchObject({ kind: 'window_too_large' })
+    expect(noNum.hint, '无数字时必须指向注册表，不得说「报文里的数字」').not.toMatch(/报文里的数字/)
+    expect(noNum.hint).toMatch(/max_window_days/)
+    // 反向：带数字时把那个数写出来
+    expect(classify(14501, '> 31 is invalid').hint).toMatch(/31/)
   })
 
   it('14501 的 endTime 越界判定为 window_misaligned —— 切片修不好它', () => {
@@ -280,6 +290,20 @@ describe('错误分类', () => {
     expect(classify(14004, 'uid参数不能为空，请检查').kind).toBe('param')
     expect(classify(14004, 'Bad json payload').kind).toBe('param')
     expect(classify(14004, 'group not exist or deleted').kind).toBe('param')
+  })
+
+  it('14004 Timestamp interval limit 不是参数错误：边界是开的，hint 必须写「严格小于」', () => {
+    // 2026-11-08 真实凭证实测（export.session）：跨度恰等于 6×86400000（144.0h）
+    // → `14004 Timestamp interval limit`；518399999ms（143.9999h）通过。旧实现落到
+    // 兜底 `param`（「核对字段名与类型」）—— Agent 会反复核对字段并原样重试，而真正
+    // 要做的是把跨度严格压到上界之下。
+    const r = classify(14004, 'Timestamp interval limit')
+    expect(r.kind).toBe('window_too_large')
+    expect(r.retryable).toBe(false)
+    expect(r.hint).toMatch(/严格小于/)
+    expect(r.hint).toMatch(/max_window_days/)
+    // 反向：报文大小写变化不得漏判（真实报文的 T 大写，但别把判据钉在大小写上）
+    expect(classify(14004, 'timestamp interval limit').kind).toBe('window_too_large')
   })
 
   it('14004 appId not bind 不是参数错误：点名「未绑定公众号」，别让 Agent 反复核对字段', () => {

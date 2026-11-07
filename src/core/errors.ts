@@ -168,16 +168,21 @@ export function classify(code: number | string, rawMessage: string): QiyuError {
                // （有时 200 有时被拒，设计稿 §6.2），贴着等号的写法会把这条不稳定边界
                // 当成安全上界教给 Agent。纯历史日期是唯一可靠做法。
                hint: 'endTime 必须早于今天 00:00（用纯历史日期，不要包含今天的数据）' }
-    if (has(message, 'is invalid'))
+    if (has(message, 'is invalid')) {
+      // ⚠️ 报文**不一定**带数字（2026-11-07 审查实测）：`classify('14501','x is invalid')`
+      // 也命中本分支，而 hint 却让 Agent 去找一个不存在的数字。按报文实际形态分支。
+      const num = /(?:>|>=|超过|大于)\s*(\d+)/.exec(message)?.[1]
       return { ...base, kind: 'window_too_large', retryable: false,
                // ⚠️ 不要写"core 会重切" —— 本计划没有自动切片（见「已知缺口」），
                // 那样 Agent 会等一个永远不发生的重试。主用户是 Agent，hint 必须是它能执行的动作。
-               //
-               // 报文里带着服务端自己的上限（`> 31 is invalid` / `> 365 is invalid`），
-               // 所以这里直接把那个数字指出来 —— 比让 Agent 去查注册表更可靠，
-               // 因为 `maxWindowDays` 只有已实测的接口才有。
-               hint: '时间跨度超出该接口上限。报文里的数字就是上限天数（如 `> 31` 即 31 天），' +
-                     '请按它切片后重试；`qiyu api list` 里带 max_window_days 的接口也标了上限' }
+               hint: num !== undefined
+                 // 报文里带着服务端自己的上限（`> 31 is invalid` / `> 365 is invalid`），
+                 // 直接把那个数字指出来 —— 比让 Agent 去查注册表更可靠。
+                 ? `时间跨度超出该接口上限。报文里的数字就是上限天数（文中为 ${num}），` +
+                   '请按它切片后重试；`qiyu api list` 里带 max_window_days 的接口也标了上限'
+                 : '时间跨度超出该接口上限。报文里**不带**数字，' +
+                   '请按 `qiyu api list` 里该接口的 max_window_days 切片后重试' }
+    }
     return { ...base, kind: 'unknown', retryable: false }
   }
 
@@ -208,6 +213,16 @@ export function classify(code: number | string, rawMessage: string): QiyuError {
       return { ...base, kind: 'module_offline', retryable: false,
                hint: '该账号未绑定公众号（appId not bind）—— 不是字段或类型错误，改参数与重试都无效；' +
                      '请先在七鱼后台完成公众号绑定' }
+    if (message.toLowerCase().includes('timestamp interval limit'))
+      // 实测（2026-11-08 真实凭证，export.session）：跨度**恰等于** maxWindowDays ×
+      // 86400000 毫秒（6 天 = 144.0h）也报本错 —— 518400000ms 拒绝、518399999ms 通过。
+      // 此前落到兜底 param（「核对字段名与类型」）：成因完全指错，Agent 会反复核对
+      // 字段并原样重试。与「≤ 上界即可」的报表族不同，这个接口的边界是**开**的 ——
+      // 只说"缩小窗口"会让 Agent 切回恰好 N 天再撞一次，必须写出「严格小于」。
+      return { ...base, kind: 'window_too_large', retryable: false,
+               hint: '时间跨度超出该接口上限 —— 且**恰好等于**注册表上界也会被拒' +
+                     '（export.session 实测：跨度恰为 max_window_days×86400000 毫秒报本错，' +
+                     '减 1 毫秒即通过）。请按「严格小于 max_window_days 天」的跨度切片后重试' }
     return param('服务端拒绝了参数，请核对字段名与类型')
   }
 
@@ -255,7 +270,12 @@ export function classify(code: number | string, rawMessage: string): QiyuError {
     case '14001':
       return { ...base, kind: 'auth', retryable: false, hint: '请检查 QIYU_APP_KEY 是否正确' }
     case '14002':
-      return { ...base, kind: 'auth', retryable: false, hint: '签名不匹配，这是 CLI 的内部缺陷' }
+      // ⚠️ 不能断言「唯一成因是 CLI 自身」：checksum = SHA1(appSecret + md5(body) + time)
+      // （sign.ts），所以 **appSecret 配错**同样返回 14002（2026-11-07 审查）。此前
+      // 文案只说内部缺陷，Agent 会直接报 bug 而不去核对 QIYU_APP_SECRET。
+      return { ...base, kind: 'auth', retryable: false,
+               hint: '签名不匹配 —— 先核对 QIYU_APP_SECRET 是否为本应用的真实值'
+                 + '（appSecret 参与 checksum 计算，配错同样报 14002）；确认无误再按 CLI 缺陷上报' }
     case '14003':
       // core 层会**先用新时间戳重签重试一次**，正常情况下 Agent 不会看到这个错误。
       // ⚠️ 但 Agent 能看到它，就说明重签也没救回来 —— 那是**本机时钟真的偏移了**

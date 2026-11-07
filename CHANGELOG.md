@@ -122,6 +122,79 @@
 
 ### 修复
 
+- **真实凭证端到端实测发现的会话导出两处硬故障 + 契约诚实性收敛（2026-11-07/08 多代理审计，每条发现先复现再改）**：
+
+  **真实采样复现（此前从未端到端跑通过 `sync run sessions.export`）**：
+  · **恰好 144.0 小时的窗口被服务端拒绝**：引擎 Range 是半开 `[start, end)`，
+    `sessions.export` 却把 `w.end` 原样发给导出接口，跨度恰为 `6 × 86400000 = 518400000ms`
+    —— 实测 `14004 Timestamp interval limit`，而 `518399999ms`（143.9999h）通过。
+    修复前两窗全部 `fetch_failed`、水位冻结、一行不落；修复后 `fetchSessions` 按
+    「半开 → 闭区间」映射发 `end − 1`，fixture 核对与 gap 文案统一改用实际请求窗口。
+    **端到端复跑**：两窗全成功、32,497 行落库、零 gap、水位推进到请求末端。
+    注册表 `export.session` 的 note、`max_window_days` 图例与类型注释同步写明
+    「边界是开的，必须严格小于」；`14004 Timestamp interval limit` 从兜底 `param`
+    （「核对字段名与类型」的假归因）改判 `window_too_large` 并给可执行的「严格小于」hint。
+  · **导出 zip 的条目名带不可预测的导出 id 前缀**：真实 zip 是
+    `5411798/session.txt`，中央目录精确匹配 `session.txt` 永远落空 —— 第二个窗口
+    全部报「没有 session.txt 条目」。改为**按基名**匹配，基名重复时显式拒绝
+    （形态漂移，不猜用哪一条）；真实 zip 上实测解压 112,829,042 字节、7679 行，
+    尾部标记与请求窗口吻合。
+  · **`max_window_days` 只说「`<=` 即安全」、报表族与导出族边界开闭相反**：图例改为
+    「按毫秒精确比较，但边界开闭随接口而变」并点名 export.session；`api call` 的用户
+    不会再切回「恰好 6 天」这个必失败的边界。
+
+  **其余审计发现（每条都有复现出处与回归守卫）**：
+  · **无子命令的四个命令族把帮助当成功输出**：`store / db / stats / sync` 无子命令时
+    裸文本进 stdout、退 0，与顶层及 `api / auth` 的 `usageFail`（退 2 + JSON）相反；
+    统一为用法错误，并给「可用子命令」hint。
+  · **`--pretty` 写反位置在五个命令族说法矛盾**：`db --pretty tables` 说「未知参数：
+    tables」（tables 明明是已知子命令），别的命令说「必须写在子命令之后」；收敛到
+    `prettyAfterSubcommand` 单一渲染点，位置参数一律按「顺序写反」引导。
+  · **`api call` 的 `data` 图例谎称「原样透传、不改写」并指向不存在的响应字段表**：
+    信封 M 会 trim、形状 C 的畸形 JSON 键先修复再解析；`api schema` 只有请求参数与
+    信封种类，没有响应字段表。`non_json_body` 告警也不再说「按原样字面量发送」——
+    `--body` 一律 JSON.parse → JSON.stringify、Content-Type 恒 application/json，
+    且按 `bodyKind === 'none'` 分形（该接口不接收 body，服务端多半忽略）。
+  · **`sync tasks` 的水位图例把请求端点说成库表列**：`op_end` 等字段不在
+    `tickets / ticket_logs` 表里，图例改为「请求参数里的时间端点」并保留
+    「同名字段形状随命令不同」的提醒。
+  · **`statSync` 失败一律说「检查权限」**：实测还有 `ELOOP` / `ENOTDIR` /
+    `ENAMETOOLONG` 三种成因；`statFailureHint(errno)` 按 errno 分形，未归类如实说
+    「未专门归类」，不猜。
+  · **他人库的 `schema_version` 表骗过前置检查**：探针实测
+    `schema_version(version_id, applied_at)` 放行后落 internal「备份重建」——
+    把「不是本 CLI 的库」说成损坏缓存。`db / store / sync` 三处共用
+    `SCHEMA_VERSION_COLUMNS_SQL` 查列名，缺 `version` 列即显式「换 --db 路径」。
+  · **`--db` 相对路径按 HOME 解析却无人告知**：顶层与五个命令族 `--help` 统一经
+    `DB_PATH_HELP` 单一出处写出「不是当前目录」；与调度条目固化路径的设计取舍同源。
+  · **`fail()` 漏净化 `code`**：服务端回 `code:"\u009b31mX"`（CSI）时控制字节原样进
+    stdout；补上与 message/hint/target 同一条最终防线。
+  · **`retryStrategy` / `fallback` 的注释仍说「本计划不填 / query 不存在」**：G1 已
+    实现「有本地表映射且库文件存在时填」，注释改实况并写明不承诺表非空/覆盖窗口。
+  · **查询掩码词法器的三个缺口**：双引号标识符内容、美元引号字符串（`$$…$$` /
+    `$tag$…$tag$`）、以及 `--` 注释在 `\r` 处终止 —— 补词法分支并加 3 条可区分的
+    变异用例（其中美元引号用例两度重写到「移除分支必红」才定稿）。
+  · **`SUMMARIZE <表>` 绕过 PII 掩码（严重）**：输出列是通用的 `column_name / min / max`，
+    真正的列名在**行值**里，三条列名级启发式全部落空 —— 实测 `userName` 的
+    `min:"张三丰"`、`max:"李四光"` 明文输出且零警告。行级补「形状 + 基名命中」判据，
+    命中行的统计列按该列规则脱敏并计入结构性命中（不再被误报成「业务数字被误改」）。
+  · **`api call --help` 对 `--no-validate` 的描述大于实现**：CLI 级安装提示（skill
+    未安装等）不受该开关影响、照旧出现在 warnings；帮助文字改为精确表述。
+  · **分页响应首页有 total、后续页缺 total 时静默短读**：旧逻辑清空 declared 并
+    break，短读终检永不执行；改为抛「响应形态漂移，拒绝落库」。
+  · **systemd ExecStart 与 crontab 对同一参数的转义不一致**：`--profile o'brien`
+    的裸单引号在 systemd 解析里会被当引号符切开命令行；`systemdArg` 改为单引号
+    也触发双引号包裹（多载体转义契约的第 4 个载体）。
+  · **`store status/internal` 的恢复 hint 自指**：失败命令本身就是 `store status` 时
+    让 Agent 重跑刚失败的命令；改为「换 --db 验证 + 备份后经渲染器重建」，恢复命令
+    一律经 `storeInitCommand` / `syncRunCommand` 渲染并写明占位符替换契约。
+
+  **验证**：`npm run typecheck` 0；全量 2 分片 `--maxWorkers=1` 全绿（52 + 51 文件，
+  1252 / 1207 用例）；`npm run build` 0；`npm run check:pack` 通过（238 文件）。
+  行为修复逐条变异验证（请求映射、错误分类、zip 基名匹配、词法分支、errno 分形、
+  列检查、图例与帮助守卫等），变异均转红、恢复均转绿；本轮新写的 internal hint
+  曾触发 `BARE_HINT` 漂移守卫，已按渲染器口径修正并复测。
+
 - **skill / 凭证 / CLI 输出的三十八处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
 
   · **`skill install` 与 `where` / `check` 对「受管文件集」的口径分叉**：install 把用户额外

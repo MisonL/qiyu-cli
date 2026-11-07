@@ -16,12 +16,12 @@ export interface ErrorInput {
   hint?: string
   retryAfter?: { seconds: number; source: 'observed' | 'doc' | 'local' | 'header' | 'fallback' }
   /**
-   * ⚠️ 本计划不填。设计稿 §9.1 在限流示例里列了它，但"改用本地查询"这个动作
-   * 依赖存储层，本计划没有 store/（见「已知缺口」）。留空键、等有实现时再填，
-   * 好过写一个 Agent 会照做却查不到表的死值。
+   * 限流错误附加的「改用本地查询」策略（G1 已实现）：仅当接口在同步任务里有本地表映射、
+   * 且配置指向的库文件存在时由 `commands/api.ts` 填入（危险接口不给）。
+   * ⚠️ 只表示「有表可查」，不承诺表存在/非空/覆盖调用方的窗口 —— 边界写在 hint 里。
    */
   retryStrategy?: string
-  /** 同上：fallback 指向的是尚不存在的 `qiyu query` 命令。 */
+  /** 同上的落点命令（`qiyu query --table <表>`）。未命中映射 / 库文件不存在时不输出该键。 */
   fallback?: string
   /**
    * 设为 true 即请求"这是危险操作"。**它同时决定三件事**，调用方只需给这一个字段：
@@ -404,7 +404,11 @@ export function fail(error: ErrorInput): number {
   // ⚠️ 只净化**文本字段**：`retry_after` 是数字、`confirm_required` 等是布尔/闭集字面量，
   // 不经过此函数；`target` 是回显给 Agent 的目标名（可能是路径/表名），一并净化。
   const e: ErrorPayload = {
-    code: error.code, kind: error.kind, retryable: error.retryable,
+    // ⚠️ `code` 也必须净化（2026-11-07 审查实测）：它常是服务端返回的不可信字段
+    // （`envelope.ts` 的 `String(o.code ?? 'unknown')`），实测服务端回
+    // `code:"\u009b31mX"`（CSI）时原始 C1 控制字节原样进 stdout —— 与本函数上方
+    // 「唯一防线」的思路同源，此前只漏了这一个字段。
+    code: sanitizeMessage(error.code), kind: error.kind, retryable: error.retryable,
     message: sanitizeMessage(error.message),
   }
   if (error.hint) e.hint = sanitizeMessage(error.hint)

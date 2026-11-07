@@ -63,6 +63,12 @@ describe('store init', () => {
       expect(e.code).toBe('internal')
       expect(e.message).toMatch(/存储操作失败（底层：.*Constraint Error/)
       expect(e.hint).not.toMatch(/写入/)
+      // ⚠️ 2026-11-07 审查：失败的命令是 `store status`，hint 却让人「用 qiyu store status
+      // 检查数据库状态」—— 让 Agent 重跑刚失败的同一条命令即死循环。
+      expect(e.hint, 'hint 不得指向刚失败的同一条命令').not.toMatch(/用 qiyu store status/)
+      // 但必须给出可执行动作：换 --db 验证 + 备份后新路径重建
+      expect(e.hint).toContain('--db')
+      expect(e.hint).toContain('qiyu store init')
     } finally {
       vi.doUnmock('../../src/store/index.js')
       vi.restoreAllMocks()

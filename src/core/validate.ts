@@ -85,10 +85,26 @@ export function validateBody(
   const hasBodySchema = file.bodyKind === 'json' && bodyParams.length > 0
   // bodyKind !== 'json' 的接口根本不进形状表：只可能出 non_json_body（软）。
   // ⚠️ message 不得含「未验证」（spec §四 第 68 条③ + 验收 9）——那是「值得再试」的措辞；只陈述「已发出 + 不要重发」。
+  // ⚠️ 也不能说「按原样字面量发送」（2026-11-07 审查实测）：`--body` 先 JSON.parse，
+  //    再经 http.ts 的 buildBody = JSON.stringify 发出，Content-Type 恒 application/json
+  //    （http.ts 只有这一条发送通道）。所谓「原样」连空白与转义都不成立，
+  //    xml/multipart/text/form 的原始字节更是无法表达 —— 与 `api schema` 的 body_kind
+  //    图例（「传输层恒为 JSON」）逐字对齐。
+  // ⚠️ bodyKind `none` 的 callable 接口（data.overview.ipcc、icoutcall.phone.getLineList 等）
+  //    也走这里：它们不吃任何 body，传了的 JSON 会被发出去并被忽略 —— 同样要说「该编码无法表达」，
+  //    不能笼统说成「服务端会解析失败」。
   if (file.bodyKind !== 'json') {
     if (body === undefined) return { hard: [], soft: [] }
+    const kind = sanitizeControlChars(file.bodyKind)
     return { hard: [], soft: [{ kind: 'non_json_body',
-      message: `本接口 body_kind 是 ${sanitizeControlChars(file.bodyKind)}，你的 --body 已按原样字面量发送、未经字段校验；本 CLI 不构造非 JSON 的 body 编码。该字面量已随请求发出，不要重发（重发 = 再执行一次接口，写接口会重复写入）` }] }
+      message: `本接口 body_kind 是 ${kind}：本 CLI 只有一条发送通道 —— `
+        + '--body 一律 JSON.parse 后再 JSON.stringify、Content-Type 恒 application/json，'
+        + (file.bodyKind === 'none'
+          ? '该接口不接收 body。'
+          : `${kind} 的原始编码（如 xml 标签、multipart 分段）无法表达。`)
+        + '你给的字面量未经该编码表达 —— 该请求已发出（按 JSON 字节），'
+        + (file.bodyKind === 'none' ? '服务端多半忽略它' : '服务端多半按 JSON 解析而失败')
+        + '；不要重发（重发 = 再执行一次接口，写接口会重复写入）' }] }
   }
   if (!hasBodySchema) return { hard: [], soft: [] }
 

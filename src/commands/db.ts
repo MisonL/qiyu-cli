@@ -21,7 +21,7 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openSandbox, withTimeoutHint } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
-import { statGuard, schemaVersionMissing, storeTablesWarnings } from './store-precheck.js'
+import { SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, storeTablesWarnings } from './store-precheck.js'
 import { suggestNames, thrownToQueryExit, missingTableCauses } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
@@ -33,7 +33,7 @@ import {
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
-import { parseStoreFlags } from './store-flags.js'
+import { DB_PATH_HELP, parseStoreFlags } from './store-flags.js'
 import { describeFieldNotes, tablesFieldNotes } from './db-notes.js'
 import type { StoreFlags } from './store-flags.js'
 import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
@@ -68,6 +68,7 @@ const USAGE = `用法：qiyu db <子命令> [参数]
                            查看单表列定义
 
 存储定位：--db / --profile / --backend（store 命令同族）。
+${DB_PATH_HELP}
 `
 
 // ⚠️ 运行时的「已知 token 集」现在**每个子命令各自取自己的完整接受集**（2026-11-06 审查）：
@@ -244,7 +245,12 @@ export async function openGuardedSession(
     const tables = await metaHint.run(
       "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
     const names = tables.rows.map((r) => String(r.table_name))
-    const missing = schemaVersionMissing(config.path, names)
+    // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：别的工具也会建叫 schema_version 的表。
+    // 只有该表在场时才补查列名 —— 零表/无该表时 `schemaVersionMissing` 不需要它。
+    const versionColumns = names.includes('schema_version')
+      ? (await metaHint.run(SCHEMA_VERSION_COLUMNS_SQL)).rows.map((r) => String(r.column_name))
+      : undefined
+    const missing = schemaVersionMissing(config.path, names, versionColumns)
     if (missing !== null) {
       await session.close()
       return { exit: fail(missing) }
@@ -490,7 +496,12 @@ async function dbDescribe(argv: string[]): Promise<number> {
 export async function dbCommand(argv: string[]): Promise<number> {
   setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
-  if (sub === undefined || sub === '--help' || sub === '-h') {
+  // ⚠️ 无子命令 = 用法错误（退 2 + JSON）—— 见 store.ts 同款注释（2026-11-07 审查）。
+  if (sub === undefined) {
+    return usageFail(`用法：qiyu db <tables|describe> [参数]（\`qiyu db --help\` 查看全部）`,
+      '可用子命令：tables、describe')
+  }
+  if (sub === '--help' || sub === '-h') {
     // --help 不吞未知参数；已知 flag 与非 flag token（子命令名、取值）一律放行
     //（`db --help describe --db /tmp/x` 是 Agent 的常见写法，此前会退 2）。
     const problem = helpArgsError(rest, DB_SPECS.flatMap((sp) => sp.flags), '。--help 不接受额外参数')
@@ -501,14 +512,15 @@ export async function dbCommand(argv: string[]): Promise<number> {
   // G1：--pretty 是输出开关，必须写在具体子命令之后（`db tables --pretty`）。
   if (sub === '--pretty') {
     const problem = helpArgsError(rest, DB_SPECS.flatMap((sp) => sp.flags))
-    const positional = rest.filter((a) => !a.startsWith('-'))
     if (problem !== undefined) return usageFail(`${problem}。--pretty 不接受额外参数`)
-    if (positional.length > 0)
-      return usageFail(`未知参数：${describeArgs(positional)}。--pretty 不接受额外参数`)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
       return 0
     }
+    // ⚠️ 位置参数一律按「顺序写反」引导（2026-11-07 审查）：此前把子命令名当
+    // 「未知参数」报出（`db --pretty tables` → 「未知参数：tables」），而 `tables`
+    // 是本命令**已知**的子命令；同一写法在 stats 上给的是「必须写在子命令之后」。
+    // 五个命令族各写一份，答案还互相矛盾 —— 判据收敛到 `prettyAfterSubcommand`。
     return usageFail(prettyAfterSubcommand('db'))
   }
   if (sub !== 'tables' && sub !== 'describe') {

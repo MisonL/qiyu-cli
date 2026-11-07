@@ -79,15 +79,14 @@ export async function authCommand(argv: string[]): Promise<number> {
   // G1：--pretty 已实现，但必须写在具体子命令之后（`auth whoami --pretty`）。
   if (sub === '--pretty') {
     const unknown = argv.slice(1).filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
-    const positional = argv.slice(1).filter((a) => !a.startsWith('-'))
-    const extra = [...unknown, ...positional]
-    if (extra.length > 0) {
-      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 不接受额外参数`)
+    if (unknown.length > 0) {
+      return usageFail(`未知参数：${describeArgs(unknown)}。--pretty 不接受额外参数`)
     }
     if (argv.includes('--help') || argv.includes('-h')) {
       process.stdout.write(AUTH_USAGE)
       return EXIT.OK
     }
+    // ⚠️ 位置参数按「顺序写反」引导（2026-11-07 审查）—— 见 db.ts 同款注释。
     return usageFail(prettyAfterSubcommand('auth'))
   }
   if (sub === 'login') return login(argv.slice(1))
