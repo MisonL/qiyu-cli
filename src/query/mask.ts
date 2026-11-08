@@ -342,10 +342,21 @@ function bareKeywords(text: string): string {
  * `<已脱敏>`（Codex 2026-11-08 第五轮 P2）。判据作用在 bareKeywords（字面量/注释/双引号
  * 标识符全剥）上，要求是文首，或深度 1 的 `FROM (`/`JOIN (`。旧判据的 `;` 后语句头不认：
  * 多语句被沙箱语句数闸门拒绝（src/query/sandbox.ts 语句数闸门），带 `;` 的 SQL 到不了脱敏。
+ *
+ * 返回两个信号（调用方据此**声明缺口**，见 maskQueryRows）：
+ *   · recognized：可识别的语句头 —— 行级脱敏按 `column_name` 行值生效；
+ *   · unrecognizedParen：过标识符边界、前面（跳空白）紧邻 `(`，但不在可识别的层级
+ *     （如 `FROM (SELECT * FROM (SUMMARIZE …))`、逗号连接的 `, (SUMMARIZE …)`、CTE 内的
+ *     子查询）。这类位置**合法**且输出仍是 SUMMARIZE 形状（真机实测 min/max 明文），
+ *     本判据不脱敏 —— 必须由调用方发缺口警告，绝不静默（CodeRabbit 2026-11-08 第七轮
+ *     major；`WITH t AS (SUMMARIZE …)` 已被真机否决为 Parser Error —— A CTE needs a SELECT）。
+ *     ⚠️ `AS SUMMARIZE` 别名前面不是 `(`，不会进这一档（方向安全，误报会改写元数据数字）。
  */
-function isSummarizeStatement(sql: string): boolean {
+function summarizeTokenPositions(sql: string): { recognized: boolean; unrecognizedParen: boolean } {
   const bare = bareKeywords(sql)
   const re = /SUMMARIZE/gi
+  let recognized = false
+  let unrecognizedParen = false
   let m: RegExpExecArray | null
   while ((m = re.exec(bare)) !== null) {
     // ⚠️ `\b` 不够：`SUMMARIZE$q$` 是合法标识符（`$` 不是词字符，`\b` 会误判成
@@ -355,17 +366,20 @@ function isSummarizeStatement(sql: string): boolean {
     if (isIdentAt(bare, m.index + m[0].length)) continue
     const before = bare.slice(0, m.index)
     // 顶层语句头：前面只有空白。
-    if (/^\s*$/.test(before)) return true
+    if (/^\s*$/.test(before)) { recognized = true; continue }
     // 顶层 `FROM (SUMMARIZE …)` / `JOIN (SUMMARIZE …)`（深度 1，且 `(` 顶层直接跟在
     // FROM/JOIN 后）。深度用括号计数 —— bareKeywords 已把字面量/注释/双引号标识符抹空，
-    // 剩下的括号都是真括号。⚠️ 更深层的 `(SUMMARIZE …)`（如 WHERE … IN (SELECT …
-    // FROM (SUMMARIZE …))）不认：那种查询的最终输出不是 SUMMARIZE 结果，认了会把
-    // 元数据查询的数字误改（Codex 2026-11-08 第六轮 P2）。`FROM (SELECT * FROM
-    // (SUMMARIZE …))` 这类深层真输出属残余边界，方向记录在此。
+    // 剩下的括号都是真括号。更深层的不认：认了会把元数据查询的数字误改
+    //（Codex 2026-11-08 第六轮 P2），但必须落在 unrecognizedParen 里由调用方声明缺口。
     const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
-    if (depth === 1 && /(?:\bFROM|\bJOIN)\s*\(\s*$/i.test(before)) return true
+    if (depth === 1 && /(?:\bFROM|\bJOIN)\s*\(\s*$/i.test(before)) { recognized = true; continue }
+    if (/\(\s*$/.test(before)) unrecognizedParen = true
   }
-  return false
+  return { recognized, unrecognizedParen }
+}
+
+function isSummarizeStatement(sql: string): boolean {
+  return summarizeTokenPositions(sql).recognized
 }
 
 /**
@@ -724,11 +738,14 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   //     这里是对已知形态的补强）。残余边界：`query('SUMM' || 'ARIZE …')` 动态拼串取不到。
   //   · 命中判据：该行 `column_name` 的**基名**精确匹配敏感列清单（与列名级同一口径）；
   //   · 动作：命中行的统计列按该列规则脱敏。
+  const summarizeTokens = mode.kind === 'sql'
+    ? summarizeTokenPositions(mode.sql)
+    : { recognized: false, unrecognizedParen: false }
   const summarizeSql = mode.kind === 'sql'
-    && (isSummarizeStatement(mode.sql) || queryCallSummarize(mode.sql))
-  const summarizeShape = summarizeSql
-    && columns.includes('column_name')
+    && (summarizeTokens.recognized || queryCallSummarize(mode.sql))
+  const summarizeShapeColumns = columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
+  const summarizeShape = summarizeSql && summarizeShapeColumns
   // avg/std 只对数值列出现：`SUMMARIZE SELECT userPhone::DOUBLE AS userPhone` 的均值/标准差
   // 同样是 PII 派生值，一并整值替换。count 是行数、approx_unique 是去重计数，单看它们
   // 恢复不出任何一个原值，不在此列。
@@ -931,6 +948,18 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       'SQL 含 SUMMARIZE，但输出列名已被改写（缺 column_name / min / max 形状）：'
       + '行级脱敏无法按行值识别敏感列，统计值（min/max/分位数）可能**未脱敏**。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
+  }
+  // ⚠️ SQL 里的 SUMMARIZE 位置**不可识别**但输出是 SUMMARIZE 形状（CodeRabbit 2026-11-08
+  // 第七轮 major，真机实测）：`SELECT * FROM (SELECT * FROM (SUMMARIZE sessions))` 合法，
+  // 输出 column_name/min/max，userName 的 min/max 是明文 —— 行级判据不生效、其余警告也不发。
+  // 与上一档同一策略：**只声明缺口，不冒认脱敏**（值级兜底对姓名/地址无从下手）。
+  if (!summarizeSql && summarizeTokens.unrecognizedParen && summarizeShapeColumns) {
+    warnings.push(
+      'SQL 里的 SUMMARIZE 处于**无法识别的位置**（如多层子查询 '
+      + '`FROM (SELECT * FROM (SUMMARIZE …))`、逗号连接或 CTE 内的子查询）：'
+      + '输出仍是 SUMMARIZE 形状，但行级脱敏无法据此生效，统计值（min/max/分位数）可能**未脱敏**。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
+      + '或把 SUMMARIZE 提到顶层（`SUMMARIZE <表>`）')
   }
   // 边界用「前后不是标识符字符」而不是 `\\b`：别名可以带标点（`"p("`），
   // 而 `\\b` 只在词字符与非词字符之间成立 —— `\\bp(\\b` 即使不抛也永远匹配不上

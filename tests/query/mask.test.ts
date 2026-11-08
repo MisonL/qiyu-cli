@@ -1260,6 +1260,43 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     }
   })
 
+  it('缺口声明：SUMMARIZE 在无法识别的位置（多层子查询）必须警告且不冒认脱敏（CodeRabbit 第七轮）', () => {
+    // 真机实测（2026-11-08 probe8）：`WITH t AS (SUMMARIZE sessions) SELECT * FROM t` 是
+    // Parser Error（A CTE needs a SELECT）—— 评审给的第一例不成立；但
+    // `SELECT * FROM (SELECT * FROM (SUMMARIZE sessions))` 合法，输出 column_name/min/max
+    // 且 userName 的 min/max 是**明文**。深度 2 不在可识别层级 → 行级脱敏不生效，
+    // 必须发缺口警告（只声明，不伪造脱敏：值级兜底对姓名无从下手，原值保留）。
+    const sqls = [
+      'SELECT * FROM (SELECT * FROM (SUMMARIZE sessions))',
+      'WITH t AS (SELECT * FROM (SUMMARIZE sessions)) SELECT * FROM t',
+    ]
+    for (const sql of sqls) {
+      const out = maskQueryRows({
+        rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+        columns: ['column_name', 'min', 'max'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.rows[0]!.min, sql).toBe('张三丰')
+      expect(out.warnings.join('\n'), sql).toContain('无法识别的位置')
+      expect(out.warnings.join('\n'), sql).toContain('未脱敏')
+    }
+    // 反向：别名位置（`0 AS SUMMARIZE`，形状列齐全 —— 最接近误报的形态）不得触发
+    const ok = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 3 }],
+      columns: ['column_name', 'min'],
+      mode: { kind: 'sql', sql: "SELECT 0 AS SUMMARIZE, 'userName' AS column_name, 3 AS min", tables: TABLES },
+    })
+    expect(ok.warnings.join('\n')).not.toContain('无法识别的位置')
+    // 反向：可识别位置（深度 1 的 FROM (）已被行级脱敏覆盖，不吃这条警告
+    const ok2 = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SELECT * FROM (SUMMARIZE sessions)', tables: TABLES },
+    })
+    expect(ok2.rows[0]!.min).toBe(FULL)
+    expect(ok2.warnings.join('\n')).not.toContain('无法识别的位置')
+  })
+
   it('P2b 词法正向：真的 query() 调用（不在注释里）仍要命中', () => {
     for (const sql of [
       "SELECT * FROM query('SUMMARIZE sessions')",
