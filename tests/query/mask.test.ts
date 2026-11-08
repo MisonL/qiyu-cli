@@ -1260,6 +1260,73 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     }
   })
 
+  it('P2 位置判据：query() 不在最终输出来源时不得改写普通值，只声明缺口（Codex 第七轮）', () => {
+    // 真机实测（probe9）：`SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS
+    // (SELECT 1 FROM query('SUMMARIZE sessions'))` 合法，输出 column_name/min、min 是**常量 3**。
+    // 按全 SQL 判据脱敏会把业务常量篡改成 `<已脱敏>`（Codex 第七轮 P2）。逗号并列来源同理。
+    for (const sql of [
+      "SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))",
+      "SELECT 'userName' AS column_name, 3 AS min FROM sessions, query('SUMMARIZE sessions')",
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ column_name: 'userName', min: 3 }],
+        columns: ['column_name', 'min'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.rows[0]!.min, sql).toBe(3)
+      expect(out.warnings.join('\n'), sql).toContain('无法识别的位置')
+    }
+    // 反向：顶层 FROM query(...) 是最终来源，照常脱敏（既有正向用例的判据锚点）
+    const top = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: "SELECT * FROM query('SUMMARIZE sessions')", tables: TABLES },
+    })
+    expect(top.rows[0]!.min).toBe(FULL)
+    expect(top.warnings.join('\n')).not.toContain('无法识别的位置')
+  })
+
+  it('P2 E-string：query 的 E 字符串实参按 DuckDB 转义语义解码后再判（Codex 第七轮）', () => {
+    // 真机实测（probe9/probe10）：
+    //   · `\x2f\x2a` = `/*`、`\x2a\x2f` = `*/` —— 不解码会把注释里的 SUMMARIZE 当关键字，
+    //     把常量 min=3 脱敏；
+    //   · `\'` 是 E 串里的转义引号（不结束字符串），不按 E 语义扫引号边界会截断实参、
+    //     漏掉后面的真 SUMMARIZE；
+    //   · `\x53` = `S` —— 解转义后关键字必须仍被识别（含 E 串正则误伤方向的对照）。
+    const noHit = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 3 }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT * FROM query(E'SELECT ''userName'' AS column_name, 3 AS min \\x2f\\x2a FROM (SUMMARIZE sessions) \\x2a\\x2f')`,
+        tables: TABLES,
+      },
+    })
+    expect(noHit.rows[0]!.min).toBe(3)
+
+    const quoted = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT * FROM query(E'SELECT ''userName'' AS column_name, 3 AS min /* it\\'s not a comment */ FROM (SUMMARIZE sessions)')`,
+        tables: TABLES,
+      },
+    })
+    expect(quoted.rows[0]!.min).toBe(FULL)
+
+    const hexed = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT * FROM query(E'\\x53UMMARIZE sessions')`,
+        tables: TABLES,
+      },
+    })
+    expect(hexed.rows[0]!.min).toBe(FULL)
+  })
+
   it('缺口声明：SUMMARIZE 在无法识别的位置（多层子查询）必须警告且不冒认脱敏（CodeRabbit 第七轮）', () => {
     // 真机实测（2026-11-08 probe8）：`WITH t AS (SUMMARIZE sessions) SELECT * FROM t` 是
     // Parser Error（A CTE needs a SELECT）—— 评审给的第一例不成立；但

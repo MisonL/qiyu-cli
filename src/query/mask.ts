@@ -387,10 +387,19 @@ function isSummarizeStatement(sql: string): boolean {
  * ⚠️ 必须先在**裸 token** 上定位 `query(`（注释/字符串/双引号标识符里的同串不算调用），
  * 再回到原 SQL 读那个字符串实参 —— 直接在原文上正则会把注释里写的伪装调用
  * 也当成真调用（Codex 2026-11-08 第三轮 P2 实测）。
+ *
+ * 返回 `hit`（内层确实含 SUMMARIZE）与 `atTopOutput`（**外层**该调用位于最终输出路径：
+ * 裸文本深度 0 且前面紧邻 `FROM`/`JOIN`）。只有 query() 的结果就是最终输出时，行级判据
+ * 才敢按行值改写；其他位置（`WHERE EXISTS (… FROM query(…))`、IN 子查询、逗号并列、
+ * 多层子查询透传）只声明缺口、不改写 —— 实测
+ * `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
+ * 合法且输出 min 是常量 3，按全 SQL 判据脱敏会把业务常量改成 `<已脱敏>`（Codex 第七轮 P2）。
  */
-function queryCallSummarize(sql: string): boolean {
+function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean } {
   const bare = bareKeywords(sql)
   const re = /\bquery\s*\(/gi
+  let hit = false
+  let atTopOutput = false
   let m: RegExpExecArray | null
   while ((m = re.exec(bare)) !== null) {
     let i = m.index + m[0].length
@@ -411,19 +420,68 @@ function queryCallSummarize(sql: string): boolean {
       break
     }
     // 字符串前缀：DuckDB 接受 `E'…'`（转义字符串）—— 实测 `query(E'SUMMARIZE sessions')` 有效。
-    if ((sql[i] === 'E' || sql[i] === 'e') && sql[i + 1] === "'") i++
+    // ⚠️ E 串的**引号边界**也按 E 语义：`\'` 是转义引号（不结束字符串），`''` 同样；
+    // 普通串里反斜杠没有特殊含义（实测 `'a\x41b'` 保留字面量 `\x41`）（Codex 第七轮 P2）。
+    const isEscape = (sql[i] === 'E' || sql[i] === 'e') && sql[i + 1] === "'"
+    if (isEscape) i++
     if (sql[i] !== "'") continue
     const start = i
     for (i++; i < sql.length; i++) {
+      if (isEscape && sql[i] === '\\') { i++; continue }
       if (sql[i] === "'") { if (sql[i + 1] !== "'") break; i++ }
     }
-    // ⚠️ 实参是**内层 SQL 源码**，必须解码（'' → '）后再跑同一套词法判据 —— 内层里的
-    // SUMMARIZE 也可能只是注释/字符串/别名：实测 `query('SELECT ''x'' … /* SUMMARIZE */')`
+    // ⚠️ 实参是**内层 SQL 源码**，必须按 DuckDB 的字符串语义解码后再跑同一套词法判据：
+    // E 串先解转义（`\x2f\x2a` → `/*` —— 不解码会把注释里的 SUMMARIZE 当成真关键字，
+    // 实测该查询输出常量 min=3 却被脱敏，Codex 第七轮 P2），再统一把 `''` → `'`。
+    // 内层里的 SUMMARIZE 也可能只是注释/字符串/别名：实测 `query('SELECT ''x'' … /* SUMMARIZE */')`
     // 在 DuckDB 里返回普通行，按裸词判会把列值误改（Codex 2026-11-08 第五轮 P2）。
-    const inner = sql.slice(start + 1, i).replace(/''/g, "'")
-    if (isSummarizeStatement(inner) || queryCallSummarize(inner)) return true
+    const raw = sql.slice(start + 1, i)
+    const inner = (isEscape ? decodeEString(raw) : raw).replace(/''/g, "'")
+    if (!(isSummarizeStatement(inner) || queryCallSummarize(inner).hit)) continue
+    hit = true
+    const before = bare.slice(0, m.index)
+    const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
+    if (depth === 0 && /(?:\bFROM|\bJOIN)\s*$/i.test(before)) atTopOutput = true
   }
-  return false
+  return { hit, atTopOutput }
+}
+
+/**
+ * 按 DuckDB E-string 语义解码转义序列（真机实测 2026-11-08）：
+ *   · `\xHH`：1-2 位十六进制（`\x41` → `A`，`\x4` → U+0004）；
+ *   · `\NNN`：1-3 位八进制（`\101` → `A`，`\1011` → `A1`）；
+ *   · `\n \r \t \b \f \\ \' \" \?`：常规转义；
+ *   · 其他（含 `\v`、`\q`、非法十六进制 `\xzz`）：**丢弃反斜杠、保留字符**
+ *    （实测 `\v` → `v`、`\xzz` → `xzz`）；
+ *   · `\u`/`\U`/`\0` 在 DuckDB 是 Parser Error（unicode_to_utf8 / pg_verifymbstr
+ *     NOT IMPLEMENTED），这类 SQL 根本执行不了，解码结果不影响任何输出。
+ * 普通串（无 E 前缀）不做转义解码（实测 `'a\x41b'` 保留字面量）。
+ */
+function decodeEString(raw: string): string {
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!
+    if (ch !== '\\') { out += ch; continue }
+    const next = raw[i + 1]
+    if (next === undefined) { out += ch; continue }
+    if (next === 'x' || next === 'X') {
+      const hex = /^[0-9A-Fa-f]{1,2}/.exec(raw.slice(i + 2))
+      if (hex !== null) { out += String.fromCharCode(parseInt(hex[0], 16)); i += 1 + hex[0].length; continue }
+      out += 'x'; i++; continue
+    }
+    if (next >= '0' && next <= '7') {
+      const oct = /^[0-7]{1,3}/.exec(raw.slice(i + 1))!
+      out += String.fromCharCode(parseInt(oct[0], 8)); i += oct[0].length; continue
+    }
+    if (next === 'n') { out += '\n'; i++; continue }
+    if (next === 'r') { out += '\r'; i++; continue }
+    if (next === 't') { out += '\t'; i++; continue }
+    if (next === 'b') { out += '\b'; i++; continue }
+    if (next === 'f') { out += '\f'; i++; continue }
+    // `\\`、`\'`、`\"`、`\?` 及未知转义：输出字符本身（丢弃反斜杠）
+    out += next; i++
+  }
+  return out
 }
 
 /**
@@ -741,8 +799,15 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const summarizeTokens = mode.kind === 'sql'
     ? summarizeTokenPositions(mode.sql)
     : { recognized: false, unrecognizedParen: false }
+  const queryCall = mode.kind === 'sql'
+    ? queryCallSummarize(mode.sql)
+    : { hit: false, atTopOutput: false }
   const summarizeSql = mode.kind === 'sql'
-    && (summarizeTokens.recognized || queryCallSummarize(mode.sql))
+    && (summarizeTokens.recognized || queryCall.atTopOutput)
+  // 「位置无法确认」：SUMMARIZE 在 `(` 后但层级不可识别，或 query() 命中却不在最终输出来源 ——
+  // 这两种情况下输出**可能**仍是 SUMMARIZE 形状，但按行值改写会篡改普通数据，只能声明缺口。
+  const summarizeUnconfirmed = summarizeTokens.unrecognizedParen
+    || (queryCall.hit && !queryCall.atTopOutput)
   const summarizeShapeColumns = columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
   const summarizeShape = summarizeSql && summarizeShapeColumns
@@ -949,15 +1014,20 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       + '行级脱敏无法按行值识别敏感列，统计值（min/max/分位数）可能**未脱敏**。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
   }
-  // ⚠️ SQL 里的 SUMMARIZE 位置**不可识别**但输出是 SUMMARIZE 形状（CodeRabbit 2026-11-08
-  // 第七轮 major，真机实测）：`SELECT * FROM (SELECT * FROM (SUMMARIZE sessions))` 合法，
-  // 输出 column_name/min/max，userName 的 min/max 是明文 —— 行级判据不生效、其余警告也不发。
-  // 与上一档同一策略：**只声明缺口，不冒认脱敏**（值级兜底对姓名/地址无从下手）。
-  if (!summarizeSql && summarizeTokens.unrecognizedParen && summarizeShapeColumns) {
+  // ⚠️ SQL 里的 SUMMARIZE 位置**无法确认是最终输出**但输出是 SUMMARIZE 形状
+  //（CodeRabbit 2026-11-08 第七轮 major + Codex 第七轮 P2，均真机实测）：
+  //   · `SELECT * FROM (SELECT * FROM (SUMMARIZE sessions))` 合法，输出 column_name/min/max，
+  //     userName 的 min/max 是明文 —— 行级判据不生效、其余警告也不发；
+  //   · `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
+  //     也合法，但输出 min 是**常量 3** —— 按全 SQL 判据脱敏会把业务常量篡改成 `<已脱敏>`。
+  // 两向都不安全：漏脱敏与误改。与上一档同一策略：**只声明缺口，不冒认脱敏**。
+  if (!summarizeSql && summarizeUnconfirmed && summarizeShapeColumns) {
     warnings.push(
       'SQL 里的 SUMMARIZE 处于**无法识别的位置**（如多层子查询 '
-      + '`FROM (SELECT * FROM (SUMMARIZE …))`、逗号连接或 CTE 内的子查询）：'
-      + '输出仍是 SUMMARIZE 形状，但行级脱敏无法据此生效，统计值（min/max/分位数）可能**未脱敏**。'
+      + '`FROM (SELECT * FROM (SUMMARIZE …))`、逗号连接、CTE 内的子查询，'
+      + '或 query() 只出现在 WHERE/EXISTS/IN 子查询里）：'
+      + '输出可能仍是 SUMMARIZE 形状，但无法确认统计值是否未脱敏 —— '
+      + '行级脱敏未生效，统计值（min/max/分位数）可能**未脱敏**；若这些行不是 SUMMARIZE 结果则保持原值。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
       + '或把 SUMMARIZE 提到顶层（`SUMMARIZE <表>`）')
   }
