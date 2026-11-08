@@ -192,7 +192,13 @@
     `query('SUMMARIZE …')` 嵌套形态单独判（P2）；⑥ `14004 Timestamp interval limit`
     的 hint 把成因说死成「跨度超限」，而设计稿 §7.5 明载 `start>end` / `start==end` /
     超限三成因共码不可区分 → hint 改为「最常见成因」并给出第二成因的核对动作
-    （CodeRabbit minor）。两轮共 9 条回归用例、5 处变异转红。
+    （CodeRabbit minor）。第三轮复审追加：⑦ 关键词/嵌套调用判据仍扫原始 SQL ——
+    注释里的 `query('SUMMARIZE sessions')`、双引号别名 `"SUMMARIZE"` 都会误触发；
+    关键词改判 `bareKeywords`（单/双引号、美元引号、注释全剥）的裸 token，嵌套调用
+    改为「裸 token 定位 query( → 回原文读字符串实参」（P2）；⑧ 美元引号边界判据是
+    ASCII-only 字符类，DuckDB 实测接受 `1 AS 列$q$` 这类非 ASCII 标识符，两个 `$q$`
+    又被当成引号对 → 字符类扩到 `\p{L}\p{N}\p{M}`（P2）。三轮共 12 条回归用例、
+    7 处变异转红。
   · **`api call --help` 对 `--no-validate` 的描述大于实现**：CLI 级安装提示（skill
     未安装等）不受该开关影响、照旧出现在 warnings；帮助文字改为精确表述。
   · **分页响应首页有 total、后续页缺 total 时静默短读**：旧逻辑清空 declared 并

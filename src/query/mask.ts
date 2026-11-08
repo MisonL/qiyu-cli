@@ -309,6 +309,50 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+/**
+ * 剥掉**所有**引号内容（单引号串、美元引号串、双引号标识符）与注释，只留裸 token。
+ * 与 `withoutLiterals` 的区别：双引号标识符也抹掉（那个函数保留它是为了列名匹配）。
+ * 用于「这个词是不是 SQL 关键字」的判断 —— `SELECT "SUMMARIZE" AS x`、注释里的
+ * `query('SUMMARIZE …')`、字符串字面量里的同名词都不是关键字（Codex 2026-11-08 第三轮 P2）。
+ * ⚠️ 抹除保持等长（空格），返回文本的下标与原文逐位对齐。
+ */
+function bareKeywords(text: string): string {
+  const lit = withoutLiterals(text)
+  let out = ''
+  for (let i = 0; i < lit.length; i++) {
+    if (lit[i] !== '"') { out += lit[i]; continue }
+    const start = i
+    for (i++; i < lit.length; i++) {
+      if (lit[i] === '"') { if (lit[i + 1] !== '"') break; i++ }
+    }
+    out += ' '.repeat(Math.min(i, lit.length - 1) - start + 1)
+  }
+  return out
+}
+
+/**
+ * `query('…')` 内层 SQL 里出现 SUMMARIZE 关键字（`SELECT * FROM query('SUMMARIZE sessions')`）。
+ * ⚠️ 必须先在**裸 token** 上定位 `query(`（注释/字符串/双引号标识符里的同串不算调用），
+ * 再回到原 SQL 读那个字符串实参 —— 直接在原文上正则会把注释里写的伪装调用
+ * 也当成真调用（Codex 2026-11-08 第三轮 P2 实测）。
+ */
+function queryCallSummarize(sql: string): boolean {
+  const bare = bareKeywords(sql)
+  const re = /\bquery\s*\(/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(bare)) !== null) {
+    let i = m.index + m[0].length
+    while (i < sql.length && /\s/.test(sql[i]!)) i++
+    if (sql[i] !== "'") continue
+    const start = i
+    for (i++; i < sql.length; i++) {
+      if (sql[i] === "'") { if (sql[i + 1] !== "'") break; i++ }
+    }
+    if (/\bSUMMARIZE\b/i.test(sql.slice(start + 1, i))) return true
+  }
+  return false
+}
+
 function withoutLiterals(text: string): string {
   let out = ''
   // ⚠️ 被抹掉的字符一律换成等长空格：下标与原文**逐位对齐**，`sliceClause` 才能在抹过的
@@ -347,7 +391,11 @@ function withoutLiterals(text: string): string {
     // 警告在场）。字母/数字/下划线/`$` 与本文件其它词边界正则的字符类一致。
     if (ch === '$') {
       const prev = i > 0 ? text[i - 1]! : ''
-      if (i > 0 && /[A-Za-z0-9_$]/.test(prev)) { out += ch; continue }
+      // 标识符字符按 DuckDB 的实际规则判定：Unicode 字母/数字/组合符 + 下划线 + `$`
+      //（Codex 2026-11-08 第三轮 P2 实测：`SELECT userPhone, 1 AS 列$q$, … GROUP BY …,
+      // 列$q$` 是合法 SQL，旧的 ASCII-only 字符类不认识中文，两个 `$q$` 仍被当成引号对，
+      // 把 `GROUP BY` 抹掉 → 分组失真警告丢失）。`\p{L}` 覆盖中文等字母。
+      if (i > 0 && /[\p{L}\p{N}\p{M}_$]/u.test(prev)) { out += ch; continue }
       const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i))
       if (m !== null) {
         const end = text.indexOf(m[0], i + m[0].length)
@@ -560,10 +608,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   //     这里是对已知形态的补强）。残余边界：`query('SUMM' || 'ARIZE …')` 动态拼串取不到。
   //   · 命中判据：该行 `column_name` 的**基名**精确匹配敏感列清单（与列名级同一口径）；
   //   · 动作：命中行的统计列按该列规则脱敏。
-  const nestedSummarize = mode.kind === 'sql'
-    && /\bquery\s*\(\s*'(?:[^']|'')*?\bSUMMARIZE\b/i.test(mode.sql)
   const summarizeShape = mode.kind === 'sql'
-    && (/\bSUMMARIZE\b/i.test(withoutLiterals(mode.sql)) || nestedSummarize)
+    && (/\bSUMMARIZE\b/i.test(bareKeywords(mode.sql)) || queryCallSummarize(mode.sql))
     && columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
   // avg/std 只对数值列出现：`SUMMARIZE SELECT userPhone::DOUBLE AS userPhone` 的均值/标准差

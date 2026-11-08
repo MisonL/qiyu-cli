@@ -1240,11 +1240,33 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       "SELECT 'SUMMARIZE' AS marker, column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name",
       'SELECT column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name -- SUMMARIZE sessions',
       "SELECT $$SUMMARIZE sessions$$ AS marker, column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name",
+      // Codex 第三轮 P2：注释里伪装的 query() 调用、双引号标识符同名词都不得算关键字
+      "SELECT 'userName' AS column_name, 3 AS min /* query('SUMMARIZE sessions') */",
+      'SELECT "SUMMARIZE" AS marker, column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name',
     ]) {
       const out = maskQueryRows({ ...base, mode: { kind: 'sql', sql, tables: TABLES } })
       expect(out.rows[0]!.min, sql).toBe(3)
       expect(out.warnings.join('\n'), sql).not.toContain('SUMMARIZE')
     }
+  })
+
+  it('P2b 词法正向：真的 query() 调用（不在注释里）仍要命中', () => {
+    const out = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: "SELECT * FROM query('SUMMARIZE sessions')", tables: TABLES },
+    })
+    expect(out.rows[0]!.min).toBe(FULL)
+  })
+
+  it('P2a 词法正向：非 ASCII 标识符里的 $q$ 也不得当美元引号（DuckDB 实测合法别名）', () => {
+    const sql = 'SELECT userPhone, 1 AS 列$q$, COUNT(*) AS n FROM sessions GROUP BY userPhone, 列$q$'
+    const out = maskQueryRows({
+      rows: [{ userPhone: '13800138000', n: 1 }],
+      columns: ['userPhone', 'n'],
+      mode: { kind: 'sql', sql, tables: TABLES },
+    })
+    expect(out.warnings.join('\n'), '分组失真警告必须在场').toContain('GROUP BY / DISTINCT')
   })
 
   it('P families：SUMMARIZE 的 avg/std 也是 PII 派生值，一并替换', () => {
