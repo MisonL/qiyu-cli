@@ -36,7 +36,7 @@ import type { StoreLocation } from '../output.js'
 import { DB_PATH_HELP, parseStoreFlags } from './store-flags.js'
 import { describeFieldNotes, tablesFieldNotes } from './db-notes.js'
 import type { StoreFlags } from './store-flags.js'
-import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS, subcommandNames } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /**
@@ -513,7 +513,7 @@ export async function dbCommand(argv: string[]): Promise<number> {
   if (sub === '--pretty') {
     const problem = helpArgsError(rest, DB_SPECS.flatMap((sp) => sp.flags))
     if (problem !== undefined) return usageFail(`${problem}。--pretty 不接受额外参数`)
-    const badPos = prettyPositionalProblem(rest, subcommandNames(DB_SPECS))
+    const badPos = prettyPositionalProblem(rest, DB_SPECS)
     if (badPos !== undefined) return usageFail(badPos)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)

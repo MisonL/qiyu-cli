@@ -331,6 +331,17 @@ function bareKeywords(text: string): string {
 }
 
 /**
+ * `SUMMARIZE` 是**语句头关键字**（`SUMMARIZE sessions` / `SELECT * FROM (SUMMARIZE …)`），
+ * 不是任意位置出现的裸词 —— `SELECT 0 AS SUMMARIZE, 'userName' AS column_name, 3 AS min`
+ * 是合法别名（DuckDB 实测），按裸词判会把这条元数据查询误判成统计输出、把数字 3 改成
+ * `<已脱敏>`（Codex 2026-11-08 第五轮 P2）。判据作用在 bareKeywords（字面量/注释/双引号
+ * 标识符全剥）上，要求前面是文首、`(` 或 `;`。
+ */
+function isSummarizeStatement(sql: string): boolean {
+  return /(?:^|[(;])\s*SUMMARIZE\b/i.test(bareKeywords(sql))
+}
+
+/**
  * `query('…')` 内层 SQL 里出现 SUMMARIZE 关键字（`SELECT * FROM query('SUMMARIZE sessions')`）。
  * ⚠️ 必须先在**裸 token** 上定位 `query(`（注释/字符串/双引号标识符里的同串不算调用），
  * 再回到原 SQL 读那个字符串实参 —— 直接在原文上正则会把注释里写的伪装调用
@@ -365,9 +376,45 @@ function queryCallSummarize(sql: string): boolean {
     for (i++; i < sql.length; i++) {
       if (sql[i] === "'") { if (sql[i + 1] !== "'") break; i++ }
     }
-    if (/\bSUMMARIZE\b/i.test(sql.slice(start + 1, i))) return true
+    // ⚠️ 实参是**内层 SQL 源码**，必须解码（'' → '）后再跑同一套词法判据 —— 内层里的
+    // SUMMARIZE 也可能只是注释/字符串/别名：实测 `query('SELECT ''x'' … /* SUMMARIZE */')`
+    // 在 DuckDB 里返回普通行，按裸词判会把列值误改（Codex 2026-11-08 第五轮 P2）。
+    const inner = sql.slice(start + 1, i).replace(/''/g, "'")
+    if (isSummarizeStatement(inner) || queryCallSummarize(inner)) return true
   }
   return false
+}
+
+/**
+ * 取 `i` 之前的**完整码点**（UTF-16 代理对被 `text[i-1]` 截成孤立低代理项时补齐高代理项）。
+ * 美元引号边界判据必须按码点判：补充平面字母（实测 DuckDB 接受 `𝒜$q$`，U+1D49C）由两个
+ * UTF-16 单元组成，只看 `text[i-1]` 会拿到孤立低代理项、`\p{L}` 判不出（Codex 2026-11-08
+ * 第五轮 P2）。
+ */
+function prevCodePoint(text: string, i: number): string {
+  if (i >= 2) {
+    const hi = text.charCodeAt(i - 2)
+    const lo = text.charCodeAt(i - 1)
+    if (hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff) return text.slice(i - 2, i)
+  }
+  return i > 0 ? text[i - 1]! : ''
+}
+
+/**
+ * DuckDB 的标识符字符判据（美元引号边界用）：ASCII 字母/数字/`_`/`$`，以及**任何非 ASCII、
+ * 非空白**字符 —— DuckDB（utf8proc 词法）把 Unicode 字母/数字/组合符/连接符乃至货币符号
+ * 都接受为标识符字符（实测 `¢$q$` U+00A2 合法），补充平面字母按代理对处理（实测 `𝒜$q$`）。
+ * ASCII 标点（`=`、`(`、`,`、空白等）不是标识符字符 —— 美元引号合法地跟在它们之后。
+ * 方向：把模棱两可的非 ASCII 字符按**标识符**处理（不认成引号开头）—— 误判成字面量会
+ * 抹掉后续内容并让分组/缺口分析静默失效，误判成标识符只是少抹一段（该段是非法 SQL）。
+ */
+function isIdentCharAt(text: string, i: number): boolean {
+  const cp = prevCodePoint(text, i)
+  if (cp === '') return false
+  if (/^[A-Za-z0-9_$]$/.test(cp)) return true
+  const code = cp.codePointAt(0)
+  if (code === undefined || code < 0x80) return false
+  return !/\s/u.test(cp)
 }
 
 function withoutLiterals(text: string): string {
@@ -407,12 +454,10 @@ function withoutLiterals(text: string): string {
     // `GROUP BY` 整段抹掉 → 分组失真警告静默丢失（实测判据双边：去掉 alias 的对照组
     // 警告在场）。字母/数字/下划线/`$` 与本文件其它词边界正则的字符类一致。
     if (ch === '$') {
-      const prev = i > 0 ? text[i - 1]! : ''
-      // 标识符字符按 DuckDB 的实际规则判定：Unicode 字母/数字/组合符 + 下划线 + `$`
-      //（Codex 2026-11-08 第三轮 P2 实测：`SELECT userPhone, 1 AS 列$q$, … GROUP BY …,
-      // 列$q$` 是合法 SQL，旧的 ASCII-only 字符类不认识中文，两个 `$q$` 仍被当成引号对，
-      // 把 `GROUP BY` 抹掉 → 分组失真警告丢失）。`\p{L}` 覆盖中文等字母。
-      if (i > 0 && /[\p{L}\p{N}\p{M}_$]/u.test(prev)) { out += ch; continue }
+      // 标识符字符按 DuckDB 的实际规则判定（见 isIdentCharAt）：中文、补充平面字母、
+      // 货币符号等都是合法标识符字符（Codex 第三/五轮 P2 实测），紧跟在它们之后的 `$`
+      // 属于标识符，不是美元引号开头。
+      if (isIdentCharAt(text, i)) { out += ch; continue }
       const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i))
       if (m !== null) {
         const end = text.indexOf(m[0], i + m[0].length)
@@ -626,7 +671,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   //   · 命中判据：该行 `column_name` 的**基名**精确匹配敏感列清单（与列名级同一口径）；
   //   · 动作：命中行的统计列按该列规则脱敏。
   const summarizeShape = mode.kind === 'sql'
-    && (/\bSUMMARIZE\b/i.test(bareKeywords(mode.sql)) || queryCallSummarize(mode.sql))
+    && (isSummarizeStatement(mode.sql) || queryCallSummarize(mode.sql))
     && columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
   // avg/std 只对数值列出现：`SUMMARIZE SELECT userPhone::DOUBLE AS userPhone` 的均值/标准差

@@ -1243,6 +1243,10 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       // Codex 第三轮 P2：注释里伪装的 query() 调用、双引号标识符同名词都不得算关键字
       "SELECT 'userName' AS column_name, 3 AS min /* query('SUMMARIZE sessions') */",
       'SELECT "SUMMARIZE" AS marker, column_name, MIN(ordinal_position) AS min FROM information_schema.columns GROUP BY column_name',
+      // Codex 第五轮 P2：SUMMARIZE 作为**未加引号别名**（DuckDB 实测合法）不是语句头关键字
+      "SELECT 0 AS SUMMARIZE, 'userName' AS column_name, 3 AS min",
+      // Codex 第五轮 P2：query() 内层 SQL 里 SUMMARIZE 只出现在注释中
+      "SELECT * FROM query('SELECT ''userName'' AS column_name, 3 AS min /* SUMMARIZE */')",
     ]) {
       const out = maskQueryRows({ ...base, mode: { kind: 'sql', sql, tables: TABLES } })
       expect(out.rows[0]!.min, sql).toBe(3)
@@ -1267,13 +1271,17 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
   })
 
   it('P2a 词法正向：非 ASCII 标识符里的 $q$ 也不得当美元引号（DuckDB 实测合法别名）', () => {
-    const sql = 'SELECT userPhone, 1 AS 列$q$, COUNT(*) AS n FROM sessions GROUP BY userPhone, 列$q$'
-    const out = maskQueryRows({
-      rows: [{ userPhone: '13800138000', n: 1 }],
-      columns: ['userPhone', 'n'],
-      mode: { kind: 'sql', sql, tables: TABLES },
-    })
-    expect(out.warnings.join('\n'), '分组失真警告必须在场').toContain('GROUP BY / DISTINCT')
+    // 三档字符：中文（BMP 字母）、补充平面字母 U+1D49C 𝒜（UTF-16 代理对 —— 只看
+    // text[i-1] 会拿到孤立低代理项）、货币符号 U+00A2 ¢（Sc 类别，DuckDB 实测接受）。
+    for (const alias of ['列', '𝒜', '¢']) {
+      const sql = `SELECT userPhone, 1 AS ${alias}$q$, COUNT(*) AS n FROM sessions GROUP BY userPhone, ${alias}$q$`
+      const out = maskQueryRows({
+        rows: [{ userPhone: '13800138000', n: 1 }],
+        columns: ['userPhone', 'n'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), `${alias}：分组失真警告必须在场`).toContain('GROUP BY / DISTINCT')
+    }
   })
 
   it('P families：SUMMARIZE 的 avg/std 也是 PII 派生值，一并替换', () => {

@@ -203,7 +203,18 @@
     `--pretty` 分派分支只查未知 flag，位置参数里的拼错子命令名被 `--help` 静默吞成
     退出码 0（`api --pretty typo --help`）→ 新增共享判据 `prettyPositionalProblem`
     （拼错词在 help 前拒绝，合法子命令名仍走顺序写反引导），七族接入
-    （CodeRabbit/Codex 同指）。四轮共 15 条回归用例、9 处变异转红。
+    （CodeRabbit/Codex 同指）。第五轮 minor 再收敛判据边界：第一个裸位置 token 之后
+    的 token 属子命令自己的参数域（`db --pretty describe sessions --help` 的
+    `sessions`），flag **取值**（`--db /tmp/x` 的 `/tmp/x`）也不是位置参数 ——
+    判据只查第一个裸位置 token，并按 FlagSpec 跳过值位（否则 `sync --pretty
+    --db /tmp/x status --help` 会把取值误判成拼错词，退化成退出码 2）。
+    第六轮复审追加（Codex 3 条 P2）：⑪ `SUMMARIZE` 是**语句头关键字**而非任意裸词 ——
+    `SELECT 0 AS SUMMARIZE, …` 是 DuckDB 实测合法别名，按裸词判会误改元数据数字；
+    判据要求前面是文首/`(`/`;`（P2）；⑫ `query('…')` 实参要先解码、再对**内层 SQL**
+    跑同一词法判据 —— 内层注释里的 `SUMMARIZE` 此前会误触发（P2）；⑬ 美元引号标识符
+    边界要按**完整码点**判 —— 补充平面字母 `𝒜`（U+1D49C，代理对被 `text[i-1]` 截断）
+    与货币符号 `¢`（U+00A2）都是 DuckDB 实测合法标识符字符（P2）。
+    五轮共 17 条回归用例、13 处变异转红。
   · **`api call --help` 对 `--no-validate` 的描述大于实现**：CLI 级安装提示（skill
     未安装等）不受该开关影响、照旧出现在 warnings；帮助文字改为精确表述。
   · **分页响应首页有 total、后续页缺 total 时静默短读**：旧逻辑清空 declared 并

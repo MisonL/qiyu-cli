@@ -111,6 +111,19 @@ describe('命令行入口', () => {
       expect(await run([fam, '--pretty', sub, '--help']), `${fam} ${sub}：help 应优先`).toBe(0)
       expect(out, `${fam}：应输出帮助正文`).toContain('用法：')
     }
+    // 对照（CodeRabbit 第五轮 minor）：子命令**之后**的位置参数与 flag **取值**不是
+    // 这里的判据 —— `db --pretty describe sessions --help` 的 `sessions`、`--db /tmp/x`
+    // 的 `/tmp/x` 都属子命令自己的参数域，help 必须照常输出。
+    for (const argv of [
+      ['db', '--pretty', 'describe', 'sessions', '--help'],
+      ['sync', '--pretty', 'status', '--db', '/tmp/x', '--help'],
+      // 值位出现在子命令**之前**时同样不能当位置参数（`/tmp/x` 是 --db 的取值）
+      ['sync', '--pretty', '--db', '/tmp/x', 'status', '--help'],
+    ]) {
+      out = ''; err = ''
+      expect(await run(argv), `${argv.join(' ')}：help 应优先（值位不是位置参数）`).toBe(0)
+      expect(out).toContain('用法：')
+    }
     // 顺序写反的裸用法仍给出 prettyAfterSubcommand 引导（不回归）
     out = ''; err = ''
     expect(await run(['db', '--pretty', 'tables'])).toBe(2)

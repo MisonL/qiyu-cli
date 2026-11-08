@@ -13,7 +13,7 @@ import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/val
 import { ok, fail, usageFail, describeArgs, setPretty, EXIT } from '../output.js'
 import { localFallbackFor } from './local-fallback.js'
 import { callFieldNotes } from './api-notes.js'
-import { GLOBAL_FLAGS, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, renderFlagNames, subcommandNames } from './spec-types.js'
+import { GLOBAL_FLAGS, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /** `api list` 的业务 flag（`flags` 里还要再并上全局 flag）。 */
@@ -135,7 +135,7 @@ export async function apiCommand(argv: string[]): Promise<number> {
     }
     // ⚠️ 位置参数里的拼错子命令名必须在 help 之前拒绝（Codex 2026-11-08 第四轮 P2）——
     // `api --pretty typo --help` 曾经把 typo 静默吞掉、help 退 0。
-    const badPos = prettyPositionalProblem(argv.slice(1), subcommandNames(API_SPECS))
+    const badPos = prettyPositionalProblem(argv.slice(1), API_SPECS)
     if (badPos !== undefined) return usageFail(badPos)
     if (argv.includes('--help') || argv.includes('-h')) {
       process.stdout.write(API_USAGE)

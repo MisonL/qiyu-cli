@@ -15,7 +15,7 @@ import {
 } from './store-precheck.js'
 import { TABLES } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
-import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS, subcommandNames } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -121,7 +121,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     if (sub === '--pretty') {
       const problem = helpArgsError(rest, STORE_SPECS.flatMap((sp) => sp.flags))
       if (problem !== undefined) return usageFail(`${problem}。--pretty 不接受额外参数`)
-      const badPos = prettyPositionalProblem(rest, subcommandNames(STORE_SPECS))
+      const badPos = prettyPositionalProblem(rest, STORE_SPECS)
       if (badPos !== undefined) return usageFail(badPos)
       if (rest.includes('--help') || rest.includes('-h')) {
         process.stdout.write(USAGE)

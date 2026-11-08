@@ -165,28 +165,42 @@ export function prettyAfterSubcommand(group: string): string {
 }
 
 /**
- * `--pretty` 写在子命令之前的分派分支里，**位置参数**的唯一判据（Codex 2026-11-08 第四轮 P2）。
+ * `--pretty` 写在子命令之前的分派分支里，**位置参数**的唯一判据
+ *（Codex 2026-11-08 第四轮 P2 + CodeRabbit 第五轮 minor 双向收敛）。
  *
  * ⚠️ 只查「未知 flag」会放过位置参数：`qiyu api --pretty typo --help` 里 `typo` 不以
- * `-` 开头、被忽略，随后 `--help` 以退出码 0 返回 —— 拼错的参数被静默吞掉（改动前它
- * 会报「未知参数：typo」；本判据恢复该行为并保持 order「未知/位置 → help → 顺序写反」）。
- * 位置参数分两类：
- *   · **已知子命令名**（`db --pretty tables`）—— 返回 undefined，交给 `--help` 与
- *     `prettyAfterSubcommand`（顺序写反引导）；
- *   · **其余**（拼写错误 / 臆造词）—— 返回 usage 文案，调用方须在 **help 之前**拒绝。
+ * `-` 开头、被忽略，随后 `--help` 以退出码 0 返回 —— 拼错的参数被静默吞掉（改动前
+ * api 族会报「未知参数：typo」）。故第一个裸位置 token 必须是子命令名，否则在
+ * **help 之前**拒绝。
+ *
+ * ⚠️ 判据只看**第一个**裸位置 token（第五轮 minor）：合法子命令名之后的 token 属于
+ * 那条子命令的位置参数域（`db --pretty describe sessions --help` 的 `sessions`），
+ * `--db /tmp/x` 这类 flag **取值**也不是位置参数 —— 都不在这里判，交给 help 与
+ * 子命令自己的解析器。为此必须按 FlagSpec 跳过**值位**（value/repeatable 的下一个
+ * token 是取值，不是位置参数），否则 `sync --pretty status --db /tmp/x --help`
+ * 会把取值 `/tmp/x` 误判成拼错词（第五轮实测回归）。
+ *
+ * 返回 undefined = 放行（交给调用方的 help / prettyAfterSubcommand）；否则返回
+ * usage 文案，调用方须在 help 之前拒绝。
  */
 export function prettyPositionalProblem(
-  args: readonly string[], subcommands: readonly string[],
+  args: readonly string[],
+  specs: ReadonlyArray<{ path: readonly string[]; flags: readonly FlagSpec[] }>,
 ): string | undefined {
-  const invalid = args.filter((a) => !a.startsWith('-') && !subcommands.includes(a))
-  return invalid.length === 0
-    ? undefined
-    : `未知参数：${describeArgs(invalid)}。--pretty 不接受额外参数`
-}
-
-/** 从命令族 `*_SPECS` 取子命令名（`path[1]`），供上面的判据使用 —— 不另写第二份清单。 */
-export function subcommandNames(specs: ReadonlyArray<{ path: readonly string[] }>): string[] {
-  return specs.map((s) => s.path[1]).filter((n): n is string => n !== undefined)
+  const subcommands = specs.map((s) => s.path[1]).filter((n): n is string => n !== undefined)
+  const valueFlags = new Set(
+    specs.flatMap((s) => s.flags).filter((f) => f.kind !== 'bool').map((f) => f.name),
+  )
+  let first: string | undefined
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!
+    if (valueFlags.has(a)) { i++; continue }        // flag + 它的取值：取值不是位置参数
+    if (a.startsWith('-')) continue                 // 不吃值的 flag
+    first = a
+    break
+  }
+  if (first === undefined || subcommands.includes(first)) return undefined
+  return `未知参数：${describeArgs([first])}。--pretty 不接受额外参数`
 }
 
 /**
