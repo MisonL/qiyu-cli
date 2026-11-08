@@ -22,7 +22,7 @@ import {
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import { withTimeoutHint } from '../query/sandbox.js'
-import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS, subcommandNames } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -401,6 +401,8 @@ export async function statsCommand(argv: string[]): Promise<number> {
     const problem = helpArgsError(rest, STATS_SPECS.flatMap((sp) => sp.flags))
     if (problem !== undefined)
       return usageFail(`${problem}。--pretty 不接受额外参数`)
+    const badPos = prettyPositionalProblem(rest, subcommandNames(STATS_SPECS))
+    if (badPos !== undefined) return usageFail(badPos)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
       return 0

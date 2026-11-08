@@ -1251,12 +1251,19 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
   })
 
   it('P2b 词法正向：真的 query() 调用（不在注释里）仍要命中', () => {
-    const out = maskQueryRows({
-      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
-      columns: ['column_name', 'min', 'max'],
-      mode: { kind: 'sql', sql: "SELECT * FROM query('SUMMARIZE sessions')", tables: TABLES },
-    })
-    expect(out.rows[0]!.min).toBe(FULL)
+    for (const sql of [
+      "SELECT * FROM query('SUMMARIZE sessions')",
+      // DuckDB 实测接受的两种等价写法（Codex 2026-11-08 第四轮 P1）
+      "SELECT * FROM query(/* gap */ 'SUMMARIZE sessions')",
+      "SELECT * FROM query(E'SUMMARIZE sessions')",
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+        columns: ['column_name', 'min', 'max'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.rows[0]!.min, sql).toBe(FULL)
+    }
   })
 
   it('P2a 词法正向：非 ASCII 标识符里的 $q$ 也不得当美元引号（DuckDB 实测合法别名）', () => {

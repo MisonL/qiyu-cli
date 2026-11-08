@@ -165,6 +165,31 @@ export function prettyAfterSubcommand(group: string): string {
 }
 
 /**
+ * `--pretty` 写在子命令之前的分派分支里，**位置参数**的唯一判据（Codex 2026-11-08 第四轮 P2）。
+ *
+ * ⚠️ 只查「未知 flag」会放过位置参数：`qiyu api --pretty typo --help` 里 `typo` 不以
+ * `-` 开头、被忽略，随后 `--help` 以退出码 0 返回 —— 拼错的参数被静默吞掉（改动前它
+ * 会报「未知参数：typo」；本判据恢复该行为并保持 order「未知/位置 → help → 顺序写反」）。
+ * 位置参数分两类：
+ *   · **已知子命令名**（`db --pretty tables`）—— 返回 undefined，交给 `--help` 与
+ *     `prettyAfterSubcommand`（顺序写反引导）；
+ *   · **其余**（拼写错误 / 臆造词）—— 返回 usage 文案，调用方须在 **help 之前**拒绝。
+ */
+export function prettyPositionalProblem(
+  args: readonly string[], subcommands: readonly string[],
+): string | undefined {
+  const invalid = args.filter((a) => !a.startsWith('-') && !subcommands.includes(a))
+  return invalid.length === 0
+    ? undefined
+    : `未知参数：${describeArgs(invalid)}。--pretty 不接受额外参数`
+}
+
+/** 从命令族 `*_SPECS` 取子命令名（`path[1]`），供上面的判据使用 —— 不另写第二份清单。 */
+export function subcommandNames(specs: ReadonlyArray<{ path: readonly string[] }>): string[] {
+  return specs.map((s) => s.path[1]).filter((n): n is string => n !== undefined)
+}
+
+/**
  * 存储定位三件套（store 命令同族）。值位语义唯一事实源在 `store-flags.ts`：
  * `STORE_VALUE_FLAG_NAMES` 从这里派生，解析器与 spec 消费同一份，避免两边各写一遍
  * `'--db' || '--profile' || '--backend'` 而漂移。

@@ -8,7 +8,7 @@ import {
   resolveProfileName, shellPath,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
-import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, REJECTED_FLAGS } from './spec-types.js'
+import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, subcommandNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /** `auth login` 的业务 flag：只有 `--profile`（凭证从**环境变量**读，见命令内注释）。 */
@@ -82,6 +82,8 @@ export async function authCommand(argv: string[]): Promise<number> {
     if (unknown.length > 0) {
       return usageFail(`未知参数：${describeArgs(unknown)}。--pretty 不接受额外参数`)
     }
+    const badPos = prettyPositionalProblem(argv.slice(1), subcommandNames(AUTH_SPECS))
+    if (badPos !== undefined) return usageFail(badPos)
     if (argv.includes('--help') || argv.includes('-h')) {
       process.stdout.write(AUTH_USAGE)
       return EXIT.OK

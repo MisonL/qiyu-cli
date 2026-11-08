@@ -342,7 +342,24 @@ function queryCallSummarize(sql: string): boolean {
   let m: RegExpExecArray | null
   while ((m = re.exec(bare)) !== null) {
     let i = m.index + m[0].length
-    while (i < sql.length && /\s/.test(sql[i]!)) i++
+    // ⚠️ `(` 与字符串实参之间可以夹空白**与注释**（DuckDB 实测接受
+    // `query(/* gap */ 'SUMMARIZE sessions')`），只跳空白会漏检 → PII 统计值原样输出
+    //（Codex 2026-11-08 第四轮 P1）。注释按词法跳过，不当作实参。
+    for (;;) {
+      while (i < sql.length && /\s/.test(sql[i]!)) i++
+      if (sql[i] === '/' && sql[i + 1] === '*') {
+        const close = sql.indexOf('*/', i + 2)
+        i = close === -1 ? sql.length : close + 2
+        continue
+      }
+      if (sql[i] === '-' && sql[i + 1] === '-') {
+        while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i++
+        continue
+      }
+      break
+    }
+    // 字符串前缀：DuckDB 接受 `E'…'`（转义字符串）—— 实测 `query(E'SUMMARIZE sessions')` 有效。
+    if ((sql[i] === 'E' || sql[i] === 'e') && sql[i + 1] === "'") i++
     if (sql[i] !== "'") continue
     const start = i
     for (i++; i < sql.length; i++) {

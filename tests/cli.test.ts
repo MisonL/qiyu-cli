@@ -95,6 +95,28 @@ describe('命令行入口', () => {
     expect(err).toBe('')
   })
 
+  it('分派层 --pretty：拼错的子命令名不得被 --help 吞掉（七个命令族同判据，Codex 2026-11-08 P2）', async () => {
+    // `qiyu api --pretty typo --help` 此前只查「未知 flag」，typo 被忽略、help 退 0 ——
+    // 拼错的参数被静默吞掉（改动前它会报「未知参数：typo」）。判据：位置参数里的**非子命令**
+    // token 必须在 help 之前拒绝；**合法子命令名**（顺序写反）仍走 help → prettyAfterSubcommand。
+    for (const fam of ['api', 'auth', 'db', 'stats', 'sync', 'store', 'skill']) {
+      out = ''; err = ''
+      expect(await run([fam, '--pretty', 'typo', '--help']), `${fam}：拼错的参数必须退 2`).toBe(2)
+      expect(err, `${fam}：必须点名拼错的参数`).toMatch(/未知参数：typo/)
+    }
+    // 对照：位置参数是**合法子命令名**时，--help 仍优先（`db --pretty tables --help`）——
+    // 不得把顺序写反的合法写法也拒成 2。
+    for (const [fam, sub] of [['db', 'tables'], ['stats', 'fields'], ['store', 'init'], ['skill', 'install']]) {
+      out = ''; err = ''
+      expect(await run([fam, '--pretty', sub, '--help']), `${fam} ${sub}：help 应优先`).toBe(0)
+      expect(out, `${fam}：应输出帮助正文`).toContain('用法：')
+    }
+    // 顺序写反的裸用法仍给出 prettyAfterSubcommand 引导（不回归）
+    out = ''; err = ''
+    expect(await run(['db', '--pretty', 'tables'])).toBe(2)
+    expect(err).toContain('必须写在具体子命令之后')
+  })
+
   it('纯空白的子命令也要点名，不能渲染成不可见的名字（2026-10-08 修）', async () => {
     // `qiyu " "`（shell 变量展开成一个空格）此前报「未知子命令： ；可用子命令：…」——
     // 冒号后是空格，Agent 看不出自己传了什么。规则同 output.ts 的 describeArgs。

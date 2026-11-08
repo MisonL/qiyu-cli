@@ -37,7 +37,7 @@ import { TABLES } from '../store/schema.js'
 import { REPORT_TABLES } from '../query/metric-catalog.js'
 import { SYNC_TASKS } from '../sync/registry.js'
 import { COMMAND_TREE } from './tree.js'
-import { prettyAfterSubcommand } from './spec-types.js'
+import { prettyAfterSubcommand, prettyPositionalProblem, subcommandNames } from './spec-types.js'
 import { SKILL_SPECS, skillFlagSpecs } from './skill-specs.js'
 import { checkSkillDir, type CheckContext, type CheckResult, type ViolationRule } from '../skill/check.js'
 import { contentHash, contentHashOfFiles, fileHash, installSkill, listFiles, managedContentHash, planInstall, sameFileSet, INSTALL_STATUSES, type InstallPlan, type InstallStatus } from '../skill/install.js'
@@ -1414,6 +1414,8 @@ export async function skillCommand(argv: string[]): Promise<number> {
     if (unknown.length > 0) {
       return usageFail(`未知参数：${describeArgs(unknown)}。--pretty 不接受额外参数`)
     }
+    const badPos = prettyPositionalProblem(rest, subcommandNames(SKILL_SPECS))
+    if (badPos !== undefined) return usageFail(badPos)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(SKILL_USAGE)
       return 0

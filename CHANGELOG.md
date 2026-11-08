@@ -197,8 +197,13 @@
     关键词改判 `bareKeywords`（单/双引号、美元引号、注释全剥）的裸 token，嵌套调用
     改为「裸 token 定位 query( → 回原文读字符串实参」（P2）；⑧ 美元引号边界判据是
     ASCII-only 字符类，DuckDB 实测接受 `1 AS 列$q$` 这类非 ASCII 标识符，两个 `$q$`
-    又被当成引号对 → 字符类扩到 `\p{L}\p{N}\p{M}`（P2）。三轮共 12 条回归用例、
-    7 处变异转红。
+    又被当成引号对 → 字符类扩到 `\p{L}\p{N}\p{M}`（P2）。第四轮复审追加：
+    ⑨ `query(/* gap */ '…')` 与 `query(E'…')`（DuckDB 实测均合法）漏检 →
+    跳过注释、识别字符串前缀（P1，漏检意味着 PII 统计值原样输出）；⑩ 七个命令族的
+    `--pretty` 分派分支只查未知 flag，位置参数里的拼错子命令名被 `--help` 静默吞成
+    退出码 0（`api --pretty typo --help`）→ 新增共享判据 `prettyPositionalProblem`
+    （拼错词在 help 前拒绝，合法子命令名仍走顺序写反引导），七族接入
+    （CodeRabbit/Codex 同指）。四轮共 15 条回归用例、9 处变异转红。
   · **`api call --help` 对 `--no-validate` 的描述大于实现**：CLI 级安装提示（skill
     未安装等）不受该开关影响、照旧出现在 warnings；帮助文字改为精确表述。
   · **分页响应首页有 total、后续页缺 total 时静默短读**：旧逻辑清空 declared 并
