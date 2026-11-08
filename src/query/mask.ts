@@ -287,7 +287,12 @@ const AGGREGATE_CALL = new RegExp(
  * 覆盖整个表达式是安全的方向：含聚合函数的项不可能同时是分组键（DuckDB 会拒绝）。
  */
 function isAggregateItem(item: string): boolean {
-  return AGGREGATE_CALL.test(withoutLiterals(item))
+  // ⚠️ 双引号标识符（输出别名）里的文本也要剥掉（Codex 2026-11-08 第六轮 P2）：
+  // `SELECT userPhone AS "Bob's COUNT(*)'s label", COUNT(*) AS n … GROUP BY userPhone`
+  // 是 DuckDB 实测合法查询，别名文本里的 `COUNT(*` 会让投影项被误判成聚合、把真实
+  // 手机号投影排除出 `projected` → 分组失真警告静默丢失。别名永远是标识符，不可能
+  // 是聚合函数调用本身，剥掉方向安全。
+  return AGGREGATE_CALL.test(bareKeywords(item))
 }
 
 /**
@@ -335,10 +340,32 @@ function bareKeywords(text: string): string {
  * 不是任意位置出现的裸词 —— `SELECT 0 AS SUMMARIZE, 'userName' AS column_name, 3 AS min`
  * 是合法别名（DuckDB 实测），按裸词判会把这条元数据查询误判成统计输出、把数字 3 改成
  * `<已脱敏>`（Codex 2026-11-08 第五轮 P2）。判据作用在 bareKeywords（字面量/注释/双引号
- * 标识符全剥）上，要求前面是文首、`(` 或 `;`。
+ * 标识符全剥）上，要求是文首，或深度 1 的 `FROM (`/`JOIN (`。旧判据的 `;` 后语句头不认：
+ * 多语句被沙箱语句数闸门拒绝（src/query/sandbox.ts 语句数闸门），带 `;` 的 SQL 到不了脱敏。
  */
 function isSummarizeStatement(sql: string): boolean {
-  return /(?:^|[(;])\s*SUMMARIZE\b/i.test(bareKeywords(sql))
+  const bare = bareKeywords(sql)
+  const re = /SUMMARIZE/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(bare)) !== null) {
+    // ⚠️ `\b` 不够：`SUMMARIZE$q$` 是合法标识符（`$` 不是词字符，`\b` 会误判成
+    // 完整关键字，DuckDB 实测 `SELECT (SUMMARIZE$q$) AS marker, …` 返回普通行）——
+    // 前后都必须按 DuckDB 的标识符字符判据检查（Codex 2026-11-08 第六轮 P2）。
+    if (isIdentCharAt(bare, m.index)) continue
+    if (isIdentAt(bare, m.index + m[0].length)) continue
+    const before = bare.slice(0, m.index)
+    // 顶层语句头：前面只有空白。
+    if (/^\s*$/.test(before)) return true
+    // 顶层 `FROM (SUMMARIZE …)` / `JOIN (SUMMARIZE …)`（深度 1，且 `(` 顶层直接跟在
+    // FROM/JOIN 后）。深度用括号计数 —— bareKeywords 已把字面量/注释/双引号标识符抹空，
+    // 剩下的括号都是真括号。⚠️ 更深层的 `(SUMMARIZE …)`（如 WHERE … IN (SELECT …
+    // FROM (SUMMARIZE …))）不认：那种查询的最终输出不是 SUMMARIZE 结果，认了会把
+    // 元数据查询的数字误改（Codex 2026-11-08 第六轮 P2）。`FROM (SELECT * FROM
+    // (SUMMARIZE …))` 这类深层真输出属残余边界，方向记录在此。
+    const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
+    if (depth === 1 && /(?:\bFROM|\bJOIN)\s*\(\s*$/i.test(before)) return true
+  }
+  return false
 }
 
 /**
@@ -359,8 +386,8 @@ function queryCallSummarize(sql: string): boolean {
     for (;;) {
       while (i < sql.length && /\s/.test(sql[i]!)) i++
       if (sql[i] === '/' && sql[i + 1] === '*') {
-        const close = sql.indexOf('*/', i + 2)
-        i = close === -1 ? sql.length : close + 2
+        // 嵌套块注释按深度跳过（DuckDB 实测 `/* outer /* inner */ … */` 合法）
+        i = skipBlockComment(sql, i)
         continue
       }
       if (sql[i] === '-' && sql[i + 1] === '-') {
@@ -400,6 +427,20 @@ function prevCodePoint(text: string, i: number): string {
   return i > 0 ? text[i - 1]! : ''
 }
 
+/** ASCII 空白集合 —— DuckDB 的词法空白只有这几个。⚠️ 不能用 `\s`：JS 的 `\s` 把
+ *  U+2028/U+2029 等也算空白，而 DuckDB 实测把它们当**标识符字符**（`1 AS x\u2028$q$`
+ *  合法，两个 `$q$` 都被当成标识符的一部分，Codex 2026-11-08 第六轮 P2）。 */
+const ASCII_WS = new Set([' ', '\t', '\n', '\r', '\f', '\v'])
+
+/** 单个码点是否 DuckDB 标识符字符（ASCII：字母/数字/`_`/`$`；非 ASCII：一律算，除 ASCII 空白）。 */
+function isIdentCp(cp: string): boolean {
+  if (cp === '') return false
+  if (/^[A-Za-z0-9_$]$/.test(cp)) return true
+  const code = cp.codePointAt(0)
+  if (code === undefined || code < 0x80) return false
+  return !ASCII_WS.has(cp)
+}
+
 /**
  * DuckDB 的标识符字符判据（美元引号边界用）：ASCII 字母/数字/`_`/`$`，以及**任何非 ASCII、
  * 非空白**字符 —— DuckDB（utf8proc 词法）把 Unicode 字母/数字/组合符/连接符乃至货币符号
@@ -409,12 +450,25 @@ function prevCodePoint(text: string, i: number): string {
  * 抹掉后续内容并让分组/缺口分析静默失效，误判成标识符只是少抹一段（该段是非法 SQL）。
  */
 function isIdentCharAt(text: string, i: number): boolean {
-  const cp = prevCodePoint(text, i)
-  if (cp === '') return false
-  if (/^[A-Za-z0-9_$]$/.test(cp)) return true
-  const code = cp.codePointAt(0)
-  if (code === undefined || code < 0x80) return false
-  return !/\s/u.test(cp)
+  return isIdentCp(prevCodePoint(text, i))
+}
+
+/** `text[i]` 处的码点是否标识符字符（next 方向；`codePointAt` 天然按码点处理代理对）。 */
+function isIdentAt(text: string, i: number): boolean {
+  if (i >= text.length) return false
+  return isIdentCp(String.fromCodePoint(text.codePointAt(i)!))
+}
+
+/** 嵌套块注释：`/*` 开头可再嵌 `/*`（DuckDB 实测合法），按深度数到配对的 `*`+`/` 才算结束。返回注释结束后的下标。 */
+function skipBlockComment(text: string, start: number): number {
+  let i = start + 2
+  let depth = 1
+  while (i < text.length && depth > 0) {
+    if (text[i] === '/' && text[i + 1] === '*') { depth++; i += 2; continue }
+    if (text[i] === '*' && text[i + 1] === '/') { depth--; i += 2; continue }
+    i++
+  }
+  return Math.min(i, text.length)
 }
 
 function withoutLiterals(text: string): string {
@@ -479,11 +533,11 @@ function withoutLiterals(text: string): string {
       continue
     }
     if (ch === '/' && text[i + 1] === '*') {
-      const start = i
-      i += 2
-      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
-      i++   // 越过 `/`
-      out += blank(Math.min(i, text.length - 1) - start + 1)
+      // ⚠️ 必须按**嵌套深度**跳过（Codex 2026-11-08 第六轮 P2）：`/* outer /* inner */ … */`
+      // 是 DuckDB 实测合法语法，停在第一个 `*/` 会把仍在注释里的内容当成 SQL 记号。
+      const end = skipBlockComment(text, i)
+      out += blank(end - i)
+      i = end - 1
       continue
     }
     out += ch
@@ -670,8 +724,9 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   //     这里是对已知形态的补强）。残余边界：`query('SUMM' || 'ARIZE …')` 动态拼串取不到。
   //   · 命中判据：该行 `column_name` 的**基名**精确匹配敏感列清单（与列名级同一口径）；
   //   · 动作：命中行的统计列按该列规则脱敏。
-  const summarizeShape = mode.kind === 'sql'
+  const summarizeSql = mode.kind === 'sql'
     && (isSummarizeStatement(mode.sql) || queryCallSummarize(mode.sql))
+  const summarizeShape = summarizeSql
     && columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
   // avg/std 只对数值列出现：`SUMMARIZE SELECT userPhone::DOUBLE AS userPhone` 的均值/标准差
@@ -865,6 +920,16 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     warnings.push(
       'SUMMARIZE 的统计值（min/max/分位数）可能来自敏感列：本次已按输出里的 column_name '
       + '精确匹配脱敏；**别名/表达式列**（如 `SUMMARIZE SELECT userName AS n …`）不在其列。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
+  }
+  // ⚠️ SQL 含 SUMMARIZE 但**输出列名被改写**（`SELECT column_name AS c, min AS m, max AS x
+  // FROM (SUMMARIZE sessions)`，CodeRabbit 2026-11-08 第六轮实测）：形状判据不匹配 → 行级
+  // 脱敏不触发，而 SQL 文本又不含敏感列名、其余缺口警告也不发 —— PII 统计值原样输出且
+  // mask_warnings 为空。按本文件对 query()/COLUMNS() 的同一策略：**声明缺口，绝不静默**。
+  if (summarizeSql && !summarizeShape) {
+    warnings.push(
+      'SQL 含 SUMMARIZE，但输出列名已被改写（缺 column_name / min / max 形状）：'
+      + '行级脱敏无法按行值识别敏感列，统计值（min/max/分位数）可能**未脱敏**。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
   }
   // 边界用「前后不是标识符字符」而不是 `\\b`：别名可以带标点（`"p("`），

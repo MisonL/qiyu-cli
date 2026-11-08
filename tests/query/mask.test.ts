@@ -1247,6 +1247,12 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       "SELECT 0 AS SUMMARIZE, 'userName' AS column_name, 3 AS min",
       // Codex 第五轮 P2：query() 内层 SQL 里 SUMMARIZE 只出现在注释中
       "SELECT * FROM query('SELECT ''userName'' AS column_name, 3 AS min /* SUMMARIZE */')",
+      // Codex 第六轮 P2：完整标识符边界 —— `$` 不是词字符，`\b` 在 `SUMMARIZE$q$` 处成立
+      // 会把它误判成关键字；DuckDB 实测该查询是普通 SELECT（返回 marker/column_name/min 三列）
+      "SELECT (SUMMARIZE$q$) AS marker, 'userName' AS column_name, 3 AS min FROM (SELECT 0 AS SUMMARIZE$q$) t",
+      // Codex 第六轮 P2：块注释可**嵌套**（DuckDB 实测合法）—— 停在第一个 `*/` 会把仍在
+      // 注释里的 `'SUMMARIZE sessions'` 当成 query() 实参，误判成 SUMMARIZE 输出把 min 改成脱敏值
+      "SELECT * FROM query(/* outer /* inner */ 'SUMMARIZE sessions' */ 'SELECT 1')",
     ]) {
       const out = maskQueryRows({ ...base, mode: { kind: 'sql', sql, tables: TABLES } })
       expect(out.rows[0]!.min, sql).toBe(3)
@@ -1270,10 +1276,33 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     }
   })
 
+  it('缺口声明：SUMMARIZE 输出列名被改写（重投影）时必须警告，不得静默漏出（CodeRabbit 第六轮）', () => {
+    // `SELECT column_name AS c, min AS m, max AS x FROM (SUMMARIZE sessions)`：真机实测
+    // 输出列是 c/m/x，userName 行的 m/x 是原值 —— 形状判据不匹配 → 行级脱敏够不着，
+    // SQL 文本又不含敏感列名、其余缺口警告也不发。按「声明缺口，绝不静默」策略补警告。
+    const out = maskQueryRows({
+      rows: [{ c: 'userName', m: '张三丰', x: '李四光' }],
+      columns: ['c', 'm', 'x'],
+      mode: { kind: 'sql', sql: 'SELECT column_name AS c, min AS m, max AS x FROM (SUMMARIZE sessions)', tables: TABLES },
+    })
+    // 值级兜底对这些无格式值无从下手 —— 不能伪造脱敏，但缺口必须可见
+    expect(out.warnings.join('\n'), '缺口警告必须在场').toContain('输出列名已被改写')
+    expect(out.warnings.join('\n')).toContain('可能**未脱敏**')
+    expect(out.warnings.join('\n')).toContain('query --table')
+    // 反向：形状匹配的正常 SUMMARIZE 不吃这条警告（避免噪音）
+    const ok = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SUMMARIZE sessions', tables: TABLES },
+    })
+    expect(ok.warnings.join('\n')).not.toContain('输出列名已被改写')
+  })
+
   it('P2a 词法正向：非 ASCII 标识符里的 $q$ 也不得当美元引号（DuckDB 实测合法别名）', () => {
-    // 三档字符：中文（BMP 字母）、补充平面字母 U+1D49C 𝒜（UTF-16 代理对 —— 只看
-    // text[i-1] 会拿到孤立低代理项）、货币符号 U+00A2 ¢（Sc 类别，DuckDB 实测接受）。
-    for (const alias of ['列', '𝒜', '¢']) {
+    // 四档字符：中文（BMP 字母）、补充平面字母 U+1D49C 𝒜（UTF-16 代理对 —— 只看
+    // text[i-1] 会拿到孤立低代理项）、货币符号 U+00A2 ¢（Sc 类别，DuckDB 实测接受）、
+    // U+2028 行分隔符（JS 的 `\s` 算空白、DuckDB 实测算标识符字符 —— Codex 第六轮 P2）。
+    for (const alias of ['列', '𝒜', '¢', 'x\u2028']) {
       const sql = `SELECT userPhone, 1 AS ${alias}$q$, COUNT(*) AS n FROM sessions GROUP BY userPhone, ${alias}$q$`
       const out = maskQueryRows({
         rows: [{ userPhone: '13800138000', n: 1 }],
@@ -1282,6 +1311,21 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       })
       expect(out.warnings.join('\n'), `${alias}：分组失真警告必须在场`).toContain('GROUP BY / DISTINCT')
     }
+  })
+
+  it('P2b 聚合判据：双引号别名里的 COUNT(* 文本不得把投影项判成聚合（分组失真警告不得丢失）', () => {
+    // DuckDB 实测合法的输出别名（Codex 第六轮 P2）：`SELECT userPhone AS "Bob's COUNT(*)'s label",
+    // COUNT(*) AS n … GROUP BY userPhone`。withoutLiterals 保留了双引号内容，别名里的
+    // `COUNT(*` 曾让 userPhone 投影被当成聚合项排除出 projected → 分组失真警告静默丢失。
+    // 别名只可能是标识符、不可能是调用本身，剥掉方向安全。
+    const sql = `SELECT userPhone AS "Bob's COUNT(*)'s label", COUNT(*) AS n FROM sessions GROUP BY userPhone`
+    const out = maskQueryRows({
+      rows: [{ "Bob's COUNT(*)'s label": '13800138000', n: 3 }],
+      columns: ["Bob's COUNT(*)'s label", 'n'],
+      mode: { kind: 'sql', sql, tables: TABLES },
+    })
+    expect(out.warnings.join('\n')).toContain('GROUP BY / DISTINCT')
+    expect(out.warnings.join('\n')).toContain('userPhone')
   })
 
   it('P families：SUMMARIZE 的 avg/std 也是 PII 派生值，一并替换', () => {
