@@ -395,11 +395,12 @@ function isSummarizeStatement(sql: string): boolean {
  * `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
  * 合法且输出 min 是常量 3，按全 SQL 判据脱敏会把业务常量改成 `<已脱敏>`（Codex 第七轮 P2）。
  */
-function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean } {
+function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; gap: boolean } {
   const bare = bareKeywords(sql)
   const re = /\bquery\s*\(/gi
   let hit = false
   let atTopOutput = false
+  let gap = false
   let m: RegExpExecArray | null
   while ((m = re.exec(bare)) !== null) {
     let i = m.index + m[0].length
@@ -435,36 +436,49 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean }
     // 实测该查询输出常量 min=3 却被脱敏，Codex 第七轮 P2），再统一把 `''` → `'`。
     // 内层里的 SUMMARIZE 也可能只是注释/字符串/别名：实测 `query('SELECT ''x'' … /* SUMMARIZE */')`
     // 在 DuckDB 里返回普通行，按裸词判会把列值误改（Codex 2026-11-08 第五轮 P2）。
-    const raw = sql.slice(start + 1, i)
-    const inner = (isEscape ? decodeEString(raw) : raw).replace(/''/g, "'")
-    if (!(isSummarizeStatement(inner) || queryCallSummarize(inner).hit)) continue
-    hit = true
-    const before = bare.slice(0, m.index)
-    const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
-    if (depth === 0 && /(?:\bFROM|\bJOIN)\s*$/i.test(before)) atTopOutput = true
+    const inner = decodeStringLiteral(sql.slice(start + 1, i), isEscape)
+    // ⚠️ 递归必须传播**输出来源**而不是只看「内层含 SUMMARIZE」（Codex 第八轮 P2，真机实测）：
+    // 内层 SQL `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM
+    // query('SUMMARIZE sessions'))` 的输出是常量 3 —— 内层命中来自 WHERE 里的非输出路径，
+    // 按 `.hit` 提升会让外层的 query() 被当成统计来源、常量被改成 `<已脱敏>`。
+    // 只有内层**自身的输出**是 SUMMARIZE（内层语句头 / 内层 query() 在其顶层 FROM）才提升。
+    const innerTokens = summarizeTokenPositions(inner)
+    const sub = queryCallSummarize(inner)
+    if (innerTokens.recognized || sub.atTopOutput) {
+      hit = true
+      const before = bare.slice(0, m.index)
+      const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
+      if (depth === 0 && /(?:\bFROM|\bJOIN)\s*$/i.test(before)) atTopOutput = true
+    } else if (innerTokens.unrecognizedParen || sub.gap || (sub.hit && !sub.atTopOutput)) {
+      // 内层有 SUMMARIZE 痕迹但输出无法确认（深层子查询 / 内层 query() 不在输出路径）——
+      // 向上传播「无法确认」，由调用方声明缺口，绝不冒认脱敏。
+      gap = true
+    }
   }
-  return { hit, atTopOutput }
+  return { hit, atTopOutput, gap }
 }
 
 /**
- * 按 DuckDB E-string 语义解码转义序列（真机实测 2026-11-08）：
- *   · `\xHH`：1-2 位十六进制（`\x41` → `A`，`\x4` → U+0004）；
- *   · `\NNN`：1-3 位八进制（`\101` → `A`，`\1011` → `A1`）；
- *   · `\n \r \t \b \f \\ \' \" \?`：常规转义；
- *   · 其他（含 `\v`、`\q`、非法十六进制 `\xzz`）：**丢弃反斜杠、保留字符**
- *    （实测 `\v` → `v`、`\xzz` → `xzz`）；
- *   · `\u`/`\U`/`\0` 在 DuckDB 是 Parser Error（unicode_to_utf8 / pg_verifymbstr
- *     NOT IMPLEMENTED），这类 SQL 根本执行不了，解码结果不影响任何输出。
- * 普通串（无 E 前缀）不做转义解码（实测 `'a\x41b'` 保留字面量）。
+ * 把一个字符串字面量的**原始内容**（不含两端引号）解码为它表示的字符序列，即内层 SQL 源码。
+ * 真机实测（2026-11-08）DuckDB 的字符串词法：
+ *   · `''`（两个引号）**在两种串里都表示一个引号字符** —— 折叠必须与转义解码在**同一次扫描**
+ *     里各做一次：若先解 E 转义再全局折叠 `''`，`\x27\x27`（两个引号字符）会被二次折成一个，
+ *     内层 SQL 的引号边界失衡 → 把字符串里的 SUMMARIZE 误认成语句（Codex 第八轮 P2）。
+ *   · 普通串（无 E 前缀）**不做**转义解码（实测 `'a\x41b'` 保留字面量 `\x41`）。
+ *   · E 串转义：`\xHH`（**仅小写 x**，1-2 位十六进制；实测大写 `\X41` → `X41`，走未知转义；
+ *     Codex 第八轮 P2）、`\NNN`（1-3 位八进制）、`\n \r \t \b \f`、其余未知转义丢弃反斜杠
+ *     保留字符（实测 `\v` → `v`、`\q` → `q`、非法十六进制 `\xzz` → `xzz`）；
+ *     `\u`/`\U`/`\0` 在 DuckDB 是 Parser Error，这类 SQL 根本执行不了。
  */
-function decodeEString(raw: string): string {
+function decodeStringLiteral(raw: string, isEscape: boolean): string {
   let out = ''
   for (let i = 0; i < raw.length; i++) {
     const ch = raw[i]!
-    if (ch !== '\\') { out += ch; continue }
+    if (ch === "'" && raw[i + 1] === "'") { out += "'"; i++; continue }
+    if (!isEscape || ch !== '\\') { out += ch; continue }
     const next = raw[i + 1]
     if (next === undefined) { out += ch; continue }
-    if (next === 'x' || next === 'X') {
+    if (next === 'x') {
       const hex = /^[0-9A-Fa-f]{1,2}/.exec(raw.slice(i + 2))
       if (hex !== null) { out += String.fromCharCode(parseInt(hex[0], 16)); i += 1 + hex[0].length; continue }
       out += 'x'; i++; continue
@@ -478,7 +492,7 @@ function decodeEString(raw: string): string {
     if (next === 't') { out += '\t'; i++; continue }
     if (next === 'b') { out += '\b'; i++; continue }
     if (next === 'f') { out += '\f'; i++; continue }
-    // `\\`、`\'`、`\"`、`\?` 及未知转义：输出字符本身（丢弃反斜杠）
+    // `\\`、`\'`、`\"`、`\?` 及未知转义（含大写 `\X`）：输出字符本身（丢弃反斜杠）
     out += next; i++
   }
   return out
@@ -801,13 +815,14 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     : { recognized: false, unrecognizedParen: false }
   const queryCall = mode.kind === 'sql'
     ? queryCallSummarize(mode.sql)
-    : { hit: false, atTopOutput: false }
+    : { hit: false, atTopOutput: false, gap: false }
   const summarizeSql = mode.kind === 'sql'
     && (summarizeTokens.recognized || queryCall.atTopOutput)
   // 「位置无法确认」：SUMMARIZE 在 `(` 后但层级不可识别，或 query() 命中却不在最终输出来源 ——
   // 这两种情况下输出**可能**仍是 SUMMARIZE 形状，但按行值改写会篡改普通数据，只能声明缺口。
   const summarizeUnconfirmed = summarizeTokens.unrecognizedParen
     || (queryCall.hit && !queryCall.atTopOutput)
+    || queryCall.gap
   const summarizeShapeColumns = columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
   const summarizeShape = summarizeSql && summarizeShapeColumns
@@ -815,6 +830,25 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 同样是 PII 派生值，一并整值替换。count 是行数、approx_unique 是去重计数，单看它们
   // 恢复不出任何一个原值，不在此列。
   const SUMMARIZE_STATS = ['min', 'max', 'avg', 'std', 'q25', 'q50', 'q75'] as const
+  // ⚠️ 统计列必须**来自 SUMMARIZE 输出**才可脱敏（Codex 第八轮 P2，真机实测）：顶层 SELECT 把
+  // `3 AS min` / `COUNT(*) AS min` 这类表达式重投影成统计列名时，输出数字不是统计值
+  //（`SELECT column_name, 3 AS min FROM (SUMMARIZE sessions)` 返回常量 3、`COUNT(*) AS min`
+  // 返回 1）—— 按行值脱敏会把普通常量篡改成 `<已脱敏>`。判据只看**顶层**选择列表：统计列若由
+  // 「表达式 AS 统计列名」定义且源不是裸列引用（`min` / `t.min`），就不是统计来源 → 跳过脱敏
+  // 并声明缺口（表达式也可能是统计派生，如 `min + 0 AS min`，不能静默）。
+  // 残余边界：深层子查询里先重命名常量再透传（`x.min` 来自内层 `3 AS min`）判不出 ——
+  // 输出列名仍是 min，会被当统计列脱敏（方向：宁可误脱敏常量也不漏 PII）。
+  const summarizeTopItems = mode.kind === 'sql'
+    ? splitTopLevel(withoutLiterals(sliceClause(
+      mode.sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\b\s*(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b')))
+    : []
+  const statReassigned = (stat: string): boolean => summarizeTopItems.some((item) => {
+    const m = /^(.*?)\s+AS\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*$/i.exec(item.trim())
+    if (m === null) return false
+    if ((m[2] ?? m[3] ?? '').toLowerCase() !== stat) return false
+    return !new RegExp(`^(?:[A-Za-z_][A-Za-z0-9_]*\\.)?${stat}$`, 'i').test(m[1]!.trim())
+  })
+  const summarizeReassigned = new Set<string>()
   const outRows = rows.map((row) => {
     const out = { ...row }
     for (const name of columns) {
@@ -844,12 +878,22 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       }
       if (out[name] !== before) changed.add(name)
     }
-    if (summarizeShape && typeof out.column_name === 'string') {
-      const col = baseName(out.column_name)
+    // ⚠️ 重名列必须按**同后缀**分组脱敏（CodeRabbit 2026-11-08 第八轮 minor，真机实测）：
+    // 自连接两个 SUMMARIZE 时 sandbox 层把重名列去重成 `column_name`/`column_name:1`、
+    // `min`/`min:1`…（sandbox.ts deduplicateNames，行键与 columns 同一序列）。只认无后缀
+    // `column_name` 会把第二组统计列（`min:1`/`max:1`）原样漏出 —— 而 summarizeShape=true
+    // 使缺口警告也不发。后缀配对是确定的：同一组的列共享同一后缀。
+    if (summarizeShape) for (const nameCol of columns) {
+      if (!/^column_name(?::\d+)?$/.test(nameCol)) continue
+      const suffix = nameCol.slice('column_name'.length)
+      if (typeof out[nameCol] !== 'string') continue
+      const col = baseName(out[nameCol] as string)
       if (sensitiveNames.includes(col)) {
         for (const stat of SUMMARIZE_STATS) {
-          if (!(stat in row)) continue
-          const before = row[stat]
+          const key = stat + suffix
+          if (!(key in row)) continue
+          if (statReassigned(stat)) { summarizeReassigned.add(stat); continue }
+          const before = row[key]
           if (before === null || before === undefined) continue
           // ⚠️ 值级兜底的**整值替换必须保留**（Codex 2026-11-08 P1 实测）：`out[stat]` 若已被
           // `maskCellByValue` 判成 FULL（JSON 含 PII 叶子 / 畸形 JSON / STRUCT），这里再用列规则
@@ -858,12 +902,12 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
           // 重新可见。规则：已是 FULL → 保持；否则按该列规则脱敏（非字符串与列名级同一条 S1 规则）。
           // 强度关系：能过 EMAIL/PHONE/IPV4 正则的值，值级判出的规则就是列规则本身，两者逐字相等；
           // 值级是 FULL 而列规则给出弱形态的唯一路径就是上面这种 JSON 整串误配 —— 故 FULL 优先。
-          out[stat] = out[stat] === FULL || typeof before !== 'string'
+          out[key] = out[key] === FULL || typeof before !== 'string'
             ? FULL
             : maskValue(before, ruleForColumn(col))
-          if (out[stat] !== before) {
-            changed.add(stat)
-            summarizeMasked.add(stat)
+          if (out[key] !== before) {
+            changed.add(key)
+            summarizeMasked.add(key)
             // ⚠️ 不写 `structuralMasked`（Codex 2026-11-08 P2 实测）：它是一个**列级**集合，
             // 任一敏感行把它塞进去，后面「值形态误伤」的判据就会跳过该列的全部单元格 ——
             // 混合结果里非敏感行（如 session_id 的 min 恰好是手机号形态）被值级兜底改写时
@@ -1012,6 +1056,15 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     warnings.push(
       'SQL 含 SUMMARIZE，但输出列名已被改写（缺 column_name / min / max 形状）：'
       + '行级脱敏无法按行值识别敏感列，统计值（min/max/分位数）可能**未脱敏**。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
+  }
+  // ⚠️ 统计列被重投影成表达式（`3 AS min`、`COUNT(*) AS min`、`min + 0 AS min`）：
+  // 无法确认输出数字是不是统计值 —— 保持原值、不冒认脱敏，但缺口必须可见。
+  if (summarizeReassigned.size > 0) {
+    warnings.push(
+      'SQL 把 SUMMARIZE 的统计列重投影成了表达式（如 `3 AS min`、`COUNT(*) AS min`）：'
+      + `这些列（${[...summarizeReassigned].join('、')}）可能是常量、聚合值或统计值的派生 —— `
+      + '无法确认来源，本次保持原值、未按 SUMMARIZE 脱敏。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
   }
   // ⚠️ SQL 里的 SUMMARIZE 位置**无法确认是最终输出**但输出是 SUMMARIZE 形状

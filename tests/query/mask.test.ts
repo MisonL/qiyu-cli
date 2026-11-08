@@ -1327,6 +1327,113 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     expect(hexed.rows[0]!.min).toBe(FULL)
   })
 
+  it('P2 投影来源：统计列被重投影成常量/聚合时不得改写，只声明缺口（Codex 第八轮）', () => {
+    // 真机实测（probe12）：`SELECT column_name, 3 AS min FROM (SUMMARIZE sessions)` 返回
+    // column_name/min、min 是**常量 3**；`COUNT(*) AS min` 返回 1。按行值脱敏会把常量篡改。
+    for (const sql of [
+      'SELECT column_name, 3 AS min FROM (SUMMARIZE sessions)',
+      'SELECT column_name, COUNT(*) AS min FROM (SUMMARIZE sessions) GROUP BY column_name',
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ column_name: 'userName', min: 3 }],
+        columns: ['column_name', 'min'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.rows[0]!.min, sql).not.toBe(FULL)
+      expect(out.warnings.join('\n'), sql).toContain('重投影成了表达式')
+    }
+    // 反向：裸列透传（min/max 原样投影）仍照常脱敏
+    const ok = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SELECT column_name, min, max FROM (SUMMARIZE sessions)', tables: TABLES },
+    })
+    expect(ok.rows[0]!.min).toBe(FULL)
+    expect(ok.warnings.join('\n')).not.toContain('重投影成了表达式')
+  })
+
+  it('P2 递归与 E 串边界：嵌套 query 的位置判据、\x27 引号、大写 \X（Codex 第八轮）', () => {
+    // ① 嵌套 query() 的内层命中在 WHERE EXISTS 里（非输出路径）→ 外层不得当成统计来源
+    //   （真机实测 probe12：输出 column_name/min、min 是常量 3）
+    const nested = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 3 }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT * FROM query('SELECT ''userName'' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query(''SUMMARIZE sessions''))')`,
+        tables: TABLES,
+      },
+    })
+    expect(nested.rows[0]!.min).toBe(3)
+    // ② E 串用 \x27\x27 编码内层空串：解码后是两个引号（不得二次折叠成引号边界错乱）
+    //   （真机实测 probe12：返回 a=""/marker/column_name/min，min 是常量 3）
+    const quoted = maskQueryRows({
+      rows: [{ a: '', marker: 'FROM (SUMMARIZE sessions)', column_name: 'userName', min: 3 }],
+      columns: ['a', 'marker', 'column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT * FROM query(E'SELECT \\x27\\x27 AS a, \\x27FROM (SUMMARIZE sessions)\\x27 AS marker, \\x27userName\\x27 AS column_name, 3 AS min')`,
+        tables: TABLES,
+      },
+    })
+    expect(quoted.rows[0]!.min).toBe(3)
+    // ③ 大写 \X 不是十六进制转义（真机实测 E'\X41' → 'X41'）：注释里的 SUMMARIZE 不成立
+    const upper = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 3 }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT * FROM query(E'SELECT ''userName'' AS column_name, 3 AS min /* \\X2a\\X2f FROM (SUMMARIZE sessions) */')`,
+        tables: TABLES,
+      },
+    })
+    expect(upper.rows[0]!.min).toBe(3)
+    // ④ 对照：内层 query() 就在内层顶层 FROM → 仍是真统计来源，照常脱敏
+    //   （真机实测 probe12：输出 SUMMARIZE 全形状）
+    const nestedTop = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT * FROM query('SELECT * FROM query(''SUMMARIZE sessions'')')`,
+        tables: TABLES,
+      },
+    })
+    expect(nestedTop.rows[0]!.min).toBe(FULL)
+  })
+
+  it('重名列：自连接两个 SUMMARIZE 时带 :N 后缀的统计列也必须脱敏（CodeRabbit 第八轮）', () => {
+    // 真机实测（probe11）：`SELECT * FROM (SUMMARIZE sessions) a, (SUMMARIZE sessions) b`
+    // 的 columnNames() 是两组**同名**列，sandbox 层按驱动规则去重为 `column_name`/
+    // `column_name:1`、`min`/`min:1`（行键与 columns 同一序列，sandbox.ts deduplicateNames）。
+    // 行级判据必须按同后缀配对，否则第二组 min:1/max:1 明文漏出且无警告。
+    const sql = 'SELECT * FROM (SUMMARIZE sessions) a, (SUMMARIZE sessions) b'
+    const out = maskQueryRows({
+      rows: [{
+        column_name: 'userName', min: '张三丰', max: '李四光',
+        'column_name:1': 'userName', 'min:1': '张三丰', 'max:1': '李四光',
+      }],
+      columns: ['column_name', 'min', 'max', 'column_name:1', 'min:1', 'max:1'],
+      mode: { kind: 'sql', sql, tables: TABLES },
+    })
+    expect(out.rows[0]!.min).toBe(FULL)
+    expect(out.rows[0]!.max).toBe(FULL)
+    expect(out.rows[0]!['min:1']).toBe(FULL)
+    expect(out.rows[0]!['max:1']).toBe(FULL)
+    // 反向：第二组是非敏感列（session_id）时不得牵连改写
+    const ok = maskQueryRows({
+      rows: [{
+        column_name: 'userName', min: '张三丰', max: '李四光',
+        'column_name:1': 'session_id', 'min:1': 's1', 'max:1': 's2',
+      }],
+      columns: ['column_name', 'min', 'max', 'column_name:1', 'min:1', 'max:1'],
+      mode: { kind: 'sql', sql, tables: TABLES },
+    })
+    expect(ok.rows[0]!.min).toBe(FULL)
+    expect(ok.rows[0]!['min:1']).toBe('s1')
+    expect(ok.rows[0]!['max:1']).toBe('s2')
+  })
+
   it('缺口声明：SUMMARIZE 在无法识别的位置（多层子查询）必须警告且不冒认脱敏（CodeRabbit 第七轮）', () => {
     // 真机实测（2026-11-08 probe8）：`WITH t AS (SUMMARIZE sessions) SELECT * FROM t` 是
     // Parser Error（A CTE needs a SELECT）—— 评审给的第一例不成立；但
