@@ -1686,6 +1686,37 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     expect(ok.warnings.join('\n')).not.toContain('输出列名已被改写')
   })
 
+  it('缺口声明：位置无法确认的嵌套 SUMMARIZE 若列名被改写同样必须警告（CodeRabbit 第十三轮 major）', () => {
+    // 真机实测（2026-11-09）：两种写法都合法，输出 c/m（x），userName 行的 m 是明文；
+    // 修复前 warnings=[] —— 位置档要 summarizeShapeColumns、改写档要 summarizeSql，两条都不满足。
+    for (const sql of [
+      'SELECT * FROM (SELECT column_name AS c, min AS m, max AS x FROM (SUMMARIZE sessions))',
+      'WITH t AS (SELECT column_name AS c, min AS m FROM (SUMMARIZE sessions)) SELECT * FROM t',
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ c: 'userName', m: '张三丰', x: '张三丰' }],
+        columns: ['c', 'm', 'x'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.warnings.join('\n'), sql).toContain('输出列名已被改写')
+      expect(out.warnings.join('\n'), sql).toContain('未脱敏')
+    }
+    // ⚠️ 反向（记录、非承重）：列名被改写但位置可识别（`FROM (` 深度 1）+ 同句另有一个
+    // 无法识别位置的 SUMMARIZE（逗号并列来源，真机实测合法，输出 14 列）。此形态 summarizeSql
+    // 为真、走改写档点名成因而非泛化档；`|| unrecognizedParen` 的 CR 版本在它上面行为相同
+    //（实测两版都绿），列出是为了钉住「命中档必须点名改写成因」。
+    const reported = maskQueryRows({
+      rows: [{ c: 'userName', m: '张三丰' }],
+      columns: ['c', 'm'],
+      mode: {
+        kind: 'sql',
+        sql: 'SELECT * FROM (SELECT column_name AS c, min AS m FROM (SUMMARIZE sessions)), (SUMMARIZE staff) t',
+        tables: TABLES,
+      },
+    })
+    expect(reported.warnings.join('\n')).toContain('输出列名已被改写')
+  })
+
   it('P2a 词法正向：非 ASCII 标识符里的 $q$ 也不得当美元引号（DuckDB 实测合法别名）', () => {
     // 四档字符：中文（BMP 字母）、补充平面字母 U+1D49C 𝒜（UTF-16 代理对 —— 只看
     // text[i-1] 会拿到孤立低代理项）、货币符号 U+00A2 ¢（Sc 类别，DuckDB 实测接受）、

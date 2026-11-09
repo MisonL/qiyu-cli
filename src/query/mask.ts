@@ -1135,7 +1135,17 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // FROM (SUMMARIZE sessions)`，CodeRabbit 2026-11-08 第六轮实测）：形状判据不匹配 → 行级
   // 脱敏不触发，而 SQL 文本又不含敏感列名、其余缺口警告也不发 —— PII 统计值原样输出且
   // mask_warnings 为空。按本文件对 query()/COLUMNS() 的同一策略：**声明缺口，绝不静默**。
-  if (summarizeSql && !summarizeShape) {
+  // ⚠️ 位置无法确认的嵌套形态同样要覆盖（CodeRabbit 2026-11-09 第十三轮 major，真机实测
+  // 两种写法都输出明文 c/m/x 且 warnings=[]）：
+  //   · `SELECT * FROM (SELECT column_name AS c, min AS m, max AS x FROM (SUMMARIZE sessions))`
+  //   · `WITH t AS (SELECT column_name AS c, min AS m FROM (SUMMARIZE sessions)) SELECT * FROM t`
+  // 但**不能**只按 `unrecognizedParen` 放宽：可证明透传的 SQL 里若别处还有无法识别位置的
+  // SUMMARIZE（如 `SELECT * FROM (SUMMARIZE sessions), (SUMMARIZE staff) t`，真机实测合法、
+  // 输出 12 + 12 列），`unrecognizedParen` 也会置真，而输出是标准统计形状 —— 那类只走
+  // 「无法确认是否构成最终输出」泛化档，不该被说成「列名已被改写」。
+  // 判据：位置无法确认（非 summarizeSql）**且**输出不是可静态证明的透传 —— 后者在进入本档时
+  // 形状必然不匹配（可证明形态恒为 column_name/min/max），只作显式兜底、如实记录未单独承重。
+  if (!summarizeShape && (summarizeSql || (summarizeUnconfirmed && !summarizeProj.enabled))) {
     warnings.push(
       'SQL 含 SUMMARIZE，但输出列名已被改写（缺 column_name / min / max 形状）：'
       + '行级脱敏无法按行值识别敏感列，统计值（min/max/分位数）可能**未脱敏**。'
