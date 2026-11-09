@@ -133,8 +133,11 @@ export function describeArgs(args: readonly string[]): string {
  * cmd.exe 不识别单引号、`&` 在引号外仍会切命令，**不要把 win32 的 hint 原样粘进
  * cmd.exe**。这两个边界都如实记录，不假装一种引号能通吃所有 shell。
  */
-export function storeInitCommand(path: string): string {
+export function storeInitCommand(path: string, profileFlag?: string): string {
+  // 档名随路径一起带出（口径同 syncRunCommand）：store init 也要落
+  // profiles.<name>.robots / store.options，重建出的库才是同一组数据。
   return `qiyu store init --db ${shellArg(path)}`
+    + (profileFlag === undefined ? '' : ` --profile ${shellArg(profileFlag)}`)
 }
 
 /**

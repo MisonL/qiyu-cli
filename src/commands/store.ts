@@ -50,7 +50,7 @@ const USAGE = `用法：qiyu store <子命令> [参数]
 ${DB_PATH_HELP}
 `
 
-export function thrownToExit(e: unknown): number {
+export function thrownToExit(e: unknown, profileFlag?: string): number {
   const err = e as { kind?: string; message?: string; hint?: string; retryable?: boolean }
   // usage 类错误（store 层预检抛出，如未知列/缺列/连接已关闭）：归 usageFail 双通道、
   // 退出码 2 —— 这是用法错误不是环境故障（M1 修：此前被下方排除条件挡住后落 internal）。
@@ -89,9 +89,13 @@ export function thrownToExit(e: unknown): number {
   return fail({ code: 'internal', kind: 'internal', retryable: false,
     message: `存储操作失败（底层：${msg}）`, hint: '数据库执行期错误（重跑同一条命令不会改变结果）。'
       + '请先用 --db 指向另一个库验证是否是该库的问题；若只有该库失败，请先备份该文件，再用 '
-      + storeInitCommand('<新路径>') + ' 重建（把 <新路径> 整段替换成新的 .duckdb 文件路径，'
+      + storeInitCommand('<新路径>', profileFlag) + ' 重建（把 <新路径> 整段替换成新的 .duckdb 文件路径，'
       + '不要指回出问题的文件 —— 本地库只是缓存），之后带同一个 --db 跑 '
-      + syncRunCommand('<新路径>') + ' 可重新拉取' })
+      + syncRunCommand('<新路径>', profileFlag) + ' 可重新拉取' })
+    // ⚠️ `profileFlag` 必须随 hint 带出（CodeRabbit 2026-11-09 minor）：`sync run` 从**解析出的
+    // 档**读 `store.options.knowledgeRobotIds` 与 `profiles.<name>.robots`（robotId 注入面），
+    // 只给 `--db` 的恢复命令会用错 robot 集合且不报错（真库实测：带 `--profile alpha` 解析出
+    // [1000001]、不带则为空）。调用点见本文件 storeCommand 两处与 sync.ts 的 openRo。
 }
 
 export async function storeCommand(argv: string[]): Promise<number> {
@@ -211,7 +215,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     let store
     try {
       store = await openStore(config, 'rw')
-    } catch (e) { return thrownToExit(e) }
+    } catch (e) { return thrownToExit(e, profileFlag) }
     try {
       await store.init()
       // ⚠️ 与 `store status` 同口径（2026-11-01）：`store.tables()` 给的是**全库**清单
@@ -228,7 +232,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
       warnings === undefined
         ? { field_notes: storeFieldNotes() }
         : { field_notes: storeFieldNotes(), warnings })
-    } catch (e) { return thrownToExit(e) } finally { await store.close() }
+    } catch (e) { return thrownToExit(e, profileFlag) } finally { await store.close() }
   }
 
   // status
@@ -243,7 +247,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
   const guarded = statGuard(config.path)
   if (guarded !== null) return guarded
   let store
-  try { store = await openStore(config, 'ro') } catch (e) { return thrownToExit(e) }
+  try { store = await openStore(config, 'ro') } catch (e) { return thrownToExit(e, profileFlag) }
   try {
     const names = await store.tables()
     // ⚠️ 成因分形（他人库不引导向 init）在共享实现里，口径与 db/sync 逐字一致。
@@ -279,5 +283,5 @@ export async function storeCommand(argv: string[]): Promise<number> {
     warnings === undefined
       ? { field_notes: storeFieldNotes() }
       : { field_notes: storeFieldNotes(), warnings })
-  } catch (e) { return thrownToExit(e) } finally { await store.close() }
+  } catch (e) { return thrownToExit(e, profileFlag) } finally { await store.close() }
 }

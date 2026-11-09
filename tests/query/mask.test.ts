@@ -1327,7 +1327,7 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     expect(hexed.rows[0]!.min).toBe(FULL)
   })
 
-  it('P2 白名单透传：表达式/集合操作/重名列/非敏感同名列一律不改写（Codex 第九轮 6 条）', () => {
+  it('P2 白名单透传：表达式/集合操作/重名列/非敏感同名列/星号多来源一律不改写（Codex 第九~十轮）', () => {
     // 全部真机实测（probe14）。方向统一：无法证明是 SUMMARIZE 输出透传时**只声明缺口、
     // 不改写任何值** —— 数据损坏比漏脱敏更糟。
     // ① 非敏感同名列不得被大小写不敏感匹配误改（staff.username ≠ sessions.userName）——
@@ -1356,6 +1356,10 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       // ⑥ UNION ALL 追加普通行
       ["SELECT column_name, min FROM (SUMMARIZE sessions) UNION ALL SELECT 'userName', 'ordinary constant'",
         { column_name: 'userName', min: '张三丰' }, ['column_name', 'min'], '张三丰'],
+      // ⑦ `SELECT *` + 多来源（JOIN/逗号并列）：`:N` 后缀无法证明配对（Codex 第十轮 P2）
+      ["SELECT * FROM (SUMMARIZE (SELECT 1 AS userName)) s CROSS JOIN (VALUES ('userName', 3)) v(column_name, min)",
+        { column_name: 'userName', 'column_name:1': 'userName', min: 3, 'min:1': 3 },
+        ['column_name', 'column_name:1', 'min', 'min:1'], 3],
     ]
     for (const [sql, row, cols, expectMin] of cases) {
       const out = maskQueryRows({

@@ -227,11 +227,13 @@ function resolveConfig(flags: StoreFlags): {
 /** 只读命令的库前置检查（statSync 分流沿 store status；hint 统一指 store init，spec §九）。 */
 
 /** 打开 ro 库；结构不完整（缺 schema_version）视为「不是本 CLI 创建的库」。 */
-async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?: Store; code?: number }> {
+async function openRo(
+  config: Parameters<typeof openStore>[0], profileFlag?: string,
+): Promise<{ store?: Store; code?: number }> {
   let store: Store
   try {
     store = await openStore(config, 'ro')
-  } catch (e) { return { code: thrownToExit(e) } }
+  } catch (e) { return { code: thrownToExit(e, profileFlag) } }
   try {
     const names = await store.tables()
     // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：他人工具的 schema_version 可能没有
@@ -249,7 +251,7 @@ async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?
     return { store }
   } catch (e) {
     try { await store.close() } catch { /* 清理错误不掩盖原异常 */ }
-    return { code: thrownToExit(e) }
+    return { code: thrownToExit(e, profileFlag) }
   }
 }
 
@@ -289,7 +291,7 @@ async function syncStatus(argv: string[]): Promise<number> {
   } catch (e) { return failFromTagged(e) }
   const guarded = statGuard(resolved.path)
   if (guarded !== null) return guarded
-  const opened = await openRo(resolved.config)
+  const opened = await openRo(resolved.config, resolved.profileFlag)
   if (opened.code !== undefined || !opened.store) return opened.code ?? 1
   const store = opened.store
 
@@ -388,7 +390,7 @@ async function syncVerify(argv: string[]): Promise<number> {
 
   const guarded = statGuard(resolved.path)
   if (guarded !== null) return guarded
-  const opened = await openRo(resolved.config)
+  const opened = await openRo(resolved.config, resolved.profileFlag)
   if (opened.code !== undefined || !opened.store) return opened.code ?? 1
   const store = opened.store
 
@@ -529,7 +531,7 @@ async function probeSynced(
 ): Promise<number | null> {
   const guarded = statGuard(path)
   if (guarded !== null) return guarded
-  const opened = await openRo(config)
+  const opened = await openRo(config, profileFlag)
   if (opened.code !== undefined || !opened.store) return opened.code ?? 1
   const store = opened.store
   try {

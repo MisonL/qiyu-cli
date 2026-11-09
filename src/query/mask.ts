@@ -719,6 +719,50 @@ function summarizeAliasName(item: string): string | null {
   return null
 }
 
+/** 去掉括号内的内容（等长空格），用于只在顶层判断关键字/分隔符。 */
+function blankParens(text: string): string {
+  let out = ''
+  let depth = 0
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (ch === '(') { depth++; out += ' '; continue }
+    if (ch === ')') { depth = Math.max(0, depth - 1); out += ' '; continue }
+    out += depth > 0 ? ' ' : ch
+  }
+  return out
+}
+
+/**
+ * 把 FROM 子句切成顶层来源列表（`(SUMMARIZE …) a JOIN (SUMMARIZE …) b ON …` → 两个来源）。
+ * 顶层 = 不在括号内：括号内容先抹成空格。
+ * 返回 null 表示遇到无法确认的顶层关键字（LATERAL/UNNEST/ASOF/TABLESAMPLE 等），
+ * 调用方按「来源不确定」处理。
+ */
+function splitJoinSources(fromClause: string): string[] | null {
+  const scan = withoutLiterals(fromClause)
+  const top = blankParens(scan)
+  if (/\b(?:LATERAL|UNNEST|ASOF|TABLESAMPLE)\b/i.test(top)) return null
+  // 切分点：顶层逗号、顶层 JOIN 族关键字、顶层 ON/USING 条件起点
+  const cuts: Array<[number, number, 'sep' | 'on']> = []
+  const re = /\b(?:JOIN|ON|USING)\b/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(top)) !== null) cuts.push([m.index, m.index + m[0].length, m[0].toUpperCase() === 'JOIN' ? 'sep' : 'on'])
+  // 顶层逗号（top 已抹掉括号内容，逗号只可能是顶层）
+  const pieces: string[] = []
+  let start = 0
+  const events: Array<[number, number, 'sep' | 'on']> = []
+  for (let i = 0; i < top.length; i++) if (top[i] === ',') events.push([i, i + 1, 'sep'])
+  for (const c of cuts) events.push(c)
+  events.sort((a, b) => a[0] - b[0])
+  for (const [s0, e0, kind] of events) {
+    if (s0 < start) continue
+    if (kind === 'sep') { pieces.push(fromClause.slice(start, s0)); start = e0 }
+    else { pieces.push(fromClause.slice(start, s0)); start = fromClause.length }
+  }
+  if (start < fromClause.length) pieces.push(fromClause.slice(start))
+  return pieces.map((p) => p.trim()).filter((p) => p !== '')
+}
+
 type SummarizeProjection = {
   /** 是否**可证明**是 SUMMARIZE 输出的透传 —— 行级脱敏只在这个白名单里启用。 */
   enabled: boolean
@@ -769,12 +813,36 @@ function analyzeSummarizeProjection(mode: MaskInput['mode'], shapeColumns: boole
     res.enabled = true
     return res
   }
+  // ⚠️ `SELECT *` 只有 FROM 里**没有 JOIN/逗号并列/集合操作**时才等于「只有 SUMMARIZE 的输出」
+  //（Codex 2026-11-09 第十轮 P2，真机实测）：
+  // `SELECT * FROM (SUMMARIZE (SELECT 1 AS userName)) s CROSS JOIN (VALUES ('userName', 3))
+  //  v(column_name, min)` 输出 12 列 + 右侧 2 列（去重成 `column_name:1`/`min:1`），
+  // `min:1` 是普通常量 3 却按列名命中被改成 `<已脱敏>`。多来源时 `:N` 后缀无法证明配对，
+  // 星号也不再是「纯透传」。
+  if (items.some((it) => /^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?\*$/.test(it))) {
+    // ⚠️ 星号只在「FROM 的**每个来源都是 SUMMARIZE 子查询**」时等于纯透传（Codex 第十轮 P2，
+    // 真机实测）：`SELECT * FROM (SUMMARIZE …) s CROSS JOIN (VALUES ('userName', 3))
+    // v(column_name, min)` 输出 12 列 + 右侧 2 列，`min:1` 是普通常量 3 却被按列名改成
+    // `<已脱敏>`。全部来源同形态时才认：那时 `:N` 的每个配对项确实来自同一组统计列
+    //（自连接两个 SUMMARIZE 的既有形态）。
+    const fromClause = sliceClause(mode.sql, /\bFROM\b/i,
+      'WHERE\\b|GROUP\\s+BY|ORDER\\s+BY|LIMIT|HAVING|QUALIFY|WINDOW|UNION|EXCEPT|INTERSECT')
+    const sources = splitJoinSources(fromClause)
+    // 来源可以是 `(SUMMARIZE …)` 子查询，也可以是 `query('…SUMMARIZE…')` 调用
+    //（内层已被 queryCall.atTopOutput 确认是统计输出）。
+    const allSummarize = sources !== null && sources.length > 0
+      && sources.every((src) => /^(?:\(\s*SUMMARIZE\b|query\s*\()/i.test(src))
+    if (!allSummarize) {
+      res.ambiguousDup = true
+      return res
+    }
+    res.enabled = true
+    return res
+  }
   const counts = new Map<string, number>()
-  let star = false
   let hasColName = false
   let hasStat = false
   for (const item of items) {
-    if (/^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?\*$/.test(item)) { star = true; continue }
     const bare = /^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))$/.exec(item)
     if (bare !== null) {
       const name = (bare[1] ?? bare[2]!).toLowerCase()
@@ -788,7 +856,6 @@ function analyzeSummarizeProjection(mode: MaskInput['mode'], shapeColumns: boole
     const alias = summarizeAliasName(item)
     if (alias !== null && SUMMARIZE_OUT_COLS.has(alias)) res.reassigned.add(alias)
   }
-  if (star) { hasColName = true; hasStat = true }
   // 显式列举且同一列名出现多次：`:N` 后缀按名独立计数，无法证明 `column_name:1` 与
   // `min:1` 来自同一个 SUMMARIZE 实例（重排选择项真机实测会错配）。
   res.ambiguousDup = [...counts.values()].some((n) => n > 1)
