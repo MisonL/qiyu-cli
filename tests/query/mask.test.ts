@@ -1279,7 +1279,7 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
         mode: { kind: 'sql', sql, tables: TABLES },
       })
       expect(out.rows[0]!.min, sql).toBe(3)
-      expect(out.warnings.join('\n'), sql).toContain('无法识别的位置')
+      expect(out.warnings.join('\n'), sql).toContain('无法确认是否构成最终输出')
     }
     // 反向（第十二轮契约收窄）：顶层 FROM query(...) 也不再按统计值脱敏 ——
     // query() 内层无法静态证明输出是统计值，一律保持原值 + 缺口警告。
@@ -1588,7 +1588,7 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     expect(ok.rows[0]!['min:1']).toBe('s1')
   })
 
-  it('缺口声明：SUMMARIZE 在无法识别的位置（多层子查询）必须警告且不冒认脱敏（CodeRabbit 第七轮）', () => {
+  it('缺口声明：SUMMARIZE 在无法确认是否构成最终输出（多层子查询）必须警告且不冒认脱敏（CodeRabbit 第七轮）', () => {
     // 真机实测（2026-11-08 probe8）：`WITH t AS (SUMMARIZE sessions) SELECT * FROM t` 是
     // Parser Error（A CTE needs a SELECT）—— 评审给的第一例不成立；但
     // `SELECT * FROM (SELECT * FROM (SUMMARIZE sessions))` 合法，输出 column_name/min/max
@@ -1605,7 +1605,7 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
         mode: { kind: 'sql', sql, tables: TABLES },
       })
       expect(out.rows[0]!.min, sql).toBe('张三丰')
-      expect(out.warnings.join('\n'), sql).toContain('无法识别的位置')
+      expect(out.warnings.join('\n'), sql).toContain('无法确认是否构成最终输出')
       expect(out.warnings.join('\n'), sql).toContain('未脱敏')
     }
     // 反向：别名位置（`0 AS SUMMARIZE`，形状列齐全 —— 最接近误报的形态）不得触发
@@ -1614,7 +1614,7 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       columns: ['column_name', 'min'],
       mode: { kind: 'sql', sql: "SELECT 0 AS SUMMARIZE, 'userName' AS column_name, 3 AS min", tables: TABLES },
     })
-    expect(ok.warnings.join('\n')).not.toContain('无法识别的位置')
+    expect(ok.warnings.join('\n')).not.toContain('无法确认是否构成最终输出')
     // 反向：可识别位置（深度 1 的 FROM (）已被行级脱敏覆盖，不吃这条警告
     const ok2 = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
@@ -1622,7 +1622,7 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       mode: { kind: 'sql', sql: 'SELECT * FROM (SUMMARIZE sessions)', tables: TABLES },
     })
     expect(ok2.rows[0]!.min).toBe(FULL)
-    expect(ok2.warnings.join('\n')).not.toContain('无法识别的位置')
+    expect(ok2.warnings.join('\n')).not.toContain('无法确认是否构成最终输出')
   })
 
   it('P2b 词法正向：真 query() 调用不再脱敏，但必须声明缺口（第十二轮契约收窄）', () => {
@@ -1640,6 +1640,27 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       })
       expect(out.rows[0]!.min, sql).toBe('张三丰')
       expect(out.warnings.join('\n'), sql).toContain('无法确认来源')
+    }
+  })
+
+  it('P2 内层重投影：query() 实参不是纯透传时也必须声明缺口（第十二轮收窄的静默缺口）', () => {
+    // `SELECT * FROM query('SELECT column_name, min FROM (SUMMARIZE sessions)')` 合法且输出
+    // 就是统计值 → 必须走缺口警告。修复前 innerIsPure=false 且不下探到 gap，**一条 SUMMARIZE
+    // 警告都不发**（只有 query() 自身的 nestedSql 泛化提示），属于「声明缺口、绝不静默」的反例。
+    for (const sql of [
+      "SELECT * FROM query('SELECT column_name, min FROM (SUMMARIZE sessions)')",
+      // 表达式重投影：真机实测 `'x' AS min` 合法（注意 `min + 0` 会在 VARCHAR 上 Binder Error，不可用）
+      "SELECT * FROM query('SELECT column_name, ''x'' AS min FROM (SUMMARIZE sessions)')",
+    ]) {
+      const out = maskQueryRows({
+        rows: [{ column_name: 'userName', min: '张三丰' }],
+        columns: ['column_name', 'min'],
+        mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.rows[0]!.min, sql).toBe('张三丰')
+      expect(out.warnings.join('\n'), sql).toContain('内层投影**不是原样透传**')
+      // 两档缺口互斥：不重复发泛化的「无法确认是否构成最终输出」
+      expect(out.warnings.join('\n'), sql).not.toContain('无法确认是否构成最终输出')
     }
   })
 

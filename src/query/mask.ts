@@ -378,20 +378,19 @@ function summarizeTokenPositions(sql: string): { recognized: boolean; unrecogniz
   return { recognized, unrecognizedParen }
 }
 
-function isSummarizeStatement(sql: string): boolean {
-  return summarizeTokenPositions(sql).recognized
-}
-
 /**
  * `query('…')` 内层 SQL 里出现 SUMMARIZE 关键字（`SELECT * FROM query('SUMMARIZE sessions')`）。
  * ⚠️ 必须先在**裸 token** 上定位 `query(`（注释/字符串/双引号标识符里的同串不算调用），
  * 再回到原 SQL 读那个字符串实参 —— 直接在原文上正则会把注释里写的伪装调用
  * 也当成真调用（Codex 2026-11-08 第三轮 P2 实测）。
  *
- * 返回 `hit`（内层确实含 SUMMARIZE）与 `atTopOutput`（**外层**该调用位于最终输出路径：
- * 裸文本深度 0 且前面紧邻 `FROM`/`JOIN`）。只有 query() 的结果就是最终输出时，行级判据
- * 才敢按行值改写；其他位置（`WHERE EXISTS (… FROM query(…))`、IN 子查询、逗号并列、
- * 多层子查询透传）只声明缺口、不改写 —— 实测
+ * ⚠️ 第十二轮起 query() 的来源**不再进入行级脱敏**：内层 SQL 的输出来源十余轮复审都被
+ * 构造出合法反例（`SELECT 常量 FROM (SUMMARIZE …)` 等），无法静态证明。因此这里只服务
+ * 一个目的 —— **发现缺口**（返回 `hit` 即调用方发「无法确认来源」警告），`atTopOutput`
+ * 只用于在缺口文案里说清是哪种情形：
+ *   · `atTopOutput`：该调用位于最终输出路径（裸文本深度 0 且紧邻 `FROM`/`JOIN`）；
+ *   · 非输出路径：`WHERE EXISTS (… FROM query(…))`、IN 子查询、逗号并列、多层子查询。
+ * 两种情形都**不改写任何值** —— 实测
  * `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
  * 合法且输出 min 是常量 3，按全 SQL 判据脱敏会把业务常量改成 `<已脱敏>`（Codex 第七轮 P2）。
  */
@@ -449,14 +448,15 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
     // 例如 `SELECT * FROM query('SELECT ''userName'' AS column_name, 3 AS min FROM
     // (SUMMARIZE (SELECT 1 AS userName))')` 输出 min=3（常量）—— 按统计值脱敏会篡改它
     //（Codex 2026-11-09 第十一轮 P2）。验证：内层 SQL 要么自身就是 SUMMARIZE（语句头），
-    // 要么投影是纯透传（`SELECT *` 或裸列引用 —— 复用投影分析的精简版判据）。
-    const innerIsPure = (/^\s*SUMMARIZE\b/i.test(inner) || isSummarizePassthrough(inner))
+    // 要么是纯透传 —— 复用唯一判据 passthroughReason（`SELECT *` 单一 SUMMARIZE 来源）。
+    const innerIsPure = passthroughReason(inner) === null
     if ((innerTokens.recognized && innerIsPure) || sub.atTopOutput) {
       hit = true
       const before = bare.slice(0, m.index)
       const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
       if (depth === 0 && /(?:\bFROM|\bJOIN)\s*$/i.test(before)) atTopOutput = true
-    } else if (innerTokens.unrecognizedParen || sub.gap || (sub.hit && !sub.atTopOutput)) {
+    } else if ((innerTokens.recognized && !innerIsPure) || innerTokens.unrecognizedParen
+      || sub.gap || (sub.hit && !sub.atTopOutput)) {
       // 内层有 SUMMARIZE 痕迹但输出无法确认（深层子查询 / 内层 query() 不在输出路径）——
       // 向上传播「无法确认」，由调用方声明缺口，绝不冒认脱敏。
       gap = true
@@ -702,38 +702,6 @@ function aliasesOf(selectList: string, name: string): string[] {
   return out
 }
 
-/**
- * 对一次查询的输出行脱敏（spec §7.2）。纯函数：输入行不被就地改写；
- * `noMask` 时直接返回入参数组（不拷贝，因为一个字节都不会改）。
- */
-/**
- * 内层 SQL 是否可静态证明输出是 SUMMARIZE 统计结果（第十二轮收窄）：
- * 仅 `SUMMARIZE …` 语句头，或 `SELECT * FROM (SUMMARIZE …) [别名]` 单一来源。
- * 其他形态（集合操作、JOIN、显式列举、嵌套 query、表达式重投影）一律不认。
- */
-function isSummarizePassthrough(sql: string): boolean {
-  const bare = withoutLiterals(sql)
-  if (/^\s*SUMMARIZE\b/i.test(bare)) return true
-  if (execTopLevel(bare, /\b(?:UNION|INTERSECT|EXCEPT)\b/i) !== null) return false
-  const items = splitTopLevel(sliceClause(
-    bare, /^\s*SELECT\s+(?:ALL\s+)?/i, 'FROM\\b'))
-    .map((t) => t.trim()).filter((t) => t !== '')
-  if (items.length !== 1 || !/^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?\*$/.test(items[0]!)) return false
-  const from = sliceClause(bare, /\bFROM\b/i,
-    'WHERE\\b|GROUP\\s+BY|ORDER\\s+BY|LIMIT|HAVING|QUALIFY|WINDOW|UNION|EXCEPT|INTERSECT').trim()
-  let depth = 0
-  for (let i = 0; i < from.length; i++) {
-    if (from[i] === '(') depth++
-    else if (from[i] === ')') { depth--; if (depth === 0) {
-      const src = from.slice(1, i)
-      const rest = from.slice(i + 1).trim()
-      return /^\s*SUMMARIZE\b/i.test(src)
-        && (rest === '' || /^(?:AS\s+)?(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)$/i.test(rest))
-    } }
-  }
-  return false
-}
-
 type SummarizeProjection = {
   /** 是否**可证明**是 SUMMARIZE 输出的透传 —— 行级脱敏只在这个白名单里启用。 */
   enabled: boolean
@@ -758,66 +726,69 @@ type SummarizeProjection = {
  *      没有 JOIN / 逗号并列 / ON / 列别名列表 / 集合操作 / FROM-first；
  *      别名只允许裸标识符或双引号标识符（`AS "ON"` 这类词形也不再歧义，因为不做关键字切分）。
  * 连 `query('…')` 包装也不再启用行级脱敏：内层 SQL 的可分析性是另一套递归词法，
- * 每轮都被找出反例；这类查询输出**原值 + 缺口警告**，用户可改用 `query --table`。
+ * 每轮都被找出反例；这类查询输出**原值 + 缺口警告**，用户可改用 `query --table`
+ *（内层也复用本判据 passthroughReason，但只用来区分「纯透传 / 不可证明」两档缺口文案）。
  * 残余边界：②里的 `SUMMARIZE` 子查询自身若带 `(SELECT … AS min …)` 入参（如
  * `SUMMARIZE SELECT 3 AS min FROM …`），输出仍是统计结果，不受影响 —— 入参不改变
  * 输出列语义。
  */
-function analyzeSummarizeProjection(mode: MaskInput['mode'], shapeColumns: boolean): SummarizeProjection {
-  const res: SummarizeProjection = { enabled: false, reason: '' }
-  if (mode.kind !== 'sql' || !shapeColumns) return res
-  const bare = withoutLiterals(mode.sql)
-  // ① 顶层就是 SUMMARIZE 语句 —— 输出即统计结果。
-  if (/^\s*SUMMARIZE\b/i.test(bare)) {
-    res.enabled = true
-    return res
-  }
+/** 不可证明时的统一成因（外层缺口文案与内层缺口判定共用同一句）。 */
+const UNPROVABLE = '投影或 FROM 来源无法静态证明是单一 SUMMARIZE 输出'
+
+/**
+ * 一段 SQL 能**静态证明**输出是 SUMMARIZE 统计结果的唯一判据（外层投影与 query() 内层共用
+ * —— 判据只许一个实现点，否则内外层迟早漂移）。可证明时返回 null，否则返回成因文本。
+ * 形态见下方 analyzeSummarizeProjection 的文档。
+ */
+function passthroughReason(sql: string): string | null {
+  const bare = withoutLiterals(sql)
+  // ① 语句头就是 SUMMARIZE —— 输出即统计结果。
+  if (/^\s*SUMMARIZE\b/i.test(bare)) return null
   // 集合操作：非 SUMMARIZE 分支会被混进来 → 不认。
   if (execTopLevel(bare, /\b(?:UNION|INTERSECT|EXCEPT)\b/i) !== null) {
-    res.reason = '含 UNION/INTERSECT/EXCEPT（后续分支不是 SUMMARIZE 输出）'
-    return res
+    return '含 UNION/INTERSECT/EXCEPT（后续分支不是 SUMMARIZE 输出）'
   }
-  // 必须是 `SELECT *`（或 `SELECT <限定>.*`），且只允许这一个投影项。
+  // ② 必须是 `SELECT *`（或 `SELECT <限定>.*`），且只允许这一个投影项。
+  // FROM-first 查询（`FROM (SUMMARIZE …) t`）：选择列表隐式、来源组合不可见 → 不认。
   const selectM = /^\s*(?:SELECT|FROM)\b/i.exec(bare)
-  // FROM-first 查询（`FROM (SUMMARIZE …) t`）不走行级脱敏：选择列表隐式、来源组合不可见。
-  if (selectM === null || /^\s*FROM\b/i.test(selectM[0])) {
-    res.reason = '投影或 FROM 来源无法静态证明是单一 SUMMARIZE 输出'
-    return res
-  }
+  if (selectM === null || /^\s*FROM\b/i.test(selectM[0])) return UNPROVABLE
   const selectClause = sliceClause(bare, /^\s*SELECT\s+(?:ALL\s+)?/i, 'FROM\\b')
   const items = splitTopLevel(selectClause).map((t) => t.trim()).filter((t) => t !== '')
   if (items.length !== 1 || !/^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?\*$/.test(items[0]!)) {
-    // 显式列举 / `*, expr` 混合 / 表达式 —— 来源无法静态证明，交给缺口警告。
-    res.reason = '投影或 FROM 来源无法静态证明是单一 SUMMARIZE 输出'
-    return res
+    // 显式列举 / `*, expr` 混合 / 表达式。
+    return UNPROVABLE
   }
   const fromClause = sliceClause(bare, /\bFROM\b/i,
-    'WHERE\\b|GROUP\\s+BY|ORDER\\s+BY|LIMIT|HAVING|QUALIFY|WINDOW|UNION|EXCEPT|INTERSECT')
-  if (fromClause === '') { res.reason = '投影或 FROM 来源无法静态证明是单一 SUMMARIZE 输出'; return res }
+    'WHERE\\b|GROUP\\s+BY|ORDER\\s+BY|LIMIT|HAVING|QUALIFY|WINDOW|UNION|EXCEPT|INTERSECT').trim()
   // 单一来源：`(SUMMARIZE …)` 后只跟裸别名或双引号别名；ON/USING/JOIN/逗号/列别名列表都不允许。
   // ⚠️ 用**平衡括号扫描**取出来源块（不按关键字切分 —— `AS "ON"`、`(SELECT … JOIN …)`
   // 等内容全在括号里，与关键字无关），再看剩余文本是否只是别名。
-  const trimmed = fromClause.trim()
-  if (!trimmed.startsWith('(')) { res.reason = '投影或 FROM 来源无法静态证明是单一 SUMMARIZE 输出'; return res }
+  if (!fromClause.startsWith('(')) return UNPROVABLE
   let depth = 0
   let close = -1
-  for (let i = 0; i < trimmed.length; i++) {
-    const ch = trimmed[i]!
+  for (let i = 0; i < fromClause.length; i++) {
+    const ch = fromClause[i]!
     if (ch === '(') depth++
     else if (ch === ')') { depth--; if (depth === 0) { close = i; break } }
   }
-  if (close === -1) { res.reason = '投影或 FROM 来源无法静态证明是单一 SUMMARIZE 输出'; return res }
-  const srcText = trimmed.slice(1, close)
-  if (!/^\s*SUMMARIZE\b/i.test(srcText)) { res.reason = '投影或 FROM 来源无法静态证明是单一 SUMMARIZE 输出'; return res }
-  const rest = trimmed.slice(close + 1).trim()
+  if (close === -1) return UNPROVABLE
+  if (!/^\s*SUMMARIZE\b/i.test(fromClause.slice(1, close))) return UNPROVABLE
+  const rest = fromClause.slice(close + 1).trim()
   // 允许：空 / 裸别名 / `AS 别名`；别名本身是裸标识符或双引号标识符；不得有 `(列列表)`
-  const okAlias = rest === ''
-    || /^(?:AS\s+)?(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)$/i.test(rest)
-  if (!okAlias) { res.reason = '投影或 FROM 来源无法静态证明是单一 SUMMARIZE 输出'; return res }
-  res.enabled = true
-  return res
+  if (rest !== '' && !/^(?:AS\s+)?(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)$/i.test(rest)) return UNPROVABLE
+  return null
 }
 
+function analyzeSummarizeProjection(mode: MaskInput['mode'], shapeColumns: boolean): SummarizeProjection {
+  if (mode.kind !== 'sql' || !shapeColumns) return { enabled: false, reason: '' }
+  const reason = passthroughReason(mode.sql)
+  return reason === null ? { enabled: true, reason: '' } : { enabled: false, reason }
+}
+
+/**
+ * 对一次查询的输出行脱敏（spec §7.2）。纯函数：输入行不被就地改写；
+ * `noMask` 时直接返回入参数组（不拷贝，因为一个字节都不会改）。
+ */
 export function maskQueryRows(input: MaskInput): MaskOutcome {
   const { rows, columns, mode, noMask, loc } = input
 
@@ -944,10 +915,12 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const summarizeSql = mode.kind === 'sql'
     && (summarizeTokens.recognized || queryCall.atTopOutput)
   // 第十二轮起 query() 来源不再进入行级脱敏入口（无法静态证明输出是统计值），
-  // 其命中信号只留在 summarizeUnconfirmed 里用于发缺口警告。
-  const hasQueryGap = queryCall.hit && !queryCall.atTopOutput
+  // 其信号只用于发缺口警告：
+  //   · hit：内层**纯透传**（语句头/`SELECT *` 单一来源）—— 输出可能原样含统计值；
+  //   · gap：内层含 SUMMARIZE 但投影是重投影 / 位置不可识别 —— 输出是否含统计值未知；
+  //   · hit 且非输出路径（WHERE EXISTS / IN / 逗号并列）—— 输出不是统计值，只声明缺口。
   const summarizeUnconfirmed = summarizeTokens.unrecognizedParen
-    || hasQueryGap
+    || queryCall.hit
     || queryCall.gap
   const summarizeShapeColumns = columns.includes('column_name')
     && (columns.includes('min') || columns.includes('max'))
@@ -990,12 +963,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     // analyzeSummarizeProjection）：其余形态（表达式重投影、显式列举、集合操作、多来源、
     // query() 包装等）按列名+行值猜来源会把**普通值**改成 `<已脱敏>` —— 数据损坏比漏脱敏
     // 更糟，统一降级为缺口警告。
-    // ⚠️ 后缀（`:N`）保留为防御：可证明形态里 SUMMARIZE 输出列名唯一，不会出现 `:N`；
-    // 一旦出现说明输出被其他来源污染（与上面的白名单结论矛盾），此时按同后缀分组也
-    // 无法证明配对 —— 因此这里只处理 `column_name` 本名，`:N` 列留给缺口警告。
+    // ⚠️ 后缀（`:N`）不处理：可证明形态里 SUMMARIZE 输出列名唯一，不会出现 `:N`；
+    // 一旦出现说明输出被其他来源污染（与白名单结论矛盾）—— 而已证明形态下不会发生。
     if (summarizeShape && summarizeProj.enabled) for (const nameCol of columns) {
       if (nameCol !== 'column_name') continue
-      const suffix = ''
       if (typeof out[nameCol] !== 'string') continue
       // 行值匹配**大小写敏感**（第十二轮收窄）：可证明形态里 column_name 是原样输出，
       // 无需大小写折叠；否则非敏感的 `staff.username` 会误匹配 sessions.userName
@@ -1003,8 +974,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       const rawCol = baseName(out[nameCol] as string)
       const col = sensitiveNames.includes(rawCol) ? rawCol : undefined
       if (col !== undefined) {
-        for (const stat of SUMMARIZE_STATS) {
-          const key = stat + suffix
+        for (const key of SUMMARIZE_STATS) {
           if (!(key in row)) continue
           const before = row[key]
           if (before === null || before === undefined) continue
@@ -1190,17 +1160,28 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   //   · `SELECT * FROM (SELECT * FROM (SUMMARIZE sessions))` 合法，输出 column_name/min/max，
   //     userName 的 min/max 是明文 —— 行级判据不生效、其余警告也不发；
   //   · `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
-  //     也合法，但输出 min 是**常量 3** —— 按全 SQL 判据脱敏会把业务常量篡改成 `<已脱敏>`。
+  //     也合法，但输出 min 是**常量 3** —— 按全 SQL 判据脱敏会把业务常量篡改成 `<已脱敏>`；
+  //   · `SELECT * FROM query('SELECT column_name, min FROM (SUMMARIZE sessions)')` 内层是重投影，
+  //     输出仍可能是统计值 —— 第十二轮收窄时曾被这一档漏掉，现由 queryCall.gap 兜住，
+  //     并有**单独一档文案**（下一条），因为它的成因与修复建议都与位置类不同。
   // 两向都不安全：漏脱敏与误改。与上一档同一策略：**只声明缺口，不冒认脱敏**。
-  if (!summarizeSql && summarizeUnconfirmed && summarizeShapeColumns) {
+  if (!summarizeSql && summarizeUnconfirmed && !queryCall.gap && summarizeShapeColumns) {
     warnings.push(
-      'SQL 里的 SUMMARIZE 处于**无法识别的位置**（如多层子查询 '
+      'SQL 里的 SUMMARIZE **无法确认是否构成最终输出**（如多层子查询 '
       + '`FROM (SELECT * FROM (SUMMARIZE …))`、逗号连接、CTE 内的子查询，'
       + '或 query() 只出现在 WHERE/EXISTS/IN 子查询里）：'
       + '输出可能仍是 SUMMARIZE 形状，但无法确认统计值是否未脱敏 —— '
       + '行级脱敏未生效，统计值（min/max/分位数）可能**未脱敏**；若这些行不是 SUMMARIZE 结果则保持原值。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
       + '或把 SUMMARIZE 提到顶层（`SUMMARIZE <表>`）')
+  }
+  if (!summarizeSql && queryCall.gap && summarizeShapeColumns) {
+    warnings.push(
+      'SQL 在 `query()` 内层使用了 SUMMARIZE，但内层投影**不是原样透传**'
+      + '（显式列举 / 表达式重投影 / 位置不可识别）：'
+      + '统计值（min/max/分位数）可能**未脱敏**；若内层输出被改写成常量则保持原值。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
+      + '或改用 `SELECT * FROM (SUMMARIZE <表>)` 原样透传')
   }
   // 边界用「前后不是标识符字符」而不是 `\\b`：别名可以带标点（`"p("`），
   // 而 `\\b` 只在词字符与非词字符之间成立 —— `\\bp(\\b` 即使不抛也永远匹配不上
