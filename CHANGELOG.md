@@ -229,7 +229,7 @@
     → 行级脱敏收窄为白名单（P2×6：Codex 八~九轮）；⑳ 大小写误配：`staff.username` 匹配
     `sessions.userName` → 只在下 TableDef 大小写不敏感查列时放宽（major + P2：CR 九轮
     + Codex 九轮）；㉑ 星号多来源（`*` + CROSS JOIN）与 `query()` 来源验证（minor + P2×2：
-    CR 十轮 + Codex 十~~十一轮）；㉒ 显式列举路径也要求单一 `(SUMMARIZE …)` 来源
+    CR 十轮 + Codex 十至十一轮）；㉒ 显式列举路径也要求单一 `(SUMMARIZE …)` 来源
     （P2：Codex 十一轮）；㉓ 第十二轮结论性收窄：**行级脱敏只保留两类可静态证明的形态**
     —— `SUMMARIZE <表>`（语句头）与 `SELECT * FROM (SUMMARIZE <表>)`（单一来源无 JOIN/
     逗号/列别名列表）；`query(…)` 包装、显式列举、集合操作、FROM-first、`*`+多来源、
