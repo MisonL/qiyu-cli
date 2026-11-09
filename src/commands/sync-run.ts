@@ -27,7 +27,7 @@ import { readWatermark } from '../sync/state.js'
 // callPaced 静态导入（范围外发现③）：wireCategories 的注入路径也必须过任务层的限频闸门 ——
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
-import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso, shanghaiDayStart } from '../core/time.js'
+import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso, shanghaiDayStart, shanghaiYesterdayStart } from '../core/time.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
 import { classifyOpenFailure, openFailureHint } from '../store/retry.js'
@@ -487,10 +487,27 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       if (boundary !== null && boundary !== shanghaiDayStart(boundary)) {
         for (const t of selected) {
           if (t.windowAlign !== 'shanghaiDay') continue
+          // ⚠️ 声明了末端上限的任务（考勤/绩效 `windowEndClamp: 'shanghaiYesterday'`）：
+          // 目标日已过日界但**晚于上限**时，把 --until 写到次日也拉不到 —— 增量拉取永远
+          // 停在「昨天 0 点」，剩下的只能等上限自然前移（Codex 2026-11-10 第二轮 P2：
+          // 旧文案一律劝「写到次日 0 点」，照做后提示消失、该日仍未同步）。
+          const dayStart = shanghaiDayStart(boundary)
+          if (t.windowEndClamp === 'shanghaiYesterday') {
+            const limit = shanghaiYesterdayStart(clock())
+            if (dayStart >= limit) {
+              untilNotes.set(t.id, [
+                `--until 终点 ${shanghaiIso(boundary)} 不是上海日界（00:00），且 ` +
+                `${shanghaiIso(dayStart)} 这一天不早于本任务的末端上限 ${shanghaiIso(limit)}`
+                + '（该接口 endTime 不能晚于昨天 0 点，越界会被拒）：调整 --until 也无法拉到这段 ——'
+                + '本任务最多同步到上限之前，之后的日期要等上限自然前移（次日）再跑增量。',
+              ])
+              continue
+            }
+          }
           untilNotes.set(t.id, [
             `--until 解析到的终点 ${shanghaiIso(boundary)} 不是上海日界（00:00）：本任务按上海`
             + '自然日对齐切窗（每窗一个整日聚合），末窗是半个自然日、按残段窗跳过（不拉、不写）——'
-            + `从 ${shanghaiIso(shanghaiDayStart(boundary))} 起的这一天不会进库，`
+            + `从 ${shanghaiIso(dayStart)} 起的这一天不会进库，`
             + '结果里的 complete 与 gaps 为空不代表这一段已同步。要含该日请把 --until 写到次日 0 点'
             + '（如 --until 2026-10-16 含 10/15 整天）。',
           ])

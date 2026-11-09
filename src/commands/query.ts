@@ -18,7 +18,7 @@
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, missingTableCauses } from '../query/errors.js'
-import { maskQueryRows, withoutLiterals, withoutComments, isIdentCharAt } from '../query/mask.js'
+import { maskQueryRows, withoutLiterals, withoutComments, isIdentCharAt, queryCallArgs } from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
@@ -163,7 +163,9 @@ const ISO_DAY_COL_RE = /\b(stat_date|work_date)\b/i
  * `'2026-11-08T00:00:00Z'`、`'2026-11-09 00:00:00.000Z'`、`'2026-11-08T00:00:00.000Z'`
  * 三种都静默少算一天、零 warning —— 其中 `…Z` 形态正是 CLI 自己 `--sql` 示例里教的写法。
  */
-const DAY_VALUE_RE = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?)?$/
+// ⚠️ 秒可缺省（CodeRabbit 2026-11-10）：`'2026-10-13 00:00'` / `'…T00:00Z'` 同样按字典序
+// 少算一天，要求秒会把它们漏掉（缺秒时 frac/tz 恒为 null → 下面按「不是列内形态」返回 true）。
+const DAY_VALUE_RE = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?)?$/
 function isMiscomparedDayLiteral(v: string): boolean {
   const m = DAY_VALUE_RE.exec(v.trim())
   if (m === null) return false
@@ -189,6 +191,14 @@ function isMiscomparedDayLiteral(v: string): boolean {
  * 单引号状态逐个读出（`'it''s'` 是转义、不是两个字面量）。
  */
 function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
+  // `query('<内层 SQL>')` 包装（沙箱放行的形态）里真正执行的是**实参内的 SQL**：
+  // `withoutLiterals` 会把整个实参抹掉，只看外层就会漏掉内层里的错位日字面量
+  //（Codex 2026-11-10 第二轮 P2，实测 `SELECT * FROM query($$…stat_date >= '2026-10-13'$$)`
+  // 少算一天却零警告）。递归检查每个实参的内层 SQL（内层还能再套 query()）。
+  for (const inner of queryCallArgs(withoutComments(sql))) {
+    const innerHint = dayLiteralHint(inner, loc)
+    if (innerHint !== null) return innerHint
+  }
   // 注释先抹成空白（逐位对齐）：注释里写的 `-- WHERE stat_date >= '…'` 不是真条件。
   const code = withoutComments(sql)
   if (!ISO_DAY_COL_RE.test(withoutLiterals(code))) return null

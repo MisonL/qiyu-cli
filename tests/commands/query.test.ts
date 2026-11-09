@@ -337,6 +337,30 @@ describe('query --sql · 成功路径（spec §十）', () => {
       'SELECT CAST("stat_date" AS VARCHAR) AS d FROM daily_overview WHERE stat_date >= \'2026-10-13\'')).toBe(0)
     expect(warned()).toBe(true)
 
+    // Codex 第二轮 2026-11-10 P2：`query(<内层 SQL>)` 包装里真正执行的是实参内层 SQL —
+    // 内层里的错位日字面量同样必须警告（实测旧实现零警告、少算一天）
+    expect(await q('--sql',
+      "SELECT * FROM query($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'$$)")).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT * FROM query('SELECT count(*) AS n FROM daily_overview WHERE stat_date >= ''2026-10-13''')")).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证：内层用正确形态 → 不警告
+    expect(await q('--sql',
+      "SELECT * FROM query($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00.000Z'$$)")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // CodeRabbit 第二轮 2026-11-10：秒可缺省 —— `HH:MM` 形态同样少算一天
+    for (const lit of ['2026-10-13 00:00', '2026-10-13T00:00Z']) {
+      expect(await q('--sql',
+        `SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '${lit}'`), lit).toBe(0)
+      expect(warned(), lit).toBe(true)
+    }
+    // 反证：缺秒但形态就是列内写法（16:00Z）仍放行？——列内恒带 `.000` 秒，故 16:00Z 不合法、必然警告
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00Z'")).toBe(0)
+    expect(warned()).toBe(true)
+
     // Codex 2026-11-10 P2 ①：非 `.000` 的毫秒字面量在字典序上排在 `…00.000Z` 之后，
     // 会把当天行排除 —— 必须警告（旧判据「≥3 位小数即放行」会漏）
     expect(await q('--sql',

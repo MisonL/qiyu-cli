@@ -1788,6 +1788,31 @@ describe('区间语义与 notes（2026-11-10 审计）', () => {
     }
   })
 
+  it('声明末端上限的任务 + 目标日晚于上限 → 提示「等上限前移」，不得劝改 --until（Codex 2026-11-10）', async () => {
+    // 上海 2026-10-20 12:00；order_performance 声明 windowEndClamp=shanghaiYesterday
+    //（endTime 不能晚于 10/19 0:00）。要 10/19 这一天：它 ≥ 上限，改 --until 也拉不到。
+    const CLOCK = Date.UTC(2026, 9, 20, 4, 0, 0)
+    vi.useFakeTimers({ now: CLOCK })
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => okC({
+      orders: [], sum: { sellMoney: 0 }, total: 0,
+    })))
+    try {
+      await fresh().then((s) => s.close())
+      const code = await syncCommand(['run', 'reports.order_performance', '--db', dbPath(),
+        '--since', '2026-10-17', '--until', '2026-10-19T12:30:00+08:00', '--quiet'])
+      expect([0, 1]).toContain(code)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      const notes = t.notes as string[]
+      expect(notes.some((n) => /末端上限/.test(n))).toBe(true)
+      expect(notes.some((n) => /等上限自然前移|上限自然前移/.test(n))).toBe(true)
+      // 不得再给出「把 --until 写到次日 0 点」这种照做也无效的建议
+      expect(notes.some((n) => /请把 --until 写到次日 0 点/.test(n))).toBe(false)
+    } finally {
+      vi.unstubAllGlobals()
+      vi.useRealTimers()
+    }
+  })
+
   it('日对齐任务 + 日界 --until → 不产生该 note（反证：判据不是「给了 --until 就报」）', async () => {
     const CLOCK = Date.UTC(2026, 9, 20, 4, 0, 0)
     vi.useFakeTimers({ now: CLOCK })

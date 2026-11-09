@@ -394,12 +394,14 @@ function summarizeTokenPositions(sql: string): { recognized: boolean; unrecogniz
  * `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
  * 合法且输出 min 是常量 3，按全 SQL 判据脱敏会把业务常量改成 `<已脱敏>`（Codex 第七轮 P2）。
  */
-function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; gap: boolean } {
+/**
+ * 遍历 SQL 里每个 `query(<字符串实参>)` 调用，回调**解码后的内层 SQL** 与调用位置。
+ * 词法（`bareKeywords` 定位、注释跳过、E 串/美元引号/单引号解码）只在这一处 ——
+ * `queryCallSummarize`（脱敏缺口）与 `queryCallArgs`（日期字面量警告）共用。
+ */
+function forEachQueryArg(sql: string, cb: (inner: string, callIndex: number) => void): void {
   const bare = bareKeywords(sql)
   const re = /\bquery\s*\(/gi
-  let hit = false
-  let atTopOutput = false
-  let gap = false
   let m: RegExpExecArray | null
   while ((m = re.exec(bare)) !== null) {
     let i = m.index + m[0].length
@@ -452,6 +454,23 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
     // query('SUMMARIZE sessions'))` 的输出是常量 3 —— 内层命中来自 WHERE 里的非输出路径，
     // 按 `.hit` 提升会让外层的 query() 被当成统计来源、常量被改成 `<已脱敏>`。
     // 只有内层**自身的输出**是 SUMMARIZE（内层语句头 / 内层 query() 在其顶层 FROM）才提升。
+    cb(inner, m.index)
+  }
+}
+
+/** `query(...)` 每个字符串实参的内层 SQL（供需要在实参内部读值的判据用，逐层展开由调用方做）。 */
+export function queryCallArgs(sql: string): string[] {
+  const out: string[] = []
+  forEachQueryArg(sql, (inner) => out.push(inner))
+  return out
+}
+
+function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; gap: boolean } {
+  const bare = bareKeywords(sql)
+  let hit = false
+  let atTopOutput = false
+  let gap = false
+  forEachQueryArg(sql, (inner, callIndex) => {
     const innerTokens = summarizeTokenPositions(inner)
     const sub = queryCallSummarize(inner)
     // ⚠️ innerTokens.recognized 对 `SELECT expr FROM (SUMMARIZE …)` 成立（SUMMARIZE 在
@@ -463,7 +482,7 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
     const innerIsPure = passthroughReason(inner) === null
     if ((innerTokens.recognized && innerIsPure) || sub.atTopOutput) {
       hit = true
-      const before = bare.slice(0, m.index)
+      const before = bare.slice(0, callIndex)
       const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
       if (depth === 0 && /(?:\bFROM|\bJOIN)\s*$/i.test(before)) atTopOutput = true
     } else if ((innerTokens.recognized && !innerIsPure) || innerTokens.unrecognizedParen
@@ -472,7 +491,7 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
       // 向上传播「无法确认」，由调用方声明缺口，绝不冒认脱敏。
       gap = true
     }
-  }
+  })
   return { hit, atTopOutput, gap }
 }
 
