@@ -59,7 +59,7 @@ const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/
 
 /** --no-mask 的 PII 风险警告（spec §7.2）。导出供命令层/测试复用。 */
 export const NO_MASK_WARNING = '输出包含未脱敏的客户 PII；不要写入日志或对外报表'
-/** 缺口警告上限（spec §7.2：去重、上限 5 条）。 */
+/** 缺口警告的**每类别**上限（spec §7.2：去重、上限 5 条）——按类别计，不让一类吃掉另一类的预算。 */
 const WARNING_LIMIT = 5
 
 // 列名 → 规则（brief 给定，与 spec §7.1 的可识别形态对应）。用显式集合而不是
@@ -1373,11 +1373,16 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   const warnOne = (name: string): string =>
     `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，`
     + '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样'
-  const slots = Math.max(0, WARNING_LIMIT - warnings.length)
-  const perColumnSlots = unmatched.length > slots ? Math.max(0, slots - 1) : unmatched.length
+  // 上限是**本类别自己的**行数（spec §7.2 说的是「这个判据的去重上限」），不按
+  // `warnings.length` 扣减：扣减会让其它类别的警告把预算吃光（Codex 2026-11-10 第三轮 P2：
+  // 前 5 条已存在时这里仍要发汇总 → 超上限；不发汇总 → 又回到「静默截断」，是本轮修的 bug）。
+  // 现在本块最多出 WARNING_LIMIT 行：截断时最后一行是点名剩余列的汇总。
+  const perColumnSlots = unmatched.length > WARNING_LIMIT
+    ? WARNING_LIMIT - 1
+    : unmatched.length
   for (const name of unmatched.slice(0, perColumnSlots)) warnings.push(warnOne(name))
   if (unmatched.length > perColumnSlots) {
-    // 剩余列并成一条：既不超上限的「逐列」口径，又点名全部被截断的列。
+    // 剩余列并成一条：既不超本类别的行数上限，又点名全部被截断的列。
     const rest = unmatched.slice(perColumnSlots)
     warnings.push(`另有 ${rest.length} 个敏感列的缺口警告未列出（受 ${WARNING_LIMIT} 条上限）：`
       + `${rest.join('、')}；这些列的脱敏同样可能不完整`)

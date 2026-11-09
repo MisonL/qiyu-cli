@@ -428,6 +428,24 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     expect(nullish.maskedColumns).toEqual([])
   })
 
+  it('其它类别已占满 5 条时，截断汇总仍发出且本类别自身不超过上限（Codex 2026-11-10 第三轮 P2）', () => {
+    // 构造：7 个未匹配敏感列 + 一个 GROUP BY 敏感列 —— 本类别 7 条 → 4 条逐列 + 1 条汇总 = 5；
+    // GROUP BY 那条是另一类别，不得把本类别的预算吃成 0（旧实现按 warnings.length 扣减 →
+    // 要么超上限、要么整条汇总不发=静默截断）。
+    const out = maskQueryRows({
+      rows: [{ a: '张三', b: '13800138000', c: 'a@x.com', d: '上海', e: '10.2.3.4', f: 'x', g: 'y' }],
+      columns: ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
+      mode: sqlMode('SELECT userName AS a, userPhone AS b, userEmail AS c, userAddress AS d, '
+        + 'fromIp AS e, userIpCity AS f, userCrmInfo AS g FROM sessions GROUP BY userPhone'),
+    })
+    const own = out.warnings.filter((w) => /SQL 引用了敏感列|另有 \d+ 个敏感列的缺口警告未列出/.test(w))
+    expect(own).toHaveLength(5)
+    expect(own[4]).toMatch(/另有 3 个敏感列的缺口警告未列出/)
+    // 汇总必须点名被截断的列（敏感列按声明顺序遍历：前 4 条逐列，剩余 3 条进汇总）
+    const rest = own[4].slice(own[4].indexOf('：') + 1)
+    expect(rest.split('、')).toHaveLength(3)
+  })
+
   it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5（第 5 条点名被截断的剩余列）、词边界、SQL 侧大小写不敏感）', () => {
     const one = maskQueryRows({
       rows: [{ p: '13800138000' }], columns: ['p'],

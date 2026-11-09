@@ -328,8 +328,9 @@ qiyu --version                       包版本 + skill_contract_version
 （complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped, contained?}`，
 `total = succeeded + failed + skipped`，`skipped` = 跳过的**残段窗**数 + **整窗晚于
 末端上限被丢弃**的窗数；`contained` 仅在 > 0 时出现 = 完全落进前一窗**回看重叠区**、被合并的
-窗数（overlapDays > 0 的任务；数据已由前一窗覆盖，所以不算 skipped、也不计入 total ——
-物理切出的窗数 = total + contained），见下）/ `rows` /
+窗数（overlapDays > 0 的任务；**覆盖窗成功**时数据已由那一窗覆盖，所以不算 skipped、也不计入
+total —— 覆盖窗失败时这些窗改记 skipped 并逐窗出进度行；物理切出的窗数 = total + contained），
+见下）/ `rows` /
 `resolved_range`（Asia/Shanghai 的 `+08:00` ISO 二元组）/ `watermark` / `last_synced_at` /
 `gaps` / `notes`。`gaps[].range` 与 `resolved_range` 同形态（同一套时间解析）；
 `notes` 是中文说明数组（恒在，常为空），例如「请求区间早于接口可得数据的最早边界」

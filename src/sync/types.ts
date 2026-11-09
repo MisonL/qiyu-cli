@@ -45,8 +45,9 @@ export interface TaskRunResult {
      * 被重叠区合并掉的窗数（`skipContained` 剔除，2026-11-09 起）。这些窗**不执行**：
      * 它们完全落在前一窗的回看重叠区内（overlapDays > 0 的任务，如工单 3 天回看），
      * 数据已由前一窗覆盖 —— 所以既不算 succeeded 也**不算 skipped**（skipped 的语义是
-     * 「该拉的没拉」，而这里的没拉是因为重复）。仅在 > 0 时输出；**不计入 total** ——
-     * 物理切出的窗数 = total + contained。
+     * 「该拉的没拉」，而这里的没拉是因为重复）。「已覆盖」**以覆盖窗成功为前提**：
+     * 覆盖它的那一窗失败时这些窗记 skipped 并逐窗出进度行（2026-11-10，Codex 第三轮）。
+     * 仅在 > 0 时输出；**不计入 total** —— 物理切出的窗数 = total + contained。
      */
     contained?: number
   }

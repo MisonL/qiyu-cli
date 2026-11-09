@@ -608,7 +608,7 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
       }
 
       // layer1-④：类型白名单。DESCRIBE / SHOW / PRAGMA table_info / PRAGMA database_list /
-      // VALUES / TABLE x / FROM x 等只读形态,都报告为 1（只读，放行）。`typeof` 守卫：注入的假模块若把 StatementType 的值
+      // VALUES / TABLE x / FROM x 等只读形态，都报告为 1（只读，放行）。`typeof` 守卫：注入的假模块若把 StatementType 的值
       // 给成字符串，不能让它静默地把所有语句都挡掉。
       const ST = mod.StatementType ?? {}
       const SELECT = typeof ST.SELECT === 'number' ? ST.SELECT : 1   // 实测值：SELECT=1

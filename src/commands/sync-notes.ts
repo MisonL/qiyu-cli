@@ -140,8 +140,9 @@ export function runFieldNotes(): Record<string, string> {
       + '「今天」时）。两种都跳过不 fetch、不写库、不推水位，但计入 total'
       + '（total = succeeded + failed + skipped）；stderr 进度行分两句点名成因',
     'tasks[].windows.contained': '完全落进前一窗回看重叠区、被合并的窗数（仅 > 0 时出现）。'
-      + '这些窗不执行 —— 数据已由前一窗覆盖（overlapDays > 0 的任务，如工单 3 天回看），'
-      + '所以既不是 succeeded 也不是 skipped（skipped 才代表「该拉的没拉」）；'
+      + '这些窗不执行 —— 覆盖它的那一窗成功时数据已由那一窗覆盖（overlapDays > 0 的任务，'
+      + '如工单 3 天回看），所以既不是 succeeded 也不是 skipped（skipped 才代表「该拉的没拉」）；'
+      + '覆盖窗失败时它们改记 skipped 并逐窗出进度行；'
       + '它不计入 total —— 物理切出的窗数 = total + contained',
     // ⚠️ 2026-11-04 自查修正：初版把 written 说成「真正落库的行数」—— 而引擎对
     // count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」（kept），

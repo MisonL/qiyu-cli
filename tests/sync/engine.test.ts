@@ -273,7 +273,8 @@ describe('窗口切分与包含窗跳过', () => {
       { start: 60 * DAY, end: 63 * DAY },
     ])
     // 2026-11-09 审计：被重叠区合并的窗此前从所有计数里消失（total=3 看起来就是切出的
-    // 全部 4 窗里的 3 —— 少的那一个无从得知）。现在单独披露为 contained（不计入 total）。
+    // 全部 4 窗里的 3 —— 少的那一个无从得知）。现在单独披露为 contained（不计入 total）；
+    // 且只有**覆盖窗成功**才算 contained（Codex 2026-11-10 第三轮 P2）——这里三窗全成功。
     expect(r.windows.total).toBe(3)
     expect(r.windows.contained).toBe(1)
     expect(r.windows.skipped).toBe(0)   // 合并不是跳过：数据已被前一窗覆盖

@@ -390,6 +390,11 @@ const clampedAwayCount = (windows: Range[], limit: number): number =>
 const truncatedByClamp = (windows: Range[], limit: number): Range[] =>
   Number.isFinite(limit) ? windows.filter((w) => w.start < limit && w.end > limit) : []
 
+/** 合并窗的覆盖窗失败时的进度行：那个窗被合并进了一个没成功的窗 —— 该段没拉到。 */
+const containedUnreachedNote = (task: SyncTask, w: Range): string =>
+  `[${task.id}] 窗未执行（原本落在前一窗的回看重叠区、被合并，但覆盖它的那一窗失败）：`
+  + `[${new Date(w.start).toISOString()}, ${new Date(w.end).toISOString()}) —— 已按 skipped 计入，须重跑补齐`
+
 /** 截短窗的进度行（人读 stderr；与整窗丢弃的 clampedAwayNote 分开说成因）。 */
 const clampedShortNote = (task: SyncTask, w: Range, limit: number): string =>
   `[${task.id}] 窗末端被上限截短（只拉到 ${new Date(limit).toISOString()}）：`
@@ -544,11 +549,14 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   const clamped = clampWindowEnd(raw, limit)
   const skippedResidual = clamped.filter((w) => isResidualWindow(task, w))
   const notResidual = clamped.filter((w) => !isResidualWindow(task, w))
-  const windows = skipContained(notResidual, overlapMs)
+  const links = containedLinks(notResidual, overlapMs)
+  const windows = links.kept
   // 重叠压缩掉的窗（2026-11-09 审计）：overlapDays > 0 的任务里，完全落进前一窗重叠区的
-  // 窗被 `skipContained` 剔除——它既不执行也不该算「跳过」（数据已被前一窗覆盖），
-  // 但此前它从所有计数里消失，`total` 比切出的窗数少、没有任何字段说明差在哪。
-  const containedCount = notResidual.length - windows.length
+  // 窗被合并——它既不执行也不该算「跳过」（按切窗形态，数据已被前一窗覆盖），但此前它从
+  // 所有计数里消失。⚠️ 是否**真的**覆盖要看覆盖窗的结果（Codex 2026-11-10 第三轮 P2：
+  // 覆盖窗自己失败时 `failed:1, contained:1` 而表是空的）—— 所以 `containedCount` 等到
+  // 循环结束、按「覆盖窗成功」结算（见下面循环后的结算段），失败覆盖窗名下的合并窗进 skipped。
+  // ⚠️ 只能声明在成功返回的那条路径作用域里（空窗早返回不涉及任何反馈射）。
   // 可拉范围 = 请求范围 ∩ 末端上限：resolved_range 如实回显「这轮实际覆盖到哪」——
   // 回显一个没覆盖到的 end 会让 Agent 以为今天的数据已同步（G 高-1 的静默面）。
   const effectiveRange: Range = { start: rangeStart, end: Math.min(resolvedRange.end, limit) }
@@ -572,8 +580,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     for (const w of truncatedByClamp(raw, limit)) progress(clampedShortNote(task, w, limit))
     const skippedAll = skippedResidual.length + droppedByClamp.length
     return { taskId: task.id,
-      windows: { total: skippedAll, succeeded: 0, failed: 0, skipped: skippedAll,
-        ...(containedCount > 0 ? { contained: containedCount } : {}) },
+      windows: { total: skippedAll, succeeded: 0, failed: 0, skipped: skippedAll },
       rows: { fetched: 0, written: 0 },
       resolvedRange: { start: outRange.start, end: outRange.start }, gaps, status: 'complete' }
   }
@@ -607,9 +614,14 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     for (const w of droppedByClamp) progress(clampedAwayNote(task, w, limit))
     for (const w of truncatedByClamp(raw, limit)) progress(clampedShortNote(task, w, limit))
 
+    // 每个执行窗成功与否，结束时结算它名下的合并窗（见上的注释）
+    const windowOk: boolean[] = []
+    let containedCount = 0
+    let containedUnreached = 0
     for (let i = 0; i < windows.length; i++) {
       const w = windows[i]
       const ref: WindowRef = { ...w, index: i, total: windows.length }
+      windowOk.push(false)
       progress(`[${task.id}] 窗口 ${i + 1}/${windows.length}: ${new Date(w.start).toISOString()} ~ ${new Date(w.end).toISOString()}`)
 
       // —— 限频闸门（持久化冷却；慢不是错：等待后重试本窗，预算耗尽才记 gap）——
@@ -684,13 +696,27 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       }
 
       succeeded++
+      windowOk[i] = true
       writtenTotal += written
       progress(`[${task.id}] 窗口 ${i + 1}/${windows.length} 完成：拉取 ${fetchRes.rows.length} 行，写入 ${written} 行`)
     }
 
+    // 合并窗结算：覆盖窗成功 → contained；覆盖窗失败 → 这些窗该拉没拉 → skipped
+    //（并逐窗出进度行点名「未覆盖」，绝不静默）。
+    for (let i = 0; i < windows.length; i++) {
+      const merged = links.containedBy[i] ?? []
+      if (merged.length === 0) continue
+      if (windowOk[i]) containedCount += merged.length
+      else {
+        containedUnreached += merged.length
+        for (const w of merged) progress(containedUnreachedNote(task, w))
+      }
+    }
+    const skippedTotal = skipped + containedUnreached
+
     return {
       taskId: task.id,
-      windows: { total: windows.length + skipped, succeeded, failed, skipped,
+      windows: { total: windows.length + skippedTotal, succeeded, failed, skipped: skippedTotal,
         ...(containedCount > 0 ? { contained: containedCount } : {}) },
       rows: { fetched: fetchedTotal, written: writtenTotal },
       // 末端与水位同源（见上）：断链时 = 连续成功末端，未断链 = 本窗 end。
@@ -837,17 +863,43 @@ function snapshotResult(task: SyncTask, resolvedRange: Range, gaps: GapInfo[],
  * 跳过不改变数据、只省一次 API 调用。相邻重叠窗（end 超出 prev.end）不跳过。
  */
 function skipContained(windows: Range[], overlapMs: number): Range[] {
-  if (windows.length < 2 || overlapMs <= 0) return windows
-  const out = [windows[0]]
-  for (let i = 1; i < windows.length; i++) {
-    const prev = out[out.length - 1]
-    const cur = windows[i]
-    if (cur.end <= prev.end && cur.start >= prev.end - overlapMs) continue
-    out.push(cur)
-  }
-  return out
+  return containedLinks(windows, overlapMs).kept
 }
 
+/**
+ * 与 `skipContained` 同一次遍历，额外记下**每个被合并窗落在哪个执行窗里**。
+ *
+ * 被合并 ≠ 已覆盖（Codex 2026-11-10 第三轮 P2）：覆盖它的那一窗自己也可能失败
+ * （`sessions.export` 的 1 天窗失败 → `failed:1, contained:1` 而表是空的）。所以
+ * `windows.contained` 只统计「**覆盖窗已经成功**」的那些合并窗，未覆盖的归入 `unreached`，
+ * 由调用方按 skipped 计 —— 字段的承诺是「数据已由前一窗覆盖」，不能只看切窗形态。
+ */
+function containedLinks(windows: Range[], overlapMs: number): { kept: Range[]; containedBy: Range[][]; unreached: Range[] } {
+  const kept: Range[] = []
+  const containedBy: Range[][] = []
+  if (windows.length === 0) return { kept, containedBy, unreached: [] }
+  if (windows.length < 2 || overlapMs <= 0) {
+    kept.push(...windows)
+    for (let i = 0; i < windows.length; i++) containedBy.push([])
+    return { kept, containedBy, unreached: [] }
+  }
+  let dropped: Range[] = []
+  kept.push(windows[0])
+  containedBy.push([])
+  for (let i = 1; i < windows.length; i++) {
+    const prev = kept[kept.length - 1]
+    const cur = windows[i]
+    if (cur.end <= prev.end && cur.start >= prev.end - overlapMs) { dropped.push(cur); continue }
+    containedBy[containedBy.length - 1] = dropped
+    dropped = []
+    kept.push(cur)
+    containedBy.push([])
+  }
+  // 最后一个执行窗之后若还有被合并窗（cur 落在 prev 重叠区但 prev 已是末窗）——
+  // 上面的循环只在遇到下一个执行窗时才结算 dropped，末尾这次要补上
+  if (dropped.length > 0) containedBy[containedBy.length - 1] = dropped
+  return { kept, containedBy, unreached: [] }
+}
 /**
  * 各任务的窗口计划（runRotated 用）：范围合成与切窗与 runWindowed 同口径
  *（显式区间优先 / 水位置信 / 末端钳制 / 包含窗跳过）。
@@ -859,8 +911,12 @@ interface RotationPlan {
   windows: Range[]
   // 修复批 6 #2：残段窗（非日界首/末段）——不执行，但计入 total 并标 skipped。
   skippedResidual: Range[]
-  // 重叠压缩掉的窗数（skipContained 剔除）——计入 contained，不进 skipped / total。
+  // 重叠压缩掉的窗数（containedLinks 剔除）——覆盖窗成功后计入 contained，否则进 skipped。
   containedCount: number
+  /** 每个执行窗名下的被合并窗（结算用；与 windows 同下标）。 */
+  containedBy: Range[][]
+  /** 每个执行窗是否成功（结算用；与 windows 同下标）。 */
+  windowOk: boolean[]
   /** 末端钳制**之前**的切片窗（截短进度行的判据：start < limit < end）。 */
   truncatedSource: Range[]
   // 2026-11-03：晚于末端上限被整窗丢弃的窗 —— 同样计入 total/skipped（不得静默消失）。
@@ -903,9 +959,11 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
   const clamped = clampWindowEnd(rawWindows, limit)
   const skippedResidual = clamped.filter((w) => isResidualWindow(task, w))
   const notResidual = clamped.filter((w) => !isResidualWindow(task, w))
-  const windows = skipContained(notResidual, overlapMs)
-  // 重叠压缩掉的窗：与 runWindowed 同口径（见那边的注释）。
-  const containedCount = notResidual.length - windows.length
+  const links = containedLinks(notResidual, overlapMs)
+  const windows = links.kept
+  // 重叠压缩掉的窗：与 runWindowed 同口径（见那边的注释）—— 是否算「已覆盖」要等
+  // 覆盖窗的结果，由 runRotated 的结算段定（plan 里先带 links）。
+  const containedCount = 0
   const outRange: Range = { start: rangeStart,
     end: Math.max(rangeStart, Math.min(resolvedRange.end, limit)) }
   const lock = { by: lockOwner(), at: new Date(now).toISOString() }
@@ -916,7 +974,8 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
     for (const w of skippedResidual) ctx.onProgress?.(residualNote(task, w))
     for (const w of droppedByClamp) ctx.onProgress?.(clampedAwayNote(task, w, limit))
     for (const w of truncatedByClamp(truncatedSource, limit)) ctx.onProgress?.(clampedShortNote(task, w, limit))
-    return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, containedCount, truncatedSource, lock, gaps: [],
+    return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, containedCount,
+      containedBy: links.containedBy, windowOk: [], truncatedSource, lock, gaps: [],
       succeeded: 0, failed: 0, fetched: 0, written: 0,
       contiguousEnd: null, contiguousBroken: false, resolvedEnd: null }
   }
@@ -928,7 +987,8 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
   await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
     await markPending(tx, task.id, state, lock)
   }))
-  return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, containedCount, truncatedSource, lock, gaps: [],
+  return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, containedCount,
+    containedBy: links.containedBy, windowOk: windows.map(() => false), truncatedSource, lock, gaps: [],
     succeeded: 0, failed: 0, fetched: 0, written: 0,
     contiguousEnd: null, contiguousBroken: false, resolvedEnd: null }
 }
@@ -1004,6 +1064,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
             ctx, () => commitWindow(ctx, task, w, kept, expected, watermarkRange, plan.lock), isTransient)
           plan.written += written
           plan.succeeded++
+          plan.windowOk[round] = true
           plan.resolvedEnd = watermarkMs
           if (!plan.contiguousBroken) plan.contiguousEnd = w.end
         } catch (e) {
@@ -1032,16 +1093,32 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
   // 末端与水位同源（修复批 4 #2）：断链时 = 连续成功末端（resolvedEnd），未断链 = 请求末。
   // ⚠️ 末端是「上次成功推进到的时刻」，与删除边界（天对齐下取 dayOf(end−1ms)，
   // 见 writeRows）刻意不同：前者是位置、后者是行集覆盖。
-  return plans.map((p) => ({
-    taskId: p.task.id,
-    // 修复批 6 #2：残段窗计入 total、标 skipped（与 runWindowed 同口径）。
-    windows: { total: p.windows.length + p.skippedResidual.length + p.droppedByClamp.length,
-      succeeded: p.succeeded, failed: p.failed,
-      skipped: p.skippedResidual.length + p.droppedByClamp.length,
-      ...(p.containedCount > 0 ? { contained: p.containedCount } : {}) },
-    rows: { fetched: p.fetched, written: p.written },
-    resolvedRange: { start: p.resolvedRange.start, end: p.resolvedEnd ?? p.resolvedRange.start },
-    gaps: p.gaps,
-    status: p.failed === 0 ? 'complete' as const : 'partial' as const,
-  }))
+  return plans.map((p) => {
+    // 合并窗结算（与 runWindowed 同口径，Codex 2026-11-10 第三轮 P2）：覆盖窗成功才算
+    // contained；覆盖窗失败 → 该段没拉到 → 归 skipped 并逐窗出进度行。
+    let contained = 0
+    let unreached = 0
+    for (let i = 0; i < p.windows.length; i++) {
+      const merged = p.containedBy[i] ?? []
+      if (merged.length === 0) continue
+      if (p.windowOk[i] === true) contained += merged.length
+      else {
+        unreached += merged.length
+        for (const w of merged) progress(containedUnreachedNote(p.task, w))
+      }
+    }
+    const skippedTotal = p.skippedResidual.length + p.droppedByClamp.length + unreached
+    return {
+      taskId: p.task.id,
+      // 修复批 6 #2：残段窗计入 total、标 skipped（与 runWindowed 同口径）。
+      windows: { total: p.windows.length + skippedTotal,
+        succeeded: p.succeeded, failed: p.failed,
+        skipped: skippedTotal,
+        ...(contained > 0 ? { contained } : {}) },
+      rows: { fetched: p.fetched, written: p.written },
+      resolvedRange: { start: p.resolvedRange.start, end: p.resolvedEnd ?? p.resolvedRange.start },
+      gaps: p.gaps,
+      status: p.failed === 0 ? 'complete' as const : 'partial' as const,
+    }
+  })
 }
