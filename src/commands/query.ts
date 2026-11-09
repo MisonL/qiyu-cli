@@ -18,7 +18,7 @@
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, missingTableCauses } from '../query/errors.js'
-import { maskQueryRows, withoutLiterals, withoutComments, isIdentCharAt, queryCallArgs } from '../query/mask.js'
+import { maskQueryRows, withoutLiterals, withoutComments, isIdentCharAt, queryCallArgs, dollarQuoteEnd } from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
@@ -216,11 +216,17 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
     // 标识符边界用 mask.ts 的同一判据（中文/补充平面字符都是合法标识符字符，
     // 紧跟在它们之后的 `$` 属于标识符，不是美元引号开头）
     if (code[i] === '$' && !isIdentCharAt(code, i)) {
-      // 美元引号体：`$tag$…$tag$`（形似引号却找不到配对结束符时按普通字符放行）
-      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(code.slice(i))
-      if (m !== null) {
-        const close = code.indexOf(m[0], i + m[0].length)
-        if (close !== -1) { i = close + m[0].length - 1; continue }
+      // 美元引号体：`$tag$…$tag$`（形似引号却找不到配对结束符时按普通字符放行）。
+      // 扫描走 `mask.ts` 的 `dollarQuoteEnd`（同一词法规则的唯一实现点）—— 本处曾复制
+      // 过一份正则，修外层时漏掉了这里（CodeRabbit 2026-11-10 第五轮）。
+      // 体**本身**就可以是日期字面量（实测 `$$2026-10-13$$` 与 `'2026-10-13'` 等价、
+      // 同样少算一天）—— 整段跳过前先按同一判据查一遍。
+      // `query($$…$$)` 的体是内层 SQL，匹配不上 `DAY_VALUE_RE`，不受影响。
+      const dq = dollarQuoteEnd(code, i)
+      if (dq !== null) {
+        if (isMiscomparedDayLiteral(code.slice(dq.openEnd, dq.closeStart))) return isoDayLiteralHint(loc)
+        i = dq.closeStart + (dq.openEnd - i) - 1
+        continue
       }
     }
     if (code[i] !== "'") continue

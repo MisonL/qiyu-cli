@@ -602,7 +602,7 @@ function skipBlockComment(text: string, start: number): number {
  * 规则复制到两处会让同一条 SQL 在两个判据里得到不同结论。调用方负责「标识符边界」判断
  * （紧跟在标识符字符后的 `$` 属于标识符，不是引号开头）。
  */
-function dollarQuoteEnd(text: string, start: number): { openEnd: number; closeStart: number } | null {
+export function dollarQuoteEnd(text: string, start: number): { openEnd: number; closeStart: number } | null {
   const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(start))
   if (m === null) return null
   const closeStart = text.indexOf(m[0], start + m[0].length)

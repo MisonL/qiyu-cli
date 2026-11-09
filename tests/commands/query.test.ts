@@ -325,6 +325,23 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(await q('--sql',
       "SELECT $$it's$$ AS x FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
     expect(warned()).toBe(true)
+    // CodeRabbit 2026-11-10 第五轮：美元引号体**本身**就可以是日期字面量
+    //（实测 `$$2026-10-13$$` 与 `'2026-10-13'` 等价、同样少算一天）——
+    // 旧实现把整段体跳过，零警告。带 tag 的形态同款。
+    expect(await q('--sql',
+      'SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $$2026-10-13$$')).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      'SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $q$2026-10-13$q$')).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证：美元引号体是列内真实形态 / 与日期无关的串 → 不警告
+    expect(await q('--sql',
+      'SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $$2026-10-12T16:00:00.000Z$$')).toBe(0)
+    expect(warned()).toBe(false)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $$it's$$")).toBe(0)
+    expect(warned()).toBe(false)
+
     // 反证 3c：标识符内部带 `$tag$` 形态（marker$q$）不得被当成美元引号开头 ——
     // 美元引号判据的错误方向是「把真字面量一并跳过」，所以用一个**带日字面量**的 SQL 查
     expect(await q('--sql',
