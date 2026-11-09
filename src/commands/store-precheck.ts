@@ -211,7 +211,13 @@ export function schemaVersionMissing(
   path: string, names: readonly string[], versionColumns?: readonly string[],
 ): ErrorInput | null {
   if (names.includes('schema_version')) {
-    if (versionColumns !== undefined && !versionColumns.includes('version')) {
+    // ⚠️ 列名比较必须与 DuckDB 的解析规则一致（Codex 2026-11-09 第十三轮 P2，真机实测）：
+    // `CREATE TABLE schema_version ("VERSION" INTEGER, …)` 反射出 `VERSION`/`Version`，
+    // 而 `SELECT MAX(version)` 照样解析成功 —— 旧的小写精确比较会把**可用的库**判成他人库、
+    // 挡住全部读命令。反例同样实测过：带空格的 `" version"` / `"version "` 与 `version_id`
+    // 确实解析失败，只有大小写变体不可区分。
+    if (versionColumns !== undefined
+      && !versionColumns.some((c) => c.toLowerCase() === 'version')) {
       return {
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `目标数据库不是本 CLI 创建的（schema_version 表缺少 version 列，`

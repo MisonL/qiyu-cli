@@ -214,6 +214,53 @@ describe('库结构校验（缺 schema_version）：同一成因同一说法', (
       expect(hint, `${name} 把它引导向 store init`).not.toContain('store init')
     }
   })
+
+  it('列名大小写变体（"VERSION"/"Version"）是真 schema_version，不得判成他人库（Codex 第十三轮 P2）', async () => {
+    // 真机实测（2026-11-09）：`CREATE TABLE schema_version ("VERSION" INTEGER, applied_at
+    // TIMESTAMP)` 在 information_schema 里反射为 `VERSION`，而 `SELECT MAX(version)` 照样
+    // 解析成功（DuckDB 标识符大小写不敏感）—— 精确小写比较会挡住全部读命令。
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (q: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown> }>; closeSync: () => void }> }
+    }
+    for (const [file, ddl] of [
+      ['upper.duckdb', 'CREATE TABLE schema_version ("VERSION" INTEGER, applied_at TIMESTAMP)'],
+      ['camel.duckdb', 'CREATE TABLE schema_version ("Version" INTEGER, applied_at TIMESTAMP)'],
+    ] as const) {
+      const p = join(dir, file)
+      const inst = await mod.DuckDBInstance.create(p)
+      const c = await inst.connect()
+      await c.run(ddl)
+      inst.closeSync()
+      // 全部读命令都不得被这条判据拒绝（输出说的是数据/后续错误，而不是「不是本 CLI 创建的」）
+      for (const [name, run] of READERS) {
+        out = ''
+        // 前置检查放行后，命令会继续往下走：空壳库必然在后续 SQL 上出错（命令层归错并退非 0，
+        // 个别路径直接抛）—— 这里只关心「说的不是他人库」，其余异常一律吞掉。
+        try { await run(p) } catch { /* 放行后的后续失败与本判据无关 */ }
+        expect(out, `${name} 把 ${ddl} 判成了他人库：${out.slice(0, 200)}`).not.toContain('不是本 CLI 创建的')
+      }
+    }
+  })
+
+  it('反例：带空格/换名的列仍判他人库（只有大小写变体不可区分，真机实测）', async () => {
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (q: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown> }>; closeSync: () => void }> }
+    }
+    for (const [file, ddl] of [
+      ['space.duckdb', 'CREATE TABLE schema_version (" version" INTEGER, applied_at TIMESTAMP)'],
+      ['trail.duckdb', 'CREATE TABLE schema_version ("version " INTEGER, applied_at TIMESTAMP)'],
+    ] as const) {
+      const p = join(dir, file)
+      const inst = await mod.DuckDBInstance.create(p)
+      const c = await inst.connect()
+      await c.run(ddl)
+      inst.closeSync()
+      const got = await hintsFor(p)
+      for (const [name, hint] of Object.entries(got)) {
+        expect(hint, `${name} 对 ${ddl} 必须判他人库`).toContain('不是本 CLI 创建的')
+      }
+    }
+  })
 })
 
 describe('单一实现点（漂移守卫）', () => {
