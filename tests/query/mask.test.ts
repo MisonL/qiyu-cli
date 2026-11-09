@@ -1392,7 +1392,7 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     const cases: Array<[string, Record<string, unknown>, string[], string | number]> = [
       // ② 重排自连接：`:N` 后缀不能证明同组
       ['SELECT a.column_name, b.column_name, b.min, a.min FROM (SUMMARIZE sessions) a, (SUMMARIZE sessions) b',
-        { column_name: 'userName', column_name_1: 'session_id', min: 's1', min_1: '张三丰' },
+        { column_name: 'userName', 'column_name:1': 'session_id', min: 's1', 'min:1': '张三丰' },
         ['column_name', 'column_name:1', 'min', 'min:1'], 's1'],
       // ③ 省略 AS 的别名 `3 min`
       ['SELECT column_name, 3 min FROM (SUMMARIZE sessions)', { column_name: 'userName', min: 3 },
@@ -1632,6 +1632,9 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       "SELECT * FROM query('SUMMARIZE sessions')",
       "SELECT * FROM query(/* gap */ 'SUMMARIZE sessions')",
       "SELECT * FROM query(E'SUMMARIZE sessions')",
+      // 美元引号实参（真机实测合法并输出统计值，CR 第十四轮 minor）：旧扫描只认单引号 → 静默
+      'SELECT * FROM query($$SUMMARIZE sessions$$)',
+      'SELECT * FROM query($q$SUMMARIZE sessions$q$)',
     ]) {
       const out = maskQueryRows({
         rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],

@@ -424,18 +424,29 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
     // 普通串里反斜杠没有特殊含义（实测 `'a\x41b'` 保留字面量 `\x41`）（Codex 第七轮 P2）。
     const isEscape = (sql[i] === 'E' || sql[i] === 'e') && sql[i + 1] === "'"
     if (isEscape) i++
-    if (sql[i] !== "'") continue
-    const start = i
-    for (i++; i < sql.length; i++) {
-      if (isEscape && sql[i] === '\\') { i++; continue }
-      if (sql[i] === "'") { if (sql[i + 1] !== "'") break; i++ }
+    // ⚠️ 美元引号实参同样合法（真机实测 `query($$SUMMARIZE sessions$$)` /
+    // `query($q$SUMMARIZE sessions$q$)` 都输出统计值，CodeRabbit 2026-11-09 第十四轮 minor）：
+    // 旧扫描只认单引号，这类实参直接 `continue` → hit/gap 双假 → 一条 SUMMARIZE 缺口都不发。
+    // 与 withoutLiterals 共用同一个扫描点 dollarQuoteEnd；内容没有转义，原样就是内层 SQL。
+    const dq = sql[i] === '$' && !isIdentCharAt(sql, i) ? dollarQuoteEnd(sql, i) : null
+    let inner: string
+    if (dq !== null) {
+      inner = sql.slice(dq.openEnd, dq.closeStart)
+      i = dq.closeStart + (dq.openEnd - i) - 1
+    } else {
+      if (sql[i] !== "'") continue
+      const start = i
+      for (i++; i < sql.length; i++) {
+        if (isEscape && sql[i] === '\\') { i++; continue }
+        if (sql[i] === "'") { if (sql[i + 1] !== "'") break; i++ }
+      }
+      // ⚠️ 实参是**内层 SQL 源码**，必须按 DuckDB 的字符串语义解码后再跑同一套词法判据：
+      // E 串先解转义（`\x2f\x2a` → `/*` —— 不解码会把注释里的 SUMMARIZE 当成真关键字，
+      // 实测该查询输出常量 min=3 却被脱敏，Codex 第七轮 P2），再统一把 `''` → `'`。
+      // 内层里的 SUMMARIZE 也可能只是注释/字符串/别名：实测 `query('SELECT ''x'' … /* SUMMARIZE */')`
+      // 在 DuckDB 里返回普通行，按裸词判会把列值误改（Codex 2026-11-08 第五轮 P2）。
+      inner = decodeStringLiteral(sql.slice(start + 1, i), isEscape)
     }
-    // ⚠️ 实参是**内层 SQL 源码**，必须按 DuckDB 的字符串语义解码后再跑同一套词法判据：
-    // E 串先解转义（`\x2f\x2a` → `/*` —— 不解码会把注释里的 SUMMARIZE 当成真关键字，
-    // 实测该查询输出常量 min=3 却被脱敏，Codex 第七轮 P2），再统一把 `''` → `'`。
-    // 内层里的 SUMMARIZE 也可能只是注释/字符串/别名：实测 `query('SELECT ''x'' … /* SUMMARIZE */')`
-    // 在 DuckDB 里返回普通行，按裸词判会把列值误改（Codex 2026-11-08 第五轮 P2）。
-    const inner = decodeStringLiteral(sql.slice(start + 1, i), isEscape)
     // ⚠️ 递归必须传播**输出来源**而不是只看「内层含 SUMMARIZE」（Codex 第八轮 P2，真机实测）：
     // 内层 SQL `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM
     // query('SUMMARIZE sessions'))` 的输出是常量 3 —— 内层命中来自 WHERE 里的非输出路径，
@@ -564,6 +575,22 @@ function skipBlockComment(text: string, start: number): number {
   return Math.min(i, text.length)
 }
 
+/**
+ * 美元引号字符串（`$$…$$` / `$tag$…$tag$`）的唯一扫描点：`text[start] === '$'`，返回终止定界符
+ * 之后的**开区间**下标（内容为 `text[start + 定界符长度, 结束)`），不成对时返回 -1。
+ *
+ * ⚠️ 两处共用（`withoutLiterals` 抹字面量、`queryCallSummarize` 读 query() 实参）：同一套解码
+ * 规则复制到两处会让同一条 SQL 在两个判据里得到不同结论。调用方负责「标识符边界」判断
+ * （紧跟在标识符字符后的 `$` 属于标识符，不是引号开头）。
+ */
+function dollarQuoteEnd(text: string, start: number): { openEnd: number; closeStart: number } | null {
+  const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(start))
+  if (m === null) return null
+  const closeStart = text.indexOf(m[0], start + m[0].length)
+  if (closeStart === -1) return null
+  return { openEnd: start + m[0].length, closeStart }
+}
+
 function withoutLiterals(text: string): string {
   let out = ''
   // ⚠️ 被抹掉的字符一律换成等长空格：下标与原文**逐位对齐**，`sliceClause` 才能在抹过的
@@ -611,14 +638,13 @@ function withoutLiterals(text: string): string {
       // 货币符号等都是合法标识符字符（Codex 第三/五轮 P2 实测），紧跟在它们之后的 `$`
       // 属于标识符，不是美元引号开头。
       if (isIdentCharAt(text, i)) { out += ch; continue }
-      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i))
-      if (m !== null) {
-        const end = text.indexOf(m[0], i + m[0].length)
-        if (end !== -1) {
-          out += blank(end + m[0].length - i)
-          i = end + m[0].length - 1
-          continue
-        }
+      const dq = dollarQuoteEnd(text, i)
+      if (dq !== null) {
+        const delim = dq.openEnd - i
+        const end = dq.closeStart + delim   // 整个 `$tag$…$tag$` 之后的第一个字符
+        out += blank(end - i)
+        i = end - 1
+        continue
       }
       out += ch
       continue

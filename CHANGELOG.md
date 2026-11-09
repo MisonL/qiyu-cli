@@ -239,7 +239,7 @@
     （`query('SELECT column_name, min FROM (SUMMARIZE sessions)')`）时内层不满足纯透传，
     旧接线既不置 hit 也不置 gap → 外层一条 SUMMARIZE 警告都不发；现统一由
     `queryCall.gap` 兜住，缺口文案改为「无法确认是否构成最终输出」以覆盖「位置已知但投影不可证明」。
-    72 条 mask 用例，14 组变异各自精确转红；引用 mask 的 3 个测试文件共 144 用例全绿。
+    73 条 mask 用例全绿；引用 mask 的 3 个测试文件共 145 用例全绿。
   · **SUMMARIZE 缺口 + schema_version 列名大小写（2026-11-09 第十三轮双路复核）**：
     ㉔ 位置无法确认的嵌套 SUMMARIZE 若列名被改写
     （`SELECT * FROM (SELECT column_name AS c, min AS m, max AS x FROM (SUMMARIZE sessions))`、
@@ -248,6 +248,11 @@
     ㉕ `schema_version` 列名按**大小写精确**比较，把 `"VERSION"`/`"Version"` 这类 DuckDB
     照样能解析的库判成「不是本 CLI 创建的」、挡住全部读命令（P2：Codex；真机实测带空格的
     `" version"`/`"version "` 确实解析失败，只有大小写变体不可区分）→ 改为大小写不敏感。
+    **第十四轮（CodeRabbit minor×2）**：㉖ `query($$SUMMARIZE sessions$$)` / `query($q$…$q$)`
+    美元引号实参被实参扫描跳过（只认单引号）→ hit/gap 双假、一条 SUMMARIZE 缺口都不发；
+    实参扫描与 `withoutLiterals` 收敛到同一个 `dollarQuoteEnd` 扫描点（判据只许一个实现点）；
+    ㉗ 自连接重排用例的行键写成 `column_name_1` 而列名是 `column_name:1`，`name in out` 为假 →
+    `:1` 列从未进入脱敏，用例没覆盖它声称的场景。
     73 条 mask 用例 + 15 条前置检查用例全绿，两处修复均做撤销即红的变异验证。
   · **`api call --help` 对 `--no-validate` 的描述大于实现**：CLI 级安装提示（skill
     未安装等）不受该开关影响、照旧出现在 warnings；帮助文字改为精确表述。
