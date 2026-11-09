@@ -95,6 +95,41 @@ describe('命令行入口', () => {
     expect(err).toBe('')
   })
 
+  it('分派层 --pretty：拼错的子命令名不得被 --help 吞掉（七个命令族同判据，Codex 2026-11-08 P2）', async () => {
+    // `qiyu api --pretty typo --help` 此前只查「未知 flag」，typo 被忽略、help 退 0 ——
+    // 拼错的参数被静默吞掉（改动前它会报「未知参数：typo」）。判据：位置参数里的**非子命令**
+    // token 必须在 help 之前拒绝；**合法子命令名**（顺序写反）仍走 help → prettyAfterSubcommand。
+    for (const fam of ['api', 'auth', 'db', 'stats', 'sync', 'store', 'skill']) {
+      out = ''; err = ''
+      expect(await run([fam, '--pretty', 'typo', '--help']), `${fam}：拼错的参数必须退 2`).toBe(2)
+      expect(err, `${fam}：必须点名拼错的参数`).toMatch(/未知参数：typo/)
+    }
+    // 对照：位置参数是**合法子命令名**时，--help 仍优先（`db --pretty tables --help`）——
+    // 不得把顺序写反的合法写法也拒成 2。
+    for (const [fam, sub] of [['db', 'tables'], ['stats', 'fields'], ['store', 'init'], ['skill', 'install']]) {
+      out = ''; err = ''
+      expect(await run([fam, '--pretty', sub, '--help']), `${fam} ${sub}：help 应优先`).toBe(0)
+      expect(out, `${fam}：应输出帮助正文`).toContain('用法：')
+    }
+    // 对照（CodeRabbit 第五轮 minor）：子命令**之后**的位置参数与 flag **取值**不是
+    // 这里的判据 —— `db --pretty describe sessions --help` 的 `sessions`、`--db /tmp/x`
+    // 的 `/tmp/x` 都属子命令自己的参数域，help 必须照常输出。
+    for (const argv of [
+      ['db', '--pretty', 'describe', 'sessions', '--help'],
+      ['sync', '--pretty', 'status', '--db', '/tmp/x', '--help'],
+      // 值位出现在子命令**之前**时同样不能当位置参数（`/tmp/x` 是 --db 的取值）
+      ['sync', '--pretty', '--db', '/tmp/x', 'status', '--help'],
+    ]) {
+      out = ''; err = ''
+      expect(await run(argv), `${argv.join(' ')}：help 应优先（值位不是位置参数）`).toBe(0)
+      expect(out).toContain('用法：')
+    }
+    // 顺序写反的裸用法仍给出 prettyAfterSubcommand 引导（不回归）
+    out = ''; err = ''
+    expect(await run(['db', '--pretty', 'tables'])).toBe(2)
+    expect(err).toContain('必须写在具体子命令之后')
+  })
+
   it('纯空白的子命令也要点名，不能渲染成不可见的名字（2026-10-08 修）', async () => {
     // `qiyu " "`（shell 变量展开成一个空格）此前报「未知子命令： ；可用子命令：…」——
     // 冒号后是空格，Agent 看不出自己传了什么。规则同 output.ts 的 describeArgs。
@@ -247,6 +282,26 @@ describe('命令行入口', () => {
     out = ''
     await run(['--help'])
     expect(() => JSON.parse(out)).toThrow()
+  })
+
+  it('每个命令族「无子命令」都退 2 + stdout JSON（裸文本只留给 --help）', async () => {
+    // ⚠️ 2026-11-07 审查：本用例此前只覆盖 `[]` 与未知子命令两种形态，于是
+    // `qiyu store|sync|db|stats` 无子命令时**把用法文本写进 stdout、退 0** 的缺陷
+    // 活了很久 —— 与顶层及 api/auth/query/skill 的答案相反，而 cli.ts 的 USAGE 明写
+    // 「--help 是唯一以裸文本输出的情形」。`qiyu store | jq` 因此拿到 parse error。
+    // 判据：Agent 能 `| jq` 的前提 —— **除 --help 外 stdout 没有非 JSON 输出**。
+    const groups = ['auth', 'api', 'store', 'sync', 'db', 'query', 'stats', 'skill']
+    for (const g of groups) {
+      out = ''; err = ''
+      expect(await run([g]), `${g} 无子命令`).toBe(2)
+      expect(JSON.parse(out).error, `${g} 的 stdout 必须是错误信封`).toMatchObject({ code: 'usage' })
+      // stderr 要有人类可读说明（`query` 是叶子命令，无参报「缺少查询方式」而不是「用法：」）
+      expect(err, `${g} 的 stderr 要有说明`).not.toBe('')
+      // 反向：--help 仍是裸文本（唯一的例外，不能被顺手改成 JSON）
+      out = ''; err = ''
+      expect(await run([g, '--help']), `${g} --help`).toBe(0)
+      expect(() => JSON.parse(out), `${g} --help 必须是裸文本`).toThrow()
+    }
   })
 })
 

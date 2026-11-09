@@ -15,14 +15,14 @@ import { METRIC_CATALOG, REPORT_TABLES, declareMetric } from '../query/metric-ca
 import type { MetricDecl, MetricSource, MetricUnit } from '../query/metric-catalog.js'
 import { TABLES } from '../store/schema.js'
 import { openGuardedSession } from './db.js'
-import { parseStoreFlags } from './store-flags.js'
+import { DB_PATH_HELP, parseStoreFlags } from './store-flags.js'
 import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
   dbTablesCommand, dbDescribeCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE, metadataTimeoutHint,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import { withTimeoutHint } from '../query/sandbox.js'
-import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -49,6 +49,7 @@ const USAGE = `用法：qiyu stats <子命令> [参数]
   ${REPORT_TABLES.join('、')}
 
 存储定位：--db / --profile / --backend（store 命令同族）。
+${DB_PATH_HELP}
 `
 
 /**
@@ -383,7 +384,12 @@ async function statsFields(argv: string[]): Promise<number> {
 export async function statsCommand(argv: string[]): Promise<number> {
   setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
-  if (sub === undefined || sub === '--help' || sub === '-h') {
+  // ⚠️ 无子命令 = 用法错误（退 2 + JSON）—— 见 store.ts 同款注释（2026-11-07 审查）。
+  if (sub === undefined) {
+    return usageFail('用法：qiyu stats <fields> [参数]（`qiyu stats --help` 查看全部）',
+      '可用子命令：fields')
+  }
+  if (sub === '--help' || sub === '-h') {
     // --help 不吞额外参数；--pretty 豁免（db.ts 同族惯例）
     const problem = helpArgsError(rest, STATS_SPECS.flatMap((sp) => sp.flags), '。--help 不接受额外参数')
     if (problem !== undefined) return usageFail(problem)
@@ -395,6 +401,8 @@ export async function statsCommand(argv: string[]): Promise<number> {
     const problem = helpArgsError(rest, STATS_SPECS.flatMap((sp) => sp.flags))
     if (problem !== undefined)
       return usageFail(`${problem}。--pretty 不接受额外参数`)
+    const badPos = prettyPositionalProblem(rest, STATS_SPECS)
+    if (badPos !== undefined) return usageFail(badPos)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
       return 0

@@ -10,6 +10,8 @@ import { queryCommand } from '../../src/commands/query.js'
 import { statsCommand } from '../../src/commands/stats.js'
 import { skillCommand } from '../../src/commands/skill.js'
 import { SKILL_SPECS } from '../../src/commands/skill-specs.js'
+import { DB_PATH_HELP } from '../../src/commands/store-flags.js'
+import { run } from '../../src/cli.js'
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -32,6 +34,27 @@ beforeEach(() => {
   vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
 })
 afterEach(() => { vi.restoreAllMocks() })
+
+describe('--db 的相对路径语义必须在各命令 --help 里写明（2026-11-07 审查）', () => {
+  // `--db` 的相对路径按 HOME 解析（store/config.ts），与用户对「相对路径按 cwd」的直觉相反：
+  // 不写明，Agent 会把 `--db data/q.db` 当成当前目录的库。文案唯一出处是 DB_PATH_HELP，
+  // 五个命令族（含顶层 `qiyu --help`）的 help 都必须带它 —— 漏一族就是一族 Agent 被误导。
+  const FAMILIES: Array<[string, (argv: string[]) => Promise<number>]> = [
+    ['store', (a) => storeCommand(a)],
+    ['db', (a) => dbCommand(a)],
+    ['query', (a) => queryCommand(a)],
+    ['stats', (a) => statsCommand(a)],
+    ['sync', (a) => syncCommand(a)],
+    ['qiyu（顶层）', (a) => run(a)],
+  ]
+  it('store / db / query / stats / sync 与顶层 --help 都写明', async () => {
+    for (const [name, run] of FAMILIES) {
+      out = ''; err = ''
+      expect(await run(['--help']), name).toBe(0)
+      expect(out, `${name} --help 没写明 --db 的相对路径语义`).toContain(DB_PATH_HELP)
+    }
+  })
+})
 
 describe('COMMAND_TREE', () => {
   it('覆盖全部 20 条叶命令（含 skill 三条、auth 两条）', () => {

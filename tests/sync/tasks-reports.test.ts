@@ -429,6 +429,34 @@ describe('报表任务 fetch（http mock）', () => {
     }
   })
 
+  // ⚠️ 2026-11-07 审查实测缺口：第二页起缺 `total` 时，旧实现把 `declared` 清空并 break，
+  // 循环末尾的短读终检被跳过 —— page1 total=5 + 2 行、page2 1 行无 total → 返回 3 行、
+  // 不报错、不留 gap（静默少取 2 行）。判据：**首页已声明 total 之后缺它 = 形态漂移**。
+  it('staff_attendance：首页已声明 total 而后页缺 total → 失败留 gap，不得静默短读', async () => {
+    const row = (id: number, ts: number) => ({ staffId: id, date: ts, loginDuration: 1 })
+    const H = 3_600_000
+    const BASE = 1_700_000_000_000 - (1_700_000_000_000 % H)
+    const fetchMock = respondQueue([
+      () => okC({ result: [row(1000002, BASE), row(1000002, BASE + H)], total: 5 }),
+      // 第二页只给 1 行、且**没有 total**
+      () => okC({ result: [row(1000002, BASE + 2 * H)] }),
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const r = await runTask(reportById('reports.staff_attendance')!, ctx(store))
+      // 不得报 complete（那正是静默短读的形态）
+      expect(r.status).not.toBe('complete')
+      expect(r.gaps.some((g) => g.reason === 'fetch_failed'), '必须留 fetch_failed gap')
+        .toBe(true)
+      expect(r.gaps.map((g) => g.detail).join('\n')).toContain('缺少 total')
+      expect(await store.count('staff_attendance'), '失败窗不落库').toBe(0)
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   // gap 2 写路径：读侧的上界守卫（`MAX_SHANGHAI_SAFE_MS`）在写侧也要有同款判据。
   // 旧判据只有 `n <= 1e11` 下界 —— 微秒误写（1792467000000000000）远大于 1e11，能过，
   // 随后 `new Date(n).toISOString()`（hour_ts）与 `shanghaiDayIso(n)`（stat_date）

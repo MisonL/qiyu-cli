@@ -274,7 +274,14 @@ async function pagedRaw(taskId: string, w: WindowRef, ctx: FetchCtx): Promise<{
     out.push(...rows)
     const total = (res.payload as { total?: unknown } | null)?.total
     if (typeof total !== 'number') {
-      // total 缺省视为单页：拉满一页仍不声明 total 时不再翻（口径与 tickets.search 一致）
+      // ⚠️ 只有在**第一页**就缺 total 时才按「单页」处理（口径与 tickets.search 一致）。
+      // 已声明过 total 之后某页缺它 = 响应形态漂移，**不能**再把 declared 清空并 break ——
+      // 那会让下面的短读终检永远不执行，静默返回少于声明 total 的行且不留任何 gap
+      //（2026-11-07 审查实测：page1 total=5 + 2 行、page2 1 行无 total → 返回 3 行、不报错）。
+      if (declared !== null) {
+        throw new Error(`接口 ${endpointOf(taskId)} 第 ${page} 页缺少 total（首页声明 total=${declared}）：` +
+          '响应形态漂移，拒绝落库——重跑即可')
+      }
       declared = null
       break
     }

@@ -135,6 +135,28 @@ describe('只读前置检查：同一成因在所有命令上给出同一说法�
     expect(uniq.length, JSON.stringify(got, null, 2)).toBe(1)
     expect(uniq[0]).toContain('store init --db ' + missing)
   })
+
+  it('ELOOP / ENOTDIR / ENAMETOOLONG：hint 必须按 errno 归因，不得一律说成「权限」', () => {
+    if (process.platform === 'win32') return
+    // 三个真前置状态（2026-11-07 审查实测的逐字报文见 statFailureHint 的注释）
+    const loop = join(dir, 'loop.duckdb')
+    execFileSync('ln', ['-s', 'loop.duckdb', loop])
+    const notDir = join(dir, 'plain.txt', 'child.duckdb')
+    writeFileSync(join(dir, 'plain.txt'), 'x')
+    const tooLong = join(dir, 'a'.repeat(300))
+    const cases: Array<[string, string, RegExp]> = [
+      ['ELOOP', loop, /符号链接成环/],
+      ['ENOTDIR', notDir, /不是目录/],
+      ['ENAMETOOLONG', tooLong, /路径过长/],
+    ]
+    for (const [label, path, expected] of cases) {
+      out = ''
+      expect(statGuard(path), `${label} 应当被前置检查拒绝`).toBe(1)
+      const hint = String(errorOf().hint)
+      expect(hint, `${label} 的 hint 没点名真正成因：${hint}`).toMatch(expected)
+      expect(hint, `${label} 不是权限问题，却说成权限：${hint}`).not.toContain('权限')
+    }
+  })
 })
 
 describe('库结构校验（缺 schema_version）：同一成因同一说法', () => {
@@ -168,6 +190,75 @@ describe('库结构校验（缺 schema_version）：同一成因同一说法', (
     // store init 对他人库会再次拒绝（duckdb.ts 的他人库防线）→ 引导过去是死循环
     for (const [name, hint] of Object.entries(got)) {
       expect(hint, `${name} 把他人库引导向 store init`).not.toContain('store init')
+    }
+  })
+
+  it('同名不同形的 schema_version（他人工具建的表，缺 version 列）：同样判「不是本 CLI 创建的」', async () => {
+    // 2026-11-07 审查实测：旧判据只认表名 —— 这种库放行后 `store status` 在
+    // `MAX(version)` 上抛 Binder Error，落 internal「备份重建」，把「不是本 CLI 的库」
+    // 说成损坏缓存（还可能让用户去重建别人的库）。
+    const p = join(dir, 'foreign-shape.duckdb')
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (q: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown> }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(p)
+    const c = await inst.connect()
+    await c.run('CREATE TABLE schema_version (version_id INTEGER, applied_at TIMESTAMP)')
+    inst.closeSync()
+    const got = await hintsFor(p)
+    const uniq = [...new Set(Object.values(got))]
+    expect(uniq.length, JSON.stringify(got, null, 2)).toBe(1)
+    expect(uniq[0]).toContain('不是本 CLI 创建的')
+    for (const [name, hint] of Object.entries(got)) {
+      expect(hint, `${name} 把同名不同形的他人库说成损坏缓存`).not.toContain('备份')
+      expect(hint, `${name} 把它引导向 store init`).not.toContain('store init')
+    }
+  })
+
+  it('列名大小写变体（"VERSION"/"Version"）是真 schema_version，不得判成他人库（Codex 第十三轮 P2）', async () => {
+    // 真机实测（2026-11-09）：`CREATE TABLE schema_version ("VERSION" INTEGER, applied_at
+    // TIMESTAMP)` 在 information_schema 里反射为 `VERSION`，而 `SELECT MAX(version)` 照样
+    // 解析成功（DuckDB 标识符大小写不敏感）—— 精确小写比较会挡住全部读命令。
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (q: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown> }>; closeSync: () => void }> }
+    }
+    for (const [file, ddl] of [
+      ['upper.duckdb', 'CREATE TABLE schema_version ("VERSION" INTEGER, applied_at TIMESTAMP)'],
+      ['camel.duckdb', 'CREATE TABLE schema_version ("Version" INTEGER, applied_at TIMESTAMP)'],
+    ] as const) {
+      const p = join(dir, file)
+      const inst = await mod.DuckDBInstance.create(p)
+      const c = await inst.connect()
+      await c.run(ddl)
+      inst.closeSync()
+      // 全部读命令都不得被这条判据拒绝（输出说的是数据/后续错误，而不是「不是本 CLI 创建的」）
+      for (const [name, run] of READERS) {
+        out = ''
+        // 前置检查放行后，命令会继续往下走：空壳库必然在后续 SQL 上出错（命令层归错并退非 0，
+        // 个别路径直接抛）—— 这里只关心「说的不是他人库」，其余异常一律吞掉。
+        try { await run(p) } catch { /* 放行后的后续失败与本判据无关 */ }
+        expect(out, `${name} 把 ${ddl} 判成了他人库：${out.slice(0, 200)}`).not.toContain('不是本 CLI 创建的')
+      }
+    }
+  })
+
+  it('反例：带空格/换名的列仍判他人库（只有大小写变体不可区分，真机实测）', async () => {
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (q: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown> }>; closeSync: () => void }> }
+    }
+    for (const [file, ddl] of [
+      ['space.duckdb', 'CREATE TABLE schema_version (" version" INTEGER, applied_at TIMESTAMP)'],
+      ['trail.duckdb', 'CREATE TABLE schema_version ("version " INTEGER, applied_at TIMESTAMP)'],
+    ] as const) {
+      const p = join(dir, file)
+      const inst = await mod.DuckDBInstance.create(p)
+      const c = await inst.connect()
+      await c.run(ddl)
+      inst.closeSync()
+      const got = await hintsFor(p)
+      for (const [name, hint] of Object.entries(got)) {
+        expect(hint, `${name} 对 ${ddl} 必须判他人库`).toContain('不是本 CLI 创建的')
+      }
     }
   })
 })

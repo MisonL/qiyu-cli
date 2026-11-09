@@ -28,6 +28,7 @@ import {
 import type { BuiltTableQuery } from '../query/table-query.js'
 import { openGuardedSession } from './db.js'
 import { queryFieldNotes } from './query-notes.js'
+import { DB_PATH_HELP } from './store-flags.js'
 import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
   dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand, querySqlCommand,
@@ -86,6 +87,7 @@ const USAGE = `用法：qiyu query <查询方式> [参数]
   --no-mask                关闭默认脱敏，输出原始 PII（不要写入日志或对外报表）
   --db <path> / --profile <name> / --backend <name>
                            存储定位（与 store / sync 命令同族）
+${DB_PATH_HELP}
 
 只接受单条 SELECT / DESCRIBE / SHOW / EXPLAIN；写操作、多语句、文件与网络访问一律被沙箱拦截。
 `

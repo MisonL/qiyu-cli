@@ -161,6 +161,10 @@ describe('validateBody —— 软规则与 strict', () => {
     expect(r.soft[0].message).toMatch(/已(随请求)?发出|已经发出/)
     expect(r.soft[0].message).toMatch(/不要重发/)
     expect(r.soft[0].message).not.toMatch(/未验证/)
+    // ⚠️ 2026-11-07 审查：旧文案「已按原样字面量发送」与实现相反 —— `--body` 先 JSON.parse，
+    // 再由 buildBody = JSON.stringify 发出、Content-Type 恒 application/json（http.ts 唯一通道）。
+    expect(r.soft[0].message, '不得再声称按原样/字面量发送').not.toMatch(/原样|字面量发送/)
+    expect(r.soft[0].message, '必须点破传输层恒为 JSON').toContain('JSON')
   })
 })
 

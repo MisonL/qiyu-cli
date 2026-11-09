@@ -232,7 +232,15 @@ function systemdArg(v: string): string {
   // 写 `v.replace(/\$/g, '$$')` 实测产出**一个** `$`（转义被自身吃掉）。函数返回值
   // 不做这种解析。
   const escaped = v.replace(/\\/g, () => '\\\\').replace(/%/g, () => '%%').replace(/\$/g, () => '$$')
-  const quoted = shellQuote(escaped)
+  // ⚠️ 引号不能走 `shellQuote`（2026-11-07 审查实测）：它只在含空白/双引号时才加双引号，
+  // `--profile o'brien` 于是把裸 `'` 原样写进 ExecStart —— 而 systemd.service(5) 的
+  // 命令行解析把 `'` 当**引号符**，整条命令会被错误切分。同一参数在 crontab 兜底行里
+  // 却经 `shellArg(v,'linux')` 正确转义 —— 两个载体对同一值给出不同结果。
+  // 规则：含空白 / 双引号 / 单引号时用双引号包裹，并把 `"` 转义
+  // （反斜杠已在上一步双写，systemd 在双引号内外都按同一规则处理反斜杠）。
+  const quoted = /[\s"']/.test(escaped)
+    ? `"${escaped.replace(/"/g, () => '\\"')}"`
+    : escaped
   // ④ systemd.service(5)：「An argument solely consisting of ";" must be escaped, i.e.
   // specified as "\;"」—— 裸 `;` 是**命令分隔符**，会把一条 ExecStart 劈成两条命令
   //（`sync install --db ';'` 这种值罕见，但静默执行别的东西比报错更糟）。文档只对
@@ -392,7 +400,8 @@ function unmappable(): Error {
  * `shellQuote`（本文件）保留给**不经 shell 也不做替换**的消费方：launchd 的 plist 走
  * `xmlEscape`；schtasks 的 `/TR` 存的是任务动作，由 Task Scheduler 直接 CreateProcess
  * （不经 cmd.exe，`$`/`%` 不展开 —— 依据其执行模型推断，本机 darwin 未能实测）。
- * ExecStart 另有 `systemdArg`（`shellQuote` + systemd 自己的 `%%`/`$$` 转义）。
+ * ExecStart 另有 `systemdArg`（systemd 自己的引号与 `%%`/`$$` 转义；**单引号也参与**
+ * —— 见该函数注释）。
  */
 function crontabArg(v: string): string {
   return shellArg(v, 'linux').replace(/%/g, '\\%')

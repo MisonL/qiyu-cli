@@ -4,16 +4,18 @@ import { dirname } from 'node:path'
 import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openStore } from '../store/index.js'
 import {
-  ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty, storeInitCommand, describeArgs,
+  ok, fail, usageFail, failFromTagged, sanitizeControlChars, setPretty,
+  storeInitCommand, syncRunCommand, describeArgs,
 } from '../output.js'
 import { classifyOpenFailure, openFailureHint } from '../store/retry.js'
-import { parseStoreFlags } from './store-flags.js'
+import { DB_PATH_HELP, parseStoreFlags } from './store-flags.js'
 import {
-  statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables, storeTablesWarnings,
+  SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables,
+  storeTablesWarnings,
 } from './store-precheck.js'
 import { TABLES } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
-import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
 
 /**
@@ -45,9 +47,10 @@ const USAGE = `用法：qiyu store <子命令> [参数]
 
 ⚠️ 存储配置仍需手工编辑 ~/.config/qiyu/config.json（store 命令本身不写配置；配置文件可能已
 由 auth login 创建，但只含 credentials 键，不含 store 段）。也可用 --db / QIYU_DB_PATH 直接指定库路径。
+${DB_PATH_HELP}
 `
 
-export function thrownToExit(e: unknown): number {
+export function thrownToExit(e: unknown, profileFlag?: string): number {
   const err = e as { kind?: string; message?: string; hint?: string; retryable?: boolean }
   // usage 类错误（store 层预检抛出，如未知列/缺列/连接已关闭）：归 usageFail 双通道、
   // 退出码 2 —— 这是用法错误不是环境故障（M1 修：此前被下方排除条件挡住后落 internal）。
@@ -76,14 +79,39 @@ export function thrownToExit(e: unknown): number {
   // ⚠️ internal 兜底（第四轮 I 组 H1/M8 修）：spec §8.2 禁止把 DuckDB 英文原文裸透
   // 给 Agent —— 必须中文包装 + 底层原文；hint 中性化（status 只读路径也会走到这里，
   // 不能说「写入」）。
+  // ⚠️ hint 不得指向 `qiyu store status`（2026-11-07 审查）：本函数是 `store init` 与
+  // `store status` **共用**的出口 —— 当失败的命令本身就是 `store status` 时，
+  // 「请用 store status 检查数据库状态」是在让 Agent 重跑刚失败的同一条命令（死循环）。
+  // 换成两个子命令都成立的诊断动作：换一个 --db 验证库本身是否有问题。
+  // ⚠️ 恢复命令必须经渲染器带出（store-hint-selection 的 BARE_HINT 守卫）：
+  // 重建目标是一个**尚不存在的新路径**，渲染器只接路径 —— 用全仓统一的占位符 `<新路径>`
+  // 传入，替换契约（换成真实 .duckdb 路径、不要指回原文件）随 hint 一并写明。
   return fail({ code: 'internal', kind: 'internal', retryable: false,
-    message: `存储操作失败（底层：${msg}）`, hint: '数据库执行期错误。若持续出现，请用 qiyu store status 检查数据库状态，或用 --db 指向其他数据库文件' })
+    message: `存储操作失败（底层：${msg}）`, hint: '数据库执行期错误（重跑同一条命令不会改变结果）。'
+      + '请先用 --db 指向另一个库验证是否是该库的问题；若只有该库失败，请先备份该文件，再用 '
+      + storeInitCommand('<新路径>', profileFlag) + ' 重建（把 <新路径> 整段替换成新的 .duckdb 文件路径，'
+      + '不要指回出问题的文件 —— 本地库只是缓存），之后带同一个 --db 跑 '
+      + syncRunCommand('<新路径>', profileFlag) + ' 可重新拉取' })
+    // ⚠️ `profileFlag` 必须随 hint 带出（CodeRabbit 2026-11-09 minor）：`sync run` 从**解析出的
+    // 档**读 `store.options.knowledgeRobotIds` 与 `profiles.<name>.robots`（robotId 注入面），
+    // 只给 `--db` 的恢复命令会用错 robot 集合且不报错（真库实测：带 `--profile alpha` 解析出
+    // [1000001]、不带则为空）。调用点见本文件 storeCommand 两处与 sync.ts 的 openRo。
 }
 
 export async function storeCommand(argv: string[]): Promise<number> {
   setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
-  if (sub === undefined || sub === '--help' || sub === '-h') {
+  // ⚠️ 无子命令 = 用法错误（退 2 + stdout JSON），**不是**裸文本帮助（2026-11-07 审查）：
+  // 此前它和 `--help` 共用一个分支，把 USAGE 写进 stdout 并退 0 —— 而顶层 `run()`、
+  // `api` / `auth` / `query` / `skill` 五个命令族对同一形态都给 usageFail（退 2 + JSON）。
+  // `cli.ts` 的 USAGE 还明写「`--help` 是**唯一**以裸文本输出的情形」，README 则承诺
+  // 「Agent 靠退出码和 stdout 的 JSON 做决定」—— 裸文本让 `qiyu store | jq` 直接 parse error。
+  // 原始裁决见计划 2026-09-30 §无参数分支：「无参数是用法错误，不是『用户请求帮助』」。
+  if (sub === undefined) {
+    return usageFail(`用法：qiyu store <init|status> [参数]（\`qiyu store --help\` 查看全部）`,
+      '可用子命令：init、status')
+  }
+  if (sub === '--help' || sub === '-h') {
     // --help 不吞**未知**参数；已知 flag 与子命令名/取值一律放行（2026-11-06 审查：
     // `store status --db /tmp/x --help` 此前被 `GLOBAL_FLAG_NAMES` 判成「未知参数」退 2）。
     const problem = helpArgsError(rest, STORE_SPECS.flatMap((sp) => sp.flags), '。--help 不接受额外参数')
@@ -96,18 +124,14 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // 写在这里时没有任何子命令可修饰 —— 给出正确写法，而不是说成"未知子命令"（B 惯例）。
     if (sub === '--pretty') {
       const problem = helpArgsError(rest, STORE_SPECS.flatMap((sp) => sp.flags))
-      // `--help` 同时出现时按帮助处理（帮助请求不校验位置参数）
-      const positional = rest.includes('--help') || rest.includes('-h')
-        ? []
-        : rest.filter((a) => !a.startsWith('-'))
       if (problem !== undefined) return usageFail(`${problem}。--pretty 不接受额外参数`)
-      if (positional.length > 0) {
-        return usageFail(`未知参数：${describeArgs(positional)}。--pretty 不接受额外参数`)
-      }
+      const badPos = prettyPositionalProblem(rest, STORE_SPECS)
+      if (badPos !== undefined) return usageFail(badPos)
       if (rest.includes('--help') || rest.includes('-h')) {
         process.stdout.write(USAGE)
         return 0
       }
+      // ⚠️ 位置参数一律按「顺序写反」引导（2026-11-07 审查）—— 见 db.ts 同款注释。
       return usageFail(prettyAfterSubcommand('store'))
     }
     return usageFail(`未知子命令：${sub}\n可用子命令：init、status`)
@@ -191,7 +215,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     let store
     try {
       store = await openStore(config, 'rw')
-    } catch (e) { return thrownToExit(e) }
+    } catch (e) { return thrownToExit(e, profileFlag) }
     try {
       await store.init()
       // ⚠️ 与 `store status` 同口径（2026-11-01）：`store.tables()` 给的是**全库**清单
@@ -208,7 +232,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
       warnings === undefined
         ? { field_notes: storeFieldNotes() }
         : { field_notes: storeFieldNotes(), warnings })
-    } catch (e) { return thrownToExit(e) } finally { await store.close() }
+    } catch (e) { return thrownToExit(e, profileFlag) } finally { await store.close() }
   }
 
   // status
@@ -223,11 +247,16 @@ export async function storeCommand(argv: string[]): Promise<number> {
   const guarded = statGuard(config.path)
   if (guarded !== null) return guarded
   let store
-  try { store = await openStore(config, 'ro') } catch (e) { return thrownToExit(e) }
+  try { store = await openStore(config, 'ro') } catch (e) { return thrownToExit(e, profileFlag) }
   try {
     const names = await store.tables()
     // ⚠️ 成因分形（他人库不引导向 init）在共享实现里，口径与 db/sync 逐字一致。
-    const missing = schemaVersionMissing(config.path, names)
+    // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：他人工具的 schema_version 无 version 列时，
+    // 旧判据放行，下面的 MAX(version) 抛 Binder Error 落 internal「备份重建」—— 假归因。
+    const versionColumns = names.includes('schema_version')
+      ? (await store.query(SCHEMA_VERSION_COLUMNS_SQL)).rows.map((r) => String(r.column_name))
+      : undefined
+    const missing = schemaVersionMissing(config.path, names, versionColumns)
     if (missing !== null) return fail(missing)
     const tables: Array<{ name: string; rows: number }> = []
     // ⚠️ 只能对**声明表**（`TABLES`）做 COUNT（2026-11-01 实测修）：`store.count()` 内部
@@ -254,5 +283,5 @@ export async function storeCommand(argv: string[]): Promise<number> {
     warnings === undefined
       ? { field_notes: storeFieldNotes() }
       : { field_notes: storeFieldNotes(), warnings })
-  } catch (e) { return thrownToExit(e) } finally { await store.close() }
+  } catch (e) { return thrownToExit(e, profileFlag) } finally { await store.close() }
 }

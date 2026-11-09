@@ -545,11 +545,33 @@ describe('sessions 任务全链路（重叠去重按 session.id）', () => {
     const lines = rows.map((r) => JSON.stringify(r))
     return makeEncryptedZip([{ name: 'session.txt', content: `${lines.join('\n')}\n${tailFor(declared)}\n` }], APP_KEY.slice(0, 12))
   }
-  /** 包装任务 fetch：fetchZip 按**本窗请求窗口**合成 zip（多窗用例每窗各自的声明不同）。 */
+  /** 从已 stub 的全局 fetch 里读**最近一次 create 的请求窗口**（多窗/多次 runTask 下
+   * create 不是第 1 次调用：check 的 body 是 {key}，按形状挑 {start,end} 的最后一个）。 */
+  function requestedWindow(): { start: number; end: number } {
+    const calls = (globalThis.fetch as unknown as {
+      mock: { calls: [string, { body?: string }][] }
+    }).mock.calls
+    for (let i = calls.length - 1; i >= 0; i--) {
+      const raw = calls[i]![1]?.body
+      if (typeof raw !== 'string') continue
+      try {
+        const b = JSON.parse(raw) as Record<string, unknown>
+        if (typeof b.start === 'number' && typeof b.end === 'number') {
+          return { start: b.start, end: b.end }
+        }
+      } catch { /* 非 JSON body 跳过 */ }
+    }
+    throw new Error('测试 harness：fetch mock 里找不到 create 请求体')
+  }
+  /** 包装任务 fetch：fetchZip 按**本窗实际请求窗口**合成 zip（正常形态：尾标记声明 = 请求窗口）。
+   * ⚠️ 不能拿引擎窗 `w` 声明：引擎 Range 是半开 [start, end)，导出请求是闭区间
+   * [start, end−1]（2026-11-08 实测：跨度恰 144.0h 被服务端 14004 拒绝）—— 声明用 w 会让
+   * 每个正常窗都比实际请求宽 1ms，被判成 export_window_mismatch 假 gap。这里从 create
+   * 请求体读真实请求，不重复实现「半开→闭区间」规则。 */
   function withZip(t: SyncTask, rows: unknown[]): SyncTask {
     const orig = t.fetch
     return { ...t, fetch: async (w, c) => orig(w, { ...c,
-      fetchZip: async () => mkZip(rows, w), pollIntervalMs: 0 } as never) }
+      fetchZip: async () => mkZip(rows, requestedWindow()), pollIntervalMs: 0 } as never) }
   }
   function mocksFor(): ReturnType<typeof vi.fn> {
     // 按调用序循环供给 create → check（多窗口流水线各自走一遍同一序列；zip 由 fetchZip 注入）
@@ -577,6 +599,28 @@ describe('sessions 任务全链路（重叠去重按 session.id）', () => {
       expect(r1.gaps).toEqual([])
       expect(r2.gaps).toEqual([])
       expect(await store.count('sessions')).toBe(1)   // 同 id 两窗口重叠 → 1 行
+      await store.close()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('导出请求是闭区间 [start, end−1]：跨度必须**严格小于** maxWindowDays×86400000（恰 144.0h 实测 14004）', async () => {
+    // 2026-11-08 真实凭证实测：create 跨度恰 518400000ms（6×86400000 = 144.0h）→
+    // `14004 Timestamp interval limit`，518399999ms（143.9999h）通过。此前引擎的半开窗
+    // 被原样当请求发出去，`sync run sessions.export` 每个 6 天窗都 fetch_failed、一行不落。
+    // 本用例钉住：create 请求体的跨度严格小于窗口上限，且声明窗口 = 实际请求时不产生假 gap。
+    const fetchMock = mocksFor()
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const store = await fresh()
+      const t = withZip(sessionsById('sessions.export')!, [SESSION_ROW])
+      const r = await runTask(t, ctx(store, { rangeOverride: { start: 0, end: 6 * DAY } }))
+      expect(r.status).toBe('complete')
+      const body = JSON.parse((fetchMock.mock.calls[0]![1] as { body: string }).body)
+      expect(body).toEqual({ start: 0, end: 6 * DAY - 1 })
+      expect(body.end - body.start).toBeLessThan(6 * DAY)   // 恰等于 6 天即 14004
+      expect(r.gaps).toEqual([])                            // 声明 = 实际请求 → 无 gap
       await store.close()
     } finally {
       vi.unstubAllGlobals()

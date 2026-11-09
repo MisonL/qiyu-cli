@@ -160,6 +160,15 @@ describe('失败输出', () => {
     expect(e2.hint).toBe('a\nb')
   })
 
+  it('fail() 同样净化 code —— 它常是服务端返回的不可信字段（2026-11-07 审查）', () => {
+    // 实测缺口：`envelope.ts` 把服务端 code 直接 `String(o.code ?? 'unknown')` 透传，
+    // 服务端回 `code:"\u009b31mX"`（CSI）时原始 C1 字节原样进 stdout ——
+    // 与上一条修的是同一族（「出口净化一次」），此前只漏了 code 这个字段。
+    fail({ code: '\u009b31mX', kind: 'unknown', retryable: false, message: 'm' })
+    expect(out, 'stdout 里出现了原始 C1 CSI 字节').not.toMatch(/[\u0080-\u009F]/)
+    expect(JSON.parse(out).error.code).toBe('·31mX')
+  })
+
   it('hint / retry_after 等可选字段被原样透出 —— 它们是错误分类的全部产出', () => {
     // ⚠️ `hint` 是**多数**错误分类的产出，但**不是每条分支都有** —— 限流族就没有：
     // `rate()`（任务 3）返回的 `QiyuError` 不带 `hint`，因此真实的 14009 输出里

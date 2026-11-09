@@ -13,7 +13,7 @@ import { effectiveBodyParams, normalizeAliases, validateBody } from '../core/val
 import { ok, fail, usageFail, describeArgs, setPretty, EXIT } from '../output.js'
 import { localFallbackFor } from './local-fallback.js'
 import { callFieldNotes } from './api-notes.js'
-import { GLOBAL_FLAGS, prettyAfterSubcommand, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
+import { GLOBAL_FLAGS, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, renderFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /** `api list` 的业务 flag（`flags` 里还要再并上全局 flag）。 */
@@ -91,7 +91,7 @@ const API_USAGE = `用法：qiyu api <list|call|schema> [参数]
 --all     连同不可主动调用的接口一起列出
 --body    请求体（JSON 字面量）。省略与传 {} 是两条不同的服务端路径
 --yes     危险接口（写/破坏性操作）必须显式确认
---no-validate  完全关闭 body 校验、别名改写与 warnings（危险门禁不受影响）
+--no-validate  关闭 body 校验与别名改写（CLI 级安装提示照旧出现在 warnings；危险门禁不受影响）
 --strict       把「未知字段/类型不符」的提示升级为拒绝
 
 出错时 stdout 是 {"ok":false,"error":{code,kind,retryable,message,hint?}}。
@@ -130,15 +130,18 @@ export async function apiCommand(argv: string[]): Promise<number> {
   // 子命令之后（`api list --pretty`）。次序保持 **未知/位置 → help → pretty 指引**。
   if (sub === '--pretty') {
     const unknown = argv.slice(1).filter((a) => a.startsWith('-') && a !== '--pretty' && a !== '--help' && a !== '-h')
-    const positional = argv.slice(1).filter((a) => !a.startsWith('-'))
-    const extra = [...unknown, ...positional]
-    if (extra.length > 0) {
-      return usageFail(`未知参数：${describeArgs(extra)}。--pretty 不接受额外参数`)
+    if (unknown.length > 0) {
+      return usageFail(`未知参数：${describeArgs(unknown)}。--pretty 不接受额外参数`)
     }
+    // ⚠️ 位置参数里的拼错子命令名必须在 help 之前拒绝（Codex 2026-11-08 第四轮 P2）——
+    // `api --pretty typo --help` 曾经把 typo 静默吞掉、help 退 0。
+    const badPos = prettyPositionalProblem(argv.slice(1), API_SPECS)
+    if (badPos !== undefined) return usageFail(badPos)
     if (argv.includes('--help') || argv.includes('-h')) {
       process.stdout.write(API_USAGE)
       return EXIT.OK
     }
+    // ⚠️ 位置参数按「顺序写反」引导（2026-11-07 审查）—— 见 db.ts 同款注释。
     return usageFail(prettyAfterSubcommand('api'))
   }
   if (sub === 'list') return list(argv.slice(1))
@@ -336,8 +339,10 @@ function list(argv: string[]): number {
       // 切到"31 天零 23 小时"，然后在精确比较的接口（robot.statistic.summary）
       // 上撞 14004 —— 而它无从知道是自己把上界理解松了。
       max_window_days:
-        '时间跨度上界（天），**按精确比较理解**：必须 `end - start <= max_window_days * 86400000` 毫秒。' +
+        '时间跨度上界（天），**按毫秒精确比较**：`end - start` 不得超过 `max_window_days * 86400000`。' +
         '不要按"向下取整"切到 N 天零若干小时 —— 部分接口（robot.statistic.summary）会拒绝。' +
+        '⚠️ 边界开闭**随接口而变**：报表族实测恰好等于上界可接受；export.session 实测**恰好等于也会被拒**' +
+        '（14004 Timestamp interval limit，上界减 1ms 通过）—— 对它必须严格小于。拿不准时留出余量。' +
         '未输出该键的接口没有已知上限',
       // ⚠️ category 的**来源与稳定度**都必须说清：它是 Apifox 文档目录路径，
       // 不是厂商 API 契约的一部分。不说清，Agent 会把它当稳定枚举去写分支逻辑
@@ -459,7 +464,8 @@ async function schema(argv: string[]): Promise<number> {
           + '非鉴权的 query 参数只出现在不可主动调用的入站接口上；`path` = 路径占位符 —— 本 CLI 不做占位符替换，'
           + '带 path 参数的接口也都不可主动调用；`header` = 请求头 —— 现注册表里只有 content-type，由 CLI 固定发送。'
           + '⚠️ 不要把非 body 参数塞进 --body —— 只有该接口有 JSON body 参数表（has_body_schema=true）'
-          + '且未加 --no-validate 时才会得到 unknown_field 提示；其余情形它会被原样发出、服务端大概率忽略'
+          + '且未加 --no-validate 时才会得到 unknown_field 提示；其余情形它照样随请求发出（不做字段检查；'
+          + '整条 body 仍会被 JSON.stringify 重写为紧凑 JSON，不是逐字节原样）、服务端大概率忽略'
           + '（别把「返回成功」当成「字段生效了」）',
         'params[].type': '参数类型（string/integer/array/object/boolean/number）。⚠️ 只有该接口 `body_kind=json`、'
           + '`in=body` 且本次传入的字段会被 api call 比对：类型不符是软告警（integer 要求整数，1.5 也判不符），'

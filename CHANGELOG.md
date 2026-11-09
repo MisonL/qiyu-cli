@@ -122,6 +122,155 @@
 
 ### 修复
 
+- **真实凭证端到端实测发现的会话导出两处硬故障 + 契约诚实性收敛（2026-11-07/08 多代理审计，每条发现先复现再改）**：
+
+  **真实采样复现（此前从未端到端跑通过 `sync run sessions.export`）**：
+  · **恰好 144.0 小时的窗口被服务端拒绝**：引擎 Range 是半开 `[start, end)`，
+    `sessions.export` 却把 `w.end` 原样发给导出接口，跨度恰为 `6 × 86400000 = 518400000ms`
+    —— 实测 `14004 Timestamp interval limit`，而 `518399999ms`（143.9999h）通过。
+    修复前两窗全部 `fetch_failed`、水位冻结、一行不落；修复后 `fetchSessions` 按
+    「半开 → 闭区间」映射发 `end − 1`，fixture 核对与 gap 文案统一改用实际请求窗口。
+    **端到端复跑**：两窗全成功、32,497 行落库、零 gap、水位推进到请求末端。
+    注册表 `export.session` 的 note、`max_window_days` 图例与类型注释同步写明
+    「边界是开的，必须严格小于」；`14004 Timestamp interval limit` 从兜底 `param`
+    （「核对字段名与类型」的假归因）改判 `window_too_large` 并给可执行的「严格小于」hint。
+  · **导出 zip 的条目名带不可预测的导出 id 前缀**：真实 zip 是
+    `5411798/session.txt`，中央目录精确匹配 `session.txt` 永远落空 —— 第二个窗口
+    全部报「没有 session.txt 条目」。改为**按基名**匹配，基名重复时显式拒绝
+    （形态漂移，不猜用哪一条）；真实 zip 上实测解压 112,829,042 字节、7679 行，
+    尾部标记与请求窗口吻合。
+  · **`max_window_days` 只说「`<=` 即安全」、报表族与导出族边界开闭相反**：图例改为
+    「按毫秒精确比较，但边界开闭随接口而变」并点名 export.session；`api call` 的用户
+    不会再切回「恰好 6 天」这个必失败的边界。
+
+  **其余审计发现（每条都有复现出处与回归守卫）**：
+  · **无子命令的四个命令族把帮助当成功输出**：`store / db / stats / sync` 无子命令时
+    裸文本进 stdout、退 0，与顶层及 `api / auth` 的 `usageFail`（退 2 + JSON）相反；
+    统一为用法错误，并给「可用子命令」hint。
+  · **`--pretty` 写反位置在五个命令族说法矛盾**：`db --pretty tables` 说「未知参数：
+    tables」（tables 明明是已知子命令），别的命令说「必须写在子命令之后」；收敛到
+    `prettyAfterSubcommand` 单一渲染点，位置参数一律按「顺序写反」引导。
+  · **`api call` 的 `data` 图例谎称「原样透传、不改写」并指向不存在的响应字段表**：
+    信封 M 会 trim、形状 C 的畸形 JSON 键先修复再解析；`api schema` 只有请求参数与
+    信封种类，没有响应字段表。`non_json_body` 告警也不再说「按原样字面量发送」——
+    `--body` 一律 JSON.parse → JSON.stringify、Content-Type 恒 application/json，
+    且按 `bodyKind === 'none'` 分形（该接口不接收 body，服务端多半忽略）。
+  · **`sync tasks` 的水位图例把请求端点说成库表列**：`op_end` 等字段不在
+    `tickets / ticket_logs` 表里，图例改为「请求参数里的时间端点」并保留
+    「同名字段形状随命令不同」的提醒。
+  · **`statSync` 失败一律说「检查权限」**：实测还有 `ELOOP` / `ENOTDIR` /
+    `ENAMETOOLONG` 三种成因；`statFailureHint(errno)` 按 errno 分形，未归类如实说
+    「未专门归类」，不猜。
+  · **他人库的 `schema_version` 表骗过前置检查**：探针实测
+    `schema_version(version_id, applied_at)` 放行后落 internal「备份重建」——
+    把「不是本 CLI 的库」说成损坏缓存。`db / store / sync` 三处共用
+    `SCHEMA_VERSION_COLUMNS_SQL` 查列名，缺 `version` 列即显式「换 --db 路径」。
+  · **`--db` 相对路径按 HOME 解析却无人告知**：顶层与五个命令族 `--help` 统一经
+    `DB_PATH_HELP` 单一出处写出「不是当前目录」；与调度条目固化路径的设计取舍同源。
+  · **`fail()` 漏净化 `code`**：服务端回 `code:"\u009b31mX"`（CSI）时控制字节原样进
+    stdout；补上与 message/hint/target 同一条最终防线。
+  · **`retryStrategy` / `fallback` 的注释仍说「本计划不填 / query 不存在」**：G1 已
+    实现「有本地表映射且库文件存在时填」，注释改实况并写明不承诺表非空/覆盖窗口。
+  · **查询掩码词法器的三个缺口**：双引号标识符内容、美元引号字符串（`$$…$$` /
+    `$tag$…$tag$`）、以及 `--` 注释在 `\r` 处终止 —— 补词法分支并加 3 条可区分的
+    变异用例（其中美元引号用例两度重写到「移除分支必红」才定稿）。
+  · **`SUMMARIZE <表>` 绕过 PII 掩码（严重）**：输出列是通用的 `column_name / min / max`，
+    真正的列名在**行值**里，三条列名级启发式全部落空 —— 实测 `userName` 的
+    `min:"张三丰"`、`max:"李四光"` 明文输出且零警告。行级补「形状 + 基名命中」判据，
+    命中行的统计列按该列规则脱敏并计入结构性命中（不再被误报成「业务数字被误改」）。
+    **Codex 复审（2026-11-08）又抓出该补丁自身的四条回归，逐条探针复现后修复**：
+    ① 值级兜底已整段替换的 JSON 被列规则重新降级 —— 紧凑 JSON 整串命中邮箱正则，
+    `@` 之后（含 `secret` 字段）明文回归（P1）；② 形状判据只看输出列名，
+    `SELECT column_name, MIN(ordinal_position) … FROM information_schema.columns`
+    的数字 `min` 被误改成 `<已脱敏>`（P2）；③ 列级 `structuralMasked` 让混合结果里
+    非敏感行（`session_id` 的 min 恰为手机号形态）的误伤告警静默消失（P2）；
+    ④ 美元引号识别没查标识符边界，`marker$q$` 这类合法别名被当成引号对，
+    把中间的 `GROUP BY` 抹掉 → 分组失真警告丢失（P2）。修复后补 7 条回归用例
+    （含「对照组必须有警告」的反向判据），**四条变异逐一转红**。第二轮复审追加：
+    ⑤ 关键词判据作用在原始 SQL 上，字符串/注释里的 `'SUMMARIZE'` 同名词会误触发
+    形状（合法元数据查询被改值）→ 改判**剥除字面量与注释后**的词法文本，
+    `query('SUMMARIZE …')` 嵌套形态单独判（P2）；⑥ `14004 Timestamp interval limit`
+    的 hint 把成因说死成「跨度超限」，而设计稿 §7.5 明载 `start>end` / `start==end` /
+    超限三成因共码不可区分 → hint 改为「最常见成因」并给出第二成因的核对动作
+    （CodeRabbit minor）。第三轮复审追加：⑦ 关键词/嵌套调用判据仍扫原始 SQL ——
+    注释里的 `query('SUMMARIZE sessions')`、双引号别名 `"SUMMARIZE"` 都会误触发；
+    关键词改判 `bareKeywords`（单/双引号、美元引号、注释全剥）的裸 token，嵌套调用
+    改为「裸 token 定位 query( → 回原文读字符串实参」（P2）；⑧ 美元引号边界判据是
+    ASCII-only 字符类，DuckDB 实测接受 `1 AS 列$q$` 这类非 ASCII 标识符，两个 `$q$`
+    又被当成引号对 → 字符类扩到 `\p{L}\p{N}\p{M}`（P2）。第四轮复审追加：
+    ⑨ `query(/* gap */ '…')` 与 `query(E'…')`（DuckDB 实测均合法）漏检 →
+    跳过注释、识别字符串前缀（P1，漏检意味着 PII 统计值原样输出）；⑩ 七个命令族的
+    `--pretty` 分派分支只查未知 flag，位置参数里的拼错子命令名被 `--help` 静默吞成
+    退出码 0（`api --pretty typo --help`）→ 新增共享判据 `prettyPositionalProblem`
+    （拼错词在 help 前拒绝，合法子命令名仍走顺序写反引导），七族接入
+    （CodeRabbit/Codex 同指）。第五轮 minor 再收敛判据边界：第一个裸位置 token 之后
+    的 token 属子命令自己的参数域（`db --pretty describe sessions --help` 的
+    `sessions`），flag **取值**（`--db /tmp/x` 的 `/tmp/x`）也不是位置参数 ——
+    判据只查第一个裸位置 token，并按 FlagSpec 跳过值位（否则 `sync --pretty
+    --db /tmp/x status --help` 会把取值误判成拼错词，退化成退出码 2）。
+    第六轮复审追加（Codex 3 条 P2）：⑪ `SUMMARIZE` 是**语句头关键字**而非任意裸词 ——
+    `SELECT 0 AS SUMMARIZE, …` 是 DuckDB 实测合法别名，按裸词判会误改元数据数字；
+    判据要求前面是文首/`(`/`;`（P2）；⑫ `query('…')` 实参要先解码、再对**内层 SQL**
+    跑同一词法判据 —— 内层注释里的 `SUMMARIZE` 此前会误触发（P2）；⑬ 美元引号标识符
+    边界要按**完整码点**判 —— 补充平面字母 `𝒜`（U+1D49C，代理对被 `text[i-1]` 截断）
+    与货币符号 `¢`（U+00A2）都是 DuckDB 实测合法标识符字符（P2）。
+    五轮共 17 条回归用例、13 处变异转红。
+    **2026-11-09 第 6–12 轮双路复核（SUMMARIZE 词法判据的七轮结构性收窄）**：
+    CodeRabbit/Codex 十二轮复审发现 28 条新缺陷，每次均探针复现后再修复：
+    ⑭ 重投影缺口静默（minor）：输出列名被 `AS` 改写（`column_name AS c`）时行级判据不触发
+    且其余警告也不发 — 补「可能未脱敏」缺口（CodeRabbit 六轮）；⑮ 完整标识符边界 + 完整码点
+    + 嵌套块注释 + 双引号别名文本不得参与聚合 + U+2028 标识符字符（P2：Codex 六轮）；
+    ⑯ 深层子查询 `FROM (SELECT * FROM (SUMMARIZE …))` 的合法 SUMMARIZE 输出同样明文漏出
+    → 补 `unrecognizedParen` 缺口（major：CodeRabbit 七轮）；⑰ `query()` 输出路径与 E-string
+    解码 —— `WHERE EXISTS` 里的 SUMMARIZE 只参与过滤、输出是常量 3，按全 SQL 判据脱敏会把
+    常量篡改 → `atTopOutput` 位置信号，非输出路径只发缺口（P2：Codex 七轮）；⑱ 自连接重名列
+    后缀配对（minor：CodeRabbit 八轮）；⑲ 统计列投影来源核验 —— `3 AS min`/`COUNT(*) AS min`/
+    `'not PII' AS min`/省略 AS 的 `3 min`/前置别名 `min: 3`/UNION 追加普通行/重排自连接后缀错配
+    → 行级脱敏收窄为白名单（P2×6：Codex 八~九轮）；⑳ 大小写误配：`staff.username` 匹配
+    `sessions.userName` → 只在下 TableDef 大小写不敏感查列时放宽（major + P2：CR 九轮
+    + Codex 九轮）；㉑ 星号多来源（`*` + CROSS JOIN）与 `query()` 来源验证（minor + P2×2：
+    CR 十轮 + Codex 十至十一轮）；㉒ 显式列举路径也要求单一 `(SUMMARIZE …)` 来源
+    （P2：Codex 十一轮）；㉓ 第十二轮结论性收窄：**行级脱敏只保留两类可静态证明的形态**
+    —— `SUMMARIZE <表>`（语句头）与 `SELECT * FROM (SUMMARIZE <表>)`（单一来源无 JOIN/
+    逗号/列别名列表）；`query(…)` 包装、显式列举、集合操作、FROM-first、`*`+多来源、
+    全部降级为「声明缺口、不改写任何值」（上述 28 条缺陷每条都是同一个根因：
+    「猜来源」在更复杂的 SQL 组合下总能被构造出新反例，真机 probe17 钉死边界）。
+    收窄后自查补一处静默缺口：`query()` 内层被**显式重投影**
+    （`query('SELECT column_name, min FROM (SUMMARIZE sessions)')`）时内层不满足纯透传，
+    旧接线既不置 hit 也不置 gap → 外层一条 SUMMARIZE 警告都不发；现统一由
+    `queryCall.gap` 兜住，缺口文案改为「无法确认是否构成最终输出」以覆盖「位置已知但投影不可证明」。
+    73 条 mask 用例全绿；引用 mask 的 3 个测试文件共 145 用例全绿。
+  · **SUMMARIZE 缺口 + schema_version 列名大小写（2026-11-09 第十三轮双路复核）**：
+    ㉔ 位置无法确认的嵌套 SUMMARIZE 若列名被改写
+    （`SELECT * FROM (SELECT column_name AS c, min AS m, max AS x FROM (SUMMARIZE sessions))`、
+    CTE 写法）既不满足位置档的 `shapeColumns`、也不满足改写档的 `summarizeSql` →
+    `warnings=[]` 明文漏出（major：CR）；现按「位置无法确认 **且** 输出不是可证明透传」补缺；
+    ㉕ `schema_version` 列名按**大小写精确**比较，把 `"VERSION"`/`"Version"` 这类 DuckDB
+    照样能解析的库判成「不是本 CLI 创建的」、挡住全部读命令（P2：Codex；真机实测带空格的
+    `" version"`/`"version "` 确实解析失败，只有大小写变体不可区分）→ 改为大小写不敏感。
+    **第十四轮（CodeRabbit minor×2）**：㉖ `query($$SUMMARIZE sessions$$)` / `query($q$…$q$)`
+    美元引号实参被实参扫描跳过（只认单引号）→ hit/gap 双假、一条 SUMMARIZE 缺口都不发；
+    实参扫描与 `withoutLiterals` 收敛到同一个 `dollarQuoteEnd` 扫描点（判据只许一个实现点）；
+    ㉗ 自连接重排用例的行键写成 `column_name_1` 而列名是 `column_name:1`，`name in out` 为假 →
+    `:1` 列从未进入脱敏，用例没覆盖它声称的场景。
+    73 条 mask 用例 + 15 条前置检查用例全绿，两处修复均做撤销即红的变异验证。
+  · **`api call --help` 对 `--no-validate` 的描述大于实现**：CLI 级安装提示（skill
+    未安装等）不受该开关影响、照旧出现在 warnings；帮助文字改为精确表述。
+  · **分页响应首页有 total、后续页缺 total 时静默短读**：旧逻辑清空 declared 并
+    break，短读终检永不执行；改为抛「响应形态漂移，拒绝落库」。
+  · **systemd ExecStart 与 crontab 对同一参数的转义不一致**：`--profile o'brien`
+    的裸单引号在 systemd 解析里会被当引号符切开命令行；`systemdArg` 改为单引号
+    也触发双引号包裹（多载体转义契约的第 4 个载体）。
+  · **`store status/internal` 的恢复 hint 自指**：失败命令本身就是 `store status` 时
+    让 Agent 重跑刚失败的命令；改为「换 --db 验证 + 备份后经渲染器重建」，恢复命令
+    一律经 `storeInitCommand` / `syncRunCommand` 渲染并写明占位符替换契约。
+
+  **验证**：`npm run typecheck` 0；全量 2 分片 `--maxWorkers=1` 全绿（52 + 51 文件，
+  1252 / 1207 用例）；`npm run build` 0；`npm run check:pack` 通过（238 文件）。
+  行为修复逐条变异验证（请求映射、错误分类、zip 基名匹配、词法分支、errno 分形、
+  列检查、图例与帮助守卫等），变异均转红、恢复均转绿；本轮新写的 internal hint
+  曾触发 `BARE_HINT` 漂移守卫，已按渲染器口径修正并复测。
+
 - **skill / 凭证 / CLI 输出的三十八处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
 
   · **`skill install` 与 `where` / `check` 对「受管文件集」的口径分叉**：install 把用户额外

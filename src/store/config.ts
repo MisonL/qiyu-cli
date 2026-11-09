@@ -226,6 +226,11 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
     : assertPositiveInt(storeBlock.batchSize, `profiles.${profileName}.store.batchSize`, 100_000)
 
   // 相对路径（内置默认 relPath）按 home 解析；~ 前缀展开为 home（M-6）
+  // ⚠️ 刻意不按 cwd 解析（2026-11-07 审查）：`--db` 的值会被固化进**调度条目**
+  //（sync install），而调度任务的 cwd 不一定是安装时的 cwd；相对 HOME 是唯一在
+  // 交互与调度两侧稳定一致的基准。代价是与其他命令「相对路径按 cwd」的直觉相反 ——
+  // 所以各命令的 --help 必须写明这一点（`DB_PATH_FLAG_HELP`），否则 Agent 会以为
+  // `--db data/q.db` 指向当前目录，实际建到了 ~/data/q.db。
   const expanded = expandHome(rawPath, home)
   const finalPath = isAbsolute(expanded) ? expanded : join(home, expanded)
 

@@ -57,7 +57,36 @@ export function nonRegularFileHint(isDirectory: boolean): string {
 }
 
 /**
- * 只读命令的库前置检查（`statSync` 的 ENOENT / 权限 / 非普通文件三分）。
+ * `statSync` 失败（ENOENT 之外）的 hint —— **按 errno 分形**。
+ *
+ * ⚠️ 2026-11-07 审查实测：此前所有非 ENOENT 错误一律说「请检查路径权限」，
+ * 而实测 `statSync` 的失败原因至少还有三种，逐字报文（macOS）：
+ *   · `ELOOP: too many symbolic links encountered`（`ln -s loop loop`）
+ *   · `ENOTDIR: not a directory`（`plain.txt/child`）
+ *   · `ENAMETOOLONG: name too long`（300 字符路径）
+ * 这三种都不是权限问题 —— 让 Agent 去查权限，它会在一个没有权限问题的地方白找一轮。
+ * 判据只问「能不能 stat」，成因必须由 errno 说出来。
+ * 未归类的 errno 如实说「未专门归类」，不猜成权限。
+ */
+export function statFailureHint(errno: string | undefined): string {
+  switch (errno) {
+    case 'EACCES':
+    case 'EPERM':
+      return '请检查路径权限（只读命令不需要写权限）'
+    case 'ELOOP':
+      return '路径中存在符号链接成环（ELOOP），stat 无法解析 —— 请改用真实路径，或先修掉循环链接'
+    case 'ENOTDIR':
+      return '路径中有一段不是目录（ENOTDIR）—— 请检查 --db 的拼写（它可能把文件当成了目录）'
+    case 'ENAMETOOLONG':
+      return '路径过长（ENAMETOOLONG）—— 请缩短 --db 路径'
+    default:
+      return `无法访问该路径（errno=${errno ?? '未知'}）：本 CLI 只按 errno 归类了权限 / 链接成环 /`
+        + '路径中有非目录段 / 路径过长四种，其余请按报文里的系统错误码定位'
+  }
+}
+
+/**
+ * 只读命令的库前置检查（`statSync` 的 ENOENT / 非普通文件 / 其余 errno 三分）。
  * 合格（是一个普通文件）→ `null`，调用方继续打开库。
  *
  * hint 一律指向 `qiyu store init` 的**完整命令**（带本次 `--db` 绝对路径）——
@@ -76,7 +105,7 @@ export function statGuard(path: string): number | null {
     return fail({
       code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
       message: `无法访问 ${path}：${e instanceof Error ? e.message : String(e)}`,
-      hint: '请检查路径权限（只读命令不需要写权限）',
+      hint: statFailureHint((e as { code?: string }).code),
     })
   }
   if (!st.isFile()) {
@@ -156,17 +185,48 @@ export function storeTablesWarnings(
 }
 
 /**
+ * 查 `schema_version` 表列名的 SQL —— **唯一字符串**（db/store/sync 三个调用点共用，
+ * 各自经自己的会话执行；判据本体在 `schemaVersionMissing`）。
+ */
+export const SCHEMA_VERSION_COLUMNS_SQL =
+  "SELECT column_name FROM information_schema.columns WHERE table_schema='main' AND table_name='schema_version'"
+
+/**
  * 库结构校验：已有 `schema_version` → `null`；否则给出**按成因分形**的失败载荷。
  *
  * ⚠️ **成因必须分形**：「有表但无 `schema_version`」是**他人库** —— `store init` 会再次
  * 拒绝（`store/duckdb.ts` 的他人库防线），把它一并引导向 `store init` 就是
  * `store init` → 原命令的死循环；「零表」才是 `init` 可补的成因。
  *
+ * ⚠️ **表名不是身份证明**（2026-11-07 审查实测）：别的工具也会建叫 `schema_version`
+ * 的表。探针实测 `schema_version(version_id, applied_at)` 的库：旧判据放行，`store status`
+ * 落 internal「存储操作失败（底层：Binder Error: … version not found）」+「备份重建」hint
+ * —— 把一个只是**不是本 CLI 的库**说成损坏缓存。调用方用 `SCHEMA_VERSION_COLUMNS_SQL`
+ * 查到列名后传 `versionColumns`；**没传**时保持旧判据（不猜）。
+ *
  * ⚠️ 返回载荷而不是自己 `fail()`：调用方失败前还得先关掉自己持有的会话
  * （`openSandbox` 的 session / `openStore` 的 store），关会话是调用方的所有权责任。
  */
-export function schemaVersionMissing(path: string, names: readonly string[]): ErrorInput | null {
-  if (names.includes('schema_version')) return null
+export function schemaVersionMissing(
+  path: string, names: readonly string[], versionColumns?: readonly string[],
+): ErrorInput | null {
+  if (names.includes('schema_version')) {
+    // ⚠️ 列名比较必须与 DuckDB 的解析规则一致（Codex 2026-11-09 第十三轮 P2，真机实测）：
+    // `CREATE TABLE schema_version ("VERSION" INTEGER, …)` 反射出 `VERSION`/`Version`，
+    // 而 `SELECT MAX(version)` 照样解析成功 —— 旧的小写精确比较会把**可用的库**判成他人库、
+    // 挡住全部读命令。反例同样实测过：带空格的 `" version"` / `"version "` 与 `version_id`
+    // 确实解析失败，只有大小写变体不可区分。
+    if (versionColumns !== undefined
+      && !versionColumns.some((c) => c.toLowerCase() === 'version')) {
+      return {
+        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
+        message: `目标数据库不是本 CLI 创建的（schema_version 表缺少 version 列，`
+          + `实际列：${versionColumns.join('、')}）：${path}`,
+        hint: '目标数据库不是本 CLI 创建的，请换 --db 路径',
+      }
+    }
+    return null
+  }
   return {
     code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
     message: `数据库结构不完整（缺表）：${path}`,

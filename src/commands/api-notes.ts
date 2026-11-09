@@ -11,14 +11,19 @@
 // 恰恰是最容易被误读的一个 —— 它是本输出里唯一来自上游的键。
 export function callFieldNotes(): Record<string, string> {
   return {
-    data: '上游响应解包后的载荷：本 CLI 按信封形状取出 data / result / staffInfo 等键，'
-      + '取出后原样透传、不改写不脱敏。字段含义用 `qiyu api schema <id>` 查，'
-      + '不要按其他命令 data 的形状推断',
+    data: '上游响应解包后的载荷：本 CLI 按信封形状取出 data / result / staffInfo 等键'
+      // ⚠️ 不能说「原样透传、不改写」（2026-11-07 审查实测）：形状 M 的载荷在透传前被
+      // trim()，形状 C 的畸形 JSON 先经 repairUnquotedIntKeys 修复再解析。
+      // ⚠️ 也不能让读者去 `api schema` 查响应字段：它只有请求侧 params 与
+      // `response_shape:{kind}`，没有任何响应字段表（2026-11-07 审查）。
+      + '（信封形状 M 会 trim 首尾空白，形状 C 的畸形 JSON 键会先被修复再解析）。'
+      + '⚠️ 本 CLI 没有响应字段表：`qiyu api schema` 只给请求参数与信封种类，'
+      + '各字段的确切含义以七鱼官方文档为准，不要按其他命令 data 的形状推断',
     endpoint: '本次调用的接口 id（把结果与请求对上用）',
     warnings: '⚠️ 这是多来源数组，元素形状不统一：'
       + '① body 校验的软告警（对象，含 `kind` / `message`），'
       // ⚠️ `field` **不保证**存在（Sourcery 指出）：`non_json_body`（body_kind 非 json 时
-      // 照原样发字面量）是**整条请求**级的提示，没有单一字段可归因 —— 它只带 `kind` 与
+      // 整条请求级的提示 —— 传输层仍按 JSON.stringify 发 JSON 字节，不是该编码的原文）是**整条请求**级的提示，没有单一字段可归因 —— 它只带 `kind` 与
       // `message`。消费者按 `w.field` 取值会拿到 `undefined`。
       + '`field` 仅在告警属于某个具体字段时出现（如 `unknown_field` / '
       + '`type_mismatch` / `alias_normalized`），`non_json_body` 这类整条请求级的提示没有它，'

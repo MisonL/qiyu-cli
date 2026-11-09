@@ -462,10 +462,13 @@ describe('api list', () => {
     // code 只是标签"（2026-10-08 补）：此前那句说明只写进了顶层 `USAGE`，
     // 而「已知缺口」段却声称三处都写了 —— 现在三处都写上，并各有一条断言钉住。
     expect(out, 'API_USAGE 必须告知按 kind 分支').toMatch(/按 kind 分支/)
-    // ⚠️ `--no-validate` 的实际范围**不止校验**：它还关闭别名改写与 warnings（spec §九 验收 19）。
-    // 旧 usage 只写「关闭 body 校验」，Agent 会以为别名仍然生效 —— 说法与行为不符即契约不诚实。
-    expect(out, '--no-validate 的说明必须点明它同时关闭别名改写与 warnings')
-      .toMatch(/--no-validate\s+完全关闭 body 校验、别名改写与 warnings/)
+    // ⚠️ `--no-validate` 的实际范围：关闭 body 校验（含硬拒）与别名改写，但**关不掉全部
+    // warnings** —— skill 安装态提示经 `ok()` 的 mergeSkillWarning 照旧进 meta.warnings
+    // （2026-11-07 审查实测：旧文案「完全关闭 …warnings」与 api-notes 的「② 照旧出现」矛盾）。
+    expect(out, '--no-validate 的说明必须点明它关闭 body 校验与别名改写，且不能承诺 warnings 全关')
+      .toMatch(/--no-validate\s+关闭 body 校验与别名改写/)
+    expect(out, '--no-validate 的说明不得再声称 warnings 被完全关闭')
+      .not.toMatch(/--no-validate\s+完全关闭/)
     // ⚠️ `--help` 不吞额外参数（2026-10-08 修）：此前 `api --help --bod` /
     // `api --help extra` 返回 0，把拼错的 flag / 多余的位置参数静默吞掉
     // （`api --bod` 单独跑是 2）。与叶子命令同一条次序：未知/位置参数 → help。

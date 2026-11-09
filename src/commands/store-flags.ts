@@ -15,6 +15,17 @@ import { STORE_FLAGS } from './spec-types.js'
 
 export interface StoreFlags { db?: string; profile?: string; backend?: string }
 
+/**
+ * `--db` 的相对路径语义 —— 各命令 `--help` 里那句话的**唯一出处**。
+ *
+ * ⚠️ 为什么必须写出来（2026-11-07 审查）：`--db` 的相对路径按 **HOME** 解析
+ * （`store/config.ts` 的 `resolveStoreConfig`，默认库 relPath 依赖它），而用户对
+ * 普通命令的相对路径直觉是 **cwd** —— 两条相反的直觉同时成立，`--help` 不提，
+ * Agent 会把 `--db data/q.duckdb` 当成「当前目录下的库」，实际解析到
+ * `~/data/q.duckdb`。绝对路径与 `~` 开头不受影响，提醒要短，但要提到 `~` 也会展开。
+ */
+export const DB_PATH_HELP = '--db 相对路径按 HOME 解析（不是当前目录）：data/q.db 即 ~/data/q.db'
+
 /** 值位 flag 名（`--db` 等，带 `--`），顺序沿 `STORE_FLAGS`。 */
 export const STORE_VALUE_FLAG_NAMES: readonly string[] = STORE_FLAGS.map((f) => f.name)
 

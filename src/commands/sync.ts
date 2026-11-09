@@ -27,7 +27,7 @@
 import { homedir } from 'node:os'
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { statGuard, schemaVersionMissing } from './store-precheck.js'
+import { SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing } from './store-precheck.js'
 import { SYNC_TASKS, taskById, UNSUPPORTED_DATASETS } from '../sync/registry.js'
 import { listGaps, listWatermarks } from '../sync/state.js'
 import type { SyncTask } from '../sync/types.js'
@@ -47,9 +47,9 @@ import {
 } from '../schedule/install.js'
 import type { Platform } from '../schedule/install.js'
 import type { Store } from '../store/types.js'
-import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
+import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
-import { STORE_VALUE_FLAG_NAMES } from './store-flags.js'
+import { DB_PATH_HELP, STORE_VALUE_FLAG_NAMES } from './store-flags.js'
 import { nonEmptyValue } from '../core/config.js'
 
 /** `sync install` 的业务 flag。 */
@@ -142,6 +142,7 @@ const USAGE = `用法：qiyu sync <子命令> [参数]
 
 CRON 为 5 段（分 时 日 月 周），支持 * / 数字 / a-b / a-b/k / */k / 逗号列表。
 存储定位：--db / --profile / --backend（store 命令同族）。
+${DB_PATH_HELP}
 install 的平台形态：darwin=launchd plist、linux=systemd unit+timer（crontab 兜底）、
 win32=schtasks。安装前置：库已初始化且至少成功同步过一次（sync_state 有
 range_status=complete 或 last_synced_at 非空的行；全败的 run 只留 pending，不算跑通）。
@@ -226,14 +227,21 @@ function resolveConfig(flags: StoreFlags): {
 /** 只读命令的库前置检查（statSync 分流沿 store status；hint 统一指 store init，spec §九）。 */
 
 /** 打开 ro 库；结构不完整（缺 schema_version）视为「不是本 CLI 创建的库」。 */
-async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?: Store; code?: number }> {
+async function openRo(
+  config: Parameters<typeof openStore>[0], profileFlag?: string,
+): Promise<{ store?: Store; code?: number }> {
   let store: Store
   try {
     store = await openStore(config, 'ro')
-  } catch (e) { return { code: thrownToExit(e) } }
+  } catch (e) { return { code: thrownToExit(e, profileFlag) } }
   try {
     const names = await store.tables()
-    const missing = schemaVersionMissing(config.path, names)
+    // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：他人工具的 schema_version 可能没有
+    // version 列 —— 只认表名会让后续查询落 internal，把「不是本 CLI 的库」说成损坏。
+    const versionColumns = names.includes('schema_version')
+      ? (await store.query(SCHEMA_VERSION_COLUMNS_SQL)).rows.map((r) => String(r.column_name))
+      : undefined
+    const missing = schemaVersionMissing(config.path, names, versionColumns)
     if (missing !== null) {
       await store.close()
       // 成因分形在共享实现里（有表无 schema_version = 他人库 → 换路径；
@@ -243,7 +251,7 @@ async function openRo(config: Parameters<typeof openStore>[0]): Promise<{ store?
     return { store }
   } catch (e) {
     try { await store.close() } catch { /* 清理错误不掩盖原异常 */ }
-    return { code: thrownToExit(e) }
+    return { code: thrownToExit(e, profileFlag) }
   }
 }
 
@@ -283,7 +291,7 @@ async function syncStatus(argv: string[]): Promise<number> {
   } catch (e) { return failFromTagged(e) }
   const guarded = statGuard(resolved.path)
   if (guarded !== null) return guarded
-  const opened = await openRo(resolved.config)
+  const opened = await openRo(resolved.config, resolved.profileFlag)
   if (opened.code !== undefined || !opened.store) return opened.code ?? 1
   const store = opened.store
 
@@ -382,7 +390,7 @@ async function syncVerify(argv: string[]): Promise<number> {
 
   const guarded = statGuard(resolved.path)
   if (guarded !== null) return guarded
-  const opened = await openRo(resolved.config)
+  const opened = await openRo(resolved.config, resolved.profileFlag)
   if (opened.code !== undefined || !opened.store) return opened.code ?? 1
   const store = opened.store
 
@@ -523,7 +531,7 @@ async function probeSynced(
 ): Promise<number | null> {
   const guarded = statGuard(path)
   if (guarded !== null) return guarded
-  const opened = await openRo(config)
+  const opened = await openRo(config, profileFlag)
   if (opened.code !== undefined || !opened.store) return opened.code ?? 1
   const store = opened.store
   try {
@@ -715,7 +723,13 @@ async function syncUninstall(argv: string[]): Promise<number> {
 export async function syncCommand(argv: string[]): Promise<number> {
   setPretty(false) // G1：每条命令入口重置输出格式 —— 同一进程内多次 run（测试）不残留上一条命令的开关。
   const [sub, ...rest] = argv
-  if (sub === undefined || sub === '--help' || sub === '-h') {
+  // ⚠️ 无子命令 = 用法错误（退 2 + JSON）—— 见 store.ts 同款注释（2026-11-07 审查：
+  // 四个命令族曾与 `--help` 共用分支，裸文本进 stdout、退 0，与顶层和 api/auth 相反）。
+  if (sub === undefined) {
+    return usageFail(`用法：qiyu sync <tasks|run|status|verify|install|uninstall> [参数]`
+      + '（`qiyu sync --help` 查看全部）')
+  }
+  if (sub === '--help' || sub === '-h') {
     const problem = helpArgsError(rest, SYNC_SPECS.flatMap((sp) => sp.flags), '。--help 不接受额外参数')
     if (problem !== undefined) return usageFail(problem)
     process.stdout.write(USAGE)
@@ -724,19 +738,14 @@ export async function syncCommand(argv: string[]): Promise<number> {
   // G1：--pretty 是输出开关，必须写在具体子命令之后（`sync status --pretty`）。
   if (sub === '--pretty') {
     const problem = helpArgsError(rest, SYNC_SPECS.flatMap((sp) => sp.flags))
-    // 非 flag 的 token 在 `--pretty` 分支仍然是错误（没有子命令时它们是孤立参数）；
-    // 但 `--help` 存在时放行（帮助请求，见下一条判断）。
-    const positional = rest.includes('--help') || rest.includes('-h')
-      ? []
-      : rest.filter((a) => !a.startsWith('-'))
     if (problem !== undefined) return usageFail(`${problem}。--pretty 不接受额外参数`)
-    if (positional.length > 0) {
-      return usageFail(`未知参数：${describeArgs(positional)}。--pretty 不接受额外参数`)
-    }
+    const badPos = prettyPositionalProblem(rest, SYNC_SPECS)
+    if (badPos !== undefined) return usageFail(badPos)
     if (rest.includes('--help') || rest.includes('-h')) {
       process.stdout.write(USAGE)
       return 0
     }
+    // ⚠️ 位置参数一律按「顺序写反」引导（2026-11-07 审查）—— 见 db.ts 同款注释。
     return usageFail(prettyAfterSubcommand('sync'))
   }
   if (sub !== 'tasks' && sub !== 'run' && sub !== 'status' && sub !== 'verify'

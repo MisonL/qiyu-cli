@@ -249,6 +249,21 @@ describe('planInstall linux —— systemd unit + timer（crontab 兜底在 note
     expect(inner.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!.content)
       .toContain('--db /tmp/a;b.db')
   })
+
+  it('systemd ExecStart：值里的单引号必须转义（否则 systemd 把它当引号符，整条命令被切分）', () => {
+    // 2026-11-07 审查实测：`shellQuote` 只在含空白/双引号时才加引号，`--profile o'brien`
+    // 于是把裸 `'` 写进 ExecStart —— 而 systemd 的解析把 `'` 当引号符。同一参数在
+    // crontab 兜底行里经 `shellArg(v,'linux')` 正确转义，两个载体给出不同结果。
+    const p = planInstall('linux', '0 2 * * *', { home: HOME, exec: EXEC, storeArgs: ['--profile', "o'brien"] })
+    const svc = p.entries.find((e) => e.path.endsWith('qiyu-sync.service'))!
+    // 必须被双引号包住（否则裸 ' 被 systemd 当引号符）
+    expect(svc.content).toMatch(/--profile "o'brien"/)
+    // crontab 兜底行同一值：经 shellArg 后是 'o'\''brien'
+    const lines = p.entries.filter((e) => e.path.includes('cron'))
+    if (lines.length > 0) {
+      expect(lines[0]!.content).toContain("'o'\\''brien'")
+    }
+  })
 })
 
 describe('planInstall win32 —— schtasks 命令行', () => {
