@@ -553,7 +553,7 @@ function isIdentCp(cp: string): boolean {
  * 方向：把模棱两可的非 ASCII 字符按**标识符**处理（不认成引号开头）—— 误判成字面量会
  * 抹掉后续内容并让分组/缺口分析静默失效，误判成标识符只是少抹一段（该段是非法 SQL）。
  */
-function isIdentCharAt(text: string, i: number): boolean {
+export function isIdentCharAt(text: string, i: number): boolean {
   return isIdentCp(prevCodePoint(text, i))
 }
 

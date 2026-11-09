@@ -18,7 +18,7 @@
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, missingTableCauses } from '../query/errors.js'
-import { maskQueryRows, withoutLiterals, withoutComments } from '../query/mask.js'
+import { maskQueryRows, withoutLiterals, withoutComments, isIdentCharAt } from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
@@ -168,10 +168,16 @@ function isMiscomparedDayLiteral(v: string): boolean {
   const m = DAY_VALUE_RE.exec(v.trim())
   if (m === null) return false
   if (m[2] === undefined) return true                             // 纯日期
-  if (m[5] === undefined || m[6] === undefined) return true        // 没有小数秒或没有时区：不可能是列内形态
-  if (m[5].length < 3) return true                                 // 不足三位小数 ≠ 列内的 `.000`
+  // ⚠️ 命中了时刻但没给小数秒/时区时，分组是 `null`（不是 `undefined`）—— 两种都按「不是列内形态」
+  // 处理；只判 `undefined` 会让这种字面量一路走到最后返回 false（2026-11-10 回归发现）。
+  const frac = m[5] ?? null
+  const tz = m[6] ?? null
+  if (frac === null || tz === null) return true                    // 没有小数秒或没有时区：不可能是列内形态
+  // 只有恰好 `.000` 才是列内形态（Codex 2026-11-10 P2）：`.123` 这类字面量在字典序上会
+  // 排在 `…16:00:00.000Z` 之后、把当天行排除在外，旧判据（≥3 位即放行）会静默漏报。
+  if (frac !== '000') return true                                  // 列内形态恒为三位 `.000`（`.123` 在字典序上把当天行排除）
   if (m[2] !== '16' || m[3] !== '00' || m[4] !== '00') return true  // 不是 16:00:00 的 UTC 形态
-  return m[6] !== 'Z'                                              // `+08:00`/`+0800` 等一律错位
+  return tz !== 'Z'                                                // `+08:00`/`+0800` 等一律错位
 }
 
 /**
@@ -186,22 +192,47 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
   // 注释先抹成空白（逐位对齐）：注释里写的 `-- WHERE stat_date >= '…'` 不是真条件。
   const code = withoutComments(sql)
   if (!ISO_DAY_COL_RE.test(withoutLiterals(code))) return null
-  // 在「只抹注释」的文本上找孤立的**开引号**：字符串里的 `''` 与 `"…'…"` 标识符里的
-  // 单引号都不是开关引，跳过其整段。美元引号内容按原样保留，但它的开/闭 `$tag$`
-  // 不经过 `'` 分支，无需特判。
+  // 在「只抹注释」的文本上找孤立的**开引号**。`withoutComments` 原样保留双引号标识符与
+  // 美元引号体，所以这两段必须整体跳过（CodeRabbit 2026-11-10）：`SELECT "it's" …` 里的
+  // `'` 会被当成开引号、把后面的真实字面量吞进一个假字面量，警告静默丢失。
   for (let i = 0; i < code.length; i++) {
+    if (code[i] === '"') {
+      // 双引号标识符：`""` 是转义引号（与单引号串同款）
+      for (i++; i < code.length; i++) {
+        if (code[i] === '"') { if (code[i + 1] !== '"') break; i++ }
+      }
+      continue
+    }
+    // 标识符边界用 mask.ts 的同一判据（中文/补充平面字符都是合法标识符字符，
+    // 紧跟在它们之后的 `$` 属于标识符，不是美元引号开头）
+    if (code[i] === '$' && !isIdentCharAt(code, i)) {
+      // 美元引号体：`$tag$…$tag$`（形似引号却找不到配对结束符时按普通字符放行）
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(code.slice(i))
+      if (m !== null) {
+        const close = code.indexOf(m[0], i + m[0].length)
+        if (close !== -1) { i = close + m[0].length - 1; continue }
+      }
+    }
     if (code[i] !== "'") continue
-    const lit = readSingleQuoted(code, i)
+    const lit = readSingleQuoted(code, i, isEscapeStringAt(code, i))
     if (lit !== null && isMiscomparedDayLiteral(lit.value)) return isoDayLiteralHint(loc)
     if (lit !== null) i = lit.end - 1
   }
   return null
 }
 
-/** 读以 `start` 处开引号起的单引号字面量，返回解码后的内容与结束下标（`''` 是转义引号）。 */
-function readSingleQuoted(text: string, start: number): { value: string; end: number } | null {
+/**
+ * 读以 `start` 处开引号起的单引号字面量，返回解码后的内容与结束下标（`''` 是转义引号）。
+ * `escapeBackslash`（E 串 `E'…'`）时 `\'` 是转义引号、不结束字符串（DuckDB 实测，
+ * 与 `mask.ts` 的 withoutLiterals 同一规则；Codex 2026-11-10 P2：不认它会把 E 串后半段
+ * 当成字符串之外的内容，吞掉后面真实日字面量的开引号 → 漏报）。
+ */
+function readSingleQuoted(text: string, start: number,
+  escapeBackslash: boolean): { value: string; end: number } | null {
   let value = ''
   for (let j = start + 1; j < text.length; j++) {
+    // E 串里的反斜杠转义：`\x` 原样保留（判据不看这类内容，只要不提前结束即可）
+    if (escapeBackslash && text[j] === '\\') { j++; if (j < text.length) value += text[j]; continue }
     if (text[j] === "'") {
       if (text[j + 1] === "'") { value += "'"; j++; continue }
       return { value, end: j + 1 }
@@ -209,6 +240,11 @@ function readSingleQuoted(text: string, start: number): { value: string; end: nu
     value += text[j]
   }
   return null   // 不成对（解析错误由沙箱报），本警告不接管
+}
+
+/** `text[i]` 处的单引号是否是 E 串的开关引（前面紧跟、且只紧跟一个 ` E`/` e`）。 */
+function isEscapeStringAt(text: string, i: number): boolean {
+  return i >= 1 && (text[i - 1] === 'E' || text[i - 1] === 'e') && !isIdentCharAt(text, i - 1)
 }
 
 function isoDayLiteralHint(loc?: StoreLocation): string {
@@ -262,6 +298,10 @@ interface QueryFlags {
 
 function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
   const out: QueryFlags & { rest: string[] } = { noMask: false, groupBy: [], rest: [] }
+  // 值位 flag 重复出现必须报错（Codex 2026-11-10 P2）：此前只有 `parseStoreFlags` 拒绝，
+  // 而本解析器同样直接赋值 —— `query --db a --db b` 静默作用在后一个库上。
+  // `--group-by` 例外：它本来就允许重复（spec §六）。
+  const seen = new Set<string>()
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (VALUE_FLAGS.has(a)) {
@@ -274,6 +314,10 @@ function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
       //（与帮助模式的 `helpArgsError` 同源，2026-11-06 Codex 审查）。
       if (v === undefined || (DASH_VALUE_FLAGS.has(a) ? FLAG_TOKENS.has(v) : v.startsWith('--'))) {
         throw new Error(`${a} 缺少取值`)
+      }
+      if (a !== '--group-by') {
+        if (seen.has(a)) throw new Error(`${a} 重复出现：只能给一次（不做静默覆盖）`)
+        seen.add(a)
       }
       if (a === '--sql') out.sql = v
       else if (a === '--table') out.table = v

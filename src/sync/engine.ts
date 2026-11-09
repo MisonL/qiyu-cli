@@ -859,8 +859,10 @@ interface RotationPlan {
   windows: Range[]
   // 修复批 6 #2：残段窗（非日界首/末段）——不执行，但计入 total 并标 skipped。
   skippedResidual: Range[]
-  // 重叠压缩掉的窗数（skipContained 剔除）——计入 total 与 contained，不进 skipped。
+  // 重叠压缩掉的窗数（skipContained 剔除）——计入 contained，不进 skipped / total。
   containedCount: number
+  /** 末端钳制**之前**的切片窗（截短进度行的判据：start < limit < end）。 */
+  truncatedSource: Range[]
   // 2026-11-03：晚于末端上限被整窗丢弃的窗 —— 同样计入 total/skipped（不得静默消失）。
   droppedByClamp: Range[]
   lock: { by: string; at: string }
@@ -897,6 +899,7 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
     : sliceForTask(task, resolvedRange, task.maxWindowDays)
   // 末端上限之外的窗整窗丢弃 → 与 runWindowed 同口径：计数可见 + 进度行（见那边的注释）。
   const droppedByClamp = rawWindows.filter((w) => w.start >= limit)
+  const truncatedSource = rawWindows
   const clamped = clampWindowEnd(rawWindows, limit)
   const skippedResidual = clamped.filter((w) => isResidualWindow(task, w))
   const notResidual = clamped.filter((w) => !isResidualWindow(task, w))
@@ -912,16 +915,20 @@ async function planRotation(task: SyncTask, ctx: RunCtx, now: number): Promise<R
   if (windows.length === 0) {
     for (const w of skippedResidual) ctx.onProgress?.(residualNote(task, w))
     for (const w of droppedByClamp) ctx.onProgress?.(clampedAwayNote(task, w, limit))
-    return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, containedCount, lock, gaps: [],
+    for (const w of truncatedByClamp(truncatedSource, limit)) ctx.onProgress?.(clampedShortNote(task, w, limit))
+    return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, containedCount, truncatedSource, lock, gaps: [],
       succeeded: 0, failed: 0, fetched: 0, written: 0,
       contiguousEnd: null, contiguousBroken: false, resolvedEnd: null }
   }
   for (const w of skippedResidual) ctx.onProgress?.(residualNote(task, w))
   for (const w of droppedByClamp) ctx.onProgress?.(clampedAwayNote(task, w, limit))
+  // 截短提示（Codex 2026-11-10 P2）：考勤/绩效这类声明了 windowEndClamp 的任务在
+  // `sync run` 里**全部走轮转路径**，此前只有 runWindowed 出这句 —— 实际命令面看不到。
+  for (const w of truncatedByClamp(truncatedSource, limit)) ctx.onProgress?.(clampedShortNote(task, w, limit))
   await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
     await markPending(tx, task.id, state, lock)
   }))
-  return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, containedCount, lock, gaps: [],
+  return { task, state, resolvedRange: outRange, windows, skippedResidual, droppedByClamp, containedCount, truncatedSource, lock, gaps: [],
     succeeded: 0, failed: 0, fetched: 0, written: 0,
     contiguousEnd: null, contiguousBroken: false, resolvedEnd: null }
 }
@@ -944,6 +951,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
 
   const plans: RotationPlan[] = []
   for (const task of tasks) plans.push(await planRotation(task, ctx, now))
+
 
   try {
     const maxRounds = plans.reduce((m, p) => Math.max(m, p.windows.length), 0)

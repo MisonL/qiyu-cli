@@ -290,6 +290,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       if (v === undefined || v.startsWith('--')) {
         return usageFail(`${a} 缺少取值`)
       }
+      // 重复出现必须报错（Codex 2026-11-10 P2）：本命令自己解析这三个 flag（不走
+      // parseStoreFlags），此前直接赋值 —— `sync run --db a --db b` 静默作用在后一个库。
+      if (flags[a] !== undefined) return usageFail(`${a} 重复出现：只能给一次（不做静默覆盖）`)
       flags[a] = v
       i++
     } else if (RUN_BOOL_FLAGS.includes(a) || a === '--pretty') {

@@ -317,14 +317,50 @@ describe('query --sql · 成功路径（spec §十）', () => {
       "SELECT COUNT(*) AS n FROM daily_overview /* WHERE stat_date >= '2026-10-13' */")).toBe(0)
     expect(warned()).toBe(false)
 
-    // 反证 3：双引号标识符里含 iso-day 列名 + 真正的日期字面量 → 仍要警告（标识符是合法引用）
+    // 反证 3b（CodeRabbit 2026-11-10）：双引号标识符/美元引号体里的 `'` 不得被当成开引号、
+    // 把后面的真实字面量吞掉 —— 两种形态都必须仍报警
     expect(await q('--sql',
-      'SELECT "stat_date" FROM daily_overview WHERE "stat_date" >= \'2026-10-13\'')).toBe(0)
+      'SELECT 1 AS "it\'s" FROM daily_overview WHERE stat_date >= \'2026-10-13\'')).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT $$it's$$ AS x FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证 3c：标识符内部带 `$tag$` 形态（marker$q$）不得被当成美元引号开头 ——
+    // 美元引号判据的错误方向是「把真字面量一并跳过」，所以用一个**带日字面量**的 SQL 查
+    expect(await q('--sql',
+      'SELECT 1 AS marker$q$ FROM daily_overview WHERE stat_date >= \'2026-10-13\'')).toBe(0)
+    expect(warned()).toBe(true)
+
+    // 反证 3：双引号标识符里含 iso-day 列名 + 真正的日期字面量 → 仍要警告
+    //（裸 `"stat_date"` 会被当布尔条件、Binder 报错 —— 包进 CAST 才是合法查询）
+    expect(await q('--sql',
+      'SELECT CAST("stat_date" AS VARCHAR) AS d FROM daily_overview WHERE stat_date >= \'2026-10-13\'')).toBe(0)
+    expect(warned()).toBe(true)
+
+    // Codex 2026-11-10 P2 ①：非 `.000` 的毫秒字面量在字典序上排在 `…00.000Z` 之后，
+    // 会把当天行排除 —— 必须警告（旧判据「≥3 位小数即放行」会漏）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00.123Z'")).toBe(0)
+    expect(warned()).toBe(true)
+
+    // Codex 2026-11-10 P2 ②：E 串里的 `\'` 是转义引号、不结束字符串 —— 后面的真实字面量
+    // 不能被当成「字符串外」而漏报
+    expect(await q('--sql',
+      "SELECT E'it\\'s' AS x FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
     expect(warned()).toBe(true)
   })
 })
 
 describe('query --sql · 参数与错误分派（spec §十一）', () => {
+  it('值位 flag 重复出现 → usage（Codex 2026-11-10 P2：本命令的 parseFlags 此前静默覆盖）', async () => {
+    await seed()
+    expect(await q('--sql', 'SELECT 1', '--db', dbPath(), '--db', join(dir, 'b.db'))).toBe(2)
+    expect(String(errorOf().message)).toMatch(/--db 重复出现/)
+    expect(await q('--table', 'sessions', '--limit', '1', '--limit', '2')).toBe(2)
+    // --group-by 本来就是可重复的（spec §六），不得被这条守卫误伤
+    expect(await q('--table', 'sessions', '--group-by', 'staffId', '--group-by', 'session_type')).toBe(0)
+  })
+
   it('--sql 与 --table 互斥；都缺 → usage', async () => {
     await seed()
 

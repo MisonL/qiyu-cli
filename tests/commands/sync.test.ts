@@ -1748,6 +1748,11 @@ describe('修复批 2 · E 中-2/C-11：gap 区间与 resolved_range 同走上�
 })
 
 describe('区间语义与 notes（2026-11-10 审计）', () => {
+  it('sync run 的 --db 重复出现 → 用法错误（Codex 2026-11-10 P2：本命令自解析 flag，不走 parseStoreFlags）', async () => {
+    const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(), '--db', join(dir, 'b.db')])
+    expect(code).toBe(2)
+    expect(String(JSON.parse(out).error.message)).toMatch(/--db 重复出现/)
+  })
   it('--since 与 --until 同一天（都解析到 0 点）→ usage，hint 说明半开区间与日期语义', { timeout: 120_000 }, async () => {
     await fresh().then((s) => s.close())
     const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(),
