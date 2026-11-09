@@ -1304,16 +1304,30 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     })
     expect(noHit.rows[0]!.min).toBe(3)
 
+    // ⚠️ 内层必须**自身输出统计值**才脱敏（Codex 第十一轮 P2，真机 probe17）：
+    // `SELECT 'userName' AS column_name, 3 AS min … FROM (SUMMARIZE …)` 的内层输出是常量 3 ——
+    // 按统计值脱敏就是篡改普通值。改断言为「常量保持不变」；真统计来源用纯透传内层。
     const quoted = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 3, max: 4 }],
+      columns: ['column_name', 'min', 'max'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT * FROM query(E'SELECT ''userName'' AS column_name, 3 AS min, 4 AS max /* it\\'s */ FROM (SUMMARIZE sessions)')`,
+        tables: TABLES,
+      },
+    })
+    expect(quoted.rows[0]!.min).toBe(3)
+    // 纯透传内层（`SELECT * FROM (SUMMARIZE …)`）仍是真统计来源
+    const pureQuoted = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
       columns: ['column_name', 'min', 'max'],
       mode: {
         kind: 'sql',
-        sql: `SELECT * FROM query(E'SELECT ''userName'' AS column_name, 3 AS min /* it\\'s not a comment */ FROM (SUMMARIZE sessions)')`,
+        sql: `SELECT * FROM query(E'SELECT * FROM (SUMMARIZE sessions /* it\\'s */)')`,
         tables: TABLES,
       },
     })
-    expect(quoted.rows[0]!.min).toBe(FULL)
+    expect(pureQuoted.rows[0]!.min).toBe(FULL)
 
     const hexed = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
@@ -1325,6 +1339,33 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       },
     })
     expect(hexed.rows[0]!.min).toBe(FULL)
+  })
+
+  it('P2 来源核验：query 内层重投影、多来源与 query 来源一律不改写（Codex/CodeRabbit 第十一轮）', () => {
+    // probe17 真机实测：三条合法 SQL 的正常常量输出都被旧判据误改成 <已脱敏>。
+    const cases: Array<[string, Record<string, unknown>, string[], unknown, string?]> = [
+      // ① query() 实参是「SELECT 常量 FROM (SUMMARIZE …)」：内层输出不是统计值
+      //     → think 对应命中的是 query() 的「缺口」警告（SQL 使用了 query()/query_table()/COLUMNS()…），
+      //       不是 SUMMARIZE 的缺口
+      ["SELECT * FROM query('SELECT ''userName'' AS column_name, 3 AS min, 4 AS max FROM (SUMMARIZE (SELECT 1 AS userName))')",
+        { column_name: 'userName', min: 3, max: 4 }, ['column_name', 'min', 'max'], 3, 'query()/query_table()/COLUMNS()'],
+      // ② 显式列举但来自 JOIN 的 VALUES 侧（v.min / v.max）
+      ["SELECT v.column_name, v.min, v.max FROM (SUMMARIZE (SELECT 1 AS userName)) s CROSS JOIN (VALUES ('userName', 3, 4)) v(column_name, min, max)",
+        { column_name: 'userName', min: 3, max: 4 }, ['column_name', 'min', 'max'], 3],
+      // ③ `SELECT *` 多来源混 SUMMARIZE 与 query(普通 SELECT)（右侧 column_name:1/min:1）
+      ["SELECT * FROM (SUMMARIZE (SELECT 1 AS userName)) s, query('SELECT ''userName'' AS column_name, 3 AS min') q",
+        { column_name: 'userName', min: 1, 'column_name:1': 'userName', 'min:1': 3 },
+        ['column_name', 'min', 'column_name:1', 'min:1'], 1],
+    ]
+    for (const [sql, row, cols, expectMin, expectedWarn] of cases) {
+      const out = maskQueryRows({ rows: [row], columns: cols, mode: { kind: 'sql', sql, tables: TABLES } })
+      expect(out.rows[0]!.min, sql).toBe(expectMin)
+      if (expectedWarn) {
+        expect(out.warnings.join('\n'), sql).toContain(expectedWarn)
+      } else {
+        expect(out.warnings.join('\n'), sql).toContain('无法确认来源')
+      }
+    }
   })
 
   it('P2 白名单透传：表达式/集合操作/重名列/非敏感同名列/星号多来源一律不改写（Codex 第九~十轮）', () => {

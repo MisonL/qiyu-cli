@@ -444,7 +444,14 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
     // 只有内层**自身的输出**是 SUMMARIZE（内层语句头 / 内层 query() 在其顶层 FROM）才提升。
     const innerTokens = summarizeTokenPositions(inner)
     const sub = queryCallSummarize(inner)
-    if (innerTokens.recognized || sub.atTopOutput) {
+    // ⚠️ innerTokens.recognized 对 `SELECT expr FROM (SUMMARIZE …)` 成立（SUMMARIZE 在
+    // 深度 1 的 FROM 内），但 SELECT 自身输出的是**表达式求值结果**、不是 SUMMARIZE 统计值。
+    // 例如 `SELECT * FROM query('SELECT ''userName'' AS column_name, 3 AS min FROM
+    // (SUMMARIZE (SELECT 1 AS userName))')` 输出 min=3（常量）—— 按统计值脱敏会篡改它
+    //（Codex 2026-11-09 第十一轮 P2）。验证：内层 SQL 要么自身就是 SUMMARIZE（语句头），
+    // 要么投影是纯透传（`SELECT *` 或裸列引用 —— 复用投影分析的精简版判据）。
+    const innerIsPure = (/^\s*SUMMARIZE\b/i.test(inner) || isSummarizePassthrough(inner))
+    if ((innerTokens.recognized && innerIsPure) || sub.atTopOutput) {
       hit = true
       const before = bare.slice(0, m.index)
       const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
@@ -763,6 +770,22 @@ function splitJoinSources(fromClause: string): string[] | null {
   return pieces.map((p) => p.trim()).filter((p) => p !== '')
 }
 
+/** 内层 SQL 是否为 SUMMARIZE 的纯透传（选择列表要么 `*`，要么全是裸列引用且列名恰为标准统计列）。 */
+function isSummarizePassthrough(sql: string): boolean {
+  const items = splitTopLevel(sliceClause(
+    sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\b\s*(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b'))
+    .map((t) => t.trim()).filter((t) => t !== '')
+  if (items.length === 0) return false
+  // `*` 是纯透传（已有 analyzeSummarizeProjection 负责外层多来源截断）
+  if (items.some((it) => /^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?\*$/.test(it))) return true
+  for (const item of items) {
+    const bare = /^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))$/.exec(item)
+    if (bare === null) return false
+    const name = (bare[1] ?? bare[2]!).toLowerCase()
+    if (!SUMMARIZE_OUT_COLS.has(name)) return false
+  }
+  return true
+}
 type SummarizeProjection = {
   /** 是否**可证明**是 SUMMARIZE 输出的透传 —— 行级脱敏只在这个白名单里启用。 */
   enabled: boolean
@@ -831,7 +854,17 @@ function analyzeSummarizeProjection(mode: MaskInput['mode'], shapeColumns: boole
     // 来源可以是 `(SUMMARIZE …)` 子查询，也可以是 `query('…SUMMARIZE…')` 调用
     //（内层已被 queryCall.atTopOutput 确认是统计输出）。
     const allSummarize = sources !== null && sources.length > 0
-      && sources.every((src) => /^(?:\(\s*SUMMARIZE\b|query\s*\()/i.test(src))
+      && sources.every((src) => {
+        if (/^\(\s*SUMMARIZE\b/i.test(src)) return true
+        if (/^query\s*\(/i.test(src)) {
+          // 来源片段本身就是 FROM 的一个来源，`atTopOutput`（片段内是否有前置 FROM）不适用；
+          // 用 `hit` —— 它已要求内层输出确为 SUMMARIZE（纯透传），
+          // `query('SELECT expr … FROM (SUMMARIZE …)')` 这类内层重投影不会命中
+          //（Codex 2026-11-09 第十一轮 P2）。
+          return queryCallSummarize(src).hit
+        }
+        return false
+      })
     if (!allSummarize) {
       res.ambiguousDup = true
       return res
@@ -839,7 +872,13 @@ function analyzeSummarizeProjection(mode: MaskInput['mode'], shapeColumns: boole
     res.enabled = true
     return res
   }
-  const counts = new Map<string, number>()
+  
+const fromSrcs = splitJoinSources(sliceClause(
+    mode.sql, /\bFROM\b/i,
+    'WHERE\\b|GROUP\\s+BY|ORDER\\s+BY|LIMIT|HAVING|QUALIFY|WINDOW|UNION|EXCEPT|INTERSECT'))
+const fromSingleSummarize = fromSrcs !== null && fromSrcs.length === 1
+  && /^\(\s*SUMMARIZE\b/i.test(fromSrcs[0]!)
+const counts = new Map<string, number>()
   let hasColName = false
   let hasStat = false
   for (const item of items) {
@@ -859,7 +898,10 @@ function analyzeSummarizeProjection(mode: MaskInput['mode'], shapeColumns: boole
   // 显式列举且同一列名出现多次：`:N` 后缀按名独立计数，无法证明 `column_name:1` 与
   // `min:1` 来自同一个 SUMMARIZE 实例（重排选择项真机实测会错配）。
   res.ambiguousDup = [...counts.values()].some((n) => n > 1)
-  res.enabled = hasColName && hasStat && !res.ambiguousDup
+  // 带表限定的列（`v.min`）说明显式点名了别的来源 —— 无法证明该值来自 SUMMARIZE 输出
+  //（真机实测：JOIN 到 VALUES 别名 v 时 `v.min` 是普通常量 3，Codex 第十一轮 P2）。
+  const qualified = items.some((it) => /^(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*\S/.test(it))
+  res.enabled = hasColName && hasStat && !res.ambiguousDup && !qualified && fromSingleSummarize
   return res
 }
 
