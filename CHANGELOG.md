@@ -215,6 +215,27 @@
     边界要按**完整码点**判 —— 补充平面字母 `𝒜`（U+1D49C，代理对被 `text[i-1]` 截断）
     与货币符号 `¢`（U+00A2）都是 DuckDB 实测合法标识符字符（P2）。
     五轮共 17 条回归用例、13 处变异转红。
+    **2026-11-09 第 6–12 轮双路复核（SUMMARIZE 词法判据的十六次结构性收窄）**：
+    CodeRabbit/Codex 十二轮复审发现 28 条新缺陷，每次均探针复现后再修复：
+    ⑭ 重投影缺口静默（minor）：输出列名被 `AS` 改写（`column_name AS c`）时行级判据不触发
+    且其余警告也不发 — 补「可能未脱敏」缺口（CodeRabbit 六轮）；⑮ 完整标识符边界 + 完整码点
+    + 嵌套块注释 + 双引号别名文本不得参与聚合 + U+2028 标识符字符（P2：Codex 六轮）；
+    ⑯ 深层子查询 `FROM (SELECT * FROM (SUMMARIZE …))` 的合法 SUMMARIZE 输出同样明文漏出
+    → 补 `unrecognizedParen` 缺口（major：CodeRabbit 七轮）；⑰ `query()` 输出路径与 E-string
+    解码 —— `WHERE EXISTS` 里的 SUMMARIZE 只参与过滤、输出是常量 3，按全 SQL 判据脱敏会把
+    常量篡改 → `atTopOutput` 位置信号，非输出路径只发缺口（P2：Codex 七轮）；⑱ 自连接重名列
+    后缀配对（minor：CodeRabbit 八轮）；⑲ 统计列投影来源核验 —— `3 AS min`/`COUNT(*) AS min`/
+    `'not PII' AS min`/省略 AS 的 `3 min`/前置别名 `min: 3`/UNION 追加普通行/重排自连接后缀错配
+    → 行级脱敏收窄为白名单（P2×6：Codex 八~九轮）；⑳ 大小写误配：`staff.username` 匹配
+    `sessions.userName` → 只在下 TableDef 大小写不敏感查列时放宽（major + P2：CR 九轮
+    + Codex 九轮）；㉑ 星号多来源（`*` + CROSS JOIN）与 `query()` 来源验证（minor + P2×2：
+    CR 十轮 + Codex 十~~十一轮）；㉒ 显式列举路径也要求单一 `(SUMMARIZE …)` 来源
+    （P2：Codex 十一轮）；㉓ 第十二轮结论性收窄：**行级脱敏只保留两类可静态证明的形态**
+    —— `SUMMARIZE <表>`（语句头）与 `SELECT * FROM (SUMMARIZE <表>)`（单一来源无 JOIN/
+    逗号/列别名列表）；`query(…)` 包装、显式列举、集合操作、FROM-first、`*`+多来源、
+    全部降级为「声明缺口、不改写任何值」（上述 28 条缺陷每条都是同一个根因：
+    「猜来源」在更复杂的 SQL 组合下总能被构造出新反例，真机 probe17 钉死边界）。
+    71 条 mask 用例，12 组变异各自精确转红；关联 5 文件 135 用例全绿。
   · **`api call --help` 对 `--no-validate` 的描述大于实现**：CLI 级安装提示（skill
     未安装等）不受该开关影响、照旧出现在 warnings；帮助文字改为精确表述。
   · **分页响应首页有 total、后续页缺 total 时静默短读**：旧逻辑清空 declared 并

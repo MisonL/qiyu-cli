@@ -1211,12 +1211,10 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     expect(out.warnings.join('\n')).not.toContain('SUMMARIZE')
   })
 
-  it('P2b 反向：SUMMARIZE 的三种实测形态都要命中（含嵌套与 query() 包装）', () => {
-    for (const sql of [
-      'SUMMARIZE sessions',
-      'SELECT * FROM (SUMMARIZE sessions)',
-      "SELECT * FROM query('SUMMARIZE sessions')",
-    ]) {
+  it('P2b 反向：可静态证明的两种形态命中；query() 包装保持原值并声明缺口（第十二轮契约收窄）', () => {
+    // ⚠️ 2026-11-09 第十二轮结论：query() 内层分析十余轮都被构造出「内层输出其实是常量」
+    // 的合法反例，无法静态证明 → 一律保持原值 + 缺口警告，不再猜来源。
+    for (const sql of ['SUMMARIZE sessions', 'SELECT * FROM (SUMMARIZE sessions)']) {
       const out = maskQueryRows({
         rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
         columns: ['column_name', 'min', 'max'],
@@ -1225,6 +1223,13 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       expect(out.rows[0]!.min, sql).toBe(FULL)
       expect(out.rows[0]!.max, sql).toBe(FULL)
     }
+    const q = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: "SELECT * FROM query('SUMMARIZE sessions')", tables: TABLES },
+    })
+    expect(q.rows[0]!.min).toBe('张三丰')
+    expect(q.warnings.join('\n')).toContain('无法确认来源')
   })
 
   it('P2b 词法反向：字符串/注释里的 SUMMARIZE 同名词不得触发形状（合法元数据查询）', () => {
@@ -1276,14 +1281,15 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       expect(out.rows[0]!.min, sql).toBe(3)
       expect(out.warnings.join('\n'), sql).toContain('无法识别的位置')
     }
-    // 反向：顶层 FROM query(...) 是最终来源，照常脱敏（既有正向用例的判据锚点）
+    // 反向（第十二轮契约收窄）：顶层 FROM query(...) 也不再按统计值脱敏 ——
+    // query() 内层无法静态证明输出是统计值，一律保持原值 + 缺口警告。
     const top = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
       columns: ['column_name', 'min', 'max'],
       mode: { kind: 'sql', sql: "SELECT * FROM query('SUMMARIZE sessions')", tables: TABLES },
     })
-    expect(top.rows[0]!.min).toBe(FULL)
-    expect(top.warnings.join('\n')).not.toContain('无法识别的位置')
+    expect(top.rows[0]!.min).toBe('张三丰')
+    expect(top.warnings.join('\n')).toContain('无法确认来源')
   })
 
   it('P2 E-string：query 的 E 字符串实参按 DuckDB 转义语义解码后再判（Codex 第七轮）', () => {
@@ -1317,7 +1323,8 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       },
     })
     expect(quoted.rows[0]!.min).toBe(3)
-    // 纯透传内层（`SELECT * FROM (SUMMARIZE …)`）仍是真统计来源
+    // 纯透传内层（`SELECT * FROM (SUMMARIZE …)`）也不再按统计值脱敏（第十二轮）：
+    // query() 包装整体只发缺口警告，保持原值。
     const pureQuoted = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
       columns: ['column_name', 'min', 'max'],
@@ -1327,7 +1334,8 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
         tables: TABLES,
       },
     })
-    expect(pureQuoted.rows[0]!.min).toBe(FULL)
+    expect(pureQuoted.rows[0]!.min).toBe('张三丰')
+    expect(pureQuoted.warnings.join('\n')).toContain('无法确认来源')
 
     const hexed = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
@@ -1338,7 +1346,8 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
         tables: TABLES,
       },
     })
-    expect(hexed.rows[0]!.min).toBe(FULL)
+    expect(hexed.rows[0]!.min).toBe('张三丰')
+    expect(hexed.warnings.join('\n')).toContain('无法确认来源')
   })
 
   it('P2 来源核验：query 内层重投影、多来源与 query 来源一律不改写（Codex/CodeRabbit 第十一轮）', () => {
@@ -1423,14 +1432,22 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       },
     })
     expect(eStr.rows[0]!.min).toBe('x')
-    // 反向：可证明透传仍照常脱敏
+    // 反向：可证明透传（`SELECT *` 单一 SUMMARIZE 来源）仍照常脱敏；
+    // 显式列举（`SELECT column_name, min, max`）第十二轮起归入缺口（来源不可静态证明）
     const ok = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SELECT * FROM (SUMMARIZE sessions)', tables: TABLES },
+    })
+    expect(ok.rows[0]!.min).toBe(FULL)
+    expect(ok.warnings.join('\n')).not.toContain('无法确认来源')
+    const listed = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
       columns: ['column_name', 'min', 'max'],
       mode: { kind: 'sql', sql: 'SELECT column_name, min, max FROM (SUMMARIZE sessions)', tables: TABLES },
     })
-    expect(ok.rows[0]!.min).toBe(FULL)
-    expect(ok.warnings.join('\n')).not.toContain('无法确认来源')
+    expect(listed.rows[0]!.min).toBe('张三丰')
+    expect(listed.warnings.join('\n')).toContain('无法确认来源')
   })
 
   it('P2 column_name 重投影：大小写改写后仍须脱敏并声明缺口（CodeRabbit 第九轮）', () => {
@@ -1443,18 +1460,26 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
         columns: ['column_name', 'min', 'max'],
         mode: { kind: 'sql', sql: `SELECT ${fn}(column_name) AS column_name, min, max FROM (SUMMARIZE sessions)`, tables: TABLES },
       })
-      expect(out.rows[0]!.min, fn).toBe(FULL)
-      expect(out.rows[0]!.max, fn).toBe(FULL)
-      expect(out.warnings.join('\n'), fn).toContain('column_name 重投影')
+      // 第十二轮收窄：显式列举来源不可静态证明 → 保持原值 + 缺口
+      expect(out.rows[0]!.min, fn).toBe('张三丰')
+      expect(out.warnings.join('\n'), fn).toContain('无法确认来源')
     }
-    // 反向：原样投影 column_name 不触发该警告
+    // 反向：`SELECT *` 单一 SUMMARIZE 来源不触发
     const ok = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SELECT * FROM (SUMMARIZE sessions)', tables: TABLES },
+    })
+    expect(ok.rows[0]!.min).toBe(FULL)
+    expect(ok.warnings.join('\n')).not.toContain('无法确认来源')
+    // 显式列举也发出「无法确认来源」缺口
+    const listed = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
       columns: ['column_name', 'min', 'max'],
       mode: { kind: 'sql', sql: 'SELECT column_name, min, max FROM (SUMMARIZE sessions)', tables: TABLES },
     })
-    expect(ok.rows[0]!.min).toBe(FULL)
-    expect(ok.warnings.join('\n')).not.toContain('column_name 重投影')
+    expect(listed.rows[0]!.min).toBe('张三丰')
+    expect(listed.warnings.join('\n')).toContain('无法确认来源')
   })
 
   it('P2 投影来源：统计列被重投影成常量/聚合时不得改写，只声明缺口（Codex 第八轮）', () => {
@@ -1470,16 +1495,16 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
         mode: { kind: 'sql', sql, tables: TABLES },
       })
       expect(out.rows[0]!.min, sql).not.toBe(FULL)
-      expect(out.warnings.join('\n'), sql).toContain('重投影成了表达式')
+      expect(out.warnings.join('\n'), sql).toContain('无法确认来源')
     }
-    // 反向：裸列透传（min/max 原样投影）仍照常脱敏
+    // 反向：`SELECT *` 单一来源仍照常脱敏
     const ok = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
       columns: ['column_name', 'min', 'max'],
-      mode: { kind: 'sql', sql: 'SELECT column_name, min, max FROM (SUMMARIZE sessions)', tables: TABLES },
+      mode: { kind: 'sql', sql: 'SELECT * FROM (SUMMARIZE sessions)', tables: TABLES },
     })
     expect(ok.rows[0]!.min).toBe(FULL)
-    expect(ok.warnings.join('\n')).not.toContain('重投影成了表达式')
+    expect(ok.warnings.join('\n')).not.toContain('无法确认来源')
   })
 
   it('P2 递归与 E 串边界：嵌套 query 的位置判据、\x27 引号、大写 \X（Codex 第八轮）', () => {
@@ -1518,8 +1543,7 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       },
     })
     expect(upper.rows[0]!.min).toBe(3)
-    // ④ 对照：内层 query() 就在内层顶层 FROM → 仍是真统计来源，照常脱敏
-    //   （真机实测 probe12：输出 SUMMARIZE 全形状）
+    // ④ 对照（第十二轮收窄）：query() 包装不再脱敏 → 保持原值 + 缺口警告
     const nestedTop = maskQueryRows({
       rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
       columns: ['column_name', 'min', 'max'],
@@ -1529,7 +1553,8 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
         tables: TABLES,
       },
     })
-    expect(nestedTop.rows[0]!.min).toBe(FULL)
+    expect(nestedTop.rows[0]!.min).toBe('张三丰')
+    expect(nestedTop.warnings.join('\n')).toContain('无法确认来源')
   })
 
   it('重名列：自连接两个 SUMMARIZE 时带 :N 后缀的统计列也必须脱敏（CodeRabbit 第八轮）', () => {
@@ -1546,11 +1571,11 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       columns: ['column_name', 'min', 'max', 'column_name:1', 'min:1', 'max:1'],
       mode: { kind: 'sql', sql, tables: TABLES },
     })
-    expect(out.rows[0]!.min).toBe(FULL)
-    expect(out.rows[0]!.max).toBe(FULL)
-    expect(out.rows[0]!['min:1']).toBe(FULL)
-    expect(out.rows[0]!['max:1']).toBe(FULL)
-    // 反向：第二组是非敏感列（session_id）时不得牵连改写
+    // 第十二轮收窄：逗号并列建立多个来源，来源不可静态证明 → 保持原值 + 缺口
+    expect(out.rows[0]!.min).toBe('张三丰')
+    expect(out.rows[0]!['min:1']).toBe('张三丰')
+    expect(out.warnings.join('\n')).toContain('无法确认来源')
+    // 反向：第二组是非敏感列（session_id）时同样缺口警告
     const ok = maskQueryRows({
       rows: [{
         column_name: 'userName', min: '张三丰', max: '李四光',
@@ -1559,9 +1584,8 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       columns: ['column_name', 'min', 'max', 'column_name:1', 'min:1', 'max:1'],
       mode: { kind: 'sql', sql, tables: TABLES },
     })
-    expect(ok.rows[0]!.min).toBe(FULL)
+    expect(ok.rows[0]!.min).toBe('张三丰')
     expect(ok.rows[0]!['min:1']).toBe('s1')
-    expect(ok.rows[0]!['max:1']).toBe('s2')
   })
 
   it('缺口声明：SUMMARIZE 在无法识别的位置（多层子查询）必须警告且不冒认脱敏（CodeRabbit 第七轮）', () => {
@@ -1601,10 +1625,11 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     expect(ok2.warnings.join('\n')).not.toContain('无法识别的位置')
   })
 
-  it('P2b 词法正向：真的 query() 调用（不在注释里）仍要命中', () => {
+  it('P2b 词法正向：真 query() 调用不再脱敏，但必须声明缺口（第十二轮契约收窄）', () => {
+    // 第十二轮结论：query() 内层无法静态证明输出是统计值（十余轮都有合法反例），
+    // 一律保持原值 + 「无法确认来源」缺口；脱敏只保留可证明的语句头与 SELECT * 形态。
     for (const sql of [
       "SELECT * FROM query('SUMMARIZE sessions')",
-      // DuckDB 实测接受的两种等价写法（Codex 2026-11-08 第四轮 P1）
       "SELECT * FROM query(/* gap */ 'SUMMARIZE sessions')",
       "SELECT * FROM query(E'SUMMARIZE sessions')",
     ]) {
@@ -1613,7 +1638,8 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
         columns: ['column_name', 'min', 'max'],
         mode: { kind: 'sql', sql, tables: TABLES },
       })
-      expect(out.rows[0]!.min, sql).toBe(FULL)
+      expect(out.rows[0]!.min, sql).toBe('张三丰')
+      expect(out.warnings.join('\n'), sql).toContain('无法确认来源')
     }
   })
 
