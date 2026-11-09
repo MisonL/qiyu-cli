@@ -566,8 +566,14 @@ function withoutLiterals(text: string): string {
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]!
     if (ch === "'") {
+      // E 串（`E'…'`）：`\'` 是转义引号、不结束字符串（DuckDB 实测
+      // `E'it\'s FROM (SUMMARIZE sessions)'` 合法）—— 不按此跳过会把字符串后半段当成
+      // 裸 SQL，从中误判出 SUMMARIZE 关键字（Codex 2026-11-08 第九轮 P2）。
+      const isEscape = i >= 1 && (text[i - 1] === 'E' || text[i - 1] === 'e')
+        && !isIdentCharAt(text, i - 1)
       const start = i
       for (i++; i < text.length; i++) {
+        if (isEscape && text[i] === '\\') { i++; continue }
         if (text[i] === "'") { if (text[i + 1] !== "'") break; i++ }
       }
       out += blank(i - start + 1)
@@ -693,6 +699,103 @@ function aliasesOf(selectList: string, name: string): string[] {
  * 对一次查询的输出行脱敏（spec §7.2）。纯函数：输入行不被就地改写；
  * `noMask` 时直接返回入参数组（不拷贝，因为一个字节都不会改）。
  */
+/** SUMMARIZE 的标准输出列（真机实测 12 列，小写）。 */
+const SUMMARIZE_OUT_COLS = new Set([
+  'column_name', 'column_type', 'min', 'max', 'approx_unique', 'avg', 'std',
+  'q25', 'q50', 'q75', 'count', 'null_percentage',
+])
+/** `lower|upper(<col>) [AS] column_name` —— 唯一可安全放宽大小写匹配的变形。 */
+const CASE_FOLDED_COL_RE = /^(?:lower|upper)\s*\(\s*(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?(?:"column_name"|column_name)\s*\)\s*(?:AS\s+(?:"column_name"|column_name))?$/i
+
+/** 选择项的别名（显式 `AS x` / DuckDB 前置别名 `x: expr` / 省略 AS 的 `expr x`），小写。 */
+function summarizeAliasName(item: string): string | null {
+  const t = item.trim()
+  let m = /\bAS\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))\s*$/i.exec(t)
+  if (m !== null) return (m[1] ?? m[2]!).toLowerCase()
+  m = /^("([^"]+)"|[A-Za-z_][A-Za-z0-9_$]*)\s*:\s*\S/.exec(t)
+  if (m !== null) return (m[2] ?? m[1]!).toLowerCase()
+  m = /^(.+?)\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))\s*$/i.exec(t)
+  if (m !== null) return (m[2] ?? m[3]!).toLowerCase()
+  return null
+}
+
+type SummarizeProjection = {
+  /** 是否**可证明**是 SUMMARIZE 输出的透传 —— 行级脱敏只在这个白名单里启用。 */
+  enabled: boolean
+  /** column_name 被 lower/upper 变形（此时行值可安全大小写不敏感匹配）。 */
+  caseFolded: boolean
+  /** 被表达式重投影掉的标准列（含 column_name），用于声明缺口。 */
+  reassigned: Set<string>
+  /** 顶层含集合操作（UNION/INTERSECT/EXCEPT）→ 后续分支来源不明。 */
+  setOp: boolean
+  /** 显式列举且同一列名出现多次 —— `:N` 后缀不能证明来自同一组（deduplicateNames 按名独立计数）。 */
+  ambiguousDup: boolean
+}
+
+/**
+ * 分析顶层投影能否**证明**是 SUMMARIZE 输出（Codex 2026-11-08 第九轮 6 条 P2 的共同根因）：
+ * 行级脱敏依赖「输出列名 + 行值」猜测来源，任何重写都可能猜错并把**普通值**改成
+ * `<已脱敏>`（`3 AS min` / `3 min` 省略 AS / `'not PII' AS min` 字面量 / UNION 追加普通行 /
+ * 重排自连接的后缀错配 —— 全部真机实测）。因此只在下列白名单里启用：
+ *   · 顶层就是 SUMMARIZE 语句（选择列表解析为空）；
+ *   · `*` 透传；
+ *   · 每个选择项都是 SUMMARIZE 标准列的**裸引用**（`col` / `t.col` / `"col"`）；
+ *   · `lower|upper(column_name) [AS] column_name`（行值只变大小写，仍可匹配）。
+ * 其余一律 enabled=false，由调用方**声明缺口**、不冒认脱敏。
+ * 残余边界：深层子查询里先重命名常量再以裸列透传（`x.min` 来自内层 `3 AS min`）判不出，
+ * 输出列名仍是 min，会被当统计列脱敏（方向：宁可误脱敏常量也不漏 PII）。
+ */
+function analyzeSummarizeProjection(mode: MaskInput['mode'], shapeColumns: boolean): SummarizeProjection {
+  const res: SummarizeProjection = {
+    enabled: false, caseFolded: false, reassigned: new Set(), setOp: false, ambiguousDup: false,
+  }
+  if (mode.kind !== 'sql' || !shapeColumns) return res
+  // 顶层语句就是 SUMMARIZE（`SUMMARIZE sessions` / `SUMMARIZE SELECT …`）→ 输出即统计结果，
+  // 其后的 SELECT 是 SUMMARIZE 的入参、不是外层投影（`SUMMARIZE SELECT userPhone::DOUBLE
+  // AS userPhone FROM sessions` 实测输出统计值，必须脱敏）。
+  if (/^\s*SUMMARIZE\b/i.test(withoutLiterals(mode.sql))) {
+    res.enabled = true
+    return res
+  }
+  if (execTopLevel(withoutLiterals(mode.sql), /\b(?:UNION|INTERSECT|EXCEPT)\b/i) !== null) {
+    res.setOp = true
+    return res
+  }
+  const items = splitTopLevel(sliceClause(
+    mode.sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\b\s*(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b'))
+    .map((t) => t.trim()).filter((t) => t !== '')
+  if (items.length === 0) {
+    // 顶层就是 SUMMARIZE 语句（`SUMMARIZE sessions` / `SUMMARIZE SELECT …`）→ 输出即统计结果
+    res.enabled = true
+    return res
+  }
+  const counts = new Map<string, number>()
+  let star = false
+  let hasColName = false
+  let hasStat = false
+  for (const item of items) {
+    if (/^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?\*$/.test(item)) { star = true; continue }
+    const bare = /^(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)\s*\.\s*)?(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))$/.exec(item)
+    if (bare !== null) {
+      const name = (bare[1] ?? bare[2]!).toLowerCase()
+      counts.set(name, (counts.get(name) ?? 0) + 1)
+      if (!SUMMARIZE_OUT_COLS.has(name)) continue
+      if (name === 'column_name') hasColName = true
+      if (name === 'min' || name === 'max') hasStat = true
+      continue
+    }
+    if (CASE_FOLDED_COL_RE.test(item)) { res.caseFolded = true; hasColName = true; continue }
+    const alias = summarizeAliasName(item)
+    if (alias !== null && SUMMARIZE_OUT_COLS.has(alias)) res.reassigned.add(alias)
+  }
+  if (star) { hasColName = true; hasStat = true }
+  // 显式列举且同一列名出现多次：`:N` 后缀按名独立计数，无法证明 `column_name:1` 与
+  // `min:1` 来自同一个 SUMMARIZE 实例（重排选择项真机实测会错配）。
+  res.ambiguousDup = [...counts.values()].some((n) => n > 1)
+  res.enabled = hasColName && hasStat && !res.ambiguousDup
+  return res
+}
+
 export function maskQueryRows(input: MaskInput): MaskOutcome {
   const { rows, columns, mode, noMask, loc } = input
 
@@ -830,25 +933,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 同样是 PII 派生值，一并整值替换。count 是行数、approx_unique 是去重计数，单看它们
   // 恢复不出任何一个原值，不在此列。
   const SUMMARIZE_STATS = ['min', 'max', 'avg', 'std', 'q25', 'q50', 'q75'] as const
-  // ⚠️ 统计列必须**来自 SUMMARIZE 输出**才可脱敏（Codex 第八轮 P2，真机实测）：顶层 SELECT 把
-  // `3 AS min` / `COUNT(*) AS min` 这类表达式重投影成统计列名时，输出数字不是统计值
-  //（`SELECT column_name, 3 AS min FROM (SUMMARIZE sessions)` 返回常量 3、`COUNT(*) AS min`
-  // 返回 1）—— 按行值脱敏会把普通常量篡改成 `<已脱敏>`。判据只看**顶层**选择列表：统计列若由
-  // 「表达式 AS 统计列名」定义且源不是裸列引用（`min` / `t.min`），就不是统计来源 → 跳过脱敏
-  // 并声明缺口（表达式也可能是统计派生，如 `min + 0 AS min`，不能静默）。
-  // 残余边界：深层子查询里先重命名常量再透传（`x.min` 来自内层 `3 AS min`）判不出 ——
-  // 输出列名仍是 min，会被当统计列脱敏（方向：宁可误脱敏常量也不漏 PII）。
-  const summarizeTopItems = mode.kind === 'sql'
-    ? splitTopLevel(withoutLiterals(sliceClause(
-      mode.sql, /^\s*SELECT\s+(?:ALL\s+|DISTINCT\b\s*(?:ON\s*\([^)]*\)\s*)?)?/i, 'FROM\\b')))
-    : []
-  const statReassigned = (stat: string): boolean => summarizeTopItems.some((item) => {
-    const m = /^(.*?)\s+AS\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*$/i.exec(item.trim())
-    if (m === null) return false
-    if ((m[2] ?? m[3] ?? '').toLowerCase() !== stat) return false
-    return !new RegExp(`^(?:[A-Za-z_][A-Za-z0-9_]*\\.)?${stat}$`, 'i').test(m[1]!.trim())
-  })
-  const summarizeReassigned = new Set<string>()
+  const summarizeProj = analyzeSummarizeProjection(mode, summarizeSql && summarizeShapeColumns)
+  const summarizeReassigned = summarizeProj.reassigned
   const outRows = rows.map((row) => {
     const out = { ...row }
     for (const name of columns) {
@@ -883,16 +969,26 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     // `min`/`min:1`…（sandbox.ts deduplicateNames，行键与 columns 同一序列）。只认无后缀
     // `column_name` 会把第二组统计列（`min:1`/`max:1`）原样漏出 —— 而 summarizeShape=true
     // 使缺口警告也不发。后缀配对是确定的：同一组的列共享同一后缀。
-    if (summarizeShape) for (const nameCol of columns) {
+    // ⚠️ 行级脱敏只在**可证明是 SUMMARIZE 输出透传**时启用（Codex 2026-11-08 第九轮 6 条 P2 的
+    // 共同根因）：投影含表达式重写（`3 AS min`/`3 min`/`'not PII' AS min`）、集合操作
+    // （UNION 追加普通行）、或显式重复列名（`:N` 后缀不能证明同组）时，按列名+行值猜测会把
+    // **普通值**改成 `<已脱敏>` —— 数据损坏比漏脱敏更糟。这些形态统一降级为缺口警告。
+    if (summarizeShape && summarizeProj.enabled) for (const nameCol of columns) {
       if (!/^column_name(?::\d+)?$/.test(nameCol)) continue
       const suffix = nameCol.slice('column_name'.length)
       if (typeof out[nameCol] !== 'string') continue
-      const col = baseName(out[nameCol] as string)
-      if (sensitiveNames.includes(col)) {
+      // 行值匹配：只有投影把 column_name 做了 lower/upper 变形时才大小写不敏感（变形后的
+      // 行值 `username` 仍指向同一列，CodeRabbit 第九轮 major）；原样透传时**大小写敏感**
+      // —— 否则非敏感的 `staff.username` 会误匹配 `sessions.userName`（Codex 第九轮 P2）。
+      const rawCol = baseName(out[nameCol] as string)
+      const col = summarizeProj.caseFolded
+        ? sensitiveNames.find((n) => n.toLowerCase() === rawCol.toLowerCase())
+        : (sensitiveNames.includes(rawCol) ? rawCol : undefined)
+      if (col !== undefined) {
         for (const stat of SUMMARIZE_STATS) {
           const key = stat + suffix
           if (!(key in row)) continue
-          if (statReassigned(stat)) { summarizeReassigned.add(stat); continue }
+          if (summarizeProj.reassigned.has(stat)) continue
           const before = row[key]
           if (before === null || before === undefined) continue
           // ⚠️ 值级兜底的**整值替换必须保留**（Codex 2026-11-08 P1 实测）：`out[stat]` 若已被
@@ -1060,11 +1156,34 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   }
   // ⚠️ 统计列被重投影成表达式（`3 AS min`、`COUNT(*) AS min`、`min + 0 AS min`）：
   // 无法确认输出数字是不是统计值 —— 保持原值、不冒认脱敏，但缺口必须可见。
-  if (summarizeReassigned.size > 0) {
+  // ⚠️ 投影含无法确认来源的改写 → 只声明缺口、不冒认脱敏（Codex 第九轮 P2）：
+  // 表达式重投影（`3 AS min`/`COUNT(*) AS min`/`lower(column_name)` 之外的变形）、
+  // 集合操作（UNION 追加普通行）、显式重复列名（`:N` 后缀不能证明同组）。
+  if (summarizeShape && !summarizeProj.enabled) {
+    const reason = summarizeProj.setOp
+      ? '含 UNION/INTERSECT/EXCEPT（后续分支不是 SUMMARIZE 输出）'
+      : summarizeProj.ambiguousDup
+        ? '显式列举且同一列名出现多次（无法确认各列来自同一组 SUMMARIZE 输出）'
+        : '含表达式重写（如 `3 AS min`、`3 min`、字符串常量别名）'
+    warnings.push(
+      'SQL 的 SUMMARIZE 输出投影**无法确认来源**：' + reason + '。'
+      + '本次只声明缺口、未按 SUMMARIZE 改写任何值 —— 统计值可能**未脱敏**，'
+      + '这些行也可能根本不是统计结果。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
+      + '或改用 `SELECT * FROM (SUMMARIZE <表>)` 原样透传')
+  }
+  const reassignedStats = [...summarizeReassigned].filter((n) => n !== 'column_name')
+  if (reassignedStats.length > 0) {
     warnings.push(
       'SQL 把 SUMMARIZE 的统计列重投影成了表达式（如 `3 AS min`、`COUNT(*) AS min`）：'
-      + `这些列（${[...summarizeReassigned].join('、')}）可能是常量、聚合值或统计值的派生 —— `
+      + `这些列（${reassignedStats.join('、')}）可能是常量、聚合值或统计值的派生 —— `
       + '无法确认来源，本次保持原值、未按 SUMMARIZE 脱敏。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
+  }
+  if (summarizeProj.caseFolded || summarizeReassigned.has('column_name')) {
+    warnings.push(
+      'SQL 把 SUMMARIZE 的 column_name 重投影成了表达式（如 `lower(column_name) AS column_name`）：'
+      + '行值可能已被改写，本次按大小写不敏感匹配尽力脱敏，但仍可能漏掉变形后的敏感列名。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列')
   }
   // ⚠️ SQL 里的 SUMMARIZE 位置**无法确认是最终输出**但输出是 SUMMARIZE 形状

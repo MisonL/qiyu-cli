@@ -1327,6 +1327,91 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     expect(hexed.rows[0]!.min).toBe(FULL)
   })
 
+  it('P2 白名单透传：表达式/集合操作/重名列/非敏感同名列一律不改写（Codex 第九轮 6 条）', () => {
+    // 全部真机实测（probe14）。方向统一：无法证明是 SUMMARIZE 输出透传时**只声明缺口、
+    // 不改写任何值** —— 数据损坏比漏脱敏更糟。
+    // ① 非敏感同名列不得被大小写不敏感匹配误改（staff.username ≠ sessions.userName）——
+    //    这是合法透传、只是没有敏感列，既不脱敏也不应报缺口
+    const staff = maskQueryRows({
+      rows: [{ column_name: 'username', min: 'support-a', max: 'support-b' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SUMMARIZE staff', tables: TABLES },
+    })
+    expect(staff.rows[0]!.min).toBe('support-a')
+    expect(staff.warnings.join('\n')).not.toContain('未脱敏')
+    const cases: Array<[string, Record<string, unknown>, string[], string | number]> = [
+      // ② 重排自连接：`:N` 后缀不能证明同组
+      ['SELECT a.column_name, b.column_name, b.min, a.min FROM (SUMMARIZE sessions) a, (SUMMARIZE sessions) b',
+        { column_name: 'userName', column_name_1: 'session_id', min: 's1', min_1: '张三丰' },
+        ['column_name', 'column_name:1', 'min', 'min:1'], 's1'],
+      // ③ 省略 AS 的别名 `3 min`
+      ['SELECT column_name, 3 min FROM (SUMMARIZE sessions)', { column_name: 'userName', min: 3 },
+        ['column_name', 'min'], 3],
+      // ④ 字符串常量别名
+      ["SELECT column_name, 'not PII' AS min FROM (SUMMARIZE sessions)", { column_name: 'userName', min: 'not PII' },
+        ['column_name', 'min'], 'not PII'],
+      // ⑤ 前置别名 `min: 3`
+      ['SELECT column_name, min: 3 FROM (SUMMARIZE sessions)', { column_name: 'userName', min: 3 },
+        ['column_name', 'min'], 3],
+      // ⑥ UNION ALL 追加普通行
+      ["SELECT column_name, min FROM (SUMMARIZE sessions) UNION ALL SELECT 'userName', 'ordinary constant'",
+        { column_name: 'userName', min: '张三丰' }, ['column_name', 'min'], '张三丰'],
+    ]
+    for (const [sql, row, cols, expectMin] of cases) {
+      const out = maskQueryRows({
+        rows: [row], columns: cols, mode: { kind: 'sql', sql, tables: TABLES },
+      })
+      expect(out.rows[0]!.min, sql).toBe(expectMin)
+      expect(out.warnings.join('\n'), sql).toContain('无法确认来源')
+    }
+    // ⑦ E 串转义引号：SUMMARIZE 只出现在字符串里，且外层投影是**可证明的裸透传** ——
+    //    若 withoutLiterals 不按 E 语义跳过 \\'，字符串会在 `it\\` 处截断、后半段的
+    //    `FROM (SUMMARIZE sessions)` 裸露 → 误判成 SUMMARIZE 输出并改写 `min`。
+    //    真机实测（probe15）：该查询合法，返回 column_name=userName / min=x 一行。
+    const eStr = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 'x' }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: `SELECT column_name, min FROM (SELECT 'userName' AS column_name, 'x' AS min) t WHERE E'it\\'s FROM (SUMMARIZE sessions)' = 'x' OR TRUE`,
+        tables: TABLES,
+      },
+    })
+    expect(eStr.rows[0]!.min).toBe('x')
+    // 反向：可证明透传仍照常脱敏
+    const ok = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SELECT column_name, min, max FROM (SUMMARIZE sessions)', tables: TABLES },
+    })
+    expect(ok.rows[0]!.min).toBe(FULL)
+    expect(ok.warnings.join('\n')).not.toContain('无法确认来源')
+  })
+
+  it('P2 column_name 重投影：大小写改写后仍须脱敏并声明缺口（CodeRabbit 第九轮）', () => {
+    // 真机实测（probe13）：`SELECT lower(column_name) AS column_name, min, max FROM
+    // (SUMMARIZE sessions)` 的行值是 `username`/`userphone`，min/max 是明文。
+    // 大小写敏感比较（旧行为）不命中 → 明细明文且零警告。
+    for (const fn of ['lower', 'upper']) {
+      const out = maskQueryRows({
+        rows: [{ column_name: fn === 'lower' ? 'username' : 'USERNAME', min: '张三丰', max: '李四光' }],
+        columns: ['column_name', 'min', 'max'],
+        mode: { kind: 'sql', sql: `SELECT ${fn}(column_name) AS column_name, min, max FROM (SUMMARIZE sessions)`, tables: TABLES },
+      })
+      expect(out.rows[0]!.min, fn).toBe(FULL)
+      expect(out.rows[0]!.max, fn).toBe(FULL)
+      expect(out.warnings.join('\n'), fn).toContain('column_name 重投影')
+    }
+    // 反向：原样投影 column_name 不触发该警告
+    const ok = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰', max: '李四光' }],
+      columns: ['column_name', 'min', 'max'],
+      mode: { kind: 'sql', sql: 'SELECT column_name, min, max FROM (SUMMARIZE sessions)', tables: TABLES },
+    })
+    expect(ok.rows[0]!.min).toBe(FULL)
+    expect(ok.warnings.join('\n')).not.toContain('column_name 重投影')
+  })
+
   it('P2 投影来源：统计列被重投影成常量/聚合时不得改写，只声明缺口（Codex 第八轮）', () => {
     // 真机实测（probe12）：`SELECT column_name, 3 AS min FROM (SUMMARIZE sessions)` 返回
     // column_name/min、min 是**常量 3**；`COUNT(*) AS min` 返回 1。按行值脱敏会把常量篡改。
