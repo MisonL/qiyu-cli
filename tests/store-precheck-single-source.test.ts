@@ -136,6 +136,20 @@ describe('只读前置检查：同一成因在所有命令上给出同一说法�
     expect(uniq[0]).toContain('store init --db ' + missing)
   })
 
+  it('断链符号链接：不得说成「不存在 → 先 store init」（init 拒绝符号链接，形成死循环）', async () => {
+    if (process.platform === 'win32') return
+    // 2026-11-09 审计实测：statSync 跟随断链抛 ENOENT，旧实现与「路径真不存在」同分支，
+    // hint 指向 store init；而 store init 用 lstat 拒绝符号链接 —— 两条 hint 互相矛盾。
+    const dangling = join(dir, 'dangling.duckdb')
+    execFileSync('ln', ['-s', join(dir, 'nope.duckdb'), dangling])
+    const got = await hintsFor(dangling)
+    const uniq = [...new Set(Object.values(got))]
+    expect(uniq.length, JSON.stringify(got, null, 2)).toBe(1)
+    expect(uniq[0]).toMatch(/符号链接/)
+    // 不得把用户指回一条必然再失败的命令（「先运行 store init」那种说法）
+    expect(uniq[0], '断链的 hint 不得引导先运行 store init').not.toMatch(/请先运行\s*：?\s*qiyu store init/)
+  })
+
   it('ELOOP / ENOTDIR / ENAMETOOLONG：hint 必须按 errno 归因，不得一律说成「权限」', () => {
     if (process.platform === 'win32') return
     // 三个真前置状态（2026-11-07 审查实测的逐字报文见 statFailureHint 的注释）

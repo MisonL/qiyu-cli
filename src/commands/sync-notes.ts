@@ -131,13 +131,18 @@ export function runFieldNotes(): Record<string, string> {
     // ⚠️ windows / rows 是嵌套对象，此前只解释了 windows.skipped 与 status 里顺带提到的
     // 字段（2026-11-04 反向 sweep 实测：total/succeeded/failed 与 rows.* 全部裸奔）。
     // 这四个数是 Agent 判「这次到底拿到没有」的依据，必须各自可见。
-    'tasks[].windows.total': '本轮切出的窗口总数（= succeeded + failed + skipped）',
+    'tasks[].windows.total': '本轮计入的窗口总数（= succeeded + failed + skipped）——\n'
+      + '不含被重叠区合并的窗（那是 contained；物理切出的窗数 = total + contained）',
     'tasks[].windows.succeeded': '成功窗数。⚠️ 空窗也算成功，所以 > 0 不代表有数据 —— 结合 rows.written 与 windows.failed 判断',
     'tasks[].windows.failed': '失败窗数（失败会在 gaps 里逐条记录）',
     'tasks[].windows.skipped': '没跑的窗数，两种成因：① 残段窗（日对齐任务被显式区间钳出的'
       + '非日界首/末段）；② 整窗晚于末端上限被丢弃的窗（windowEndClamp：考勤/绩效请求到'
       + '「今天」时）。两种都跳过不 fetch、不写库、不推水位，但计入 total'
       + '（total = succeeded + failed + skipped）；stderr 进度行分两句点名成因',
+    'tasks[].windows.contained': '完全落进前一窗回看重叠区、被合并的窗数（仅 > 0 时出现）。'
+      + '这些窗不执行 —— 数据已由前一窗覆盖（overlapDays > 0 的任务，如工单 3 天回看），'
+      + '所以既不是 succeeded 也不是 skipped（skipped 才代表「该拉的没拉」）；'
+      + '它不计入 total —— 物理切出的窗数 = total + contained',
     // ⚠️ 2026-11-04 自查修正：初版把 written 说成「真正落库的行数」—— 而引擎对
     // count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」（kept），
     // 那批行已随事务回滚、实际没落库（sync/engine.ts 的 catch 分支与 brief 钉死用例）。

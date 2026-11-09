@@ -591,7 +591,27 @@ function dollarQuoteEnd(text: string, start: number): { openEnd: number; closeSt
   return { openEnd: start + m[0].length, closeStart }
 }
 
-function withoutLiterals(text: string): string {
+/**
+ * 抹掉单引号/美元引号字面量与 SQL 注释（判据只看标识符，不看字面量/注释里的文本）。
+ * 导出给 `commands/query.ts` 的日期字面量警告用（列名判据）。
+ */
+export function withoutLiterals(text: string): string {
+  return blankSql(text, true)
+}
+
+/**
+ * 只抹注释（双引号标识符与字面量原样保留，下标逐位对齐）。
+ * `commands/query.ts` 的日期字面量警告在它上面定位孤立 `'` 再取字面量内容。
+ */
+export function withoutComments(text: string): string {
+  return blankSql(text, false)
+}
+
+/**
+ * 抹掉单引号/美元引号字面量与注释的唯一词法状态机。`blankLiterals=false` 时
+ * **原样保留**字面量（含美元引号内容）——供需要在字面量内部读值的判据用。
+ */
+function blankSql(text: string, blankLiterals: boolean): string {
   let out = ''
   // ⚠️ 被抹掉的字符一律换成等长空格：下标与原文**逐位对齐**，`sliceClause` 才能在抹过的
   // 文本上定位 `GROUP BY`/`DISTINCT` 而不会命中字符串字面量里的同一串词（Codex 2026-11-05
@@ -610,7 +630,7 @@ function withoutLiterals(text: string): string {
         if (isEscape && text[i] === '\\') { i++; continue }
         if (text[i] === "'") { if (text[i + 1] !== "'") break; i++ }
       }
-      out += blank(i - start + 1)
+      out += blankLiterals ? blank(i - start + 1) : text.slice(start, Math.min(i, text.length - 1) + 1)
       continue
     }
     // 双引号是**标识符**（`SELECT "userPhone"` 是真实列引用，抹掉会漏判）→ 原样保留，
@@ -642,7 +662,7 @@ function withoutLiterals(text: string): string {
       if (dq !== null) {
         const delim = dq.openEnd - i
         const end = dq.closeStart + delim   // 整个 `$tag$…$tag$` 之后的第一个字符
-        out += blank(end - i)
+        out += blankLiterals ? blank(end - i) : text.slice(i, end)
         i = end - 1
         continue
       }
@@ -1314,8 +1334,11 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       + '需要准确分组请用 `--no-mask`（并自行承担 PII 风险），或改用不敏感列分组')
   }
 
+  // 先收集**全部**该报的列，再按上限逐条发：最后一条替成「另有 N 个未列出」的清单。
+  // ⚠️ 只在循环里 `break` 会让被截掉的列**静默消失**（2026-11-09 审计实测：7 个未匹配
+  // 敏感列只出 5 条，没有「等/其余」字样，Agent 读到的 5 条看起来就是全部缺口）。
+  const unmatched: string[] = []
   for (const name of sensitiveNames) {
-    if (warnings.length >= WARNING_LIMIT) break
     if (matchedSensitive.has(name)) continue
     // `\b` 两侧都要求非标识符字符：userPhoneBook 这类更长标识符不会误报 userPhone。
     //
@@ -1326,9 +1349,19 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     // 代价是 `SELECT username FROM staff`（staff.username 不是敏感列）会多一条误报 ——
     // spec 明确要求这个方向。
     if (!new RegExp(`\\b${name}\\b`, 'i').test(mode.sql)) continue
-    warnings.push(
-      `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，` +
-      '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样')
+    unmatched.push(name)
+  }
+  const warnOne = (name: string): string =>
+    `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，`
+    + '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样'
+  const slots = Math.max(0, WARNING_LIMIT - warnings.length)
+  const perColumnSlots = unmatched.length > slots ? Math.max(0, slots - 1) : unmatched.length
+  for (const name of unmatched.slice(0, perColumnSlots)) warnings.push(warnOne(name))
+  if (unmatched.length > perColumnSlots) {
+    // 剩余列并成一条：既不超上限的「逐列」口径，又点名全部被截断的列。
+    const rest = unmatched.slice(perColumnSlots)
+    warnings.push(`另有 ${rest.length} 个敏感列的缺口警告未列出（受 ${WARNING_LIMIT} 条上限）：`
+      + `${rest.join('、')}；这些列的脱敏同样可能不完整`)
   }
 
   // 值级兜底命中了**非敏感列**（场景审查 7.2）：11 位、以 1 开头的订单号/聚合值会被

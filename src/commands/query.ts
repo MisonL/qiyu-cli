@@ -18,7 +18,7 @@
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, missingTableCauses } from '../query/errors.js'
-import { maskQueryRows } from '../query/mask.js'
+import { maskQueryRows, withoutLiterals, withoutComments } from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
@@ -89,7 +89,9 @@ const USAGE = `用法：qiyu query <查询方式> [参数]
                            存储定位（与 store / sync 命令同族）
 ${DB_PATH_HELP}
 
-只接受单条 SELECT / DESCRIBE / SHOW / EXPLAIN；写操作、多语句、文件与网络访问一律被沙箱拦截。
+只接受单条只读查询（DuckDB 判为「只读」的语句都放行：SELECT、DESCRIBE、SHOW、EXPLAIN、
+PRAGMA 查询形态、VALUES、TABLE <表>、FROM <表> 等）；写操作、SET/CALL 之类的实例配置、多语句、
+文件与网络访问一律被沙箱拦截。实测放行/拦截清单见 README「只读沙箱」。
 `
 
 /**
@@ -142,19 +144,77 @@ function zeroRowHint(loc?: StoreLocation): string {
  * `'2026-10-12T16:00:00.000Z' >= '2026-10-13T00:00:00+08:00'` 为 false，整整少一天，
  * 退出码 0、四道自证机制一道都不响。
  *
- * 判据 = SQL 文本同时含 iso-day 列名与「日期形态字面量」（纯 `YYYY-MM-DD` 或缺时刻的
- * `…T00:00:00+08:00`）——即 CLI 自己教出去、却在 `--sql` 里比较错的那种写法。
- * 方向安全（多警告）：误报只多一句话；UTC `…Z` 形态与 `--table` 通道不受影响。
+ * 判据 = SQL 文本同时含 iso-day 列名与「会被字典序比较错的一天」形态的**单引号字面量**
+ *（`dayLiteralHint`，下方）。方向安全（多警告）：误报只多一条附带修复方法的 warning。
  */
 // ⚠️ 大小写不敏感，理由同上（`STAT_DATE >= '2026-10-13'` 同样会少一天）。
 const ISO_DAY_COL_RE = /\b(stat_date|work_date)\b/i
-// ⚠️ 必须同时接受 `T` 与**空格**分隔（场景审查 4）：SQL 里 `'2026-10-12 00:00:00'` 是
-// 与 `'…T00:00:00'` 等价的合法写法，旧正则只认 `T` → 空格形态静默少算一天、零 warning。
-const DAY_LITERAL_RE = /'\d{4}-\d{2}-\d{2}([T ]00:00:00(\.0+)?(\+08:00)?)?'/
+/**
+ * 单引号字面量的内容里是否有「按字典序比较会少一天」的形态。
+ *
+ * 列内只存两种合法形态：上海日零点写成 `YYYY-MM-DDT16:00:00.000Z`（UTC 数值），
+ * 或整值为 NULL。按字典序比较时，下列字面量都会把前端那一天排除或错位：
+ *   · `YYYY-MM-DD` / `YYYY-MM-DD 00:00:00` / `…T00:00:00`（任何不带时区或 +08:00 的写法）
+ *   · `YYYY-MM-DD…Z`（**这是 UTC 时刻，不是上海日**：`'…T00:00:00Z'` 只有上海 08:00 起才算数）
+ *   · `YYYY-MM-DD…+08:00` 以外的偏移（如 `+0800`、`…-05:00`）
+ * 唯一的合法写法（UTC 16:00Z 且带小数秒，如 `'2026-10-12T16:00:00.000Z'`）放行。
+ *
+ * 2026-11-09 实测漏报（旧 `DAY_LITERAL_RE` 只认 `YYYY-MM-DD[ 或 T]00:00:00[.0…][+08:00]`）：
+ * `'2026-11-08T00:00:00Z'`、`'2026-11-09 00:00:00.000Z'`、`'2026-11-08T00:00:00.000Z'`
+ * 三种都静默少算一天、零 warning —— 其中 `…Z` 形态正是 CLI 自己 `--sql` 示例里教的写法。
+ */
+const DAY_VALUE_RE = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?)?$/
+function isMiscomparedDayLiteral(v: string): boolean {
+  const m = DAY_VALUE_RE.exec(v.trim())
+  if (m === null) return false
+  if (m[2] === undefined) return true                             // 纯日期
+  if (m[5] === undefined || m[6] === undefined) return true        // 没有小数秒或没有时区：不可能是列内形态
+  if (m[5].length < 3) return true                                 // 不足三位小数 ≠ 列内的 `.000`
+  if (m[2] !== '16' || m[3] !== '00' || m[4] !== '00') return true  // 不是 16:00:00 的 UTC 形态
+  return m[6] !== 'Z'                                              // `+08:00`/`+0800` 等一律错位
+}
+
+/**
+ * `--sql` 通道的日期字面量警告判据（单一实现点）。
+ *
+ * 词法复用 `mask.ts` 的同一个状态机（`withoutComments` / `withoutLiterals`，逐位对齐）：
+ * 列名在「抹掉注释与字面量」的文本上找（注释里的 `-- WHERE stat_date …` 不是真条件；
+ * `"stat_date"` 双引号标识符原样保留、仍算列名）；字面量在「只抹注释」的文本上按
+ * 单引号状态逐个读出（`'it''s'` 是转义、不是两个字面量）。
+ */
+function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
+  // 注释先抹成空白（逐位对齐）：注释里写的 `-- WHERE stat_date >= '…'` 不是真条件。
+  const code = withoutComments(sql)
+  if (!ISO_DAY_COL_RE.test(withoutLiterals(code))) return null
+  // 在「只抹注释」的文本上找孤立的**开引号**：字符串里的 `''` 与 `"…'…"` 标识符里的
+  // 单引号都不是开关引，跳过其整段。美元引号内容按原样保留，但它的开/闭 `$tag$`
+  // 不经过 `'` 分支，无需特判。
+  for (let i = 0; i < code.length; i++) {
+    if (code[i] !== "'") continue
+    const lit = readSingleQuoted(code, i)
+    if (lit !== null && isMiscomparedDayLiteral(lit.value)) return isoDayLiteralHint(loc)
+    if (lit !== null) i = lit.end - 1
+  }
+  return null
+}
+
+/** 读以 `start` 处开引号起的单引号字面量，返回解码后的内容与结束下标（`''` 是转义引号）。 */
+function readSingleQuoted(text: string, start: number): { value: string; end: number } | null {
+  let value = ''
+  for (let j = start + 1; j < text.length; j++) {
+    if (text[j] === "'") {
+      if (text[j + 1] === "'") { value += "'"; j++; continue }
+      return { value, end: j + 1 }
+    }
+    value += text[j]
+  }
+  return null   // 不成对（解析错误由沙箱报），本警告不接管
+}
+
 function isoDayLiteralHint(loc?: StoreLocation): string {
   return '该列列内是 UTC `…Z` 形态的字符串（上海日零点 = 前一日 16:00Z），按字典序比较，' +
-    '日期字面量会**少算或漏掉当天**。要在 --sql 里过滤请写 UTC 形态（如 \'2026-10-12T16:00:00.000Z\'），' +
-    '或改用 `' + queryTableCommand('<表>', loc) + ' --since/--until`（该通道已处理取整语义）'
+    '这个日期字面量会**少算或漏掉一天**（`…Z` 是 UTC 时刻，不是上海日）。要在 --sql 里过滤请写 UTC 形态' +
+    '（如 \'2026-10-12T16:00:00.000Z\'），或改用 `' + queryTableCommand('<表>', loc) + ' --since/--until`（该通道已处理取整语义）'
 }
 
 /**
@@ -460,7 +520,11 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
 
   // 0 行 ≠ 没有数据（spec §十 / 红线 3）：给了时间过滤而 0 行时附可操作提示。
   if (result.rows.length === 0 && (input.since !== undefined || input.until !== undefined)) {
-    warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until, loc))
+    // 区间倒置（只给 --until 且早于表 MIN）的成因已由 buildTimeFilter 的警告说清，
+    // 且它是**必然** 0 行 —— 再叠一条「同步可能未覆盖该区间」是假归因
+    //（同步正常覆盖了这段，只是上限压根没到开始）（2026-11-09 审计）。
+    const inverted = plan.resolvedRange !== null && plan.resolvedRange[0] > plan.resolvedRange[1]
+    if (!inverted) warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until, loc))
   } else if (result.rows.length === 0) {
     // 没给时间过滤也 0 行：spec §十 把「空表」列为 warnings 的触发条件。
     // 这里必须能区分「表空」与「查询没命中」—— `--table` 通道没有 WHERE 子句（除了时间过滤），
@@ -490,8 +554,15 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     // `coveredDays` 来自实际查询区间，缺省上界含今天；而 expectedDays 已排除今天。
     // 今天只要有一行，就会把昨天的真缺口补满 → 零警告（实测：10/13–10/18 + 今天、
     // 缺 10/19，`--since 7d` 输出 warnings: []）。这里按夹紧后的 hi 再算一次。
+    // ⚠️ 夹紧后的上界可能**早于下界**（2026-11-09 实测）：窗口只有今天一格时
+    //（`--since <今天>`，iso-day 下 lo = hi = 今天零点），今天被排除 → hi = 昨天零点 < lo。
+    // 此时窗口内一个应覆盖的日子都没有：跳过覆盖重算、不报缺口。此前照样拿夹紧后的上界
+    // 跑 `buildCoverageQuery` → 抛「区间无效」用法错误，而本段在 usageFail 的 try 之外，
+    // 异常冒到顶层被归成 `internal` +「若反复出现请报告此问题」——正常问法被说成内部故障。
     let daysInWindow = coveredDays
-    if (hi < plan.resolvedRange[1]) {
+    if (hi < plan.resolvedRange[0]) {
+      daysInWindow = 0
+    } else if (hi < plan.resolvedRange[1]) {
       const clamped = buildCoverageQuery({ ...input, until: hi })
       const row = (await session.run(clamped.sql, {
         params: clamped.params, timeoutMs: input.timeoutMs,
@@ -685,8 +756,9 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     }
     // iso-day 列 + 日期形态字面量 → 按字符串比较会少一天（场景 F3）。与 0 行无关：
     // 非 0 行也可能已经悄悄少了一整天，这正是它危险的地方。
-    if (ISO_DAY_COL_RE.test(sqlText) && DAY_LITERAL_RE.test(sqlText)) {
-      warnings.push(isoDayLiteralHint(openedLoc))
+    if (ISO_DAY_COL_RE.test(sqlText)) {
+      const dayHint = dayLiteralHint(sqlText, openedLoc)
+      if (dayHint !== null) warnings.push(dayHint)
     }
     // 截断不得静默：Agent 会把「只看到前 N 行」当成事实（spec §十）。
     if (result.truncated) {

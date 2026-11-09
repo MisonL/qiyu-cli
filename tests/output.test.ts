@@ -257,6 +257,7 @@ describe('失败输出', () => {
       ['auth_missing', 1],
       ['bad_time', 1],
       ['config_insecure', 1],
+      ['config_invalid', 1],
       ['internal', 1],
       ['module_offline', 1],
       ['needs_confirmation', 1],

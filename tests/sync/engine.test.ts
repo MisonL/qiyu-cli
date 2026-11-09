@@ -266,13 +266,17 @@ describe('窗口切分与包含窗跳过', () => {
       },
     })
     const r = await runTask(t, { ...ctx(store), rangeOverride: { start: 0, end: 63 * DAY } })
-    // sliceByMaxWindow 产出 4 窗（[0,31],[30,61],[60,63],[62,63]）；引擎跳过第 4 窗
+    // sliceByMaxWindow 产出 4 窗（[0,31],[30,61],[60,63],[62,63]）；引擎合并第 4 窗
     expect(fetched).toEqual([
       { start: 0, end: 31 * DAY },
       { start: 30 * DAY, end: 61 * DAY },
       { start: 60 * DAY, end: 63 * DAY },
     ])
+    // 2026-11-09 审计：被重叠区合并的窗此前从所有计数里消失（total=3 看起来就是切出的
+    // 全部 4 窗里的 3 —— 少的那一个无从得知）。现在单独披露为 contained（不计入 total）。
     expect(r.windows.total).toBe(3)
+    expect(r.windows.contained).toBe(1)
+    expect(r.windows.skipped).toBe(0)   // 合并不是跳过：数据已被前一窗覆盖
     await store.close()
   })
 

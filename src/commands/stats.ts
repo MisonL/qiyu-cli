@@ -156,7 +156,11 @@ export const UNIT_NOTES = {
   count: '计数（整数）',
   ms: '毫秒（实测样本 loginDuration 天粒度 = 86400024，即 86400000 + 24）',
   unknown: '判不出单位（目录未收录、字段名后缀也推不出）—— 不是「没有单位」：'
-    + '报告时如实写「单位未知」，不要猜。这些字段同时列在 unknown_fields',
+    + '报告时如实写「单位未知」，不要猜。这些字段同时列在 unknown_fields。'
+    // 2026-11-09 审计：此前只说「不要猜」，没有给出真能跑的核实路径；而 --sql 拒绝
+    // 参数占位符 `?`，用户照 SQL 习惯写 `WHERE field = ?` 会以退出码 2 失败。
+    + "要看原始值判断量纲用 `qiyu query --sql '<SQL>'` 显式列出该列"
+    + '（--sql 不接受参数占位符 `?`，过滤条件必须写成字面量）',
 } satisfies Record<MetricUnit, string>
 
 /** `declared.<字段>.source` 的两个取值：标明声明是实测还是命名推断。 */
@@ -350,13 +354,22 @@ async function statsFields(argv: string[]): Promise<number> {
     }
     const emptyKey = countOf(shape.empty_key)
     if (emptyKey > 0) {
+      // 成因按事实写：观测 SQL 只收**非空键**（`WHERE e.key <> ''`），不是「JSON 路径表达不了」——
+      // 空键从没进过路径表达式。且这条不承诺「其余字段」：payload 可能只有空键
+      //（2026-11-09 实测：`{"":1}` 时旧文案「其余字段照常统计」与下面「均无可观测字段」互相矛盾）。
       warnings.push(`该表有 ${emptyKey} 行 payload 含空字符串键 ""，该键未计入统计`
-        + '（JSON 路径无法表达空键名）；其余字段照常统计')
+        + '（观测只收非空键）；同一行里的非空键照常统计')
     }
     if (observed.length === 0) {
       const n = Number(shape.total)
       if (n === 0) {
         warnings.push('该表无数据；先运行 `' + syncRunCommand(opened.dbPath, opened.profileFlag) + '`')
+      } else if (emptyKey > 0) {
+        // 有行、只是空键被排除：不得把它归进「NULL / 空对象 / 非对象」（`{"":1}` 都不是）
+        warnings.push(`该表有 ${n} 行，但 0 个可观测字段：${emptyKey} 行 payload 只有空字符串键 ""`
+          + '（空键不计入统计，原因见上一行）。'
+          + '若这不是预期，用 `' + querySqlCommand(storeLocationOf(opened.dbPath, opened.profileFlag))
+          + '` 直接查看 payload（' + SQL_ARG_REPLACE_NOTE + '）')
       } else {
         warnings.push(`该表有 ${n} 行，但 payload 均无可观测字段（payload 为 NULL / 空对象 / 非对象）。`
           + '字段自描述需要 payload 内的 JSON 键；请确认同步写入的是报表原始 JSON')

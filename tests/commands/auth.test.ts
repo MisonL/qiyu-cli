@@ -276,16 +276,18 @@ describe('auth login', () => {
   it('配置文件畸形时拒绝覆盖 —— 不静默丢掉用户手写的内容', async () => {
     writeCfg('{ 坏 JSON')
     vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
-    expect(await authCommand(['login'])).toBe(2)
+    // 退出码必须是 1 不是 2（2026-11-09 审计）：退出码 2 = 「改参数重来」，
+    // 而换环境变量修不好损坏的 JSON；kind 点名真正成因 config_invalid。
+    expect(await authCommand(['login'])).toBe(1)
+    expect(JSON.parse(out).error.kind).toBe('config_invalid')
     expect(JSON.parse(out).error.message).toMatch(/无法读取现有配置文件/)
-    // ⚠️ 必须同时断言 stderr **非空且**无 Markdown 标记（2026-10-26 逐点变异实测发现）：
-    // 本分支**被**这条用例走到了，但它只断言了 message —— 给该 usageFail 的文案
-    // 注入 `**`，全量测试**仍全绿**（`api.test.ts` 的哨兵表覆盖不到这里：那条表
-    // 的每一行都是一次裸调用，构造不出"配置文件畸形"的前置状态）。
-    // ⚠️ `not.toMatch(/\*\*/)` 单独用**在空串上恒真**（Sourcery 2026-10-26）——
-    // 必须先钉非空：这条路径的承诺是"人能在终端看到原因"，stderr 空着就等于没兑现。
-    expect(err, '这条分支必须把原因写进 stderr（人有 stderr、Agent 有 stdout）').not.toBe('')
-    expect(err).not.toMatch(/\*\*/)
+    expect(String(JSON.parse(out).error.hint)).toMatch(/修好或移走该文件/)
+    // stderr 不再有（2026-11-09 审计裁决）：这条路径从 usageFail（stderr + stdout 双通道）
+    // 改走 fail（退出码 1 的业务错误，与其他 fail 出口一致，只写 stdout JSON）。
+    // 人的原因说明改由 stdout 的 message + hint 承担 —— 上面已逐条断言。
+    expect(err).toBe('')
+    // 文案不得带 Markdown 标记（2026-10-26 变异实测的守卫保留，只是挪到 stdout 上钉）
+    expect(out).not.toMatch(/\*\*/)
     // 坏文件必须**原样没动**（没有被覆盖成一个"看起来成功"的新文件）
     expect(readFileSync(cfgPath(), 'utf8')).toBe('{ 坏 JSON')
   })

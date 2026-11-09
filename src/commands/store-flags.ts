@@ -51,11 +51,18 @@ if (!STORE_VALUE_FLAG_NAMES.every((n) => n.startsWith('--'))) {
  */
 export function parseStoreFlags(argv: string[]): StoreFlags & { rest: string[] } {
   const out: StoreFlags & { rest: string[] } = { rest: [] }
+  const seen = new Set<string>()
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (STORE_VALUE_FLAG_NAMES.includes(a)) {
       const v = argv[i + 1]
       if (v === undefined || v.startsWith('--')) throw new Error(`${a} 缺少取值`)
+      // ⚠️ 重复出现必须报错，不得静默覆盖（2026-11-09 审计实测）：
+      // `store status --db a.duckdb --db b.duckdb` 此前只认后一个、对前一个只字不提，
+      // Agent 会以为命令作用在它**第一个**给的库上（`api call --body` 的同类判据：
+      // 带值 flag 重复 = 有一个值被丢弃，退出码 2 换它改参数）。
+      if (seen.has(a)) throw new Error(`${a} 重复出现：只能给一次（不做静默覆盖）`)
+      seen.add(a)
       // a 已由上面的 includes 收窄为三件套之一，slice(2) 得到 db/profile/backend。
       out[a.slice(2) as keyof StoreFlags] = v
       i++

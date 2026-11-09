@@ -50,6 +50,11 @@ export const ERROR_KINDS = [
   // 可被整体替换）—— 退出码 1，重试无用，必须由人执行 chmod 收紧密码。
   // ⚠️ 与 `auth_missing` 的区别：那是「没配」，这是「配了但落在不安全的位置」。
   'config_insecure',
+  // 配置层（2026-11-09 审计）：配置文件**读不出来**（畸形 JSON / 未知键 / 权限拒绝）——
+  // 退出码 1，改参数修不好，必须先修文件。此前 `auth login` 把这种情形报成
+  // `kind: usage`（退出码 2），而退出码 2 的语义是「改参数重来」：换环境变量不会
+  // 修好损坏的 JSON（`auth whoami` 对同一状态是降级为 warning、退出 0）。
+  'config_invalid',
 ] as const
 
 // ⚠️ `sandbox_blocked` / `query_error` 是 **code** 不是 kind：查询层的这两类失败

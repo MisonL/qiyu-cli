@@ -264,13 +264,13 @@ describe('query --sql · 成功路径（spec §十）', () => {
     // 纯日期字面量同样触发
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
-    expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(true)
+    expect((meta().warnings as string[]).some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))).toBe(true)
 
     // ⚠️ 空格分隔形态同样触发（场景审查 4）：`'2026-10-13 00:00:00'` 与 `T` 形态等价，
     // 旧正则只认 `T` → 这种写法静默少算一天、零 warning。
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13 00:00:00'")).toBe(0)
-    expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(true)
+    expect((meta().warnings as string[]).some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))).toBe(true)
 
     // 反证 1：UTC `…Z` 形态（正确写法）不警告
     expect(await q('--sql',
@@ -281,6 +281,46 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM sessions WHERE session_id >= '2026-10-13'")).toBe(0)
     expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(false)
+  })
+
+  it('日期字面量的其余错位写法同样警告；正确 UTC 16:00Z 与注释里的条件不警告（2026-11-09 审计）', async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 旧判据只认 `YYYY-MM-DD[ 或 T]00:00:00[.0…][+08:00]`，实测这三种写法退出码 0、零 warning：
+    // ① CLI 自己 `--sql` 示例教的 `…Z` 形态（00:00:00Z 是 UTC 时刻，不是上海日零点）
+    for (const lit of [
+      '2026-11-08T00:00:00Z',        // 无小数秒的 Z 形态
+      '2026-11-09 00:00:00.000Z',    // 空格分隔 + 小数秒 + Z
+      '2026-11-08T00:00:00.000Z',    // 标准 Z 形态，但时刻是 00:00（不是 16:00）
+      '2026-11-08T16:00:00+08:00',   // +08:00 形态的 16:00 也不是列内形态
+    ]) {
+      expect(await q('--sql',
+        `SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '${lit}'`), lit).toBe(0)
+      expect(warned(), lit).toBe(true)
+    }
+
+    // 反证 1：列内真实形态（UTC 16:00:00.000Z）不警告
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00.000Z'")).toBe(0)
+    expect(warned()).toBe(false)
+    // 反证 1b：16:00:00Z（无小数秒）会与 `.000Z` 逐位比较错位 → 必须警告（上面已测 00:00Z，这里补时刻对、形态错）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00Z'")).toBe(0)
+    expect(warned()).toBe(true)
+
+    // 反证 2：条件被注释掉 → 不是真条件，不警告（help 明说 SQL 可含 `--` 注释）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview -- WHERE stat_date >= '2026-10-13'\n")).toBe(0)
+    expect(warned()).toBe(false)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview /* WHERE stat_date >= '2026-10-13' */")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // 反证 3：双引号标识符里含 iso-day 列名 + 真正的日期字面量 → 仍要警告（标识符是合法引用）
+    expect(await q('--sql',
+      'SELECT "stat_date" FROM daily_overview WHERE "stat_date" >= \'2026-10-13\'')).toBe(0)
+    expect(warned()).toBe(true)
   })
 })
 
@@ -353,6 +393,26 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     // 超时/被拦之后只读会话必须已关闭、文件锁不滞留（M11）：
     // 用「同一文件能否以 READ_WRITE 打开」作外部证据，比断言 closeSync 被调用更接近事实。
     await expectLockReleased()
+  })
+
+  it('只读形态（PRAGMA 查询 / VALUES / TABLE / FROM）放行；拒绝文案与实测一致（2026-11-09 审计）', async () => {
+    await seed()
+    // USAGE 与拒绝 hint 此前只说 SELECT / DESCRIBE / SHOW / EXPLAIN，实测这四种也放行：
+    for (const sql of [
+      'VALUES (1)',
+      "PRAGMA table_info('sessions')",
+      'PRAGMA database_size',
+      'TABLE sessions',
+      'FROM sessions LIMIT 1',
+    ]) {
+      expect(await q('--sql', sql), sql).toBe(0)
+    }
+    // 形如赋值的 PRAGMA 解析成 SET → 拒绝；hint 必须把放行面说全（不再只列 4 个关键字）
+    expect(await q('--sql', "PRAGMA enable_profiling='json'")).toBe(2)
+    const hint = String(errorOf().hint)
+    expect(hint).toMatch(/PRAGMA 查询/)
+    expect(hint).toMatch(/VALUES/)
+    expect(hint).toMatch(/SET\/CALL/)
   })
 
   it('超时：--timeout 0.05 + 超大聚合 → query_timeout 退出码 1；--timeout 0 = 真的不限时', async () => {
@@ -782,6 +842,15 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(String(e.hint)).toContain('qiyu db describe sessions')
     expect(String(e.hint)).toMatch(/不是你的查询写错了/)
     expect(String(e.hint)).not.toMatch(/检查表名、列名与 SQL 语法/)
+    // 被删的正是时间列 → 必须说明修好前列名相关的用法都不可用，并给出能跑的替代
+    //（2026-11-09 审计：此前的 hint 只指 db describe，等于没有出路）
+    expect(String(e.hint)).toMatch(/时间列 startTime 恢复前/)
+    expect(String(e.hint)).toMatch(/--since\/--until/)
+    expect(String(e.hint)).toContain("qiyu query --sql '<SQL>'")
+    // 替代路径真的能跑：显式列出其余列即可读出数据（不是一句做不到的建议）
+    expect(await q('--sql',
+      'SELECT session_id, payload, staffId, endTime, session_type FROM sessions')).toBe(0)
+    expect(rowsOf().length).toBeGreaterThan(0)
     // ⚠️ 只对 --table 通道生效：--sql 通道用户确实写了 SQL，原样分派（候选清单）
     expect(await q('--sql', 'SELECT "startTime" FROM sessions')).toBe(2)
     expect(String(errorOf().hint)).not.toMatch(/不是你的查询写错了/)
@@ -817,6 +886,33 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     // 反证 2：非 iso-day 表（sessions，epoch-ms）不算自然日、不触发
     expect(await qAt('--table', 'sessions', '--since', '2026-10-01')).toBe(0)
     expect((meta().warnings as string[]).some((x) => /自然日/.test(x))).toBe(false)
+  })
+
+  it('--since 今天（iso-day）不得因缺口夹紧打穿成 internal（2026-11-09 审计）', async () => {
+    // 实测事故：`--since 2026-11-09`（当天）在**今天有数据**的库上 →
+    // `查询执行失败（底层：区间无效：生效下界 …11-09… 晚于生效上界 …11-08…）`，
+    // kind=internal + hint「若反复出现请报告此问题」——把正常问法说成内部故障。
+    // 成因：缺口警告把上界夹到「昨天零点」，再拿夹紧后的上界跑覆盖查询——
+    // 窗口窄到只剩今天时夹紧后的上界反而**早于**下界，`buildCoverageQuery` 抛用法错误，
+    // 而这段代码在 usageFail 的 try 之外，异常一路冒到顶层被归为 internal。
+    await seed()
+    // 对照①：今天还没有行 → 0 行是数据事实（有 0 行警告），不是内部故障
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-15')).toBe(0)
+    expect(rowsOf()).toHaveLength(0)
+
+    // 对照②（事故形态）：今天**有行**才触发缺口检查 —— 必须 1 行、0 缺口警告
+    await seedMore('daily_overview', [overviewRow('2026-10-14T16:00:00.000Z')])   // 上海 10/15（今天）
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-15')).toBe(0)
+    expect(meta().resolved_range).toEqual([
+      '2026-10-15T00:00:00+08:00', '2026-10-15T00:00:00+08:00'])
+    expect(rowsOf()).toHaveLength(1)
+    // 窗口只有今天一格：今天不算缺口（当天数据次日才同步），不得报缺口
+    expect((meta().warnings as string[]).some((x) => /自然日/.test(x))).toBe(false)
+
+    // 对照③：单日显式 --until 同一天仍正常
+    expect(await qAt('--table', 'daily_overview',
+      '--since', '2026-10-15', '--until', '2026-10-15')).toBe(0)
+    expect(rowsOf()).toHaveLength(1)
   })
 
   it('今天有行时不得掩盖昨天的真缺口（正确性审查 F6）', async () => {
@@ -877,6 +973,18 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     // --sql 通道同一张表：用户自己写的 SQL，仍走 Catalog Error 翻译（不抢分派）
     expect(await q('--sql', 'SELECT COUNT(*) FROM staff_quality')).toBe(2)
     expect(errorOf().kind).toBe('usage')
+  })
+
+  it('只给 --until 且早于表 MIN → 0 行成因只由「缺省下界晚于上界」说明，不再叠假归因（2026-11-09 审计）', async () => {
+    await seed()
+    // seed 的 daily_overview 最早一行是上海 10/14；--until 10/13 → 缺省下界(10/14) > 上界(10/13)
+    expect(await qAt('--table', 'daily_overview', '--until', '2026-10-13')).toBe(0)
+    expect(rowsOf()).toHaveLength(0)
+    const warnings = meta().warnings as string[]
+    // 成因警告仍在（并把倒置的 resolved_range 解释清楚）
+    expect(warnings.some((w) => /缺省下界.*晚于上界.*必然 0 行/.test(w))).toBe(true)
+    // 但不得再说「同步可能未覆盖该区间」：区间是倒置的，同步覆盖不覆盖与 0 行无关
+    expect(warnings.some((w) => /同步可能未覆盖该区间/.test(w))).toBe(false)
   })
 
   it('只有 --until → 下界取该表 MIN；空表 → resolved_range null + 两条 warning', async () => {

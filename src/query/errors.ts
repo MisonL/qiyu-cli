@@ -17,7 +17,7 @@
 //
 // ⚠️ 分层约束（spec §5.1）：不 import `sync/`、`commands/`。`output.ts` 是 CLI 输出层
 // （信封与退出码），不是命令层，可以 import。
-import { fail, failCompact, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand, dbTablesCommand, dbDescribeCommand } from '../output.js'
+import { fail, failCompact, sanitizeMessage, stripSqlEcho, storeInitCommand, syncRunCommand, dbTablesCommand, dbDescribeCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE } from '../output.js'
 import type { StoreLocation } from '../output.js'
 import type { TableDef } from '../store/schema.js'
 import {
@@ -512,11 +512,27 @@ export function driftFailureFor(table: TableDef, e: unknown, loc?: StoreLocation
   }
   const byColumn = matchMissingName(msg, [COLUMN_NAMED_RE, COLUMN_NAME_RE])
   if (byColumn !== null && table.columns.some((c) => c.name === byColumn[1])) {
+    const missing = byColumn[1]
+    // 被删的恰好是**时间列**时，hint 只指 db describe 等于没有出路（2026-11-09 审计实测）：
+    // 本命令的 WHERE/SELECT 由代码按声明生成，只要时间列不在库里，任何 --since/--until
+    // 查询都会以同一条错误失败，--group-by 也绕不过 SELECT 列表里的该列。所以必须说明
+    // 「修好之前哪些用法不可用」，并给出真能跑的替代（--sql 不行——它同样在 SELECT * 时撞列，
+    // 但可以显式列只取保留下来的列）。
+    const timeCol = table.timeColumn
+    const isTimeCol = timeCol !== undefined && timeCol.name === missing
+    const hint = isTimeCol
+      ? '这不是你的查询写错了：本命令的 SQL 由 CLI 生成，列名来自 TABLES 声明。'
+        + `时间列 ${missing} 恢复前，本命令对该表的 --since/--until（以及默认的整表查询）都会失败；`
+        + '用 `' + querySqlCommand(loc) + '` 显式列出其余列（不选 ' + missing + '）可先把已有数据读出来（'
+        + SQL_ARG_REPLACE_NOTE + '），'
+        + '根因修复用 `' + dbDescribeCommand(table.name, loc) + '` 核对漂移后重新同步或重建库'
+      : '这不是你的查询写错了：本命令的 SQL 由 CLI 生成，列名来自 TABLES 声明。'
+        + '用 `' + dbDescribeCommand(table.name, loc) + '` 查看实际列集与漂移警告，'
+        + '并按提示重新同步或重建库'
     return {
       code: 'query_error', kind: 'usage', retryable: false,
-      message: `列 ${byColumn[1]} 在库中不存在（表 ${table.name}）——库与 TABLES 声明漂移`,
-      hint: '这不是你的查询写错了：本命令的 SQL 由 CLI 生成，列名来自 TABLES 声明。'
-        + '用 `' + dbDescribeCommand(table.name, loc) + '` 查看实际列集与漂移警告',
+      message: `列 ${missing} 在库中不存在（表 ${table.name}）——库与 TABLES 声明漂移`,
+      hint,
     }
   }
   return null

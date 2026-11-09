@@ -428,7 +428,7 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     expect(nullish.maskedColumns).toEqual([])
   })
 
-  it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5、词边界、SQL 侧大小写不敏感）', () => {
+  it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5（第 5 条点名被截断的剩余列）、词边界、SQL 侧大小写不敏感）', () => {
     const one = maskQueryRows({
       rows: [{ p: '13800138000' }], columns: ['p'],
       mode: sqlMode('SELECT userPhone AS p FROM sessions'),
@@ -453,6 +453,11 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
       mode: sqlMode('SELECT userName AS a, userPhone AS b, userEmail AS c, userAddress AS d, fromIp AS e, userIpCity AS f FROM sessions'),
     })
     expect(six.warnings).toHaveLength(5)
+    // 上限截断不得静默（2026-11-09 审计）：被截掉的列必须点名并给出总数，
+    // 否则 Agent 读到的 5 条看起来就是全部缺口。
+    expect(six.warnings[4]).toMatch(/另有 2 个敏感列的缺口警告未列出/)
+    expect(six.warnings[4]).toContain('fromIp')
+    expect(six.warnings[4]).toContain('userIpCity')
 
     // 词边界：userPhoneBook 是更长的标识符，不得触发 userPhone 警告
     const longer = maskQueryRows({

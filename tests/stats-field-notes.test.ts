@@ -86,6 +86,9 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     expect(UNIT_NOTES.ratio).toContain('报告原值并标注不确定')
     expect(UNIT_NOTES.unknown).toContain('不是「没有单位」')
     expect(UNIT_NOTES.unknown).toContain('unknown_fields')
+    // 给出一条真能跑的核实路径，并点明 --sql 拒绝参数占位符（2026-11-09 审计）
+    expect(UNIT_NOTES.unknown).toContain("qiyu query --sql '<SQL>'")
+    expect(UNIT_NOTES.unknown).toContain('不接受参数占位符')
     expect(UNIT_NOTES.ms).toContain('毫秒')
     expect(SOURCE_NOTES['name-suffix']).toContain('不是实测')
   })

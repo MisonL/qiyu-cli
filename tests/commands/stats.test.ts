@@ -361,6 +361,57 @@ describe('stats fields', () => {
     expect(warnings[0]).toMatch(/该表无数据/)
   })
 
+  it('只有空键的行 → 不得与「空对象 / 非对象」归成一个成因（2026-11-09 审计）', async () => {
+    // 实测事故：payload 为 `{"":1}` 时同时出现两条互斥的警告——
+    // 「含空字符串键 …；其余字段照常统计」（暗示还有别的字段，实际一个都没有）与
+    // 「有 N 行，但 payload 均无可观测字段（payload 为 NULL / 空对象 / 非对象）」
+    //（`{"":1}` 是非空对象，两种成因都不符）。空键为什么被排除也没说对：
+    // 成因是观测 SQL 的 `WHERE e.key <> ''`，不是「JSON 路径无法表达空键名」。
+    const s = await fresh()
+    try {
+      await s.upsert('daily_overview', [
+        { stat_date: '2026-10-01T16:00:00.000Z', payload: '{"":1}', synchronized_at: null },
+        { stat_date: '2026-10-02T16:00:00.000Z', payload: '{}', synchronized_at: null },
+        { stat_date: '2026-10-03T16:00:00.000Z', payload: '{"sessions":7}', synchronized_at: null },
+      ])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+
+    expect(data().observed).toEqual([
+      { field: 'sessions', rows_present: 1, minus_one: 0, nulls: 0, min: 7, max: 7 },
+    ])
+    const w = meta().warnings as string[]
+    const emptyKeyW = w.filter((x) => /空字符串键/.test(x))
+    expect(emptyKeyW).toHaveLength(1)
+    // 说对成因、不说「其余字段照常统计」（此时确实有别的字段，但要按事实说），
+    // 并点名真正原因：观测只收非空键
+    expect(emptyKeyW[0]).toMatch(/非空键/)
+    expect(emptyKeyW[0]).not.toMatch(/JSON 路径无法表达/)
+    // 有可观测字段时不得再出「均无可观测字段」
+    expect(w.some((x) => /个可观测字段/.test(x))).toBe(false)
+  })
+
+  it('只有空键、0 个可观测字段 → 成因里必须含空键，不得说成 NULL / 空对象 / 非对象', async () => {
+    const s = await fresh()
+    try {
+      await s.upsert('daily_overview', [
+        { stat_date: '2026-10-01T16:00:00.000Z', payload: '{"":1}', synchronized_at: null },
+      ])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+    expect(data().observed).toEqual([])
+    const w = meta().warnings as string[]
+    const noField = w.filter((x) => /个可观测字段/.test(x))
+    expect(noField).toHaveLength(1)
+    expect(noField[0]).toMatch(/空键/)
+    // 「空键未计入统计」的成因说明只出现一次（0 字段那条是补充成因，不是重复计数的另一份）
+    expect(w.filter((x) => /该键未计入统计/.test(x))).toHaveLength(1)
+  })
+
   it('有行但 payload 无可观测字段 → 不谎称「无数据」，warning 点名 payload', async () => {
     const s = await fresh()
     try {

@@ -727,7 +727,9 @@ describe('C-8：尾部标记行（导出窗口声明）与请求窗口核对', (
         `${JSON.stringify(SESSION_ROW)}\n${stale}\n`)
       const r = await runTask(t, ctx(store, { rangeOverride: W }))
       expect(r.status).toBe('partial')
-      expect(r.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })
+      // contained: 1 —— 1 天区间 + overlapDays=1 切出 2 个区间，末窗完全落在回看重叠区里
+      // （2026-11-09 起单独披露；不计入 total / skipped）
+      expect(r.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0, contained: 1 })
       expect(r.gaps.length).toBe(1)
       expect(r.gaps[0]!.reason).toBe('fetch_failed')
       // failDetail 中文包装 + 消息含「格式漂移」与 fixture 原文（原文在 detail 里可见）

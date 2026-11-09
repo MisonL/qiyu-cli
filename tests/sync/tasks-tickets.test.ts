@@ -131,6 +131,9 @@ describe('op 参数守卫（Review Focus 1 钉死：客户端 usage，零请求�
         ['opEnd 缺失', { start: NOW - DAY, index: 0, total: 1 } as unknown as WindowRef],
         ['opEnd=0', { start: NOW - DAY, end: 0, index: 0, total: 1 } as WindowRef],
         ['顺序颠倒', { start: NOW, end: NOW - DAY, index: 0, total: 1 } as WindowRef],
+        // 零宽窗（start === end）同样拦下（2026-11-09 审计）：姊妹管线对同一形态是
+        // `end <= start` 拒绝，两处判据必须同向
+        ['零宽窗', { start: NOW, end: NOW, index: 0, total: 1 } as WindowRef],
         // C 中-2：opStart=0（1970 哨兵）同样必须拦下 —— 服务端会静默钳到 now−31d
         ['opStart<=0', { start: 0, end: NOW, index: 0, total: 1 } as WindowRef],
       ] as Array<[string, WindowRef]>) {
@@ -166,8 +169,11 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
     }), { status: 200, headers: { 'content-type': 'application/json' } }))
   }
 
-  it('90 天诱导场景：按 ≤31 天切片 + 3 天重叠 → 4 窗（90/31 直接切会被静默钳制少取 ~58 天）', async () => {
-    // sliceByMaxWindow(90d, 31, 3) = [0,31],[28,59],[56,87],[84,90] —— 4 窗、无包含窗
+  it('90 天诱导场景：按 ≤31 天切片 + 3 天重叠 → 4 窗执行 + 1 窗被重叠合并（contained）', async () => {
+    // sliceByMaxWindow(90d, 31, 3) 切出 5 个区间：[0,31],[28,59],[56,87],[84,90],[87,90)；
+    // 末窗完全落在前一窗的 3 天回看重叠区里 → skipContained 合并掉，**执行 4 窗**。
+    // 2026-11-09 审计：合并掉的窗此前从所有计数里消失（total=4 看起来就是切出的全部），
+    // 现在单独披露为 contained（不算 skipped —— 数据已被前一窗覆盖；不计入 total）。
     const fetchMock = vi.fn(() => okC({ total: 0, tickets: [] }))
     vi.stubGlobal('fetch', fetchMock)
     try {
@@ -175,7 +181,11 @@ describe('op 窗口切片与 3 天回看（runTask 全链路，http mock）', ()
       const r = await runTask(ticketById('tickets.search')!, ctx(store, {
         rangeOverride: { start: NOW - 90 * DAY, end: NOW },
       }))
-      expect(r.windows.total).toBe(4)
+      expect(r.windows.total).toBe(4)        // 执行的 4 窗（+ skipped 0）
+      expect(r.windows.contained).toBe(1)    // 被重叠区合并的第 5 窗，单独披露
+      expect(r.windows.skipped).toBe(0)     // 合并不是跳过：skipped 只代表「该拉的没拉」
+      // 执行的就是 4 窗（每窗至少 2 次调用：页数探测 + 假空重试，所以只断言 ≥4）
+      expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(4)
       expect(r.status).toBe('complete')
       await store.close()
     } finally {

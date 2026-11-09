@@ -266,6 +266,27 @@ describe('③ windowEndClamp 之外的窗必须计数可见（不得静默消失
   })
 })
 
+describe('③b windowEndClamp 截短的窗必须有点名进度行（2026-11-09 审计）', () => {
+  it('跨过末端上限的 31 天窗 → 照常执行（截短），进度行点名「末端被上限截短」', async () => {
+    const store = await fresh()
+    const lines: string[] = []
+    // 窗 [NOW−10d, NOW) 跨过上限（昨天 0 点）→ 截短为 [NOW−10d, 昨天 0 点)。
+    // 此前它只是「一个成功窗」，没有任何输出说明实际只拉到了昨天 —— 与整窗丢弃
+    //（有进度行）不对称。
+    vi.stubGlobal('fetch', vi.fn(async () => okC({ list: [] })))
+    try {
+      const r = await runTask(reportById('reports.staff_attendance')!, ctx(store, {
+        rangeOverride: { start: NOW - 10 * DAY, end: NOW },
+        onProgress: (m: string) => lines.push(m),
+      }))
+      expect(r.windows.succeeded).toBe(1)
+      expect(lines.join('\n')).toMatch(/窗末端被上限截短/)
+      expect(lines.join('\n')).toMatch(/不是丢失已有数据/)
+    } finally { vi.unstubAllGlobals() }
+    await store.close()
+  })
+})
+
 describe('④ order_performance：sum 哨兵行按天唯一（回补不得覆盖另一天的汇总）', () => {
   const okOrders = (money: number) => okC({
     orders: [{ orderId: 900001, sellMoney: money }], sum: { sellMoney: money }, total: 1,

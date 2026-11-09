@@ -271,7 +271,7 @@ qiyu --version                       包版本 + skill_contract_version
 
 **请按 `kind` 分支，不要按 `code`。** `code` 只是个标签：它可能是服务端的数字码
 （如 `14009`），也可能是本 CLI 合成的词（`usage` / `network` / `internal` /
-`auth_missing` / `config_insecure` / `confirm_required` / `store_locked` /
+`auth_missing` / `config_insecure` / `config_invalid` / `confirm_required` / `store_locked` /
 `store_not_initialized` / `local_rate_limit` / `query_error` / `sandbox_blocked` /
 `query_timeout` / `sync_not_run` / `unknown`）。合成词在官方错误码表里查不到。
 ⚠️ 上面与 `qiyu --help` 里的是一批**常见值**，不是穷举：`kind` 的单一事实源是
@@ -325,9 +325,11 @@ qiyu --version                       包版本 + skill_contract_version
 ### sync 命令的输出
 
 `sync run` 的 stdout 是 `{tasks:[...], truncated:false}`，每个任务含 `task` / `status`
-（complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped}`，
-`total = succeeded + failed + skipped`，`skipped` = 跳过的**残段窗**数 + **整窗晚于末端上限
-被丢弃**的窗数，见下）/ `rows` /
+（complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped, contained?}`，
+`total = succeeded + failed + skipped`，`skipped` = 跳过的**残段窗**数 + **整窗晚于
+末端上限被丢弃**的窗数；`contained` 仅在 > 0 时出现 = 完全落进前一窗**回看重叠区**、被合并的
+窗数（overlapDays > 0 的任务；数据已由前一窗覆盖，所以不算 skipped、也不计入 total ——
+物理切出的窗数 = total + contained），见下）/ `rows` /
 `resolved_range`（Asia/Shanghai 的 `+08:00` ISO 二元组）/ `watermark` / `last_synced_at` /
 `gaps` / `notes`。`gaps[].range` 与 `resolved_range` 同形态（同一套时间解析）；
 `notes` 是中文说明数组（恒在，常为空），例如「请求区间早于接口可得数据的最早边界」
@@ -600,8 +602,10 @@ min/max **只能核对一致性、不是量纲证据** —— 量纲不明确时
   ⚠️ 这些是**警告不是防护**：`--sql` 通道的 payload 缺口只能靠 Agent 读到警告后改用
   `--table` 或 `--no-mask` 显式承担风险来闭合，CLI 无法在保持报表 payload 可用的前提下
   替你做整值替换。
-- **只读沙箱三层缺一不可**：`query --sql` 只接受单条只读语句（`SELECT` / `DESCRIBE` / `SHOW` / `EXPLAIN`——
-  后两者实测归入 `statementType` 的 SELECT/EXPLAIN 类型值），
+- **只读沙箱三层缺一不可**：`query --sql` 只接受单条**只读语句**——DuckDB 判为只读的形态都放行
+  （`SELECT` / `DESCRIBE` / `SHOW` / `EXPLAIN` / `PRAGMA` 查询 / `VALUES` / `TABLE <表>` / `FROM <表>`；
+  实测 2026-11-09），拒绝的是非只读类型（写操作、`SET`/`CALL` 之类的实例配置、`PRAGMA x='y'`
+  这类解析成 SET 的赋值）；
   每实例首次连接时 `enable_external_access=false` + `lock_configuration=true`，
   实例 `access_mode=READ_ONLY`。文件读写、网络、`ATTACH`、`COPY TO`、多语句全部被拦；
   `EXPLAIN ANALYZE` 也拒（它会真正执行内层语句）。
