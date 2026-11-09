@@ -566,3 +566,37 @@ describe('纯空白凭证（A12，2026-11-06）', () => {
     expect(String(e.hint)).not.toMatch(/unset/)
   })
 })
+
+describe('配置读取权限拒绝（Codex 2026-11-10 第四轮 P2）', () => {
+  // ⚠️ 收权限位造 EACCES 只在非 root POSIX 上成立（root 无视权限位）——同文件既有约定。
+  const posixOnly = process.platform === 'win32' || process.getuid?.() === 0
+  it.skipIf(posixOnly)('login：文件不可读 → config_insecure + chmod 600，而不是笼统的 config_invalid', async () => {
+    // 事故形态：`loadConfigFile` → `readConfigRaw` 把读失败包成**无 kind** 的普通 Error，
+    // 于是 login 里那条「权限拒绝 → config_insecure + chmod」的分支**从来走不到**
+    // （死分支），同一状态 whoami/api 报 config_insecure、login 报 config_invalid。
+    const p = writeCfg({ profiles: {} }, 0o000)
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    try {
+      expect(await authCommand(['login'])).toBe(1)
+      const e = JSON.parse(out).error as Record<string, unknown>
+      expect(e.kind).toBe('config_insecure')
+      expect(String(e.hint)).toContain(`chmod 600`)
+      expect(String(e.hint)).toContain('本次未写入任何内容')
+      // 文件不得被改动（连覆盖都没有）—— 先恢复权限才读得出来，读的是**内容**不是权限
+      chmodSync(p, 0o600)
+      expect(readFileSync(p, 'utf8'), '不可读的文件也不能被覆盖').toContain('profiles')
+    } finally {
+      chmodSync(p, 0o600)
+    }
+  })
+
+  it.skipIf(posixOnly)('whoami：文件不可读 → 同样 config_insecure（与 api/sync 的凭证合流同口径）', async () => {
+    const p = writeCfg({ profiles: {} }, 0o000)
+    try {
+      expect(await authCommand(['whoami'])).toBe(1)
+      expect(JSON.parse(out).error.kind).toBe('config_insecure')
+    } finally {
+      chmodSync(p, 0o600)
+    }
+  })
+})

@@ -11,7 +11,7 @@
 // 只提供「配置文件作为载体」的全部通用能力。错误文案与 C1 逐字兼容 ——
 // 现有 25 条 config.test.ts 一条不改地全绿是本次抽取的验收线。
 
-import { readFileSync, writeFileSync, lstatSync, statSync, existsSync, mkdirSync, renameSync, chmodSync } from 'node:fs'
+import { readFileSync, writeFileSync, lstatSync, statSync, existsSync, mkdirSync, renameSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname, isAbsolute } from 'node:path'
 
@@ -142,8 +142,17 @@ export function parseConfig(raw: Record<string, unknown>): QiyuConfigFile {
   return { defaultProfile, profiles }
 }
 
-/** 读 + 解析一步完成（文件不存在返回空结构）。**不含权限裁决**（见 `loadConfigChecked`）。 */
+/**
+ * 读 + 解析一步完成（文件不存在返回空结构）。**不含权限过宽的裁决**（见 `loadConfigChecked`）。
+ *
+ * ⚠️ 但「读不出来**是因为权限**」在这里就要分流（Codex 2026-11-10 第四轮 P2）：
+ * `readConfigRaw` 把读失败包成无 kind 的普通 Error，与「畸形 JSON」同一个出口 ——
+ * 调用方各自的「权限拒绝」分支于是全是死代码（login 报 config_invalid、store 侧被
+ * 包成 usage 退出码 2，而 api/sync 走另一条路报 config_insecure：同一状态三种说法）。
+ * 探测放在**唯一读取点**，所有调用方（auth/api/sync/store）自动同口径。
+ */
 export function loadConfigFile(configPath: string): { file: QiyuConfigFile; exists: boolean } {
+  assertConfigReadable(configPath)
   const exists = existsSync(configPath)
   const raw = readConfigRaw(configPath)
   return { file: parseConfig(raw), exists }
@@ -189,6 +198,24 @@ export function insecureConfigError(configPath: string, reason: 'file' | 'dir'):
       hint: `这是配置文件的权限问题，重试无用 —— 请执行：${fix}`,
     },
   )
+}
+
+/**
+ * 「配置文件读不出来**是因为权限**」→ 转成 `insecureConfigError`（与权限过宽同一条错误）。
+ *
+ * 只分流权限类 errno（EACCES / EPERM）：其余读失败（ENOENT 之外，如路径中段不是目录）
+ * 与畸形配置一样由调用方按「解释不了内容」处理。判据是 `e.code` 属性（fs errno），
+ * 不拿报文文本去挑 —— 见 `tests/open-failure-single-source.test.ts` 的同款规则。
+ */
+export function assertConfigReadable(configPath: string): void {
+  if (!existsSync(configPath)) return
+  try {
+    accessSync(configPath, fsConstants.R_OK)
+  } catch (e) {
+    const code = (e as { code?: string }).code
+    if (code === 'EACCES' || code === 'EPERM') throw insecureConfigError(configPath, 'file')
+    throw e
+  }
 }
 
 /**

@@ -169,7 +169,9 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 **权限规则**：配置文件**含凭证**且 group/other 有**任何**权限位（如 `0644` 可读、`0622` 只写、
 `0601` 仅 other 可执行）时，**任何读取配置的命令都会拒绝读取**（`kind: config_insecure`，
 退出码 1，hint 点名要执行的 `chmod`）——可读时落盘的 appSecret 对同机其他用户可读，
-其余组合也不该放宽，判据就是 `mode & 0o077 !== 0`。不读配置的命令（`--version`、
+其余组合也不该放宽，判据就是 `mode & 0o077 !== 0`。文件**读不出来**（权限拒绝，
+`EACCES`/`EPERM`）同样按 `config_insecure` 报（退出码 1 + `chmod 600` hint）——它是权限
+问题，不是配置内容问题。不读配置的命令（`--version`、
 `api list`、`skill where`、`sync tasks` 等）不受影响，它们不碰凭证。不含凭证的文件维持
 「只在 stderr 警告、不阻断」。
 父目录 group/other **可写**（文件可被整体替换）时同样拒绝。`auth login` 是**唯一的例外**：
@@ -192,7 +194,8 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 > 缺席时，知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。空数组有**三种**成因：
 > 该档没配 robots、该档根本不存在，或**配置文件读取失败**（畸形 JSON / 未知键）——
 > 第三种会在 `meta.warnings` 里点名，先读 `warnings` 再判断，别把读不到配置当成「该档没配」。
-> （含凭证且权限过宽不是「读取失败」：那种情况 `whoami` 直接以 `config_insecure` 报错。）
+> （含凭证且权限过宽、或文件因权限**不可读**，都不是「读取失败」：那两种情况 `whoami`
+> 直接以 `config_insecure` 报错，不进 warnings。）
 
 ## 使用
 

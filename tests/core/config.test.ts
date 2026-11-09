@@ -121,6 +121,26 @@ describe('权限裁决（loadConfigChecked）', () => {
     expect(t.hint).toMatch(/chmod 600/)
   })
 
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '文件不可读（EACCES）→ 与权限过宽同一条 config_insecure（Codex 2026-11-10 第四轮 P2）', () => {
+      // 事故形态：读失败被 readConfigRaw 包成无 kind 的普通 Error，于是调用方的
+      // 「权限拒绝」分支是死代码；这条状态由 loadConfigChecked 统一分流。
+      writeCfg({ profiles: {} }, 0o000)
+      let caught: unknown
+      try { loadConfigChecked(cfgPath()) } catch (e) { caught = e }
+      const t = caught as { kind?: string; hint?: string }
+      expect(t.kind).toBe('config_insecure')
+      expect(t.hint).toMatch(/chmod 600/)
+    })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '文件不可读时 fileProfile 给的是 fatal 而不是 warn（api/sync 走 fatal 分支）', () => {
+      writeCfg({ profiles: {} }, 0o000)
+      const r = fileProfile(cfgPath())
+      expect((r.fatal as { kind?: string } | undefined)?.kind).toBe('config_insecure')
+      expect(r.warn).toBeUndefined()
+    })
+
   it('**无**凭证且 0644 → 只警告不阻断（C1 既有口径）', () => {
     writeCfg({ profiles: { default: { store: { batchSize: 5 } } } }, 0o644)
     // A8（2026-11-06 审查）：此前的 `msgs` 数组从未被 push，`expect(msgs).toEqual([])`

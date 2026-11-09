@@ -2000,6 +2000,12 @@
   只修共享解析器会漏掉各自解析这两个 flag 的命令）。
   · **`auth login` 配置损坏时退出码 2**：改 `kind: config_invalid`（退出码 1，不写任何内容），
   权限拒绝则归 `config_insecure`；`ERROR_KINDS`、README、`qiyu --help`、skill `errors.md` 同步。
+  · **配置文件读不出来是因为权限时，各命令给出三种说法**（Codex 2026-11-10 第四轮 P2）：
+  读失败被包成无 kind 的普通 Error，与「畸形 JSON」同出口 —— login 报 `config_invalid`
+  （它那条 `config_insecure` 分支是死代码）、store/db/query/stats 降级成 `usage` 退出码 2，
+  只有 api/sync 报 `config_insecure`。现在在唯一读取点 `loadConfigFile` 读取前分流
+  （`accessSync(R_OK)` 失败且 errno 为 EACCES/EPERM → 与权限过宽同一条错误 + `chmod 600` hint），
+  四个命令族实测同一状态同一结论。
 
   **同步**
   · **被重叠区合并的窗从所有计数里消失**：`windows` 新增 `contained`（仅 > 0 输出，
