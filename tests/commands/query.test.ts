@@ -283,6 +283,25 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(false)
   })
 
+  it('无法静态展开的 query() 声明日期检查边界；普通字面量不冒认列引用', async () => {
+    await seed()
+    const sql = "SELECT * FROM query('SELECT count(*) AS n FROM daily_overview WHERE ' || 'stat_date >= ''2026-10-13''')"
+    expect(await q('--sql', sql)).toBe(0)
+    expect(rowsOf()[0]?.n).toBe('1')
+
+    expect(await q('--sql', "SELECT 'stat_date' AS label, '2026-10-13' AS day")).toBe(0)
+    expect((meta().warnings as string[]).join('\n')).not.toMatch(/少算或漏掉/)
+  })
+
+  it('COLUMNS 的美元引号与注释实参也声明日期错位', async () => {
+    await seed()
+    for (const selector of ["COLUMNS($$stat.*$$)", "COLUMNS(/* 注释 */ 'stat.*')"]) {
+      expect(await q('--sql', `SELECT COUNT(*) AS n FROM daily_overview WHERE ${selector} >= '2026-10-13'`)).toBe(0)
+      expect(rowsOf()[0]?.n).toBe('1')
+      expect((meta().warnings as string[]).join('\n')).toMatch(/少算或漏掉/)
+    }
+  })
+
   it('日期字面量的其余错位写法同样警告；正确 UTC 16:00Z 与注释里的条件不警告（2026-11-09 审计）', async () => {
     await seed()
     const warned = (): boolean => (meta().warnings as string[])
@@ -340,6 +359,34 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(warned()).toBe(false)
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $$it's$$")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // Codex 2026-11-10 第六轮 P2：时间列引用藏在**有执行语义的字符串**里时不得漏报。
+    // ① `COLUMNS('stat_date')` / `COLUMNS('<正则>')`：列名是 COLUMNS 的字符串实参
+    //（实测 `WHERE COLUMNS('stat_date') >= '2026-10-13'` 两天夹具只计一天）。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE COLUMNS('stat_date') >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE COLUMNS('stat.*') >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证：只有 COLUMNS('stat_date')、没有日期字面量 → 不警告
+    expect(await q('--sql', "SELECT COLUMNS('stat_date') FROM daily_overview")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // ② `query` 函数的三种「实参不能当裸字面量直接取」的合法写法：带引号的函数名、
+    // 多余括号、CAST 包裹 —— 内层 SQL 仍要递归检查（实测三种都少算一天、旧实现零警告）
+    for (const sql of [
+      "SELECT * FROM \"query\"($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'$$)",
+      "SELECT * FROM query(($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'$$))",
+      "SELECT * FROM query(CAST($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'$$ AS VARCHAR))",
+    ]) {
+      expect(await q('--sql', sql), sql).toBe(0)
+      expect(warned(), sql).toBe(true)
+    }
+    // 反证：CAST 里的内层 SQL 没有日期过滤 → 不警告
+    expect(await q('--sql',
+      "SELECT * FROM query(CAST('SELECT 1 AS n' AS VARCHAR))")).toBe(0)
     expect(warned()).toBe(false)
 
     // 反证 3c：标识符内部带 `$tag$` 形态（marker$q$）不得被当成美元引号开头 ——

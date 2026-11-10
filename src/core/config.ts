@@ -185,12 +185,17 @@ export function shellPath(p: string): string {
  * Agent 会照退出码去改参数，而这件事只能由人去 chmod —— 设计稿 §3.4 与 README
  * 写的都是前者，所以 store 那条路径是缺陷，不是另一种口径。
  */
-export function insecureConfigError(configPath: string, reason: 'file' | 'dir'): Error {
+export function insecureConfigError(configPath: string, reason: 'file' | 'dir' | 'unreadable'): Error {
   const dir = dirname(configPath)
+  // ⚠️ 三种成因必须是三句话（CR/Codex 2026-11-10 第六轮）：`unreadable` 是**当前用户
+  // 读不了**，与「含凭证且过宽」相反（那说的是别人能读）—— 套用过宽的文案会把
+  // 「权限位全零、不含凭证的文件」说成凭证暴露风险，Agent 会去查一个不存在的泄露面。
   const what = reason === 'file'
     ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 有权限位；可读时其他用户就能读到 appSecret）`
-    : `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
-  const fix = reason === 'file' ? `chmod 600 ${shellPath(configPath)}` : `chmod 700 ${shellPath(dir)}`
+    : reason === 'dir'
+      ? `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
+      : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
+  const fix = reason === 'dir' ? `chmod 700 ${shellPath(dir)}` : `chmod 600 ${shellPath(configPath)}`
   return Object.assign(
     new Error(`${what}，已拒绝读取`),
     {
@@ -201,7 +206,8 @@ export function insecureConfigError(configPath: string, reason: 'file' | 'dir'):
 }
 
 /**
- * 「配置文件读不出来**是因为权限**」→ 转成 `insecureConfigError`（与权限过宽同一条错误）。
+ * 「配置文件读不出来**是因为权限**」→ 转成 `insecureConfigError(…, 'unreadable')`
+ * （同一个 kind、同一条 chmod 修法，但成因文案**独立**：读不了 ≠ 别人能读）。
  *
  * 只分流权限类 errno（EACCES / EPERM）：其余读失败（ENOENT 之外，如路径中段不是目录）
  * 与畸形配置一样由调用方按「解释不了内容」处理。判据是 `e.code` 属性（fs errno），
@@ -213,7 +219,7 @@ export function assertConfigReadable(configPath: string): void {
     accessSync(configPath, fsConstants.R_OK)
   } catch (e) {
     const code = (e as { code?: string }).code
-    if (code === 'EACCES' || code === 'EPERM') throw insecureConfigError(configPath, 'file')
+    if (code === 'EACCES' || code === 'EPERM') throw insecureConfigError(configPath, 'unreadable')
     throw e
   }
 }

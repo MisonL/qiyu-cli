@@ -18,7 +18,9 @@
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, missingTableCauses } from '../query/errors.js'
-import { maskQueryRows, withoutLiterals, withoutComments, isIdentCharAt, queryCallArgs, dollarQuoteEnd } from '../query/mask.js'
+import {
+  maskQueryRows, withoutLiterals, withoutComments, queryCallArgs, readSqlString, sqlFunctionCalls, skipSqlTrivia,
+} from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
@@ -195,13 +197,20 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
   // `withoutLiterals` 会把整个实参抹掉，只看外层就会漏掉内层里的错位日字面量
   //（Codex 2026-11-10 第二轮 P2，实测 `SELECT * FROM query($$…stat_date >= '2026-10-13'$$)`
   // 少算一天却零警告）。递归检查每个实参的内层 SQL（内层还能再套 query()）。
-  for (const inner of queryCallArgs(withoutComments(sql))) {
+  let unexpandable = false
+  for (const inner of queryCallArgs(withoutComments(sql), () => { unexpandable = true })) {
     const innerHint = dayLiteralHint(inner, loc)
     if (innerHint !== null) return innerHint
   }
   // 注释先抹成空白（逐位对齐）：注释里写的 `-- WHERE stat_date >= '…'` 不是真条件。
   const code = withoutComments(sql)
-  if (!ISO_DAY_COL_RE.test(withoutLiterals(code))) return null
+  // ⚠️ 不要只判 `withoutLiterals(code)`：列名可能藏在**有执行语义的字符串**里 ——
+  // `COLUMNS('stat_date')` / `COLUMNS('stat.*')` 是列选择器（实测
+  // `WHERE COLUMNS('stat_date') >= '2026-10-13'` 两天夹具只计一天，Codex 2026-11-10 第六轮 P2），
+  // 而 `withoutLiterals` 会把整个串抹掉。也不能放宽到 `code` 原样：普通字面量里的
+  // `'stat_date'` 不是列引用，那会让无关日期字面量也报上。
+  if (unexpandable) return unexpandableQueryHint(loc)
+  if (!ISO_DAY_COL_RE.test(withoutLiterals(code)) && !hasDayColumnSelector(code)) return null
   // 在「只抹注释」的文本上找孤立的**开引号**。`withoutComments` 原样保留双引号标识符与
   // 美元引号体，所以这两段必须整体跳过（CodeRabbit 2026-11-10）：`SELECT "it's" …` 里的
   // `'` 会被当成开引号、把后面的真实字面量吞进一个假字面量，警告静默丢失。
@@ -213,54 +222,50 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
       }
       continue
     }
-    // 标识符边界用 mask.ts 的同一判据（中文/补充平面字符都是合法标识符字符，
-    // 紧跟在它们之后的 `$` 属于标识符，不是美元引号开头）
-    if (code[i] === '$' && !isIdentCharAt(code, i)) {
-      // 美元引号体：`$tag$…$tag$`（形似引号却找不到配对结束符时按普通字符放行）。
-      // 扫描走 `mask.ts` 的 `dollarQuoteEnd`（同一词法规则的唯一实现点）—— 本处曾复制
-      // 过一份正则，修外层时漏掉了这里（CodeRabbit 2026-11-10 第五轮）。
-      // 体**本身**就可以是日期字面量（实测 `$$2026-10-13$$` 与 `'2026-10-13'` 等价、
-      // 同样少算一天）—— 整段跳过前先按同一判据查一遍。
-      // `query($$…$$)` 的体是内层 SQL，匹配不上 `DAY_VALUE_RE`，不受影响。
-      const dq = dollarQuoteEnd(code, i)
-      if (dq !== null) {
-        if (isMiscomparedDayLiteral(code.slice(dq.openEnd, dq.closeStart))) return isoDayLiteralHint(loc)
-        i = dq.closeStart + (dq.openEnd - i) - 1
-        continue
-      }
+    // 字面量（单引号 / E 串 / 美元引号）：体**本身**就可以是日期字面量（`$$2026-10-13$$`
+    // 实测与 `'2026-10-13'` 等价，CodeRabbit 2026-11-10 第五轮）；解码与读取走 `mask.ts`
+    // 的同一实现（`readSqlString`）。标识符边界由它的美元引号判据负责。
+    const lit = readSqlString(code, i)
+    if (lit !== null) {
+      if (isMiscomparedDayLiteral(lit.value)) return isoDayLiteralHint(loc)
+      i = lit.end - 1
+      continue
     }
-    if (code[i] !== "'") continue
-    const lit = readSingleQuoted(code, i, isEscapeStringAt(code, i))
-    if (lit !== null && isMiscomparedDayLiteral(lit.value)) return isoDayLiteralHint(loc)
-    if (lit !== null) i = lit.end - 1
   }
   return null
 }
 
 /**
- * 读以 `start` 处开引号起的单引号字面量，返回解码后的内容与结束下标（`''` 是转义引号）。
- * `escapeBackslash`（E 串 `E'…'`）时 `\'` 是转义引号、不结束字符串（DuckDB 实测，
- * 与 `mask.ts` 的 withoutLiterals 同一规则；Codex 2026-11-10 P2：不认它会把 E 串后半段
- * 当成字符串之外的内容，吞掉后面真实日字面量的开引号 → 漏报）。
+ * SQL 里是否有**列选择器**里的字面量指向时间列：`COLUMNS('stat_date')` / `COLUMNS('stat.*')` /
+ * `"COLUMNS"('…')`。
+ *
+ * `COLUMNS(<正则字符串>)` 的串是**执行语义**（选择哪些列），不是普通字面量 —— 实测
+ * `WHERE COLUMNS('stat_date') >= '2026-10-13'` 两天夹具只计一天。判据限定在 COLUMNS 的
+ * 实参里：任意位置的普通字符串不当列名。参数按 DuckDB 的正则语义解释；非法正则由
+ * DuckDB 自己报错，这里不据此报警。
  */
-function readSingleQuoted(text: string, start: number,
-  escapeBackslash: boolean): { value: string; end: number } | null {
-  let value = ''
-  for (let j = start + 1; j < text.length; j++) {
-    // E 串里的反斜杠转义：`\x` 原样保留（判据不看这类内容，只要不提前结束即可）
-    if (escapeBackslash && text[j] === '\\') { j++; if (j < text.length) value += text[j]; continue }
-    if (text[j] === "'") {
-      if (text[j + 1] === "'") { value += "'"; j++; continue }
-      return { value, end: j + 1 }
-    }
-    value += text[j]
+function hasDayColumnSelector(code: string): boolean {
+  for (const { open } of sqlFunctionCalls(code, 'columns')) {
+    const lit = readSqlString(code, skipSqlTrivia(code, open))
+    if (lit === null) continue
+    if (ISO_DAY_COL_RE.test(lit.value)) return true
+    try {
+      const rx = new RegExp(lit.value, 'i')
+      if (rx.test('stat_date') || rx.test('work_date')) return true
+    } catch { /* 非法正则：DuckDB 会自己报错，这里不据此报警 */ }
   }
-  return null   // 不成对（解析错误由沙箱报），本警告不接管
+  return false
 }
 
-/** `text[i]` 处的单引号是否是 E 串的开关引（前面紧跟、且只紧跟一个 ` E`/` e`）。 */
-function isEscapeStringAt(text: string, i: number): boolean {
-  return i >= 1 && (text[i - 1] === 'E' || text[i - 1] === 'e') && !isIdentCharAt(text, i - 1)
+/**
+ * `query()` 的实参不是单个静态字符串（拼接 / 函数调用）：内层 SQL 随时可以拼出
+ * `stat_date >= '2026-10-13'` 这类错位日字面量，而静态判据看不见 —— 声明检查边界
+ * （Codex 2026-11-10 第六轮 P2 实测 `query('SELECT ' || '1')` 被冒认成内层 `SELECT `）。
+ */
+function unexpandableQueryHint(loc?: StoreLocation): string {
+  return 'SQL 的 `query()` 实参不是单个静态字符串（拼接 / 函数调用等）：内层 SQL 无法静态展开，'
+    + '其中是否含「少算一天」的日期过滤**无法检查**——请确认内层用的是 UTC 形态'
+    + '（如 \'2026-10-12T16:00:00.000Z\'），或改用 `' + queryTableCommand('<表>', loc) + '`'
 }
 
 function isoDayLiteralHint(loc?: StoreLocation): string {
@@ -814,12 +819,11 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     if (result.rows.length === 0 && ZERO_ROW_TIME_RE.test(sqlText)) {
       warnings.push(`查询返回 0 行，且 SQL 引用了业务时间列。${zeroRowHint(openedLoc)}`)
     }
-    // iso-day 列 + 日期形态字面量 → 按字符串比较会少一天（场景 F3）。与 0 行无关：
-    // 非 0 行也可能已经悄悄少了一整天，这正是它危险的地方。
-    if (ISO_DAY_COL_RE.test(sqlText)) {
-      const dayHint = dayLiteralHint(sqlText, openedLoc)
-      if (dayHint !== null) warnings.push(dayHint)
-    }
+  // ⚠️ 不要在这里重复判 `ISO_DAY_COL_RE.test(sqlText)`（CR/Codex 2026-11-10 第六轮）：
+    // 列名可能只在 `COLUMNS('stat.*')` 的选择器串里，外层 gate 会让内层 hint 永远看不到它。
+    // 列名判定只在 `dayLiteralHint` 里做（含选择器形态）。
+    const dayHint = dayLiteralHint(sqlText, openedLoc)
+    if (dayHint !== null) warnings.push(dayHint)
     // 截断不得静默：Agent 会把「只看到前 N 行」当成事实（spec §十）。
     if (result.truncated) {
       warnings.push(truncationWarning(masked.rows.length, limit, 'sql', true, openedLoc))

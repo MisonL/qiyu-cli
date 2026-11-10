@@ -128,9 +128,12 @@ describe('权限裁决（loadConfigChecked）', () => {
       writeCfg({ profiles: {} }, 0o000)
       let caught: unknown
       try { loadConfigChecked(cfgPath()) } catch (e) { caught = e }
-      const t = caught as { kind?: string; hint?: string }
+      const t = caught as { kind?: string; message?: string; hint?: string }
       expect(t.kind).toBe('config_insecure')
       expect(t.hint).toMatch(/chmod 600/)
+      // 成因错误是另一种契约不诚实（CR/Codex 第六轮）：文件不含凭证、group/other 全零，
+      // 文案若说「含凭证且权限过宽」就是假归因。
+      expect(String(t.message)).not.toContain('过宽')
     })
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(

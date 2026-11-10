@@ -314,6 +314,104 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+/** 只定位代码位置上的调用；注释和字面量不参与匹配，双引号名字按完整标识符比较。 */
+export function sqlFunctionCalls(text: string, name: string): Array<{ nameStart: number; open: number }> {
+  const code = withoutLiterals(text)
+  const out: Array<{ nameStart: number; open: number }> = []
+  for (let i = 0; i < code.length;) {
+    const start = i
+    let value: string
+    if (code[i] === '"') {
+      for (i++; i < code.length; i++) {
+        if (code[i] === '"') { if (code[i + 1] !== '"') break; i++ }
+      }
+      value = code.slice(start + 1, i).replace(/""/g, '"')
+      i = Math.min(i + 1, code.length)
+    } else if (isIdentAt(code, i)) {
+      do { i += String.fromCodePoint(code.codePointAt(i)!).length } while (isIdentAt(code, i))
+      value = code.slice(start, i)
+    } else { i++; continue }
+    if (value.toLowerCase() !== name.toLowerCase()) continue
+    const open = skipSqlTrivia(text, i)
+    if (text[open] === '(') out.push({ nameStart: start, open: open + 1 })
+  }
+  return out
+}
+
+/** 跳过 DuckDB 的 ASCII 空白与嵌套注释，返回下一个代码位置。 */
+export function skipSqlTrivia(text: string, start: number): number {
+  let i = start
+  for (;;) {
+    while (i < text.length && ASCII_WS.has(text[i]!)) i++
+    if (text[i] === '/' && text[i + 1] === '*') { i = skipBlockComment(text, i); continue }
+    if (text[i] === '-' && text[i + 1] === '-') {
+      while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++
+      continue
+    }
+    return i
+  }
+}
+
+/** end 恒为闭定界符之后的下标；解码与 query() 内层 SQL 使用同一套字符串规则。 */
+export function readSqlString(text: string, start: number): { end: number; value: string } | null {
+  if (text[start] === '$' && !isIdentCharAt(text, start)) {
+    const dq = dollarQuoteEnd(text, start)
+    return dq === null ? null : {
+      end: dq.closeStart + (dq.openEnd - start), value: text.slice(dq.openEnd, dq.closeStart),
+    }
+  }
+  const prefixed = (text[start] === 'E' || text[start] === 'e') && text[start + 1] === "'"
+  const q = prefixed ? start + 1 : start
+  if (text[q] !== "'") return null
+  const isEscape = q > 0 && (text[q - 1] === 'E' || text[q - 1] === 'e') && !isIdentCharAt(text, q - 1)
+  let i = q + 1
+  for (; i < text.length; i++) {
+    if (isEscape && text[i] === '\\') { i++; continue }
+    if (text[i] === "'") { if (text[i + 1] !== "'") break; i++ }
+  }
+  if (i >= text.length) return null
+  return { end: i + 1, value: decodeStringLiteral(text.slice(q + 1, i), isEscape) }
+}
+
+/**
+ * 只展开整个实参都是字面量、括号或保值字符串 CAST 的形态。
+ * 不求值拼接或其它函数；不能把表达式的静态前缀冒认成实际执行的 SQL。
+ */
+function readStaticArg(text: string, open: number): string | null {
+  let i = skipSqlTrivia(text, open)
+  const wrappers: Array<'paren' | 'cast'> = []
+  for (;;) {
+    if (text[i] === '(') {
+      wrappers.push('paren')
+      i = skipSqlTrivia(text, i + 1)
+      continue
+    }
+    if (/^cast/i.test(text.slice(i, i + 4)) && !isIdentAt(text, i + 4)) {
+      const next = skipSqlTrivia(text, i + 4)
+      if (text[next] !== '(') return null
+      wrappers.push('cast')
+      i = skipSqlTrivia(text, next + 1)
+      continue
+    }
+    break
+  }
+  const lit = readSqlString(text, i)
+  if (lit === null) return null
+  i = skipSqlTrivia(text, lit.end)
+  for (let w = wrappers.length - 1; w >= 0; w--) {
+    if (wrappers[w] === 'cast') {
+      if (text.slice(i, i + 2).toLowerCase() !== 'as' || isIdentAt(text, i + 2)) return null
+      i = skipSqlTrivia(text, i + 2)
+      const type = /^(varchar|text|string)/i.exec(text.slice(i))
+      if (type === null || isIdentAt(text, i + type[0].length)) return null
+      i = skipSqlTrivia(text, i + type[0].length)
+    }
+    if (text[i] !== ')') return null
+    i = skipSqlTrivia(text, i + 1)
+  }
+  return text[i] === ')' ? lit.value : null
+}
+
 /**
  * 剥掉**所有**引号内容（单引号串、美元引号串、双引号标识符）与注释，只留裸 token。
  * 与 `withoutLiterals` 的区别：双引号标识符也抹掉（那个函数保留它是为了列名匹配）。
@@ -380,88 +478,31 @@ function summarizeTokenPositions(sql: string): { recognized: boolean; unrecogniz
 
 /**
  * `query('…')` 内层 SQL 里出现 SUMMARIZE 关键字（`SELECT * FROM query('SUMMARIZE sessions')`）。
- * ⚠️ 必须先在**裸 token** 上定位 `query(`（注释/字符串/双引号标识符里的同串不算调用），
- * 再回到原 SQL 读那个字符串实参 —— 直接在原文上正则会把注释里写的伪装调用
- * 也当成真调用（Codex 2026-11-08 第三轮 P2 实测）。
  *
  * ⚠️ 第十二轮起 query() 的来源**不再进入行级脱敏**：内层 SQL 的输出来源十余轮复审都被
  * 构造出合法反例（`SELECT 常量 FROM (SUMMARIZE …)` 等），无法静态证明。因此这里只服务
- * 一个目的 —— **发现缺口**（返回 `hit` 即调用方发「无法确认来源」警告），`atTopOutput`
- * 只用于在缺口文案里说清是哪种情形：
- *   · `atTopOutput`：该调用位于最终输出路径（裸文本深度 0 且紧邻 `FROM`/`JOIN`）；
- *   · 非输出路径：`WHERE EXISTS (… FROM query(…))`、IN 子查询、逗号并列、多层子查询。
+ * 一个目的 —— **发现缺口**（返回 `hit` / `gap` 即调用方发对应警告）：
+ *   · `hit`：内层可静态展开，且自身输出是 SUMMARIZE；
+ *   · `gap`：内层有 SUMMARIZE 痕迹但输出无法确认，或实参根本展不开。
  * 两种情形都**不改写任何值** —— 实测
  * `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
  * 合法且输出 min 是常量 3，按全 SQL 判据脱敏会把业务常量改成 `<已脱敏>`（Codex 第七轮 P2）。
  */
-/**
- * 遍历 SQL 里每个 `query(<字符串实参>)` 调用，回调**解码后的内层 SQL** 与调用位置。
- * 词法（`bareKeywords` 定位、注释跳过、E 串/美元引号/单引号解码）只在这一处 ——
- * `queryCallSummarize`（脱敏缺口）与 `queryCallArgs`（日期字面量警告）共用。
- */
-function forEachQueryArg(sql: string, cb: (inner: string, callIndex: number) => void): void {
-  const bare = bareKeywords(sql)
-  const re = /\bquery\s*\(/gi
-  let m: RegExpExecArray | null
-  while ((m = re.exec(bare)) !== null) {
-    let i = m.index + m[0].length
-    // ⚠️ `(` 与字符串实参之间可以夹空白**与注释**（DuckDB 实测接受
-    // `query(/* gap */ 'SUMMARIZE sessions')`），只跳空白会漏检 → PII 统计值原样输出
-    //（Codex 2026-11-08 第四轮 P1）。注释按词法跳过，不当作实参。
-    for (;;) {
-      while (i < sql.length && /\s/.test(sql[i]!)) i++
-      if (sql[i] === '/' && sql[i + 1] === '*') {
-        // 嵌套块注释按深度跳过（DuckDB 实测 `/* outer /* inner */ … */` 合法）
-        i = skipBlockComment(sql, i)
-        continue
-      }
-      if (sql[i] === '-' && sql[i + 1] === '-') {
-        while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i++
-        continue
-      }
-      break
-    }
-    // 字符串前缀：DuckDB 接受 `E'…'`（转义字符串）—— 实测 `query(E'SUMMARIZE sessions')` 有效。
-    // ⚠️ E 串的**引号边界**也按 E 语义：`\'` 是转义引号（不结束字符串），`''` 同样；
-    // 普通串里反斜杠没有特殊含义（实测 `'a\x41b'` 保留字面量 `\x41`）（Codex 第七轮 P2）。
-    const isEscape = (sql[i] === 'E' || sql[i] === 'e') && sql[i + 1] === "'"
-    if (isEscape) i++
-    // ⚠️ 美元引号实参同样合法（真机实测 `query($$SUMMARIZE sessions$$)` /
-    // `query($q$SUMMARIZE sessions$q$)` 都输出统计值，CodeRabbit 2026-11-09 第十四轮 minor）：
-    // 旧扫描只认单引号，这类实参直接 `continue` → hit/gap 双假 → 一条 SUMMARIZE 缺口都不发。
-    // 与 withoutLiterals 共用同一个扫描点 dollarQuoteEnd；内容没有转义，原样就是内层 SQL。
-    const dq = sql[i] === '$' && !isIdentCharAt(sql, i) ? dollarQuoteEnd(sql, i) : null
-    let inner: string
-    if (dq !== null) {
-      inner = sql.slice(dq.openEnd, dq.closeStart)
-      i = dq.closeStart + (dq.openEnd - i) - 1
-    } else {
-      if (sql[i] !== "'") continue
-      const start = i
-      for (i++; i < sql.length; i++) {
-        if (isEscape && sql[i] === '\\') { i++; continue }
-        if (sql[i] === "'") { if (sql[i + 1] !== "'") break; i++ }
-      }
-      // ⚠️ 实参是**内层 SQL 源码**，必须按 DuckDB 的字符串语义解码后再跑同一套词法判据：
-      // E 串先解转义（`\x2f\x2a` → `/*` —— 不解码会把注释里的 SUMMARIZE 当成真关键字，
-      // 实测该查询输出常量 min=3 却被脱敏，Codex 第七轮 P2），再统一把 `''` → `'`。
-      // 内层里的 SUMMARIZE 也可能只是注释/字符串/别名：实测 `query('SELECT ''x'' … /* SUMMARIZE */')`
-      // 在 DuckDB 里返回普通行，按裸词判会把列值误改（Codex 2026-11-08 第五轮 P2）。
-      inner = decodeStringLiteral(sql.slice(start + 1, i), isEscape)
-    }
-    // ⚠️ 递归必须传播**输出来源**而不是只看「内层含 SUMMARIZE」（Codex 第八轮 P2，真机实测）：
-    // 内层 SQL `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM
-    // query('SUMMARIZE sessions'))` 的输出是常量 3 —— 内层命中来自 WHERE 里的非输出路径，
-    // 按 `.hit` 提升会让外层的 query() 被当成统计来源、常量被改成 `<已脱敏>`。
-    // 只有内层**自身的输出**是 SUMMARIZE（内层语句头 / 内层 query() 在其顶层 FROM）才提升。
-    cb(inner, m.index)
+
+/** 遍历每个 `query(<静态字符串实参>)` 调用，回调**解码后的内层 SQL** 与调用位置；展不开的走 `onUnresolved`。 */
+function forEachQueryArg(sql: string, cb: (inner: string, callIndex: number) => void,
+  onUnresolved?: () => void): void {
+  for (const { open, nameStart } of sqlFunctionCalls(sql, 'query')) {
+    const inner = readStaticArg(sql, open)
+    if (inner === null) onUnresolved?.()
+    else cb(inner, nameStart)
   }
 }
 
-/** `query(...)` 每个字符串实参的内层 SQL（供需要在实参内部读值的判据用，逐层展开由调用方做）。 */
-export function queryCallArgs(sql: string): string[] {
+/** query() 的静态实参；无法展开的完整表达式通过独立信号报告，不冒认前缀。 */
+export function queryCallArgs(sql: string, onUnresolved?: () => void): string[] {
   const out: string[] = []
-  forEachQueryArg(sql, (inner) => out.push(inner))
+  forEachQueryArg(sql, (inner) => out.push(inner), onUnresolved)
   return out
 }
 
@@ -491,6 +532,10 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
       // 向上传播「无法确认」，由调用方声明缺口，绝不冒认脱敏。
       gap = true
     }
+  }, () => {
+    // 实参无法静态展开（拼接 / 函数调用）：内层可能含 SUMMARIZE（也可能不含）——
+    // 与「内层有 SUMMARIZE 但输出不确定」同属「没检查」，只声明缺口，不冒认脱敏。
+    gap = true
   })
   return { hit, atTopOutput, gap }
 }

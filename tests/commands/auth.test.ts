@@ -582,6 +582,10 @@ describe('配置读取权限拒绝（Codex 2026-11-10 第四轮 P2）', () => {
       expect(e.kind).toBe('config_insecure')
       expect(String(e.hint)).toContain(`chmod 600`)
       expect(String(e.hint)).toContain('本次未写入任何内容')
+      // 成因必须是**读不出来**，不能套用「权限过宽」的文案（CR/Codex 第六轮）：
+      // 夹具文件不含任何凭证、group/other 位也全为零 —— 说成凭证暴露是假归因。
+      expect(String(e.message)).not.toContain('过宽')
+      expect(String(e.message)).toMatch(/无法读取|读不出来|没有读取权限/)
       // 文件不得被改动（连覆盖都没有）—— 先恢复权限才读得出来，读的是**内容**不是权限
       chmodSync(p, 0o600)
       expect(readFileSync(p, 'utf8'), '不可读的文件也不能被覆盖').toContain('profiles')
