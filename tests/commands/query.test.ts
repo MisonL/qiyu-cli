@@ -302,6 +302,29 @@ describe('query --sql · 成功路径（spec §十）', () => {
     }
   })
 
+  it('日期字面量首尾带空白、尾随字符时同样按错位警告（Codex 第七轮 P2）', async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测（2026-11-10 DuckDB 临时库）：库值 `…16:00:00.000Z` >= `'…16:00:00.000Z '` 为 **false**
+    // —— 字面量多出的尾随字符在字典序上把它排到库值之后，边界日整列被排除；而旧判据先
+    // `trim()` 再看形态，把它当成列内合法写法放行、零警告。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Z '")).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Zx'")).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证：**前导**空白不会排除边界日（实测库值 >= `' …Z'` 为 true，字面量更小）→ 不误报
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= ' 2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(warned()).toBe(false)
+    // 反证：逐字一致的列内形态仍然放行（不因去掉 trim 而多报）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
   it('日期字面量的其余错位写法同样警告；正确 UTC 16:00Z 与注释里的条件不警告（2026-11-09 审计）', async () => {
     await seed()
     const warned = (): boolean => (meta().warnings as string[])

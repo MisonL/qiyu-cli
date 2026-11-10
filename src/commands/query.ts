@@ -167,10 +167,17 @@ const ISO_DAY_COL_RE = /\b(stat_date|work_date)\b/i
  */
 // ⚠️ 秒可缺省（CodeRabbit 2026-11-10）：`'2026-10-13 00:00'` / `'…T00:00Z'` 同样按字典序
 // 少算一天，要求秒会把它们漏掉（缺秒时 frac/tz 恒为 null → 下面按「不是列内形态」返回 true）。
-const DAY_VALUE_RE = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?)?$/
+const DAY_VALUE_RE = /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?)?/
 function isMiscomparedDayLiteral(v: string): boolean {
-  const m = DAY_VALUE_RE.exec(v.trim())
+  // ⚠️ 判据是「日形态**前缀**」，不是完整匹配（Codex 2026-11-10 第七轮 P2）：比较发生在
+  // VARCHAR 原文上 —— 实测库值 `…16:00:00.000Z` >= `'…16:00:00.000Z '` 为 **false**，
+  // 尾随字符把字面量排到库值之后、边界日整列被排除。旧实现先 `trim()` 再完整匹配，
+  // 把它当成列内形态放行（零警告）；而只去掉 `trim()` 又会因完整匹配失败落到「不像日期」
+  // 分支、同样零警告 —— 必须「按前缀认出是日形态」再单独判是否逐字一致。
+  // **前导**空白不影响（实测库值 >= `' …Z'` 为 true：字面量更小，不排除任何行）。
+  const m = DAY_VALUE_RE.exec(v)
   if (m === null) return false
+  const exact = m[0].length === v.length
   if (m[2] === undefined) return true                             // 纯日期
   // ⚠️ 命中了时刻但没给小数秒/时区时，分组是 `null`（不是 `undefined`）—— 两种都按「不是列内形态」
   // 处理；只判 `undefined` 会让这种字面量一路走到最后返回 false（2026-11-10 回归发现）。
@@ -181,7 +188,8 @@ function isMiscomparedDayLiteral(v: string): boolean {
   // 排在 `…16:00:00.000Z` 之后、把当天行排除在外，旧判据（≥3 位即放行）会静默漏报。
   if (frac !== '000') return true                                  // 列内形态恒为三位 `.000`（`.123` 在字典序上把当天行排除）
   if (m[2] !== '16' || m[3] !== '00' || m[4] !== '00') return true  // 不是 16:00:00 的 UTC 形态
-  return tz !== 'Z'                                                // `+08:00`/`+0800` 等一律错位
+  if (tz !== 'Z') return true                                      // `+08:00`/`+0800` 等一律错位
+  return !exact                                                    // 尾随字符：库值是它的严格前缀 → 排除边界日
 }
 
 /**
