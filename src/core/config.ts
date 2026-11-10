@@ -185,17 +185,25 @@ export function shellPath(p: string): string {
  * Agent 会照退出码去改参数，而这件事只能由人去 chmod —— 设计稿 §3.4 与 README
  * 写的都是前者，所以 store 那条路径是缺陷，不是另一种口径。
  */
-export function insecureConfigError(configPath: string, reason: 'file' | 'dir' | 'unreadable'): Error {
+export function insecureConfigError(
+  configPath: string, reason: 'file' | 'dir' | 'unreadable' | 'dir-unreadable',
+): Error {
   const dir = dirname(configPath)
-  // ⚠️ 三种成因必须是三句话（CR/Codex 2026-11-10 第六轮）：`unreadable` 是**当前用户
-  // 读不了**，与「含凭证且过宽」相反（那说的是别人能读）—— 套用过宽的文案会把
-  // 「权限位全零、不含凭证的文件」说成凭证暴露风险，Agent 会去查一个不存在的泄露面。
+  // ⚠️ 四种成因必须是四句话（CR/Codex 2026-11-10 第六轮 + 第十轮）：`unreadable` 是**当前
+  // 用户读不了**，与「含凭证且过宽」相反（那说的是别人能读）—— 套用过宽的文案会把
+  // 「权限位全零、不含凭证的文件」说成凭证暴露风险，Agent 会去查一个不存在的泄露面；
+  // `dir-unreadable` 又是另一层（目录进不去），修法与文案都不能套用文件那一档。
   const what = reason === 'file'
     ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 有权限位；可读时其他用户就能读到 appSecret）`
     : reason === 'dir'
       ? `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
-      : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
-  const fix = reason === 'dir' ? `chmod 700 ${shellPath(dir)}` : `chmod 600 ${shellPath(configPath)}`
+      : reason === 'dir-unreadable'
+        // 父目录不可搜索时，对**文件**做 chmod 本身就会失败（目录都进不去），修法必须落在目录上
+        ? `配置目录 ${dir} 当前用户不可搜索（无法进入该目录，因此读不到其中的配置文件；与文件里有没有凭证无关）`
+        : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
+  const fix = reason === 'dir' || reason === 'dir-unreadable'
+    ? `chmod 700 ${shellPath(dir)}`
+    : `chmod 600 ${shellPath(configPath)}`
   return Object.assign(
     new Error(`${what}，已拒绝读取`),
     {
@@ -206,21 +214,33 @@ export function insecureConfigError(configPath: string, reason: 'file' | 'dir' |
 }
 
 /**
- * 「配置文件读不出来**是因为权限**」→ 转成 `insecureConfigError(…, 'unreadable')`
- * （同一个 kind、同一条 chmod 修法，但成因文案**独立**：读不了 ≠ 别人能读）。
+ * 「配置文件读不出来**是因为权限**」→ 转成 `insecureConfigError`（同一个 kind，但成因文案与
+ * 修法按「挡在哪一层」区分：读不了 ≠ 别人能读；**目录不可进入** ≠ 文件本身读不了）。
  *
- * 只分流权限类 errno（EACCES / EPERM）：其余读失败（ENOENT 之外，如路径中段不是目录）
- * 与畸形配置一样由调用方按「解释不了内容」处理。判据是 `e.code` 属性（fs errno），
- * 不拿报文文本去挑 —— 见 `tests/open-failure-single-source.test.ts` 的同款规则。
+ * ⚠️ 不能用 `existsSync` 判「有没有配置」（Codex 2026-11-10 第十轮 P2，实测）：父目录
+ * `chmod 000` 时穿过它的 `stat` 被 EACCES 吞掉，`existsSync(文件)` 返回 **false** ——
+ * 于是真配置被当成「不存在」，`auth whoami` 报 `auth_missing`、store/query 回落默认库，
+ * 而用户真正要做的是 chmod 目录。改为直接 `accessSync`：**只有 ENOENT 才是「没有配置」**。
+ *
+ * 只按 errno 属性分流（EACCES / EPERM），不拿报文文本去挑 —— 见
+ * `tests/open-failure-single-source.test.ts` 的同款规则。其余 errno（如 ENOTDIR）沿用
+ * 旧口径「按缺失处理」：这条判据只回答「权限挡没挡住」，别的读失败不在这里另立成因。
  */
 export function assertConfigReadable(configPath: string): void {
-  if (!existsSync(configPath)) return
   try {
     accessSync(configPath, fsConstants.R_OK)
   } catch (e) {
     const code = (e as { code?: string }).code
-    if (code === 'EACCES' || code === 'EPERM') throw insecureConfigError(configPath, 'unreadable')
-    throw e
+    if (code !== 'EACCES' && code !== 'EPERM') return
+    // 同样是 EACCES，挡在哪一层决定修法：父目录不可搜索时对文件 chmod 本身就会失败。
+    let dirBlocked = false
+    try {
+      accessSync(dirname(configPath), fsConstants.X_OK)
+    } catch (e2) {
+      const c2 = (e2 as { code?: string }).code
+      dirBlocked = c2 === 'EACCES' || c2 === 'EPERM'
+    }
+    throw insecureConfigError(configPath, dirBlocked ? 'dir-unreadable' : 'unreadable')
   }
 }
 

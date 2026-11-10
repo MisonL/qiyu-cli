@@ -603,4 +603,23 @@ describe('配置读取权限拒绝（Codex 2026-11-10 第四轮 P2）', () => {
       chmodSync(p, 0o600)
     }
   })
+
+  it.skipIf(posixOnly)('whoami：配置**目录**不可进入 → config_insecure + chmod 700，不是 auth_missing（Codex 第十轮 P2）', async () => {
+    // 事故形态（实测）：目录 000 时 `existsSync(文件)` 为 false，真配置被当成缺失 ——
+    // whoami 报 `auth_missing` + 「appKey 来自（缺失）」，hint 让人 `auth login`，
+    // 而 login 同样进不去这个目录。用户会照着一条必然失败的 hint 去做。
+    writeCfg({ profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } } })
+    const dir = join(home, '.config', 'qiyu')
+    chmodSync(dir, 0o000)
+    try {
+      expect(await authCommand(['whoami'])).toBe(1)
+      const e = JSON.parse(out).error as Record<string, unknown>
+      expect(e.kind, '必须是权限问题，不是凭证缺失').toBe('config_insecure')
+      expect(String(e.message)).toContain('配置目录')
+      expect(String(e.hint)).toMatch(/chmod 700/)
+      expect(String(e.message)).not.toContain('过宽')
+    } finally {
+      chmodSync(dir, 0o700)
+    }
+  })
 })

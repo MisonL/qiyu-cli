@@ -2013,7 +2013,15 @@
   · **unknown 字段的核实指引照着执行必然失败**（Codex 第九轮 P2，实测）：unknown 字段是报表
     **payload 里的 JSON 键**、不是表的列（`SELECT unlistedMetric` 是 Binder Error），旧文案
     「显式列出该列」误导；改为 `payload ->> '<字段>'` 提取并点明它不是列。
-  · **脱敏缺口警告上限 5 条时静默截断**：第 5 条改为「另有 N 个敏感列的缺口警告未列出」并点名；  上限按**类别**计（本块最多 5 行），不按全局行数扣减 —— 否则其它类别的警告占满 5 条后，
+  · **父目录不可搜索时真配置被当成「不存在」**（Codex 第十轮 P2，实测）：`existsSync` 在穿过
+    `chmod 000` 的目录时被 EACCES 吞掉、返回 **false**，`assertConfigReadable` 提前返回 ——
+    `auth whoami` 报 `auth_missing`（「appKey 来自 （缺失）」）并让人 `auth login`，而 login
+    同样进不去这个目录；store/query 还会回落到默认库。改为 `accessSync` 先行、**只有 ENOENT
+    才是「没有配置」**；EACCES/EPERM 再按「挡在哪一层」分流：新成因 `dir-unreadable`
+    （目录不可搜索 → `chmod 700` 目录）与既有 `unreadable`（文件读不了 → `chmod 600` 文件）
+    各自一句文案、各自一条修法。README 与 skill `errors.md` 的 kind 表同步补第三档。
+  · **脱敏缺口警告上限 5 条时静默截断**：第 5 条改为「另有 N 个敏感列的缺口警告未列出」并点名；
+    上限按**类别**计（本块最多 5 行），不按全局行数扣减 —— 否则其它类别的警告占满 5 条后，
   不发汇总就退回静默截断、发汇总又超上限（Codex 2026-11-10 第三轮 P2）。
   · **库漂移删掉的是时间列时 hint 没有出路**：补「恢复前列名相关用法都会失败」+ 可执行的
   `--sql` 显式列替代（附引号替换契约）。

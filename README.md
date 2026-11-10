@@ -171,7 +171,9 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 退出码 1，hint 点名要执行的 `chmod`）——可读时落盘的 appSecret 对同机其他用户可读，
 其余组合也不该放宽，判据就是 `mode & 0o077 !== 0`。文件**读不出来**（权限拒绝，
 `EACCES`/`EPERM`）同样按 `config_insecure` 报（退出码 1 + `chmod 600` hint）——它是权限
-问题，不是配置内容问题。不读配置的命令（`--version`、
+问题，不是配置内容问题；而**配置目录**不可搜索（目录进不去、连文件都 stat 不到）报的是
+另一句话，hint 是 `chmod 700 <目录>`——对文件 chmod 在这个状态下本身就执行不了，不会把
+「目录挡路」说成「凭证缺失」。不读配置的命令（`--version`、
 `api list`、`skill where`、`sync tasks` 等）不受影响，它们不碰凭证。不含凭证的文件维持
 「只在 stderr 警告、不阻断」。
 父目录 group/other **可写**（文件可被整体替换）时同样拒绝。`auth login` 是**唯一的例外**：

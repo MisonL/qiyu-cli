@@ -137,6 +137,27 @@ describe('权限裁决（loadConfigChecked）', () => {
     })
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '父目录不可搜索（配置目录 000）→ 同样是 config_insecure，而非「配置不存在」（Codex 第十轮 P2）', () => {
+      // 事故形态（实测）：目录 000 时 `existsSync(文件)` 返回 **false**（穿过不可搜索目录的
+      // stat 被 EACCES 吞掉），旧的「不存在就提前返回」把真配置当成缺失 —— auth whoami 报
+      // auth_missing、store 回落默认库。成因是**目录**不可进入，修法也必须是 chmod 目录。
+      writeCfg({ profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } } })
+      const dir = dirname(cfgPath())
+      chmodSync(dir, 0o000)
+      try {
+        let caught: unknown
+        try { loadConfigChecked(cfgPath()) } catch (e) { caught = e }
+        const t = caught as { kind?: string; message?: string; hint?: string }
+        expect(t.kind).toBe('config_insecure')
+        expect(String(t.message)).toContain('配置目录')
+        // 修法必须真的能修：文件 chmod 在这里执行不了（目录进不去）
+        expect(t.hint).toMatch(/chmod 700/)
+      } finally {
+        chmodSync(dir, 0o700)
+      }
+    })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
     '文件不可读时 fileProfile 给的是 fatal 而不是 warn（api/sync 走 fatal 分支）', () => {
       writeCfg({ profiles: {} }, 0o000)
       const r = fileProfile(cfgPath())
