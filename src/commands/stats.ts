@@ -21,6 +21,7 @@ import {
   dbTablesCommand, dbDescribeCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE, metadataTimeoutHint,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
+import type { StoreLocation } from '../output.js'
 import { withTimeoutHint } from '../query/sandbox.js'
 import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
@@ -159,8 +160,12 @@ export const UNIT_NOTES = {
     + '报告时如实写「单位未知」，不要猜。这些字段同时列在 unknown_fields。'
     // 2026-11-09 审计：此前只说「不要猜」，没有给出真能跑的核实路径；而 --sql 拒绝
     // 参数占位符 `?`，用户照 SQL 习惯写 `WHERE field = ?` 会以退出码 2 失败。
-    + "要看原始值判断量纲用 `qiyu query --sql '<SQL>'` 显式列出该列"
-    + '（--sql 不接受参数占位符 `?`，过滤条件必须写成字面量）',
+    // ⚠️ 命令的渲染发生在调用点（`statsFieldNotes(loc)`）：写死成裸 `qiyu query --sql`
+    // 时，`stats fields --db X` 的提示照着执行会查**默认库**（Codex 2026-11-10 第八轮 P2）。
+    + '要看原始值判断量纲用 {@query} 显式列出该列'
+    // 用全角括号、不用分号：`renderNotes` 以「；」分隔各项，半角的 `; ... ` 不会被拆开；
+    // 而全角分号会把这条说明截成一项假的「值」（三方守卫的图例 ⊆ 枚举会红）。
+    + '（--sql 不接受参数占位符 `?`，过滤条件必须写成字面量。' + SQL_ARG_REPLACE_NOTE + '）',
 } satisfies Record<MetricUnit, string>
 
 /** `declared.<字段>.source` 的两个取值：标明声明是实测还是命名推断。 */
@@ -179,7 +184,7 @@ function renderNotes(notes: Record<string, string>): string {
  * `stats fields` 的 `meta.field_notes`（导出供测试核对真实渲染路径 —— 测试若自写一份
  * 渲染副本，生产漏渲染某个值时它照样全绿）。
  */
-export function statsFieldNotes(): Record<string, string> {
+export function statsFieldNotes(loc?: StoreLocation): Record<string, string> {
   return {
     table: '本次统计的报表表名（回显输入；只接受报表域表，见命令 help 的可用表清单）。'
       + '它不是「库里有哪些表」的依据 —— 那用 `db tables`；也不是「该表已同步」的证明',
@@ -189,7 +194,10 @@ export function statsFieldNotes(): Record<string, string> {
     // ⚠️ 图例键的路径形态即契约：`declared` 是**按字段名分组的对象**（不是数组），
     // `observed` 才是数组。写成 `declared[].unit` 指的是一个不存在的路径
     // （CodeRabbit 2026-10-27 抓到；测试里有一条钉住这个形态）。
-    'declared.<字段>.unit': renderNotes(UNIT_NOTES),
+    // 占位符 `{@query}` 在**调用点**渲染成本次的 `qiyu query --sql … --db <本次库>`：
+    // `UNIT_NOTES` 是常量、不认识本次的存储定位，模板里写死裸命令会让 `--db X` 的提示
+    // 照着执行时查默认库（Codex 2026-11-10 第八轮 P2）。渲染器仍是 output.ts 的唯一实现点。
+    'declared.<字段>.unit': renderNotes(UNIT_NOTES).replace('{@query}', `\`${querySqlCommand(loc)}\``),
     'declared.<字段>.source': renderNotes(SOURCE_NOTES),
     'declared.<字段>.higher_is_better':
       '恒为 null —— 设计稿与本 CLI 都没有任何「指标越大越好还是越小越好」的上游依据，'
@@ -384,9 +392,10 @@ async function statsFields(argv: string[]): Promise<number> {
         + `${result.rows.length} 个字段；该表的字段集可能不完整`)
     }
 
+    const loc = storeLocationOf(opened.dbPath, opened.profileFlag)
     return ok(
       { table, sentinel: SENTINEL, declared: Object.fromEntries(declared), observed, unknown_fields: unknownFields },
-      { field_notes: statsFieldNotes(), warnings })
+      { field_notes: statsFieldNotes(loc), warnings })
   } catch (e) {
     return thrownToQueryExit(e, TABLES, false, storeLocationOf(opened.dbPath, opened.profileFlag))
   } finally {

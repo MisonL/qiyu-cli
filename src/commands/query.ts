@@ -218,7 +218,8 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
   // 而 `withoutLiterals` 会把整个串抹掉。也不能放宽到 `code` 原样：普通字面量里的
   // `'stat_date'` 不是列引用，那会让无关日期字面量也报上。
   if (unexpandable) return unexpandableQueryHint(loc)
-  if (!ISO_DAY_COL_RE.test(withoutLiterals(code)) && !hasDayColumnSelector(code)) return null
+  if (!ISO_DAY_COL_RE.test(withoutLiterals(code)) && !hasDayColumnSelector(code)
+    && !hasDayColumnKeyReference(code)) return null
   // 在「只抹注释」的文本上找孤立的**开引号**。`withoutComments` 原样保留双引号标识符与
   // 美元引号体，所以这两段必须整体跳过（CodeRabbit 2026-11-10）：`SELECT "it's" …` 里的
   // `'` 会被当成开引号、把后面的真实字面量吞进一个假字面量，警告静默丢失。
@@ -263,6 +264,68 @@ function hasDayColumnSelector(code: string): boolean {
     } catch { /* 非法正则：DuckDB 会自己报错，这里不据此报警 */ }
   }
   return false
+}
+
+/**
+ * 与 `hasDayColumnSelector` 同一问题的另两种写法（Codex 2026-11-10 第八轮 P2，均实测）：
+ *   · `struct_extract(d, 'stat_date')` / `COLUMNS(['stat_date', 'stat.*'])`：列名是**列表**或
+ *     其它函数的位置实参里的字符串 —— 函数名与实参不是一一对应，所以按「有时间列名字面量
+ *     出现在函数调用的实参括号里」认，而不是给每个函数名各写一条规则；
+ *   · `d['stat_date']`：下标访问，列名在方括号里。
+ *
+ * 反面（不认）：普通位置的字符串（`SELECT 'stat_date' AS label`）、字面量里的伪代码。
+ * 方向性：误认只会多一条带修复方法的日期警告（与 `hasDayColumnSelector` 同一取舍）。
+ */
+function hasDayColumnKeyReference(code: string): boolean {
+  const blank = withoutLiterals(code)
+  const re = /(?<![A-Za-z0-9_$])[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")*"/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(blank)) !== null) {
+    let k = m.index + m[0].length
+    while (k < blank.length && /[ \t\n\r\f\v]/.test(blank[k]!)) k++
+    if (blank[k] !== '(' && blank[k] !== '[') { re.lastIndex = k; continue }
+    const close = blank[k] === '(' ? ')' : ']'
+    const end = matchingParen(blank, k, blank[k]!, close)
+    if (end === -1) { re.lastIndex = k; continue }
+    // 实参里的每个字符串字面量：本身就是时间列名，或是以时间列名结尾的下标 `d['stat_date']`
+    //（下标表达式里的引号紧跟在 `[` 后）。
+    for (let s = k + 1; s < end; s++) {
+      const lit = readSqlString(code, s)
+      if (lit === null) continue
+      if (ISO_DAY_COL_RE.test(lit.value)) return true
+      s = lit.end - 1
+    }
+    re.lastIndex = k + 1
+  }
+  return false
+}
+
+/**
+ * 列表 / 函数的括号或下标方括号配对，返回**闭括号之后**的下标；不成对返回 -1。
+ *
+ * ⚠️ 先把字面量与注释抹成空白再数（`withoutLiterals` 的结果）：字符串里的括号不参与配对；
+ * 双引号标识符可以是「函数名」（`"f"(…)`）也可含括号（`"a(b"`），所以从**扫描位置**起按
+ * 词法推进，而不是简单字符计数。每次循环都前进，绝不空转。
+ */
+function matchingParen(blank: string, open: number, openCh: string, closeCh: string): number {
+  let depth = 0
+  for (let i = open; i < blank.length; i++) {
+    const ch = blank[i]
+    if (ch === '"') {
+      // 双引号标识符整段跳过（`""` 是转义引号）
+      let j = i + 1
+      for (; j < blank.length; j++) {
+        if (blank[j] === '"') { if (blank[j + 1] !== '"') break; j++ }
+      }
+      i = j
+      continue
+    }
+    if (ch === openCh) depth++
+    else if (ch === closeCh) {
+      if (--depth === 0) return i + 1
+    }
+  }
+  return -1
 }
 
 /**

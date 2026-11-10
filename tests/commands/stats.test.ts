@@ -147,7 +147,7 @@ describe('stats fields', () => {
     for (const o of data().observed as Observed[]) expect(declared[o.field], o.field).toBeDefined()
   })
 
-  it('meta.field_notes 随真实输出下发：declared 的值域与观测语义都有释义（2026-10-27）', async () => {
+  it('meta.field_notes 随真实输出下发：declared 的值域与观测语义都有释义（2026-10-27）', { timeout: 180_000 }, async () => {
     // 这条钉「图例真的进了 Agent 拿到的那个 JSON」——`statsFieldNotes()` 单测绿不代表
     // 命令层把它挂上了 meta（漏挂时单测全绿、Agent 依旧读不到）。
     await seed()
@@ -158,6 +158,11 @@ describe('stats fields', () => {
     expect(notes['declared.<字段>.unit']).toContain('ratio = ')
     expect(notes['declared.<字段>.unit']).toContain('不是 0–100 的百分数')
     expect(notes['declared.<字段>.source']).toContain('name-suffix = ')
+    // 核实路径必须指向**本次**的库（Codex 2026-11-10 第八轮 P2）：`stats fields --db X` 的
+    // 提示若给裸 `qiyu query --sql '<SQL>'`，照着执行会查默认库 —— 另一份数据或「库未初始化」。
+    expect(notes['declared.<字段>.unit'], '核实路径必须回显本次 --db')
+      .toContain(`--db ${dbPath()}`)
+    expect(notes['declared.<字段>.unit']).toContain('整段替换')
     expect(notes['declared.<字段>.higher_is_better']).toContain('恒为 null')
     expect(notes['observed[].minus_one']).toContain('不是负数比率')
     // warnings 与 field_notes 同时在 meta 里，互不覆盖

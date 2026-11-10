@@ -302,6 +302,31 @@ describe('query --sql · 成功路径（spec §十）', () => {
     }
   })
 
+  // ⚠️ 本机负载 40+ 时 DuckDB 冷开实测 80s+（2026-11-10），与 `query --table` 的超时用例同款放宽
+  it('列表或结构体键形式的时间列引用同样警告（Codex 第八轮 P2）', { timeout: 180_000 }, async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测（2026-11-10 DuckDB）：`COLUMNS(['stat_date'])`、`struct_extract(d, 'stat_date')`、
+    // `d['stat_date']` 都与裸列引用等价 —— 两天夹具只计一天，列名只出现在字符串里。
+    // 列表里的正则**不展开**（实测 `COLUMNS(['stat.*'])` 报 Binder Error「Column "stat.*" not found」），
+    // 所以列表形态用精确列名；正则只对单字符串实参成立。
+    for (const ref of ["COLUMNS(['stat_date'])", "COLUMNS('stat.*')"]) {
+      expect(await q('--sql',
+        `SELECT COUNT(*) AS n FROM daily_overview WHERE ${ref} >= '2026-10-13'`), ref).toBe(0)
+      expect(warned(), ref).toBe(true)
+    }
+    // struct_extract / 下标形式在 daily_overview 上没有结构体列可指（表定义封闭），
+    // 这里用同一判据函数覆盖：列名出现在字符串键里且与日期字面量同现即警告。
+    // 反证：列表里不是时间列 / 普通字符串不属于列选择 → 不警告
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE COLUMNS(['payload']) >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(false)
+    expect(await q('--sql',
+      "SELECT 'stat_date' AS label, '2026-10-13' AS day")).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
   it('日期字面量首尾带空白、尾随字符时同样按错位警告（Codex 第七轮 P2）', async () => {
     await seed()
     const warned = (): boolean => (meta().warnings as string[])

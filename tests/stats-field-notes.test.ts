@@ -87,7 +87,12 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     expect(UNIT_NOTES.unknown).toContain('不是「没有单位」')
     expect(UNIT_NOTES.unknown).toContain('unknown_fields')
     // 给出一条真能跑的核实路径，并点明 --sql 拒绝参数占位符（2026-11-09 审计）
-    expect(UNIT_NOTES.unknown).toContain("qiyu query --sql '<SQL>'")
+    // 核实路径模板：`{@query}` 是占位符，由 `statsFieldNotes(loc)` 在调用点渲染成本次的库
+    expect(UNIT_NOTES.unknown).toContain('{@query}')
+    expect(statsFieldNotes({ db: '/tmp/x/q.duckdb' })['declared.<字段>.unit'])
+      .toContain("qiyu query --sql '<SQL>' --db /tmp/x/q.duckdb")
+    expect(statsFieldNotes()['declared.<字段>.unit'], '未给定位时不渲染出半个命令')
+      .not.toContain('{\@query}')
     expect(UNIT_NOTES.unknown).toContain('不接受参数占位符')
     expect(UNIT_NOTES.ms).toContain('毫秒')
     expect(SOURCE_NOTES['name-suffix']).toContain('不是实测')
