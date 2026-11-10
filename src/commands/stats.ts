@@ -162,7 +162,11 @@ export const UNIT_NOTES = {
     // 参数占位符 `?`，用户照 SQL 习惯写 `WHERE field = ?` 会以退出码 2 失败。
     // ⚠️ 命令的渲染发生在调用点（`statsFieldNotes(loc)`）：写死成裸 `qiyu query --sql`
     // 时，`stats fields --db X` 的提示照着执行会查**默认库**（Codex 2026-11-10 第八轮 P2）。
-    + '要看原始值判断量纲用 {@query} 显式列出该列'
+    // 措辞按「unknown 字段是什么」核过：它们是**报表 payload 里的 JSON 键**，不是表的列
+    // ——实测 `SELECT unlistedMetric FROM daily_overview` 是 Binder Error，要经 `payload ->>`
+    // 取值。原句「显式列出该列」照着执行必然失败（Codex 2026-11-10 第九轮 P2）。
+    + '要看原始值判断量纲用 {@query} 把 payload 里的该字段取出来'
+    + '（写着 `payload ->> \'<字段>\'`，它不是表的列、直接 SELECT 字段名会报列不存在）'
     // 用全角括号、不用分号：`renderNotes` 以「；」分隔各项，半角的 `; ... ` 不会被拆开；
     // 而全角分号会把这条说明截成一项假的「值」（三方守卫的图例 ⊆ 枚举会红）。
     + '（--sql 不接受参数占位符 `?`，过滤条件必须写成字面量。' + SQL_ARG_REPLACE_NOTE + '）',
@@ -197,7 +201,10 @@ export function statsFieldNotes(loc?: StoreLocation): Record<string, string> {
     // 占位符 `{@query}` 在**调用点**渲染成本次的 `qiyu query --sql … --db <本次库>`：
     // `UNIT_NOTES` 是常量、不认识本次的存储定位，模板里写死裸命令会让 `--db X` 的提示
     // 照着执行时查默认库（Codex 2026-11-10 第八轮 P2）。渲染器仍是 output.ts 的唯一实现点。
-    'declared.<字段>.unit': renderNotes(UNIT_NOTES).replace('{@query}', `\`${querySqlCommand(loc)}\``),
+    // ⚠️ 替换值必须是回调：`String.replace` 的字符串替换值会解释 `$&`/`$$`/`` $` ``/`$'`/`$1`，
+    // 而命令里含用户给的库路径与档名 —— `/tmp/q$&.duckdb` 会被改写成 `/tmp/q{@query}.duckdb`
+    //（Codex / CodeRabbit 2026-11-10 第九轮，实测）。
+    'declared.<字段>.unit': renderNotes(UNIT_NOTES).replace('{@query}', () => `\`${querySqlCommand(loc)}\``),
     'declared.<字段>.source': renderNotes(SOURCE_NOTES),
     'declared.<字段>.higher_is_better':
       '恒为 null —— 设计稿与本 CLI 都没有任何「指标越大越好还是越小越好」的上游依据，'

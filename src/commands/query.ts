@@ -289,7 +289,19 @@ function hasDayColumnKeyReference(code: string): boolean {
     if (end === -1) { re.lastIndex = k; continue }
     // 实参里的每个字符串字面量：本身就是时间列名，或是以时间列名结尾的下标 `d['stat_date']`
     //（下标表达式里的引号紧跟在 `[` 后）。
+    // ⚠️ 先跳过完整的双引号标识符再认字面量：`struct_extract("it's", 'stat_date')` 里
+    // `"it's"` 内部的撇号不是字符串起始，按字面量读会一路吞到 `'stat_date'` 之后
+    //（Codex 2026-11-10 第九轮 P2，实测该写法下库值被排除边界日却无警告）。
     for (let s = k + 1; s < end; s++) {
+      if (code[s] === '"') {
+        // 双引号标识符整段跳过：`""` 是转义引号；未闭合时退到区间末尾
+        let t = s + 1
+        while (t < end && !(code[t] === '"' && code[t + 1] !== '"')) {
+          t += code[t] === '"' && code[t + 1] === '"' ? 2 : 1
+        }
+        s = t
+        continue
+      }
       const lit = readSqlString(code, s)
       if (lit === null) continue
       if (ISO_DAY_COL_RE.test(lit.value)) return true

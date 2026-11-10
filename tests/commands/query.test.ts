@@ -327,6 +327,30 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(warned()).toBe(false)
   })
 
+  // ⚠️ 本机负载 40+ 时 DuckDB 冷开实测 80s+（2026-11-10），与 `query --table` 的超时用例同款放宽
+  it('双引号别名里的撇号不吞掉后面的键字面量（Codex 第九轮 P2）', { timeout: 180_000 }, async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测 2026-11-10：`SELECT COUNT(*) … FROM daily_overview AS "it's" WHERE
+    // struct_extract("it's", 'stat_date') >= '2026-10-13'` 两天夹具只计一天。
+    // 别名里的撇号不是字符串起始；旧扫描从它开始读字面量，一路吞掉真正的 `'stat_date'`，
+    // 于是列名只剩在字符串里、外层 gate 判「没有日期列」→ 零警告。用 query() 包装让
+    // 这段 SQL 真跑（沙箱放行形态），同时逼判据只看内层实参。
+    const sql = 'SELECT * FROM query($$'
+      + `SELECT COUNT(*) AS n FROM daily_overview AS "it's" WHERE struct_extract("it's", 'stat_date') >= '2026-10-13'`
+      + '$$)'
+    expect(await q('--sql', sql)).toBe(0)
+    expect(rowsOf()[0]?.n).toBe('1')
+    expect(warned()).toBe(true)
+    // 反证：同样的别名、键不是时间列名 → 不误报
+    const neg = 'SELECT * FROM query($$'
+      + `SELECT COUNT(*) AS n FROM daily_overview AS "it's" WHERE struct_extract("it's", 'payload') >= '2026-10-13'`
+      + '$$)'
+    expect(await q('--sql', neg)).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
   it('日期字面量首尾带空白、尾随字符时同样按错位警告（Codex 第七轮 P2）', async () => {
     await seed()
     const warned = (): boolean => (meta().warnings as string[])

@@ -94,6 +94,11 @@ describe('stats fields 的 declared 值域 ↔ field_notes ↔ README（三方�
     expect(statsFieldNotes()['declared.<字段>.unit'], '未给定位时不渲染出半个命令')
       .not.toContain('{\@query}')
     expect(UNIT_NOTES.unknown).toContain('不接受参数占位符')
+    // unknown 字段是 **payload 里的 JSON 键**、不是表的列：实测 `SELECT unlistedMetric FROM
+    // daily_overview` 是 Binder Error，只有 `payload ->> '…'` 能取值。旧文案「显式列出该列」
+    // 照着执行必然失败（Codex 2026-11-10 第九轮 P2）。
+    expect(UNIT_NOTES.unknown).toContain("payload ->> '<字段>'")
+    expect(UNIT_NOTES.unknown, '不得再指导把它当列直接 SELECT').not.toContain('显式列出该列')
     expect(UNIT_NOTES.ms).toContain('毫秒')
     expect(SOURCE_NOTES['name-suffix']).toContain('不是实测')
   })
