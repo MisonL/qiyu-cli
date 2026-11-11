@@ -621,8 +621,12 @@ export function isIdentCharAt(text: string, i: number): boolean {
   return isIdentCp(prevCodePoint(text, i))
 }
 
-/** `text[i]` 处的码点是否标识符字符（next 方向；`codePointAt` 天然按码点处理代理对）。 */
-function isIdentAt(text: string, i: number): boolean {
+/**
+ * `text[i]` 处的码点是否标识符字符（next 方向；`codePointAt` 天然按码点处理代理对）。
+ * 导出给 `commands/query.ts` 的键引用扫描：标识符判据只许一个实现点（ASCII 正则会漏掉
+ * `数据['stat_date']` 这类合法 Unicode 别名，Codex 2026-11-11 第十四轮 P2）。
+ */
+export function isIdentAt(text: string, i: number): boolean {
   if (i >= text.length) return false
   return isIdentCp(String.fromCodePoint(text.codePointAt(i)!))
 }

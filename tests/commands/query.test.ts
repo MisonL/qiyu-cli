@@ -376,6 +376,45 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(warned()).toBe(false)
   })
 
+  it('不可展开的 query() 不吞掉外层已确认的错位警告（CodeRabbit 第十四轮 minor）', { timeout: 180_000 }, async () => {
+    await seed()
+    const all = (): string => (meta().warnings as string[]).join('\n')
+    const definite = (): boolean => /少算或漏掉一天|少算或漏掉当天/.test(all())
+    // 实测（2026-11-11）：外层 `stat_date >= '2026-10-13'` 单独出现必报「少算或漏掉一天」；
+    // 同句再加一个拼接实参的 query() 时，旧实现先返回「无法检查」，**确定**的警告连同修法
+    // 一起被替换 —— Agent 只看到「没法检查」，不会去改那条真的会少算的过滤。
+    const withUnexpandable = "SELECT COUNT(*) AS n FROM daily_overview "
+      + "WHERE stat_date >= '2026-10-13' AND EXISTS (SELECT * FROM query('SELECT ' || '1'))"
+    expect(await q('--sql', withUnexpandable)).toBe(0)
+    expect(definite(), '确定警告优先于「无法检查」').toBe(true)
+    // 反证①：外层没有错位字面量时，不可展开仍要声明缺口（不能因为改了顺序就静默）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Z' "
+      + "AND EXISTS (SELECT * FROM query('SELECT ' || '1'))")).toBe(0)
+    expect(definite(), '规范字面量不该报错位').toBe(false)
+    expect(all(), '没有确定警告时必须声明「无法检查」').toMatch(/无法检查/)
+    // 反证②：完全没有日列引用的不可展开 query() 同样声明缺口
+    expect(await q('--sql', "SELECT * FROM query('SELECT ' || '1')")).toBe(0)
+    expect(all()).toMatch(/无法检查/)
+  })
+
+  it('Unicode 别名的下标键引用同样警告（Codex 第十四轮 P2）', { timeout: 180_000 }, async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测（2026-11-11）：DuckDB 接受任何非 ASCII 非空白字符作标识符（`AS 数据` 合法），
+    // `数据['stat_date'] >= '2026-10-13'` 与 `d['stat_date']` 等价、边界日被排除；
+    // 而键引用扫描的标识符正则只认 ASCII，别名认不出来 → 括号都没看 → 零警告。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview AS 数据 WHERE 数据['stat_date'] >= '2026-10-13'")).toBe(0)
+    expect(rowsOf()[0]?.n).toBe('1')
+    expect(warned(), 'Unicode 别名的下标键也必须被认出来').toBe(true)
+    // 反证：同样的 Unicode 别名、键不是时间列名 → 不误报
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview AS 数据 WHERE 数据['payload'] >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
   it('非规范 iso-day 写法（空格分隔 / 前导空白）同样警告（Codex 第十一轮 P2）', async () => {
     await seed()
     const warned = (): boolean => (meta().warnings as string[])

@@ -20,6 +20,7 @@ import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, missingTableCauses } from '../query/errors.js'
 import {
   maskQueryRows, withoutLiterals, withoutComments, queryCallArgs, readSqlString, sqlFunctionCalls, skipSqlTrivia,
+  isIdentAt, isIdentCharAt,
 } from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
@@ -224,9 +225,13 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
   // `WHERE COLUMNS('stat_date') >= '2026-10-13'` 两天夹具只计一天，Codex 2026-11-10 第六轮 P2），
   // 而 `withoutLiterals` 会把整个串抹掉。也不能放宽到 `code` 原样：普通字面量里的
   // `'stat_date'` 不是列引用，那会让无关日期字面量也报上。
-  if (unexpandable) return unexpandableQueryHint(loc)
+  // ⚠️ 「无法检查」不能盖过**已确认**的错位（CodeRabbit 2026-11-11 第十四轮，实测）：
+  // 外层 `stat_date >= '2026-10-13'` 是确定的少算一天，同句再带一个拼接实参的 `query()`
+  // 时若提前返回「无法检查」，Agent 只看到「没法检查」、不会去改那条真会少算的过滤。
+  // 顺序因此是：外层扫描优先；只有外层**什么都没发现**时才退化成声明缺口。
+  const unexpandableHint = (): string | null => (unexpandable ? unexpandableQueryHint(loc) : null)
   if (!ISO_DAY_COL_RE.test(withoutLiterals(code)) && !hasDayColumnSelector(code)
-    && !hasDayColumnKeyReference(code)) return null
+    && !hasDayColumnKeyReference(code)) return unexpandableHint()
   // 在「只抹注释」的文本上找孤立的**开引号**。`withoutComments` 原样保留双引号标识符与
   // 美元引号体，所以这两段必须整体跳过（CodeRabbit 2026-11-10）：`SELECT "it's" …` 里的
   // `'` 会被当成开引号、把后面的真实字面量吞进一个假字面量，警告静默丢失。
@@ -248,7 +253,8 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
       continue
     }
   }
-  return null
+  // 有日列引用但字面量都规范 → 外层没有确定结论，仍要声明不可展开的缺口（不得静默）。
+  return unexpandableHint()
 }
 
 /**
@@ -285,15 +291,35 @@ function hasDayColumnSelector(code: string): boolean {
  */
 function hasDayColumnKeyReference(code: string): boolean {
   const blank = withoutLiterals(code)
-  const re = /(?<![A-Za-z0-9_$])[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")*"/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(blank)) !== null) {
-    let k = m.index + m[0].length
-    while (k < blank.length && /[ \t\n\r\f\v]/.test(blank[k]!)) k++
-    if (blank[k] !== '(' && blank[k] !== '[') { re.lastIndex = k; continue }
+  // ⚠️ 标识符判据必须与 SQL 词法一致（Codex 2026-11-11 第十四轮 P2，实测）：DuckDB 接受
+  // 任何非 ASCII 非空白字符作未引用标识符（`AS 数据` 合法），`数据['stat_date']` 与
+  // `d['stat_date']` 等价、边界日同样被排除；ASCII 正则认不出别名 → 括号都没看 → 零警告。
+  // 复用 `mask.ts` 的 isIdentCp（经 `isIdentAt` 前向 / `isIdentCharAt` 前导边界），
+  // 标识符规则只许一个实现点。
+  const ws = /[ \t\n\r\f\v]/
+  for (let i = 0; i < blank.length; i++) {
+    let nameEnd: number
+    if (blank[i] === '"') {
+      // 双引号标识符整段跳过（`""` 是转义引号；未闭合时退到末尾）
+      let j = i + 1
+      while (j < blank.length && !(blank[j] === '"' && blank[j + 1] !== '"')) {
+        j += blank[j] === '"' && blank[j + 1] === '"' ? 2 : 1
+      }
+      nameEnd = Math.min(j + 1, blank.length)
+    } else if (isIdentAt(blank, i) && !isIdentCharAt(blank, i)) {
+      // 未引用标识符的**起点**（前一个字符不是标识符字符）
+      let j = i
+      while (j < blank.length && isIdentAt(blank, j)) j++
+      nameEnd = j
+    } else {
+      continue
+    }
+    let k = nameEnd
+    while (k < blank.length && ws.test(blank[k]!)) k++
+    if (blank[k] !== '(' && blank[k] !== '[') { i = nameEnd - 1; continue }
     const close = blank[k] === '(' ? ')' : ']'
     const end = matchingParen(blank, k, blank[k]!, close)
-    if (end === -1) { re.lastIndex = k; continue }
+    if (end === -1) { i = nameEnd - 1; continue }
     // 实参里的每个字符串字面量：本身就是时间列名，或是以时间列名结尾的下标 `d['stat_date']`
     //（下标表达式里的引号紧跟在 `[` 后）。
     // ⚠️ 先跳过完整的双引号标识符再认字面量：`struct_extract("it's", 'stat_date')` 里
@@ -314,7 +340,7 @@ function hasDayColumnKeyReference(code: string): boolean {
       if (ISO_DAY_COL_RE.test(lit.value)) return true
       s = lit.end - 1
     }
-    re.lastIndex = k + 1
+    i = k   // 从实参内部继续扫（原实现 re.lastIndex = k + 1）
   }
   return false
 }
