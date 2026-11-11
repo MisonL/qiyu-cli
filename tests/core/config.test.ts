@@ -158,6 +158,32 @@ describe('权限裁决（loadConfigChecked）', () => {
     })
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '祖先目录不可搜索时点名**真正挡路的那一层**（Codex 第十一轮 P2）', () => {
+      // 事故形态（实测）：`~/.config` 是 000、`~/.config/qiyu` 本身 700 时，
+      // `accessSync(qiyu, X_OK)` 照样 EACCES（穿不过 .config），旧实现于是把 qiyu 当成
+      // 挡路的目录，hint 建议 `chmod 700 …/qiyu` —— 这条命令本身都执行不了
+      //（实测 `chmod: … Permission denied`），用户照做后依然读不到配置。
+      writeCfg({ profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } } })
+      const blocked = dirname(dirname(cfgPath()))   // ~/.config
+      chmodSync(blocked, 0o000)
+      try {
+        let caught: unknown
+        try { loadConfigChecked(cfgPath()) } catch (e) { caught = e }
+        const t = caught as { kind?: string; message?: string; hint?: string }
+        expect(t.kind).toBe('config_insecure')
+        expect(String(t.message)).toContain(`配置目录 ${blocked} `)
+        expect(String(t.hint)).toContain(`chmod 700 ${blocked}`)
+        // hint 里的目录不得是被祖先挡住、自己其实好好的那一层
+        expect(String(t.hint)).not.toContain(`${blocked}/qiyu`)
+        // 修法必须真能执行：照 hint 做之后配置读得出来
+        chmodSync(blocked, 0o700)
+        expect(loadConfigChecked(cfgPath()).exists).toBe(true)
+      } finally {
+        chmodSync(blocked, 0o700)
+      }
+    })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
     '文件不可读时 fileProfile 给的是 fatal 而不是 warn（api/sync 走 fatal 分支）', () => {
       writeCfg({ profiles: {} }, 0o000)
       const r = fileProfile(cfgPath())

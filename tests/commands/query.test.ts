@@ -364,13 +364,38 @@ describe('query --sql · 成功路径（spec §十）', () => {
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Zx'")).toBe(0)
     expect(warned()).toBe(true)
-    // 反证：**前导**空白不会排除边界日（实测库值 >= `' …Z'` 为 true，字面量更小）→ 不误报
+    // **前导**空白也不是库内形态：实测 `<= ' 2026-…Z'` 一行都不剩（`>=` 则全放行）——
+    // 判据不看运算符，按方向安全一律警告（Codex 第十一轮 P2；此前按 `>=` 单方向实证
+    // 放行，反过来用就静默漏报）。
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= ' 2026-10-13T16:00:00.000Z'")).toBe(0)
-    expect(warned()).toBe(false)
+    expect(warned()).toBe(true)
     // 反证：逐字一致的列内形态仍然放行（不因去掉 trim 而多报）
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
+  it('非规范 iso-day 写法（空格分隔 / 前导空白）同样警告（Codex 第十一轮 P2）', async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测（2026-11-10 DuckDB）：库值形态是 `2026-10-13T16:00:00.000Z`（**T** 分隔）。
+    // 空格分隔在字典序上排在 `T` 之前：`stat_date <= '2026-10-13 16:00:00.000Z'` 把边界日
+    // 整列排除；带前导空白更极端，`<= ' 2026-…Z'` 一行都不剩。
+    // 旧判据把 `[T ]` 都当列内形态（空格分隔零警告），而 `^` 锚让前导空白根本不像日期。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date <= '2026-10-13 16:00:00.000Z'")).toBe(0)
+    expect(rowsOf()[0]?.n, '空格分隔在字典序上小于库值 → 边界日被排除').toBe('0')
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date <= ' 2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(rowsOf()[0]?.n, '前导空白把字面量排到库值之前 → 一行不剩').toBe('0')
+    expect(warned()).toBe(true)
+    // 反证：规范形态（T 分隔、逐字一致）放行且不报警
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date <= '2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(rowsOf()[0]?.n).toBe('1')
     expect(warned()).toBe(false)
   })
 

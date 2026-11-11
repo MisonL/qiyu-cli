@@ -187,22 +187,28 @@ export function shellPath(p: string): string {
  */
 export function insecureConfigError(
   configPath: string, reason: 'file' | 'dir' | 'unreadable' | 'dir-unreadable',
+  /** `dir-unreadable` 专用：路径上**最外层**被权限挡住的目录（见 `blockedAncestor`）。 */
+  blockedDir?: string,
 ): Error {
   const dir = dirname(configPath)
   // ⚠️ 四种成因必须是四句话（CR/Codex 2026-11-10 第六轮 + 第十轮）：`unreadable` 是**当前
   // 用户读不了**，与「含凭证且过宽」相反（那说的是别人能读）—— 套用过宽的文案会把
   // 「权限位全零、不含凭证的文件」说成凭证暴露风险，Agent 会去查一个不存在的泄露面；
   // `dir-unreadable` 又是另一层（目录进不去），修法与文案都不能套用文件那一档。
+  // ⚠️ `dir-unreadable` 点名的必须是**真正挡路的目录**（Codex 2026-11-10 第十一轮 P2）：
+  // `~/.config` 000 时 `accessSync(~/.config/qiyu, X_OK)` 同样 EACCES，照 `dirname` 报会
+  // 让人 chmod 一条**本身都执行不了**的路径（实测 `chmod: … Permission denied`）。
+  const blocked = blockedDir ?? dir
   const what = reason === 'file'
     ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 有权限位；可读时其他用户就能读到 appSecret）`
     : reason === 'dir'
       ? `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
       : reason === 'dir-unreadable'
-        // 父目录不可搜索时，对**文件**做 chmod 本身就会失败（目录都进不去），修法必须落在目录上
-        ? `配置目录 ${dir} 当前用户不可搜索（无法进入该目录，因此读不到其中的配置文件；与文件里有没有凭证无关）`
+        ? `配置目录 ${blocked} 当前用户不可搜索（它挡在配置路径上，因此读不到其中的配置文件；`
+          + `若它下面还有不可进入的层，修好这一层后重跑会重新点名；与文件里有没有凭证无关）`
         : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
   const fix = reason === 'dir' || reason === 'dir-unreadable'
-    ? `chmod 700 ${shellPath(dir)}`
+    ? `chmod 700 ${shellPath(blocked)}`
     : `chmod 600 ${shellPath(configPath)}`
   return Object.assign(
     new Error(`${what}，已拒绝读取`),
@@ -211,6 +217,37 @@ export function insecureConfigError(
       hint: `这是配置文件的权限问题，重试无用 —— 请执行：${fix}`,
     },
   )
+}
+
+/**
+ * 路径上**最外层**不可进入（不可搜索）的目录 —— 修法必须落在它身上。
+ *
+ * ⚠️ 为什么不能直接用 `dirname(configPath)`（Codex 2026-11-10 第十一轮 P2，实测）：
+ * `~/.config` 是 000、`~/.config/qiyu` 本身 700 时，`accessSync(qiyu, X_OK)` 照样 EACCES
+ * （穿不过 .config），于是会被误当成「qiyu 挡路」。hint 因此建议 `chmod 700 …/qiyu` ——
+ * 这条命令本身都执行不了（`chmod: … Permission denied`），照做后仍读不到配置。
+ *
+ * 从配置目录逐层向上探，记下**最后一个** EACCES/EPERM 的目录（即最外层挡路者）：
+ * 它的父目录一定是能进入的（否则循环会继续往上），所以 `chmod 700` 对它的父目录有效、
+ * 一定可执行。更深的层若也被挡，等这层修好后重跑会重新点名（文案里已说明）。
+ * 上面某一层是**别的**错误（如 ENOTDIR）时停在那里，交回既有口径。
+ */
+function blockedAncestor(dir: string): string | null {
+  let blocked: string | null = null
+  let cur = dir
+  for (;;) {
+    try {
+      accessSync(cur, fsConstants.X_OK)
+      return blocked   // 这一层进得去：上面记下的最深不可进入者就是真正挡路的
+    } catch (e) {
+      const code = (e as { code?: string }).code
+      if (code !== 'EACCES' && code !== 'EPERM') return blocked
+      blocked = cur
+      const parent = dirname(cur)
+      if (parent === cur) return blocked   // 到根了
+      cur = parent
+    }
+  }
 }
 
 /**
@@ -232,15 +269,12 @@ export function assertConfigReadable(configPath: string): void {
   } catch (e) {
     const code = (e as { code?: string }).code
     if (code !== 'EACCES' && code !== 'EPERM') return
-    // 同样是 EACCES，挡在哪一层决定修法：父目录不可搜索时对文件 chmod 本身就会失败。
-    let dirBlocked = false
-    try {
-      accessSync(dirname(configPath), fsConstants.X_OK)
-    } catch (e2) {
-      const c2 = (e2 as { code?: string }).code
-      dirBlocked = c2 === 'EACCES' || c2 === 'EPERM'
-    }
-    throw insecureConfigError(configPath, dirBlocked ? 'dir-unreadable' : 'unreadable')
+    // 同样是 EACCES，挡在哪一层决定修法：目录不可进入时对文件 chmod 本身就会失败，
+    // 而目录又可能不是直接父目录（祖先被挡时子目录的 accessSync 一样报 EACCES）。
+    const blocked = blockedAncestor(dirname(configPath))
+    throw blocked !== null
+      ? insecureConfigError(configPath, 'dir-unreadable', blocked)
+      : insecureConfigError(configPath, 'unreadable')
   }
 }
 

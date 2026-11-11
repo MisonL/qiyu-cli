@@ -542,7 +542,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   （`db tables.time_range`、`db describe` 的 `unit`、`resolved_range`、`data_coverage`）呈现
   的是 `+08:00` 形态。`--table` 通道已处理取整语义；**`--sql` 里直接按字符串比较时要用 UTC 形态**，
   否则会少算一天（如 `WHERE stat_date >= '2026-10-12T16:00:00.000Z'`）。检测到
-  「iso-day 列 + 日期形态字面量」时 `meta.warnings` 会明确提示。
+  「iso-day 列 + 日期形态字面量」时 `meta.warnings` 会明确提示——**只有与库内形态逐字一致
+  的 `YYYY-MM-DDT16:00:00.000Z` 才不提示**：空格分隔（`… 16:00:00.000Z`）在字典序上排在
+  `T` 之前、前导空白更小，用 `<=` 时会排除边界日甚至全表（判据看不到运算符，按方向安全一律提示）。
 - `db tables` / `db describe` 的 `meta.notice` 恒在（本库含客户 PII 的提示）；
   声明与实况不一致（缺表/缺列/多列/时间列脏值）逐条进 `meta.warnings`，不静默——`db tables` 做表级
   与列集核对，`db describe` 给出该表的逐列差异细节。时间列里不符合约定形态的值**不进**

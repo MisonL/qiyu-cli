@@ -433,7 +433,9 @@ describe('空串档名：读写两个方向必须解出同一个档（2026-10-29
 })
 
 describe('auth 已挂载到入口', () => {
-  it('run(["auth", ...]) 会走到 authCommand，而不是报"未知子命令"', async () => {
+  // ⚠️ `await import('../../src/cli.js')` 会拉进整个命令注册表，本机负载高时实测
+  // 5008–5015ms（默认 5s 超时）——与 query.test.ts 等文件「负载下放宽」同款处理。
+  it('run(["auth", ...]) 会走到 authCommand，而不是报"未知子命令"', { timeout: 30_000 }, async () => {
     // ⚠️ 这条守的是"挂载"本身。光有 authCommand 实现而忘了登记进 COMMANDS 表，
     // 各子命令的单测全绿，而 CLI 会静默返回"未知子命令：auth"。
     //
