@@ -131,7 +131,9 @@ export function runFieldNotes(): Record<string, string> {
     // ⚠️ windows / rows 是嵌套对象，此前只解释了 windows.skipped 与 status 里顺带提到的
     // 字段（2026-11-04 反向 sweep 实测：total/succeeded/failed 与 rows.* 全部裸奔）。
     // 这四个数是 Agent 判「这次到底拿到没有」的依据，必须各自可见。
-    'tasks[].windows.total': '本轮计入的窗口总数（= succeeded + failed + skipped）——\n'
+    // ⚠️ 这条释义里不能有换行：`meta.field_notes` 的值是 JSON 字符串，内部换行会让
+    // Agent/工具把一句定义读成两段（CodeRabbit 2026-11-11，此前是源码折行残留的 `\n`）。
+    'tasks[].windows.total': '本轮计入的窗口总数（= succeeded + failed + skipped）——'
       + '不含被重叠区合并的窗（那是 contained；物理切出的窗数 = total + contained）',
     'tasks[].windows.succeeded': '成功窗数。⚠️ 空窗也算成功，所以 > 0 不代表有数据 —— 结合 rows.written 与 windows.failed 判断',
     'tasks[].windows.failed': '失败窗数（失败会在 gaps 里逐条记录）',

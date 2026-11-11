@@ -178,7 +178,10 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 「只在 stderr 警告、不阻断」。
 父目录 group/other **可写**（文件可被整体替换）时同样拒绝。`auth login` 是**唯一的例外**：
 它不拒绝，而是把已有文件重写为 `0600`（马上要写入新的 secret，拒绝没有意义），写完自检
-不合格才报 `config_insecure`。Windows 上跳过这些检查。数据库正常关闭后 `.wal` 临时文件会
+不合格才报 `config_insecure`。Windows 上跳过这些检查（「过宽」判据只看 POSIX 权限位）；
+但**读被拒绝**（NTFS ACL）在 Windows 上同样会按 `config_insecure` 报，此时 hint 是
+`icacls <路径> /reset`（恢复继承的 ACL）—— `chmod` 不存在于 Windows，POSIX 修法照搬过去
+用户将无路可走。数据库正常关闭后 `.wal` 临时文件会
 自动消失，请勿手工删除。
 
 > ⚠️ `whoami` **只检查凭证是否存在**，不校验它是否有效——一个拼错的 AppKey 同样返回

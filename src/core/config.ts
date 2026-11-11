@@ -2,7 +2,7 @@
 //
 // 配置文件的**通用层**（G1 第三批抽取）：路径解析、读文件、JSON 解析、
 // 键白名单校验、credentials/robots 块校验、权限检查、原子写。
-// 只 import node:fs/os/path —— 这是「commands/auth.ts 与 commands/api.ts
+// 只 import node 内置 + `core/shell.js` 的 shellArg（引号单一实现点，已下沉到 core 以免违反「core 不得 import output.js」的分层守卫）—— 这是「commands/auth.ts 与 commands/api.ts
 // 不得加载 store/」这条分层红线（layering.test.ts 钉着）的解法：
 // auth/api 只 import 本文件，`store/config.ts` 内部也走这里。
 //
@@ -14,6 +14,7 @@
 import { readFileSync, writeFileSync, lstatSync, statSync, existsSync, mkdirSync, renameSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname, isAbsolute } from 'node:path'
+import { shellArg } from './shell.js'
 
 /** 顶层已知键 —— 未知键 fail-closed（spec §3.3）。 */
 export const KNOWN_TOP = new Set(['defaultProfile', 'profiles'])
@@ -189,6 +190,8 @@ export function insecureConfigError(
   configPath: string, reason: 'file' | 'dir' | 'unreadable' | 'dir-unreadable',
   /** `dir-unreadable` 专用：路径上**最外层**被权限挡住的目录（见 `blockedAncestor`）。 */
   blockedDir?: string,
+  /** 测试可注入；生产恒为 `process.platform`。 */
+  platform: string = process.platform,
 ): Error {
   const dir = dirname(configPath)
   // ⚠️ 四种成因必须是四句话（CR/Codex 2026-11-10 第六轮 + 第十轮）：`unreadable` 是**当前
@@ -198,18 +201,29 @@ export function insecureConfigError(
   // ⚠️ `dir-unreadable` 点名的必须是**真正挡路的目录**（Codex 2026-11-10 第十一轮 P2）：
   // `~/.config` 000 时 `accessSync(~/.config/qiyu, X_OK)` 同样 EACCES，照 `dirname` 报会
   // 让人 chmod 一条**本身都执行不了**的路径（实测 `chmod: … Permission denied`）。
+  // ⚠️ Windows 上 EACCES/EPERM 的成因是 **ACL**（不是 POSIX 权限位），`chmod` 不存在于
+  // Windows —— 修法必须平台化（Codex 2026-11-10 第十二轮 P2）：`icacls /reset` 恢复继承的
+  // ACL；引号按 win32 方言走 `shellArg`（hint 会被真的执行，引号规则只许一个实现点）。
   const blocked = blockedDir ?? dir
+  const win = platform === 'win32'
   const what = reason === 'file'
     ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 有权限位；可读时其他用户就能读到 appSecret）`
     : reason === 'dir'
       ? `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
       : reason === 'dir-unreadable'
-        ? `配置目录 ${blocked} 当前用户不可搜索（它挡在配置路径上，因此读不到其中的配置文件；`
-          + `若它下面还有不可进入的层，修好这一层后重跑会重新点名；与文件里有没有凭证无关）`
-        : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
-  const fix = reason === 'dir' || reason === 'dir-unreadable'
-    ? `chmod 700 ${shellPath(blocked)}`
-    : `chmod 600 ${shellPath(configPath)}`
+        ? win
+          ? `配置路径上的目录 ${blocked} 被 Windows ACL 拒绝访问（不是 POSIX 权限位，chmod 修不了它）`
+          : `配置目录 ${blocked} 当前用户不可搜索（它挡在配置路径上，因此读不到其中的配置文件；`
+            + `若它下面还有不可进入的层，修好这一层后重跑会重新点名；与文件里有没有凭证无关）`
+        : win
+          ? `配置文件 ${configPath} 被 Windows ACL 拒绝读取（不是 POSIX 权限语义，chmod 修不了它；与文件里有没有凭证无关）`
+          : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
+  const fix = win && (reason === 'unreadable' || reason === 'dir-unreadable')
+    ? `icacls ${shellArg(reason === 'dir-unreadable' ? blocked : configPath, 'win32')} /reset`
+      + `（恢复继承的 ACL；也可在「属性 → 安全」里给当前用户授予读取权限）`
+    : reason === 'dir' || reason === 'dir-unreadable'
+      ? `chmod 700 ${shellPath(blocked)}`
+      : `chmod 600 ${shellPath(configPath)}`
   return Object.assign(
     new Error(`${what}，已拒绝读取`),
     {

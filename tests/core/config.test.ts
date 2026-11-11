@@ -13,9 +13,10 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   __resetPermissionWarnings, checkPermissions, configHasCredentials, configPathFor,
-  fileCredentials, fileProfile, loadConfigChecked, loadConfigFile, parseConfig,
+  fileCredentials, fileProfile, insecureConfigError, loadConfigChecked, loadConfigFile, parseConfig,
   resolveProfileName, serializeConfig, writeConfigFile,
 } from '../../src/core/config.js'
+import { shellArg } from '../../src/output.js'
 
 let home = ''
 const cfgPath = (): string => join(home, '.config', 'qiyu', 'config.json')
@@ -416,5 +417,39 @@ describe('profiles 是 null 原型对象（2026-10-27，原型链绕过守卫）
     expect(Object.getPrototypeOf(g.profiles)).toBe(null)
     expect(Object.keys(g.profiles)).toEqual(['__proto__'])
     expect(g.profiles['__proto__'].robots).toEqual({ '1000001': '甲' })
+  })
+})
+
+describe('Windows ACL 拒绝的平台化修法（Codex 第十二轮 P2）', () => {
+  // 事故形态：Windows 上 ACL 拒绝同样让 `accessSync` 抛 EACCES/EPERM，旧实现一律给
+  // POSIX `chmod` hint —— chmod 在 Windows 上不存在，用户拿不到任何可执行的恢复步骤
+  // （README 约定 Windows 跳过「过宽」检查，但读拒绝分流出 config_insecure 后照样走到 hint）。
+  // 判据用注入的 platform 参数钉住（macOS 上造不出真 ACL 拒绝，行为面按平台分流验证）。
+  const winPath = 'C:\\Users\\测试用户\\config.json'
+  const winDir = 'C:\\Users\\测试用户\\.config'
+
+  it('unreadable → icacls /reset，不再给 chmod', () => {
+    const e = insecureConfigError(winPath, 'unreadable', undefined, 'win32') as unknown as Record<string, string>
+    expect(e.kind).toBe('config_insecure')
+    expect(e.message).toContain('Windows ACL')
+    expect(e.message, '「权限位」是 POSIX 语义，Windows 上是假归因').not.toContain('权限位')
+    expect(e.hint).toContain('icacls')
+    expect(e.hint).toContain('/reset')
+    expect(e.hint, 'chmod 在 Windows 上不存在').not.toContain('chmod')
+    // 路径按 win32 方言引号化（shellArg 的唯一实现点）
+    expect(e.hint).toContain(shellArg(winPath, 'win32'))
+  })
+
+  it('dir-unreadable → icacls 指向被挡的那一层', () => {
+    const e = insecureConfigError(`${winDir}\\qiyu\\config.json`, 'dir-unreadable', winDir, 'win32') as unknown as Record<string, string>
+    expect(e.message).toContain(winDir)
+    expect(e.hint).toContain('icacls')
+    expect(e.hint).toContain(shellArg(winDir, 'win32'))
+    expect(e.hint).not.toContain('chmod')
+  })
+
+  it('POSIX 口径不变（chmod 文件 / chmod 目录）', () => {
+    expect(String((insecureConfigError('/tmp/x/cfg', 'unreadable') as unknown as { hint: string }).hint)).toMatch(/chmod 600/)
+    expect(String((insecureConfigError('/tmp/x/cfg', 'dir-unreadable', '/tmp/x') as unknown as { hint: string }).hint)).toMatch(/chmod 700 \/tmp\/x/)
   })
 })
