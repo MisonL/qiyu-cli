@@ -49,6 +49,11 @@ export function readConfigRaw(configPath: string): Record<string, unknown> {
   try {
     raw = readFileSync(configPath, 'utf8')
   } catch (e) {
+    // ⚠️ EACCES/EPERM 不包成普通 Error：Windows 上 fs.access 不评估 NTFS ACL，
+    // 真拒绝可能出现在这里（CodeRabbit 第十三轮），必须与探测点同口径给
+    // config_insecure + 平台化修法（见 `permissionReadError`）。
+    const code = (e as { code?: string }).code
+    if (code === 'EACCES' || code === 'EPERM') throw permissionReadError(configPath)
     throw new Error(`无法读取配置文件 ${configPath}：${e instanceof Error ? e.message : String(e)}`)
   }
   try {
@@ -285,11 +290,25 @@ export function assertConfigReadable(configPath: string): void {
     if (code !== 'EACCES' && code !== 'EPERM') return
     // 同样是 EACCES，挡在哪一层决定修法：目录不可进入时对文件 chmod 本身就会失败，
     // 而目录又可能不是直接父目录（祖先被挡时子目录的 accessSync 一样报 EACCES）。
-    const blocked = blockedAncestor(dirname(configPath))
-    throw blocked !== null
-      ? insecureConfigError(configPath, 'dir-unreadable', blocked)
-      : insecureConfigError(configPath, 'unreadable')
+    throw permissionReadError(configPath)
   }
+}
+
+/**
+ * 读点上 EACCES/EPERM 的**唯一分类出口**（`assertConfigReadable` 与 `readConfigRaw` 共用）。
+ *
+ * ⚠️ 为什么读点也要分流（CodeRabbit 2026-11-11 第十三轮）：Node 的 `fs.access` 在 Windows
+ * 上**不评估 NTFS ACL** —— ACL 拒绝时 `accessSync(R_OK)` 可能成功、真拒绝发生在后面的
+ * `readFileSync`。只靠探测点分流，`config_insecure`（含 icacls hint）在 Windows 上就是
+ * **不可达分支**：拒绝被 `readConfigRaw` 包成无 kind 的普通 Error，login 报 config_invalid、
+ * store 族报 usage 2 —— 「同一个危险状态，多种行为」的旧乱象全数复活。POSIX 上这也是
+ * 竞态的兜底（access 通过后、读之前权限被改）。
+ */
+function permissionReadError(configPath: string): Error {
+  const blocked = blockedAncestor(dirname(configPath))
+  return blocked !== null
+    ? insecureConfigError(configPath, 'dir-unreadable', blocked)
+    : insecureConfigError(configPath, 'unreadable')
 }
 
 /**

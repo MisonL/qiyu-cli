@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path'
 import {
   __resetPermissionWarnings, checkPermissions, configHasCredentials, configPathFor,
   fileCredentials, fileProfile, insecureConfigError, loadConfigChecked, loadConfigFile, parseConfig,
+  readConfigRaw,
   resolveProfileName, serializeConfig, writeConfigFile,
 } from '../../src/core/config.js'
 import { shellArg } from '../../src/output.js'
@@ -451,5 +452,34 @@ describe('Windows ACL 拒绝的平台化修法（Codex 第十二轮 P2）', () =
   it('POSIX 口径不变（chmod 文件 / chmod 目录）', () => {
     expect(String((insecureConfigError('/tmp/x/cfg', 'unreadable') as unknown as { hint: string }).hint)).toMatch(/chmod 600/)
     expect(String((insecureConfigError('/tmp/x/cfg', 'dir-unreadable', '/tmp/x') as unknown as { hint: string }).hint)).toMatch(/chmod 700 \/tmp\/x/)
+  })
+})
+
+describe('读点上的权限拒绝同样分流（CodeRabbit 第十三轮 minor）', () => {
+  // Node 的 fs.access 在 Windows 上不评估 NTFS ACL：探测点 accessSync 可能成功，
+  // 真拒绝发生在 readConfigRaw 的 readFileSync —— 旧实现把它包成无 kind 的普通
+  // Error，login 报 config_invalid、store 族报 usage 2，Windows 的 icacls hint
+  // 成了不可达分支。POSIX 上用 chmod 000 直接调 readConfigRaw 复现同一形态。
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'readConfigRaw 遇 EACCES → config_insecure + chmod 600，不再是普通 Error', () => {
+      writeCfg({ profiles: {} }, 0o000)
+      let caught: unknown
+      try { readConfigRaw(cfgPath()) } catch (e) { caught = e }
+      const t = caught as { kind?: string; hint?: string; message?: string }
+      expect(t.kind).toBe('config_insecure')
+      expect(t.hint).toMatch(/chmod 600/)
+      expect(String(t.message)).not.toContain('无法读取配置文件')
+    })
+
+  it('其它读错误（EISDIR：配置路径本身是目录）保持既有普通 Error 口径', () => {
+    // ⚠️ 反例构造的限制（实测）：`<cfg>/x/y` 的 ENOTDIR 会被开头的 `existsSync` 吞成
+    // 「不存在」（返回 {}、不抛）；要在 readFileSync 上造出非权限错误，只能让配置路径
+    // **本身是目录** —— readFileSync(目录) 报 EISDIR，走普通 Error 分支。
+    mkdirSync(cfgPath(), { recursive: true })
+    let caught: unknown
+    try { readConfigRaw(cfgPath()) } catch (e) { caught = e }
+    const t = caught as { kind?: string; message?: string }
+    expect(t.kind).toBeUndefined()
+    expect(String(t.message)).toContain('无法读取配置文件')
   })
 })

@@ -2043,6 +2043,14 @@
     「被 Windows ACL 拒绝（不是 POSIX 权限语义）」，hint 改为 `icacls <路径> /reset`（恢复
     继承的 ACL，附「属性 → 安全」的手工授权替代），路径引号按 win32 方言走 `shellArg`
     单一实现点。README 与 skill `errors.md` 同步。
+  · **权限拒绝的分流只挂在探测点，Windows 上不可达**（CodeRabbit 第十三轮 minor）：Node 的
+    `fs.access` 在 Windows 上不评估 NTFS ACL —— 真拒绝发生在 `readFileSync`，被包成无 kind
+    的普通 Error，login 报 config_invalid、store 族报 usage 2，上一轮加的 icacls hint 成了死分支
+    （Windows 用例只注入 platform，从未走真实探测路径）。把 EACCES/EPERM 的分类收进
+    `permissionReadError` 唯一实现点，探测点与**读点**（`readConfigRaw`）共用；POSIX 上顺带兜住
+    「access 通过后、读之前权限被改」的竞态。回归：`readConfigRaw` 直接对 000 文件 → config_insecure；
+    EISDIR 等非权限读错误维持普通 Error 口径（`<cfg>/x/y` 的 ENOTDIR 会被 existsSync 吞成「不存在」，
+    反例只能用「配置路径本身是目录」构造，实测）。
   · **脱敏缺口警告上限 5 条时静默截断**：第 5 条改为「另有 N 个敏感列的缺口警告未列出」并点名；
     上限按**类别**计（本块最多 5 行），不按全局行数扣减 —— 否则其它类别的警告占满 5 条后，
   不发汇总就退回静默截断、发汇总又超上限（Codex 2026-11-10 第三轮 P2）。
