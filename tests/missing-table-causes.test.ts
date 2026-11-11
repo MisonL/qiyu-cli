@@ -21,6 +21,7 @@ import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync } from 'node:f
 import { tmpdir } from 'node:os'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { shellArg } from '../src/core/shell.js'
 import { dbCommand } from '../src/commands/db.js'
 import { queryCommand } from '../src/commands/query.js'
 import { statsCommand } from '../src/commands/stats.js'
@@ -121,7 +122,7 @@ describe('缺表成因的行为口径（真 DuckDB）', () => {
       expect(text, `${where} 未要求重建前先备份`).toContain('先备份库文件')
       // 恢复命令必须指向本次的库：hint 会出现在 `--db <自定义路径>` 的输出里，
       // 只说「运行 qiyu store init」会让 Agent 初始化默认库，选中的库依然缺失
-      expect(text, `${where} 的恢复命令未带本次的 --db`).toContain('--db ' + dbPath())
+      expect(text, `${where} 的恢复命令未带本次的 --db`).toContain('--db ' + shellArg(dbPath()))
       // 缺表的表名必须点名（不能只说「有表缺失」）。⚠️ query/stats 的出口是 error.hint，
       // 表名在**同一条错误的 message** 里（`表 daily_overview 不存在`），不在 hint —— 故
       // 对 warning 出口断言 hint 文本，对 hint 出口断言整条错误（message + hint）。

@@ -276,16 +276,18 @@ describe('auth login', () => {
   it('配置文件畸形时拒绝覆盖 —— 不静默丢掉用户手写的内容', async () => {
     writeCfg('{ 坏 JSON')
     vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
-    expect(await authCommand(['login'])).toBe(2)
+    // 退出码必须是 1 不是 2（2026-11-09 审计）：退出码 2 = 「改参数重来」，
+    // 而换环境变量修不好损坏的 JSON；kind 点名真正成因 config_invalid。
+    expect(await authCommand(['login'])).toBe(1)
+    expect(JSON.parse(out).error.kind).toBe('config_invalid')
     expect(JSON.parse(out).error.message).toMatch(/无法读取现有配置文件/)
-    // ⚠️ 必须同时断言 stderr **非空且**无 Markdown 标记（2026-10-26 逐点变异实测发现）：
-    // 本分支**被**这条用例走到了，但它只断言了 message —— 给该 usageFail 的文案
-    // 注入 `**`，全量测试**仍全绿**（`api.test.ts` 的哨兵表覆盖不到这里：那条表
-    // 的每一行都是一次裸调用，构造不出"配置文件畸形"的前置状态）。
-    // ⚠️ `not.toMatch(/\*\*/)` 单独用**在空串上恒真**（Sourcery 2026-10-26）——
-    // 必须先钉非空：这条路径的承诺是"人能在终端看到原因"，stderr 空着就等于没兑现。
-    expect(err, '这条分支必须把原因写进 stderr（人有 stderr、Agent 有 stdout）').not.toBe('')
-    expect(err).not.toMatch(/\*\*/)
+    expect(String(JSON.parse(out).error.hint)).toMatch(/修好或移走该文件/)
+    // stderr 不再有（2026-11-09 审计裁决）：这条路径从 usageFail（stderr + stdout 双通道）
+    // 改走 fail（退出码 1 的业务错误，与其他 fail 出口一致，只写 stdout JSON）。
+    // 人的原因说明改由 stdout 的 message + hint 承担 —— 上面已逐条断言。
+    expect(err).toBe('')
+    // 文案不得带 Markdown 标记（2026-10-26 变异实测的守卫保留，只是挪到 stdout 上钉）
+    expect(out).not.toMatch(/\*\*/)
     // 坏文件必须**原样没动**（没有被覆盖成一个"看起来成功"的新文件）
     expect(readFileSync(cfgPath(), 'utf8')).toBe('{ 坏 JSON')
   })
@@ -431,7 +433,9 @@ describe('空串档名：读写两个方向必须解出同一个档（2026-10-29
 })
 
 describe('auth 已挂载到入口', () => {
-  it('run(["auth", ...]) 会走到 authCommand，而不是报"未知子命令"', async () => {
+  // ⚠️ `await import('../../src/cli.js')` 会拉进整个命令注册表，本机负载高时实测
+  // 5008–5015ms（默认 5s 超时）——与 query.test.ts 等文件「负载下放宽」同款处理。
+  it('run(["auth", ...]) 会走到 authCommand，而不是报"未知子命令"', { timeout: 30_000 }, async () => {
     // ⚠️ 这条守的是"挂载"本身。光有 authCommand 实现而忘了登记进 COMMANDS 表，
     // 各子命令的单测全绿，而 CLI 会静默返回"未知子命令：auth"。
     //
@@ -562,5 +566,62 @@ describe('纯空白凭证（A12，2026-11-06）', () => {
     expect(String(e.hint)).toContain('设为真实值')
     expect(String(e.hint)).toContain('只从环境变量读取')
     expect(String(e.hint)).not.toMatch(/unset/)
+  })
+})
+
+describe('配置读取权限拒绝（Codex 2026-11-10 第四轮 P2）', () => {
+  // ⚠️ 收权限位造 EACCES 只在非 root POSIX 上成立（root 无视权限位）——同文件既有约定。
+  const posixOnly = process.platform === 'win32' || process.getuid?.() === 0
+  it.skipIf(posixOnly)('login：文件不可读 → config_insecure + chmod 600，而不是笼统的 config_invalid', async () => {
+    // 事故形态：`loadConfigFile` → `readConfigRaw` 把读失败包成**无 kind** 的普通 Error，
+    // 于是 login 里那条「权限拒绝 → config_insecure + chmod」的分支**从来走不到**
+    // （死分支），同一状态 whoami/api 报 config_insecure、login 报 config_invalid。
+    const p = writeCfg({ profiles: {} }, 0o000)
+    vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
+    try {
+      expect(await authCommand(['login'])).toBe(1)
+      const e = JSON.parse(out).error as Record<string, unknown>
+      expect(e.kind).toBe('config_insecure')
+      expect(String(e.hint)).toContain(`chmod 600`)
+      expect(String(e.hint)).toContain('本次未写入任何内容')
+      // 成因必须是**读不出来**，不能套用「权限过宽」的文案（CR/Codex 第六轮）：
+      // 夹具文件不含任何凭证、group/other 位也全为零 —— 说成凭证暴露是假归因。
+      expect(String(e.message)).not.toContain('过宽')
+      expect(String(e.message)).toMatch(/无法读取|读不出来|没有读取权限/)
+      // 文件不得被改动（连覆盖都没有）—— 先恢复权限才读得出来，读的是**内容**不是权限
+      chmodSync(p, 0o600)
+      expect(readFileSync(p, 'utf8'), '不可读的文件也不能被覆盖').toContain('profiles')
+    } finally {
+      chmodSync(p, 0o600)
+    }
+  })
+
+  it.skipIf(posixOnly)('whoami：文件不可读 → 同样 config_insecure（与 api/sync 的凭证合流同口径）', async () => {
+    const p = writeCfg({ profiles: {} }, 0o000)
+    try {
+      expect(await authCommand(['whoami'])).toBe(1)
+      expect(JSON.parse(out).error.kind).toBe('config_insecure')
+    } finally {
+      chmodSync(p, 0o600)
+    }
+  })
+
+  it.skipIf(posixOnly)('whoami：配置**目录**不可进入 → config_insecure + chmod 700，不是 auth_missing（Codex 第十轮 P2）', async () => {
+    // 事故形态（实测）：目录 000 时 `existsSync(文件)` 为 false，真配置被当成缺失 ——
+    // whoami 报 `auth_missing` + 「appKey 来自（缺失）」，hint 让人 `auth login`，
+    // 而 login 同样进不去这个目录。用户会照着一条必然失败的 hint 去做。
+    writeCfg({ profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } } })
+    const dir = join(home, '.config', 'qiyu')
+    chmodSync(dir, 0o000)
+    try {
+      expect(await authCommand(['whoami'])).toBe(1)
+      const e = JSON.parse(out).error as Record<string, unknown>
+      expect(e.kind, '必须是权限问题，不是凭证缺失').toBe('config_insecure')
+      expect(String(e.message)).toContain('配置目录')
+      expect(String(e.hint)).toMatch(/chmod 700/)
+      expect(String(e.message)).not.toContain('过宽')
+    } finally {
+      chmodSync(dir, 0o700)
+    }
   })
 })

@@ -169,12 +169,19 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 **权限规则**：配置文件**含凭证**且 group/other 有**任何**权限位（如 `0644` 可读、`0622` 只写、
 `0601` 仅 other 可执行）时，**任何读取配置的命令都会拒绝读取**（`kind: config_insecure`，
 退出码 1，hint 点名要执行的 `chmod`）——可读时落盘的 appSecret 对同机其他用户可读，
-其余组合也不该放宽，判据就是 `mode & 0o077 !== 0`。不读配置的命令（`--version`、
+其余组合也不该放宽，判据就是 `mode & 0o077 !== 0`。文件**读不出来**（权限拒绝，
+`EACCES`/`EPERM`）同样按 `config_insecure` 报（退出码 1 + `chmod 600` hint）——它是权限
+问题，不是配置内容问题；而**配置目录**不可搜索（目录进不去、连文件都 stat 不到）报的是
+另一句话，hint 是 `chmod 700 <目录>`——对文件 chmod 在这个状态下本身就执行不了，不会把
+「目录挡路」说成「凭证缺失」。不读配置的命令（`--version`、
 `api list`、`skill where`、`sync tasks` 等）不受影响，它们不碰凭证。不含凭证的文件维持
 「只在 stderr 警告、不阻断」。
 父目录 group/other **可写**（文件可被整体替换）时同样拒绝。`auth login` 是**唯一的例外**：
 它不拒绝，而是把已有文件重写为 `0600`（马上要写入新的 secret，拒绝没有意义），写完自检
-不合格才报 `config_insecure`。Windows 上跳过这些检查。数据库正常关闭后 `.wal` 临时文件会
+不合格才报 `config_insecure`。Windows 上跳过这些检查（「过宽」判据只看 POSIX 权限位）；
+但**读被拒绝**（NTFS ACL）在 Windows 上同样会按 `config_insecure` 报，此时 hint 是
+`icacls <路径> /reset`（恢复继承的 ACL）—— `chmod` 不存在于 Windows，POSIX 修法照搬过去
+用户将无路可走。数据库正常关闭后 `.wal` 临时文件会
 自动消失，请勿手工删除。
 
 > ⚠️ `whoami` **只检查凭证是否存在**，不校验它是否有效——一个拼错的 AppKey 同样返回
@@ -192,7 +199,8 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 > 缺席时，知识库类目同步会用这些 id 驱动（`knowledgeRobotIds` 优先）。空数组有**三种**成因：
 > 该档没配 robots、该档根本不存在，或**配置文件读取失败**（畸形 JSON / 未知键）——
 > 第三种会在 `meta.warnings` 里点名，先读 `warnings` 再判断，别把读不到配置当成「该档没配」。
-> （含凭证且权限过宽不是「读取失败」：那种情况 `whoami` 直接以 `config_insecure` 报错。）
+> （含凭证且权限过宽、或文件因权限**不可读**，都不是「读取失败」：那两种情况 `whoami`
+> 直接以 `config_insecure` 报错，不进 warnings。）
 
 ## 使用
 
@@ -271,7 +279,7 @@ qiyu --version                       包版本 + skill_contract_version
 
 **请按 `kind` 分支，不要按 `code`。** `code` 只是个标签：它可能是服务端的数字码
 （如 `14009`），也可能是本 CLI 合成的词（`usage` / `network` / `internal` /
-`auth_missing` / `config_insecure` / `confirm_required` / `store_locked` /
+`auth_missing` / `config_insecure` / `config_invalid` / `confirm_required` / `store_locked` /
 `store_not_initialized` / `local_rate_limit` / `query_error` / `sandbox_blocked` /
 `query_timeout` / `sync_not_run` / `unknown`）。合成词在官方错误码表里查不到。
 ⚠️ 上面与 `qiyu --help` 里的是一批**常见值**，不是穷举：`kind` 的单一事实源是
@@ -325,13 +333,20 @@ qiyu --version                       包版本 + skill_contract_version
 ### sync 命令的输出
 
 `sync run` 的 stdout 是 `{tasks:[...], truncated:false}`，每个任务含 `task` / `status`
-（complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped}`，
-`total = succeeded + failed + skipped`，`skipped` = 跳过的**残段窗**数 + **整窗晚于末端上限
-被丢弃**的窗数，见下）/ `rows` /
+（complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped, contained?}`，
+`total = succeeded + failed + skipped`，`skipped` 有三种成因：跳过的**残段窗**数 +
+**整窗晚于末端上限被丢弃**的窗数 + **覆盖窗失败**时其名下被合并、该拉没拉的窗数；
+`contained` 仅在 > 0 时出现 = 完全落进前一窗**回看重叠区**、被合并的
+窗数（overlapDays > 0 的任务；**覆盖窗成功**时数据已由那一窗覆盖，所以不算 skipped、也不计入
+total —— 覆盖窗失败时这些窗改记 skipped 并逐窗出进度行；物理切出的窗数 = total + contained），
+见下）/ `rows` /
 `resolved_range`（Asia/Shanghai 的 `+08:00` ISO 二元组）/ `watermark` / `last_synced_at` /
 `gaps` / `notes`。`gaps[].range` 与 `resolved_range` 同形态（同一套时间解析）；
-`notes` 是中文说明数组（恒在，常为空），例如「请求区间早于接口可得数据的最早边界」
-——把「区间不可得」与「同步故障」分开。
+`notes` 是中文说明数组（恒在，常为空），**有意跳过而非故障**——看到它不代表本轮失败。
+来源一：「请求区间早于接口可得数据的最早边界」（把「区间不可得」与「同步故障」分开）；
+来源二：日对齐任务遇到非上海日界的 `--until`，两档——该日不早于末端上限（调整 `--until`
+无用，要等上限自然前移再跑增量）或末窗是半个自然日按残段窗跳过（该日未同步，要含该日
+请把 `--until` 写到次日 0 点）。末段有无被跳过看 `windows.skipped`，不要只凭本数组为空判断。
 
 ⚠️ **`watermark` / `last_synced_at` 是 UTC `Z` 形态**（引擎写库的原样字符串），与同一行里
 `resolved_range` 的 `+08:00` 形态**写法不同**——两者可以是同一时刻
@@ -356,7 +371,7 @@ qiyu --version                       包版本 + skill_contract_version
 
 | status | 含义 | 该做什么 |
 |---|---|---|
-| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗**或整窗晚于末端上限**被跳过），判实际覆盖要看 `windows.skipped` |
+| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（**残段窗**或**整窗晚于末端上限**两种；覆盖窗失败转 skipped 那种必然带 `windows.failed > 0`，只会出现在 `partial`），判实际覆盖要看 `windows.skipped` |
 | `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 是写入行数（为 0 也可能是「窗口都成功、只是上游没数据」；⚠️ count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」——那批行已回滚、实际没落库，这两类失败窗存在时它**偏大**） |
 | `failed` | 快照任务的失败（本地限频闸门拦截 / 上游取数失败 / 落库失败或行数核对不符） | 快照没有窗口循环，所以不会出现 `partial`；反过来 windowed 任务也**不会**给出 `failed` —— 全窗失败同样是 `partial` |
 
@@ -455,8 +470,11 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 16 小时段）——引擎**跳过不落库**（半日聚合不写日行，避免覆盖该日的整日聚合值；
 `windows.skipped` 如实计数、每窗一条 stderr 进度行）。**`skipped` 也计入「整窗晚于
 末端上限被丢弃」的窗**（`windowEndClamp`，考勤/绩效请求到「今天」时）：这类窗同样
-不 fetch、不算成功，但会出现在 `skipped` 里并逐窗出「晚于末端上限」进度行——
-`skipped > 0` 不再只意味着「有残段窗被跳过」，判实际覆盖先分清这两种成因。**末残段**的整日值**可能**由其
+不 fetch、不算成功，但会出现在 `skipped` 里并逐窗出「晚于末端上限」进度行。
+**第三种成因：覆盖窗失败的合并窗**——overlapDays > 0 的任务里，被前一窗回看重叠区
+合并的窗在覆盖窗成功时算 `contained`，覆盖窗失败时就是「该拉的没拉」，改记 `skipped`
+并逐窗出「须重跑补齐」进度行；此时本轮 status 必为 `partial`，看 `gaps` 找到失败的覆盖窗。
+`skipped > 0` 不等于「都是有意不拉的窗」，判实际覆盖先分清这三种成因。**末残段**的整日值**可能**由其
 请求区间覆盖该整天的日对齐 run 补全（水位停在最后一个整日窗末端；若下一轮的请求区间
 仍未覆盖该整天，该段仍是残段、继续跳过——不保证「下一次 run」就补上）；
 **首残段**不落日行也**不补**——该半日段没有合法落点（写入即半日覆盖整日），属显式
@@ -534,7 +552,9 @@ shell rc 变量。存储定位走环境变量（`QIYU_DB_PATH` 等）时，insta
   （`db tables.time_range`、`db describe` 的 `unit`、`resolved_range`、`data_coverage`）呈现
   的是 `+08:00` 形态。`--table` 通道已处理取整语义；**`--sql` 里直接按字符串比较时要用 UTC 形态**，
   否则会少算一天（如 `WHERE stat_date >= '2026-10-12T16:00:00.000Z'`）。检测到
-  「iso-day 列 + 日期形态字面量」时 `meta.warnings` 会明确提示。
+  「iso-day 列 + 日期形态字面量」时 `meta.warnings` 会明确提示——**只有与库内形态逐字一致
+  的 `YYYY-MM-DDT16:00:00.000Z` 才不提示**：空格分隔（`… 16:00:00.000Z`）在字典序上排在
+  `T` 之前、前导空白更小，用 `<=` 时会排除边界日甚至全表（判据看不到运算符，按方向安全一律提示）。
 - `db tables` / `db describe` 的 `meta.notice` 恒在（本库含客户 PII 的提示）；
   声明与实况不一致（缺表/缺列/多列/时间列脏值）逐条进 `meta.warnings`，不静默——`db tables` 做表级
   与列集核对，`db describe` 给出该表的逐列差异细节。时间列里不符合约定形态的值**不进**
@@ -600,8 +620,10 @@ min/max **只能核对一致性、不是量纲证据** —— 量纲不明确时
   ⚠️ 这些是**警告不是防护**：`--sql` 通道的 payload 缺口只能靠 Agent 读到警告后改用
   `--table` 或 `--no-mask` 显式承担风险来闭合，CLI 无法在保持报表 payload 可用的前提下
   替你做整值替换。
-- **只读沙箱三层缺一不可**：`query --sql` 只接受单条只读语句（`SELECT` / `DESCRIBE` / `SHOW` / `EXPLAIN`——
-  后两者实测归入 `statementType` 的 SELECT/EXPLAIN 类型值），
+- **只读沙箱三层缺一不可**：`query --sql` 只接受单条**只读语句**——DuckDB 判为只读的形态都放行
+  （`SELECT` / `DESCRIBE` / `SHOW` / `EXPLAIN` / `PRAGMA` 查询 / `VALUES` / `TABLE <表>` / `FROM <表>`；
+  实测 2026-11-09），拒绝的是非只读类型（写操作、`SET`/`CALL` 之类的实例配置、`PRAGMA x='y'`
+  这类解析成 SET 的赋值）；
   每实例首次连接时 `enable_external_access=false` + `lock_configuration=true`，
   实例 `access_mode=READ_ONLY`。文件读写、网络、`ATTACH`、`COPY TO`、多语句全部被拦；
   `EXPLAIN ANALYZE` 也拒（它会真正执行内层语句）。

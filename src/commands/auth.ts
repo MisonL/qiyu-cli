@@ -249,11 +249,29 @@ async function login(argv: string[]): Promise<number> {
   const configPath = configPathFor()
   let file: QiyuConfigFile
   try {
+    // 权限拒绝由 `loadConfigFile` 在读取前分流（唯一读取点，带 kind + chmod hint）——
+    // 本 catch 的 insecure 分支因此可达（Codex 2026-11-10 第四轮 P2）。
     file = loadConfigFile(configPath).file
   } catch (e) {
     // 读不出来（畸形 JSON / 未知键 / 权限拒绝）——不能"无视坏文件直接覆盖"：
     // 那会静默丢掉用户手写的其它配置。如实报错，让人先修。
-    return usageFail(`无法读取现有配置文件：${(e as Error).message}`)
+    // ⚠️ 不能报成 usage（退出码 2，2026-11-09 审计实测）：退出码 2 的语义是「改参数
+    // 重来」，而换环境变量修不好损坏的 JSON；权限拒绝则是环境问题（whoami 对同一状态
+    // 给 config_insecure）。统一走 `config_invalid`（退出码 1）+ 点名修法，
+    // 权限拒绝时 hint 直指 chmod（与 `core/config.ts` 的 config_insecure hint 同口径）。
+    const insecure = (e as { kind?: string }).kind === 'config_insecure'
+    // 权限拒绝的修复动作是唯一的一条 chmod —— 路径由 core 的 `insecureConfigError` 渲染
+    // （含 shell 引号），这里只追加“没写任何东西”这个 login 侧事实。
+    const coreHint = (e as { hint?: string }).hint
+    return fail({
+      code: insecure ? 'config_insecure' : 'config_invalid',
+      kind: insecure ? 'config_insecure' : 'config_invalid', retryable: false,
+      message: `无法读取现有配置文件：${(e as Error).message}`,
+      hint: insecure
+        ? `${coreHint ?? '这是配置文件权限问题，重试无用'}；本次未写入任何内容`
+        : '先修好或移走该文件后重跑（改成合法 JSON、删掉不认识的键，或让当前用户可读）；'
+          + '本次未写入任何内容 —— login 不会覆盖读不出来的文件，直接覆盖会丢掉你手写的其它配置',
+    })
   }
   // ⚠️ 档名走**共用解析点**（2026-10-29 实测）：此前这里是 `profile ?? envProfile ?? defaultProfile ?? 'default'`
   // 的手写链，而 `??` 会放行空串 —— `"defaultProfile": ""`（JSON 里清空字段）时

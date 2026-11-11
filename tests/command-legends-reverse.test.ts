@@ -393,6 +393,10 @@ describe('图例自身的形态约束（跨全部命令）', () => {
     for (const notes of all) {
       for (const [k, v] of Object.entries(notes)) {
         expect(v, `${k} 含 Markdown 加粗（stdout JSON 给 Agent）`).not.toContain('**')
+        // ⚠️ 释义是 `meta.field_notes` 的**字符串值**：内部换行会让 Agent/工具在定义
+        // 中途断行，读起来像两条不同的说明（CodeRabbit 2026-11-11；实测 `windows.total`
+        // 的释义里带过一个源码换行残留）。要断句就写成一句话，别用 `\n` 排版。
+        expect(v, `${k} 的释义里含换行符`).not.toMatch(/[\r\n]/)
         // `；` 是 renderNotes 的拼接符；正文里再出现会让反向解析多出幽灵取值。
         // 枚举单元格本身就是 `a = 释义；b = 释义`，豁免（其取值里不得有 `；` 由各自
         // 的枚举测试钉住：sync-state-legends / skill-field-notes / stats / db）。

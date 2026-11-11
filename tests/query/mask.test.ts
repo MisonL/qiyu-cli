@@ -428,7 +428,25 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
     expect(nullish.maskedColumns).toEqual([])
   })
 
-  it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5、词边界、SQL 侧大小写不敏感）', () => {
+  it('其它类别已占满 5 条时，截断汇总仍发出且本类别自身不超过上限（Codex 2026-11-10 第三轮 P2）', () => {
+    // 构造：7 个未匹配敏感列 + 一个 GROUP BY 敏感列 —— 本类别 7 条 → 4 条逐列 + 1 条汇总 = 5；
+    // GROUP BY 那条是另一类别，不得把本类别的预算吃成 0（旧实现按 warnings.length 扣减 →
+    // 要么超上限、要么整条汇总不发=静默截断）。
+    const out = maskQueryRows({
+      rows: [{ a: '张三', b: '13800138000', c: 'a@x.com', d: '上海', e: '10.2.3.4', f: 'x', g: 'y' }],
+      columns: ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
+      mode: sqlMode('SELECT userName AS a, userPhone AS b, userEmail AS c, userAddress AS d, '
+        + 'fromIp AS e, userIpCity AS f, userCrmInfo AS g FROM sessions GROUP BY userPhone'),
+    })
+    const own = out.warnings.filter((w) => /SQL 引用了敏感列|另有 \d+ 个敏感列的缺口警告未列出/.test(w))
+    expect(own).toHaveLength(5)
+    expect(own[4]).toMatch(/另有 3 个敏感列的缺口警告未列出/)
+    // 汇总必须点名被截断的列（敏感列按声明顺序遍历：前 4 条逐列，剩余 3 条进汇总）
+    const rest = own[4].slice(own[4].indexOf('：') + 1)
+    expect(rest.split('、')).toHaveLength(3)
+  })
+
+  it('SQL 引用敏感列但输出列名不匹配 → mask_warnings（去重、上限 5（第 5 条点名被截断的剩余列）、词边界、SQL 侧大小写不敏感）', () => {
     const one = maskQueryRows({
       rows: [{ p: '13800138000' }], columns: ['p'],
       mode: sqlMode('SELECT userPhone AS p FROM sessions'),
@@ -453,6 +471,11 @@ describe('query --sql 通道：列名级 + 值级兜底（spec §7.2）', () => 
       mode: sqlMode('SELECT userName AS a, userPhone AS b, userEmail AS c, userAddress AS d, fromIp AS e, userIpCity AS f FROM sessions'),
     })
     expect(six.warnings).toHaveLength(5)
+    // 上限截断不得静默（2026-11-09 审计）：被截掉的列必须点名并给出总数，
+    // 否则 Agent 读到的 5 条看起来就是全部缺口。
+    expect(six.warnings[4]).toMatch(/另有 2 个敏感列的缺口警告未列出/)
+    expect(six.warnings[4]).toContain('fromIp')
+    expect(six.warnings[4]).toContain('userIpCity')
 
     // 词边界：userPhoneBook 是更长的标识符，不得触发 userPhone 警告
     const longer = maskQueryRows({
@@ -1665,6 +1688,71 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
       // 两档缺口互斥：不重复发泛化的「无法确认是否构成最终输出」
       expect(out.warnings.join('\n'), sql).not.toContain('无法确认是否构成最终输出')
     }
+  })
+
+  it('展不开的 query() 实参不得被说成「使用了 SUMMARIZE」（CodeRabbit 第十六轮 minor）', () => {
+    // `SELECT column_name, min FROM query('SELECT ' || '1')` 真机实测合法、内层没有任何
+    // SUMMARIZE，但旧实现把「实参展不开」直接置 gap，于是发「SQL 在 query() 内层使用了
+    // SUMMARIZE，但内层投影不是原样透传」——把猜测写成了检出。两层都要修：
+    // ① 不得声称检出；② 必须如实说「可能含、无法展开」（缺口不能变静默）。
+    const out = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 1 }],
+      columns: ['column_name', 'min'],
+      mode: { kind: 'sql', sql: "SELECT column_name, min FROM query('SELECT ' || '1')", tables: TABLES },
+    })
+    const w = out.warnings.join('\n')
+    expect(w, '不得冒认检出 SUMMARIZE').not.toContain('内层使用了 SUMMARIZE')
+    expect(w, '不得冒认「含 SUMMARIZE」').not.toContain('SQL 含 SUMMARIZE')
+    expect(w, '必须声明「展不开 + 可能含」').toContain('无法静态展开')
+    expect(w, '缺口语义：可能未脱敏').toContain('可能**未脱敏**')
+    expect(w, '给出可执行收口').toContain('单个字符串字面量')
+    // 反证①：输出不是统计形状时，内层含不含 SUMMARIZE 都不影响输出 —— 不发这条（避免噪音）
+    const plain = maskQueryRows({
+      rows: [{ n: 1 }],
+      columns: ['n'],
+      mode: { kind: 'sql', sql: "SELECT * FROM query('SELECT ' || '1')", tables: TABLES },
+    })
+    expect(plain.warnings.join('\n')).not.toContain('无法静态展开')
+    // 反证②：静态可展开且真含 SUMMARIZE 时，仍走原检出档（不被这条盖住）
+    const real = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰' }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT * FROM query('SELECT column_name, min FROM (SUMMARIZE sessions)')",
+        tables: TABLES,
+      },
+    })
+    expect(real.warnings.join('\n')).toContain('内层使用了 SUMMARIZE')
+    expect(real.warnings.join('\n')).not.toContain('无法静态展开')
+    // 反证③：**嵌套** query() 里层的不可展开必须向上传播（CodeRabbit 第十七轮 minor）——
+    // 外层实参是静态字符串、里层实参是拼接；旧实现只把 sub.gap 传上去、丢了 sub.unresolved，
+    // 外层于是又按「检出 SUMMARIZE」说事，可整条 SQL 里没有任何 SUMMARIZE。
+    const nestedUnresolved = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 1 }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT * FROM query($q$ SELECT * FROM query('SELECT ' || '1') $q$)",
+        tables: TABLES,
+      },
+    })
+    expect(nestedUnresolved.warnings.join('\n'), '里层不可展开必须上抛').toContain('无法静态展开')
+    expect(nestedUnresolved.warnings.join('\n'), '不得冒认检出 SUMMARIZE')
+      .not.toContain('内层使用了 SUMMARIZE')
+    // 反证④：Codex 第十七轮给的另一条触发 SQL（里层是 `'…' || ''` 拼接、输出列名凑巧是
+    // column_name/min）—— 同一条传播路径，但里层多套一层常量投影，单独钉住。
+    const codexForm = maskQueryRows({
+      rows: [{ column_name: 'item', min: 3 }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT * FROM query($outer$SELECT * FROM query('SELECT ''item'' AS column_name, 3 AS min' || '')$outer$)",
+        tables: TABLES,
+      },
+    })
+    expect(codexForm.warnings.join('\n')).toContain('无法静态展开')
+    expect(codexForm.warnings.join('\n')).not.toContain('内层使用了 SUMMARIZE')
   })
 
   it('缺口声明：SUMMARIZE 输出列名被改写（重投影）时必须警告，不得静默漏出（CodeRabbit 第六轮）', () => {

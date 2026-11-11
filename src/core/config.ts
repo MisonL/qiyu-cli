@@ -2,7 +2,7 @@
 //
 // 配置文件的**通用层**（G1 第三批抽取）：路径解析、读文件、JSON 解析、
 // 键白名单校验、credentials/robots 块校验、权限检查、原子写。
-// 只 import node:fs/os/path —— 这是「commands/auth.ts 与 commands/api.ts
+// 只 import node 内置 + `core/shell.js` 的 shellArg（引号单一实现点，已下沉到 core 以免违反「core 不得 import output.js」的分层守卫）—— 这是「commands/auth.ts 与 commands/api.ts
 // 不得加载 store/」这条分层红线（layering.test.ts 钉着）的解法：
 // auth/api 只 import 本文件，`store/config.ts` 内部也走这里。
 //
@@ -11,9 +11,10 @@
 // 只提供「配置文件作为载体」的全部通用能力。错误文案与 C1 逐字兼容 ——
 // 现有 25 条 config.test.ts 一条不改地全绿是本次抽取的验收线。
 
-import { readFileSync, writeFileSync, lstatSync, statSync, existsSync, mkdirSync, renameSync, chmodSync } from 'node:fs'
+import { readFileSync, writeFileSync, lstatSync, statSync, existsSync, mkdirSync, renameSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname, isAbsolute } from 'node:path'
+import { shellArg } from './shell.js'
 
 /** 顶层已知键 —— 未知键 fail-closed（spec §3.3）。 */
 export const KNOWN_TOP = new Set(['defaultProfile', 'profiles'])
@@ -48,6 +49,11 @@ export function readConfigRaw(configPath: string): Record<string, unknown> {
   try {
     raw = readFileSync(configPath, 'utf8')
   } catch (e) {
+    // ⚠️ EACCES/EPERM 不包成普通 Error：Windows 上 fs.access 不评估 NTFS ACL，
+    // 真拒绝可能出现在这里（CodeRabbit 第十三轮），必须与探测点同口径给
+    // config_insecure + 平台化修法（见 `permissionReadError`）。
+    const code = (e as { code?: string }).code
+    if (code === 'EACCES' || code === 'EPERM') throw permissionReadError(configPath)
     throw new Error(`无法读取配置文件 ${configPath}：${e instanceof Error ? e.message : String(e)}`)
   }
   try {
@@ -142,8 +148,17 @@ export function parseConfig(raw: Record<string, unknown>): QiyuConfigFile {
   return { defaultProfile, profiles }
 }
 
-/** 读 + 解析一步完成（文件不存在返回空结构）。**不含权限裁决**（见 `loadConfigChecked`）。 */
+/**
+ * 读 + 解析一步完成（文件不存在返回空结构）。**不含权限过宽的裁决**（见 `loadConfigChecked`）。
+ *
+ * ⚠️ 但「读不出来**是因为权限**」在这里就要分流（Codex 2026-11-10 第四轮 P2）：
+ * `readConfigRaw` 把读失败包成无 kind 的普通 Error，与「畸形 JSON」同一个出口 ——
+ * 调用方各自的「权限拒绝」分支于是全是死代码（login 报 config_invalid、store 侧被
+ * 包成 usage 退出码 2，而 api/sync 走另一条路报 config_insecure：同一状态三种说法）。
+ * 探测放在**唯一读取点**，所有调用方（auth/api/sync/store）自动同口径。
+ */
 export function loadConfigFile(configPath: string): { file: QiyuConfigFile; exists: boolean } {
+  assertConfigReadable(configPath)
   const exists = existsSync(configPath)
   const raw = readConfigRaw(configPath)
   return { file: parseConfig(raw), exists }
@@ -176,12 +191,44 @@ export function shellPath(p: string): string {
  * Agent 会照退出码去改参数，而这件事只能由人去 chmod —— 设计稿 §3.4 与 README
  * 写的都是前者，所以 store 那条路径是缺陷，不是另一种口径。
  */
-export function insecureConfigError(configPath: string, reason: 'file' | 'dir'): Error {
+export function insecureConfigError(
+  configPath: string, reason: 'file' | 'dir' | 'unreadable' | 'dir-unreadable',
+  /** `dir-unreadable` 专用：路径上**最外层**被权限挡住的目录（见 `blockedAncestor`）。 */
+  blockedDir?: string,
+  /** 测试可注入；生产恒为 `process.platform`。 */
+  platform: string = process.platform,
+): Error {
   const dir = dirname(configPath)
+  // ⚠️ 四种成因必须是四句话（CR/Codex 2026-11-10 第六轮 + 第十轮）：`unreadable` 是**当前
+  // 用户读不了**，与「含凭证且过宽」相反（那说的是别人能读）—— 套用过宽的文案会把
+  // 「权限位全零、不含凭证的文件」说成凭证暴露风险，Agent 会去查一个不存在的泄露面；
+  // `dir-unreadable` 又是另一层（目录进不去），修法与文案都不能套用文件那一档。
+  // ⚠️ `dir-unreadable` 点名的必须是**真正挡路的目录**（Codex 2026-11-10 第十一轮 P2）：
+  // `~/.config` 000 时 `accessSync(~/.config/qiyu, X_OK)` 同样 EACCES，照 `dirname` 报会
+  // 让人 chmod 一条**本身都执行不了**的路径（实测 `chmod: … Permission denied`）。
+  // ⚠️ Windows 上 EACCES/EPERM 的成因是 **ACL**（不是 POSIX 权限位），`chmod` 不存在于
+  // Windows —— 修法必须平台化（Codex 2026-11-10 第十二轮 P2）：`icacls /reset` 恢复继承的
+  // ACL；引号按 win32 方言走 `shellArg`（hint 会被真的执行，引号规则只许一个实现点）。
+  const blocked = blockedDir ?? dir
+  const win = platform === 'win32'
   const what = reason === 'file'
     ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 有权限位；可读时其他用户就能读到 appSecret）`
-    : `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
-  const fix = reason === 'file' ? `chmod 600 ${shellPath(configPath)}` : `chmod 700 ${shellPath(dir)}`
+    : reason === 'dir'
+      ? `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
+      : reason === 'dir-unreadable'
+        ? win
+          ? `配置路径上的目录 ${blocked} 被 Windows ACL 拒绝访问（不是 POSIX 权限位，chmod 修不了它）`
+          : `配置目录 ${blocked} 当前用户不可搜索（它挡在配置路径上，因此读不到其中的配置文件；`
+            + `若它下面还有不可进入的层，修好这一层后重跑会重新点名；与文件里有没有凭证无关）`
+        : win
+          ? `配置文件 ${configPath} 被 Windows ACL 拒绝读取（不是 POSIX 权限语义，chmod 修不了它；与文件里有没有凭证无关）`
+          : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
+  const fix = win && (reason === 'unreadable' || reason === 'dir-unreadable')
+    ? `icacls ${shellArg(reason === 'dir-unreadable' ? blocked : configPath, 'win32')} /reset`
+      + `（恢复继承的 ACL；也可在「属性 → 安全」里给当前用户授予读取权限）`
+    : reason === 'dir' || reason === 'dir-unreadable'
+      ? `chmod 700 ${shellPath(blocked)}`
+      : `chmod 600 ${shellPath(configPath)}`
   return Object.assign(
     new Error(`${what}，已拒绝读取`),
     {
@@ -189,6 +236,79 @@ export function insecureConfigError(configPath: string, reason: 'file' | 'dir'):
       hint: `这是配置文件的权限问题，重试无用 —— 请执行：${fix}`,
     },
   )
+}
+
+/**
+ * 路径上**最外层**不可进入（不可搜索）的目录 —— 修法必须落在它身上。
+ *
+ * ⚠️ 为什么不能直接用 `dirname(configPath)`（Codex 2026-11-10 第十一轮 P2，实测）：
+ * `~/.config` 是 000、`~/.config/qiyu` 本身 700 时，`accessSync(qiyu, X_OK)` 照样 EACCES
+ * （穿不过 .config），于是会被误当成「qiyu 挡路」。hint 因此建议 `chmod 700 …/qiyu` ——
+ * 这条命令本身都执行不了（`chmod: … Permission denied`），照做后仍读不到配置。
+ *
+ * 从配置目录逐层向上探，记下**最后一个** EACCES/EPERM 的目录（即最外层挡路者）：
+ * 它的父目录一定是能进入的（否则循环会继续往上），所以 `chmod 700` 对它的父目录有效、
+ * 一定可执行。更深的层若也被挡，等这层修好后重跑会重新点名（文案里已说明）。
+ * 上面某一层是**别的**错误（如 ENOTDIR）时停在那里，交回既有口径。
+ */
+function blockedAncestor(dir: string): string | null {
+  let blocked: string | null = null
+  let cur = dir
+  for (;;) {
+    try {
+      accessSync(cur, fsConstants.X_OK)
+      return blocked   // 这一层进得去：上面记下的最深不可进入者就是真正挡路的
+    } catch (e) {
+      const code = (e as { code?: string }).code
+      if (code !== 'EACCES' && code !== 'EPERM') return blocked
+      blocked = cur
+      const parent = dirname(cur)
+      if (parent === cur) return blocked   // 到根了
+      cur = parent
+    }
+  }
+}
+
+/**
+ * 「配置文件读不出来**是因为权限**」→ 转成 `insecureConfigError`（同一个 kind，但成因文案与
+ * 修法按「挡在哪一层」区分：读不了 ≠ 别人能读；**目录不可进入** ≠ 文件本身读不了）。
+ *
+ * ⚠️ 不能用 `existsSync` 判「有没有配置」（Codex 2026-11-10 第十轮 P2，实测）：父目录
+ * `chmod 000` 时穿过它的 `stat` 被 EACCES 吞掉，`existsSync(文件)` 返回 **false** ——
+ * 于是真配置被当成「不存在」，`auth whoami` 报 `auth_missing`、store/query 回落默认库，
+ * 而用户真正要做的是 chmod 目录。改为直接 `accessSync`：**只有 ENOENT 才是「没有配置」**。
+ *
+ * 只按 errno 属性分流（EACCES / EPERM），不拿报文文本去挑 —— 见
+ * `tests/open-failure-single-source.test.ts` 的同款规则。其余 errno（如 ENOTDIR）沿用
+ * 旧口径「按缺失处理」：这条判据只回答「权限挡没挡住」，别的读失败不在这里另立成因。
+ */
+export function assertConfigReadable(configPath: string): void {
+  try {
+    accessSync(configPath, fsConstants.R_OK)
+  } catch (e) {
+    const code = (e as { code?: string }).code
+    if (code !== 'EACCES' && code !== 'EPERM') return
+    // 同样是 EACCES，挡在哪一层决定修法：目录不可进入时对文件 chmod 本身就会失败，
+    // 而目录又可能不是直接父目录（祖先被挡时子目录的 accessSync 一样报 EACCES）。
+    throw permissionReadError(configPath)
+  }
+}
+
+/**
+ * 读点上 EACCES/EPERM 的**唯一分类出口**（`assertConfigReadable` 与 `readConfigRaw` 共用）。
+ *
+ * ⚠️ 为什么读点也要分流（CodeRabbit 2026-11-11 第十三轮）：Node 的 `fs.access` 在 Windows
+ * 上**不评估 NTFS ACL** —— ACL 拒绝时 `accessSync(R_OK)` 可能成功、真拒绝发生在后面的
+ * `readFileSync`。只靠探测点分流，`config_insecure`（含 icacls hint）在 Windows 上就是
+ * **不可达分支**：拒绝被 `readConfigRaw` 包成无 kind 的普通 Error，login 报 config_invalid、
+ * store 族报 usage 2 —— 「同一个危险状态，多种行为」的旧乱象全数复活。POSIX 上这也是
+ * 竞态的兜底（access 通过后、读之前权限被改）。
+ */
+function permissionReadError(configPath: string): Error {
+  const blocked = blockedAncestor(dirname(configPath))
+  return blocked !== null
+    ? insecureConfigError(configPath, 'dir-unreadable', blocked)
+    : insecureConfigError(configPath, 'unreadable')
 }
 
 /**

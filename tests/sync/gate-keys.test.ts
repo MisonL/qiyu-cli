@@ -84,7 +84,11 @@ async function calledEndpoints(t: Parameters<typeof runTask>[0], store: Store): 
 }
 
 describe('闸门键 ⊇ fetch 真实调用的 endpoint 集合（全任务，真实调用采集）', () => {
-  it('每个任务：fetch 打到的每个 endpoint id 都在声明里（少一个就是冷却读不到的形状）', async () => {
+  // ⚠️ 这条要遍历**全部任务**真跑一遍 fetch（真实调用采集），本机实测常态 24.0s；
+  // 文件级 30s 上限余量只有 25%，负载 200+ 时必爆（2026-11-11 实测 30175/30283ms 超时、
+  // 负载回落后 23.995s 通过）。与 query/auth 等文件的「负载下放宽」同款处理。
+  it('每个任务：fetch 打到的每个 endpoint id 都在声明里（少一个就是冷却读不到的形状）',
+    { timeout: 120_000 }, async () => {
     const store = await fresh()
     try {
       for (const t of SYNC_TASKS) {

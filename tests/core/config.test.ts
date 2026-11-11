@@ -13,9 +13,11 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   __resetPermissionWarnings, checkPermissions, configHasCredentials, configPathFor,
-  fileCredentials, fileProfile, loadConfigChecked, loadConfigFile, parseConfig,
+  fileCredentials, fileProfile, insecureConfigError, loadConfigChecked, loadConfigFile, parseConfig,
+  readConfigRaw,
   resolveProfileName, serializeConfig, writeConfigFile,
 } from '../../src/core/config.js'
+import { shellArg } from '../../src/output.js'
 
 let home = ''
 const cfgPath = (): string => join(home, '.config', 'qiyu', 'config.json')
@@ -120,6 +122,76 @@ describe('权限裁决（loadConfigChecked）', () => {
     expect(t.kind).toBe('config_insecure')
     expect(t.hint).toMatch(/chmod 600/)
   })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '文件不可读（EACCES）→ 与权限过宽同一条 config_insecure（Codex 2026-11-10 第四轮 P2）', () => {
+      // 事故形态：读失败被 readConfigRaw 包成无 kind 的普通 Error，于是调用方的
+      // 「权限拒绝」分支是死代码；这条状态由 loadConfigChecked 统一分流。
+      writeCfg({ profiles: {} }, 0o000)
+      let caught: unknown
+      try { loadConfigChecked(cfgPath()) } catch (e) { caught = e }
+      const t = caught as { kind?: string; message?: string; hint?: string }
+      expect(t.kind).toBe('config_insecure')
+      expect(t.hint).toMatch(/chmod 600/)
+      // 成因错误是另一种契约不诚实（CR/Codex 第六轮）：文件不含凭证、group/other 全零，
+      // 文案若说「含凭证且权限过宽」就是假归因。
+      expect(String(t.message)).not.toContain('过宽')
+    })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '父目录不可搜索（配置目录 000）→ 同样是 config_insecure，而非「配置不存在」（Codex 第十轮 P2）', () => {
+      // 事故形态（实测）：目录 000 时 `existsSync(文件)` 返回 **false**（穿过不可搜索目录的
+      // stat 被 EACCES 吞掉），旧的「不存在就提前返回」把真配置当成缺失 —— auth whoami 报
+      // auth_missing、store 回落默认库。成因是**目录**不可进入，修法也必须是 chmod 目录。
+      writeCfg({ profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } } })
+      const dir = dirname(cfgPath())
+      chmodSync(dir, 0o000)
+      try {
+        let caught: unknown
+        try { loadConfigChecked(cfgPath()) } catch (e) { caught = e }
+        const t = caught as { kind?: string; message?: string; hint?: string }
+        expect(t.kind).toBe('config_insecure')
+        expect(String(t.message)).toContain('配置目录')
+        // 修法必须真的能修：文件 chmod 在这里执行不了（目录进不去）
+        expect(t.hint).toMatch(/chmod 700/)
+      } finally {
+        chmodSync(dir, 0o700)
+      }
+    })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '祖先目录不可搜索时点名**真正挡路的那一层**（Codex 第十一轮 P2）', () => {
+      // 事故形态（实测）：`~/.config` 是 000、`~/.config/qiyu` 本身 700 时，
+      // `accessSync(qiyu, X_OK)` 照样 EACCES（穿不过 .config），旧实现于是把 qiyu 当成
+      // 挡路的目录，hint 建议 `chmod 700 …/qiyu` —— 这条命令本身都执行不了
+      //（实测 `chmod: … Permission denied`），用户照做后依然读不到配置。
+      writeCfg({ profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } } })
+      const blocked = dirname(dirname(cfgPath()))   // ~/.config
+      chmodSync(blocked, 0o000)
+      try {
+        let caught: unknown
+        try { loadConfigChecked(cfgPath()) } catch (e) { caught = e }
+        const t = caught as { kind?: string; message?: string; hint?: string }
+        expect(t.kind).toBe('config_insecure')
+        expect(String(t.message)).toContain(`配置目录 ${blocked} `)
+        expect(String(t.hint)).toContain(`chmod 700 ${blocked}`)
+        // hint 里的目录不得是被祖先挡住、自己其实好好的那一层
+        expect(String(t.hint)).not.toContain(`${blocked}/qiyu`)
+        // 修法必须真能执行：照 hint 做之后配置读得出来
+        chmodSync(blocked, 0o700)
+        expect(loadConfigChecked(cfgPath()).exists).toBe(true)
+      } finally {
+        chmodSync(blocked, 0o700)
+      }
+    })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '文件不可读时 fileProfile 给的是 fatal 而不是 warn（api/sync 走 fatal 分支）', () => {
+      writeCfg({ profiles: {} }, 0o000)
+      const r = fileProfile(cfgPath())
+      expect((r.fatal as { kind?: string } | undefined)?.kind).toBe('config_insecure')
+      expect(r.warn).toBeUndefined()
+    })
 
   it('**无**凭证且 0644 → 只警告不阻断（C1 既有口径）', () => {
     writeCfg({ profiles: { default: { store: { batchSize: 5 } } } }, 0o644)
@@ -346,5 +418,71 @@ describe('profiles 是 null 原型对象（2026-10-27，原型链绕过守卫）
     expect(Object.getPrototypeOf(g.profiles)).toBe(null)
     expect(Object.keys(g.profiles)).toEqual(['__proto__'])
     expect(g.profiles['__proto__'].robots).toEqual({ '1000001': '甲' })
+  })
+})
+
+describe('Windows ACL 拒绝的平台化修法（Codex 第十二轮 P2）', () => {
+  // 事故形态：Windows 上 ACL 拒绝同样让 `accessSync` 抛 EACCES/EPERM，旧实现一律给
+  // POSIX `chmod` hint —— chmod 在 Windows 上不存在，用户拿不到任何可执行的恢复步骤
+  // （README 约定 Windows 跳过「过宽」检查，但读拒绝分流出 config_insecure 后照样走到 hint）。
+  // 判据用注入的 platform 参数钉住（macOS 上造不出真 ACL 拒绝，行为面按平台分流验证）。
+  const winPath = 'C:\\Users\\测试用户\\config.json'
+  const winDir = 'C:\\Users\\测试用户\\.config'
+
+  it('unreadable → icacls /reset，不再给 chmod', () => {
+    const e = insecureConfigError(winPath, 'unreadable', undefined, 'win32') as unknown as Record<string, string>
+    expect(e.kind).toBe('config_insecure')
+    expect(e.message).toContain('Windows ACL')
+    expect(e.message, '「权限位」是 POSIX 语义，Windows 上是假归因').not.toContain('权限位')
+    expect(e.hint).toContain('icacls')
+    expect(e.hint).toContain('/reset')
+    expect(e.hint, 'chmod 在 Windows 上不存在').not.toContain('chmod')
+    // 路径按 win32 方言引号化（shellArg 的唯一实现点）
+    expect(e.hint).toContain(shellArg(winPath, 'win32'))
+  })
+
+  it('dir-unreadable → icacls 指向被挡的那一层', () => {
+    const e = insecureConfigError(`${winDir}\\qiyu\\config.json`, 'dir-unreadable', winDir, 'win32') as unknown as Record<string, string>
+    expect(e.message).toContain(winDir)
+    expect(e.hint).toContain('icacls')
+    expect(e.hint).toContain(shellArg(winDir, 'win32'))
+    expect(e.hint).not.toContain('chmod')
+  })
+
+  it('POSIX 口径不变（chmod 文件 / chmod 目录）', () => {
+    // ⚠️ 显式传 'linux'（CodeRabbit 第十七轮 major）：`platform` 默认取 `process.platform`，
+    // 在 Windows 上跑本用例会拿到 `icacls` hint、这两条无条件 chmod 断言必红。本用例验的是
+    // POSIX 分支，不该随宿主平台漂移（三条 Windows 用例各自显式传 'win32'，同款）。
+    expect(String((insecureConfigError('/tmp/x/cfg', 'unreadable', undefined, 'linux') as unknown as { hint: string }).hint)).toMatch(/chmod 600/)
+    expect(String((insecureConfigError('/tmp/x/cfg', 'dir-unreadable', '/tmp/x', 'linux') as unknown as { hint: string }).hint)).toMatch(/chmod 700 \/tmp\/x/)
+  })
+})
+
+describe('读点上的权限拒绝同样分流（CodeRabbit 第十三轮 minor）', () => {
+  // Node 的 fs.access 在 Windows 上不评估 NTFS ACL：探测点 accessSync 可能成功，
+  // 真拒绝发生在 readConfigRaw 的 readFileSync —— 旧实现把它包成无 kind 的普通
+  // Error，login 报 config_invalid、store 族报 usage 2，Windows 的 icacls hint
+  // 成了不可达分支。POSIX 上用 chmod 000 直接调 readConfigRaw 复现同一形态。
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'readConfigRaw 遇 EACCES → config_insecure + chmod 600，不再是普通 Error', () => {
+      writeCfg({ profiles: {} }, 0o000)
+      let caught: unknown
+      try { readConfigRaw(cfgPath()) } catch (e) { caught = e }
+      const t = caught as { kind?: string; hint?: string; message?: string }
+      expect(t.kind).toBe('config_insecure')
+      expect(t.hint).toMatch(/chmod 600/)
+      expect(String(t.message)).not.toContain('无法读取配置文件')
+    })
+
+  it('其它读错误（EISDIR：配置路径本身是目录）保持既有普通 Error 口径', () => {
+    // ⚠️ 反例构造的限制（实测）：`<cfg>/x/y` 的 ENOTDIR 会被开头的 `existsSync` 吞成
+    // 「不存在」（返回 {}、不抛）；要在 readFileSync 上造出非权限错误，只能让配置路径
+    // **本身是目录** —— readFileSync(目录) 报 EISDIR，走普通 Error 分支。
+    mkdirSync(cfgPath(), { recursive: true })
+    let caught: unknown
+    try { readConfigRaw(cfgPath()) } catch (e) { caught = e }
+    const t = caught as { kind?: string; message?: string }
+    expect(t.kind).toBeUndefined()
+    expect(String(t.message)).toContain('无法读取配置文件')
   })
 })

@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { statsCommand } from '../../src/commands/stats.js'
+import { shellArg } from '../../src/core/shell.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import type { Store } from '../../src/store/types.js'
 
@@ -147,7 +148,7 @@ describe('stats fields', () => {
     for (const o of data().observed as Observed[]) expect(declared[o.field], o.field).toBeDefined()
   })
 
-  it('meta.field_notes 随真实输出下发：declared 的值域与观测语义都有释义（2026-10-27）', async () => {
+  it('meta.field_notes 随真实输出下发：declared 的值域与观测语义都有释义（2026-10-27）', { timeout: 180_000 }, async () => {
     // 这条钉「图例真的进了 Agent 拿到的那个 JSON」——`statsFieldNotes()` 单测绿不代表
     // 命令层把它挂上了 meta（漏挂时单测全绿、Agent 依旧读不到）。
     await seed()
@@ -158,6 +159,13 @@ describe('stats fields', () => {
     expect(notes['declared.<字段>.unit']).toContain('ratio = ')
     expect(notes['declared.<字段>.unit']).toContain('不是 0–100 的百分数')
     expect(notes['declared.<字段>.source']).toContain('name-suffix = ')
+    // 核实路径必须指向**本次**的库（Codex 2026-11-10 第八轮 P2）：`stats fields --db X` 的
+    // 提示若给裸 `qiyu query --sql '<SQL>'`，照着执行会查默认库 —— 另一份数据或「库未初始化」。
+    // ⚠️ 与渲染同源比较（CodeRabbit 第十七轮 major）：命令里的路径经 `shellArg` 引号化，
+    // Windows 上含反斜杠的路径是 `--db 'C:\…\x.duckdb'`；照裸路径拼期望在 Windows 上必红。
+    expect(notes['declared.<字段>.unit'], '核实路径必须回显本次 --db')
+      .toContain(`--db ${shellArg(dbPath())}`)
+    expect(notes['declared.<字段>.unit']).toContain('整段替换')
     expect(notes['declared.<字段>.higher_is_better']).toContain('恒为 null')
     expect(notes['observed[].minus_one']).toContain('不是负数比率')
     // warnings 与 field_notes 同时在 meta 里，互不覆盖
@@ -359,6 +367,57 @@ describe('stats fields', () => {
     warnings = meta().warnings as string[]
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toMatch(/该表无数据/)
+  })
+
+  it('只有空键的行 → 不得与「空对象 / 非对象」归成一个成因（2026-11-09 审计）', async () => {
+    // 实测事故：payload 为 `{"":1}` 时同时出现两条互斥的警告——
+    // 「含空字符串键 …；其余字段照常统计」（暗示还有别的字段，实际一个都没有）与
+    // 「有 N 行，但 payload 均无可观测字段（payload 为 NULL / 空对象 / 非对象）」
+    //（`{"":1}` 是非空对象，两种成因都不符）。空键为什么被排除也没说对：
+    // 成因是观测 SQL 的 `WHERE e.key <> ''`，不是「JSON 路径无法表达空键名」。
+    const s = await fresh()
+    try {
+      await s.upsert('daily_overview', [
+        { stat_date: '2026-10-01T16:00:00.000Z', payload: '{"":1}', synchronized_at: null },
+        { stat_date: '2026-10-02T16:00:00.000Z', payload: '{}', synchronized_at: null },
+        { stat_date: '2026-10-03T16:00:00.000Z', payload: '{"sessions":7}', synchronized_at: null },
+      ])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+
+    expect(data().observed).toEqual([
+      { field: 'sessions', rows_present: 1, minus_one: 0, nulls: 0, min: 7, max: 7 },
+    ])
+    const w = meta().warnings as string[]
+    const emptyKeyW = w.filter((x) => /空字符串键/.test(x))
+    expect(emptyKeyW).toHaveLength(1)
+    // 说对成因、不说「其余字段照常统计」（此时确实有别的字段，但要按事实说），
+    // 并点名真正原因：观测只收非空键
+    expect(emptyKeyW[0]).toMatch(/非空键/)
+    expect(emptyKeyW[0]).not.toMatch(/JSON 路径无法表达/)
+    // 有可观测字段时不得再出「均无可观测字段」
+    expect(w.some((x) => /个可观测字段/.test(x))).toBe(false)
+  })
+
+  it('只有空键、0 个可观测字段 → 成因里必须含空键，不得说成 NULL / 空对象 / 非对象', async () => {
+    const s = await fresh()
+    try {
+      await s.upsert('daily_overview', [
+        { stat_date: '2026-10-01T16:00:00.000Z', payload: '{"":1}', synchronized_at: null },
+      ])
+    } finally {
+      await s.close()
+    }
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)
+    expect(data().observed).toEqual([])
+    const w = meta().warnings as string[]
+    const noField = w.filter((x) => /个可观测字段/.test(x))
+    expect(noField).toHaveLength(1)
+    expect(noField[0]).toMatch(/空键/)
+    // 「空键未计入统计」的成因说明只出现一次（0 字段那条是补充成因，不是重复计数的另一份）
+    expect(w.filter((x) => /该键未计入统计/.test(x))).toHaveLength(1)
   })
 
   it('有行但 payload 无可观测字段 → 不谎称「无数据」，warning 点名 payload', async () => {

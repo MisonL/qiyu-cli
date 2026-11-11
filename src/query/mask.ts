@@ -59,7 +59,7 @@ const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/
 
 /** --no-mask 的 PII 风险警告（spec §7.2）。导出供命令层/测试复用。 */
 export const NO_MASK_WARNING = '输出包含未脱敏的客户 PII；不要写入日志或对外报表'
-/** 缺口警告上限（spec §7.2：去重、上限 5 条）。 */
+/** 缺口警告的**每类别**上限（spec §7.2：去重、上限 5 条）——按类别计，不让一类吃掉另一类的预算。 */
 const WARNING_LIMIT = 5
 
 // 列名 → 规则（brief 给定，与 spec §7.1 的可识别形态对应）。用显式集合而不是
@@ -314,6 +314,104 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+/** 只定位代码位置上的调用；注释和字面量不参与匹配，双引号名字按完整标识符比较。 */
+export function sqlFunctionCalls(text: string, name: string): Array<{ nameStart: number; open: number }> {
+  const code = withoutLiterals(text)
+  const out: Array<{ nameStart: number; open: number }> = []
+  for (let i = 0; i < code.length;) {
+    const start = i
+    let value: string
+    if (code[i] === '"') {
+      for (i++; i < code.length; i++) {
+        if (code[i] === '"') { if (code[i + 1] !== '"') break; i++ }
+      }
+      value = code.slice(start + 1, i).replace(/""/g, '"')
+      i = Math.min(i + 1, code.length)
+    } else if (isIdentAt(code, i)) {
+      do { i += String.fromCodePoint(code.codePointAt(i)!).length } while (isIdentAt(code, i))
+      value = code.slice(start, i)
+    } else { i++; continue }
+    if (value.toLowerCase() !== name.toLowerCase()) continue
+    const open = skipSqlTrivia(text, i)
+    if (text[open] === '(') out.push({ nameStart: start, open: open + 1 })
+  }
+  return out
+}
+
+/** 跳过 DuckDB 的 ASCII 空白与嵌套注释，返回下一个代码位置。 */
+export function skipSqlTrivia(text: string, start: number): number {
+  let i = start
+  for (;;) {
+    while (i < text.length && ASCII_WS.has(text[i]!)) i++
+    if (text[i] === '/' && text[i + 1] === '*') { i = skipBlockComment(text, i); continue }
+    if (text[i] === '-' && text[i + 1] === '-') {
+      while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++
+      continue
+    }
+    return i
+  }
+}
+
+/** end 恒为闭定界符之后的下标；解码与 query() 内层 SQL 使用同一套字符串规则。 */
+export function readSqlString(text: string, start: number): { end: number; value: string } | null {
+  if (text[start] === '$' && !isIdentCharAt(text, start)) {
+    const dq = dollarQuoteEnd(text, start)
+    return dq === null ? null : {
+      end: dq.closeStart + (dq.openEnd - start), value: text.slice(dq.openEnd, dq.closeStart),
+    }
+  }
+  const prefixed = (text[start] === 'E' || text[start] === 'e') && text[start + 1] === "'"
+  const q = prefixed ? start + 1 : start
+  if (text[q] !== "'") return null
+  const isEscape = q > 0 && (text[q - 1] === 'E' || text[q - 1] === 'e') && !isIdentCharAt(text, q - 1)
+  let i = q + 1
+  for (; i < text.length; i++) {
+    if (isEscape && text[i] === '\\') { i++; continue }
+    if (text[i] === "'") { if (text[i + 1] !== "'") break; i++ }
+  }
+  if (i >= text.length) return null
+  return { end: i + 1, value: decodeStringLiteral(text.slice(q + 1, i), isEscape) }
+}
+
+/**
+ * 只展开整个实参都是字面量、括号或保值字符串 CAST 的形态。
+ * 不求值拼接或其它函数；不能把表达式的静态前缀冒认成实际执行的 SQL。
+ */
+function readStaticArg(text: string, open: number): string | null {
+  let i = skipSqlTrivia(text, open)
+  const wrappers: Array<'paren' | 'cast'> = []
+  for (;;) {
+    if (text[i] === '(') {
+      wrappers.push('paren')
+      i = skipSqlTrivia(text, i + 1)
+      continue
+    }
+    if (/^cast/i.test(text.slice(i, i + 4)) && !isIdentAt(text, i + 4)) {
+      const next = skipSqlTrivia(text, i + 4)
+      if (text[next] !== '(') return null
+      wrappers.push('cast')
+      i = skipSqlTrivia(text, next + 1)
+      continue
+    }
+    break
+  }
+  const lit = readSqlString(text, i)
+  if (lit === null) return null
+  i = skipSqlTrivia(text, lit.end)
+  for (let w = wrappers.length - 1; w >= 0; w--) {
+    if (wrappers[w] === 'cast') {
+      if (text.slice(i, i + 2).toLowerCase() !== 'as' || isIdentAt(text, i + 2)) return null
+      i = skipSqlTrivia(text, i + 2)
+      const type = /^(varchar|text|string)/i.exec(text.slice(i))
+      if (type === null || isIdentAt(text, i + type[0].length)) return null
+      i = skipSqlTrivia(text, i + type[0].length)
+    }
+    if (text[i] !== ')') return null
+    i = skipSqlTrivia(text, i + 1)
+  }
+  return text[i] === ')' ? lit.value : null
+}
+
 /**
  * 剥掉**所有**引号内容（单引号串、美元引号串、双引号标识符）与注释，只留裸 token。
  * 与 `withoutLiterals` 的区别：双引号标识符也抹掉（那个函数保留它是为了列名匹配）。
@@ -380,80 +478,49 @@ function summarizeTokenPositions(sql: string): { recognized: boolean; unrecogniz
 
 /**
  * `query('…')` 内层 SQL 里出现 SUMMARIZE 关键字（`SELECT * FROM query('SUMMARIZE sessions')`）。
- * ⚠️ 必须先在**裸 token** 上定位 `query(`（注释/字符串/双引号标识符里的同串不算调用），
- * 再回到原 SQL 读那个字符串实参 —— 直接在原文上正则会把注释里写的伪装调用
- * 也当成真调用（Codex 2026-11-08 第三轮 P2 实测）。
  *
  * ⚠️ 第十二轮起 query() 的来源**不再进入行级脱敏**：内层 SQL 的输出来源十余轮复审都被
  * 构造出合法反例（`SELECT 常量 FROM (SUMMARIZE …)` 等），无法静态证明。因此这里只服务
- * 一个目的 —— **发现缺口**（返回 `hit` 即调用方发「无法确认来源」警告），`atTopOutput`
- * 只用于在缺口文案里说清是哪种情形：
- *   · `atTopOutput`：该调用位于最终输出路径（裸文本深度 0 且紧邻 `FROM`/`JOIN`）；
- *   · 非输出路径：`WHERE EXISTS (… FROM query(…))`、IN 子查询、逗号并列、多层子查询。
+ * 一个目的 —— **发现缺口**（返回 `hit` / `gap` 即调用方发对应警告）：
+ *   · `hit`：内层可静态展开，且自身输出是 SUMMARIZE；
+ *   · `gap`：内层有 SUMMARIZE 痕迹但输出无法确认（含探测到 query() 实参展不开）；
+ *   · `unresolved`：至少一个 query() 实参展不开 —— 此时「内层含 SUMMARIZE」只是猜测、
+ *     不是检出，文案必须说「可能含」（CodeRabbit 第十六轮 minor：展不开 ≠ 检出）。
  * 两种情形都**不改写任何值** —— 实测
  * `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
  * 合法且输出 min 是常量 3，按全 SQL 判据脱敏会把业务常量改成 `<已脱敏>`（Codex 第七轮 P2）。
  */
-function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; gap: boolean } {
+
+/** 遍历每个 `query(<静态字符串实参>)` 调用，回调**解码后的内层 SQL** 与调用位置；展不开的走 `onUnresolved`。 */
+function forEachQueryArg(sql: string, cb: (inner: string, callIndex: number) => void,
+  onUnresolved?: () => void): void {
+  for (const { open, nameStart } of sqlFunctionCalls(sql, 'query')) {
+    const inner = readStaticArg(sql, open)
+    if (inner === null) onUnresolved?.()
+    else cb(inner, nameStart)
+  }
+}
+
+/** query() 的静态实参；无法展开的完整表达式通过独立信号报告，不冒认前缀。 */
+export function queryCallArgs(sql: string, onUnresolved?: () => void): string[] {
+  const out: string[] = []
+  forEachQueryArg(sql, (inner) => out.push(inner), onUnresolved)
+  return out
+}
+
+function queryCallSummarize(sql: string):
+  { hit: boolean; atTopOutput: boolean; gap: boolean; unresolved: boolean } {
   const bare = bareKeywords(sql)
-  const re = /\bquery\s*\(/gi
   let hit = false
   let atTopOutput = false
   let gap = false
-  let m: RegExpExecArray | null
-  while ((m = re.exec(bare)) !== null) {
-    let i = m.index + m[0].length
-    // ⚠️ `(` 与字符串实参之间可以夹空白**与注释**（DuckDB 实测接受
-    // `query(/* gap */ 'SUMMARIZE sessions')`），只跳空白会漏检 → PII 统计值原样输出
-    //（Codex 2026-11-08 第四轮 P1）。注释按词法跳过，不当作实参。
-    for (;;) {
-      while (i < sql.length && /\s/.test(sql[i]!)) i++
-      if (sql[i] === '/' && sql[i + 1] === '*') {
-        // 嵌套块注释按深度跳过（DuckDB 实测 `/* outer /* inner */ … */` 合法）
-        i = skipBlockComment(sql, i)
-        continue
-      }
-      if (sql[i] === '-' && sql[i + 1] === '-') {
-        while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i++
-        continue
-      }
-      break
-    }
-    // 字符串前缀：DuckDB 接受 `E'…'`（转义字符串）—— 实测 `query(E'SUMMARIZE sessions')` 有效。
-    // ⚠️ E 串的**引号边界**也按 E 语义：`\'` 是转义引号（不结束字符串），`''` 同样；
-    // 普通串里反斜杠没有特殊含义（实测 `'a\x41b'` 保留字面量 `\x41`）（Codex 第七轮 P2）。
-    const isEscape = (sql[i] === 'E' || sql[i] === 'e') && sql[i + 1] === "'"
-    if (isEscape) i++
-    // ⚠️ 美元引号实参同样合法（真机实测 `query($$SUMMARIZE sessions$$)` /
-    // `query($q$SUMMARIZE sessions$q$)` 都输出统计值，CodeRabbit 2026-11-09 第十四轮 minor）：
-    // 旧扫描只认单引号，这类实参直接 `continue` → hit/gap 双假 → 一条 SUMMARIZE 缺口都不发。
-    // 与 withoutLiterals 共用同一个扫描点 dollarQuoteEnd；内容没有转义，原样就是内层 SQL。
-    const dq = sql[i] === '$' && !isIdentCharAt(sql, i) ? dollarQuoteEnd(sql, i) : null
-    let inner: string
-    if (dq !== null) {
-      inner = sql.slice(dq.openEnd, dq.closeStart)
-      i = dq.closeStart + (dq.openEnd - i) - 1
-    } else {
-      if (sql[i] !== "'") continue
-      const start = i
-      for (i++; i < sql.length; i++) {
-        if (isEscape && sql[i] === '\\') { i++; continue }
-        if (sql[i] === "'") { if (sql[i + 1] !== "'") break; i++ }
-      }
-      // ⚠️ 实参是**内层 SQL 源码**，必须按 DuckDB 的字符串语义解码后再跑同一套词法判据：
-      // E 串先解转义（`\x2f\x2a` → `/*` —— 不解码会把注释里的 SUMMARIZE 当成真关键字，
-      // 实测该查询输出常量 min=3 却被脱敏，Codex 第七轮 P2），再统一把 `''` → `'`。
-      // 内层里的 SUMMARIZE 也可能只是注释/字符串/别名：实测 `query('SELECT ''x'' … /* SUMMARIZE */')`
-      // 在 DuckDB 里返回普通行，按裸词判会把列值误改（Codex 2026-11-08 第五轮 P2）。
-      inner = decodeStringLiteral(sql.slice(start + 1, i), isEscape)
-    }
-    // ⚠️ 递归必须传播**输出来源**而不是只看「内层含 SUMMARIZE」（Codex 第八轮 P2，真机实测）：
-    // 内层 SQL `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM
-    // query('SUMMARIZE sessions'))` 的输出是常量 3 —— 内层命中来自 WHERE 里的非输出路径，
-    // 按 `.hit` 提升会让外层的 query() 被当成统计来源、常量被改成 `<已脱敏>`。
-    // 只有内层**自身的输出**是 SUMMARIZE（内层语句头 / 内层 query() 在其顶层 FROM）才提升。
+  let unresolved = false
+  forEachQueryArg(sql, (inner, callIndex) => {
     const innerTokens = summarizeTokenPositions(inner)
     const sub = queryCallSummarize(inner)
+    // 里层的不可展开同样向上传播（CodeRabbit 第十七轮 minor）：展不开只说明内容未知，
+    // 丢了它外层就会把里层的猜测重新当成检出。
+    if (sub.unresolved) unresolved = true
     // ⚠️ innerTokens.recognized 对 `SELECT expr FROM (SUMMARIZE …)` 成立（SUMMARIZE 在
     // 深度 1 的 FROM 内），但 SELECT 自身输出的是**表达式求值结果**、不是 SUMMARIZE 统计值。
     // 例如 `SELECT * FROM query('SELECT ''userName'' AS column_name, 3 AS min FROM
@@ -463,7 +530,7 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
     const innerIsPure = passthroughReason(inner) === null
     if ((innerTokens.recognized && innerIsPure) || sub.atTopOutput) {
       hit = true
-      const before = bare.slice(0, m.index)
+      const before = bare.slice(0, callIndex)
       const depth = (before.match(/\(/g)?.length ?? 0) - (before.match(/\)/g)?.length ?? 0)
       if (depth === 0 && /(?:\bFROM|\bJOIN)\s*$/i.test(before)) atTopOutput = true
     } else if ((innerTokens.recognized && !innerIsPure) || innerTokens.unrecognizedParen
@@ -472,8 +539,13 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
       // 向上传播「无法确认」，由调用方声明缺口，绝不冒认脱敏。
       gap = true
     }
-  }
-  return { hit, atTopOutput, gap }
+  }, () => {
+    // 实参无法静态展开（拼接 / 函数调用）：内层可能含 SUMMARIZE（也可能不含）——
+    // 与「内层有 SUMMARIZE 但输出不确定」同属「没检查」，只声明缺口，不冒认脱敏。
+    gap = true
+    unresolved = true
+  })
+  return { hit, atTopOutput, gap, unresolved }
 }
 
 /**
@@ -553,12 +625,16 @@ function isIdentCp(cp: string): boolean {
  * 方向：把模棱两可的非 ASCII 字符按**标识符**处理（不认成引号开头）—— 误判成字面量会
  * 抹掉后续内容并让分组/缺口分析静默失效，误判成标识符只是少抹一段（该段是非法 SQL）。
  */
-function isIdentCharAt(text: string, i: number): boolean {
+export function isIdentCharAt(text: string, i: number): boolean {
   return isIdentCp(prevCodePoint(text, i))
 }
 
-/** `text[i]` 处的码点是否标识符字符（next 方向；`codePointAt` 天然按码点处理代理对）。 */
-function isIdentAt(text: string, i: number): boolean {
+/**
+ * `text[i]` 处的码点是否标识符字符（next 方向；`codePointAt` 天然按码点处理代理对）。
+ * 导出给 `commands/query.ts` 的键引用扫描：标识符判据只许一个实现点（ASCII 正则会漏掉
+ * `数据['stat_date']` 这类合法 Unicode 别名，Codex 2026-11-11 第十四轮 P2）。
+ */
+export function isIdentAt(text: string, i: number): boolean {
   if (i >= text.length) return false
   return isIdentCp(String.fromCodePoint(text.codePointAt(i)!))
 }
@@ -583,7 +659,7 @@ function skipBlockComment(text: string, start: number): number {
  * 规则复制到两处会让同一条 SQL 在两个判据里得到不同结论。调用方负责「标识符边界」判断
  * （紧跟在标识符字符后的 `$` 属于标识符，不是引号开头）。
  */
-function dollarQuoteEnd(text: string, start: number): { openEnd: number; closeStart: number } | null {
+export function dollarQuoteEnd(text: string, start: number): { openEnd: number; closeStart: number } | null {
   const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(start))
   if (m === null) return null
   const closeStart = text.indexOf(m[0], start + m[0].length)
@@ -591,7 +667,27 @@ function dollarQuoteEnd(text: string, start: number): { openEnd: number; closeSt
   return { openEnd: start + m[0].length, closeStart }
 }
 
-function withoutLiterals(text: string): string {
+/**
+ * 抹掉单引号/美元引号字面量与 SQL 注释（判据只看标识符，不看字面量/注释里的文本）。
+ * 导出给 `commands/query.ts` 的日期字面量警告用（列名判据）。
+ */
+export function withoutLiterals(text: string): string {
+  return blankSql(text, true)
+}
+
+/**
+ * 只抹注释（双引号标识符与字面量原样保留，下标逐位对齐）。
+ * `commands/query.ts` 的日期字面量警告在它上面定位孤立 `'` 再取字面量内容。
+ */
+export function withoutComments(text: string): string {
+  return blankSql(text, false)
+}
+
+/**
+ * 抹掉单引号/美元引号字面量与注释的唯一词法状态机。`blankLiterals=false` 时
+ * **原样保留**字面量（含美元引号内容）——供需要在字面量内部读值的判据用。
+ */
+function blankSql(text: string, blankLiterals: boolean): string {
   let out = ''
   // ⚠️ 被抹掉的字符一律换成等长空格：下标与原文**逐位对齐**，`sliceClause` 才能在抹过的
   // 文本上定位 `GROUP BY`/`DISTINCT` 而不会命中字符串字面量里的同一串词（Codex 2026-11-05
@@ -610,7 +706,7 @@ function withoutLiterals(text: string): string {
         if (isEscape && text[i] === '\\') { i++; continue }
         if (text[i] === "'") { if (text[i + 1] !== "'") break; i++ }
       }
-      out += blank(i - start + 1)
+      out += blankLiterals ? blank(i - start + 1) : text.slice(start, Math.min(i, text.length - 1) + 1)
       continue
     }
     // 双引号是**标识符**（`SELECT "userPhone"` 是真实列引用，抹掉会漏判）→ 原样保留，
@@ -642,7 +738,7 @@ function withoutLiterals(text: string): string {
       if (dq !== null) {
         const delim = dq.openEnd - i
         const end = dq.closeStart + delim   // 整个 `$tag$…$tag$` 之后的第一个字符
-        out += blank(end - i)
+        out += blankLiterals ? blank(end - i) : text.slice(i, end)
         i = end - 1
         continue
       }
@@ -937,7 +1033,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     : { recognized: false, unrecognizedParen: false }
   const queryCall = mode.kind === 'sql'
     ? queryCallSummarize(mode.sql)
-    : { hit: false, atTopOutput: false, gap: false }
+    : { hit: false, atTopOutput: false, gap: false, unresolved: false }
   const summarizeSql = mode.kind === 'sql'
     && (summarizeTokens.recognized || queryCall.atTopOutput)
   // 第十二轮起 query() 来源不再进入行级脱敏入口（无法静态证明输出是统计值），
@@ -1171,7 +1267,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 「无法确认是否构成最终输出」泛化档，不该被说成「列名已被改写」。
   // 判据：位置无法确认（非 summarizeSql）**且**输出不是可静态证明的透传 —— 后者在进入本档时
   // 形状必然不匹配（可证明形态恒为 column_name/min/max），只作显式兜底、如实记录未单独承重。
-  if (!summarizeShape && (summarizeSql || (summarizeUnconfirmed && !summarizeProj.enabled))) {
+  // 「含 SUMMARIZE」是事实断言：探测只来自 query() 的未解析实参时它未知 → 排到下面「可能含」档。
+  const summarizePresenceUnknown = queryCall.unresolved && !queryCall.hit
+  if (!summarizeShape
+    && (summarizeSql || (summarizeUnconfirmed && !summarizeProj.enabled && !summarizePresenceUnknown))) {
     warnings.push(
       'SQL 含 SUMMARIZE，但输出列名已被改写（缺 column_name / min / max 形状）：'
       + '行级脱敏无法按行值识别敏感列，统计值（min/max/分位数）可能**未脱敏**。'
@@ -1201,7 +1300,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   //     输出仍可能是统计值 —— 第十二轮收窄时曾被这一档漏掉，现由 queryCall.gap 兜住，
   //     并有**单独一档文案**（下一条），因为它的成因与修复建议都与位置类不同。
   // 两向都不安全：漏脱敏与误改。与上一档同一策略：**只声明缺口，不冒认脱敏**。
-  if (!summarizeSql && summarizeUnconfirmed && !queryCall.gap && summarizeShapeColumns) {
+  if (!summarizeSql && summarizeUnconfirmed && !queryCall.gap && summarizeShapeColumns
+    && !summarizePresenceUnknown) {
     warnings.push(
       'SQL 里的 SUMMARIZE **无法确认是否构成最终输出**（如多层子查询 '
       + '`FROM (SELECT * FROM (SUMMARIZE …))`、逗号连接、CTE 内的子查询，'
@@ -1211,13 +1311,28 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
       + '或把 SUMMARIZE 提到顶层（`SUMMARIZE <表>`）')
   }
-  if (!summarizeSql && queryCall.gap && summarizeShapeColumns) {
+  // 「内层使用了 SUMMARIZE」同上：未解析实参只代表「可能含」，走最后一档。
+  if (!summarizeSql && queryCall.gap && summarizeShapeColumns && !summarizePresenceUnknown) {
     warnings.push(
       'SQL 在 `query()` 内层使用了 SUMMARIZE，但内层投影**不是原样透传**'
       + '（显式列举 / 表达式重投影 / 位置不可识别）：'
       + '统计值（min/max/分位数）可能**未脱敏**；若内层输出被改写成常量则保持原值。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
       + '或改用 `SELECT * FROM (SUMMARIZE <表>)` 原样透传')
+  }
+  // ⚠️ query() 实参无法静态展开（拼接 / 函数调用）—— **只声明缺口，不改写任何值**。
+  // 展不开 ≠ 检出：`query('SELECT ' || '1')` 里没有 SUMMARIZE，旧实现在这里发「SQL 在 query()
+  // 内层使用了 SUMMARIZE」是把它当成检出（CodeRabbit 第十六轮 minor，真机实测该 SQL 合法）。
+  // 所以 `queryCall.unresolved` 让上面两句「使用了 / 含 SUMMARIZE」失效，改由本档如实说
+  // 「可能含、无法检查」，并给出可执行的收口（实参改成单个字符串字面量）。
+  // 只在**输出确实是统计形状**时才发（与同族两档一致）：否则外层已投影成别的列，
+  // 内层含不含 SUMMARIZE 都不影响输出，泛化的 query() 警告已够，不必再添一条。
+  if (!summarizeSql && summarizePresenceUnknown && summarizeShapeColumns) {
+    warnings.push(
+      'SQL 里的 `query()` 实参无法静态展开（拼接 / 函数调用），无法确认内层是否含 SUMMARIZE：'
+      + '若含，其统计值（min/max/分位数）可能**未脱敏**；若不含则保持原值。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
+      + '或把 query() 的实参改为单个字符串字面量（如 `query(\'SUMMARIZE <表>\')`）')
   }
   // 边界用「前后不是标识符字符」而不是 `\\b`：别名可以带标点（`"p("`），
   // 而 `\\b` 只在词字符与非词字符之间成立 —— `\\bp(\\b` 即使不抛也永远匹配不上
@@ -1314,8 +1429,11 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       + '需要准确分组请用 `--no-mask`（并自行承担 PII 风险），或改用不敏感列分组')
   }
 
+  // 先收集**全部**该报的列，再按上限逐条发：最后一条替成「另有 N 个未列出」的清单。
+  // ⚠️ 只在循环里 `break` 会让被截掉的列**静默消失**（2026-11-09 审计实测：7 个未匹配
+  // 敏感列只出 5 条，没有「等/其余」字样，Agent 读到的 5 条看起来就是全部缺口）。
+  const unmatched: string[] = []
   for (const name of sensitiveNames) {
-    if (warnings.length >= WARNING_LIMIT) break
     if (matchedSensitive.has(name)) continue
     // `\b` 两侧都要求非标识符字符：userPhoneBook 这类更长标识符不会误报 userPhone。
     //
@@ -1326,9 +1444,24 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     // 代价是 `SELECT username FROM staff`（staff.username 不是敏感列）会多一条误报 ——
     // spec 明确要求这个方向。
     if (!new RegExp(`\\b${name}\\b`, 'i').test(mode.sql)) continue
-    warnings.push(
-      `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，` +
-      '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样')
+    unmatched.push(name)
+  }
+  const warnOne = (name: string): string =>
+    `SQL 引用了敏感列 ${name}，但输出列名不匹配；脱敏可能不完整，`
+    + '建议用 `' + queryTableCommand('<表>', loc) + '` 或保持列名原样'
+  // 上限是**本类别自己的**行数（spec §7.2 说的是「这个判据的去重上限」），不按
+  // `warnings.length` 扣减：扣减会让其它类别的警告把预算吃光（Codex 2026-11-10 第三轮 P2：
+  // 前 5 条已存在时这里仍要发汇总 → 超上限；不发汇总 → 又回到「静默截断」，是本轮修的 bug）。
+  // 现在本块最多出 WARNING_LIMIT 行：截断时最后一行是点名剩余列的汇总。
+  const perColumnSlots = unmatched.length > WARNING_LIMIT
+    ? WARNING_LIMIT - 1
+    : unmatched.length
+  for (const name of unmatched.slice(0, perColumnSlots)) warnings.push(warnOne(name))
+  if (unmatched.length > perColumnSlots) {
+    // 剩余列并成一条：既不超本类别的行数上限，又点名全部被截断的列。
+    const rest = unmatched.slice(perColumnSlots)
+    warnings.push(`另有 ${rest.length} 个敏感列的缺口警告未列出（受 ${WARNING_LIMIT} 条上限）：`
+      + `${rest.join('、')}；这些列的脱敏同样可能不完整`)
   }
 
   // 值级兜底命中了**非敏感列**（场景审查 7.2）：11 位、以 1 开头的订单号/聚合值会被

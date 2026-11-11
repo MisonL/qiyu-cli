@@ -18,7 +18,7 @@
 // ⚠️ **本模块只服务只读命令**。`store init` 的前置检查是**另一条规则**（用 `lstatSync`
 // 拒绝符号链接 + 建父目录，出口是「写」），结构不并入此处；它只复用本模块的两条
 // **非普通文件**文案，免得同一成因在 init 与只读命令上说两套话。
-import { statSync } from 'node:fs'
+import { lstatSync, statSync } from 'node:fs'
 import { fail, storeInitCommand } from '../output.js'
 import type { ErrorInput } from '../output.js'
 import { TABLES } from '../store/schema.js'
@@ -86,6 +86,22 @@ export function statFailureHint(errno: string | undefined): string {
 }
 
 /**
+ * 断链符号链接的 hint（`statGuard` 的 ENOENT 分流用）；不是断链时返回 `null`。
+ *
+ * 只读命令对断链必须说「链接目标不存在」，**不得**指向 `store init` ——
+ * `store init` 拒绝符号链接（`目标是符号链接，请给出真实路径`），照 hint 执行只会换一句错。
+ * `lstat` 本身再失败（父目录不存在等）时同样返回 `null`，交回「路径不存在」原分支。
+ */
+function danglingSymlinkHint(path: string): string | null {
+  let lst: ReturnType<typeof lstatSync>
+  try { lst = lstatSync(path) } catch { return null }
+  if (!lst.isSymbolicLink()) return null
+  return `路径是一个符号链接，但它指向的目标不存在（stat 跟随链接后得到 ENOENT）。`
+    + '请改用真实路径，或把链接改指向存在的库；`store init` 不接受符号链接路径，'
+    + '照「先运行 store init」执行只会得到第二条错误'
+}
+
+/**
  * 只读命令的库前置检查（`statSync` 的 ENOENT / 非普通文件 / 其余 errno 三分）。
  * 合格（是一个普通文件）→ `null`，调用方继续打开库。
  *
@@ -96,6 +112,18 @@ export function statGuard(path: string): number | null {
   let st: ReturnType<typeof statSync>
   try { st = statSync(path) } catch (e) {
     if ((e as { code?: string }).code === 'ENOENT') {
+      // ⚠️ 断链符号链接的 `statSync` 也抛 ENOENT（跟随链接后目标不存在），与「路径真的
+      // 不存在」在 errno 上无法区分 —— 但两者该给的 hint 相反（2026-11-09 审计实测）：
+      // 前者说「请运行 store init」，而 `store init` 自己 lstat 出是符号链接、拒绝执行，
+      // 用户被两条 hint 锁进死循环。先 lstat 一次分流：lstat 层存在 → 一定是断链。
+      const link = danglingSymlinkHint(path)
+      if (link !== null) {
+        return fail({
+          code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
+          message: `符号链接指向不存在的目标：${path}`,
+          hint: link,
+        })
+      }
       return fail({
         code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `数据库文件不存在：${path}`,

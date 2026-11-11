@@ -253,7 +253,9 @@ describe('sync run —— 单任务输出契约（spec §七）', () => {
       expect(code).toBe(0)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('partial')
-      expect(t.windows).toEqual({ total: 2, succeeded: 1, failed: 1, skipped: 0 })
+      // 40 天 + 3 天回看：切出 3 个区间，末窗完全落在回看重叠区 → contained: 1
+      // （2026-11-09 起单独披露，不计入 total）
+      expect(t.windows).toEqual({ total: 2, succeeded: 1, failed: 1, skipped: 0, contained: 1 })
       const gaps = t.gaps as Array<Record<string, unknown>>
       expect(gaps.length).toBe(1)
       expect(gaps[0]!.reason).toBe('fetch_failed')
@@ -1741,6 +1743,90 @@ describe('修复批 2 · E 中-2/C-11：gap 区间与 resolved_range 同走上�
       expect(Date.parse(gaps[0]!.range[0])).toBeGreaterThan(Date.now() - 86_400_000 - 5000)
     } finally {
       vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('区间语义与 notes（2026-11-10 审计）', () => {
+  it('sync run 的 --db 重复出现 → 用法错误（Codex 2026-11-10 P2：本命令自解析 flag，不走 parseStoreFlags）', async () => {
+    const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(), '--db', join(dir, 'b.db')])
+    expect(code).toBe(2)
+    expect(String(JSON.parse(out).error.message)).toMatch(/--db 重复出现/)
+  })
+  it('--since 与 --until 同一天（都解析到 0 点）→ usage，hint 说明半开区间与日期语义', { timeout: 120_000 }, async () => {
+    await fresh().then((s) => s.close())
+    const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(),
+      '--since', '2026-09-01', '--until', '2026-09-01'])
+    expect(code).toBe(2)
+    const e = JSON.parse(out).error as Record<string, unknown>
+    expect(e.kind).toBe('usage')
+    expect(String(e.message)).toMatch(/不早于终点/)
+    expect(String(e.hint)).toMatch(/半开区间/)
+    expect(String(e.hint)).toMatch(/不包含当天/)
+  })
+
+  it('日对齐任务 + 非日界 --until → notes 明说末残段跳过、该日不会同步（不得只留 complete）', async () => {
+    // 2026-11-09 审计：`--until 2026-10-15T12:30+08:00` 在报表任务上是 complete、gaps 为空，
+    // 而 10/15 整天一行都没有 —— 必须用 notes 说清并给出真能用的写法。
+    const CLOCK = Date.UTC(2026, 9, 20, 4, 0, 0)   // 上海 10/20 12:00
+    vi.useFakeTimers({ now: CLOCK })
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => okA([])))
+    try {
+      await fresh().then((s) => s.close())
+      // 只拉一天：起点 10/15 0 点、终点 10/15 12:30 —— 末窗是半个自然日（首窗同理也是残段）
+      const code = await syncCommand(['run', 'reports.overview', '--db', dbPath(),
+        '--since', '2026-10-15', '--until', '2026-10-15T12:30:00+08:00'])
+      expect([0, 1]).toContain(code)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      const notes = t.notes as string[]
+      expect(notes.some((n) => /不是上海日界/.test(n))).toBe(true)
+      expect(notes.some((n) => /把 --until 写到次日/.test(n))).toBe(true)
+      expect(err).toMatch(/不是上海日界/)
+    } finally {
+      vi.unstubAllGlobals()
+      vi.useRealTimers()
+    }
+  })
+
+  it('声明末端上限的任务 + 目标日晚于上限 → 提示「等上限前移」，不得劝改 --until（Codex 2026-11-10）', async () => {
+    // 上海 2026-10-20 12:00；order_performance 声明 windowEndClamp=shanghaiYesterday
+    //（endTime 不能晚于 10/19 0:00）。要 10/19 这一天：它 ≥ 上限，改 --until 也拉不到。
+    const CLOCK = Date.UTC(2026, 9, 20, 4, 0, 0)
+    vi.useFakeTimers({ now: CLOCK })
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => okC({
+      orders: [], sum: { sellMoney: 0 }, total: 0,
+    })))
+    try {
+      await fresh().then((s) => s.close())
+      const code = await syncCommand(['run', 'reports.order_performance', '--db', dbPath(),
+        '--since', '2026-10-17', '--until', '2026-10-19T12:30:00+08:00', '--quiet'])
+      expect([0, 1]).toContain(code)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      const notes = t.notes as string[]
+      expect(notes.some((n) => /末端上限/.test(n))).toBe(true)
+      expect(notes.some((n) => /等上限自然前移|上限自然前移/.test(n))).toBe(true)
+      // 不得再给出「把 --until 写到次日 0 点」这种照做也无效的建议
+      expect(notes.some((n) => /请把 --until 写到次日 0 点/.test(n))).toBe(false)
+    } finally {
+      vi.unstubAllGlobals()
+      vi.useRealTimers()
+    }
+  })
+
+  it('日对齐任务 + 日界 --until → 不产生该 note（反证：判据不是「给了 --until 就报」）', async () => {
+    const CLOCK = Date.UTC(2026, 9, 20, 4, 0, 0)
+    vi.useFakeTimers({ now: CLOCK })
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => okA([])))
+    try {
+      await fresh().then((s) => s.close())
+      const code = await syncCommand(['run', 'reports.overview', '--db', dbPath(),
+        '--since', '2026-10-15', '--until', '2026-10-16', '--quiet'])
+      expect([0, 1]).toContain(code)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect((t.notes as string[]).some((n) => /不是上海日界/.test(n))).toBe(false)
+    } finally {
+      vi.unstubAllGlobals()
+      vi.useRealTimers()
     }
   })
 })

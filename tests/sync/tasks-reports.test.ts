@@ -883,6 +883,25 @@ describe('按天轮转调度（runRotated）', () => {
     }
   }
 
+  it('轮转路径的截短窗同样出「末端被上限截短」进度行（Codex 2026-11-10 P2）', async () => {
+    // 考勤/绩效在 `sync run` 里**全部走轮转路径**：截短提示如果只挂在 runWindowed，
+    // 真实命令面永远看不到它。
+    const store = await fresh()
+    const lines: string[] = []
+    // 窗跨过末端上限（昨天 0 点）：起点 = 上海今天 0 点 − 10 天，终点 = 今天 0 点 + 1 小时
+    const t = rotTask('reports.att', {
+      windowEndClamp: 'shanghaiYesterday', maxWindowDays: 31,
+      fetch: async () => ({ rows: [], apiCount: 0 }),
+    })
+    await runRotated([t], ctx(store, {
+      rangeOverride: { start: shanghaiDayStart(1_700_000_000_000) - 10 * DAY,
+        end: shanghaiDayStart(1_700_000_000_000) + 3600_000 },
+      onProgress: (m: string) => lines.push(m),
+    }))
+    expect(lines.join('\n')).toMatch(/窗末端被上限截短/)
+    await store.close()
+  })
+
   it('3 任务 × 2 天窗口：同一天内跨任务背靠背（gate 只在同路径连发时拦）', async () => {
     const store = await fresh()
     // gate mock：记录 acquire 序；同 endpointId 连发（不同任务 id）放行——

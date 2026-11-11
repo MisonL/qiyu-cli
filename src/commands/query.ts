@@ -18,7 +18,10 @@
 // 表名/列名只来自 `TABLES` 闭集并加双引号，外部取值只进 `?` 参数位。
 import type { SandboxSession } from '../query/sandbox.js'
 import { suggestNames, thrownToQueryExit, driftFailureFor, emitQueryFailure, missingTableCauses } from '../query/errors.js'
-import { maskQueryRows } from '../query/mask.js'
+import {
+  maskQueryRows, withoutLiterals, withoutComments, queryCallArgs, readSqlString, sqlFunctionCalls, skipSqlTrivia,
+  isIdentAt, isIdentCharAt,
+} from '../query/mask.js'
 import { parseTimeArg, shanghaiIso, msToShanghaiIso, shanghaiYesterdayStart } from '../core/time.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { TableDef, TimeColumnKind } from '../store/schema.js'
@@ -89,7 +92,9 @@ const USAGE = `用法：qiyu query <查询方式> [参数]
                            存储定位（与 store / sync 命令同族）
 ${DB_PATH_HELP}
 
-只接受单条 SELECT / DESCRIBE / SHOW / EXPLAIN；写操作、多语句、文件与网络访问一律被沙箱拦截。
+只接受单条只读查询（DuckDB 判为「只读」的语句都放行：SELECT、DESCRIBE、SHOW、EXPLAIN、
+PRAGMA 查询形态、VALUES、TABLE <表>、FROM <表> 等）；写操作、SET/CALL 之类的实例配置、多语句、
+文件与网络访问一律被沙箱拦截。实测放行/拦截清单见 README「只读沙箱」。
 `
 
 /**
@@ -142,19 +147,263 @@ function zeroRowHint(loc?: StoreLocation): string {
  * `'2026-10-12T16:00:00.000Z' >= '2026-10-13T00:00:00+08:00'` 为 false，整整少一天，
  * 退出码 0、四道自证机制一道都不响。
  *
- * 判据 = SQL 文本同时含 iso-day 列名与「日期形态字面量」（纯 `YYYY-MM-DD` 或缺时刻的
- * `…T00:00:00+08:00`）——即 CLI 自己教出去、却在 `--sql` 里比较错的那种写法。
- * 方向安全（多警告）：误报只多一句话；UTC `…Z` 形态与 `--table` 通道不受影响。
+ * 判据 = SQL 文本同时含 iso-day 列名与「会被字典序比较错的一天」形态的**单引号字面量**
+ *（`dayLiteralHint`，下方）。方向安全（多警告）：误报只多一条附带修复方法的 warning。
  */
 // ⚠️ 大小写不敏感，理由同上（`STAT_DATE >= '2026-10-13'` 同样会少一天）。
 const ISO_DAY_COL_RE = /\b(stat_date|work_date)\b/i
-// ⚠️ 必须同时接受 `T` 与**空格**分隔（场景审查 4）：SQL 里 `'2026-10-12 00:00:00'` 是
-// 与 `'…T00:00:00'` 等价的合法写法，旧正则只认 `T` → 空格形态静默少算一天、零 warning。
-const DAY_LITERAL_RE = /'\d{4}-\d{2}-\d{2}([T ]00:00:00(\.0+)?(\+08:00)?)?'/
+/**
+ * 单引号字面量的内容里是否有「按字典序比较会少一天」的形态。
+ *
+ * 列内只存两种合法形态：上海日零点写成 `YYYY-MM-DDT16:00:00.000Z`（UTC 数值），
+ * 或整值为 NULL。按字典序比较时，下列字面量都会把前端那一天排除或错位：
+ *   · `YYYY-MM-DD` / `YYYY-MM-DD 00:00:00` / `…T00:00:00`（任何不带时区或 +08:00 的写法）
+ *   · `YYYY-MM-DD…Z`（**这是 UTC 时刻，不是上海日**：`'…T00:00:00Z'` 只有上海 08:00 起才算数）
+ *   · `YYYY-MM-DD…+08:00` 以外的偏移（如 `+0800`、`…-05:00`）
+ *   · 任何与库内形态**不逐字一致**的写法（空格分隔、前导空白、多/少小数位……）
+ * 唯一的合法写法（UTC 16:00Z 且带小数秒，如 `'2026-10-12T16:00:00.000Z'`）放行。
+ *
+ * 2026-11-09 实测漏报（旧 `DAY_LITERAL_RE` 只认 `YYYY-MM-DD[ 或 T]00:00:00[.0…][+08:00]`）：
+ * `'2026-11-08T00:00:00Z'`、`'2026-11-09 00:00:00.000Z'`、`'2026-11-08T00:00:00.000Z'`
+ * 三种都静默少算一天、零 warning —— 其中 `…Z` 形态正是 CLI 自己 `--sql` 示例里教的写法。
+ */
+// ⚠️ 秒可缺省（CodeRabbit 2026-11-10）：`'2026-10-13 00:00'` / `'…T00:00Z'` 同样按字典序
+// 少算一天，要求秒会把它们漏掉（缺秒时 frac/tz 恒为 null → 下面按「不是列内形态」返回 true）。
+// ⚠️ 分隔符只认 `T`（Codex 2026-11-10 第十一轮 P2）：库内形态恒为 `…T16:00:00.000Z`，
+// 空格分隔在字典序上排在 `T` 之前 —— 实测 `stat_date <= '2026-10-13 16:00:00.000Z'` 把
+// 边界日整列排除。允许 `[T ]` 会让这种写法被当成「逐字一致」放行、零警告。
+const DAY_VALUE_RE = /^(\d{4}-\d{2}-\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?)?/
+function isMiscomparedDayLiteral(v: string): boolean {
+  // ⚠️ 判据是「日形态**前缀**」，不是完整匹配（Codex 2026-11-10 第七轮 P2）：比较发生在
+  // VARCHAR 原文上 —— 实测库值 `…16:00:00.000Z` >= `'…16:00:00.000Z '` 为 **false**，
+  // 尾随字符把字面量排到库值之后、边界日整列被排除。旧实现先 `trim()` 再完整匹配，
+  // 把它当成列内形态放行（零警告）；而只去掉 `trim()` 又会因完整匹配失败落到「不像日期」
+  // 分支、同样零警告 —— 必须「按前缀认出是日形态」再单独判是否逐字一致。
+  // **前导**空白同样警告（Codex 2026-11-10 第十一轮 P2，实测）：`<= ' 2026-…Z'` 一行都不剩。
+  // 旧注释按 `>=` 单方向实证「不排除任何行」就放行 —— 反过来用就是静默漏报；判据看不到
+  // 运算符，只能按方向安全一律算错位。
+  if (v !== v.trimStart()) return DAY_VALUE_RE.test(v.trimStart())
+  const m = DAY_VALUE_RE.exec(v)
+  if (m === null) return false
+  const exact = m[0].length === v.length
+  if (m[2] === undefined) return true                             // 纯日期
+  // ⚠️ 命中了时刻但没给小数秒/时区时，分组是 `null`（不是 `undefined`）—— 两种都按「不是列内形态」
+  // 处理；只判 `undefined` 会让这种字面量一路走到最后返回 false（2026-11-10 回归发现）。
+  const frac = m[5] ?? null
+  const tz = m[6] ?? null
+  if (frac === null || tz === null) return true                    // 没有小数秒或没有时区：不可能是列内形态
+  // 只有恰好 `.000` 才是列内形态（Codex 2026-11-10 P2）：`.123` 这类字面量在字典序上会
+  // 排在 `…16:00:00.000Z` 之后、把当天行排除在外，旧判据（≥3 位即放行）会静默漏报。
+  if (frac !== '000') return true                                  // 列内形态恒为三位 `.000`（`.123` 在字典序上把当天行排除）
+  if (m[2] !== '16' || m[3] !== '00' || m[4] !== '00') return true  // 不是 16:00:00 的 UTC 形态
+  if (tz !== 'Z') return true                                      // `+08:00`/`+0800` 等一律错位
+  return !exact                                                    // 尾随字符：库值是它的严格前缀 → 排除边界日
+}
+
+/**
+ * `--sql` 通道的日期字面量警告判据（单一实现点）。
+ *
+ * 词法复用 `mask.ts` 的同一个状态机（`withoutComments` / `withoutLiterals`，逐位对齐）：
+ * 列名在「抹掉注释与字面量」的文本上找（注释里的 `-- WHERE stat_date …` 不是真条件；
+ * `"stat_date"` 双引号标识符原样保留、仍算列名）；字面量在「只抹注释」的文本上按
+ * 单引号状态逐个读出（`'it''s'` 是转义、不是两个字面量）。
+ */
+function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
+  return dayHintOf(sql, loc)?.text ?? null
+}
+
+/**
+ * 两类结论必须分开携带（CodeRabbit 2026-11-11 第十七轮 minor）：
+ *   · `mismatch`：**已确认**的错位（必须带修法）——可立即返回，不被任何缺口盖住；
+ *   · `unexpandable`：**没法检查**（内层实参展不开 / 外层无日列但存在未知 query()）。
+ * 只用一个 `string | null` 时里层递归返回的「没法检查」会被当成结论提前返回，外层已确认的
+ * 错位连同修法一起丢失。
+ */
+type DayHint = { kind: 'mismatch' | 'unexpandable'; text: string }
+
+function dayHintOf(sql: string, loc?: StoreLocation): DayHint | null {
+  // `query('<内层 SQL>')` 包装（沙箱放行的形态）里真正执行的是**实参内的 SQL**：
+  // `withoutLiterals` 会把整个实参抹掉，只看外层就会漏掉内层里的错位日字面量
+  //（Codex 2026-11-10 第二轮 P2，实测 `SELECT * FROM query($$…stat_date >= '2026-10-13'$$)`
+  // 少算一天却零警告）。递归检查每个实参的内层 SQL（内层还能再套 query()）。
+  let unexpandable = false
+  for (const inner of queryCallArgs(withoutComments(sql), () => { unexpandable = true })) {
+    const innerHint = dayHintOf(inner, loc)
+    if (innerHint?.kind === 'mismatch') return innerHint
+    // 里层的「没法检查」只记下：外层可能还有已确认的错位（见本函数头部注释）。
+    if (innerHint !== null) unexpandable = true
+  }
+  // 注释先抹成空白（逐位对齐）：注释里写的 `-- WHERE stat_date >= '…'` 不是真条件。
+  const code = withoutComments(sql)
+  // ⚠️ 不要只判 `withoutLiterals(code)`：列名可能藏在**有执行语义的字符串**里 ——
+  // `COLUMNS('stat_date')` / `COLUMNS('stat.*')` 是列选择器（实测
+  // `WHERE COLUMNS('stat_date') >= '2026-10-13'` 两天夹具只计一天，Codex 2026-11-10 第六轮 P2），
+  // 而 `withoutLiterals` 会把整个串抹掉。也不能放宽到 `code` 原样：普通字面量里的
+  // `'stat_date'` 不是列引用，那会让无关日期字面量也报上。
+  // ⚠️ 「无法检查」不能盖过**已确认**的错位（CodeRabbit 2026-11-11 第十四轮，实测）：
+  // 外层 `stat_date >= '2026-10-13'` 是确定的少算一天，同句再带一个拼接实参的 `query()`
+  // 时若提前返回「无法检查」，Agent 只看到「没法检查」、不会去改那条真会少算的过滤。
+  // 顺序因此是：外层扫描优先；只有外层**什么都没发现**时才退化成声明缺口。
+  const unexpandableHint = (): DayHint | null =>
+    (unexpandable ? { kind: 'unexpandable', text: unexpandableQueryHint(loc) } : null)
+  if (!ISO_DAY_COL_RE.test(withoutLiterals(code)) && !hasDayColumnSelector(code)
+    && !hasDayColumnKeyReference(code)) return unexpandableHint()
+  // 在「只抹注释」的文本上找孤立的**开引号**。`withoutComments` 原样保留双引号标识符与
+  // 美元引号体，所以这两段必须整体跳过（CodeRabbit 2026-11-10）：`SELECT "it's" …` 里的
+  // `'` 会被当成开引号、把后面的真实字面量吞进一个假字面量，警告静默丢失。
+  for (let i = 0; i < code.length; i++) {
+    if (code[i] === '"') {
+      // 双引号标识符：`""` 是转义引号（与单引号串同款）
+      for (i++; i < code.length; i++) {
+        if (code[i] === '"') { if (code[i + 1] !== '"') break; i++ }
+      }
+      continue
+    }
+    // 字面量（单引号 / E 串 / 美元引号）：体**本身**就可以是日期字面量（`$$2026-10-13$$`
+    // 实测与 `'2026-10-13'` 等价，CodeRabbit 2026-11-10 第五轮）；解码与读取走 `mask.ts`
+    // 的同一实现（`readSqlString`）。标识符边界由它的美元引号判据负责。
+    const lit = readSqlString(code, i)
+    if (lit !== null) {
+      if (isMiscomparedDayLiteral(lit.value)) return { kind: 'mismatch', text: isoDayLiteralHint(loc) }
+      i = lit.end - 1
+      continue
+    }
+  }
+  // 有日列引用但字面量都规范 → 外层没有确定结论，仍要声明不可展开的缺口（不得静默）。
+  return unexpandableHint()
+}
+
+/**
+ * SQL 里是否有**列选择器**里的字面量指向时间列：`COLUMNS('stat_date')` / `COLUMNS('stat.*')` /
+ * `"COLUMNS"('…')`。
+ *
+ * `COLUMNS(<正则字符串>)` 的串是**执行语义**（选择哪些列），不是普通字面量 —— 实测
+ * `WHERE COLUMNS('stat_date') >= '2026-10-13'` 两天夹具只计一天。判据限定在 COLUMNS 的
+ * 实参里：任意位置的普通字符串不当列名。参数按 DuckDB 的正则语义解释；非法正则由
+ * DuckDB 自己报错，这里不据此报警。
+ */
+function hasDayColumnSelector(code: string): boolean {
+  for (const { open } of sqlFunctionCalls(code, 'columns')) {
+    const lit = readSqlString(code, skipSqlTrivia(code, open))
+    if (lit === null) continue
+    if (ISO_DAY_COL_RE.test(lit.value)) return true
+    try {
+      const rx = new RegExp(lit.value, 'i')
+      if (rx.test('stat_date') || rx.test('work_date')) return true
+    } catch { /* 非法正则：DuckDB 会自己报错，这里不据此报警 */ }
+  }
+  return false
+}
+
+/**
+ * 与 `hasDayColumnSelector` 同一问题的另两种写法（Codex 2026-11-10 第八轮 P2，均实测）：
+ *   · `struct_extract(d, 'stat_date')` / `COLUMNS(['stat_date', 'stat.*'])`：列名是**列表**或
+ *     其它函数的位置实参里的字符串 —— 函数名与实参不是一一对应，所以按「有时间列名字面量
+ *     出现在函数调用的实参括号里」认，而不是给每个函数名各写一条规则；
+ *   · `d['stat_date']`：下标访问，列名在方括号里。
+ *
+ * 反面（不认）：普通位置的字符串（`SELECT 'stat_date' AS label`）、字面量里的伪代码。
+ * 方向性：误认只会多一条带修复方法的日期警告（与 `hasDayColumnSelector` 同一取舍）。
+ */
+function hasDayColumnKeyReference(code: string): boolean {
+  const blank = withoutLiterals(code)
+  // ⚠️ 标识符判据必须与 SQL 词法一致（Codex 2026-11-11 第十四轮 P2，实测）：DuckDB 接受
+  // 任何非 ASCII 非空白字符作未引用标识符（`AS 数据` 合法），`数据['stat_date']` 与
+  // `d['stat_date']` 等价、边界日同样被排除；ASCII 正则认不出别名 → 括号都没看 → 零警告。
+  // 复用 `mask.ts` 的 isIdentCp（经 `isIdentAt` 前向 / `isIdentCharAt` 前导边界），
+  // 标识符规则只许一个实现点。
+  const ws = /[ \t\n\r\f\v]/
+  for (let i = 0; i < blank.length; i++) {
+    let nameEnd: number
+    if (blank[i] === '"') {
+      // 双引号标识符整段跳过（`""` 是转义引号；未闭合时退到末尾）
+      let j = i + 1
+      while (j < blank.length && !(blank[j] === '"' && blank[j + 1] !== '"')) {
+        j += blank[j] === '"' && blank[j + 1] === '"' ? 2 : 1
+      }
+      nameEnd = Math.min(j + 1, blank.length)
+    } else if (isIdentAt(blank, i) && !isIdentCharAt(blank, i)) {
+      // 未引用标识符的**起点**（前一个字符不是标识符字符）
+      let j = i
+      while (j < blank.length && isIdentAt(blank, j)) j++
+      nameEnd = j
+    } else {
+      continue
+    }
+    let k = nameEnd
+    while (k < blank.length && ws.test(blank[k]!)) k++
+    if (blank[k] !== '(' && blank[k] !== '[') { i = nameEnd - 1; continue }
+    const close = blank[k] === '(' ? ')' : ']'
+    const end = matchingParen(blank, k, blank[k]!, close)
+    if (end === -1) { i = nameEnd - 1; continue }
+    // 实参里的每个字符串字面量：本身就是时间列名，或是以时间列名结尾的下标 `d['stat_date']`
+    //（下标表达式里的引号紧跟在 `[` 后）。
+    // ⚠️ 先跳过完整的双引号标识符再认字面量：`struct_extract("it's", 'stat_date')` 里
+    // `"it's"` 内部的撇号不是字符串起始，按字面量读会一路吞到 `'stat_date'` 之后
+    //（Codex 2026-11-10 第九轮 P2，实测该写法下库值被排除边界日却无警告）。
+    for (let s = k + 1; s < end; s++) {
+      if (code[s] === '"') {
+        // 双引号标识符整段跳过：`""` 是转义引号；未闭合时退到区间末尾
+        let t = s + 1
+        while (t < end && !(code[t] === '"' && code[t + 1] !== '"')) {
+          t += code[t] === '"' && code[t + 1] === '"' ? 2 : 1
+        }
+        s = t
+        continue
+      }
+      const lit = readSqlString(code, s)
+      if (lit === null) continue
+      if (ISO_DAY_COL_RE.test(lit.value)) return true
+      s = lit.end - 1
+    }
+    i = k   // 从实参内部继续扫（原实现 re.lastIndex = k + 1）
+  }
+  return false
+}
+
+/**
+ * 列表 / 函数的括号或下标方括号配对，返回**闭括号之后**的下标；不成对返回 -1。
+ *
+ * ⚠️ 先把字面量与注释抹成空白再数（`withoutLiterals` 的结果）：字符串里的括号不参与配对；
+ * 双引号标识符可以是「函数名」（`"f"(…)`）也可含括号（`"a(b"`），所以从**扫描位置**起按
+ * 词法推进，而不是简单字符计数。每次循环都前进，绝不空转。
+ */
+function matchingParen(blank: string, open: number, openCh: string, closeCh: string): number {
+  let depth = 0
+  for (let i = open; i < blank.length; i++) {
+    const ch = blank[i]
+    if (ch === '"') {
+      // 双引号标识符整段跳过（`""` 是转义引号）
+      let j = i + 1
+      for (; j < blank.length; j++) {
+        if (blank[j] === '"') { if (blank[j + 1] !== '"') break; j++ }
+      }
+      i = j
+      continue
+    }
+    if (ch === openCh) depth++
+    else if (ch === closeCh) {
+      if (--depth === 0) return i + 1
+    }
+  }
+  return -1
+}
+
+/**
+ * `query()` 的实参不是单个静态字符串（拼接 / 函数调用）：内层 SQL 随时可以拼出
+ * `stat_date >= '2026-10-13'` 这类错位日字面量，而静态判据看不见 —— 声明检查边界
+ * （Codex 2026-11-10 第六轮 P2 实测 `query('SELECT ' || '1')` 被冒认成内层 `SELECT `）。
+ */
+function unexpandableQueryHint(loc?: StoreLocation): string {
+  return 'SQL 的 `query()` 实参不是单个静态字符串（拼接 / 函数调用等）：内层 SQL 无法静态展开，'
+    + '其中是否含「少算一天」的日期过滤**无法检查**——请确认内层用的是 UTC 形态'
+    + '（如 \'2026-10-12T16:00:00.000Z\'），或改用 `' + queryTableCommand('<表>', loc) + '`'
+}
+
 function isoDayLiteralHint(loc?: StoreLocation): string {
   return '该列列内是 UTC `…Z` 形态的字符串（上海日零点 = 前一日 16:00Z），按字典序比较，' +
-    '日期字面量会**少算或漏掉当天**。要在 --sql 里过滤请写 UTC 形态（如 \'2026-10-12T16:00:00.000Z\'），' +
-    '或改用 `' + queryTableCommand('<表>', loc) + ' --since/--until`（该通道已处理取整语义）'
+    '这个日期字面量会**少算或漏掉一天**（`…Z` 是 UTC 时刻，不是上海日）。要在 --sql 里过滤请写 UTC 形态' +
+    '（如 \'2026-10-12T16:00:00.000Z\'），或改用 `' + queryTableCommand('<表>', loc) + ' --since/--until`（该通道已处理取整语义）'
 }
 
 /**
@@ -202,6 +451,10 @@ interface QueryFlags {
 
 function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
   const out: QueryFlags & { rest: string[] } = { noMask: false, groupBy: [], rest: [] }
+  // 值位 flag 重复出现必须报错（Codex 2026-11-10 P2）：此前只有 `parseStoreFlags` 拒绝，
+  // 而本解析器同样直接赋值 —— `query --db a --db b` 静默作用在后一个库上。
+  // `--group-by` 例外：它本来就允许重复（spec §六）。
+  const seen = new Set<string>()
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (VALUE_FLAGS.has(a)) {
@@ -214,6 +467,10 @@ function parseFlags(argv: string[]): QueryFlags & { rest: string[] } {
       //（与帮助模式的 `helpArgsError` 同源，2026-11-06 Codex 审查）。
       if (v === undefined || (DASH_VALUE_FLAGS.has(a) ? FLAG_TOKENS.has(v) : v.startsWith('--'))) {
         throw new Error(`${a} 缺少取值`)
+      }
+      if (a !== '--group-by') {
+        if (seen.has(a)) throw new Error(`${a} 重复出现：只能给一次（不做静默覆盖）`)
+        seen.add(a)
       }
       if (a === '--sql') out.sql = v
       else if (a === '--table') out.table = v
@@ -460,7 +717,11 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
 
   // 0 行 ≠ 没有数据（spec §十 / 红线 3）：给了时间过滤而 0 行时附可操作提示。
   if (result.rows.length === 0 && (input.since !== undefined || input.until !== undefined)) {
-    warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until, loc))
+    // 区间倒置（只给 --until 且早于表 MIN）的成因已由 buildTimeFilter 的警告说清，
+    // 且它是**必然** 0 行 —— 再叠一条「同步可能未覆盖该区间」是假归因
+    //（同步正常覆盖了这段，只是上限压根没到开始）（2026-11-09 审计）。
+    const inverted = plan.resolvedRange !== null && plan.resolvedRange[0] > plan.resolvedRange[1]
+    if (!inverted) warnings.push(zeroRowWarning(plan.resolvedRange, tc, input.until, loc))
   } else if (result.rows.length === 0) {
     // 没给时间过滤也 0 行：spec §十 把「空表」列为 warnings 的触发条件。
     // 这里必须能区分「表空」与「查询没命中」—— `--table` 通道没有 WHERE 子句（除了时间过滤），
@@ -490,8 +751,15 @@ async function runTableQuery(session: SandboxSession, input: TableRunInput): Pro
     // `coveredDays` 来自实际查询区间，缺省上界含今天；而 expectedDays 已排除今天。
     // 今天只要有一行，就会把昨天的真缺口补满 → 零警告（实测：10/13–10/18 + 今天、
     // 缺 10/19，`--since 7d` 输出 warnings: []）。这里按夹紧后的 hi 再算一次。
+    // ⚠️ 夹紧后的上界可能**早于下界**（2026-11-09 实测）：窗口只有今天一格时
+    //（`--since <今天>`，iso-day 下 lo = hi = 今天零点），今天被排除 → hi = 昨天零点 < lo。
+    // 此时窗口内一个应覆盖的日子都没有：跳过覆盖重算、不报缺口。此前照样拿夹紧后的上界
+    // 跑 `buildCoverageQuery` → 抛「区间无效」用法错误，而本段在 usageFail 的 try 之外，
+    // 异常冒到顶层被归成 `internal` +「若反复出现请报告此问题」——正常问法被说成内部故障。
     let daysInWindow = coveredDays
-    if (hi < plan.resolvedRange[1]) {
+    if (hi < plan.resolvedRange[0]) {
+      daysInWindow = 0
+    } else if (hi < plan.resolvedRange[1]) {
       const clamped = buildCoverageQuery({ ...input, until: hi })
       const row = (await session.run(clamped.sql, {
         params: clamped.params, timeoutMs: input.timeoutMs,
@@ -683,11 +951,11 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     if (result.rows.length === 0 && ZERO_ROW_TIME_RE.test(sqlText)) {
       warnings.push(`查询返回 0 行，且 SQL 引用了业务时间列。${zeroRowHint(openedLoc)}`)
     }
-    // iso-day 列 + 日期形态字面量 → 按字符串比较会少一天（场景 F3）。与 0 行无关：
-    // 非 0 行也可能已经悄悄少了一整天，这正是它危险的地方。
-    if (ISO_DAY_COL_RE.test(sqlText) && DAY_LITERAL_RE.test(sqlText)) {
-      warnings.push(isoDayLiteralHint(openedLoc))
-    }
+  // ⚠️ 不要在这里重复判 `ISO_DAY_COL_RE.test(sqlText)`（CR/Codex 2026-11-10 第六轮）：
+    // 列名可能只在 `COLUMNS('stat.*')` 的选择器串里，外层 gate 会让内层 hint 永远看不到它。
+    // 列名判定只在 `dayLiteralHint` 里做（含选择器形态）。
+    const dayHint = dayLiteralHint(sqlText, openedLoc)
+    if (dayHint !== null) warnings.push(dayHint)
     // 截断不得静默：Agent 会把「只看到前 N 行」当成事实（spec §十）。
     if (result.truncated) {
       warnings.push(truncationWarning(masked.rows.length, limit, 'sql', true, openedLoc))

@@ -50,6 +50,14 @@ export const ERROR_KINDS = [
   // 可被整体替换）—— 退出码 1，重试无用，必须由人执行 chmod 收紧密码。
   // ⚠️ 与 `auth_missing` 的区别：那是「没配」，这是「配了但落在不安全的位置」。
   'config_insecure',
+  // 配置层（2026-11-09 审计）：配置文件的**内容**读不出来（畸形 JSON / 未知键 /
+  // 路径不是普通文件）—— 退出码 1，改参数修不好，必须先修文件。
+  // ⚠️ **权限拒绝不属于这里**：那是 `config_insecure`（`permissionReadError` / auth 的
+  // insecure 分支），修法是 chmod/icacls，不是改文件内容（CodeRabbit 2026-11-11 第十四轮：
+  // 旧注释把「权限拒绝」列在本 kind 的成因里，照着它分流会挑错 kind）。此前 `auth login`
+  // 把读失败报成 `kind: usage`（退出码 2），而退出码 2 的语义是「改参数重来」：换环境变量
+  // 不会修好损坏的 JSON（`auth whoami` 对同一状态是降级为 warning、退出 0）。
+  'config_invalid',
 ] as const
 
 // ⚠️ `sandbox_blocked` / `query_error` 是 **code** 不是 kind：查询层的这两类失败

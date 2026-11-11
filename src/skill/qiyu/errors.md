@@ -11,7 +11,8 @@
 | 信号 | 动作 |
 |---|---|
 | `kind: auth_missing` | 凭证未配置（环境变量与配置文件都没有）。按 hint 设置 `QIYU_APP_KEY`/`QIYU_APP_SECRET` 或让人类跑 `qiyu auth login`；原命令重试无用 |
-| `kind: config_insecure` | 配置文件**含凭证**但权限过宽（group/other 有任何权限位，可读时可读到 appSecret）。重试无用——转告人类执行 hint 里点名的 `chmod` 后重跑 |
+| `kind: config_insecure` | 配置文件的**权限**问题，重试无用：①文件含凭证但权限过宽（group/other 有任何权限位，可读时可读到 appSecret）；②文件因权限拒绝**读不出来**（POSIX：`EACCES`/`EPERM`，hint 是 `chmod 600` 文件；Windows：NTFS ACL 拒绝，hint 是 `icacls <路径> /reset`）；③配置**目录**不可搜索/不可进入（POSIX hint 是 `chmod 700` 目录，Windows 同样是 `icacls … /reset`）。都转告人类执行 hint 里点名的命令后重跑；**不是**凭证缺失，不要改去 `auth login` |
+| `kind: config_invalid` | 配置文件**内容**读不出来（畸形 JSON / 不认识的键 / 路径不是普通文件），退出码 1。改参数、重试都修不好：按 hint 先修好或移走该文件，再重跑；`auth login` 此时**没有**写入任何内容 |
 | `kind: auth` | 凭证被服务端拒绝（key 错、IP 不在白名单、接口无权限）。按 hint 修配置；重试无用 |
 | `kind: bad_time` | 时间戳超期。CLI 已自动重签重试过；仍失败说明本机时钟真的偏了——校准系统时间 |
 | `kind: param` | 参数错误。按 message 与 hint 修正；重试无用 |

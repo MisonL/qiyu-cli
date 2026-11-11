@@ -30,7 +30,8 @@ export type RunStatus = typeof RUN_STATUSES[number]
 export interface TaskRunResult {
   taskId: string
   /**
-   * 窗口计数（修复批 6 #2 起 `skipped` 恒在）：total = succeeded + failed + skipped。
+   * 窗口计数（修复批 6 #2 起 `skipped` 恒在）：total = succeeded + failed + skipped；
+   * 物理切出的窗数 = total + contained（见 contained 的说明）。
    * skipped = 残段窗（日对齐任务被显式区间钳出的非日界首/末段）——引擎跳过不 fetch、
    * 不写库、不推水位（半日聚合不写日行）：末残段的整日值**可能**由其请求区间覆盖该
    * 整天的日对齐 run 补全（水位停在末整日窗 end、续跑起点落回日界；请求区间未覆盖
@@ -38,7 +39,18 @@ export interface TaskRunResult {
    * 没有合法落点，属显式 --since 区间的边界语义，要覆盖该日请给更宽的 --since）。
    * 跳过窗仍如实计数可见，绝不静默消失。
    */
-  windows: { total: number; succeeded: number; failed: number; skipped: number }
+  windows: {
+    total: number; succeeded: number; failed: number; skipped: number
+    /**
+     * 被重叠区合并掉的窗数（`skipContained` 剔除，2026-11-09 起）。这些窗**不执行**：
+     * 它们完全落在前一窗的回看重叠区内（overlapDays > 0 的任务，如工单 3 天回看），
+     * 数据已由前一窗覆盖 —— 所以既不算 succeeded 也**不算 skipped**（skipped 的语义是
+     * 「该拉的没拉」，而这里的没拉是因为重复）。「已覆盖」**以覆盖窗成功为前提**：
+     * 覆盖它的那一窗失败时这些窗记 skipped 并逐窗出进度行（2026-11-10，Codex 第三轮）。
+     * 仅在 > 0 时输出；**不计入 total** —— 物理切出的窗数 = total + contained。
+     */
+    contained?: number
+  }
   rows: { fetched: number; written: number }
   resolvedRange: Range
   gaps: GapInfo[]

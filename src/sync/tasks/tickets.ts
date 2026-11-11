@@ -41,8 +41,11 @@ function assertOpWindow(w: WindowRef): void {
     throw usageError(`工单 op 窗口无效：opEnd 缺省/为 0 时服务端会静默返回全量，` +
       `opStart<=0（1970 哨兵）会被静默钳制（窗口 start=${w.start}, end=${w.end}）`)
   }
-  if (w.start > w.end) {
-    throw usageError(`工单 op 窗口顺序颠倒（opStart > opEnd 会静默失效）：start=${w.start} > end=${w.end}`)
+  // ⚠️ 零宽窗（start === end）同样拒绝（2026-11-09 审计）：它的 opStart 不早于 opEnd，
+  // 若被发出去，服务端对它是否等于「未传 opEnd」没有契约保证 —— 姊妹管线
+  // （pipeline.ts 的会话导出）对同一形态已经是 `w.end <= w.start` 拒绝，两处判据必须同向。
+  if (w.start >= w.end) {
+    throw usageError(`工单 op 窗口无效（opStart 必须早于 opEnd）：start=${w.start} >= end=${w.end}`)
   }
 }
 

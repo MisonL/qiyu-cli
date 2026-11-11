@@ -27,7 +27,7 @@ import { readWatermark } from '../sync/state.js'
 // callPaced 静态导入（范围外发现③）：wireCategories 的注入路径也必须过任务层的限频闸门 ——
 // 该接口（ai.knowledge.getCategoryTree）限频 1 次/秒，裸 call 不落冷却行。
 import { callPaced } from '../sync/tasks/pace.js'
-import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso } from '../core/time.js'
+import { DAY_MS, parseTimeArg, msToShanghaiIso, shanghaiIso, shanghaiDayStart, shanghaiYesterdayStart } from '../core/time.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty } from '../output.js'
 import { thrownToExit } from './store.js'
 import { classifyOpenFailure, openFailureHint } from '../store/retry.js'
@@ -290,6 +290,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       if (v === undefined || v.startsWith('--')) {
         return usageFail(`${a} 缺少取值`)
       }
+      // 重复出现必须报错（Codex 2026-11-10 P2）：本命令自己解析这三个 flag（不走
+      // parseStoreFlags），此前直接赋值 —— `sync run --db a --db b` 静默作用在后一个库。
+      if (flags[a] !== undefined) return usageFail(`${a} 重复出现：只能给一次（不做静默覆盖）`)
       flags[a] = v
       i++
     } else if (RUN_BOOL_FLAGS.includes(a) || a === '--pretty') {
@@ -395,7 +398,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       const end = untilMs === null ? clock()
         : typeof untilMs === 'object' ? untilMs.end : untilMs
       if (start >= end) {
-        return usageFail(`区间无效：start >= end（${new Date(start).toISOString()} >= ${new Date(end).toISOString()}）`)
+        return usageFail(
+          `区间无效：解析后的起点不早于终点（start=${shanghaiIso(start)} >= end=${shanghaiIso(end)}）`,
+          EMPTY_RANGE_HINT)
       }
       rangeOverride = { start, end }
     }
@@ -469,6 +474,46 @@ export async function runSyncRun(argv: string[]): Promise<number> {
         }
       }
     }
+    // 非日界 `--until` + 日对齐任务（2026-11-10 审计）：末窗 end 不在上海日界 → 末残段
+    // 被跳过（半日聚合不落日行），用户说「同步到 10/15 中午」却一行 10/15 都没有，
+    // 而输出是 complete、gaps 为空 —— 必须用 notes 把这一条说在明处，并给出真能用的写法。
+    const untilNotes = new Map<string, string[]>()
+    if (rangeOverride !== undefined && untilRaw !== undefined) {
+      const untilEnd = parseTimeArg(untilRaw, clock, '--until')
+      // 只对「日期 / ISO 时刻」这两种定点写法提示：Nd / yesterday 解析成区间（end=now），
+      // 那是「最近 N 天」的常规用法，今天不满一天属既有语义（每日残段由次日 run 补全），
+      // 每次都提示只会变成噪音。
+      const boundary = untilEnd === null || typeof untilEnd === 'object' ? null : untilEnd
+      if (boundary !== null && boundary !== shanghaiDayStart(boundary)) {
+        for (const t of selected) {
+          if (t.windowAlign !== 'shanghaiDay') continue
+          // ⚠️ 声明了末端上限的任务（考勤/绩效 `windowEndClamp: 'shanghaiYesterday'`）：
+          // 目标日已过日界但**晚于上限**时，把 --until 写到次日也拉不到 —— 增量拉取永远
+          // 停在「昨天 0 点」，剩下的只能等上限自然前移（Codex 2026-11-10 第二轮 P2：
+          // 旧文案一律劝「写到次日 0 点」，照做后提示消失、该日仍未同步）。
+          const dayStart = shanghaiDayStart(boundary)
+          if (t.windowEndClamp === 'shanghaiYesterday') {
+            const limit = shanghaiYesterdayStart(clock())
+            if (dayStart >= limit) {
+              untilNotes.set(t.id, [
+                `--until 终点 ${shanghaiIso(boundary)} 不是上海日界（00:00），且 ` +
+                `${shanghaiIso(dayStart)} 这一天不早于本任务的末端上限 ${shanghaiIso(limit)}`
+                + '（该接口 endTime 不能晚于昨天 0 点，越界会被拒）：调整 --until 也无法拉到这段 ——'
+                + '本任务最多同步到上限之前，之后的日期要等上限自然前移（次日）再跑增量。',
+              ])
+              continue
+            }
+          }
+          untilNotes.set(t.id, [
+            `--until 解析到的终点 ${shanghaiIso(boundary)} 不是上海日界（00:00）：本任务按上海`
+            + '自然日对齐切窗（每窗一个整日聚合），末窗是半个自然日、按残段窗跳过（不拉、不写）——'
+            + `从 ${shanghaiIso(dayStart)} 起的这一天不会进库，`
+            + '结果里的 complete 与 gaps 为空不代表这一段已同步。要含该日请把 --until 写到次日 0 点'
+            + '（如 --until 2026-10-16 含 10/15 整天）。',
+          ])
+        }
+      }
+    }
     const ranks = [...new Set(selected.map((t) => taskRank(t)))].sort((a, b) => a - b)
     for (const rank of ranks) {
       const layer = selected.filter((t) => taskRank(t) === rank)
@@ -489,7 +534,8 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     const tasksOut = []
     for (const r of results) {
       const st = await readWatermark(store, r.taskId)
-      tasksOut.push(taskOut(r, st.watermark, st.lastSyncedAt, floorNotes.get(r.taskId) ?? []))
+      tasksOut.push(taskOut(r, st.watermark, st.lastSyncedAt,
+        [...(floorNotes.get(r.taskId) ?? []), ...(untilNotes.get(r.taskId) ?? [])]))
     }
     // 全失败判定（T13 fix 中-1）：引擎对 windowed 全窗失败权威产出 partial（'failed'
     // 只留给快照 gate 拦截路径）——「全失败」必须补判窗口级：succeeded=0 且 failed>0
@@ -504,6 +550,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
         if (r.gaps.length > 0) {
           process.stderr.write(`[${r.taskId}] ${r.gaps.length} 个缺口：` +
             r.gaps.map((g) => g.reason).join('、') + '\n')
+        }
+        for (const n of untilNotes.get(r.taskId) ?? []) {
+          process.stderr.write(`[${r.taskId}] 提示：${n}\n`)
         }
         for (const n of floorNotes.get(r.taskId) ?? []) {
           process.stderr.write(`[${r.taskId}] 提示：${n}\n`)
@@ -520,13 +569,30 @@ export async function runSyncRun(argv: string[]): Promise<number> {
   }
 }
 
+/**
+ * 区间两端的解析（`--since` / `--until` 共用）与「区间为空」的统一判定。
+ *
+ * `--until YYYY-MM-DD` 解析成**该日 0 点**，区间按半开 `[start, end)` 取 —— 所以
+ * 「同一天的 --since 与 --until」区间为零宽、什么都不会拉（2026-11-10 审计：此前的
+ * 报错只说「start >= end」并回显两个相同的 ISO 时刻，用户看不出这是日期语义导致的）。
+ * `--since 2026-09-01 --until 2026-09-20` 覆盖 9/1…9/19 —— 要含 9/20 当天，`--until` 写 9/21。
+ */
+const EMPTY_RANGE_HINT =
+  '按半开区间 [--since, --until) 计：--since 与 --until 解析到同一时刻时什么都不拉；'
+  + '`--until YYYY-MM-DD` 是该日 0 点（不包含当天）—— 要含那一天请把 --until 写到次日'
+
 export const SYNC_RUN_USAGE = `用法：qiyu sync run [任务...] [参数]
 
   qiyu sync run                 增量同步全部任务（缺省 = 注册表全部）
   qiyu sync run <任务...>       只跑指定任务
   --full                        全区间重刷（与 --since/--until 互斥）
   --since T --until T           指定区间；T 支持 Nd / yesterday / YYYY-MM-DD / ISO 8601
-                                （相对时间与日期按 Asia/Shanghai 解析）
+                                （相对时间与日期按 Asia/Shanghai 解析；区间按半开
+                                [--since, --until) 计，--until YYYY-MM-DD 不含当天；
+                                日对齐任务（报表）的 --until 请写日界，否则末残段跳过；
+                                只给 --until 不给 --since 时起点是「最早」——报表这类没声明
+                                接口下界的任务会从 1970 按天切出上万窗（等同 --full 的量级），
+                                只补某一段请成对给 --since）
   --quiet                       关闭 stderr 进度
   --db / --profile / --backend  存储定位（store 命令同族）
 

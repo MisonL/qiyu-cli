@@ -264,13 +264,13 @@ describe('query --sql · 成功路径（spec §十）', () => {
     // 纯日期字面量同样触发
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
-    expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(true)
+    expect((meta().warnings as string[]).some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))).toBe(true)
 
     // ⚠️ 空格分隔形态同样触发（场景审查 4）：`'2026-10-13 00:00:00'` 与 `T` 形态等价，
     // 旧正则只认 `T` → 这种写法静默少算一天、零 warning。
     expect(await q('--sql',
       "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13 00:00:00'")).toBe(0)
-    expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(true)
+    expect((meta().warnings as string[]).some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))).toBe(true)
 
     // 反证 1：UTC `…Z` 形态（正确写法）不警告
     expect(await q('--sql',
@@ -282,9 +282,317 @@ describe('query --sql · 成功路径（spec §十）', () => {
       "SELECT COUNT(*) AS n FROM sessions WHERE session_id >= '2026-10-13'")).toBe(0)
     expect((meta().warnings as string[]).some((x) => /少算或漏掉当天/.test(x))).toBe(false)
   })
+
+  it('无法静态展开的 query() 声明日期检查边界；普通字面量不冒认列引用', async () => {
+    await seed()
+    const sql = "SELECT * FROM query('SELECT count(*) AS n FROM daily_overview WHERE ' || 'stat_date >= ''2026-10-13''')"
+    expect(await q('--sql', sql)).toBe(0)
+    expect(rowsOf()[0]?.n).toBe('1')
+
+    expect(await q('--sql', "SELECT 'stat_date' AS label, '2026-10-13' AS day")).toBe(0)
+    expect((meta().warnings as string[]).join('\n')).not.toMatch(/少算或漏掉/)
+  })
+
+  it('COLUMNS 的美元引号与注释实参也声明日期错位', async () => {
+    await seed()
+    for (const selector of ["COLUMNS($$stat.*$$)", "COLUMNS(/* 注释 */ 'stat.*')"]) {
+      expect(await q('--sql', `SELECT COUNT(*) AS n FROM daily_overview WHERE ${selector} >= '2026-10-13'`)).toBe(0)
+      expect(rowsOf()[0]?.n).toBe('1')
+      expect((meta().warnings as string[]).join('\n')).toMatch(/少算或漏掉/)
+    }
+  })
+
+  // ⚠️ 本机负载 40+ 时 DuckDB 冷开实测 80s+（2026-11-10），与 `query --table` 的超时用例同款放宽
+  it('列表或结构体键形式的时间列引用同样警告（Codex 第八轮 P2）', { timeout: 180_000 }, async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测（2026-11-10 DuckDB）：`COLUMNS(['stat_date'])`、`struct_extract(d, 'stat_date')`、
+    // `d['stat_date']` 都与裸列引用等价 —— 两天夹具只计一天，列名只出现在字符串里。
+    // 列表里的正则**不展开**（实测 `COLUMNS(['stat.*'])` 报 Binder Error「Column "stat.*" not found」），
+    // 所以列表形态用精确列名；正则只对单字符串实参成立。
+    for (const ref of ["COLUMNS(['stat_date'])", "COLUMNS('stat.*')"]) {
+      expect(await q('--sql',
+        `SELECT COUNT(*) AS n FROM daily_overview WHERE ${ref} >= '2026-10-13'`), ref).toBe(0)
+      expect(warned(), ref).toBe(true)
+    }
+    // struct_extract / 下标形式在 daily_overview 上没有结构体列可指（表定义封闭），
+    // 这里用同一判据函数覆盖：列名出现在字符串键里且与日期字面量同现即警告。
+    // 反证：列表里不是时间列 / 普通字符串不属于列选择 → 不警告
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE COLUMNS(['payload']) >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(false)
+    expect(await q('--sql',
+      "SELECT 'stat_date' AS label, '2026-10-13' AS day")).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
+  // ⚠️ 本机负载 40+ 时 DuckDB 冷开实测 80s+（2026-11-10），与 `query --table` 的超时用例同款放宽
+  it('双引号别名里的撇号不吞掉后面的键字面量（Codex 第九轮 P2）', { timeout: 180_000 }, async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测 2026-11-10：`SELECT COUNT(*) … FROM daily_overview AS "it's" WHERE
+    // struct_extract("it's", 'stat_date') >= '2026-10-13'` 两天夹具只计一天。
+    // 别名里的撇号不是字符串起始；旧扫描从它开始读字面量，一路吞掉真正的 `'stat_date'`，
+    // 于是列名只剩在字符串里、外层 gate 判「没有日期列」→ 零警告。用 query() 包装让
+    // 这段 SQL 真跑（沙箱放行形态），同时逼判据只看内层实参。
+    const sql = 'SELECT * FROM query($$'
+      + `SELECT COUNT(*) AS n FROM daily_overview AS "it's" WHERE struct_extract("it's", 'stat_date') >= '2026-10-13'`
+      + '$$)'
+    expect(await q('--sql', sql)).toBe(0)
+    expect(rowsOf()[0]?.n).toBe('1')
+    expect(warned()).toBe(true)
+    // 反证：同样的别名、键不是时间列名 → 不误报
+    const neg = 'SELECT * FROM query($$'
+      + `SELECT COUNT(*) AS n FROM daily_overview AS "it's" WHERE struct_extract("it's", 'payload') >= '2026-10-13'`
+      + '$$)'
+    expect(await q('--sql', neg)).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
+  it('日期字面量首尾带空白、尾随字符时同样按错位警告（Codex 第七轮 P2）', async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测（2026-11-10 DuckDB 临时库）：库值 `…16:00:00.000Z` >= `'…16:00:00.000Z '` 为 **false**
+    // —— 字面量多出的尾随字符在字典序上把它排到库值之后，边界日整列被排除；而旧判据先
+    // `trim()` 再看形态，把它当成列内合法写法放行、零警告。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Z '")).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Zx'")).toBe(0)
+    expect(warned()).toBe(true)
+    // **前导**空白也不是库内形态：实测 `<= ' 2026-…Z'` 一行都不剩（`>=` 则全放行）——
+    // 判据不看运算符，按方向安全一律警告（Codex 第十一轮 P2；此前按 `>=` 单方向实证
+    // 放行，反过来用就静默漏报）。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= ' 2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证：逐字一致的列内形态仍然放行（不因去掉 trim 而多报）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
+  it('不可展开的 query() 不吞掉外层已确认的错位警告（CodeRabbit 第十四轮 minor）', { timeout: 180_000 }, async () => {
+    await seed()
+    const all = (): string => (meta().warnings as string[]).join('\n')
+    const definite = (): boolean => /少算或漏掉一天|少算或漏掉当天/.test(all())
+    // 实测（2026-11-11）：外层 `stat_date >= '2026-10-13'` 单独出现必报「少算或漏掉一天」；
+    // 同句再加一个拼接实参的 query() 时，旧实现先返回「无法检查」，**确定**的警告连同修法
+    // 一起被替换 —— Agent 只看到「没法检查」，不会去改那条真的会少算的过滤。
+    const withUnexpandable = "SELECT COUNT(*) AS n FROM daily_overview "
+      + "WHERE stat_date >= '2026-10-13' AND EXISTS (SELECT * FROM query('SELECT ' || '1'))"
+    expect(await q('--sql', withUnexpandable)).toBe(0)
+    expect(definite(), '确定警告优先于「无法检查」').toBe(true)
+    // 反证①：外层没有错位字面量时，不可展开仍要声明缺口（不能因为改了顺序就静默）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13T16:00:00.000Z' "
+      + "AND EXISTS (SELECT * FROM query('SELECT ' || '1'))")).toBe(0)
+    expect(definite(), '规范字面量不该报错位').toBe(false)
+    expect(all(), '没有确定警告时必须声明「无法检查」').toMatch(/无法检查/)
+    // 反证②：完全没有日列引用的不可展开 query() 同样声明缺口
+    expect(await q('--sql', "SELECT * FROM query('SELECT ' || '1')")).toBe(0)
+    expect(all()).toMatch(/无法检查/)
+    // 反证③（CodeRabbit 第十七轮 minor）：里层套一层**静态** query() 的「无法检查」也不能
+    // 提前返回、遮住外层已确认的错位。里层递归先遇到这层「无法检查」，旧实现直接 return 它，
+    // 外层的 `stat_date >= '2026-10-13'` 就没被检查。
+    const nestedStatic = "SELECT COUNT(*) AS n FROM daily_overview "
+      + "WHERE stat_date >= '2026-10-13' "
+      + "AND EXISTS (SELECT * FROM query($q$SELECT * FROM query('SELECT ' || '1')$q$))"
+    expect(await q('--sql', nestedStatic)).toBe(0)
+    expect(definite(), '里层「无法检查」不能遮住外层的确定警告').toBe(true)
+  })
+
+  it('Unicode 别名的下标键引用同样警告（Codex 第十四轮 P2）', { timeout: 180_000 }, async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测（2026-11-11）：DuckDB 接受任何非 ASCII 非空白字符作标识符（`AS 数据` 合法），
+    // `数据['stat_date'] >= '2026-10-13'` 与 `d['stat_date']` 等价、边界日被排除；
+    // 而键引用扫描的标识符正则只认 ASCII，别名认不出来 → 括号都没看 → 零警告。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview AS 数据 WHERE 数据['stat_date'] >= '2026-10-13'")).toBe(0)
+    expect(rowsOf()[0]?.n).toBe('1')
+    expect(warned(), 'Unicode 别名的下标键也必须被认出来').toBe(true)
+    // 反证：同样的 Unicode 别名、键不是时间列名 → 不误报
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview AS 数据 WHERE 数据['payload'] >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(false)
+  })
+
+  it('非规范 iso-day 写法（空格分隔 / 前导空白）同样警告（Codex 第十一轮 P2）', async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 实测（2026-11-10 DuckDB）：库值形态是 `2026-10-13T16:00:00.000Z`（**T** 分隔）。
+    // 空格分隔在字典序上排在 `T` 之前：`stat_date <= '2026-10-13 16:00:00.000Z'` 把边界日
+    // 整列排除；带前导空白更极端，`<= ' 2026-…Z'` 一行都不剩。
+    // 旧判据把 `[T ]` 都当列内形态（空格分隔零警告），而 `^` 锚让前导空白根本不像日期。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date <= '2026-10-13 16:00:00.000Z'")).toBe(0)
+    expect(rowsOf()[0]?.n, '空格分隔在字典序上小于库值 → 边界日被排除').toBe('0')
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date <= ' 2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(rowsOf()[0]?.n, '前导空白把字面量排到库值之前 → 一行不剩').toBe('0')
+    expect(warned()).toBe(true)
+    // 反证：规范形态（T 分隔、逐字一致）放行且不报警
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date <= '2026-10-13T16:00:00.000Z'")).toBe(0)
+    expect(rowsOf()[0]?.n).toBe('1')
+    expect(warned()).toBe(false)
+  })
+
+  it('日期字面量的其余错位写法同样警告；正确 UTC 16:00Z 与注释里的条件不警告（2026-11-09 审计）', async () => {
+    await seed()
+    const warned = (): boolean => (meta().warnings as string[])
+      .some((x) => /少算或漏掉一天|少算或漏掉当天/.test(x))
+    // 旧判据只认 `YYYY-MM-DD[ 或 T]00:00:00[.0…][+08:00]`，实测这三种写法退出码 0、零 warning：
+    // ① CLI 自己 `--sql` 示例教的 `…Z` 形态（00:00:00Z 是 UTC 时刻，不是上海日零点）
+    for (const lit of [
+      '2026-11-08T00:00:00Z',        // 无小数秒的 Z 形态
+      '2026-11-09 00:00:00.000Z',    // 空格分隔 + 小数秒 + Z
+      '2026-11-08T00:00:00.000Z',    // 标准 Z 形态，但时刻是 00:00（不是 16:00）
+      '2026-11-08T16:00:00+08:00',   // +08:00 形态的 16:00 也不是列内形态
+    ]) {
+      expect(await q('--sql',
+        `SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '${lit}'`), lit).toBe(0)
+      expect(warned(), lit).toBe(true)
+    }
+
+    // 反证 1：列内真实形态（UTC 16:00:00.000Z）不警告
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00.000Z'")).toBe(0)
+    expect(warned()).toBe(false)
+    // 反证 1b：16:00:00Z（无小数秒）会与 `.000Z` 逐位比较错位 → 必须警告（上面已测 00:00Z，这里补时刻对、形态错）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00Z'")).toBe(0)
+    expect(warned()).toBe(true)
+
+    // 反证 2：条件被注释掉 → 不是真条件，不警告（help 明说 SQL 可含 `--` 注释）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview -- WHERE stat_date >= '2026-10-13'\n")).toBe(0)
+    expect(warned()).toBe(false)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview /* WHERE stat_date >= '2026-10-13' */")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // 反证 3b（CodeRabbit 2026-11-10）：双引号标识符/美元引号体里的 `'` 不得被当成开引号、
+    // 把后面的真实字面量吞掉 —— 两种形态都必须仍报警
+    expect(await q('--sql',
+      'SELECT 1 AS "it\'s" FROM daily_overview WHERE stat_date >= \'2026-10-13\'')).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT $$it's$$ AS x FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(true)
+    // CodeRabbit 2026-11-10 第五轮：美元引号体**本身**就可以是日期字面量
+    //（实测 `$$2026-10-13$$` 与 `'2026-10-13'` 等价、同样少算一天）——
+    // 旧实现把整段体跳过，零警告。带 tag 的形态同款。
+    expect(await q('--sql',
+      'SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $$2026-10-13$$')).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      'SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $q$2026-10-13$q$')).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证：美元引号体是列内真实形态 / 与日期无关的串 → 不警告
+    expect(await q('--sql',
+      'SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $$2026-10-12T16:00:00.000Z$$')).toBe(0)
+    expect(warned()).toBe(false)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= $$it's$$")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // Codex 2026-11-10 第六轮 P2：时间列引用藏在**有执行语义的字符串**里时不得漏报。
+    // ① `COLUMNS('stat_date')` / `COLUMNS('<正则>')`：列名是 COLUMNS 的字符串实参
+    //（实测 `WHERE COLUMNS('stat_date') >= '2026-10-13'` 两天夹具只计一天）。
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE COLUMNS('stat_date') >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE COLUMNS('stat.*') >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证：只有 COLUMNS('stat_date')、没有日期字面量 → 不警告
+    expect(await q('--sql', "SELECT COLUMNS('stat_date') FROM daily_overview")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // ② `query` 函数的三种「实参不能当裸字面量直接取」的合法写法：带引号的函数名、
+    // 多余括号、CAST 包裹 —— 内层 SQL 仍要递归检查（实测三种都少算一天、旧实现零警告）
+    for (const sql of [
+      "SELECT * FROM \"query\"($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'$$)",
+      "SELECT * FROM query(($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'$$))",
+      "SELECT * FROM query(CAST($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'$$ AS VARCHAR))",
+    ]) {
+      expect(await q('--sql', sql), sql).toBe(0)
+      expect(warned(), sql).toBe(true)
+    }
+    // 反证：CAST 里的内层 SQL 没有日期过滤 → 不警告
+    expect(await q('--sql',
+      "SELECT * FROM query(CAST('SELECT 1 AS n' AS VARCHAR))")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // 反证 3c：标识符内部带 `$tag$` 形态（marker$q$）不得被当成美元引号开头 ——
+    // 美元引号判据的错误方向是「把真字面量一并跳过」，所以用一个**带日字面量**的 SQL 查
+    expect(await q('--sql',
+      'SELECT 1 AS marker$q$ FROM daily_overview WHERE stat_date >= \'2026-10-13\'')).toBe(0)
+    expect(warned()).toBe(true)
+
+    // 反证 3：双引号标识符里含 iso-day 列名 + 真正的日期字面量 → 仍要警告
+    //（裸 `"stat_date"` 会被当布尔条件、Binder 报错 —— 包进 CAST 才是合法查询）
+    expect(await q('--sql',
+      'SELECT CAST("stat_date" AS VARCHAR) AS d FROM daily_overview WHERE stat_date >= \'2026-10-13\'')).toBe(0)
+    expect(warned()).toBe(true)
+
+    // Codex 第二轮 2026-11-10 P2：`query(<内层 SQL>)` 包装里真正执行的是实参内层 SQL —
+    // 内层里的错位日字面量同样必须警告（实测旧实现零警告、少算一天）
+    expect(await q('--sql',
+      "SELECT * FROM query($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-13'$$)")).toBe(0)
+    expect(warned()).toBe(true)
+    expect(await q('--sql',
+      "SELECT * FROM query('SELECT count(*) AS n FROM daily_overview WHERE stat_date >= ''2026-10-13''')")).toBe(0)
+    expect(warned()).toBe(true)
+    // 反证：内层用正确形态 → 不警告
+    expect(await q('--sql',
+      "SELECT * FROM query($$SELECT count(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00.000Z'$$)")).toBe(0)
+    expect(warned()).toBe(false)
+
+    // CodeRabbit 第二轮 2026-11-10：秒可缺省 —— `HH:MM` 形态同样少算一天
+    for (const lit of ['2026-10-13 00:00', '2026-10-13T00:00Z']) {
+      expect(await q('--sql',
+        `SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '${lit}'`), lit).toBe(0)
+      expect(warned(), lit).toBe(true)
+    }
+    // 反证：缺秒但形态就是列内写法（16:00Z）仍放行？——列内恒带 `.000` 秒，故 16:00Z 不合法、必然警告
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00Z'")).toBe(0)
+    expect(warned()).toBe(true)
+
+    // Codex 2026-11-10 P2 ①：非 `.000` 的毫秒字面量在字典序上排在 `…00.000Z` 之后，
+    // 会把当天行排除 —— 必须警告（旧判据「≥3 位小数即放行」会漏）
+    expect(await q('--sql',
+      "SELECT COUNT(*) AS n FROM daily_overview WHERE stat_date >= '2026-10-12T16:00:00.123Z'")).toBe(0)
+    expect(warned()).toBe(true)
+
+    // Codex 2026-11-10 P2 ②：E 串里的 `\'` 是转义引号、不结束字符串 —— 后面的真实字面量
+    // 不能被当成「字符串外」而漏报
+    expect(await q('--sql',
+      "SELECT E'it\\'s' AS x FROM daily_overview WHERE stat_date >= '2026-10-13'")).toBe(0)
+    expect(warned()).toBe(true)
+  })
 })
 
 describe('query --sql · 参数与错误分派（spec §十一）', () => {
+  it('值位 flag 重复出现 → usage（Codex 2026-11-10 P2：本命令的 parseFlags 此前静默覆盖）', async () => {
+    await seed()
+    expect(await q('--sql', 'SELECT 1', '--db', dbPath(), '--db', join(dir, 'b.db'))).toBe(2)
+    expect(String(errorOf().message)).toMatch(/--db 重复出现/)
+    expect(await q('--table', 'sessions', '--limit', '1', '--limit', '2')).toBe(2)
+    // --group-by 本来就是可重复的（spec §六），不得被这条守卫误伤
+    expect(await q('--table', 'sessions', '--group-by', 'staffId', '--group-by', 'session_type')).toBe(0)
+  })
+
   it('--sql 与 --table 互斥；都缺 → usage', async () => {
     await seed()
 
@@ -353,6 +661,26 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     // 超时/被拦之后只读会话必须已关闭、文件锁不滞留（M11）：
     // 用「同一文件能否以 READ_WRITE 打开」作外部证据，比断言 closeSync 被调用更接近事实。
     await expectLockReleased()
+  })
+
+  it('只读形态（PRAGMA 查询 / VALUES / TABLE / FROM）放行；拒绝文案与实测一致（2026-11-09 审计）', async () => {
+    await seed()
+    // USAGE 与拒绝 hint 此前只说 SELECT / DESCRIBE / SHOW / EXPLAIN，实测这四种也放行：
+    for (const sql of [
+      'VALUES (1)',
+      "PRAGMA table_info('sessions')",
+      'PRAGMA database_size',
+      'TABLE sessions',
+      'FROM sessions LIMIT 1',
+    ]) {
+      expect(await q('--sql', sql), sql).toBe(0)
+    }
+    // 形如赋值的 PRAGMA 解析成 SET → 拒绝；hint 必须把放行面说全（不再只列 4 个关键字）
+    expect(await q('--sql', "PRAGMA enable_profiling='json'")).toBe(2)
+    const hint = String(errorOf().hint)
+    expect(hint).toMatch(/PRAGMA 查询/)
+    expect(hint).toMatch(/VALUES/)
+    expect(hint).toMatch(/SET\/CALL/)
   })
 
   it('超时：--timeout 0.05 + 超大聚合 → query_timeout 退出码 1；--timeout 0 = 真的不限时', async () => {
@@ -782,6 +1110,15 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect(String(e.hint)).toContain('qiyu db describe sessions')
     expect(String(e.hint)).toMatch(/不是你的查询写错了/)
     expect(String(e.hint)).not.toMatch(/检查表名、列名与 SQL 语法/)
+    // 被删的正是时间列 → 必须说明修好前列名相关的用法都不可用，并给出能跑的替代
+    //（2026-11-09 审计：此前的 hint 只指 db describe，等于没有出路）
+    expect(String(e.hint)).toMatch(/时间列 startTime 恢复前/)
+    expect(String(e.hint)).toMatch(/--since\/--until/)
+    expect(String(e.hint)).toContain("qiyu query --sql '<SQL>'")
+    // 替代路径真的能跑：显式列出其余列即可读出数据（不是一句做不到的建议）
+    expect(await q('--sql',
+      'SELECT session_id, payload, staffId, endTime, session_type FROM sessions')).toBe(0)
+    expect(rowsOf().length).toBeGreaterThan(0)
     // ⚠️ 只对 --table 通道生效：--sql 通道用户确实写了 SQL，原样分派（候选清单）
     expect(await q('--sql', 'SELECT "startTime" FROM sessions')).toBe(2)
     expect(String(errorOf().hint)).not.toMatch(/不是你的查询写错了/)
@@ -817,6 +1154,33 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     // 反证 2：非 iso-day 表（sessions，epoch-ms）不算自然日、不触发
     expect(await qAt('--table', 'sessions', '--since', '2026-10-01')).toBe(0)
     expect((meta().warnings as string[]).some((x) => /自然日/.test(x))).toBe(false)
+  })
+
+  it('--since 今天（iso-day）不得因缺口夹紧打穿成 internal（2026-11-09 审计）', async () => {
+    // 实测事故：`--since 2026-11-09`（当天）在**今天有数据**的库上 →
+    // `查询执行失败（底层：区间无效：生效下界 …11-09… 晚于生效上界 …11-08…）`，
+    // kind=internal + hint「若反复出现请报告此问题」——把正常问法说成内部故障。
+    // 成因：缺口警告把上界夹到「昨天零点」，再拿夹紧后的上界跑覆盖查询——
+    // 窗口窄到只剩今天时夹紧后的上界反而**早于**下界，`buildCoverageQuery` 抛用法错误，
+    // 而这段代码在 usageFail 的 try 之外，异常一路冒到顶层被归为 internal。
+    await seed()
+    // 对照①：今天还没有行 → 0 行是数据事实（有 0 行警告），不是内部故障
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-15')).toBe(0)
+    expect(rowsOf()).toHaveLength(0)
+
+    // 对照②（事故形态）：今天**有行**才触发缺口检查 —— 必须 1 行、0 缺口警告
+    await seedMore('daily_overview', [overviewRow('2026-10-14T16:00:00.000Z')])   // 上海 10/15（今天）
+    expect(await qAt('--table', 'daily_overview', '--since', '2026-10-15')).toBe(0)
+    expect(meta().resolved_range).toEqual([
+      '2026-10-15T00:00:00+08:00', '2026-10-15T00:00:00+08:00'])
+    expect(rowsOf()).toHaveLength(1)
+    // 窗口只有今天一格：今天不算缺口（当天数据次日才同步），不得报缺口
+    expect((meta().warnings as string[]).some((x) => /自然日/.test(x))).toBe(false)
+
+    // 对照③：单日显式 --until 同一天仍正常
+    expect(await qAt('--table', 'daily_overview',
+      '--since', '2026-10-15', '--until', '2026-10-15')).toBe(0)
+    expect(rowsOf()).toHaveLength(1)
   })
 
   it('今天有行时不得掩盖昨天的真缺口（正确性审查 F6）', async () => {
@@ -877,6 +1241,18 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     // --sql 通道同一张表：用户自己写的 SQL，仍走 Catalog Error 翻译（不抢分派）
     expect(await q('--sql', 'SELECT COUNT(*) FROM staff_quality')).toBe(2)
     expect(errorOf().kind).toBe('usage')
+  })
+
+  it('只给 --until 且早于表 MIN → 0 行成因只由「缺省下界晚于上界」说明，不再叠假归因（2026-11-09 审计）', async () => {
+    await seed()
+    // seed 的 daily_overview 最早一行是上海 10/14；--until 10/13 → 缺省下界(10/14) > 上界(10/13)
+    expect(await qAt('--table', 'daily_overview', '--until', '2026-10-13')).toBe(0)
+    expect(rowsOf()).toHaveLength(0)
+    const warnings = meta().warnings as string[]
+    // 成因警告仍在（并把倒置的 resolved_range 解释清楚）
+    expect(warnings.some((w) => /缺省下界.*晚于上界.*必然 0 行/.test(w))).toBe(true)
+    // 但不得再说「同步可能未覆盖该区间」：区间是倒置的，同步覆盖不覆盖与 0 行无关
+    expect(warnings.some((w) => /同步可能未覆盖该区间/.test(w))).toBe(false)
   })
 
   it('只有 --until → 下界取该表 MIN；空表 → resolved_range null + 两条 warning', async () => {

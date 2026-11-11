@@ -282,6 +282,20 @@ describe('store 配置 —— fail-closed', () => {
 })
 
 describe('store 配置 —— 权限检查', () => {
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    '文件不可读（EACCES）→ 与权限过宽同一条 config_insecure（Codex 2026-11-10 第四轮 P2）', () => {
+      // 事故形态：读失败被包成无 kind 的普通 Error，各命令 catch 一律 usageFail ——
+      // 同一状态在 store/db/query/stats 上是退出码 2 + kind usage，api/sync 上却是
+      // config_insecure 退出码 1（真机实测）。现在在唯一读取点 loadConfigFile 分流。
+      const p = writeCfg({ profiles: { default: {} } })
+      chmodSync(p, 0o000)
+      let caught: unknown
+      try { resolveStoreConfig({ home }) } catch (e) { caught = e }
+      const t = caught as { kind?: string; hint?: string }
+      expect(t.kind).toBe('config_insecure')
+      expect(t.hint).toMatch(/chmod 600/)
+    })
+
   it('group/other 可读 → 不抛错（仅警告）', () => {
     const p = writeCfg({ profiles: { default: {} } })
     chmodSync(p, 0o644)

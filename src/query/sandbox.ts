@@ -607,8 +607,8 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
         )
       }
 
-      // layer1-④：类型白名单。DESCRIBE / SHOW / PRAGMA table_info / PRAGMA database_list
-      // 都报告为 1（只读形态，放行）。`typeof` 守卫：注入的假模块若把 StatementType 的值
+      // layer1-④：类型白名单。DESCRIBE / SHOW / PRAGMA table_info / PRAGMA database_list /
+      // VALUES / TABLE x / FROM x 等只读形态，都报告为 1（只读，放行）。`typeof` 守卫：注入的假模块若把 StatementType 的值
       // 给成字符串，不能让它静默地把所有语句都挡掉。
       const ST = mod.StatementType ?? {}
       const SELECT = typeof ST.SELECT === 'number' ? ST.SELECT : 1   // 实测值：SELECT=1
@@ -616,7 +616,10 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
       if (p.statementType !== SELECT && p.statementType !== EXPLAIN) {
         throw sandboxError('usage', `只读沙箱不接受 ${typeName(p.statementType)} 语句`, {
           code: 'sandbox_blocked',
-          hint: '只允许 SELECT / DESCRIBE / SHOW / EXPLAIN 等只读查询',
+          // 文案按实测写全（2026-11-09）：放行的是「DuckDB 判为只读」的全部形态，
+          // 不止 SELECT/DESCRIBE/SHOW/EXPLAIN —— PRAGMA 查询、VALUES、TABLE/FROM 也是。
+          hint: '只允许只读查询：SELECT / DESCRIBE / SHOW / EXPLAIN / PRAGMA 查询 / VALUES / TABLE / FROM；'
+            + '写操作、SET/CALL 与多语句一律拦截',
         })
       }
 

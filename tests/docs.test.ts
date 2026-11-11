@@ -448,6 +448,35 @@ describe('修复批 5 文档联动 —— spec §5.4 补 gap reason（锚内容�
     expect(md).toMatch(/windows\.skipped/)
   })
 
+  it('README 的 complete 行不得把「覆盖窗失败转 skipped」当成 skipped 的成因（CR 第十五轮 minor）', () => {
+    // 语义事实（引擎口径）：覆盖窗失败 ⇔ 有一个窗口 failed > 0 ⇔ status 只可能是 partial；
+    // 而 complete 的定义就是 windows.failed = 0 —— 两者互斥。README 一度在 complete 行
+    // 并列「三种成因」，把只在 partial 出现的成因写进了 complete 的覆盖面，Agent 会以为
+    // 「complete 也可能藏着没拉到的合并窗」。
+    // 判据：该行必须带「只会出现在 partial」的限定，且不得声称三种成因。
+    const md = read('README.md')
+    const row = md.split('\n').find((l) => /^\| `complete` \|/.test(l))
+    expect(row, 'README 必须有 complete 的 status 行').toBeDefined()
+    expect(row!, 'complete 行必须列残段窗成因').toContain('残段窗')
+    expect(row!, 'complete 行必须列整窗晚于末端上限成因').toContain('晚于末端上限')
+    expect(row!, '覆盖窗失败那种必须限定为只在 partial 出现').toContain('只会出现在 `partial`')
+    expect(row!, 'complete 行不得声称三种 skipped 成因').not.toContain('三种')
+  })
+
+  it('README 对 tasks[].notes 的说明覆盖全部生产来源（Codex 第十五轮 P2）', () => {
+    // notes 有两个生产来源（下界 + 非日界 --until 两档）。README 若只举下界一例，
+    // 读 README 改脚本的 Agent 会把末段提示误读成故障或漏掉「该日未同步」的事实。
+    const md = read('README.md')
+    const i = md.indexOf('`notes` 是中文说明数组')
+    expect(i, 'README 必须有 notes 的字段说明').toBeGreaterThan(-1)
+    const para = md.slice(i, i + 600)
+    expect(para, '来源一：早于接口下界').toContain('早于接口可得数据的最早边界')
+    expect(para, '来源二：非日界 --until').toContain('非上海日界')
+    expect(para, '末残段档').toContain('残段窗')
+    expect(para, '末端上限档').toContain('上限自然前移')
+    expect(para, '指向 windows.skipped 判断末段').toContain('windows.skipped')
+  })
+
   it('批 6 #2 文档联动：残段窗跳过与 windows.skipped 契约写在 spec §5.2/§七 与 README', () => {
     const s = read('docs/superpowers/specs/2026-10-14-同步引擎-design.md')
     // §5.2：残段窗跳过 + 水位语义（半日聚合不落库、末残段由下轮补全）

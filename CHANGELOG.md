@@ -1966,6 +1966,188 @@
   实测指出）；`parseConfig` 改为 null 原型对象（顺带关掉 `profiles["__proto__"] = block`
   改写原型的写法），守卫侧再用 `Object.hasOwn` 加第二道锁。
 
+- **2026-11-09/10 三路只读审计：查询/统计 8 条、CLI/凭证 3 条、同步 6 条，逐条复现实测后修正**：
+
+  **查询与统计**
+  · **`query --table --since <今天>` 在「今天有数据」的库上打成 `internal`**（P1）：
+  缺口检查把上界夹到昨天零点后再跑覆盖查询，窗口只剩今天时夹紧后 `hi < lo`，
+  `buildCoverageQuery` 抛用法错误、本段又在 `usageFail` 的 try 之外 → 顶层归成
+  `internal` +「若反复出现请报告此问题」。现在 `hi < 起始` 时窗口内 0 个应覆盖日、不报缺口。
+  · **`stats fields` 空键成因自相矛盾**：`{"":1}` 同时出「其余字段照常统计」与
+  「均无可观测字段（NULL / 空对象 / 非对象）」；空键被排除的真正原因是观测 SQL 的
+  `WHERE e.key <> ''`（旧文案说的「JSON 路径无法表达」根本走不到）。0 字段时成因改用
+  「只有空字符串键」，有字段时不再承诺「其余字段」。
+  · **`--sql` 日期字面量警告漏掉最常见的三种错位写法**：`…T00:00:00Z`、
+  `… 00:00:00.000Z`、`…T00:00:00.000Z` 都静默少算一天。判据改为按列内真实形态
+  （严格 `…T16:00:00.000Z`，`.123` 之类同样错位）逐个字面量判定，词法复用 `mask.ts` 的
+  状态机（注释里的条件不报；双引号标识符、美元引号体与 E 串转义按 DuckDB 词法跳过；
+  `HH:MM` 缺秒形态、`query('<内层 SQL>')` 包装里的内层写法一并判 —— CodeRabbit/Codex
+  2026-11-10 两轮各补）。
+  · **列选择器 `COLUMNS('stat.*')` 里藏列名时漏报**（Codex 第六轮 P2）：`WHERE COLUMNS('stat_date')`
+    与 `WHERE stat_date` 等价，但字面量被抹掉后判据提前返回零警告。新增 `hasDayColumnSelector`
+    + `sqlFunctionCalls`（代码位置匹配，字面量/注释不参与）。
+  · **`"query"(…)` 双引号函数名/多余括号/CAST 包裹逃过扫描**（Codex 第六轮 P2）：实参扫描改走
+    `sqlFunctionCalls` + `readStaticArg`（只展开整个表达式为静态字符串的形态）；拼接/函数调用
+    等无法展开的表达式不再冒认前缀、单独声明缺口。
+  · **美元引号体本身是日期字面量**（CR 第五轮 minor）：`$$2026-10-13$$` 与 `'2026-10-13'` 等价、
+    此前被整段跳过零警告；扫描统一收进 `readSqlString`。
+  · **带尾随字符的列内形态字面量被当成安全格式**（Codex 第七轮 P2）：实测
+    `stat_date >= '…16:00:00.000Z '` 在 DuckDB 里为 **false**（库值是字面量的严格前缀），
+    边界日整列被排除；旧判据先 `trim()` 再完整匹配，静默放行。判据改为「按前缀认出日形态
+    + 逐字一致才放行」，前导空白仍不误报（实测那种比较不排除任何行）。
+  · **列表/结构体键形式的时间列引用漏报**（Codex 第八轮 P2，均实测）：`COLUMNS(['stat_date'])`
+    （列表里的字符串原样返回、真实等价于列引用）、`struct_extract(d, 'stat_date')`、
+    `d['stat_date']` 的列名只出现在字符串里，`withoutLiterals` 抹掉后判据提前返回零警告。
+    新增 `hasDayColumnKeyReference`：时间列名字面量出现在函数实参括号或下标方括号里即认；
+    普通位置的字符串（`SELECT 'stat_date' AS label`）仍不误报。
+  · **`stats fields --db X` 的核实提示指向默认库**（Codex 第八轮 P2）：`UNIT_NOTES` 里写死的
+    裸 `qiyu query --sql` 照着执行会查另一份库（或报库未初始化）。模板改为 `{@query}` 占位、
+    由 `statsFieldNotes(loc)` 在调用点渲染成本次的 `--db/--profile`，并带上占位符替换契约。
+  · **双引号别名里的撇号吞掉后续键字面量**（Codex 第九轮 P2，实测）：`struct_extract("it's",
+    'stat_date')` 里别名内的 `'` 被当成开引号，假字面量一路吞掉真正的 `'stat_date'`，
+    键引用判据漏报（两天夹具只计一天、零警告）。扫描改为先跳过完整双引号标识符（含 `""` 转义）
+    再认字面量。
+  · **`$` 序列被替换语法二次解释**（Codex / CodeRabbit 第九轮）：`statsFieldNotes` 用字符串
+    替换值回填 `{@query}`，库路径或档名里的 `$&`/`$$`/`` $` ``/`$'`/`$1` 被 `String.replace`
+    吃掉，`/tmp/q$&.duckdb` 被渲染成 `/tmp/q{@query}.duckdb`。替换值改为回调函数。
+  · **unknown 字段的核实指引照着执行必然失败**（Codex 第九轮 P2，实测）：unknown 字段是报表
+    **payload 里的 JSON 键**、不是表的列（`SELECT unlistedMetric` 是 Binder Error），旧文案
+    「显式列出该列」误导；改为 `payload ->> '<字段>'` 提取并点明它不是列。
+  · **父目录不可搜索时真配置被当成「不存在」**（Codex 第十轮 P2，实测）：`existsSync` 在穿过
+    `chmod 000` 的目录时被 EACCES 吞掉、返回 **false**，`assertConfigReadable` 提前返回 ——
+    `auth whoami` 报 `auth_missing`（「appKey 来自 （缺失）」）并让人 `auth login`，而 login
+    同样进不去这个目录；store/query 还会回落到默认库。改为 `accessSync` 先行、**只有 ENOENT
+    才是「没有配置」**；EACCES/EPERM 再按「挡在哪一层」分流：新成因 `dir-unreadable`
+    （目录不可搜索 → `chmod 700` 目录）与既有 `unreadable`（文件读不了 → `chmod 600` 文件）
+    各自一句文案、各自一条修法。README 与 skill `errors.md` 的 kind 表同步补第三档。
+  · **祖先目录挡路时 hint 点名的是「自己其实好好的」那一层**（Codex 第十一轮 P2，实测）：
+    `~/.config` 000、`~/.config/qiyu` 本身 700 时，`accessSync(qiyu, X_OK)` 照样 EACCES，
+    于是报「配置目录 …/qiyu 不可搜索」并建议 `chmod 700 …/qiyu` —— 这条命令本身就执行不了
+    （实测 `chmod: … Permission denied`），照做后配置仍读不出来。新增 `blockedAncestor`：
+    从配置目录逐层向上找**最外层** EACCES/EPERM 的目录（它的父目录必然可进入，所以 chmod
+    一定可执行），文案与 hint 都点名它，并写明「更深的层修好后重跑会重新点名」；
+    端到端实测：按 hint 执行后 `auth whoami` 从 `config_insecure` 变为 `configured: true`。
+  · **空格分隔 / 带前导空白的 iso-day 字面量静默漏报**（Codex 第十一轮 P2，实测）：库内形态
+    恒为 `…T16:00:00.000Z`，而旧正则把 `[T ]` 都当规范分隔符、`^` 锚又让前导空白根本不匹配 ——
+    `stat_date <= '2026-10-13 16:00:00.000Z'` 按字典序把边界日整列排除、`<= ' 2026-…Z'`
+    一行不剩，两种都零 warning。分隔符收紧为只认 `T`，前导空白单独识别后同样警告。
+    ⚠️ 这**推翻了第七轮**「前导空白不误报」的结论：那条只在 `>=` 方向成立（字面量更小、
+    只是多取行），换 `<=` 就是全表漏取；判据看不到运算符，按「方向安全（多警告）」一律算错位。
+  · **field_notes 释义值里残留换行**（CodeRabbit 第十二轮 minor，实测）：`windows.total` 的
+    释义里带了一个源码折行残留的 `\n`，Agent/工具会把一句定义在中途断行读成两段。删除，
+    并在跨命令的图例形态守卫里加「释义不得含换行/回车」的反向断言（此前只查 `**`）。
+  · **Windows ACL 拒绝拿到的是 POSIX chmod hint**（Codex 第十二轮 P2）：Windows 上 ACL 拒绝
+    同样让 `accessSync` 抛 EACCES/EPERM，旧实现一律建议 `chmod 600/700` —— chmod 不存在于
+    Windows，用户拿不到任何可执行的恢复步骤（README 声明 Windows 跳过的是「过宽」检查，
+    读拒绝分流出 `config_insecure` 后照样走到这条 hint）。修法平台化：Windows 文案改说
+    「被 Windows ACL 拒绝（不是 POSIX 权限语义）」，hint 改为 `icacls <路径> /reset`（恢复
+    继承的 ACL，附「属性 → 安全」的手工授权替代），路径引号按 win32 方言走 `shellArg`
+    单一实现点。README 与 skill `errors.md` 同步。
+  · **权限拒绝的分流只挂在探测点，Windows 上不可达**（CodeRabbit 第十三轮 minor）：Node 的
+    `fs.access` 在 Windows 上不评估 NTFS ACL —— 真拒绝发生在 `readFileSync`，被包成无 kind
+    的普通 Error，login 报 config_invalid、store 族报 usage 2，上一轮加的 icacls hint 成了死分支
+    （Windows 用例只注入 platform，从未走真实探测路径）。把 EACCES/EPERM 的分类收进
+    `permissionReadError` 唯一实现点，探测点与**读点**（`readConfigRaw`）共用；POSIX 上顺带兜住
+    「access 通过后、读之前权限被改」的竞态。回归：`readConfigRaw` 直接对 000 文件 → config_insecure；
+    EISDIR 等非权限读错误维持普通 Error 口径（`<cfg>/x/y` 的 ENOTDIR 会被 existsSync 吞成「不存在」，
+    反例只能用「配置路径本身是目录」构造，实测）。
+  · **`windows.skipped` 的释义漏了第三种成因**（Codex 第十四轮 P2，引擎源码核对）：覆盖窗失败时，
+    其名下被回看重叠区合并的窗「该拉没拉」，`runWindowed` 与 `runRotated` 都把它们计入 `skipped`
+    并逐窗出「须重跑补齐」进度行 —— 而 `meta.field_notes` 仍只声明残段窗 / 整窗晚于末端上限两种。
+    Agent 会把失败轮的 skipped 读成「都是有意不拉的窗」。释义补第三种成因并点明「此时 status 必为
+    partial、看 gaps 找失败覆盖窗」，README 三处同步（定义、complete 判定、clamp 段）。新增守卫
+    除钉释义措辞，还直接对引擎源码断言两处结算表达式（防释义与实现各说各话）。
+  · **「无法检查」盖过了已确认的日期错位**（CodeRabbit 第十四轮 minor，实测）：外层
+    `stat_date >= '2026-10-13'` 是确定的少算一天，同句再带一个拼接实参的 `query()` 时，
+    旧实现先返回「无法检查」，**确定**的警告连同修法一起被替换 —— Agent 只看到「没法检查」，
+    不会去改那条真会少算的过滤。顺序改为外层扫描优先；只有外层什么都没发现时才声明缺口。
+  · **Unicode 别名的下标键引用漏报**（Codex 第十四轮 P2，实测）：键引用扫描的标识符正则
+    只认 ASCII，而 DuckDB 接受任何非 ASCII 非空白字符作未引用标识符（`AS 数据` 合法）——
+    `数据['stat_date'] >= '2026-10-13'` 与 `d['stat_date']` 等价、边界日被排除，却零警告。
+    改为复用 `mask.ts` 的 Unicode 标识符判据（`isIdentAt` 导出、`isIdentCharAt` 判起点），
+    标识符规则只许一个实现点。
+  · **`config_invalid` 的注释把「权限拒绝」列成自己的成因**（CodeRabbit 第十四轮 minor）：
+    权限拒绝走 `config_insecure`（`permissionReadError` / auth 的 insecure 分支），照旧注释
+    分流会挑错 kind；注释改为「内容读不出来」并点名权限拒绝归 `config_insecure`。
+  · **README 的 `complete` 行把只在 `partial` 出现的成因写进覆盖面**（CodeRabbit 第十五轮 minor）：
+    `complete` 的定义是 `windows.failed = 0`，而「覆盖窗失败转 skipped」必然 `windows.failed > 0`、
+    只可能出现在 `partial` —— README 却把它并列成 skipped 的第三种成因，Agent 会以为
+    「complete 也可能藏着没拉到的合并窗」（与同文 470-474 段、field note 自相矛盾）。
+    `complete` 行改回两种成因并加「只会出现在 `partial`」限定；`tests/docs.test.ts` 加行级守卫
+    （必须带该限定、不得声称「三种」），变异退回旧文案即红。
+  · **`tasks[].notes` 的机器可读释义只声明了两个生产来源中的一个**（Codex 第十五轮 P2）：
+    `sync run` 把 `floorNotes`（区间早于接口下界）与 `untilNotes`（日对齐任务遇到非上海日界
+    `--until`，分「该日不早于末端上限 / 末窗半个自然日按残段窗跳过」两档）合并写入 notes，
+    `runFieldNotes()` 却称「当前唯一生产者是『请求区间早于接口下界』」—— 按 `meta.field_notes`
+    解读输出的 Agent 认不出末段提示，会把「该日未同步」读成故障或漏读。释义改为按来源逐档
+    说明并指向 `windows.skipped`；README 同段同步；`tests/sync-state-legends.test.ts` 加
+    释义守卫（两来源 + 两档 + 源码合并点），`tests/docs.test.ts` 加 README 段落守卫，
+    三种变异（退回旧释义 / 删上限档 / README 回旧文）均红。
+  · **展不开的 `query()` 实参被当成「检出 SUMMARIZE」**（CodeRabbit 第十六轮 minor + Codex 第十六轮 P2，
+    两路独立命中、均真机实测）：`SELECT column_name, min FROM query('SELECT ' || '1')` 合法且内层
+    没有 SUMMARIZE，但 `readStaticArg` 返回 null 时只置 `gap`，下游「gap + 统计形状列」两档文案
+    断言「内层使用了 SUMMARIZE / SQL 含 SUMMARIZE」——把猜测写成了检出，Agent 会去改一个本来
+    没问题的查询。`queryCallSummarize` 新增 `unresolved` 信号：两句检出式文案对它失效，改由
+    独立一档说「实参无法静态展开，无法确认内层是否含 SUMMARIZE…可能未脱敏」并给出可执行收口
+    （实参改成单个字符串字面量）；该档只在输出确实是统计形状时发，避免给普通查询添噪音
+    （`SELECT * FROM query('SELECT ' || '1')` 的泛化 query() 警告已覆盖）。两条变异（取消排除 /
+    删新档致缺口静默）均红。
+  · **里层 `query()` 的「没法检查」挡住外层已确认的日字面量错位**（CodeRabbit 第十七轮 minor）：
+    `dayLiteralHint` 只用 `string | null` 表达结论，递归内层时一旦拿到「无法检查」就提前返回 ——
+    外层 `stat_date >= '2026-10-13'` 这种**确定**少算一天的错位连同修法一起丢失（实测
+    `... AND EXISTS (SELECT * FROM query($q$SELECT * FROM query('SELECT ' || '1')$q$))`）。
+    改为 `{ kind: 'mismatch' | 'unexpandable', text }` 分开携带：只有 `mismatch` 立即返回，
+    缺口先记下、外层扫描完仍无发现才降级成缺口。变异（改回提前 return）即红。
+  · **嵌套 `query()` 的不可展开没有向上传播**（CodeRabbit 第十七轮 minor）：`queryCallSummarize`
+    只把 `sub.gap` 并上去、丢了 `sub.unresolved`，外层于是又把里层的猜测当成检出 SUMMARIZE；
+    同一处补 `if (sub.unresolved) unresolved = true`，变异即红。
+  · **两条测试断言把宿主平台当成了 POSIX / 裸路径**（CodeRabbit 第十七轮 major ×2）：
+    `insecureConfigError` 的 POSIX 用例没显式传 platform（Windows 上拿到 `icacls` hint）、
+    `stats fields` 的 `--db` 期望没走 `shellArg`（Windows 反斜杠路径会被引号化）——两条在
+    Windows 上都必红。改为显式 `'linux'` 与 `shellArg(...)`；同批把 `--db ` 裸拼接期望
+    （`store-hint-selection` / `store-precheck-single-source` / `missing-table-causes` /
+    `db.test`，共 12 处）一并收敛到 `shellArg`，判据是「期望必须按渲染方言生成」。
+    平台敏感性已实测（传 `'win32'` 即转 icacls、断言红；`shellArg('C:\\Temp\\q.db','win32')`
+    返回带引号形态）。
+  · **脱敏缺口警告上限 5 条时静默截断**：第 5 条改为「另有 N 个敏感列的缺口警告未列出」并点名；
+    上限按**类别**计（本块最多 5 行），不按全局行数扣减 —— 否则其它类别的警告占满 5 条后，
+  不发汇总就退回静默截断、发汇总又超上限（Codex 2026-11-10 第三轮 P2）。
+  · **库漂移删掉的是时间列时 hint 没有出路**：补「恢复前列名相关用法都会失败」+ 可执行的
+  `--sql` 显式列替代（附引号替换契约）。
+  · **只读沙箱的接受面说窄了**：`VALUES` / `PRAGMA 查询` / `TABLE` / `FROM` 实测都放行，
+  USAGE、拒绝 hint 与 README 按实测写全。
+  · **只有 `--until` 时倒置区间的 0 行警告重复归因**：不再叠「同步可能未覆盖该区间」。
+
+  **CLI 与凭证**
+  · **断链符号链接死循环**（P1）：只读命令的 `statGuard` 把断链的 `ENOENT` 当成「不存在」
+  并指向 `store init`，而 `store init` 拒绝符号链接 —— 先 `lstat` 分流，点名真实成因。
+  · **`--db/--profile/--backend` 重复出现静默覆盖**：改为用法错误（与 `api call --body` 同向）——
+  `parseStoreFlags`、`query` 的 `parseFlags`、`sync run` 三处解析器都补齐（Codex 2026-11-10 P2：
+  只修共享解析器会漏掉各自解析这两个 flag 的命令）。
+  · **`auth login` 配置损坏时退出码 2**：改 `kind: config_invalid`（退出码 1，不写任何内容），
+  权限拒绝则归 `config_insecure`；`ERROR_KINDS`、README、`qiyu --help`、skill `errors.md` 同步。
+  · **配置文件读不出来是因为权限时，各命令给出三种说法**（Codex 2026-11-10 第四轮 P2）：
+  读失败被包成无 kind 的普通 Error，与「畸形 JSON」同出口 —— login 报 `config_invalid`
+  （它那条 `config_insecure` 分支是死代码）、store/db/query/stats 降级成 `usage` 退出码 2，
+  只有 api/sync 报 `config_insecure`。现在在唯一读取点 `loadConfigFile` 读取前分流
+  （`accessSync(R_OK)` 失败且 errno 为 EACCES/EPERM → 与权限过宽同一条错误 + `chmod 600` hint），
+  四个命令族实测同一状态同一结论。
+
+  **同步**
+  · **被重叠区合并的窗从所有计数里消失**：`windows` 新增 `contained`（仅 > 0 输出，
+  物理切出窗数 = total + contained；不计入 total，`skipped` 语义保持「该拉的没拉」）；
+  `contained` 只在**覆盖它的那一窗成功**时计入 —— 覆盖窗失败时这些窗根本没拉到，
+  此前会得到 `failed: 1, contained: 1` 而表是空的（Codex 2026-11-10 第三轮 P2）；
+  此时改计 `skipped` 并逐窗出「覆盖窗失败、未覆盖」进度行（`runWindowed` 与轮转两条路径）；
+  · **`--until` 非日界时末残段跳过却没有提示**：日对齐任务补 `tasks[].notes`（complete 不等于该段已同步）；
+  声明了末端上限（考勤/绩效）且目标日晚于上限时改说「等上限前移」，不再给出照做也无效的
+  「改 --until」建议（Codex 2026-11-10）；
+  · **同一天的 `--since`/`--until`** 报错只回显两个相同时刻：改为上海 ISO 回显 + 半开区间与「不含当天」说明；
+  · **`assertOpWindow` 允许零宽窗**：改为 `start >= end` 拒绝（与管道层同向）；
+  · **`windowEndClamp` 截短的窗**：补「窗末端被上限截短」进度行（`runWindowed` 与轮转
+  `planRotation` 两条路径都出 —— 考勤/绩效在 `sync run` 里全部走轮转，只修一条等于没修）；
+  · USAGE 写明「只给 `--until` 时起点是最早，报表任务会从 1970 按天切出上万窗」。
+
 ## [0.2.1] - 2026-10-26
 
 ### 新增

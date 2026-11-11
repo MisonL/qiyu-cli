@@ -131,13 +131,24 @@ export function runFieldNotes(): Record<string, string> {
     // ⚠️ windows / rows 是嵌套对象，此前只解释了 windows.skipped 与 status 里顺带提到的
     // 字段（2026-11-04 反向 sweep 实测：total/succeeded/failed 与 rows.* 全部裸奔）。
     // 这四个数是 Agent 判「这次到底拿到没有」的依据，必须各自可见。
-    'tasks[].windows.total': '本轮切出的窗口总数（= succeeded + failed + skipped）',
+    // ⚠️ 这条释义里不能有换行：`meta.field_notes` 的值是 JSON 字符串，内部换行会让
+    // Agent/工具把一句定义读成两段（CodeRabbit 2026-11-11，此前是源码折行残留的 `\n`）。
+    'tasks[].windows.total': '本轮计入的窗口总数（= succeeded + failed + skipped）——'
+      + '不含被重叠区合并的窗（那是 contained；物理切出的窗数 = total + contained）',
     'tasks[].windows.succeeded': '成功窗数。⚠️ 空窗也算成功，所以 > 0 不代表有数据 —— 结合 rows.written 与 windows.failed 判断',
     'tasks[].windows.failed': '失败窗数（失败会在 gaps 里逐条记录）',
-    'tasks[].windows.skipped': '没跑的窗数，两种成因：① 残段窗（日对齐任务被显式区间钳出的'
+    'tasks[].windows.skipped': '没跑的窗数，三种成因：① 残段窗（日对齐任务被显式区间钳出的'
       + '非日界首/末段）；② 整窗晚于末端上限被丢弃的窗（windowEndClamp：考勤/绩效请求到'
-      + '「今天」时）。两种都跳过不 fetch、不写库、不推水位，但计入 total'
-      + '（total = succeeded + failed + skipped）；stderr 进度行分两句点名成因',
+      + '「今天」时）；③ 覆盖它的那一窗失败了 —— 它原本落在前一窗的回看重叠区、被合并，'
+      + '覆盖窗成功时算 contained，失败时就是「该拉的没拉」，改记 skipped 并逐窗出'
+      + '「须重跑补齐」进度行。三种都跳过不 fetch、不写库、不推水位，但计入 total'
+      + '（total = succeeded + failed + skipped）；stderr 进度行按成因逐种点名。'
+      + '⚠️ ③ 出现时本轮 status 必为 partial，看 gaps 找到失败的覆盖窗',
+    'tasks[].windows.contained': '完全落进前一窗回看重叠区、被合并的窗数（仅 > 0 时出现）。'
+      + '这些窗不执行 —— 覆盖它的那一窗成功时数据已由那一窗覆盖（overlapDays > 0 的任务，'
+      + '如工单 3 天回看），所以既不是 succeeded 也不是 skipped（skipped 才代表「该拉的没拉」）；'
+      + '覆盖窗失败时它们改记 skipped 并逐窗出进度行；'
+      + '它不计入 total —— 物理切出的窗数 = total + contained',
     // ⚠️ 2026-11-04 自查修正：初版把 written 说成「真正落库的行数」—— 而引擎对
     // count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」（kept），
     // 那批行已随事务回滚、实际没落库（sync/engine.ts 的 catch 分支与 brief 钉死用例）。
@@ -150,8 +161,13 @@ export function runFieldNotes(): Record<string, string> {
       + '⚠️ 快照任务（tasks[].windows.total 恒为 1）的这两类失败窗记 0 —— 快照失败即整体回滚，'
       + '没有「部分写入」可言，所以它偏小而不是偏大。'
       + '为 0 可能是「窗口都成功、只是上游没数据」',
-    'tasks[].notes': '本任务的逐条说明（恒在、可为空数组）。当前唯一生产者是「请求区间早于接口下界」——'
-      + '把「区间不可得」与「同步故障」分开，看到它不代表本轮失败',
+    'tasks[].notes': '本任务的逐条说明（恒在、可为空数组），有意跳过而非故障，看到它不代表本轮失败。'
+      + '来源一：请求区间早于接口下界——把「区间不可得」与「同步故障」分开。'
+      + '来源二：日对齐任务遇到非上海日界的 --until，两档：'
+      + '① 该日不早于末端上限——拉不到，调整 --until 无用，要等上限自然前移（次日）再跑增量；'
+      + '② 其余——末窗是半个自然日、按残段窗跳过（不拉、不写），该日未同步，'
+      + '结果里 complete 与 gaps 为空都不代表这段已同步，要含该日请把 --until 写到次日 0 点。'
+      + '末段有无被跳过看 windows.skipped（残段窗与整窗晚于上限都计入），不要只凭本数组为空判断',
     'tasks[].resolved_range': '本轮请求的水位区间（start = 水位/请求起点语义，'
       + '日对齐任务的首残段可能被跳过、start 前缀不会自动前移，所以它不是「已覆盖」的保证）。'
       + '末端与水位同源：出现失败窗后水位冻结在连续成功末端，因此它可能早于你请求的 end。'
