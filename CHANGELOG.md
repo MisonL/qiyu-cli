@@ -2083,6 +2083,15 @@
     说明并指向 `windows.skipped`；README 同段同步；`tests/sync-state-legends.test.ts` 加
     释义守卫（两来源 + 两档 + 源码合并点），`tests/docs.test.ts` 加 README 段落守卫，
     三种变异（退回旧释义 / 删上限档 / README 回旧文）均红。
+  · **展不开的 `query()` 实参被当成「检出 SUMMARIZE」**（CodeRabbit 第十六轮 minor + Codex 第十六轮 P2，
+    两路独立命中、均真机实测）：`SELECT column_name, min FROM query('SELECT ' || '1')` 合法且内层
+    没有 SUMMARIZE，但 `readStaticArg` 返回 null 时只置 `gap`，下游「gap + 统计形状列」两档文案
+    断言「内层使用了 SUMMARIZE / SQL 含 SUMMARIZE」——把猜测写成了检出，Agent 会去改一个本来
+    没问题的查询。`queryCallSummarize` 新增 `unresolved` 信号：两句检出式文案对它失效，改由
+    独立一档说「实参无法静态展开，无法确认内层是否含 SUMMARIZE…可能未脱敏」并给出可执行收口
+    （实参改成单个字符串字面量）；该档只在输出确实是统计形状时发，避免给普通查询添噪音
+    （`SELECT * FROM query('SELECT ' || '1')` 的泛化 query() 警告已覆盖）。两条变异（取消排除 /
+    删新档致缺口静默）均红。
   · **脱敏缺口警告上限 5 条时静默截断**：第 5 条改为「另有 N 个敏感列的缺口警告未列出」并点名；
     上限按**类别**计（本块最多 5 行），不按全局行数扣减 —— 否则其它类别的警告占满 5 条后，
   不发汇总就退回静默截断、发汇总又超上限（Codex 2026-11-10 第三轮 P2）。

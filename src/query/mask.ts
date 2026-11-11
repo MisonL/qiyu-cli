@@ -483,7 +483,9 @@ function summarizeTokenPositions(sql: string): { recognized: boolean; unrecogniz
  * 构造出合法反例（`SELECT 常量 FROM (SUMMARIZE …)` 等），无法静态证明。因此这里只服务
  * 一个目的 —— **发现缺口**（返回 `hit` / `gap` 即调用方发对应警告）：
  *   · `hit`：内层可静态展开，且自身输出是 SUMMARIZE；
- *   · `gap`：内层有 SUMMARIZE 痕迹但输出无法确认，或实参根本展不开。
+ *   · `gap`：内层有 SUMMARIZE 痕迹但输出无法确认（含探测到 query() 实参展不开）；
+ *   · `unresolved`：至少一个 query() 实参展不开 —— 此时「内层含 SUMMARIZE」只是猜测、
+ *     不是检出，文案必须说「可能含」（CodeRabbit 第十六轮 minor：展不开 ≠ 检出）。
  * 两种情形都**不改写任何值** —— 实测
  * `SELECT 'userName' AS column_name, 3 AS min WHERE EXISTS (SELECT 1 FROM query('SUMMARIZE sessions'))`
  * 合法且输出 min 是常量 3，按全 SQL 判据脱敏会把业务常量改成 `<已脱敏>`（Codex 第七轮 P2）。
@@ -506,11 +508,13 @@ export function queryCallArgs(sql: string, onUnresolved?: () => void): string[] 
   return out
 }
 
-function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; gap: boolean } {
+function queryCallSummarize(sql: string):
+  { hit: boolean; atTopOutput: boolean; gap: boolean; unresolved: boolean } {
   const bare = bareKeywords(sql)
   let hit = false
   let atTopOutput = false
   let gap = false
+  let unresolved = false
   forEachQueryArg(sql, (inner, callIndex) => {
     const innerTokens = summarizeTokenPositions(inner)
     const sub = queryCallSummarize(inner)
@@ -536,8 +540,9 @@ function queryCallSummarize(sql: string): { hit: boolean; atTopOutput: boolean; 
     // 实参无法静态展开（拼接 / 函数调用）：内层可能含 SUMMARIZE（也可能不含）——
     // 与「内层有 SUMMARIZE 但输出不确定」同属「没检查」，只声明缺口，不冒认脱敏。
     gap = true
+    unresolved = true
   })
-  return { hit, atTopOutput, gap }
+  return { hit, atTopOutput, gap, unresolved }
 }
 
 /**
@@ -1025,7 +1030,7 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
     : { recognized: false, unrecognizedParen: false }
   const queryCall = mode.kind === 'sql'
     ? queryCallSummarize(mode.sql)
-    : { hit: false, atTopOutput: false, gap: false }
+    : { hit: false, atTopOutput: false, gap: false, unresolved: false }
   const summarizeSql = mode.kind === 'sql'
     && (summarizeTokens.recognized || queryCall.atTopOutput)
   // 第十二轮起 query() 来源不再进入行级脱敏入口（无法静态证明输出是统计值），
@@ -1259,7 +1264,10 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   // 「无法确认是否构成最终输出」泛化档，不该被说成「列名已被改写」。
   // 判据：位置无法确认（非 summarizeSql）**且**输出不是可静态证明的透传 —— 后者在进入本档时
   // 形状必然不匹配（可证明形态恒为 column_name/min/max），只作显式兜底、如实记录未单独承重。
-  if (!summarizeShape && (summarizeSql || (summarizeUnconfirmed && !summarizeProj.enabled))) {
+  // 「含 SUMMARIZE」是事实断言：探测只来自 query() 的未解析实参时它未知 → 排到下面「可能含」档。
+  const summarizePresenceUnknown = queryCall.unresolved && !queryCall.hit
+  if (!summarizeShape
+    && (summarizeSql || (summarizeUnconfirmed && !summarizeProj.enabled && !summarizePresenceUnknown))) {
     warnings.push(
       'SQL 含 SUMMARIZE，但输出列名已被改写（缺 column_name / min / max 形状）：'
       + '行级脱敏无法按行值识别敏感列，统计值（min/max/分位数）可能**未脱敏**。'
@@ -1289,7 +1297,8 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
   //     输出仍可能是统计值 —— 第十二轮收窄时曾被这一档漏掉，现由 queryCall.gap 兜住，
   //     并有**单独一档文案**（下一条），因为它的成因与修复建议都与位置类不同。
   // 两向都不安全：漏脱敏与误改。与上一档同一策略：**只声明缺口，不冒认脱敏**。
-  if (!summarizeSql && summarizeUnconfirmed && !queryCall.gap && summarizeShapeColumns) {
+  if (!summarizeSql && summarizeUnconfirmed && !queryCall.gap && summarizeShapeColumns
+    && !summarizePresenceUnknown) {
     warnings.push(
       'SQL 里的 SUMMARIZE **无法确认是否构成最终输出**（如多层子查询 '
       + '`FROM (SELECT * FROM (SUMMARIZE …))`、逗号连接、CTE 内的子查询，'
@@ -1299,13 +1308,28 @@ export function maskQueryRows(input: MaskInput): MaskOutcome {
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
       + '或把 SUMMARIZE 提到顶层（`SUMMARIZE <表>`）')
   }
-  if (!summarizeSql && queryCall.gap && summarizeShapeColumns) {
+  // 「内层使用了 SUMMARIZE」同上：未解析实参只代表「可能含」，走最后一档。
+  if (!summarizeSql && queryCall.gap && summarizeShapeColumns && !summarizePresenceUnknown) {
     warnings.push(
       'SQL 在 `query()` 内层使用了 SUMMARIZE，但内层投影**不是原样透传**'
       + '（显式列举 / 表达式重投影 / 位置不可识别）：'
       + '统计值（min/max/分位数）可能**未脱敏**；若内层输出被改写成常量则保持原值。'
       + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
       + '或改用 `SELECT * FROM (SUMMARIZE <表>)` 原样透传')
+  }
+  // ⚠️ query() 实参无法静态展开（拼接 / 函数调用）—— **只声明缺口，不改写任何值**。
+  // 展不开 ≠ 检出：`query('SELECT ' || '1')` 里没有 SUMMARIZE，旧实现在这里发「SQL 在 query()
+  // 内层使用了 SUMMARIZE」是把它当成检出（CodeRabbit 第十六轮 minor，真机实测该 SQL 合法）。
+  // 所以 `queryCall.unresolved` 让上面两句「使用了 / 含 SUMMARIZE」失效，改由本档如实说
+  // 「可能含、无法检查」，并给出可执行的收口（实参改成单个字符串字面量）。
+  // 只在**输出确实是统计形状**时才发（与同族两档一致）：否则外层已投影成别的列，
+  // 内层含不含 SUMMARIZE 都不影响输出，泛化的 query() 警告已够，不必再添一条。
+  if (!summarizeSql && summarizePresenceUnknown && summarizeShapeColumns) {
+    warnings.push(
+      'SQL 里的 `query()` 实参无法静态展开（拼接 / 函数调用），无法确认内层是否含 SUMMARIZE：'
+      + '若含，其统计值（min/max/分位数）可能**未脱敏**；若不含则保持原值。'
+      + '要可靠覆盖请用 `' + queryTableCommand('<表>', loc) + '` 取指定列，'
+      + '或把 query() 的实参改为单个字符串字面量（如 `query(\'SUMMARIZE <表>\')`）')
   }
   // 边界用「前后不是标识符字符」而不是 `\\b`：别名可以带标点（`"p("`），
   // 而 `\\b` 只在词字符与非词字符之间成立 —— `\\bp(\\b` 即使不抛也永远匹配不上

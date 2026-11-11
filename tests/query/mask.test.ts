@@ -1690,6 +1690,43 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     }
   })
 
+  it('展不开的 query() 实参不得被说成「使用了 SUMMARIZE」（CodeRabbit 第十六轮 minor）', () => {
+    // `SELECT column_name, min FROM query('SELECT ' || '1')` 真机实测合法、内层没有任何
+    // SUMMARIZE，但旧实现把「实参展不开」直接置 gap，于是发「SQL 在 query() 内层使用了
+    // SUMMARIZE，但内层投影不是原样透传」——把猜测写成了检出。两层都要修：
+    // ① 不得声称检出；② 必须如实说「可能含、无法展开」（缺口不能变静默）。
+    const out = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 1 }],
+      columns: ['column_name', 'min'],
+      mode: { kind: 'sql', sql: "SELECT column_name, min FROM query('SELECT ' || '1')", tables: TABLES },
+    })
+    const w = out.warnings.join('\n')
+    expect(w, '不得冒认检出 SUMMARIZE').not.toContain('内层使用了 SUMMARIZE')
+    expect(w, '不得冒认「含 SUMMARIZE」').not.toContain('SQL 含 SUMMARIZE')
+    expect(w, '必须声明「展不开 + 可能含」').toContain('无法静态展开')
+    expect(w, '缺口语义：可能未脱敏').toContain('可能**未脱敏**')
+    expect(w, '给出可执行收口').toContain('单个字符串字面量')
+    // 反证①：输出不是统计形状时，内层含不含 SUMMARIZE 都不影响输出 —— 不发这条（避免噪音）
+    const plain = maskQueryRows({
+      rows: [{ n: 1 }],
+      columns: ['n'],
+      mode: { kind: 'sql', sql: "SELECT * FROM query('SELECT ' || '1')", tables: TABLES },
+    })
+    expect(plain.warnings.join('\n')).not.toContain('无法静态展开')
+    // 反证②：静态可展开且真含 SUMMARIZE 时，仍走原检出档（不被这条盖住）
+    const real = maskQueryRows({
+      rows: [{ column_name: 'userName', min: '张三丰' }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT * FROM query('SELECT column_name, min FROM (SUMMARIZE sessions)')",
+        tables: TABLES,
+      },
+    })
+    expect(real.warnings.join('\n')).toContain('内层使用了 SUMMARIZE')
+    expect(real.warnings.join('\n')).not.toContain('无法静态展开')
+  })
+
   it('缺口声明：SUMMARIZE 输出列名被改写（重投影）时必须警告，不得静默漏出（CodeRabbit 第六轮）', () => {
     // `SELECT column_name AS c, min AS m, max AS x FROM (SUMMARIZE sessions)`：真机实测
     // 输出列是 c/m/x，userName 行的 m/x 是原值 —— 形状判据不匹配 → 行级脱敏够不着，
