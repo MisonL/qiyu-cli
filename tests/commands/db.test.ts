@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { dbCommand } from '../../src/commands/db.js'
 import { missingTableCauses } from '../../src/query/errors.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
+import { shellArg } from '../../src/core/shell.js'
 import { TABLES, MIGRATIONS } from '../../src/store/schema.js'
 import type { Store } from '../../src/store/types.js'
 
@@ -586,7 +587,7 @@ describe('db describe', () => {
     expect(text).toContain('store init 不会重建该表')
     expect(text).toContain('需重建库')
     // 恢复命令必须指向本次的库（否则照 hint 跑会建默认库，见 output.ts）
-    expect(text).toContain('--db ' + dbPath())
+    expect(text).toContain('--db ' + shellArg(dbPath()))
     expect(meta().notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
   })
 

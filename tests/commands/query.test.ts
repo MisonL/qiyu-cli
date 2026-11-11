@@ -396,6 +396,14 @@ describe('query --sql · 成功路径（spec §十）', () => {
     // 反证②：完全没有日列引用的不可展开 query() 同样声明缺口
     expect(await q('--sql', "SELECT * FROM query('SELECT ' || '1')")).toBe(0)
     expect(all()).toMatch(/无法检查/)
+    // 反证③（CodeRabbit 第十七轮 minor）：里层套一层**静态** query() 的「无法检查」也不能
+    // 提前返回、遮住外层已确认的错位。里层递归先遇到这层「无法检查」，旧实现直接 return 它，
+    // 外层的 `stat_date >= '2026-10-13'` 就没被检查。
+    const nestedStatic = "SELECT COUNT(*) AS n FROM daily_overview "
+      + "WHERE stat_date >= '2026-10-13' "
+      + "AND EXISTS (SELECT * FROM query($q$SELECT * FROM query('SELECT ' || '1')$q$))"
+    expect(await q('--sql', nestedStatic)).toBe(0)
+    expect(definite(), '里层「无法检查」不能遮住外层的确定警告').toBe(true)
   })
 
   it('Unicode 别名的下标键引用同样警告（Codex 第十四轮 P2）', { timeout: 180_000 }, async () => {

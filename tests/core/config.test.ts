@@ -450,8 +450,11 @@ describe('Windows ACL 拒绝的平台化修法（Codex 第十二轮 P2）', () =
   })
 
   it('POSIX 口径不变（chmod 文件 / chmod 目录）', () => {
-    expect(String((insecureConfigError('/tmp/x/cfg', 'unreadable') as unknown as { hint: string }).hint)).toMatch(/chmod 600/)
-    expect(String((insecureConfigError('/tmp/x/cfg', 'dir-unreadable', '/tmp/x') as unknown as { hint: string }).hint)).toMatch(/chmod 700 \/tmp\/x/)
+    // ⚠️ 显式传 'linux'（CodeRabbit 第十七轮 major）：`platform` 默认取 `process.platform`，
+    // 在 Windows 上跑本用例会拿到 `icacls` hint、这两条无条件 chmod 断言必红。本用例验的是
+    // POSIX 分支，不该随宿主平台漂移（三条 Windows 用例各自显式传 'win32'，同款）。
+    expect(String((insecureConfigError('/tmp/x/cfg', 'unreadable', undefined, 'linux') as unknown as { hint: string }).hint)).toMatch(/chmod 600/)
+    expect(String((insecureConfigError('/tmp/x/cfg', 'dir-unreadable', '/tmp/x', 'linux') as unknown as { hint: string }).hint)).toMatch(/chmod 700 \/tmp\/x/)
   })
 })
 

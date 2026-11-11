@@ -87,7 +87,7 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
       expect(e.kind, name).toBe('store_not_initialized')
       // 恢复命令必须带本次解析出的绝对路径（不是默认库、不是裸命令）
       expect(String(e.hint), name).toContain(storeInitCommand(empty))
-      expect(String(e.hint), name).toContain('--db ' + empty)
+      expect(String(e.hint), name).toContain('--db ' + shellArg(empty))
     }
 
     // 照 hint 的命令执行（同一 argv 形态）→ 原命令全部收敛，默认库不被创建
@@ -127,13 +127,13 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     const w1 = (meta().warnings ?? []) as string[]
     expect(w1.some((x) => x.includes(syncRunCommand(db))), w1.join('\n')).toBe(true)
     // 独立于共享渲染器的字面断言：helper 自身漏掉 --db 时这里也会红
-    expect(w1.some((x) => x.includes('--db ' + db)), w1.join('\n')).toBe(true)
+    expect(w1.some((x) => x.includes('--db ' + shellArg(db))), w1.join('\n')).toBe(true)
 
     out = ''
     expect(await statsCommand(['fields', 'daily_overview', '--db', db])).toBe(0)
     const w2 = (meta().warnings ?? []) as string[]
     expect(w2.some((x) => x.includes(syncRunCommand(db))), w2.join('\n')).toBe(true)
-    expect(w2.some((x) => x.includes('--db ' + db)), w2.join('\n')).toBe(true)
+    expect(w2.some((x) => x.includes('--db ' + shellArg(db))), w2.join('\n')).toBe(true)
   })
 
   it('只读诊断 hint 带本次 --db（#45 边界 ②）：未知表/未知列/敏感分组/0 行/脱敏建议/iso-day', async () => {
@@ -149,7 +149,7 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     expect(await queryCommand(['--sql', 'SELECT * FROM no_such_table', '--db', db])).toBe(2)
     expect(String(errorOf().hint), '未知表').toContain(dbTablesCommand(loc))
     // 独立于渲染器的字面断言：渲染器漏 --db 时这里也会红
-    expect(String(errorOf().hint), '未知表').toContain('--db ' + db)
+    expect(String(errorOf().hint), '未知表').toContain('--db ' + shellArg(db))
 
     // ② 未知列 → db describe（列名来自全部表，定位不到表 → 占位符 <表>）
     out = ''
@@ -206,7 +206,7 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
       ['--sql', 'SELECT * FROM range(10)', '--limit', '3', '--db', db])).toBe(0)
     expect(meta().truncated).toBe(true)
     const w4 = (meta().warnings ?? []) as string[]
-    expect(w4.some((x) => x.includes('qiyu db describe <表> --db ' + db)), w4.join('\n')).toBe(true)
+    expect(w4.some((x) => x.includes('qiyu db describe <表> --db ' + shellArg(db))), w4.join('\n')).toBe(true)
   })
 
   it('mask --table 的漂移列警告（db describe）也带本次 --db', async () => {
@@ -442,7 +442,7 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     const drift = tasks[0]!.drift.find((d) => d.kind === 'state_pending')
     expect(drift, JSON.stringify(tasks)).toBeDefined()
     expect(drift!.detail).toContain(syncRunCommand(db))
-    expect(drift!.detail).toContain('--db ' + db)
+    expect(drift!.detail).toContain('--db ' + shellArg(db))
   })
 
   it('sync install 的 sync_not_run hint 与 sync verify 的 not_synced detail 都带 --db', async () => {
@@ -456,7 +456,7 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     const e = errorOf()
     expect(e.kind).toBe('sync_not_run')
     expect(String(e.hint)).toContain(syncRunCommand(db))
-    expect(String(e.hint)).toContain('--db ' + db)
+    expect(String(e.hint)).toContain('--db ' + shellArg(db))
 
     // verify（windowed 任务不请求上游）：drift.not_synced 的 detail 同样指向本次的库
     out = ''
@@ -467,7 +467,7 @@ describe('恢复命令指向本次的库（真 DuckDB）', () => {
     const drift = tasks[0]!.drift.find((d) => d.kind === 'not_synced')
     expect(drift, JSON.stringify(tasks)).toBeDefined()
     expect(drift!.detail).toContain(syncRunCommand(db))
-    expect(drift!.detail).toContain('--db ' + db)
+    expect(drift!.detail).toContain('--db ' + shellArg(db))
   })
 })
 

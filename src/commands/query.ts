@@ -209,14 +209,29 @@ function isMiscomparedDayLiteral(v: string): boolean {
  * 单引号状态逐个读出（`'it''s'` 是转义、不是两个字面量）。
  */
 function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
+  return dayHintOf(sql, loc)?.text ?? null
+}
+
+/**
+ * 两类结论必须分开携带（CodeRabbit 2026-11-11 第十七轮 minor）：
+ *   · `mismatch`：**已确认**的错位（必须带修法）——可立即返回，不被任何缺口盖住；
+ *   · `unexpandable`：**没法检查**（内层实参展不开 / 外层无日列但存在未知 query()）。
+ * 只用一个 `string | null` 时里层递归返回的「没法检查」会被当成结论提前返回，外层已确认的
+ * 错位连同修法一起丢失。
+ */
+type DayHint = { kind: 'mismatch' | 'unexpandable'; text: string }
+
+function dayHintOf(sql: string, loc?: StoreLocation): DayHint | null {
   // `query('<内层 SQL>')` 包装（沙箱放行的形态）里真正执行的是**实参内的 SQL**：
   // `withoutLiterals` 会把整个实参抹掉，只看外层就会漏掉内层里的错位日字面量
   //（Codex 2026-11-10 第二轮 P2，实测 `SELECT * FROM query($$…stat_date >= '2026-10-13'$$)`
   // 少算一天却零警告）。递归检查每个实参的内层 SQL（内层还能再套 query()）。
   let unexpandable = false
   for (const inner of queryCallArgs(withoutComments(sql), () => { unexpandable = true })) {
-    const innerHint = dayLiteralHint(inner, loc)
-    if (innerHint !== null) return innerHint
+    const innerHint = dayHintOf(inner, loc)
+    if (innerHint?.kind === 'mismatch') return innerHint
+    // 里层的「没法检查」只记下：外层可能还有已确认的错位（见本函数头部注释）。
+    if (innerHint !== null) unexpandable = true
   }
   // 注释先抹成空白（逐位对齐）：注释里写的 `-- WHERE stat_date >= '…'` 不是真条件。
   const code = withoutComments(sql)
@@ -229,7 +244,8 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
   // 外层 `stat_date >= '2026-10-13'` 是确定的少算一天，同句再带一个拼接实参的 `query()`
   // 时若提前返回「无法检查」，Agent 只看到「没法检查」、不会去改那条真会少算的过滤。
   // 顺序因此是：外层扫描优先；只有外层**什么都没发现**时才退化成声明缺口。
-  const unexpandableHint = (): string | null => (unexpandable ? unexpandableQueryHint(loc) : null)
+  const unexpandableHint = (): DayHint | null =>
+    (unexpandable ? { kind: 'unexpandable', text: unexpandableQueryHint(loc) } : null)
   if (!ISO_DAY_COL_RE.test(withoutLiterals(code)) && !hasDayColumnSelector(code)
     && !hasDayColumnKeyReference(code)) return unexpandableHint()
   // 在「只抹注释」的文本上找孤立的**开引号**。`withoutComments` 原样保留双引号标识符与
@@ -248,7 +264,7 @@ function dayLiteralHint(sql: string, loc?: StoreLocation): string | null {
     // 的同一实现（`readSqlString`）。标识符边界由它的美元引号判据负责。
     const lit = readSqlString(code, i)
     if (lit !== null) {
-      if (isMiscomparedDayLiteral(lit.value)) return isoDayLiteralHint(loc)
+      if (isMiscomparedDayLiteral(lit.value)) return { kind: 'mismatch', text: isoDayLiteralHint(loc) }
       i = lit.end - 1
       continue
     }

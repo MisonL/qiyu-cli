@@ -2092,6 +2092,23 @@
     （实参改成单个字符串字面量）；该档只在输出确实是统计形状时发，避免给普通查询添噪音
     （`SELECT * FROM query('SELECT ' || '1')` 的泛化 query() 警告已覆盖）。两条变异（取消排除 /
     删新档致缺口静默）均红。
+  · **里层 `query()` 的「没法检查」挡住外层已确认的日字面量错位**（CodeRabbit 第十七轮 minor）：
+    `dayLiteralHint` 只用 `string | null` 表达结论，递归内层时一旦拿到「无法检查」就提前返回 ——
+    外层 `stat_date >= '2026-10-13'` 这种**确定**少算一天的错位连同修法一起丢失（实测
+    `... AND EXISTS (SELECT * FROM query($q$SELECT * FROM query('SELECT ' || '1')$q$))`）。
+    改为 `{ kind: 'mismatch' | 'unexpandable', text }` 分开携带：只有 `mismatch` 立即返回，
+    缺口先记下、外层扫描完仍无发现才降级成缺口。变异（改回提前 return）即红。
+  · **嵌套 `query()` 的不可展开没有向上传播**（CodeRabbit 第十七轮 minor）：`queryCallSummarize`
+    只把 `sub.gap` 并上去、丢了 `sub.unresolved`，外层于是又把里层的猜测当成检出 SUMMARIZE；
+    同一处补 `if (sub.unresolved) unresolved = true`，变异即红。
+  · **两条测试断言把宿主平台当成了 POSIX / 裸路径**（CodeRabbit 第十七轮 major ×2）：
+    `insecureConfigError` 的 POSIX 用例没显式传 platform（Windows 上拿到 `icacls` hint）、
+    `stats fields` 的 `--db` 期望没走 `shellArg`（Windows 反斜杠路径会被引号化）——两条在
+    Windows 上都必红。改为显式 `'linux'` 与 `shellArg(...)`；同批把 `--db ` 裸拼接期望
+    （`store-hint-selection` / `store-precheck-single-source` / `missing-table-causes` /
+    `db.test`，共 12 处）一并收敛到 `shellArg`，判据是「期望必须按渲染方言生成」。
+    平台敏感性已实测（传 `'win32'` 即转 icacls、断言红；`shellArg('C:\\Temp\\q.db','win32')`
+    返回带引号形态）。
   · **脱敏缺口警告上限 5 条时静默截断**：第 5 条改为「另有 N 个敏感列的缺口警告未列出」并点名；
     上限按**类别**计（本块最多 5 行），不按全局行数扣减 —— 否则其它类别的警告占满 5 条后，
   不发汇总就退回静默截断、发汇总又超上限（Codex 2026-11-10 第三轮 P2）。

@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { statsCommand } from '../../src/commands/stats.js'
+import { shellArg } from '../../src/core/shell.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import type { Store } from '../../src/store/types.js'
 
@@ -160,8 +161,10 @@ describe('stats fields', () => {
     expect(notes['declared.<字段>.source']).toContain('name-suffix = ')
     // 核实路径必须指向**本次**的库（Codex 2026-11-10 第八轮 P2）：`stats fields --db X` 的
     // 提示若给裸 `qiyu query --sql '<SQL>'`，照着执行会查默认库 —— 另一份数据或「库未初始化」。
+    // ⚠️ 与渲染同源比较（CodeRabbit 第十七轮 major）：命令里的路径经 `shellArg` 引号化，
+    // Windows 上含反斜杠的路径是 `--db 'C:\…\x.duckdb'`；照裸路径拼期望在 Windows 上必红。
     expect(notes['declared.<字段>.unit'], '核实路径必须回显本次 --db')
-      .toContain(`--db ${dbPath()}`)
+      .toContain(`--db ${shellArg(dbPath())}`)
     expect(notes['declared.<字段>.unit']).toContain('整段替换')
     expect(notes['declared.<字段>.higher_is_better']).toContain('恒为 null')
     expect(notes['observed[].minus_one']).toContain('不是负数比率')

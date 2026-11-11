@@ -1725,6 +1725,34 @@ describe('SUMMARIZE 形态：敏感列的统计值必须脱敏（2026-11-07 审�
     })
     expect(real.warnings.join('\n')).toContain('内层使用了 SUMMARIZE')
     expect(real.warnings.join('\n')).not.toContain('无法静态展开')
+    // 反证③：**嵌套** query() 里层的不可展开必须向上传播（CodeRabbit 第十七轮 minor）——
+    // 外层实参是静态字符串、里层实参是拼接；旧实现只把 sub.gap 传上去、丢了 sub.unresolved，
+    // 外层于是又按「检出 SUMMARIZE」说事，可整条 SQL 里没有任何 SUMMARIZE。
+    const nestedUnresolved = maskQueryRows({
+      rows: [{ column_name: 'userName', min: 1 }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT * FROM query($q$ SELECT * FROM query('SELECT ' || '1') $q$)",
+        tables: TABLES,
+      },
+    })
+    expect(nestedUnresolved.warnings.join('\n'), '里层不可展开必须上抛').toContain('无法静态展开')
+    expect(nestedUnresolved.warnings.join('\n'), '不得冒认检出 SUMMARIZE')
+      .not.toContain('内层使用了 SUMMARIZE')
+    // 反证④：Codex 第十七轮给的另一条触发 SQL（里层是 `'…' || ''` 拼接、输出列名凑巧是
+    // column_name/min）—— 同一条传播路径，但里层多套一层常量投影，单独钉住。
+    const codexForm = maskQueryRows({
+      rows: [{ column_name: 'item', min: 3 }],
+      columns: ['column_name', 'min'],
+      mode: {
+        kind: 'sql',
+        sql: "SELECT * FROM query($outer$SELECT * FROM query('SELECT ''item'' AS column_name, 3 AS min' || '')$outer$)",
+        tables: TABLES,
+      },
+    })
+    expect(codexForm.warnings.join('\n')).toContain('无法静态展开')
+    expect(codexForm.warnings.join('\n')).not.toContain('内层使用了 SUMMARIZE')
   })
 
   it('缺口声明：SUMMARIZE 输出列名被改写（重投影）时必须警告，不得静默漏出（CodeRabbit 第六轮）', () => {

@@ -518,6 +518,9 @@ function queryCallSummarize(sql: string):
   forEachQueryArg(sql, (inner, callIndex) => {
     const innerTokens = summarizeTokenPositions(inner)
     const sub = queryCallSummarize(inner)
+    // 里层的不可展开同样向上传播（CodeRabbit 第十七轮 minor）：展不开只说明内容未知，
+    // 丢了它外层就会把里层的猜测重新当成检出。
+    if (sub.unresolved) unresolved = true
     // ⚠️ innerTokens.recognized 对 `SELECT expr FROM (SUMMARIZE …)` 成立（SUMMARIZE 在
     // 深度 1 的 FROM 内），但 SELECT 自身输出的是**表达式求值结果**、不是 SUMMARIZE 统计值。
     // 例如 `SELECT * FROM query('SELECT ''userName'' AS column_name, 3 AS min FROM

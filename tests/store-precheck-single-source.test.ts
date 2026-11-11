@@ -25,6 +25,7 @@ import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { shellArg } from '../src/core/shell.js'
 import { dbCommand } from '../src/commands/db.js'
 import { queryCommand } from '../src/commands/query.js'
 import { statsCommand } from '../src/commands/stats.js'
@@ -133,7 +134,7 @@ describe('只读前置检查：同一成因在所有命令上给出同一说法�
     const got = await hintsFor(missing)
     const uniq = [...new Set(Object.values(got))]
     expect(uniq.length, JSON.stringify(got, null, 2)).toBe(1)
-    expect(uniq[0]).toContain('store init --db ' + missing)
+    expect(uniq[0]).toContain('store init --db ' + shellArg(missing))
   })
 
   it('断链符号链接：不得说成「不存在 → 先 store init」（init 拒绝符号链接，形成死循环）', async () => {
@@ -191,7 +192,7 @@ describe('库结构校验（缺 schema_version）：同一成因同一说法', (
     const uniq = [...new Set(Object.values(got))]
     expect(uniq.length, JSON.stringify(got, null, 2)).toBe(1)
     expect(uniq[0]).toContain('空库（无任何表）')
-    expect(uniq[0]).toContain('store init --db ' + p)
+    expect(uniq[0]).toContain('store init --db ' + shellArg(p))
   })
 
   it('他人库（有表无 schema_version）：「不是本 CLI 创建的，请换 --db 路径」且**不**引导向 store init', async () => {
