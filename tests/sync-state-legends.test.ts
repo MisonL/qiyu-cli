@@ -138,6 +138,22 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     }
   })
 
+  it('tasks[].notes 释义覆盖全部生产来源（下界 + 非日界 --until 两档）', () => {
+    // `sync run` 的 tasks[].notes 由 floorNotes 与 untilNotes 两个 Map 合并（sync-run.ts），
+    // untilNotes 又有「末端上限」与「末残段跳过」两档文案。释义若只声明下界来源，
+    // Agent 读到末段提示时无法按 field_notes 解读（Codex 第十五轮 P2）。
+    const note = runFieldNotes()['tasks[].notes']!
+    expect(note, '旧来源：早于接口下界').toMatch(/早于接口下界|早于接口可得数据的最早边界/)
+    expect(note, '新来源：非日界 --until 的末残段').toMatch(/--until/)
+    expect(note, '末残段跳过的语义').toMatch(/残段|半个自然日|该日/)
+    expect(note, '末端上限档：等上限前移再跑').toMatch(/上限/)
+    expect(note, '不得再声称「唯一生产者」').not.toContain('唯一生产者')
+    // 实现侧锚点：两处 Map 都在合并处出现，防止释义 overstated 或漏档
+    const RUN_SRC = read('src/commands/sync-run.ts')
+    expect(RUN_SRC).toMatch(/floorNotes\.get\(r\.taskId\)/)
+    expect(RUN_SRC).toMatch(/untilNotes\.get\(r\.taskId\)/)
+  })
+
   it('field_notes 不带 Markdown 加粗（stdout JSON 给 Agent，`**` 是噪声）', () => {
     for (const notes of [runFieldNotes(), statusFieldNotes(), verifyFieldNotes(), tasksFieldNotes()]) {
       for (const [k, v] of Object.entries(notes)) expect(v, k).not.toContain('**')

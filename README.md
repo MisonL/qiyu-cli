@@ -342,8 +342,11 @@ total —— 覆盖窗失败时这些窗改记 skipped 并逐窗出进度行；�
 见下）/ `rows` /
 `resolved_range`（Asia/Shanghai 的 `+08:00` ISO 二元组）/ `watermark` / `last_synced_at` /
 `gaps` / `notes`。`gaps[].range` 与 `resolved_range` 同形态（同一套时间解析）；
-`notes` 是中文说明数组（恒在，常为空），例如「请求区间早于接口可得数据的最早边界」
-——把「区间不可得」与「同步故障」分开。
+`notes` 是中文说明数组（恒在，常为空），**有意跳过而非故障**——看到它不代表本轮失败。
+来源一：「请求区间早于接口可得数据的最早边界」（把「区间不可得」与「同步故障」分开）；
+来源二：日对齐任务遇到非上海日界的 `--until`，两档——该日不早于末端上限（调整 `--until`
+无用，要等上限自然前移再跑增量）或末窗是半个自然日按残段窗跳过（该日未同步，要含该日
+请把 `--until` 写到次日 0 点）。末段有无被跳过看 `windows.skipped`，不要只凭本数组为空判断。
 
 ⚠️ **`watermark` / `last_synced_at` 是 UTC `Z` 形态**（引擎写库的原样字符串），与同一行里
 `resolved_range` 的 `+08:00` 形态**写法不同**——两者可以是同一时刻
@@ -368,7 +371,7 @@ total —— 覆盖窗失败时这些窗改记 skipped 并逐窗出进度行；�
 
 | status | 含义 | 该做什么 |
 |---|---|---|
-| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗 / 整窗晚于末端上限 / 覆盖窗失败转 skipped 三种），判实际覆盖要看 `windows.skipped` |
+| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（**残段窗**或**整窗晚于末端上限**两种；覆盖窗失败转 skipped 那种必然带 `windows.failed > 0`，只会出现在 `partial`），判实际覆盖要看 `windows.skipped` |
 | `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 是写入行数（为 0 也可能是「窗口都成功、只是上游没数据」；⚠️ count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」——那批行已回滚、实际没落库，这两类失败窗存在时它**偏大**） |
 | `failed` | 快照任务的失败（本地限频闸门拦截 / 上游取数失败 / 落库失败或行数核对不符） | 快照没有窗口循环，所以不会出现 `partial`；反过来 windowed 任务也**不会**给出 `failed` —— 全窗失败同样是 `partial` |
 

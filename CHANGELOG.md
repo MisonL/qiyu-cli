@@ -2069,6 +2069,20 @@
   · **`config_invalid` 的注释把「权限拒绝」列成自己的成因**（CodeRabbit 第十四轮 minor）：
     权限拒绝走 `config_insecure`（`permissionReadError` / auth 的 insecure 分支），照旧注释
     分流会挑错 kind；注释改为「内容读不出来」并点名权限拒绝归 `config_insecure`。
+  · **README 的 `complete` 行把只在 `partial` 出现的成因写进覆盖面**（CodeRabbit 第十五轮 minor）：
+    `complete` 的定义是 `windows.failed = 0`，而「覆盖窗失败转 skipped」必然 `windows.failed > 0`、
+    只可能出现在 `partial` —— README 却把它并列成 skipped 的第三种成因，Agent 会以为
+    「complete 也可能藏着没拉到的合并窗」（与同文 470-474 段、field note 自相矛盾）。
+    `complete` 行改回两种成因并加「只会出现在 `partial`」限定；`tests/docs.test.ts` 加行级守卫
+    （必须带该限定、不得声称「三种」），变异退回旧文案即红。
+  · **`tasks[].notes` 的机器可读释义只声明了两个生产来源中的一个**（Codex 第十五轮 P2）：
+    `sync run` 把 `floorNotes`（区间早于接口下界）与 `untilNotes`（日对齐任务遇到非上海日界
+    `--until`，分「该日不早于末端上限 / 末窗半个自然日按残段窗跳过」两档）合并写入 notes，
+    `runFieldNotes()` 却称「当前唯一生产者是『请求区间早于接口下界』」—— 按 `meta.field_notes`
+    解读输出的 Agent 认不出末段提示，会把「该日未同步」读成故障或漏读。释义改为按来源逐档
+    说明并指向 `windows.skipped`；README 同段同步；`tests/sync-state-legends.test.ts` 加
+    释义守卫（两来源 + 两档 + 源码合并点），`tests/docs.test.ts` 加 README 段落守卫，
+    三种变异（退回旧释义 / 删上限档 / README 回旧文）均红。
   · **脱敏缺口警告上限 5 条时静默截断**：第 5 条改为「另有 N 个敏感列的缺口警告未列出」并点名；
     上限按**类别**计（本块最多 5 行），不按全局行数扣减 —— 否则其它类别的警告占满 5 条后，
   不发汇总就退回静默截断、发汇总又超上限（Codex 2026-11-10 第三轮 P2）。
