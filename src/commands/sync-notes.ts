@@ -137,10 +137,13 @@ export function runFieldNotes(): Record<string, string> {
       + '不含被重叠区合并的窗（那是 contained；物理切出的窗数 = total + contained）',
     'tasks[].windows.succeeded': '成功窗数。⚠️ 空窗也算成功，所以 > 0 不代表有数据 —— 结合 rows.written 与 windows.failed 判断',
     'tasks[].windows.failed': '失败窗数（失败会在 gaps 里逐条记录）',
-    'tasks[].windows.skipped': '没跑的窗数，两种成因：① 残段窗（日对齐任务被显式区间钳出的'
+    'tasks[].windows.skipped': '没跑的窗数，三种成因：① 残段窗（日对齐任务被显式区间钳出的'
       + '非日界首/末段）；② 整窗晚于末端上限被丢弃的窗（windowEndClamp：考勤/绩效请求到'
-      + '「今天」时）。两种都跳过不 fetch、不写库、不推水位，但计入 total'
-      + '（total = succeeded + failed + skipped）；stderr 进度行分两句点名成因',
+      + '「今天」时）；③ 覆盖它的那一窗失败了 —— 它原本落在前一窗的回看重叠区、被合并，'
+      + '覆盖窗成功时算 contained，失败时就是「该拉的没拉」，改记 skipped 并逐窗出'
+      + '「须重跑补齐」进度行。三种都跳过不 fetch、不写库、不推水位，但计入 total'
+      + '（total = succeeded + failed + skipped）；stderr 进度行按成因逐种点名。'
+      + '⚠️ ③ 出现时本轮 status 必为 partial，看 gaps 找到失败的覆盖窗',
     'tasks[].windows.contained': '完全落进前一窗回看重叠区、被合并的窗数（仅 > 0 时出现）。'
       + '这些窗不执行 —— 覆盖它的那一窗成功时数据已由那一窗覆盖（overlapDays > 0 的任务，'
       + '如工单 3 天回看），所以既不是 succeeded 也不是 skipped（skipped 才代表「该拉的没拉」）；'

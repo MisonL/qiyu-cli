@@ -408,6 +408,27 @@ describe('sync 状态位图例 ↔ 源码枚举 ↔ README（三方双向）', (
     expect(p, 'skill 正文也必须点明空 gaps 不等于完整').toContain('空 `gaps` 不等于完整')
   })
 
+  it('windows.skipped 的释义覆盖引擎的**全部**成因（Codex 2026-11-11 第十三轮 P2）', () => {
+    // 事故形态（引擎源码核对）：`runWindowed`（engine.ts 的「合并窗结算」段）与
+    // `runRotated` 同口径 —— 覆盖窗**失败**时，其名下被重叠区合并的窗「该拉没拉」，
+    // 一并计入 `windows.skipped` 并逐窗出「须重跑补齐」进度行。释义一度只列两种成因
+    //（残段窗 / 整窗晚于末端上限），Agent 会把覆盖窗失败那轮的 skipped 读成「都是
+    // 有意不拉的窗」。判据钉住三种成因与进度行口径，并对齐引擎的计数来源。
+    const note = runFieldNotes()['tasks[].windows.skipped']!
+    expect(note, '残段窗成因').toContain('残段窗')
+    expect(note, '整窗晚于末端上限成因').toContain('晚于末端上限')
+    expect(note, '覆盖窗失败成因（引擎确实这么计）').toMatch(/覆盖窗|覆盖它的那一窗/)
+    expect(note, '必须点明它才代表「该拉的没拉」、须重跑补齐').toMatch(/重跑/)
+    expect(note, '不得再声称只有两种成因').toContain('三种')
+    expect(note, '不得再声称只有两种成因').not.toContain('两种成因')
+    expect(note, '进度行口径是三种成因各一句，不是「分两句」').not.toMatch(/分两句/)
+    // 引擎口径的正面锚点：两处结算都有 containedUnreached → skipped
+    //（`ROOT_SRC` 只读 sync-notes.ts，引擎另读）
+    const ENGINE_SRC = read('src/sync/engine.ts')
+    expect(ENGINE_SRC).toMatch(/skippedTotal = skipped \+ containedUnreached/)
+    expect(ENGINE_SRC).toMatch(/droppedByClamp\.length \+ unreached/)
+  })
+
   it('源码注释里的「实测」锚点与真跑出来的输出一致（判据不靠人肉记忆）', () => {
     // ⚠️ 这条是防「注释自说自话」：注释声称 `complete` 在中窗失败时仍出现、`pending` 在
     // 有数据时仍出现 —— 两个断言都由下面两条真库用例独立钉住，这里只核对注释没被删掉

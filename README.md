@@ -334,8 +334,9 @@ qiyu --version                       包版本 + skill_contract_version
 
 `sync run` 的 stdout 是 `{tasks:[...], truncated:false}`，每个任务含 `task` / `status`
 （complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped, contained?}`，
-`total = succeeded + failed + skipped`，`skipped` = 跳过的**残段窗**数 + **整窗晚于
-末端上限被丢弃**的窗数；`contained` 仅在 > 0 时出现 = 完全落进前一窗**回看重叠区**、被合并的
+`total = succeeded + failed + skipped`，`skipped` 有三种成因：跳过的**残段窗**数 +
+**整窗晚于末端上限被丢弃**的窗数 + **覆盖窗失败**时其名下被合并、该拉没拉的窗数；
+`contained` 仅在 > 0 时出现 = 完全落进前一窗**回看重叠区**、被合并的
 窗数（overlapDays > 0 的任务；**覆盖窗成功**时数据已由那一窗覆盖，所以不算 skipped、也不计入
 total —— 覆盖窗失败时这些窗改记 skipped 并逐窗出进度行；物理切出的窗数 = total + contained），
 见下）/ `rows` /
@@ -367,7 +368,7 @@ total —— 覆盖窗失败时这些窗改记 skipped 并逐窗出进度行；�
 
 | status | 含义 | 该做什么 |
 |---|---|---|
-| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗**或整窗晚于末端上限**被跳过），判实际覆盖要看 `windows.skipped` |
+| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗 / 整窗晚于末端上限 / 覆盖窗失败转 skipped 三种），判实际覆盖要看 `windows.skipped` |
 | `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 是写入行数（为 0 也可能是「窗口都成功、只是上游没数据」；⚠️ count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」——那批行已回滚、实际没落库，这两类失败窗存在时它**偏大**） |
 | `failed` | 快照任务的失败（本地限频闸门拦截 / 上游取数失败 / 落库失败或行数核对不符） | 快照没有窗口循环，所以不会出现 `partial`；反过来 windowed 任务也**不会**给出 `failed` —— 全窗失败同样是 `partial` |
 
@@ -466,8 +467,11 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 16 小时段）——引擎**跳过不落库**（半日聚合不写日行，避免覆盖该日的整日聚合值；
 `windows.skipped` 如实计数、每窗一条 stderr 进度行）。**`skipped` 也计入「整窗晚于
 末端上限被丢弃」的窗**（`windowEndClamp`，考勤/绩效请求到「今天」时）：这类窗同样
-不 fetch、不算成功，但会出现在 `skipped` 里并逐窗出「晚于末端上限」进度行——
-`skipped > 0` 不再只意味着「有残段窗被跳过」，判实际覆盖先分清这两种成因。**末残段**的整日值**可能**由其
+不 fetch、不算成功，但会出现在 `skipped` 里并逐窗出「晚于末端上限」进度行。
+**第三种成因：覆盖窗失败的合并窗**——overlapDays > 0 的任务里，被前一窗回看重叠区
+合并的窗在覆盖窗成功时算 `contained`，覆盖窗失败时就是「该拉的没拉」，改记 `skipped`
+并逐窗出「须重跑补齐」进度行；此时本轮 status 必为 `partial`，看 `gaps` 找到失败的覆盖窗。
+`skipped > 0` 不等于「都是有意不拉的窗」，判实际覆盖先分清这三种成因。**末残段**的整日值**可能**由其
 请求区间覆盖该整天的日对齐 run 补全（水位停在最后一个整日窗末端；若下一轮的请求区间
 仍未覆盖该整天，该段仍是残段、继续跳过——不保证「下一次 run」就补上）；
 **首残段**不落日行也**不补**——该半日段没有合法落点（写入即半日覆盖整日），属显式
