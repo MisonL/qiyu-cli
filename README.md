@@ -41,7 +41,10 @@ cd qiyu-cli && npm install && npm run build
 
 > 核心命令（`auth`、`api`）零运行时依赖。`store` / `db` / `query` / `stats` 命令需要
 > `@duckdb/node-api`（可选依赖，缺失时会给出安装指引）——`npm install` 会默认安装它。
-> 该包含平台原生二进制，实测安装体积约 130 MB。`sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`（zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 仅测试夹具合成加密 zip 用，见 `devDependencies`。
+> 该包含平台原生二进制，实测安装体积约 130 MB。
+> `sync` 命令**零常规运行时依赖**：会话导出的加密 zip 解压走 Node 内置 `DecompressionStream`
+> （zip 容器解析与 ZipCrypto 解密是本仓库内的实现）；`fflate` 只在测试里用来合成加密 zip
+> 夹具，见 `devDependencies`。
 
 ### 装完之后：安装 skill（推荐）
 
@@ -97,6 +100,8 @@ qiyu auth whoami
 # {"ok":true,"data":{"configured":true,"source":"env","profile":"default","robots":[]}}
 ```
 
+### 把凭证写进配置文件
+
 也可以把凭证**写进配置文件**；之后除非用 `--profile` 指定了非 default 档，否则不必每次 export：
 
 ```bash
@@ -128,6 +133,8 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
 而**显式** `--db ''` / `--backend ''` 是用法错误——把明确给出的空值悄悄换成另一份资源不是回落，是静默改道。
 空白串（`--db '   '`）不是空串，两者都拒绝，且报错点名**真正给了空白值的那一层**
 （旧文案把三个来源一起指控为「均为空」，明明配了值的 `profiles.<name>.store.path` 也在其列）。
+
+### 配置文件结构
 
 配置文件的完整结构（**顶层 / profile / store 三层的键名写错会被拒绝，退出码 2**）：
 
@@ -166,23 +173,35 @@ shell 历史与 `ps` 输出里）。它把配置写到 `~/.config/qiyu/config.js
   `profiles` 里也不报错）。空串口径：`--profile ''` 是 usage 错误；`QIYU_PROFILE=` 与
   `"defaultProfile": ""` 视为未设置。
 
-**权限规则**：配置文件**含凭证**且 group/other 有**任何**权限位（如 `0644` 可读、`0622` 只写、
-`0601` 仅 other 可执行）时，**任何读取配置的命令都会拒绝读取**（`kind: config_insecure`，
-退出码 1，hint 点名要执行的 `chmod`）——可读时落盘的 appSecret 对同机其他用户可读，
-其余组合也不该放宽，判据就是 `mode & 0o077 !== 0`。文件**读不出来**（权限拒绝，
-`EACCES`/`EPERM`）同样按 `config_insecure` 报（退出码 1 + `chmod 600` hint）——它是权限
-问题，不是配置内容问题；而**配置目录**不可搜索（目录进不去、连文件都 stat 不到）报的是
-另一句话，hint 是 `chmod 700 <目录>`——对文件 chmod 在这个状态下本身就执行不了，不会把
-「目录挡路」说成「凭证缺失」。不读配置的命令（`--version`、
-`api list`、`skill where`、`sync tasks` 等）不受影响，它们不碰凭证。不含凭证的文件维持
-「只在 stderr 警告、不阻断」。
-父目录 group/other **可写**（文件可被整体替换）时同样拒绝。`auth login` 是**唯一的例外**：
-它不拒绝，而是把已有文件重写为 `0600`（马上要写入新的 secret，拒绝没有意义），写完自检
-不合格才报 `config_insecure`。Windows 上跳过这些检查（「过宽」判据只看 POSIX 权限位）；
-但**读被拒绝**（NTFS ACL）在 Windows 上同样会按 `config_insecure` 报，此时 hint 是
-`icacls <路径> /reset`（恢复继承的 ACL）—— `chmod` 不存在于 Windows，POSIX 修法照搬过去
-用户将无路可走。数据库正常关闭后 `.wal` 临时文件会
-自动消失，请勿手工删除。
+### 配置文件权限规则
+
+判据只有一条：配置文件**含凭证**且 group/other 有**任何**权限位（如 `0644` 可读、`0622` 只写、
+`0601` 仅 other 可执行）即拒绝读取（判据 `mode & 0o077 !== 0`）。可读时落盘的 appSecret 对同机
+其他用户可读，其余组合也不该放宽。父目录 group/other **可写**（文件可被整体替换）时同样拒绝。
+
+**任何读取配置的命令**都会拒绝：`kind: config_insecure`、退出码 1，hint 点名要执行的 `chmod`。三档成因与修法：
+
+| 成因 | hint |
+|---|---|
+| 文件权限过宽 | `chmod 600 <文件>` |
+| 文件**读不出来**（`EACCES` / `EPERM`）—— 是权限问题，不是配置内容问题 | `chmod 600 <文件>` |
+| 配置**目录**不可搜索（进不去、连文件都 stat 不到） | `chmod 700 <目录>` |
+
+目录挡路时**不能**建议对文件 chmod —— 那个状态下这条命令本身就执行不了，也不会把
+「目录挡路」说成「凭证缺失」。Windows 上「过宽」判据不适用（只看 POSIX 权限位），
+但**读被拒绝**（NTFS ACL）同样报 `config_insecure`，此时 hint 是 `icacls <路径> /reset`
+（恢复继承的 ACL）—— `chmod` 不存在于 Windows。
+
+两个例外与边界：
+
+- 不含凭证的文件**不阻断**，只在 stderr 警告。
+- `auth login` 是**唯一的例外**：它不拒绝，而是把已有文件重写为 `0600`（马上要写入新的 secret，
+  拒绝没有意义），写完自检不合格才报 `config_insecure`。
+- 不读配置的命令（`--version`、`api list`、`skill where`、`sync tasks` 等）一律不受影响。
+
+数据库正常关闭后 `.wal` 临时文件会自动消失，请勿手工删除。
+
+### `auth whoami` 能看到什么
 
 > ⚠️ `whoami` **只检查凭证是否存在**，不校验它是否有效——一个拼错的 AppKey 同样返回
 > `configured: true`。第一次真实调用才是唯一的验证。
@@ -332,27 +351,41 @@ qiyu --version                       包版本 + skill_contract_version
 
 ### sync 命令的输出
 
-`sync run` 的 stdout 是 `{tasks:[...], truncated:false}`，每个任务含 `task` / `status`
-（complete/partial/failed）/ `windows`（`{total, succeeded, failed, skipped, contained?}`，
-`total = succeeded + failed + skipped`，`skipped` 有三种成因：跳过的**残段窗**数 +
-**整窗晚于末端上限被丢弃**的窗数 + **覆盖窗失败**时其名下被合并、该拉没拉的窗数；
-`contained` 仅在 > 0 时出现 = 完全落进前一窗**回看重叠区**、被合并的
-窗数（overlapDays > 0 的任务；**覆盖窗成功**时数据已由那一窗覆盖，所以不算 skipped、也不计入
-total —— 覆盖窗失败时这些窗改记 skipped 并逐窗出进度行；物理切出的窗数 = total + contained），
-见下）/ `rows` /
-`resolved_range`（Asia/Shanghai 的 `+08:00` ISO 二元组）/ `watermark` / `last_synced_at` /
-`gaps` / `notes`。`gaps[].range` 与 `resolved_range` 同形态（同一套时间解析）；
-`notes` 是中文说明数组（恒在，常为空），**有意跳过而非故障**——看到它不代表本轮失败。
-来源一：「请求区间早于接口可得数据的最早边界」（把「区间不可得」与「同步故障」分开）；
-来源二：日对齐任务遇到非上海日界的 `--until`，两档——该日不早于末端上限（调整 `--until`
-无用，要等上限自然前移再跑增量）或末窗是半个自然日按残段窗跳过（该日未同步，要含该日
-请把 `--until` 写到次日 0 点）。末段有无被跳过看 `windows.skipped`，不要只凭本数组为空判断。
+`sync run` 的 stdout 是 `{tasks:[...], truncated:false}`。每个任务含这些字段：
+
+| 字段 | 内容 |
+|---|---|
+| `task` | 任务 id |
+| `status` | `complete` / `partial` / `failed`（逐值见下） |
+| `windows` | `{total, succeeded, failed, skipped, contained?}`，恒有 `total = succeeded + failed + skipped` |
+| `rows` | `{fetched, written}` |
+| `resolved_range` | 本轮请求的 Asia/Shanghai `+08:00` ISO 二元组（含义见 `meta.field_notes`） |
+| `watermark` / `last_synced_at` | UTC `Z` 形态，与 `resolved_range` **写法不同**（见下） |
+| `gaps` | 本轮失败 / 提示的缺口，`gaps[].range` 与 `resolved_range` 同形态 |
+| `notes` | 中文说明数组（恒在，常为空），见下 |
+
+**`windows.skipped` 有三种成因**：跳过的**残段窗**数 + **整窗晚于末端上限被丢弃**的窗数 +
+**覆盖窗失败**时其名下被合并、该拉没拉的窗数。
+
+**`windows.contained`** 仅在 > 0 时出现：完全落进前一窗**回看重叠区**、被合并的窗数
+（overlapDays > 0 的任务）。**覆盖窗成功**时数据已由那一窗覆盖，所以既不算 skipped、
+也不计入 total；覆盖窗失败时这些窗改记 skipped 并逐窗出进度行。
+物理切出的窗数 = `total + contained`。
+
+`notes` 是中文说明数组（恒在，常为空），内容是「有意跳过」、**不是故障**——看到它不代表本轮失败。两个生产来源：
+
+- 「请求区间早于接口可得数据的最早边界」（把「区间不可得」与「同步故障」分开）；
+- 日对齐任务遇到非上海日界的 `--until`，两档：该日不早于末端上限（调整 `--until` 无用，
+  要等上限自然前移再跑增量）；或末窗是半个自然日、按残段窗跳过（该日未同步，
+  要含该日请把 `--until` 写到次日 0 点）。
+
+末段有无被跳过看 `windows.skipped`，不要只凭本数组为空判断。
 
 ⚠️ **`watermark` / `last_synced_at` 是 UTC `Z` 形态**（引擎写库的原样字符串），与同一行里
 `resolved_range` 的 `+08:00` 形态**写法不同**——两者可以是同一时刻
 （实测 `"…08:53:20.000Z"` 与 `"…16:53:20+08:00"` 是同一瞬间）。直接按字符串比较会得出
 相反结论，先解析成时刻再比。`watermark` 是「数据覆盖到哪」，`last_synced_at` 是
-「那次提交发生在什么时候」——⚠️ **它按成功窗更新、不按轮**：一轮里有部分窗口失败
+「那次提交发生在什么时候」——注意**它按成功窗更新、不按轮**：一轮里有部分窗口失败
 （`sync run` 报 `partial`）时它照样被更新（实测：中窗失败 → `partial` 而它已是末个成功窗
 的提交时刻）；它也**可能晚于水位实际前进的时刻**（断链后的成功窗仍刷新它，水位却冻结在
 连续成功末端，实测同一轮里两者相差数分钟）。只有整轮没有任何带水位写入的成功提交
@@ -371,14 +404,24 @@ total —— 覆盖窗失败时这些窗改记 skipped 并逐窗出进度行；�
 
 | status | 含义 | 该做什么 |
 |---|---|---|
-| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常 —— ⚠️ 但不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（**残段窗**或**整窗晚于末端上限**两种；覆盖窗失败转 skipped 那种必然带 `windows.failed > 0`，只会出现在 `partial`），判实际覆盖要看 `windows.skipped` |
-| `partial` | 至少一个窗口失败 | ⚠️ **它也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0` 但 status 仍是 `partial`（退出码 1）。两个字段分开读：`windows.succeeded` 是成功窗数（**空窗也算成功**，大于 0 不代表有行）；`rows.written` 是写入行数（为 0 也可能是「窗口都成功、只是上游没数据」；⚠️ count_mismatch / write_failed 的失败窗记的是「参与核对的应写行数」——那批行已回滚、实际没落库，这两类失败窗存在时它**偏大**） |
+| `complete` | **没有失败窗口**（`windows.failed = 0`） | 正常。⚠️ 不保证「全部窗口都跑了」：`windows.skipped` 可能大于 0（残段窗 / 整窗晚于末端上限两种；覆盖窗失败那种只会出现在 `partial`），判实际覆盖看它 |
+| `partial` | 至少一个窗口失败 | 它**也覆盖「一行都没落」**：全窗失败时 `windows.succeeded = 0`，退出码仍为 1。两个计数字段怎么读见下 |
 | `failed` | 快照任务的失败（本地限频闸门拦截 / 上游取数失败 / 落库失败或行数核对不符） | 快照没有窗口循环，所以不会出现 `partial`；反过来 windowed 任务也**不会**给出 `failed` —— 全窗失败同样是 `partial` |
+
+上表两处展开：
+
+- **`complete` 时 `windows.skipped > 0` 有两种成因**：跳过的残段窗、整窗晚于末端上限被丢弃。
+  第三种成因（覆盖窗失败时其名下被合并的窗转 skipped）必然带 `windows.failed > 0`，
+  **只会出现在 `partial`**。
+- **`partial` 的两个计数分开读**：`windows.succeeded` 是成功窗数（空窗也算成功，
+  大于 0 不代表有行）；`rows.written` 是写入行数（为 0 也可能是「窗口都成功、只是上游没数据」）。
+  ⚠️ `count_mismatch` / `write_failed` 的失败窗记的是「参与核对的应写行数」——那批行已回滚、
+  实际没落库，这两类失败窗存在时它**偏大**。
 
 `sync status` 的 `data` 是 `{tasks:[…]}`（图例键即该路径下的字段，如 `tasks[].range_status`），
 每任务输出 `{task, watermark, range_status, last_synced_at, resolved_range,
 gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区间（形态同 run 的
-`resolved_range`，但 ⚠️ `start` 是**水位起点语义**、含可能被跳过的首残段前缀 ——
+`resolved_range`，但 `start` 是**水位起点语义**、含可能被跳过的首残段前缀 ——
 本命令不输出 `windows.skipped`，判实际覆盖要看 `sync run` 的 `windows.skipped`），
 `gaps` 是历史缺口逐条 `{range, reason, detail, recorded_at}`。
 
@@ -387,9 +430,19 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 
 | range_status | 真实含义 | 常见误读 |
 |---|---|---|
-| `complete` | **水位推进过**（引擎每个成功窗都写它） | ❌ 不是「全窗口成功」：3 窗中窗失败 → run 报 `partial` 而这里仍是 `complete`。判数据完整要综合三个判据：**覆盖范围**（`resolved_range`，以及 `sync run` 的 `windows.skipped` —— 本命令不输出它）、**历史缺口新鲜度**（按 `range` 对照，见下）、**空 `gaps` 不等于完整**（`skipped > 0` 时可能 `gaps` 为空但仍有未覆盖段） |
-| `pending` | **最近一次运行没推进水位**（每轮开跑就置 pending，成功窗才推回 complete） | 三种误读都要避免：❌ 不是「库里没数据」（首窗失败时后续成功窗照常落库、只是不推水位，实测 pending 且表里有 2 行）；❌ 不是「从未同步过」（先成功一轮、再跑一轮首窗失败同样回到 pending，而 `watermark` 保留上一轮的值）；❌ 也不是「正在同步」（并发写者会让本命令退避等待，等到后读到的是那一轮的结果） |
+| `complete` | **水位推进过**（引擎每个成功窗都写它） | ❌ 不是「全窗口成功」：3 窗中窗失败 → run 报 `partial` 而这里仍是 `complete`。判数据完整要综合三个判据，见下 |
+| `pending` | **最近一次运行没推进水位**（每轮开跑就置 pending，成功窗才推回 complete） | 有三种误读都要避免，见下 |
 | `null` | 该任务在 `sync_state` 里**没有行** | ❌ 不是「同步失败」：从未跑过，或只跑过被跳过的残段窗 |
+
+上表两处展开：
+
+- **`complete` 的「判数据完整」三个判据**：**覆盖范围**（`resolved_range`，以及 `sync run` 的
+  `windows.skipped` —— 本命令不输出它）、**历史缺口新鲜度**（按 `range` 对照，见下）、
+  **空 `gaps` 不等于完整**（`skipped > 0` 时可能 `gaps` 为空但仍有未覆盖段）。
+- **`pending` 的三种误读**：❌ 不是「库里没数据」（首窗失败时后续成功窗照常落库、只是不推水位，
+  实测 pending 且表里有 2 行）；❌ 不是「从未同步过」（先成功一轮、再跑一轮首窗失败同样回到 pending，
+  而 `watermark` 保留上一轮的值）；❌ 也不是「正在同步」（并发写者会让本命令退避等待，
+  等到后读到的是那一轮的结果）。
 
 `locked:true` 表示 `sync_state` 里有**残留**的写者章（上一轮运行被强杀）——它同样是
 「不是正在同步中」：真正持锁的进程会让本命令退避等待（`readOnlyRetryMs`，默认 30 秒），
@@ -423,7 +476,7 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 | `count_mismatch` | 写入意图行数 ≠ API 声明行数（事务已回滚） | 重跑；持续不符报告人类 |
 | `knowledge_row_malformed` | 快照映射时缺键列的行被丢弃（响应形态漂移）；含知识库类目树里缺 id 的节点（连同其子树） | 报告人类核对接口形态；快照全删重插下这些行已消失 |
 | `staff_id_list_malformed` | 分两种：`staffIdList` 非数组 → **该组全部成员**未落库（整组跳过）；成员 id 为空 → **该成员**未落库（同组其余成员照常落库） | 报告人类核对接口形态；快照全删重插下这些成员已消失 |
-| `row_missing_key` | 窗口任务（报表 / 工单 / 工单日志）映射时行缺主键列（缺键或空串），**该行未落库**；`detail` 是丢弃行数（工单日志另点名「因缺 id 整单未拉取」的工单数） | 报告人类核对接口形态；`fetched`/`written` 都不含这些行，窗口仍可能 complete |
+| `row_missing_key` | 映射时行缺主键列（缺键或空串），**该行未落库**；`detail` 是丢弃行数（工单日志另点名整单未拉取数） | 报表 / 工单 / 工单日志：报告人类核对接口形态；行数核对不含这些行，窗口仍可能 complete |
 | `filter_matched_no_staff` | 报表筛选条件未命中任何客服（本窗按 0 行记） | 结合筛选条件判断——它不是「没有数据」的证据 |
 | `export_fixture_unreported` | 导出流未上报窗口声明行，空窗可能真空也可能被截断 | 抽查该窗行数，必要时重跑 |
 | `export_window_mismatch` | 导出声明的窗口宽于请求（重叠行由幂等 upsert 吸收） | 数据不受损，知悉即可 |
@@ -595,6 +648,56 @@ min/max **只能核对一致性、不是量纲证据** —— 量纲不明确时
 脱敏边界；payload 不是合法 JSON 的行不计入统计，**含空字符串键 `""` 的行仍计入该行其它字段**
 （只跳过那个键本身），两者都会在 `meta.warnings` 里点名数量。
 
+### skill 命令的输出
+
+**`skill` 输出的状态取值**（Agent 按值分支；命令输出里每个值都带释义与动作，见
+`meta.field_notes`；本图例与源码枚举由 `tests/skill-field-notes.test.ts` 三方核对）：
+
+`data.entity.state`（`skill where`）——`ok` 实体目录可用 / `missing` 不存在（= 未安装）/
+`not_a_directory` 路径存在但不是目录（install 不会写它，需人先处理）/
+`unknown` 无法判定（带 `error`，此时 `exists` 为 `null`）—— **`unknown` 不是「不存在」**。
+
+`data.links[].state`（`skill where` 与 `skill install`）——`ok` 正确指向本实体 /
+`missing` 链接不存在（**install 只在该 Agent 的 skills 目录已存在时**创建链接，从不创建
+目录；目录不存在时 install 在 `meta.warnings` 里说明，且 `links` 里没有这个 Agent 的条目）/
+`dangling` 链接存在但目标已不在（install 会重建）/
+`foreign` **路径上是别人的东西**（不是指向本实体的符号链接，install 一律跳过，**不要删**）/
+`unknown` 无法判定（带 `error`）——同样**不是「不存在」**。
+
+`skill install --dry-run` 的 `data.action` / `data.planned_status`——`install`/`installed`
+首次安装；`update`/`updated` 覆盖正文（`--force`）或只重写落后的清单；`skip`/`skipped`
+**实体正文零写入**（内容一致且清单新鲜，或内容不同但没带 `--force`，原因在 `meta.warnings`）。
+⚠️ 零写入只针对**实体正文**：链接仍会照常建立/修复 —— 实测「删掉链接后重装」返回
+`status: skipped` 且 `links[].state` 回到 `ok`。判断链接发生了什么要看 `links[]`。
+真实安装用 `data.status`（`installed`/`updated`/`skipped`，语义同上）；`links[].action`
+是**计划动作**（`keep`/`create`/`rebuild`/`skip`/`unknown`，与 `links[].state` 一一对应），
+只在 `--dry-run` 的输出里存在 —— 真实安装的 `links[]` 条目只有 `state` 与可选 `error`。
+
+### api call 的 body 校验
+
+body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
+未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
+参数表见 `qiyu api schema <id>`（`data.params`、`data.response_shape`）。
+`data.params[]` 的元素字段是 `in`（`query` / `body` / `path` / `header`）、`required`、
+`type`、`description`、`example`，以及条件出现的 `auto`（**只挂在这个数组的元素上**，
+不是 `data` 的顶层键）。
+只依据文档生成的参数表，不构成对服务端行为的保证；**响应体不做校验**；
+校验只对 `body_kind: json` 且有 body 参数表的接口生效，其余原样透传。
+`--strict` 只做本地参数表闭集一致性检查（「严格」≠「正确严格」），误拒时**不要删字段重试**。
+
+### 输出格式（`--pretty`）
+
+**输出格式**：所有命令默认输出紧凑 JSON（一行、可解析）。`--pretty` 输出缩进 JSON（人类可读）——
+写在**具体子命令之后**（如 `qiyu api list --pretty`）。Agent 不需要它：默认输出已是合法 JSON，
+缩进只是给人看的。用法错误（退出码 2）仍是紧凑 JSON —— 先修参数，再看格式。
+
+### `api list` 的输出
+
+`api list` 输出的 `data` 是**行数组**（`[{id, title, …}, …]`，不是 `{rows:[…]}` 对象）——
+`meta.field_notes` 的键是**行字段名**（`verified` / `dangerous` / `direction` …），
+唯一的例外是 `request_schema`：它不是字段，而是一条「本 meta 不含参数表，去
+`api schema` 查」的否定声明。`meta.registry_complete` 会如实反映注册表是否已收录全部接口。
+
 ## 安全
 
 - **危险操作硬门禁**：标记为 `dangerous` 的接口在缺少 `--yes` 时，**绝不发出任何请求**：body 合法则返回退出码 4，body 缺必填/非对象则**先**报参数错误（退出码 2），并给出 `confirm_required` / `confirm_arg` / `risk` / `target` 四个字段。
@@ -650,48 +753,6 @@ Skill 化——`skill install`（复制正文 + 建 Agent 链接，幂等，`--d
 有违规退出码 1，`--compare` 下内容不一致也算失败）/
 `skill where`（只读报告实体目录与各 Agent 链接状态），
 外加 `qiyu --version`（输出包版本与 `skill_contract_version`）。
-
-**`skill` 输出的状态取值**（Agent 按值分支；命令输出里每个值都带释义与动作，见
-`meta.field_notes`；本图例与源码枚举由 `tests/skill-field-notes.test.ts` 三方核对）：
-
-`data.entity.state`（`skill where`）——`ok` 实体目录可用 / `missing` 不存在（= 未安装）/
-`not_a_directory` 路径存在但不是目录（install 不会写它，需人先处理）/
-`unknown` 无法判定（带 `error`，此时 `exists` 为 `null`）—— **`unknown` 不是「不存在」**。
-
-`data.links[].state`（`skill where` 与 `skill install`）——`ok` 正确指向本实体 /
-`missing` 链接不存在（**install 只在该 Agent 的 skills 目录已存在时**创建链接，从不创建
-目录；目录不存在时 install 在 `meta.warnings` 里说明，且 `links` 里没有这个 Agent 的条目）/
-`dangling` 链接存在但目标已不在（install 会重建）/
-`foreign` **路径上是别人的东西**（不是指向本实体的符号链接，install 一律跳过，**不要删**）/
-`unknown` 无法判定（带 `error`）——同样**不是「不存在」**。
-
-`skill install --dry-run` 的 `data.action` / `data.planned_status`——`install`/`installed`
-首次安装；`update`/`updated` 覆盖正文（`--force`）或只重写落后的清单；`skip`/`skipped`
-**实体正文零写入**（内容一致且清单新鲜，或内容不同但没带 `--force`，原因在 `meta.warnings`）。
-⚠️ 零写入只针对**实体正文**：链接仍会照常建立/修复 —— 实测「删掉链接后重装」返回
-`status: skipped` 且 `links[].state` 回到 `ok`。判断链接发生了什么要看 `links[]`。
-真实安装用 `data.status`（`installed`/`updated`/`skipped`，语义同上）；`links[].action`
-是**计划动作**（`keep`/`create`/`rebuild`/`skip`/`unknown`，与 `links[].state` 一一对应），
-只在 `--dry-run` 的输出里存在 —— 真实安装的 `links[]` 条目只有 `state` 与可选 `error`。
-
-body 分级校验：`api call` 的 `--body` 与注册表参数表比对——缺必填拒绝（退出码 2），
-未知字段/类型不符出 `meta.warnings`；`--strict` 可升级、`--no-validate` 可关闭。
-参数表见 `qiyu api schema <id>`（`data.params`、`data.response_shape`）。
-`data.params[]` 的元素字段是 `in`（`query` / `body` / `path` / `header`）、`required`、
-`type`、`description`、`example`，以及条件出现的 `auto`（**只挂在这个数组的元素上**，
-不是 `data` 的顶层键）。
-只依据文档生成的参数表，不构成对服务端行为的保证；**响应体不做校验**；
-校验只对 `body_kind: json` 且有 body 参数表的接口生效，其余原样透传。
-`--strict` 只做本地参数表闭集一致性检查（「严格」≠「正确严格」），误拒时**不要删字段重试**。
-
-**输出格式**：所有命令默认输出紧凑 JSON（一行、可解析）。`--pretty` 输出缩进 JSON（人类可读）——
-写在**具体子命令之后**（如 `qiyu api list --pretty`）。Agent 不需要它：默认输出已是合法 JSON，
-缩进只是给人看的。用法错误（退出码 2）仍是紧凑 JSON —— 先修参数，再看格式。
-
-`api list` 输出的 `data` 是**行数组**（`[{id, title, …}, …]`，不是 `{rows:[…]}` 对象）——
-`meta.field_notes` 的键是**行字段名**（`verified` / `dangerous` / `direction` …），
-唯一的例外是 `request_schema`：它不是字段，而是一条「本 meta 不含参数表，去
-`api schema` 查」的否定声明。`meta.registry_complete` 会如实反映注册表是否已收录全部接口。
 
 ## 浏览器 / 文档
 
