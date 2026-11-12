@@ -5,10 +5,10 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.2.2] - 2026-10-31
+## [0.2.2] - 2026-11-12
 
-> 2026-11-12 发布：tag `v0.2.2`（指向 main `2354cdf`，GitHub/GitLab 双远端）+ npm publish；
-> 沙箱安装实测通过（`qiyu --version` = 0.2.2、`skill check` 退出 0）。
+> tag `v0.2.2` 指向 main `2354cdf`（GitHub / GitLab 双远端），已 publish 到 npm；
+> 沙箱安装实测：`qiyu --version` = 0.2.2、`skill check` 退出 0。
 
 
 ### 文档
