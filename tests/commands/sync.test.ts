@@ -648,6 +648,9 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
       expect(code).toBe(1)
       const t = (data().tasks as Array<Record<string, unknown>>)[0]!
       expect(t.status).toBe('partial')
+      // `--since 1d` → 恰好 1 天 → 1 窗（sessions maxWindowDays=6、overlap 1：1 天 span
+      // 不产生补窗）。⚠️ 这里能钉死数字，前提是区间端点取自**同一次**时钟读取 ——
+      // 2026-11-11 CI 曾在此拿到 `total: 2`，根因见下方「时钟每读一次前进 1ms」用例。
       expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })
       // 中文可读消息（超时不再是一个裸英文 AbortError）
       expect((t.gaps as Array<{ detail: string }>)[0]!.detail).toMatch(/下载超时/)
@@ -668,6 +671,32 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
       vi.unstubAllGlobals()
     }
   })
+
+  it('`--since 1d` 的区间端点取自同一次时钟读取（时钟每读一次前进 1ms 时仍只切 1 窗）',
+    { timeout: 120000 }, async () => {
+      // 事故：2026-11-11T13:13Z CI 的 Node 24 job 在「修复批 4 #9」拿到
+      // `windows.total: 2`（另两个 job 与本机通过）。根因是区间终点读了**两次**
+      // 时钟：`parseTimeArg('1d')` 内部 clock() 算出的 end 被丢掉，随后 `--until` 缺省
+      // 又调了一次 clock()。两次 Date.now() 之间只要过去 ≥1ms，区间就从「1 天」变成
+      // 「1 天 + ε」，`sliceByMaxWindow(…, 6, 1)` 于是切出第二窗（起点 = end−1d，与首窗
+      // 几乎重合），它被 contained 合并；覆盖窗失败时按 skipped 结算 → total 从 1 变 2。
+      // 这里让时钟**每次读取都前进 1ms**，把这个竞态变成确定性复现。
+      let tick = Date.UTC(2026, 10, 11, 13, 13, 0)
+      vi.spyOn(Date, 'now').mockImplementation(() => (tick += 1))
+      const fetchMock = vi.fn()
+        .mockImplementation(() => Promise.resolve(new Response('NOT-A-ZIP', { status: 200 })))
+      vi.stubGlobal('fetch', fetchMock)
+      try {
+        await fresh().then((s) => s.close())
+        await syncCommand(['run', 'sessions.export', '--db', dbPath(), '--since', '1d', '--quiet'])
+        const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+        // 观察面只用 windows：resolved_range 在「唯一窗失败」时刻意收口成 [start, start]
+        //（引擎的 resolvedEndOut 为 null —— 不谎报已覆盖），两端相等是设计不是漂移。
+        expect(t.windows).toEqual({ total: 1, succeeded: 0, failed: 1, skipped: 0 })
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
 
   it('知识库任务排序：items 先于 categories（items 为空时 categories 不会先跑报任务序错误）', async () => {
     const order: string[] = []

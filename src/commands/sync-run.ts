@@ -373,20 +373,29 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     } catch (e) { return storeInitFail(e, resolved.config.path) }
 
     // —— 区间合成（时钟注入点：parseTimeArg 接受 clock；Nd/yesterday 已带区间，
-    //     YYYY-MM-DD/ISO 只给起点 → end=clock 当前或配对的另一端）——
+    //     YYYY-MM-DD/ISO 只给起点 → end 取本次区间合成的 now 或配对的另一端）——
     // ⚠️ 判据用 `!== undefined`（「给了」）而非真值：上面已把空白取值拦成 usage，
     // 两边用同一种判据才不会在日后又分叉出一个静默分支。
+    //
+    // ⚠️ **整段只读一次时钟**（2026-11-11 CI 实测修）：`--since 1d` 由 parseTimeArg 内部
+    // 的 clock() 算出 `end`，此前这个 end 被丢掉、`--until` 缺省时又调一次 clock()——
+    // 两次 Date.now() 之间只要过去 ≥1ms，区间就从「1 天」变成「1 天 + ε」，
+    // `sliceByMaxWindow(…, 6, 1)` 于是切出第二窗（起点 = end−1d，几乎与首窗重合），
+    // 被 contained 合并；覆盖窗失败时按 skipped 结算 → `windows.total` 从 1 变 2。
+    // 区间两端必须来自**同一时刻**，否则「最近 N 天」的窗数取决于解析耗时。
+    const now = clock()
+    const clockAt = (): number => now
     let rangeOverride: { start: number; end: number } | undefined
     const sinceRaw = flags['--since']
     const untilRaw = flags['--until']
     if (flags['--full'] !== undefined) {
-      rangeOverride = { start: 0, end: clock() }
+      rangeOverride = { start: 0, end: now }
     } else if (sinceRaw !== undefined || untilRaw !== undefined) {
-      const untilMs = untilRaw !== undefined ? parseTimeArg(untilRaw, clock, '--until') : null
+      const untilMs = untilRaw !== undefined ? parseTimeArg(untilRaw, clockAt, '--until') : null
       if (untilRaw !== undefined && untilMs === null) {
         return usageFail(`--until 无法解析：${describeArgs([untilRaw])}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601`)
       }
-      const sinceMs = sinceRaw !== undefined ? parseTimeArg(sinceRaw, clock, '--since') : null
+      const sinceMs = sinceRaw !== undefined ? parseTimeArg(sinceRaw, clockAt, '--since') : null
       if (sinceRaw !== undefined && sinceMs === null) {
         return usageFail(`--since 无法解析：${describeArgs([sinceRaw])}。支持 Nd / yesterday / YYYY-MM-DD / ISO 8601`)
       }
@@ -395,7 +404,7 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       // end=now；成对：[since 时刻, until 时刻]；--since 带 Nd 区间时用其 start。
       const start = sinceMs === null ? 0
         : typeof sinceMs === 'object' ? sinceMs.start : sinceMs
-      const end = untilMs === null ? clock()
+      const end = untilMs === null ? now
         : typeof untilMs === 'object' ? untilMs.end : untilMs
       if (start >= end) {
         return usageFail(
@@ -463,7 +472,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     if (rangeOverride !== undefined) {
       for (const t of selected) {
         if (t.windowStartFloorDays === undefined) continue
-        const floor = clock() - t.windowStartFloorDays * DAY_MS
+        // 与区间合成同一时刻：本 note 的前提是「请求终点 vs 接口下界」，而请求终点
+        // 就来自 now —— 另读一次时钟会让判据与它描述的对象差几毫秒。
+        const floor = now - t.windowStartFloorDays * DAY_MS
         if (rangeOverride.end <= floor) {
           floorNotes.set(t.id, [
             `请求区间结束于 ${shanghaiIso(rangeOverride.end)}，早于该接口可得数据的最早边界 ` +
@@ -479,7 +490,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     // 而输出是 complete、gaps 为空 —— 必须用 notes 把这一条说在明处，并给出真能用的写法。
     const untilNotes = new Map<string, string[]>()
     if (rangeOverride !== undefined && untilRaw !== undefined) {
-      const untilEnd = parseTimeArg(untilRaw, clock, '--until')
+      // 与区间合成同一时刻（clockAt）：再读一次 clock 可能跨过上海日界，
+      // 提示会描述一个与实际区间不同的日子。
+      const untilEnd = parseTimeArg(untilRaw, clockAt, '--until')
       // 只对「日期 / ISO 时刻」这两种定点写法提示：Nd / yesterday 解析成区间（end=now），
       // 那是「最近 N 天」的常规用法，今天不满一天属既有语义（每日残段由次日 run 补全），
       // 每次都提示只会变成噪音。
@@ -493,7 +506,9 @@ export async function runSyncRun(argv: string[]): Promise<number> {
           // 旧文案一律劝「写到次日 0 点」，照做后提示消失、该日仍未同步）。
           const dayStart = shanghaiDayStart(boundary)
           if (t.windowEndClamp === 'shanghaiYesterday') {
-            const limit = shanghaiYesterdayStart(clock())
+            // 与区间合成同一时刻：引擎的 windowEndLimit 来自 ctx.clock 的当前时刻，
+            // 上限另读一次时钟可能跨过上海日界，与实际切窗差一天。
+            const limit = shanghaiYesterdayStart(now)
             if (dayStart >= limit) {
               untilNotes.set(t.id, [
                 `--until 终点 ${shanghaiIso(boundary)} 不是上海日界（00:00），且 ` +
