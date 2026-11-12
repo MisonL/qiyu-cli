@@ -22,6 +22,24 @@
   由同一时刻派生的两条提示（请求区间早于接口下界、非日界 `--until` + 日对齐任务）
   也改用这个时刻 —— 提示的前提是「请求终点 vs 上/下界」，与区间两端差几毫秒会描述错对象。
 
+- **`npm ci` 不再打印 `Cannot find module .../dist/postinstall.js` 的堆栈**：
+  npm 的 `postinstall` 在 `prepare`（= `npm run build`）**之前**执行，而本仓库自己就是
+  那个包——于是在 `dist/` 尚未生成时，`node dist/postinstall.js || exit 0` 每次都先吐一段
+  MODULE_NOT_FOUND 再被 `|| exit 0` 吞掉（CI 三个 Node 版本 job 各一次，用户看到的是
+  「装依赖时报错了」）。
+  脚本改为**保留路径式真实入口、只在外层加存在性探测**：
+  `node -e "const f=require('node:fs'),c=require('node:child_process'),p='dist/postinstall.js';if(f.existsSync(p))try{c.execFileSync(process.execPath,[p],{stdio:'inherit'})}catch{}" || exit 0`。
+  ⚠️ 我们试过另一种写法（`node -e "existsSync(…)&&import('./dist/postinstall.js')"`），
+  **它能消噪声，但静默关掉了功能**：`node -e` 下 `process.argv[1]` 是 `undefined`，
+  `dist/postinstall.js` 的入口守卫 `isEntry()` 恒假 —— 文件被载入了，`mainEntry` 却一个
+  字节都不执行（实测：`~/.agents/skills/qiyu` 不产生；CodeRabbit 与 Codex 两路审查各自
+  独立发现）。所以载入必须**经文件路径**走 `execFileSync(process.execPath, [p])`，让
+  `isEntry()` 成立、真正的安装逻辑照常执行。
+  四组实测：`dist/` 在 → 正常安装（SKILL.md 落盘）；`dist/` 缺 → 静默退出 0、无噪声；
+  文件在但抛错 → 内层 `try/catch` + 外层 `|| exit 0` 双兜底仍 0（不阻断安装）；
+  `~` 下无任何 Agent 目录 → 只提示不建链（原「绝不越权写 home」语义不变）。
+  缺 `dist/` 的根因是 `postinstall` 在 `prepare`（= build）**之前**执行，本仓库自身即包；
+  这条 `postinstall` 只在全局安装真实触发（`npm_config_global` 判据在文件内部）。
 
 ## [0.2.2] - 2026-11-12
 

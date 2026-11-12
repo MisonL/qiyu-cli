@@ -173,3 +173,41 @@ describe('G7/N1：npm pack --json 三种输出形态', () => {
     expect(parsePackJson(stdout)).toEqual(['dist/cli.js'])
   })
 })
+
+// —— postinstall 脚本形态（2026-11-12 事故）——
+//
+// 背景：本仓库自身就是那个包，`npm ci` 时 postinstall 早于 prepare → `dist/` 还不存在，
+// `node dist/postinstall.js` 必然吐 MODULE_NOT_FOUND（被 `|| exit 0` 吞掉，但日志里刺眼）。
+//
+// 事故：为了消噪声把脚本改成 `node -e "existsSync(…) && import('./dist/postinstall.js')"`
+// **能消噪声，但把功能静默关掉了** —— `node -e` 下 `process.argv[1]` 是 `undefined`，
+// `dist/postinstall.js` 的入口守卫 `isEntry()` 恒假，`mainEntry` 一个字节都不执行
+// （实测：install 不产生 SKILL.md；两路审查各自独立发现）。所以脚本必须：
+//   ① 有存在性探测（dist 缺失时不出噪声）；
+//   ② **仍然通过文件路径真实执行**该文件（让 `isEntry()` 成立）；
+//   ③ 兜底为 0（postinstall 绝不阻断安装）。
+describe('postinstall 脚本形态（2026-11-12 事故：消噪声不得关掉功能）', () => {
+  const script = (JSON.parse(read('package.json')) as { scripts: Record<string, string> })
+    .scripts.postinstall ?? ''
+
+  it('存在性探测在（dist 缺失时不出 MODULE_NOT_FOUND 噪声）', () => {
+    expect(script, '缺存在性探测 → npm ci 会打印 Cannot find module 堆栈').toMatch(/existsSync/)
+  })
+
+  it('不靠 `import()` 载入 —— 动态 import 下 argv[1] 不是该文件，入口守卫恒假', () => {
+    // 变异：把载入改回 `import('./dist/postinstall.js')` → 本条红（事故逐字复现）。
+    expect(script).not.toMatch(/import\s*\(\s*['"`]\.\/?dist\/postinstall\.js/)
+  })
+
+  it('把编译产物当**文件路径**执行（isEntry() 才成立、安装逻辑才跑）', () => {
+    // 变异：改成 `node -e …import()` 或干脆删掉执行 → 本条红。
+    expect(script, '必须在 argv 位置给出 dist/postinstall.js 的路径').toMatch(/dist\/postinstall\.js/)
+    expect(script).toMatch(/execFileSync\(\s*process\.execPath\s*,\s*\[\s*p\s*\]/)
+  })
+
+  it('任何失败都收敛为 0（postinstall 绝不阻断 npm 安装）', () => {
+    expect(script.trimEnd()).toMatch(/\|\|\s*exit\s+0$/)
+    // `-e` 内也有 try/catch：文件存在但抛错时，不得让 node 以非 0 退出而阻断安装
+    expect(script).toMatch(/catch\s*\{/)
+  })
+})

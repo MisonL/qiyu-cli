@@ -36,7 +36,7 @@
     "build": "tsc && node scripts/copy-assets.mjs",
     "check:pack": "node scripts/check-pack.mjs",
     "prepare": "npm run build",
-    "postinstall": "node dist/postinstall.js || exit 0",
+    "postinstall": "node -e \"const f=require('node:fs'),c=require('node:child_process'),p='dist/postinstall.js';if(f.existsSync(p))try{c.execFileSync(process.execPath,[p],{stdio:'inherit'})}catch{}\" || exit 0",
     "test": "node scripts/test-shards.mjs",
     "test:single": "vitest run --maxWorkers=1 --no-file-parallelism",
     "typecheck": "tsc -p tsconfig.test.json"
