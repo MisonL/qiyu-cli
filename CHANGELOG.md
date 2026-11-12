@@ -7,7 +7,8 @@
 
 ## [0.2.2] - 2026-10-31
 
-> **⚠️ 材料已备、未 tag、未 publish，待授权。**
+> 2026-11-12 发布：tag `v0.2.2`（指向 main `2354cdf`，GitHub/GitLab 双远端）+ npm publish；
+> 沙箱安装实测通过（`qiyu --version` = 0.2.2、`skill check` 退出 0）。
 
 
 ### 文档
@@ -2391,7 +2392,7 @@
 - 响应信封归一化，含畸形 JSON（整数键未加引号）的容错修复
 - 逐接口限频表与 `retry_after` 提示
 
-[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.2.1...HEAD
+[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.2.2...HEAD
 [0.2.2]: https://github.com/MisonL/qiyu-cli/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/MisonL/qiyu-cli/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/MisonL/qiyu-cli/compare/v0.1.0...v0.2.0
