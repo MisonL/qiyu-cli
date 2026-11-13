@@ -46,8 +46,14 @@ function stubBody(body: unknown): void {
     JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } }))))
 }
 
-/** 图例键里只有这些是条件键（可能不出现）。 */
-const CONDITIONAL = ['warnings', 'not_found', 'warning', 'note']
+/**
+ * 图例键里只有这些是条件键（可能不出现）。
+ *
+ * `unverified_endpoint` 按接口而非按响应决定：只有注册表 `verified:false` 的接口
+ * 才输出。它「确实会出现」由 `tests/commands/api.test.ts` 的正向用例钉住
+ * （`ticket.finish` 未实测 → 必须出现），这里只登记它为条件键。
+ */
+const CONDITIONAL = ['warnings', 'not_found', 'warning', 'note', 'unverified_endpoint']
 
 describe('api call 的图例与真实输出', () => {
   it('成功响应：非条件键都在输出里，meta 的每个键都有释义（双向）', async () => {

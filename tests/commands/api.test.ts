@@ -1424,6 +1424,45 @@ describe('api call —— 危险操作门禁', () => {
     vi.unstubAllGlobals()
   })
 
+  it('未实测信封的接口：调用时 meta 必须声明 unverified_endpoint（不能只在 api list 里说）', async () => {
+    // ⚠️ 本仓库历史上反复出现的形态：声明在 `api list` 里、`api call` 却不读。
+    // 注册表 154 条里 136 条可调用，其中 73 条危险接口有 **72 条** `verified:false`
+    // —— 只有 `export.session` 实测过。`verified` 的语义是「该接口的信封形状被真实
+    // 观测过」，未实测意味着 `not_found` 判定、`data` 语义、错误分类都可能不适用
+    // （`envelope.ts` 自己记着 `deleteKnowledges` 那次把「全部删成功」报成 `not_found`）。
+    // Agent 不先跑 `api list --all` 时，这条事实对它完全隐形。
+    vi.stubEnv('QIYU_APP_KEY', 'k')
+    vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() =>
+      Promise.resolve(new Response(JSON.stringify({ code: 200, message: '{}' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }))))
+    // ticket.finish：callable + dangerous + verified:false（注册表实测值）
+    const code = await apiCommand(['call', 'ticket.finish', '--yes', '--no-validate'])
+    expect(code).toBe(0)
+    const meta = JSON.parse(out).meta
+    expect(meta.endpoint).toBe('ticket.finish')
+    expect(meta.unverified_endpoint,
+      '未实测信封是使用前必须知道的事实，不能只写在 api list 里').toBe(true)
+    // 图例里必须逐字解释这个键的含义与后果（否则它又变成「声明了但没人读」）
+    expect(meta.field_notes.unverified_endpoint).toMatch(/信封/)
+    expect(meta.field_notes.unverified_endpoint).toMatch(/not_found|判据|形状/)
+    vi.unstubAllGlobals()
+  })
+
+  it('已实测信封的接口不带 unverified_endpoint（反向：不能对所有人一律告警）', async () => {
+    // 反向断言：若实现把标志写成恒 true，这条必红。`export.session` 是注册表里
+    // 唯一 `callable && dangerous && verified:true` 的接口。
+    vi.stubEnv('QIYU_APP_KEY', 'k')
+    vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() =>
+      Promise.resolve(new Response(JSON.stringify({ code: 200, message: '{}' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }))))
+    const code = await apiCommand(['call', 'export.session', '--yes', '--no-validate'])
+    expect(code).toBe(0)
+    expect(JSON.parse(out).meta.unverified_endpoint).toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
   it('缺凭证时是 auth 错误（退出码 1），不是用法错误 —— 且与 auth whoami 一致', async () => {
     // ⚠️ 缺凭证是**环境配置**问题，不是参数写错。归为 usage（退出码 2）会让
     // Agent 去改命令行参数，而正确动作是去配 QIYU_APP_KEY。

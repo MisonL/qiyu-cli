@@ -9,6 +9,18 @@
 
 ### 修复
 
+- **`api call` 调用未实测信封的接口时，`meta` 里如实声明 `unverified_endpoint: true`**：
+  注册表 154 条里 73 条危险接口有 72 条从未观测过响应信封（`verified:false`、`envelope:null`），
+  但 `verified` 此前**只在 `api list` 输出**、`callOne` 从不读它 —— Agent 不先跑
+  `api list --all` 就完全不知道「这次的 `not_found` 判定与 `data` 解包只是按文档推的」。
+  具体后果不是抽象的：形状未实测的接口**一律不判 `not_found`**，因为「空 `data` 是什么意思」
+  没人观测过 —— `envelope.ts` 记着 `deleteKnowledges` 的空数组其实是「全部删成功」，
+  按读接口判据会被报成「什么都没删」。现在调用时即声明，`meta.field_notes` 同步给出释义
+  （点明它**不是**「这次调用失败」的信号，而是「不要依据本次输出的空/非空下结论」）。
+  只在未实测时输出（已实测的接口不带此键，避免变成对所有人的噪音）；
+  双向守卫：`ticket.finish`（未实测）必须带、`export.session`（唯一实测的危险接口）必须不带，
+  两个变异（删实现 → 正向红；改无条件 → 反向红）均已验证。
+
 - **`--since` 带相对时长时，区间终点不再取决于解析耗时**：`--since 1d` 的终点原本取自
   `parseTimeArg` 内部的时钟，随后「未给 `--until`」又调了一次时钟 —— 两次 `Date.now()`
   之间只要过去 ≥1ms，区间就从「1 天」变成「1 天 + ε」，`sliceByMaxWindow(…, 6, 1)`
