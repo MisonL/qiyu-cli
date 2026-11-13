@@ -94,10 +94,13 @@
 - **27 个测试文件迁移到 `captureSinks()`，模块级 `let out` 不再自己装 spy**。
   每个文件只改三行：`it` 从 `vitest` 改为从 `./helpers/capture.js` 导入（包装版给每条用例
   打上**世代号**）、`describe/it/expect` 其余照旧、`beforeEach` 里的两行
-  `vi.spyOn(process.stdout/stderr, 'write')` 换成一行 `captureSinks(…)`。归属仍按
-  `AsyncLocalStorage` 记录的发起者判：上一条用例的延迟尾巴写的是**它自己**的缓冲，
-  不会污染下一条。两个入口（`captureSinks()` 世代形态 / `startCapture()` 句柄形态）共用
-  同一份 spy 安装，避免两套实现各自漂移。
+  `vi.spyOn(process.stdout/stderr, 'write')` 换成一行 `captureSinks(…)`。归属按
+  `AsyncLocalStorage` 记录的**世代号**判：上一条用例的延迟尾巴属于旧世代，**一律丢弃**，
+  不会进下一条的 `out`。两个入口（`captureSinks()` 世代形态 / `startCapture()` 句柄形态）
+  共用同一份 spy 安装，避免两套实现各自漂移。
+  ⚠️ 边界：迁移形态的 sink 写的是**模块级** `out`，`it.concurrent` 的两条用例本就在写同一个
+  变量，任何归属都无法隔离它们；hook（`beforeEach`/`afterEach`）里的延迟写入也没有世代。
+  要并发隔离就用句柄形态（`startCapture()` + `cap.run()`）。
   ⚠️ 迁移中实测到的坑：**不能**用「`process.stdout.write === activeSpy` 就跳过重装」做幂等 —
   `vi.restoreAllMocks()` 还原到的是**上一层 spy**（正是本助手自己装的那个），身份判据成立
   但写入落在旧闭包的 `sinks` 里，`out` 恒空（`cli.test.ts` 当场 11 条失败）。现在每次
