@@ -5,9 +5,13 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.2.3] - 2026-11-14
 
-### 修复
+> **材料已备，未 tag、未 npm publish，待授权。** tag / publish 完成后再把本行改成发布事实
+> （参照 0.2.2 段的写法：tag 指向的提交、npm 沙箱安装实测结果），并把文末
+> `[0.2.3]` 的基址从 `compare/v0.2.2...HEAD` 换成 `compare/v0.2.2...v0.2.3`（与既往发版一致）。
+
+### 新增
 
 - **`api call` 调用未实测信封的接口时，成功与错误信封都如实声明 `unverified_endpoint: true`**：
   注册表 154 条里 73 条危险接口有 72 条从未观测过响应信封（`verified:false`、`envelope:null`），
@@ -33,6 +37,15 @@
   判据收敛为单一实现点 `unverifiedOf(spec)`，只在未实测时输出（已实测的接口不带，避免噪音）；
   守卫覆盖两个方向（`ticket.finish` 未实测必须带、`export.session` 实测必须不带）
   与三条错误出口，变异（删实现 / 改无条件 / 逐个拆出口）均实测变红。
+
+### 文档
+
+- **README 可读性重构**：`## 当前状态` 只讲交付情况（skill 图例 / body 校验 / 输出格式 /
+  `api list` 形态搬进 `## 输出契约`）；`status` / `range_status` 两张表的长说明移到表下；
+  `## 配置凭证` 拆成四节并把权限规则重写成「一条判据 + 三档成因表 + 例外」。事实与守卫短语
+  零变更（逐关键词核对过），全文无超过 300 字符的行。
+
+### 修复
 
 - **`--since` 带相对时长时，区间终点不再取决于解析耗时**：`--since 1d` 的终点原本取自
   `parseTimeArg` 内部的时钟，随后「未给 `--until`」又调了一次时钟 —— 两次 `Date.now()`
@@ -196,6 +209,15 @@
   `HANDOFF.md` §审计③。
   收益：`tests/commands/db.test.ts` 从「首条用例常超时」变为稳定通过（A/B 各 2 轮：
   改前 2/2 有首条超时失败，改后 2/2 全绿）；全量 2576 条在 load 511 下全绿。
+
+- **预热预算的环境变量做校验**（2026-11-14 独立审计）：`QIYU_WARM_TIMEOUT_MS` 原先直接
+  `Number()`。`'30s'` / 拼错的值是 `NaN`，而 Node 把 `NaN`/`Infinity` 当 **1ms**（`Infinity`
+  还会打 `TimeoutOverflowWarning`）—— 预热必然「超时」降级，每条告警都成噪音；过大的值会把
+  测试收集拖上十分钟。现在非法值退回默认 120s、过大值夹到 600s（`parseBudget`，有守卫）。
+
+- **测试注释与安全修复对齐**（同轮审计）：`tests/setup-warm.test.ts` 文件头还写着「由
+  `setup-warm.ts` 按该变量 `new Function` 求值」——那是已被 Codex P2 否决并改掉的旧方案，
+  留着会被下一个人照着恢复、等于把任意 JS 执行权交回给环境变量。已改成现状并显式禁止回退。
 
 - **`tests/commands/db.test.ts` 全文件共用一个库路径，逐条 `resetDb()` 复置。**
   同一文件里原先每条用例各建一个新路径的库（新路径 = 110ms 创建 + 75ms `init`，且绕不过
@@ -2598,7 +2620,7 @@
 - 响应信封归一化，含畸形 JSON（整数键未加引号）的容错修复
 - 逐接口限频表与 `retry_after` 提示
 
-[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.2.2...HEAD
+[0.2.3]: https://github.com/MisonL/qiyu-cli/compare/v0.2.2...HEAD
 [0.2.2]: https://github.com/MisonL/qiyu-cli/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/MisonL/qiyu-cli/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/MisonL/qiyu-cli/compare/v0.1.0...v0.2.0
