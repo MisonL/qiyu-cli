@@ -46,6 +46,15 @@
   缺 `dist/` 的根因是 `postinstall` 在 `prepare`（= build）**之前**执行，本仓库自身即包；
   这条 `postinstall` 只在全局安装真实触发（`npm_config_global` 判据在文件内部）。
 
+### 测试
+
+- **钉住「上一条用例的 ticking 时钟不得泄漏」的清理契约**（CodeRabbit 2026-11-12 第三轮 major）：
+  新增回归用例会让 `Date.now` 每读一次 +1ms，若清理失效，后续用例会拿到停在 2026-11-11 的
+  假时钟、失败变成顺序相关。核实本文件 `afterEach` 的 `vi.restoreAllMocks()` 已覆盖该恢复
+  （CodeRabbit 的结论是**假阳性**），但把这个不变量钉成守卫：`Date.now()` 必须明显远离上一条
+  用例的 tick 原点。变异验证：删掉那句恢复 → 守卫红且实测时钟停在 `tickOrigin+9`；恢复 → 绿。
+
+
 ## [0.2.2] - 2026-11-12
 
 > tag `v0.2.2` 指向 main `2354cdf`（GitHub / GitLab 双远端），已 publish 到 npm；
