@@ -123,6 +123,24 @@
   尾巴，下一条断言没收到）；变异：直接别名裸登记 → 两条尾巴用例红；去掉 options-first
   分支 → 对应用例红。
 
+- **捕获助手第二轮审查的两条收口**（CodeRabbit 2026-11-14）：① `it(名, undefined, 体)`
+  也是 options-first 重载，选项位置为 `undefined` 时不能被当成「第二实参不是对象」拒绝；
+  ② 陈旧世代的写入在**句柄形态**下曾照样追加进最新句柄的 `fallback`，污染 `cap.out` /
+  `cap.writes` —— 现在 `cap.run()` 的显式归属优先，没有归属时才过世代判据。
+  两条都有尾巴落地的守卫，变异（不认 `undefined` / fallback 不过判据）各自变红。
+
+- **`tests/setup-warm.ts` 的预热失败只降级、不拖垮测试**（Codex 2026-11-14 P2）。
+  `@duckdb/node-api` 是 `optionalDependencies`，缺原生 binding 时 `setupFiles` 里的顶层
+  await 会抛 —— 那会让**所有**测试文件连收集都进不去，包括不碰数据库的、以及「缺依赖时
+  给安装指引」的那几条。现在预热失败只往 stderr 打一行降级说明，测试回到「谁先用谁付
+  冷启动」（慢一点，不是错）。
+  守卫**真跑一个子 vitest**（`NODE_OPTIONS=--import` 注入一个让预热抛错的全局量），
+  断言不碰数据库的用例仍然通过；变异（catch 里重抛）→ 子 vitest 失败、守卫红。
+  ⚠️ 子用例文件必须落在仓库 `tests/` 下：放在 /tmp 会因 `include` 过滤报
+  「No test files found」，退出码同为 1，看着像守卫通过。
+  子 vitest 用 `spawnSync` 的 `timeout` + `SIGKILL` 兜时间（同步等待打不断用例超时，
+  CodeRabbit 2026-11-14 major），失败诊断里带 `r.error`。
+
 - **测试进程内只付一次 DuckDB 冷启动费（`tests/setup-warm.ts` + `setupFiles`）。**
   实测：进程内**首次** `DuckDBInstance.create` 在空载时 438ms、本机高负载时 19–34s
   （原生扩展加载 + 首次 mmap），之后同路径重开约 22ms。原先每个真库测试文件的首条用例

@@ -18,8 +18,10 @@
 //
 // ⚠️ 归属按**写入时刻的异步上下文**判（CodeRabbit 2026-11-13 major）：延迟回调
 // 在运行时才查 `process.stdout.write`，那时挂着的是下一条用例装的 spy。所以 spy
-// 只有一套，写入者带着 `it` 包装版建立的世代号；**旧世代的写入一律丢弃**。
-// 用例体的世代由包装版 `it` 在执行时建立（见 `it` 的注释），不需要改动用例体。
+// 只有一套，写入者带着 `it` 包装版在执行时建立的**世代号**；**旧世代的写入一律丢弃**
+// （上一条用例超时后落地的尾巴不会进下一条的 `out`）。并发用例的边界如实写在
+// `writerIsCurrent` 的注释里 —— 本节说的「隔离」不覆盖 `it.concurrent`。
+// 世代号由包装版 `it` 在执行时建立（见 `it` 的注释），不需要改动用例体。
 //
 // ⚠️ 写入回调：替身必须把 `write(chunk, cb)` / `write(chunk, enc, cb)` 的完成回调
 // 调掉（CodeRabbit 终审 major）——否则等待写入完成的用例只能超时。
@@ -40,6 +42,9 @@ interface Sink { out: (s: string) => void; err: (s: string) => void }
 interface Buf { out: string; err: string; writes: number }
 
 // —— 世代机制（① 迁移形态）——
+/** 写入者携带的世代号。⚠️ 只带世代号、不带 sink：迁移形态的 sink 写的是**模块级**变量
+ *  （`out += s`），用例间共用同一个变量、`beforeEach` 里重置 —— 「记回它自己的 sink」
+ *  与「记到当前用例」是同一件事，所以陈旧写入只能**丢弃**，不能补写到别处。 */
 const alsGen = new AsyncLocalStorage<number>()
 let currentGeneration = 0
 let sinks: Sink = { out: () => {}, err: () => {} }
@@ -74,11 +79,14 @@ const FACTORY_ALIASES = ['each', 'skipIf', 'runIf'] as const
  * ⚠️ vitest 2.1.9 有两种重载：`it(名, 体)` 与 `it(名, 选项, 体)`（CodeRabbit 2026-11-14
  * major）。只看第二实参会把「选项对象」当成执行体 —— 原样返回、执行体**没套上世代**，
  * 而它发出的延迟写入会被下一条用例接收（正是本助手要挡的形态）。
+ * `it(名, undefined, 体)` 也是这个重载（CodeRabbit 2026-11-14 major）—— 选项位置可以是
+ * `undefined`，不能只认 `typeof === 'object'`。
  * 表格行可以是函数（`it.each([[fn]])`），所以只在「注册实参」这一侧调用本函数。
  */
 function wrapBody(a: unknown[]): unknown[] {
+  const isOpts = (v: unknown): boolean => typeof v === 'object' || v === undefined
   const i = typeof a[1] === 'function' ? 1
-    : typeof a[2] === 'function' && typeof a[1] === 'object' && a[1] !== null ? 2
+    : typeof a[2] === 'function' && isOpts(a[1]) ? 2
       : -1
   if (i < 0) return a
   const out = a.slice()
@@ -139,12 +147,12 @@ function wrapIt(register: Registrar): typeof baseIt {
  * 包装发生在收集阶段，那时 `beforeEach` 还没把世代推进。
  * 超时/选项等其余实参原样透传，执行体的位置由 `wrapBody` 判定。
  */
-
 export const it: typeof baseIt = wrapIt(baseIt as unknown as Registrar)
 
 /**
  * 替换旧的「两行 vi.spyOn」（① 用法，在 `beforeEach` 里调用）：推进世代并记录本代的
- * 接收函数。写入按**写入者的世代**过滤 —— 上一条用例的尾巴（旧世代）被丢弃。
+ * 接收函数。写入按**写入者的世代**过滤 —— 上一条用例的尾巴（旧世代）被丢弃（并发边界见
+ * `writerIsCurrent` 的注释）。
  */
 export function captureSinks(onOut: (s: string) => void, onErr: (s: string) => void): void {
   currentGeneration += 1
@@ -189,20 +197,35 @@ function installShared(): void {
   // 新用例的写入进了**旧闭包里的 sinks**（`out` 永远是空串）。
   // 每条用例重装一次的代价，与原先每个 beforeEach 装两行 spy 完全同量级。
   activeSpy = vi.spyOn(process.stdout, 'write').mockImplementation((...args: unknown[]) => {
-    if (writerIsCurrent()) sinks.out(String(args[0]))
-    const b = alsBuf.getStore() ?? fallback
+    const mine = writerIsCurrent()
+    if (mine) sinks.out(String(args[0]))
+    // ⚠️ 句柄缓冲按**显式归属**记（`cap.run()` 的 alsBuf 是独立缓冲，与世代无关）；
+    // 没有显式归属时才用 `fallback`，而那条路径必须过世代判据 —— 否则陈旧世代的写入
+    // 会追加进最新句柄的 `cap.out` / `cap.writes`（CodeRabbit 2026-11-14 minor）。
+    const b = alsBuf.getStore() ?? (mine ? fallback : undefined)
     if (b) { b.writes += 1; b.out += String(args[0]) }
     return callDone(args)
   })
   vi.spyOn(process.stderr, 'write').mockImplementation((...args: unknown[]) => {
-    if (writerIsCurrent()) sinks.err(String(args[0]))
-    const b = alsBuf.getStore() ?? fallback
+    const mine = writerIsCurrent()
+    if (mine) sinks.err(String(args[0]))
+    const b = alsBuf.getStore() ?? (mine ? fallback : undefined)
     if (b) { b.err += String(args[0]) }
     return callDone(args)
   })
 }
 
-/** 写入者属于当前世代（或没有世代上下文，如 hook / 模块级代码）才接收。 */
+/**
+ * 写入者是「当前世代」吗？只接当前世代（或没有世代上下文，如 hook / 模块级代码）的写入。
+ *
+ * ⚠️ 判据是「== 最新推进到的世代」，并发用例下这个判据**不成立**（A 的 body 可能在 B 的
+ * `beforeEach` 之后执行，最新世代已是 B 的）。这是**如实承认的边界**，不是遗漏：
+ * 迁移形态的 sink 写的是模块级 `out`，两条并发用例本就在往同一个变量里写，任何归属都
+ * 无法隔离它们。**要并发隔离就用句柄形态**（`startCapture()` + `cap.run()`：`alsBuf`
+ * 按缓冲归属，与世代无关）。
+ * 反过来，若把判据改成「按用例身份取它自己的 sink」，A 的尾巴就会追加进 **B 正在写的
+ * 那个 `out`** —— 比丢弃更糟（守卫 B/I/K/M 会红，实测过）。
+ */
 function writerIsCurrent(): boolean {
   const g = alsGen.getStore()
   return g === undefined || g === currentGeneration

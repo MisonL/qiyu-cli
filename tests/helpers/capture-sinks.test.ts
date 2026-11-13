@@ -4,7 +4,7 @@
 // 事故形态与 capture.test.ts 相同，但这里走的是**现有 27 个文件**那种写法：
 // 模块级 `let out`、`beforeEach` 刷 sink，用例体不包 `run()`。
 import { describe, expect, beforeEach, vi } from 'vitest'
-import { it, captureSinks } from './capture.js'
+import { it, captureSinks, startCapture } from './capture.js'
 
 let out = ''
 let leakTail: Promise<void> = Promise.resolve()
@@ -111,6 +111,41 @@ describe('options-first 重载', () => {
     await tail
     await tick(20)
     expect(out, 'options-first 重载的执行体没套世代：尾巴漏进了本条').toBe('')
+  })
+
+  // `it(名, undefined, 体)` 也是 options-first 重载（CodeRabbit 2026-11-14 major）。
+  it('L2：`it(名, undefined, 体)` 的体留下 60ms 尾巴', undefined, async () => {
+    process.stdout.write('L2')
+    tail = new Promise<void>((resolve) => { setTimeout(() => { process.stdout.write('L2-TAIL'); resolve() }, 60) })
+    await tick(1)
+  })
+
+  it('M2：L2 的尾巴不得进本条的 out', async () => {
+    await tail
+    await tick(20)
+    expect(out, 'options 为 undefined 时执行体没套世代：尾巴漏进了本条').toBe('')
+  })
+})
+
+// ⚠️ 陈旧世代的写入不得污染**句柄形态**的回退缓冲（CodeRabbit 2026-11-14 minor）：
+// A 留下尾巴（捕获助手形态，没有 `alsBuf` 上下文），B 同时开了句柄 —— 尾巴被世代判据
+// 拒绝之后，不能顺手追加进 B 的 `fallback`，否则 B 的 `cap.out` / `cap.writes` 被污染。
+describe('陈旧写入不进句柄的回退缓冲', () => {
+  let stale: Promise<void> = Promise.resolve()
+  it('O：留一条 60ms 才落地的尾巴（本形态）', async () => {
+    stale = new Promise<void>((resolve) => { setTimeout(() => { process.stdout.write('STALE'); resolve() }, 60) })
+    await tick(1)
+  })
+
+  it('P：句柄形态下的 out / writes 不受陈旧写入影响', async () => {
+    const cap = startCapture()
+    await cap.run(async () => {
+      process.stdout.write('P')
+      await stale
+      await tick(20)
+      expect(cap.out, '陈旧写入被塞进了句柄的回退缓冲').toBe('P')
+      expect(cap.writes).toBe(1)
+    })
   })
 })
 
