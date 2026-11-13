@@ -9,9 +9,6 @@
 //    `process.stdout.write`（CodeRabbit major），只保存旧引用测不出来。
 // ② 用户的 `afterEach(restoreAllMocks)` 摘掉 spy 后，助手若不重装，写入直接绕过缓冲。
 import { describe, it, expect, vi } from 'vitest'
-import { rmSync, writeFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { startCapture, captureInstalled } from './capture.js'
 
 // ⚠️ 文件结束时 `process.stdout.write` 必须已恢复（Codex 2026-11-13 P2：vitest 2.1.9
