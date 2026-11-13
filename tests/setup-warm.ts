@@ -5,14 +5,19 @@
 // 而它的预算是 15s → 首条用例假红（A/B 实测：旧版两次运行各超时一次，新版两次全过）。
 //
 // ⚠️ 为什么放在 setupFiles 而不是 `globalSetup`：实测 globalSetup 与 worker 是**两个进程**
-// （pid 45930 vs 51568），预热不共享。setupFiles 在本进程内、每个测试文件前执行；
-// `process` 上的标记跨模块重置存活，所以整个进程只暖一次。
+// （pid 45930 vs 51568），在那边加载的原生模块到不了 worker。setupFiles 在本进程内、每个
+// 测试文件前执行；`process` 上的标记跨模块重置存活，所以整个进程只暖一次。
+//
+// ⚠️ 超时的**边界**（CodeRabbit 2026-11-14 major 的实测裁决）：`Promise.race` 的预算只管
+// 「一直不返回的 await」。原生绑定若**同步**卡住 JS 线程，同线程的定时器根本排不上队 ——
+// 实测 400ms 忙等让 100ms 定时器一次都没触发。这种阻塞不是本助手能拦住的（vitest 自己的
+// `testTimeout`/`hookTimeout` 同样拦不住），要么把预热挪进子进程 —— 试过，**没有收益**：
+// 子进程暖的是它自己的原生模块，worker 仍要自己加载一次（且 Node 自带的 strip-types 解析
+// 不了源码里的 `.js` 说明符，要额外引入 tsx 依赖）。所以如实保留「进程内 + 有界等待」。
 //
 // ✅ 「每个 worker 只暖一次」已实测（CodeRabbit 2026-11-14 major）：给预热加一行 stderr 探针，
 // `vitest run output/cli/errors/store-errors --maxWorkers=1` 下**四个文件只出现一次**探针；
-// vitest 2.1.9 从不启用 isolation 的单 worker 进程里复用同一 worker，setupFiles 在每个文件
-// 前重跑但被标记挡住。另外出现的第二个 pid 是 vitest 自己带特殊参数（`--config` 探测等）
-// 起的子跑，不跑测试文件。
+// vitest 2.1.9 在单 worker 进程里复用同一 worker，setupFiles 在每个文件前重跑但被标记挡住。
 //
 // ⚠️ 关于「setup 先加载过 `store/duckdb` 会不会让测试文件里的 `vi.mock` 失效」
 // （CodeRabbit 2026-11-14 major）：**实测不会**。探针用 `vi.mock('../src/store/duckdb.js',
@@ -45,14 +50,10 @@ export type WarmOutcome =
  *
  * ⚠️ 这里**不写 stderr**：`tests/setup-warm.test.ts` 自己是被 `setupFiles` 加载的
  * （`warmDuckDb` 的导入会先让本文件跑一遍预热），若这里直接 `process.stderr.write`，
- * 每次跑测试都会多一行「预热跳过」，而且会干扰那条子进程守卫里对告警文本的断言。
+ * 每次跑测试都会多一行「预热跳过」，还会干扰子进程守卫里对告警文本的断言。
  */
 export async function warmDuckDb(opts: { ifWarmed?: () => boolean } = {}): Promise<WarmOutcome> {
   if ((opts.ifWarmed ?? (() => (process as Marked)[FLAG] === true))()) return { ok: false, already: true }
-  // ⚠️ 预热必须**有界**（Sourcery 2026-11-14）：setupFiles 在收集**之前**执行，原生绑定
-  // 卡住不返回时，用例自身的 `testTimeout`/`hookTimeout` 都还没生效 —— 整个 worker 挂死，
-  // 表象是「测试跑了很久没动静」。超时按降级处理（没暖成 = 慢一点，不是错）。
-  // 可用 `QIYU_WARM_TIMEOUT_MS` 调小，供守卫验证这条路径。
   const budgetMs = Number(process.env.QIYU_WARM_TIMEOUT_MS ?? 120_000)
   // ⚠️ 整个预热（**含临时目录创建**）都在 try 里：`mkdtempSync` 也会失败（`TMPDIR` 指向
   // 一个文件等），放在 try 外就绕过了降级（CodeRabbit 2026-11-14 major）。
@@ -64,8 +65,7 @@ export async function warmDuckDb(opts: { ifWarmed?: () => boolean } = {}): Promi
     dir = mkdtempSync(join(tmpdir(), 'qiyu-warm-'))
     const warmDir = dir
     pending = (async (): Promise<void> => {
-      // 探针缝：`tests/setup-warm.test.ts` 在**子进程**里设这个环境变量，用来验证
-      // 「预热抛错/卡住不影响测试」。子进程与父进程不共享 `process`，所以经环境变量传代码串。
+      // 探针缝：`tests/setup-warm.test.ts` 经环境变量注入「抛错 / 永不 resolve 的一步」。
       // 注入点必须在**受超时保护的这一段里** —— 放在 race 之外就绕过了预算。
       if (process.env.QIYU_WARM_FAIL_INJECT) {
         const injected = new Function(`return (${process.env.QIYU_WARM_FAIL_INJECT})`)() as unknown
@@ -98,13 +98,11 @@ export async function warmDuckDb(opts: { ifWarmed?: () => boolean } = {}): Promi
     // ⚠️ **绝不能**让预热失败拖垮整个测试收集（Codex 2026-11-14 P2）：`@duckdb/node-api` 是
     // optionalDependencies，缺原生 binding 时这里会抛 —— 若不吞，连不碰数据库的测试文件
     // 都跑不起来，而「缺依赖要有安装指引」正是本仓库承诺的行为、也有测试钉着。
-    // 预热只是**提速**：没暖成功就退回原来的「谁先用谁付冷启动」，
-    // 代价是慢，不是错。
+    // 预热只是**提速**：没暖成功就退回原来的「谁先用谁付冷启动」，代价是慢，不是错。
     return { ok: false, already: false, error }
   } finally {
     if (timer !== undefined) clearTimeout(timer)
-    // 超时后 body 可能还在跑：不让它后来的失败变成未处理的 rejection（它的句柄也会在
-    // 进程结束时释放；这里不 await，预热已经超时，不能再等它）。
+    // 超时后 body 可能还在跑：不让它后来的失败变成未处理的 rejection。
     pending?.catch(() => {})
     if (dir !== undefined) {
       try { rmSync(dir, { recursive: true, force: true }) } catch { /* 库仍打开/已被删：清理失败不影响正确性 */ }

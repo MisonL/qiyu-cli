@@ -42,9 +42,20 @@ interface Sink { out: (s: string) => void; err: (s: string) => void }
 interface Buf { out: string; err: string; writes: number }
 
 // —— 世代机制（① 迁移形态）——
-/** 写入者携带的世代号。⚠️ 只带世代号、不带 sink：迁移形态的 sink 写的是**模块级**变量
- *  （`out += s`），用例间共用同一个变量、`beforeEach` 里重置 —— 「记回它自己的 sink」
- *  与「记到当前用例」是同一件事，所以陈旧写入只能**丢弃**，不能补写到别处。 */
+/**
+ * 写入者携带的世代号。⚠️ 只带世代号、不带 sink：迁移形态的 sink 写的是**模块级**变量
+ * （`out += s`），用例间共用同一个变量、`beforeEach` 里重置 —— 「记回它自己的 sink」
+ * 与「记到当前用例」是同一件事，所以陈旧写入只能**丢弃**，不能补写到别处。
+ *
+ * ⚠️ 「跨测试文件」这条边界实测过（CodeRabbit 2026-11-14 major 要求核查）：
+ * vitest 2.1.9 在默认 isolation 下**每个测试文件一个独立环境** —— 文件里的模块会重载，
+ * `globalThis` 也不共享（实测：文件 A 写在 globalThis 上的对象在文件 B 里是 undefined，
+ * 同一 `shared.mjs` 在两个文件里各加载一次）。上一条用例留下的定时器在文件结束时随环境
+ * 一起消失，**不会**在下一个文件里触发（实测：尾巴回调根本没执行）。
+ * 所以「把世代状态挂到 globalThis 上跨文件共享」是**无效**的（跨不过去），已回退 ——
+ * 见 `tests/helpers/capture.test.ts` 里那条跨文件守卫（它测的是「若哪天这条变可达，
+ * 尾巴必须被丢弃」）。
+ */
 const alsGen = new AsyncLocalStorage<number>()
 let currentGeneration = 0
 let sinks: Sink = { out: () => {}, err: () => {} }

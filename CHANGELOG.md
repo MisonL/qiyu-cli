@@ -166,6 +166,19 @@
   destructuring pattern … Instead, received "..a"`。在包装下它用不了，不装反而给出更清楚的
   `it.extend is not a function`。
 
+- **捕获助手的跨文件归属**（CodeRabbit 2026-11-14 major）：实测在 vitest 2.1.9 默认 isolation
+  下**不可达** —— 每个测试文件一个独立环境，模块重载、`globalThis` 不共享，文件 A 留的定时器
+  在 A 结束时随环境消失、不会在 B 里触发。曾试着把世代状态挂到 `globalThis` 上共享，实测
+  **跨不过去**（文件间不共享），已回退。守卫改为**配置漂移探针**：若哪天开了单环境/`isolate:
+  false`，跨文件残留就变成可达，届时 A 的尾巴必须被丢弃。
+
+- **预热的超时边界如实收窄**（CodeRabbit 2026-11-14 major）：`Promise.race` 的预算只管
+  「一直不返回的 await」。原生绑定若**同步**卡住 JS 线程，同线程的定时器根本排不上队
+  （实测 400ms 忙等让 100ms 定时器一次没触发），进程内任何超时都拦不住 —— vitest 自己的
+  `testTimeout` 同样拦不住。把预热挪进子进程试过，**没有收益**（子进程暖的是它自己进程的原生
+  模块，worker 仍要自己加载；且 Node 自带 strip-types 解析不了源码里的 `.js` 说明符，要额外
+  引入 tsx 依赖），已回退并把这条边界写进文件头，**不放假守卫**。
+
 - **测试进程内只付一次 DuckDB 冷启动费（`tests/setup-warm.ts` + `setupFiles`）。**
   实测：进程内**首次** `DuckDBInstance.create` 在空载时 438ms、本机高负载时 19–34s
   （原生扩展加载 + 首次 mmap），之后同路径重开约 22ms。原先每个真库测试文件的首条用例

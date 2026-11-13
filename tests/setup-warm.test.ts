@@ -55,8 +55,8 @@ describe('setup-warm：预热失败只降级、不拖垮测试', () => {
   }
 
   it('预热抛错时，不碰数据库的测试文件仍然通过', () => {
-    const warm = readFileSync(join(root, 'tests', 'setup-warm.ts'), 'utf8')
-    expect(warm, '注入变量名两边必须一致').toContain(INJECT_ENV)
+    const warmSrc = readFileSync(join(root, 'tests', 'setup-warm.ts'), 'utf8')
+    expect(warmSrc, '注入变量名两边必须一致').toContain(INJECT_ENV)
     const { status, all } = runChild({ ...process.env, [INJECT_ENV]: 'new Error("注入：模拟原生 binding 缺失")' })
     // 先断「真正的后果」：预热抛错时子 vitest 必须仍然通过。再断「不静默」。
     expect(status, `预热失败拖垮了测试收集\n${all.slice(-2000)}`).toBe(0)
@@ -85,6 +85,13 @@ describe('setup-warm：预热失败只降级、不拖垮测试', () => {
   // ⚠️ 预热必须**有界**（Sourcery 2026-11-14）：setupFiles 在收集之前执行，原生绑定卡住
   // 不返回时用例自身的超时都还没生效，整个 worker 挂死。这里把预算压到 100ms，注入一个
   // 永不 resolve 的步骤 —— 预热必须在预算内返回、并报出来。
+  // ⚠️ **同步阻塞**拦不住 —— 这是如实标注的边界，不是遗漏（CodeRabbit 2026-11-14 major）。
+  // 原生绑定若同步卡住 JS 线程，同线程的 `setTimeout` 排不上队（实测：400ms 忙等让 100ms
+  // 定时器一次都没触发），进程内的任何超时预算都形同虚设。把预热挪进子进程试过 —— 没有收益：
+  // 子进程暖的是它自己进程的原生模块，worker 仍要自己加载（且 Node 自带 strip-types 解析不了
+  // 源码里的 `.js` 说明符，要额外引入 tsx 依赖）。所以这里**不放假守卫**，只钉「预算管得住
+  // 一直不返回的 await」。
+
   it('预热卡住时按预算降级，不无限等待', async () => {
     try {
       vi.stubEnv('QIYU_WARM_TIMEOUT_MS', '100')

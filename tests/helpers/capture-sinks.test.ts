@@ -4,6 +4,10 @@
 // 事故形态与 capture.test.ts 相同，但这里走的是**现有 27 个文件**那种写法：
 // 模块级 `let out`、`beforeEach` 刷 sink，用例体不包 `run()`。
 //
+// ⚠️ 跨**文件**的尾巴（CodeRabbit 2026-11-14 major）在 `capture.test.ts` 里守卫：那里跑两个
+// 子 vitest 文件（A 留尾巴、B 验证没收到），因为 vitest 会在测试文件之间重载本助手模块，
+// 世代状态必须挂在 `globalThis` 上才跨得过去。
+//
 // ⚠️ 已知边界（CodeRabbit 2026-11-14 major 的实测裁决）：**hook 里的延迟写入没有世代**
 // （`beforeEach`/`afterEach` 不在执行体的 `alsGen.run` 里），会被当成「当前世代」接收 ——
 // 实测 A 的 `beforeEach` 里 80ms 后落地的尾巴进了 B 的 `out`。本文件的守卫**选不出来**
