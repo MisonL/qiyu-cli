@@ -144,6 +144,24 @@
   `mkdtempSync` 失败原来绕过 catch）。这条单测直接调预热体 —— 走子 vitest 分不清是预热
   还是 vitest 自身起不来（`TMPDIR` 指向文件时 vitest 在收集阶段就死）。变异：把
   `mkdtempSync` 移出 try → 该用例红。
+  预热**有界**（Sourcery 2026-11-14）：setupFiles 在收集之前执行，原生绑定卡住时用例自身的
+  超时都还没生效 —— 整个 worker 挂死。现在 `Promise.race` 一个 `QIYU_WARM_TIMEOUT_MS`
+  （默认 120s）预算，超时按降级处理。⚠️ 这个定时器**不能** `unref()`：卡住的那一步若没有
+  别的 handle，事件循环里只剩它，unref 后直接「无活可做」退出，race 既不 resolve 也不
+  reject（实测：注入永不 resolve 的 await 后用例直接 60s 超时）。
+  预热体不再自己写 stderr，失败作为返回值交给 setup 入口（本文件被 setupFiles 加载时
+  `warmDuckDb` 的导入会先跑一遍预热，自己写 stderr 会让每次跑测试都多一行告警）。
+  `init()` 失败也会关库（不把文件句柄带进后续测试文件）；清理目录同样 best-effort。
+  ⚠️ Windows 上 Node 的 `os.tmpdir()` 读 `TEMP`/`TMP` 而不是 `TMPDIR`，守卫三个一起设。
+
+- **包装版 `it` 补上 vitest 的 `sequential` 与 `for`**（CodeRabbit 2026-11-14 major）。
+  不装的话调用点在**收集阶段** `TypeError`、整文件 0 条；而 `for` 与 `each` 同类（柯里化，
+  返回登记函数）—— 当成直接登记会丢表格行，执行体拿到上一层的函数、报
+  `function is not iterable`（实测）。
+  ⚠️ `it.extend` **刻意不装**：vitest 会解析执行体的源码文本校验 fixture 写法，而包装恰好
+  把执行体换成 `(...a) => f(...a)`，报 `The first argument inside a fixture must use object
+  destructuring pattern … Instead, received "..a"`。在包装下它用不了，不装反而给出更清楚的
+  `it.extend is not a function`。
 
 - **测试进程内只付一次 DuckDB 冷启动费（`tests/setup-warm.ts` + `setupFiles`）。**
   实测：进程内**首次** `DuckDBInstance.create` 在空载时 438ms、本机高负载时 19–34s

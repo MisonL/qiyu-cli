@@ -71,8 +71,10 @@ type Aliases = Record<string, unknown>
 /** 直接登记：`it.skip(名[, 选项], 体)` / `only` / `fails` / `concurrent` / `todo`。
  *  实测这类调用**立刻**把用例登记掉，返回值是 `undefined`（不是登记函数）。 */
 const DIRECT_ALIASES = ['skip', 'only', 'fails', 'concurrent', 'todo'] as const
-/** 柯里化修饰：`it.each(表格)` / `it.skipIf(条件)` / `it.runIf(条件)`，返回登记函数。 */
-const FACTORY_ALIASES = ['each', 'skipIf', 'runIf'] as const
+/** 柯里化修饰：`it.each(表格)` / `it.for(表格)` / `it.skipIf(条件)` / `it.runIf(条件)`，
+ *  返回登记函数。⚠️ `for` 与 `each` 同类（实测：当成直接登记会丢表格行，执行体拿到的是
+ *  上一层传进来的函数，报 `function is not iterable`）。 */
+const FACTORY_ALIASES = ['each', 'for', 'skipIf', 'runIf'] as const
 
 /**
  * 找出执行体在实参里的位置。
@@ -85,12 +87,9 @@ const FACTORY_ALIASES = ['each', 'skipIf', 'runIf'] as const
  */
 function wrapBody(a: unknown[]): unknown[] {
   const isOpts = (v: unknown): boolean => typeof v === 'object' || v === undefined
-  const i = typeof a[1] === 'function' ? 1
-    : typeof a[2] === 'function' && isOpts(a[1]) ? 2
-      : -1
-  if (i < 0) return a
   const out = a.slice()
-  out[i] = wrapFn(a[i])
+  if (typeof a[1] === 'function') out[1] = wrapFn(a[1])
+  else if (typeof a[2] === 'function' && isOpts(a[1])) out[2] = wrapFn(a[2])
   return out
 }
 
@@ -123,6 +122,20 @@ function wrapIt(register: Registrar): typeof baseIt {
     if (typeof v !== 'function') continue
     // 执行体先套世代，再交给真实的直接登记函数。
     // ⚠️ `this` 必须是真实的 `it`（vitest 在内部读 `this.withContext`，实测未绑定即 TypeError）。
+    Object.defineProperty(out, key, { configurable: true, value: (...a: unknown[]) => { (v as (...x: unknown[]) => unknown).call(register, ...wrapBody(a)); return reg } })
+  }
+  // ⚠️ `sequential` 也是 vitest 的登记方法（CodeRabbit 2026-11-14 major）：本仓库暂未使用，
+  // 但 `it` 的类型是 `typeof baseIt`，按类型写出的 `it.sequential(…)` 不能在收集阶段炸掉 ——
+  // 不装的话是 `TypeError: it.sequential is not a function`、整文件 0 条。
+  //
+  // ⚠️ `extend` **刻意不装**：vitest 会解析执行体的**源码文本**来校验 fixture 写法
+  // （实测报错 `The first argument inside a fixture must use object destructuring pattern …
+  // Instead, received "..a"`），而本助手的包装恰好是把执行体换成 `(...a) => f(...a)`。
+  // 所以 `it.extend` 在包装下**用不了**；不装它，调用点拿到的是明确的
+  // `TypeError: it.extend is not a function`，比伪装成 fixture 解析错误清楚。
+  for (const key of ['sequential'] as const) {
+    const v = aliases[key] as Registrar | undefined
+    if (typeof v !== 'function') continue
     Object.defineProperty(out, key, { configurable: true, value: (...a: unknown[]) => { (v as (...x: unknown[]) => unknown).call(register, ...wrapBody(a)); return reg } })
   }
   for (const key of FACTORY_ALIASES) {

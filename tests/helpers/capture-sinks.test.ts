@@ -60,6 +60,15 @@ describe('captureSinks + 包装 it', () => {
   it.skipIf(true)("E'：it.skipIf(true) 必须被跳过（同上）", () => {
     throw new Error('条件被忽略：本用例不该执行')
   })
+
+  // vitest 的其余登记方法（CodeRabbit 2026-11-14 major）：不装就是收集阶段 TypeError、
+  // 整文件 0 条；装错形态（`for` 当成直接登记）会让执行体拿到上一层的函数。
+  it.sequential('E2：it.sequential 能登记', () => {
+    expect(true).toBe(true)
+  })
+  it.for([['a'], ['b']] as const)('E3：it.for 的表格行走到执行体里（%s）', ([v]: readonly [string]) => {
+    expect(typeof v).toBe('string')
+  })
 })
 
 describe('captureSinks + 包装 it', () => {
