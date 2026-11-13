@@ -3,7 +3,8 @@
 // 为什么单独一条：`violations[].rule` 是 10 值闭集（Agent 按值分支：改命令行 vs 改正文），
 // 而 compare 形态有 `installed.present=false`（此时 violations/unverifiable 不出现）与
 // `differences`（非空即退出码 1）两个易误读点。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,8 +21,7 @@ beforeEach(() => {
   entity = join(home, 'entity')
   out = ''
   err = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((x) => { err += x; return true })
+  captureSinks((s) => { out += s }, (x) => { err += x })
   vi.stubEnv('HOME', home) // 隔离真实 ~
   vi.stubEnv('USERPROFILE', home) // Windows 的 os.homedir() 读它
   vi.stubEnv('QIYU_SKILL_DIR', '') // 命令层把空串当「未设」

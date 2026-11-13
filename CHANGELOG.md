@@ -90,8 +90,49 @@
   （CodeRabbit 2026-11-13 major）：不调的话等待写入完成的用例只能超时。变异验证：
   去掉回调 → 用例超时变红。
   实测记录：vitest 2.1.9 默认 `restoreMocks:false`，跨用例不会自动恢复 spy。
-  ⚠️ **尚未迁移**：现有 27 个文件的模块级捕获仍在用，本助手目前只有自己的守卫在用。
-  迁移要点与逐文件风险见 `HANDOFF.md` §审计②；不要把它读成「测试隔离已全面修好」。
+
+- **27 个测试文件迁移到 `captureSinks()`，模块级 `let out` 不再自己装 spy**。
+  每个文件只改三行：`it` 从 `vitest` 改为从 `./helpers/capture.js` 导入（包装版给每条用例
+  打上**世代号**）、`describe/it/expect` 其余照旧、`beforeEach` 里的两行
+  `vi.spyOn(process.stdout/stderr, 'write')` 换成一行 `captureSinks(…)`。归属仍按
+  `AsyncLocalStorage` 记录的发起者判：上一条用例的延迟尾巴写的是**它自己**的缓冲，
+  不会污染下一条。两个入口（`captureSinks()` 世代形态 / `startCapture()` 句柄形态）共用
+  同一份 spy 安装，避免两套实现各自漂移。
+  ⚠️ 迁移中实测到的坑：**不能**用「`process.stdout.write === activeSpy` 就跳过重装」做幂等 —
+  `vi.restoreAllMocks()` 还原到的是**上一层 spy**（正是本助手自己装的那个），身份判据成立
+  但写入落在旧闭包的 `sinks` 里，`out` 恒空（`cli.test.ts` 当场 11 条失败）。现在每次
+  `captureSinks()` 无条件重装。
+  变异验证三处：「世代判据恒真」→ 尾巴用例红（`expected 'BTAIL' to be 'B'`）；
+  「不调 write 完成回调」→ 回调用例超时红；「加回身份判据」→ `cli.test.ts` 11 条红。
+  ⚠️ 包装版 `it` 必须把 vitest 的别名形态全部挂上（`each` / `skip` / `skipIf` / `runIf` /
+  `only` / `todo` / `concurrent` / `fails`）：它们是登记函数的**属性**，裸箭头函数上没有。
+  首轮迁移漏了这一层，全量报两个「失败文件」，真实情况是 `config-insecure.test.ts`（`it.each`）
+  与 `auth.test.ts`（`it.skipIf`）在**收集阶段**就 `TypeError`、一条用例都没跑 ——
+  「失败文件数」在小全量里读不出严重性。别名实现只有一个实现点，两种形态共用：
+  直接登记（`it.skip(名, 体)`）与柯里化修饰（`it.each(表格)(名, 体)`）。
+  守卫用 `it.each` / `it.runIf(false)` / `it.skipIf(true)` / `it.todo` / `it.fails` 各跑一次
+  （条件必须真的决定成败，否则「条件被当成用例名丢掉」这条错法测不出来）；
+  变异：丢表格行转发 → `it.each` 两行红；别名不展开 → each 与两条条件用例红；
+  去掉 `skipIf` 别名 → 整个文件 `TypeError` 红。
+
+- **测试进程内只付一次 DuckDB 冷启动费（`tests/setup-warm.ts` + `setupFiles`）。**
+  实测：进程内**首次** `DuckDBInstance.create` 在空载时 438ms、本机高负载时 19–34s
+  （原生扩展加载 + 首次 mmap），之后同路径重开约 22ms。原先每个真库测试文件的首条用例
+  都要承担这段，`hookTimeout`/`testTimeout` 在这台机器上会直接超时。
+  现在 `setupFiles` 在**每个 worker 进程**开跑前建一个临时库、`init()`、关掉，用
+  `process` 级布尔量保证只做一次（`setupFiles` 在被测模块之前执行，且 worker 进程内跨
+  测试文件共享）。`globalSetup` 不行 —— 实测是**另一个进程**（探测 pid 45930 vs 51568），
+  预热的 native module 到不了 worker。子进程预热与模板库拷贝两条路也实测无效，理由见
+  `HANDOFF.md` §审计③。
+  收益：`tests/commands/db.test.ts` 从「首条用例常超时」变为稳定通过（A/B 各 2 轮：
+  改前 2/2 有首条超时失败，改后 2/2 全绿）；全量 2576 条在 load 511 下全绿。
+
+- **`tests/commands/db.test.ts` 全文件共用一个库路径，逐条 `resetDb()` 复置。**
+  同一文件里原先每条用例各建一个新路径的库（新路径 = 110ms 创建 + 75ms `init`，且绕不过
+  首次冷启动），现改为 `beforeAll` 建一次目录、每条用例开头 `DROP TABLE` 全部业务表再
+  `init()`。**只在真的用库的 18 条用例里调 `resetDb()`，不是 `beforeEach` 全量** ——
+  实测放 `beforeEach` 反而更慢（10.3s → 13.5s）。`hookTimeout` 提到 60s（首次 `beforeAll`
+  仍可能撞上冷启动）；两条互不相干的用例原先共用 `alien.db` 会串，改为各自独立路径。
 
 - **钉住「上一条用例的 ticking 时钟不得泄漏」的清理契约**（CodeRabbit 2026-11-12 第三轮 major）：
   新增回归用例会让 `Date.now` 每读一次 +1ms，若清理失效，后续用例会拿到停在 2026-11-11 的

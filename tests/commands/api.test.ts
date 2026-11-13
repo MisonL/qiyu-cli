@@ -1,5 +1,6 @@
 // tests/commands/api.test.ts
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, vi, beforeEach, afterEach } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { apiCommand, assertGetHasNoBody } from '../../src/commands/api.js'
 import { authCommand } from '../../src/commands/auth.js'
 import { __resetBuckets } from '../../src/core/http.js'
@@ -59,10 +60,10 @@ beforeEach(() => {
   // 是**确定性**的失败（首次之后的每次调用必被拒），不是"随机" —— 别把它当成
   // 偶发 flake 去重跑。与 http.test.ts 一致地重置。
   __resetBuckets()
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
   // stderr 也要捕获 —— 只断言退出码区分不出"哪个分支拦下的"：
   // --pretty 与未知参数都返回 2，删掉 --pretty 分支测试照样绿（变异测试确认过）。
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  
 })
 // 用例会 stubEnv 配凭证（否则"没发请求"的断言会因缺凭证而假通过），
 // 所以这里必须一并清掉，避免污染后续用例。

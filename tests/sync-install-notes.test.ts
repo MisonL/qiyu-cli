@@ -3,7 +3,8 @@
 // 背景：这两个命令的 `commands[].ok` 是**三值**（null = 未执行 / true = 成功 / false = 失败），
 // 而 `dry_run` 决定「到底装没装」。四个分支（install/uninstall × dry-run/--yes）的键集
 // 各不相同，所以图例按模式分开 —— 一份图例解释四个不存在的键就是「声明了但没人读」。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -24,8 +25,7 @@ const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-instnotes-'))
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((x) => { out += 'ERR:' + x; return true })
+  captureSinks((s) => { out += s }, (x) => { out += 'ERR:' + x })
   vi.stubEnv('HOME', dir) // 隔离真实 ~
   // ⚠️ Windows 的 os.homedir() 读 USERPROFILE，不读 HOME（同 tests/commands/skill.test.ts
   // 记过的病根）：只 stub HOME 的话，Windows 上 install 会把条目写进开发者的真实用户目录。

@@ -8,7 +8,8 @@
 //
 // 本文件对**每条有图例的命令**跑真实输出，断言：data 里的每个字段要么被图例覆盖
 // （`k` / `k.` / `k[]` 三种前缀），要么在自明清单里（如 `entity`、`links` 这类容器）。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,8 +24,7 @@ let out = ''
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-legends-'))
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  captureSinks((s) => { out += s }, () => {})
   vi.stubEnv('HOME', dir) // 隔离真实 ~
   vi.stubEnv('USERPROFILE', dir)
 })

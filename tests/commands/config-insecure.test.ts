@@ -13,7 +13,8 @@
 // 「同一判据在不同命令上分叉」。分文件写就复现不了这个形态 —— 下一个人在 checkPermissions
 // 上加了第三个拒绝原因、只给 store 路径接上，跨文件断言不会红。这里的 `it.each`
 // 把六条命令绑在**同一张表**上，漏接一条即红。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -47,8 +48,7 @@ function writeWideConfig(mode = 0o644): string {
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'qiyu-insecure-'))
   out = ''; err = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
   vi.stubEnv('HOME', home)   // 隔离真实 ~，且让 configPathFor() 指到临时目录
   vi.stubEnv('USERPROFILE', home)
   // ⚠️ 环境变量给上完整凭证（2026-10-26）：否则 `sync run` / `api` 会**先**在凭证层

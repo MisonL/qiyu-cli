@@ -2,7 +2,8 @@
 // 夹具沿 tests/commands/store.test.ts / sync.test.ts：mkdtemp + stubEnv('HOME') +
 // 真 DuckDB 临时库 + spy stdout/stderr 双通道。
 // ⚠️ fixtures 全合成：13800001111 是明显的测试号码，不使用任何真实企业数据。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,25 +15,61 @@ import { TABLES, MIGRATIONS } from '../../src/store/schema.js'
 import type { Store } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/sync.test.ts 同款放宽）。
-vi.setConfig({ testTimeout: 15_000 })
+// `hookTimeout` 单独放宽：首个 `beforeAll` 要付 DuckDB 原生的**进程内冷启动**
+// （本机负载高时实测 10–34s），vitest 默认 10s 会先把它判超时。
+vi.setConfig({ testTimeout: 15_000, hookTimeout: 60_000 })
 
+// ⚠️ **整个文件只用一个库文件**（2026-11-13 性能改造）。原先是 `beforeEach` 里
+// `mkdtemp` 新目录、每条用例各建一个库 —— 而 `@duckdb/node-api` 的实例缓存**按路径**
+// 生效（`tests/fixtures/corrupt-db.ts` 记着这条），换路径就等于每次都付一次
+// 「打开 + 25 张表迁移」。实测（本机负载 88）：新建库 ~500–800ms/条，
+// 同路径「DROP 全部表 + 重新迁移」~140ms/条，冷启动只付一次。
+// 语义不变：每条用例开始前库都被重置成「刚 init 完」的状态（见 `resetDb()`），
+// 包括会篡改 schema 的用例（删表、删列）—— 它们留下的破坏也一并清掉。
 let dir = ''
 let out = ''
 let err = ''
 const dbPath = (): string => join(dir, 'q.db')
 
-beforeEach(() => {
+/**
+ * 把库恢复成「刚 store init 完」：删掉全部表（含用例中途建的 `rogue_table`）再迁移。
+ *
+ * ⚠️ **只给真正用库的用例调用**，不放进 `beforeEach`（2026-11-13 实测）：本文件有
+ * 三条用例根本不碰 `q.db`（两条「库不存在 / 空库 / 他人库」用的是各自的路径，
+ * 一条是纯参数错误），给它们也重置一遍等于凭空加 3×140ms。放进 `beforeEach`
+ * 首次实测反而比改造前更慢（10.3s → 13.5s）。
+ */
+async function resetDb(): Promise<void> {
+  const s = await createDuckDbStore(
+    { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+  try {
+    // 表名用 `query()` + `information_schema` 取（`tableNames()` 只列声明过的表，
+    // 而「多一张表」那条用例会建 `rogue_table`，它也必须被清掉）。
+    const names = (await s.query(
+      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'`))
+      .rows.map((r) => String(r.table_name))
+    for (const n of names) await s.query(`DROP TABLE IF EXISTS "${n}" CASCADE`)
+    await s.init()
+  } finally {
+    await s.close()
+  }
+}
+
+beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-db-'))
+  // 冷启动只付一次：`beforeAll` 里先建好库，后续每条用例的 `resetDb()` 走同路径快路径。
+  await resetDb()
+})
+beforeEach(async () => {
   out = ''; err = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（配置文件与默认库路径都走 HOME）
   vi.stubEnv('USERPROFILE', dir)
 })
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs()
-  rmSync(dir, { recursive: true, force: true })
 })
+afterAll(() => { rmSync(dir, { recursive: true, force: true }) })
 
 const data = (): Record<string, unknown> => JSON.parse(out).data
 const meta = (): Record<string, unknown> => JSON.parse(out).meta
@@ -85,6 +122,7 @@ async function seed(): Promise<void> {
 
 describe('db tables', () => {
   it('db tables 输出 25 表 + 行数 + 粒度 + PII 列 + notice', async () => {
+    await resetDb()
     await seed()
     expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
 
@@ -120,6 +158,7 @@ describe('db tables', () => {
   })
 
   it('time_range 按 timeColumn 计算；sessions 的 epoch-ms 转上海 ISO；无时间列 → null', async () => {
+    await resetDb()
     await seed()
     expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
     const byName = new Map((data().tables as TableOut[]).map((t) => [t.name, t]))
@@ -141,6 +180,7 @@ describe('db tables', () => {
   })
 
   it('声明与实况不一致（删一张表 / 多一张表）→ meta.warnings 点名，rows 不编造', async () => {
+    await resetDb()
     const s = await fresh()
     try {
       await s.query('DROP TABLE "sessions"')
@@ -185,6 +225,7 @@ describe('db tables', () => {
   })
 
   it('声明的时间列被删 → db tables 仍成功，该表 time_range 为 null + warning（不硬失败）', async () => {
+    await resetDb()
     await seed()
     const s = await createDuckDbStore(
       { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
@@ -209,6 +250,7 @@ describe('db tables', () => {
   })
 
   it('时间列的脏值不进 time_range，且逐表给 warning（正确性 P1）', async () => {
+    await resetDb()
     await seed()
     const s = await createDuckDbStore(
       { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
@@ -247,6 +289,7 @@ describe('db tables', () => {
   })
 
   it('形态判据两端锚定：尾部垃圾与纯日期也算脏值，不进 time_range（CodeRabbit 终审 minor）', async () => {
+    await resetDb()
     await seed()
     const s = await createDuckDbStore(
       { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
@@ -268,6 +311,7 @@ describe('db tables', () => {
   })
 
   it('epoch-ms 列的非数字值是脏值，必须计数并警告（CodeRabbit 复审：SQL 三值逻辑回归）', async () => {
+    await resetDb()
     await seed()
     const s = await createDuckDbStore(
       { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
@@ -286,6 +330,7 @@ describe('db tables', () => {
   })
 
   it('db describe 的时间范围同样排除脏值并逐列警告（正确性 P1）', async () => {
+    await resetDb()
     await seed()
     const s = await createDuckDbStore(
       { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
@@ -304,6 +349,7 @@ describe('db tables', () => {
   })
 
   it('db tables 也核对列集：多列/少列进 warnings（审查 I-3，README 承诺不静默）', async () => {
+    await resetDb()
     await seed()
     const s = await createDuckDbStore(
       { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
@@ -391,7 +437,7 @@ describe('db tables', () => {
     expect(e.hint).toMatch(/store init/)
 
     // 他人库（有表、无 schema_version）→ hint 指换 --db 路径
-    const alien = join(dir, 'alien.db')
+    const alien = join(dir, 'alien-tables.db')
     const inst = await mod.DuckDBInstance.create(alien)
     const conn = await inst.connect()
     await conn.run('CREATE TABLE alien (a INTEGER)')
@@ -425,6 +471,7 @@ const sessionsDef = (): (typeof TABLES)[number] => TABLES.find((t) => t.name ===
 
 describe('db describe', () => {
   it('db describe sessions：7 键逐列 + sensitive/observed_enum/时间列/row_count/PII 列', async () => {
+    await resetDb()
     await seed()
     expect(await dbCommand(['describe', 'sessions', '--db', dbPath()])).toBe(0)
 
@@ -471,6 +518,7 @@ describe('db describe', () => {
   })
 
   it('无时间列 → time_column/time_range 均 null；meta 恒有 notice / warnings / field_notes', async () => {
+    await resetDb()
     await seed()
     expect(await dbCommand(['describe', 'schema_version', '--db', dbPath()])).toBe(0)
 
@@ -488,6 +536,7 @@ describe('db describe', () => {
   })
 
   it('未知表 → usage 2 + 候选（sessons → sessions）；缺表名 / 多余位置参数 → usage 2', async () => {
+    await resetDb()
     await seed()
     // 拼错一个字符 → 候选来自 TABLES（不裸透 DuckDB 英文）。
     // ⚠️ 不给 --db：闭集校验先于任何 I/O（走到开库会得到 store_not_initialized 退出码 1）
@@ -535,6 +584,7 @@ describe('db describe', () => {
   })
 
   it('实际列集与 TABLES 不一致 → meta.warnings 点名多列/少列；列清单仍以声明为权威', async () => {
+    await resetDb()
     const s = await fresh()
     try {
       await s.query('ALTER TABLE "sessions" DROP COLUMN "userCrmInfo"')
@@ -555,6 +605,7 @@ describe('db describe', () => {
   })
 
   it('R5：声明有但库中无 → 仍输出声明元数据（row_count/time_range null）+ warning，退出码 0', async () => {
+    await resetDb()
     const s = await fresh()
     try {
       await s.query('DROP TABLE "sessions"')
@@ -592,6 +643,7 @@ describe('db describe', () => {
   })
 
   it('声明的时间列被删 → 退出码 0、time_range null、row_count 照常、warnings 点名该列', async () => {
+    await resetDb()
     await seed()
     const s = await createDuckDbStore(
       { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
@@ -621,6 +673,7 @@ describe('db describe', () => {
   })
 
   it('time_range 覆盖 iso-day 与 iso-instant 两种 kind', async () => {
+    await resetDb()
     await seed()
     // iso-day（daily_overview.stat_date）
     expect(await dbCommand(['describe', 'daily_overview', '--db', dbPath()])).toBe(0)
@@ -639,6 +692,7 @@ describe('db describe', () => {
   })
 
   it('iso-instant 按解析时刻取极值，不按字典序（CodeRabbit 终审 minor）', async () => {
+    await resetDb()
     await seed()
     const s = await createDuckDbStore(
       { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
@@ -690,7 +744,7 @@ describe('db describe', () => {
     expect(e.hint).toMatch(/store init/)
 
     // 他人库（有表、无 schema_version）
-    const alien = join(dir, 'alien.db')
+    const alien = join(dir, 'alien-describe.db')
     const inst = await mod.DuckDBInstance.create(alien)
     const conn = await inst.connect()
     await conn.run('CREATE TABLE alien (a INTEGER)')

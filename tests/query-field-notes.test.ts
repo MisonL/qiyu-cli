@@ -9,7 +9,8 @@
 //     iso-instant / epoch-ms 表没有任何提示（实测 epoch-ms 空 5 天仍报满区间、warnings: []）。
 //
 // 本文件把**图例**、**真实输出键集**与**四种/三种 null 成因**都钉在真跑出来的结果上。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -33,8 +34,7 @@ const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-qnotes-'))
   out = ''; err = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
   vi.stubEnv('HOME', dir) // 隔离真实 ~
   vi.stubEnv('USERPROFILE', dir)
 })

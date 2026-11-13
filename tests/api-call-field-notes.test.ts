@@ -3,7 +3,8 @@
 // 为什么单独一条：`api call` 的 `data` 是**上游载荷**（按信封形状取 data/result/staffInfo），
 // 与其余命令的 `data`（CLI 自己的契约）不是一回事。`not_found` 只覆盖**结构性为空**，
 // 是 Agent 最容易误读成「有数据」的地方。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -19,8 +20,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-apinotes-'))
   out = ''
   err = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((x) => { err += x; return true })
+  captureSinks((s) => { out += s }, (x) => { err += x })
   vi.stubEnv('HOME', dir) // 隔离真实 ~
   vi.stubEnv('USERPROFILE', dir) // Windows 的 os.homedir() 读它
   vi.stubEnv('QIYU_PROFILE', '')

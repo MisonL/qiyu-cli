@@ -18,7 +18,8 @@
 //   「形状合格」与「能回显」永远是同一集合，脏值退化为「被排除 + 计数警告」。
 //
 // ⚠️ fixtures 全合成：13800001111 是明显的测试号码，不使用任何真实企业数据。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -38,8 +39,7 @@ const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-db-boundary-'))
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += String(s); return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  captureSinks((s) => { out += String(s) }, () => {})
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（默认库路径与配置文件都走 HOME）
   vi.stubEnv('USERPROFILE', dir)
 })

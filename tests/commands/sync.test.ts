@@ -1,6 +1,7 @@
 // tests/commands/sync.test.ts —— D-T12：sync tasks 子命令形态（骨架沿 store.ts）。
 // D-T13 追加：sync run 子命令 —— 区间参数/输出契约/进度/退出码/store 未初始化。
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, vi, beforeEach, afterEach } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -27,8 +28,7 @@ let dir = ''
 beforeEach(() => {
   out = ''; err = ''
   dir = mkdtempSync(join(tmpdir(), 'qiyu-syncrun-'))
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（store 配置与默认库路径都走 HOME）
   vi.stubEnv('USERPROFILE', dir)
   vi.stubEnv('QIYU_APP_KEY', 'test-key')

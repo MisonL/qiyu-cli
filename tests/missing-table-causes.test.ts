@@ -16,7 +16,8 @@
 //      MISSING_TABLE_CAUSES——谁再拷贝一份到别处，直接红。
 // ⚠️ 边界（诚实记录）：①证明运行时输出，②只是**文本**判据，回答「文案是不是还只有
 // 一个实现」，证明不了别处没有语义等价但措辞不同的错误断言。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname, relative } from 'node:path'
@@ -40,8 +41,7 @@ const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-mtc-'))
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  captureSinks((s) => { out += s }, () => {})
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（配置文件与默认库路径都走 HOME）
   vi.stubEnv('USERPROFILE', dir)
 })
