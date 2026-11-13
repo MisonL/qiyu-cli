@@ -50,12 +50,40 @@ let generation = 0
 let fallback: Buf | undefined
 let activeSpy: unknown
 
-/** 把用例执行体放进**执行时**那一代的异步上下文（见 `it` 注释）。
- * `forward` 为真时转发实参（`each` 的表格行要走进去），否则以零参调用。 */
-function wrapFn(fn: unknown, forward: boolean): unknown {
+/** 把用例执行体放进**执行时**那一代的异步上下文（见 `it` 注释），实参原样转发
+ *  （`it.each` 的表格行要从这里走进执行体）。 */
+function wrapFn(fn: unknown): unknown {
   if (typeof fn !== 'function') return fn
   const f = fn as (...a: unknown[]) => unknown
-  return (...a: unknown[]) => alsGen.run(currentGeneration, () => (forward ? f(...a) : f()))
+  return (...a: unknown[]) => alsGen.run(currentGeneration, () => f(...a))
+}
+
+/** vitest 用例登记函数的两种别名形态（实测 2.1.9，见下方 `wrapIt` 的注释）。 */
+type Registrar = (name: unknown, ...rest: unknown[]) => unknown
+/** 别名表：用 `unknown` 索引，取值前由 `typeof === 'function'` 收窄。 */
+type Aliases = Record<string, unknown>
+
+/** 直接登记：`it.skip(名[, 选项], 体)` / `only` / `fails` / `concurrent` / `todo`。
+ *  实测这类调用**立刻**把用例登记掉，返回值是 `undefined`（不是登记函数）。 */
+const DIRECT_ALIASES = ['skip', 'only', 'fails', 'concurrent', 'todo'] as const
+/** 柯里化修饰：`it.each(表格)` / `it.skipIf(条件)` / `it.runIf(条件)`，返回登记函数。 */
+const FACTORY_ALIASES = ['each', 'skipIf', 'runIf'] as const
+
+/**
+ * 找出执行体在实参里的位置。
+ * ⚠️ vitest 2.1.9 有两种重载：`it(名, 体)` 与 `it(名, 选项, 体)`（CodeRabbit 2026-11-14
+ * major）。只看第二实参会把「选项对象」当成执行体 —— 原样返回、执行体**没套上世代**，
+ * 而它发出的延迟写入会被下一条用例接收（正是本助手要挡的形态）。
+ * 表格行可以是函数（`it.each([[fn]])`），所以只在「注册实参」这一侧调用本函数。
+ */
+function wrapBody(a: unknown[]): unknown[] {
+  const i = typeof a[1] === 'function' ? 1
+    : typeof a[2] === 'function' && typeof a[1] === 'object' && a[1] !== null ? 2
+      : -1
+  if (i < 0) return a
+  const out = a.slice()
+  out[i] = wrapFn(a[i])
+  return out
 }
 
 /**
@@ -67,48 +95,37 @@ function wrapFn(fn: unknown, forward: boolean): unknown {
  * `TypeError: it.each is not a function`，整个文件一条都没跑；`auth.test.ts` 用
  * `it.skipIf`，漏挂会让本该跳过的用例变成 `TypeError`。
  *
- * 实现只有一个点：每条用例的执行体都经 `wrapFn` 再登记。别名**只展开一层**：
- * `it.skipIf(c)` → 条件化后的 vitest 登记函数，`it.each(rows)` → 在 `it` 上登记。
- * ⚠️ 不能对别名结果再调一次 `wrapIt`（实测 `RangeError: Maximum call stack size exceeded`）：
- * `skip` / `only` 每次访问返回**新函数**，递归永远探不到底；而「认过的就跳过」又会让
- * 别名完全绕开世代包装。一层叠一层的形态（`it.skip.each`）本仓库没人用，不承诺。
- */
-type Registrar = (name: unknown, fn: unknown, ...rest: unknown[]) => unknown
-
-/**
- * 调一个登记函数 `r`：执行体（第二实参）经 `r` 套上世代。
- * ⚠️ 实参必须转发（2026-11-14 实测）：`it.each(cases)` 会把表格行作为入参传给执行体，
- * 丢实参的版本让 `config-insecure.test.ts` 27 条用例全报 `run is not a function`。
- * 没有第二实参（`it.todo('名')`）时原样转发 —— 那里的「第二实参」不存在，不能凭空造。
+ * ⚠️ 两类别名必须**分开处理**（CodeRabbit 2026-11-14 major，探针实测确认）：直接登记类
+ * 把用例登记掉就返回，拿它的返回值去包执行体永远包不到 —— `it.fails(名, 体)` 的体不套世代，
+ * 它发出的延迟写入会被下一条用例接住。只有柯里化类返回登记函数，才需要「拿到返回值再包」。
+ * 按**键名**分组而不是猜「首参是不是字符串」：那是等价变异（实测两个方向都杀不掉），
+ * 也挡不住真实差别（两类的差别在返回值，不在首参类型）。
  *
- * 两种别名形态**共用**它，所以只有一个实现点（2026-11-14 核实）：
- * - 直接登记 `it.skip(名, 体)` / `it.fails(名, 体)` / …：`it.skip` 本身就是 `r`；
- * - 柯里化修饰 `it.each(表格)(名, 体)` / `it.skipIf(条件)(名, 体)`：`it.each(表格)` 先交给
- *   vitest，拿回来的对象就是 `r`。
- * ⚠️ 不要在调用方按「首参是不是字符串」分流：那两条路径最终都走到 `r.call(register, …)`，
- * 分流是**等价变异**（实测两个方向都杀不掉）。
+ * ⚠️ 不支持的形态：**别名链**（`it.skip.each(表格)` / `it.concurrent.each(…)`）。
+ * 别名函数上没有挂下一层别名，故 `it.skip.each` 会在收集阶段 `TypeError: … is not a
+ * function` —— 是**响亮失败**，不是静默丢失隔离。本仓库没有这种写法；真要用就改成
+ * `it.skip(名, 体)` 或 `it.each(表格)`。
  */
-function run(r: Registrar, a: unknown[]): unknown {
-  const f = r as (...x: unknown[]) => unknown
-  return a.length < 2 ? f(...a) : f(a[0], wrapFn(a[1], true), ...a.slice(2))
-}
-
 function wrapIt(register: Registrar): typeof baseIt {
-  const reg = ((name: unknown, fn: unknown, ...rest: unknown[]) =>
-    register(name, wrapFn(fn, true), ...rest)) as unknown as typeof baseIt
+  const reg = ((...a: unknown[]) => (register as (...x: unknown[]) => unknown)(...wrapBody(a))) as unknown as typeof baseIt
   const out = reg as unknown as Record<string, unknown>
-  for (const key of ['each', 'skipIf', 'runIf', 'skip', 'only', 'todo', 'concurrent', 'fails'] as const) {
-    const v = register[key as keyof typeof register] as ((...a: unknown[]) => unknown) | undefined
+  const aliases = register as unknown as Aliases
+  for (const key of DIRECT_ALIASES) {
+    const v = aliases[key] as Registrar | undefined
     if (typeof v !== 'function') continue
+    // 执行体先套世代，再交给真实的直接登记函数。
+    // ⚠️ `this` 必须是真实的 `it`（vitest 在内部读 `this.withContext`，实测未绑定即 TypeError）。
+    Object.defineProperty(out, key, { configurable: true, value: (...a: unknown[]) => { (v as (...x: unknown[]) => unknown).call(register, ...wrapBody(a)); return reg } })
+  }
+  for (const key of FACTORY_ALIASES) {
+    const v = aliases[key] as ((...a: unknown[]) => unknown) | undefined
+    if (typeof v !== 'function') continue
+    // 先交表格/条件给 vitest 换回登记函数，再用它登记被包装的执行体。
     Object.defineProperty(out, key, {
       configurable: true,
-      // 别名只展开一层（见上方 `run` 的注释）：先用 `register` 的**同一份**实现调用，
-      // 拿回来的若是登记函数（`each`/`skipIf`/`runIf`），执行体在那一步套世代；
-      // 若返回的不是函数（`skip`/`fails`/`concurrent` 直接登记掉了），这条调用已由
-      // `run` 完成，直接返回 `reg` 供链式续用。
       value: (...a: unknown[]) => {
-        const r = v.call(register, ...a) as unknown
-        return typeof r === 'function' ? (...b: unknown[]) => run(r as Registrar, b) : reg
+        const r = (v as (...x: unknown[]) => unknown).call(register, ...a) as Registrar
+        return (...b: unknown[]) => { (r as (...x: unknown[]) => unknown)(...wrapBody(b)); return reg }
       },
     })
   }
@@ -120,9 +137,10 @@ function wrapIt(register: Registrar): typeof baseIt {
  *
  * ⚠️ `currentGeneration` 必须在**执行时**读（箭头函数体内），不能在包装时读 ——
  * 包装发生在收集阶段，那时 `beforeEach` 还没把世代推进。
- * 超时等额外参数原样透传（`each` 的用例入参由 vitest 绑进零参执行体）。别名见 `wrapIt`。
+ * 超时/选项等其余实参原样透传，执行体的位置由 `wrapBody` 判定。
  */
-export const it: typeof baseIt = wrapIt(baseIt as unknown as (n: unknown, f: unknown, ...r: unknown[]) => unknown)
+
+export const it: typeof baseIt = wrapIt(baseIt as unknown as Registrar)
 
 /**
  * 替换旧的「两行 vi.spyOn」（① 用法，在 `beforeEach` 里调用）：推进世代并记录本代的

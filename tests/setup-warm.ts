@@ -7,6 +7,15 @@
 // ⚠️ 为什么放在 setupFiles 而不是 `globalSetup`：实测 globalSetup 与 worker 是**两个进程**
 // （pid 45930 vs 51568），预热不共享。setupFiles 在本进程内、每个测试文件前执行；
 // `process` 上的标记跨模块重置存活，所以整个进程只暖一次。
+//
+// ⚠️ 关于「setup 先加载过 `store/duckdb` 会不会让测试文件里的 `vi.mock` 失效」
+// （CodeRabbit 2026-11-14 major）：**实测不会**。探针用 `vi.mock('../src/store/duckdb.js',
+// () => ({ createDuckDbStore: () => 'MOCKED' }))` 打桩后动态 import，拿到的就是 `MOCKED`
+// （vitest 按测试文件建独立模块图，mock 注册后该文件内的 import 走替身）。
+// `ci` 里唯一按模块打桩的 `store.test.ts` 走 `vi.doMock` + `vi.resetModules()`，与预热无关
+// （它自己已把「doMock 不生效」这个坑记在注释里）。若将来有人在这里加**副作用**
+// （写文件、改全局），要重新评估：预热跑在每个测试文件之前。
+
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'

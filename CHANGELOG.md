@@ -114,6 +114,14 @@
   （条件必须真的决定成败，否则「条件被当成用例名丢掉」这条错法测不出来）；
   变异：丢表格行转发 → `it.each` 两行红；别名不展开 → each 与两条条件用例红；
   去掉 `skipIf` 别名 → 整个文件 `TypeError` 红。
+  ⚠️ 别名的**两类别名形态**必须分开处理（CodeRabbit 2026-11-14 major，探针实测确认）：
+  `skip` / `only` / `fails` / `concurrent` / `todo` 是**直接登记** —— 调用即把用例登记掉、
+  返回值 `undefined`，「拿返回值再包执行体」永远包不到，执行体跑在无世代上下文里；
+  `each` / `skipIf` / `runIf` 才是柯里化修饰。按键名分两组，不按首参类型猜（实测是等价变异）。
+  另修 options-first 重载 `it(名, 选项, 体)`（同轮 major）：只认第二实参时选项对象被当成执行体。
+  守卫让这两条的**尾巴真的落地**（`it.fails` / `it.concurrent` / options-first 各留 60ms
+  尾巴，下一条断言没收到）；变异：直接别名裸登记 → 两条尾巴用例红；去掉 options-first
+  分支 → 对应用例红。
 
 - **测试进程内只付一次 DuckDB 冷启动费（`tests/setup-warm.ts` + `setupFiles`）。**
   实测：进程内**首次** `DuckDBInstance.create` 在空载时 438ms、本机高负载时 19–34s

@@ -3,7 +3,7 @@
 // 守卫 capture.ts 的「旧夹具迁移形态」（`captureSinks` + 包装过的 `it`）。
 // 事故形态与 capture.test.ts 相同，但这里走的是**现有 27 个文件**那种写法：
 // 模块级 `let out`、`beforeEach` 刷 sink，用例体不包 `run()`。
-import { describe, expect, beforeEach } from 'vitest'
+import { describe, expect, beforeEach, vi } from 'vitest'
 import { it, captureSinks } from './capture.js'
 
 let out = ''
@@ -60,5 +60,70 @@ describe('captureSinks + 包装 it', () => {
   it.todo('F：it.todo 只是占位')
   it.fails('G：it.fails 要能登记（执行体故意失败）', () => {
     expect(1).toBe(2)
+  })
+})
+
+// ⚠️ 直接登记别名的**隔离**（CodeRabbit 2026-11-14 major）：`it.fails(名, 体)` /
+// `it.concurrent(名, 体)` 这类调用把用例**立刻**登记掉、返回值是 undefined，
+// 所以「拿返回值再包执行体」永远包不到 —— 执行体跑在无世代上下文里，
+// 它发出的延迟写入会被下一条用例接住。下面每组都是「留尾巴 + 下一条验证没收到」。
+// （`it.only` 同属这一类，但它在共享文件里会让其余用例全被跳过，不适合做守卫。）
+let tail: Promise<void> = Promise.resolve()
+const tick = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+describe('直接登记别名（fails / concurrent）', () => {
+  it.fails('H：it.fails 的体留下 60ms 尾巴', async () => {
+    process.stdout.write('H')
+    tail = new Promise<void>((resolve) => { setTimeout(() => { process.stdout.write('H-TAIL'); resolve() }, 60) })
+    await tick(1)
+    throw new Error('it.fails 要求执行体抛出')
+  })
+
+  it('I：H 的尾巴不得进本条的 out', async () => {
+    await tail
+    await tick(20)
+    expect(out, 'it.fails 的执行体没套世代：尾巴漏进了本条').toBe('')
+  })
+
+  it.concurrent('J：it.concurrent 的体留下 60ms 尾巴', async () => {
+    process.stdout.write('J')
+    tail = new Promise<void>((resolve) => { setTimeout(() => { process.stdout.write('J-TAIL'); resolve() }, 60) })
+    await tick(1)
+  })
+
+  it('K：J 的尾巴不得进本条的 out', async () => {
+    await tail
+    await tick(20)
+    expect(out, 'it.concurrent 的执行体没套世代：尾巴漏进了本条').toBe('')
+  })
+})
+
+// ⚠️ options-first 重载 `it(名, 选项, 体)`（CodeRabbit 2026-11-14 major）：
+// 只认「第二实参是执行体」时，选项对象被当成执行体原样返回，真正的体没套世代。
+describe('options-first 重载', () => {
+  it('L：`it(名, 选项, 体)` 的体留下 60ms 尾巴', { timeout: 5_000 }, async () => {
+    process.stdout.write('L')
+    tail = new Promise<void>((resolve) => { setTimeout(() => { process.stdout.write('L-TAIL'); resolve() }, 60) })
+    await tick(1)
+  })
+
+  it('M：L 的尾巴不得进本条的 out', async () => {
+    await tail
+    await tick(20)
+    expect(out, 'options-first 重载的执行体没套世代：尾巴漏进了本条').toBe('')
+  })
+})
+
+// ⚠️ 预热（`tests/setup-warm.ts`）与 `vi.mock` 的共存（CodeRabbit 2026-11-14 major 的
+// 实测裁决）：setupFiles 会**先于测试文件**加载 `store/duckdb`，CR 担心这会让测试文件里的
+// `vi.mock` 失效 —— 实测不会（vitest 按测试文件建独立模块图，mock 注册后该文件内的 import
+// 走替身）。这里把实测跑成守卫：本文件 `vi.mock` 掉 duckdb。
+// ⚠️ 它**测不出**「预热是否还在」——把 `setupFiles` 摘掉后本条仍绿（已反向自检）。
+// 它测的是「即便 setup 先加载过该模块，文件级 mock 依然成立」这一半结论。
+describe('setup 预加载不破坏 vi.mock', () => {
+  vi.mock('../../src/store/duckdb.js', () => ({ createDuckDbStore: () => 'MOCKED' }))
+  it('N：文件内 vi.mock 的模块走替身（尽管 setup-warm 已真实加载过它）', async () => {
+    const m = await import('../../src/store/duckdb.js')
+    expect(m.createDuckDbStore({} as never, 'rw' as never)).toBe('MOCKED')
   })
 })
