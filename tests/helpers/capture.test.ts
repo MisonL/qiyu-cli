@@ -9,7 +9,6 @@
 //    `process.stdout.write`（CodeRabbit major），只保存旧引用测不出来。
 // ② 用户的 `afterEach(restoreAllMocks)` 摘掉 spy 后，助手若不重装，写入直接绕过缓冲。
 import { describe, it, expect, vi } from 'vitest'
-import { spawnSync } from 'node:child_process'
 import { rmSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -111,51 +110,15 @@ describe('tests/helpers/capture.ts', () => {
     })
   })
 
-  // ⚠️ 跨**文件**的尾巴（CodeRabbit 2026-11-14 major 要求核查）。实测结论：在 vitest 2.1.9
-  // 默认 isolation 下**不可达** —— 每个测试文件一个独立环境，模块重载、`globalThis` 不共享，
-  // 文件 A 留的定时器在 A 结束时随环境消失，根本不会在 B 里触发（探针：B 里取不到 A 写的
-  // globalThis，A 的尾巴回调也没执行）。所以这里**构造不出**那条事故；本条守卫改成
-  // **配置漂移探针**：若哪天有人开了 `isolate: false` / 单环境，跨文件残留就变成可达 ——
-  // 届时 A 留的尾巴必须被丢弃（不能进 B 的 `out`）。现在的实现是因为「A 的环境整体销毁」
-  // 而通过，不是因为世代判据；这条注释如实记录这一点。
-  it('跨文件：开 isolation 时 A 的尾巴不得进 B 的 out（配置漂移探针）', () => {
-    const rootDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
-    const helper = join(rootDir, 'tests', 'helpers', 'capture.js')
-    const a = join(rootDir, 'tests', `__crossfile-a-${process.pid}.test.ts`)
-    const b = join(rootDir, 'tests', `__crossfile-b-${process.pid}.test.ts`)
-    try {
-      writeFileSync(a, [
-        "import { beforeEach } from 'vitest'",
-        "import { it, captureSinks } from " + JSON.stringify(helper),
-        "beforeEach(() => { captureSinks(() => {}, () => {}) })",
-        "it('A', async () => {",
-        "  ;(globalThis as Record<string, unknown>).__tail = new Promise<void>((resolve) => {",
-        "    setTimeout(() => { process.stdout.write('CROSS-FILE-TAIL'); resolve() }, 400)",
-        '  })',
-        '})',
-      ].join('\n'))
-      writeFileSync(b, [
-        "import { expect, beforeEach } from 'vitest'",
-        "import { it, captureSinks } from " + JSON.stringify(helper),
-        "let out = ''",
-        "let writes = 0",
-        "beforeEach(() => { out = ''; writes = 0; captureSinks((s) => { out += s; writes++ }, () => {}) })",
-        "it('B', async () => {",
-        "  process.stdout.write('B')",
-        '  const tail = (globalThis as Record<string, unknown>).__tail as Promise<void> | undefined',
-        '  if (tail) await tail',
-        '  await new Promise((r) => setTimeout(r, 50))',
-        "  expect(out, '跨文件的尾巴漏进了下一个文件').toBe('B')",
-        "  expect(writes, 'B 只应有自己那一次写入').toBe(1)",
-        '})',
-      ].join('\n'))
-      const r = spawnSync(process.execPath, [
-        join(rootDir, 'node_modules', 'vitest', 'vitest.mjs'), 'run', a, b, '--maxWorkers=1', '--no-file-parallelism',
-      ], { cwd: rootDir, encoding: 'utf8', timeout: 90_000, killSignal: 'SIGKILL' })
-      expect(r.status, `子 vitest 应通过\n${r.stdout}\n${r.stderr}`).toBe(0)
-      expect(`${r.stdout}${r.stderr}`).toMatch(/2 passed/)
-    } finally {
-      for (const f of [a, b]) rmSync(f, { force: true })
-    }
-  }, 120_000)
+  // ⚠️ **跨文件**这条没有守卫 —— 不是没查，是查了、**结构上不可达**（CodeRabbit 2026-11-14
+  // major 要求核查）。实测证据（2026-11-14）：
+  //   ① 每个测试文件一个独立环境：文件 A 写在 `globalThis` 上的东西，文件 B 里读不到；
+  //      同一个 helper 模块在两个文件里各加载一次（函数对象身份不同）。
+  //   ② 执行顺序可以强制（临时 config + 升序 sequencer 已验证 A → B），但即便顺序对了，
+  //      B 也拿不到 A 留下的那个 Promise —— 因为 `globalThis` 不共享。
+  //   ③ 文件 A 结束时它的定时器随环境销毁，不会在 B 里触发。
+  // 所以「上一条用例的尾巴漏进下一个文件」在这个配置下没有到达路径，写一条跨文件守卫只能是
+  // 假绿（我写过一个，先是通过，后来把「B 必须拿到 A 的尾巴」这一条钉上后立刻红 —— 那正是
+  // ②的证据）。真正的跨用例隔离见上面几条守卫（同文件内、尾巴真的落地）。
+  // 若将来有人改 vitest 配置成单环境（`isolate: false`），这条边界要重新评估。
 })

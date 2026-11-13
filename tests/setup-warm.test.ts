@@ -57,7 +57,7 @@ describe('setup-warm：预热失败只降级、不拖垮测试', () => {
   it('预热抛错时，不碰数据库的测试文件仍然通过', () => {
     const warmSrc = readFileSync(join(root, 'tests', 'setup-warm.ts'), 'utf8')
     expect(warmSrc, '注入变量名两边必须一致').toContain(INJECT_ENV)
-    const { status, all } = runChild({ ...process.env, [INJECT_ENV]: 'new Error("注入：模拟原生 binding 缺失")' })
+    const { status, all } = runChild({ ...process.env, [INJECT_ENV]: 'throw' })
     // 先断「真正的后果」：预热抛错时子 vitest 必须仍然通过。再断「不静默」。
     expect(status, `预热失败拖垮了测试收集\n${all.slice(-2000)}`).toBe(0)
     expect(all, '预热失败应被报出来（不静默）').toContain('[setup-warm] DuckDB 预热跳过')
@@ -95,8 +95,8 @@ describe('setup-warm：预热失败只降级、不拖垮测试', () => {
   it('预热卡住时按预算降级，不无限等待', async () => {
     try {
       vi.stubEnv('QIYU_WARM_TIMEOUT_MS', '100')
-      // 注入**永不 resolve** 的一步（`await` 到它为止；`throw` 的是错误，不是卡住）。
-      vi.stubEnv(INJECT_ENV, 'new Promise(() => {})')
+      // 注入「永不 resolve」的模式（`hang`）；`throw` 是立即抛错，测不到预算。
+      vi.stubEnv(INJECT_ENV, 'hang')
       const outcome = await warmDuckDb({ ifWarmed: () => false })
       expect(outcome.ok).toBe(false)
       expect(String(errOf(outcome))).toMatch(/预热超过 100ms/)

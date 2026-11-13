@@ -65,13 +65,13 @@ export async function warmDuckDb(opts: { ifWarmed?: () => boolean } = {}): Promi
     dir = mkdtempSync(join(tmpdir(), 'qiyu-warm-'))
     const warmDir = dir
     pending = (async (): Promise<void> => {
-      // 探针缝：`tests/setup-warm.test.ts` 经环境变量注入「抛错 / 永不 resolve 的一步」。
+      // 探针缝：`tests/setup-warm.test.ts` 经环境变量选一个**固定模式**（Codex 2026-11-14 P2：
+      // 曾经用 `new Function(环境变量里的代码)` —— 那等于给了该环境变量在测试收集前以当前进程
+      // 权限执行任意 JS 的能力，一个被继承/误设的变量就能作恶）。现在只认两个字面量。
       // 注入点必须在**受超时保护的这一段里** —— 放在 race 之外就绕过了预算。
-      if (process.env.QIYU_WARM_FAIL_INJECT) {
-        const injected = new Function(`return (${process.env.QIYU_WARM_FAIL_INJECT})`)() as unknown
-        if (injected instanceof Error) throw injected
-        await injected
-      }
+      const inject = process.env.QIYU_WARM_FAIL_INJECT
+      if (inject === 'throw') throw new Error('注入：模拟原生 binding 缺失')
+      if (inject === 'hang') await new Promise<never>(() => {})
       const { createDuckDbStore } = await import('../src/store/duckdb.js')
       const s = await createDuckDbStore(
         { backend: 'duckdb', path: join(warmDir, 'warm.db'), readOnlyRetryMs: 30_000, batchSize: 1000 }, 'rw')
