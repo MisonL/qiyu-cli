@@ -19,7 +19,8 @@
 //   ① 行为层（真 fs 造前置状态）：同一成因在**所有**读命令上给出逐字相同的说法，
 //      且非普通文件的说法与 `stat` 的真实结果一致（目录 ≠ FIFO）；
 //   ② 漂移层（源码文本）：前置检查的文案不得再散在别处，附双向自检。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
@@ -45,8 +46,7 @@ let out = ''
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-precheck-'))
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  captureSinks((s) => { out += s }, () => {})
   vi.stubEnv('HOME', dir)
   vi.stubEnv('USERPROFILE', dir)
 })

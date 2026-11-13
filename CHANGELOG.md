@@ -90,8 +90,119 @@
   （CodeRabbit 2026-11-13 major）：不调的话等待写入完成的用例只能超时。变异验证：
   去掉回调 → 用例超时变红。
   实测记录：vitest 2.1.9 默认 `restoreMocks:false`，跨用例不会自动恢复 spy。
-  ⚠️ **尚未迁移**：现有 27 个文件的模块级捕获仍在用，本助手目前只有自己的守卫在用。
-  迁移要点与逐文件风险见 `HANDOFF.md` §审计②；不要把它读成「测试隔离已全面修好」。
+
+- **27 个测试文件迁移到 `captureSinks()`，模块级 `let out` 不再自己装 spy**。
+  每个文件只改三行：`it` 从 `vitest` 改为从 `./helpers/capture.js` 导入（包装版给每条用例
+  打上**世代号**）、`describe/it/expect` 其余照旧、`beforeEach` 里的两行
+  `vi.spyOn(process.stdout/stderr, 'write')` 换成一行 `captureSinks(…)`。归属按
+  `AsyncLocalStorage` 记录的**世代号**判：上一条用例的延迟尾巴属于旧世代，**一律丢弃**，
+  不会进下一条的 `out`。两个入口（`captureSinks()` 世代形态 / `startCapture()` 句柄形态）
+  共用同一份 spy 安装，避免两套实现各自漂移。
+  ⚠️ 边界：迁移形态的 sink 写的是**模块级** `out`，`it.concurrent` 的两条用例本就在写同一个
+  变量，任何归属都无法隔离它们；hook（`beforeEach`/`afterEach`）里的延迟写入也没有世代。
+  要并发隔离就用句柄形态（`startCapture()` + `cap.run()`）。
+  ⚠️ 迁移中实测到的坑：**不能**用「`process.stdout.write === activeSpy` 就跳过重装」做幂等 —
+  `vi.restoreAllMocks()` 还原到的是**上一层 spy**（正是本助手自己装的那个），身份判据成立
+  但写入落在旧闭包的 `sinks` 里，`out` 恒空（`cli.test.ts` 当场 11 条失败）。现在每次
+  `captureSinks()` 无条件重装。
+  变异验证三处：「世代判据恒真」→ 尾巴用例红（`expected 'BTAIL' to be 'B'`）；
+  「不调 write 完成回调」→ 回调用例超时红；「加回身份判据」→ `cli.test.ts` 11 条红。
+  ⚠️ 包装版 `it` 必须把 vitest 的别名形态全部挂上（`each` / `skip` / `skipIf` / `runIf` /
+  `only` / `todo` / `concurrent` / `fails`）：它们是登记函数的**属性**，裸箭头函数上没有。
+  首轮迁移漏了这一层，全量报两个「失败文件」，真实情况是 `config-insecure.test.ts`（`it.each`）
+  与 `auth.test.ts`（`it.skipIf`）在**收集阶段**就 `TypeError`、一条用例都没跑 ——
+  「失败文件数」在小全量里读不出严重性。别名实现只有一个实现点，两种形态共用：
+  直接登记（`it.skip(名, 体)`）与柯里化修饰（`it.each(表格)(名, 体)`）。
+  守卫用 `it.each` / `it.runIf(false)` / `it.skipIf(true)` / `it.todo` / `it.fails` 各跑一次
+  （条件必须真的决定成败，否则「条件被当成用例名丢掉」这条错法测不出来）；
+  变异：丢表格行转发 → `it.each` 两行红；别名不展开 → each 与两条条件用例红；
+  去掉 `skipIf` 别名 → 整个文件 `TypeError` 红。
+  ⚠️ 别名的**两类别名形态**必须分开处理（CodeRabbit 2026-11-14 major，探针实测确认）：
+  `skip` / `only` / `fails` / `concurrent` / `todo` 是**直接登记** —— 调用即把用例登记掉、
+  返回值 `undefined`，「拿返回值再包执行体」永远包不到，执行体跑在无世代上下文里；
+  `each` / `skipIf` / `runIf` 才是柯里化修饰。按键名分两组，不按首参类型猜（实测是等价变异）。
+  另修 options-first 重载 `it(名, 选项, 体)`（同轮 major）：只认第二实参时选项对象被当成执行体。
+  守卫让这两条的**尾巴真的落地**（`it.fails` / `it.concurrent` / options-first 各留 60ms
+  尾巴，下一条断言没收到）；变异：直接别名裸登记 → 两条尾巴用例红；去掉 options-first
+  分支 → 对应用例红。
+
+- **捕获助手第二轮审查的两条收口**（CodeRabbit 2026-11-14）：① `it(名, undefined, 体)`
+  也是 options-first 重载，选项位置为 `undefined` 时不能被当成「第二实参不是对象」拒绝；
+  ② 陈旧世代的写入在**句柄形态**下曾照样追加进最新句柄的 `fallback`，污染 `cap.out` /
+  `cap.writes` —— 现在 `cap.run()` 的显式归属优先，没有归属时才过世代判据。
+  两条都有尾巴落地的守卫，变异（不认 `undefined` / fallback 不过判据）各自变红。
+
+- **`tests/setup-warm.ts` 的预热失败只降级、不拖垮测试**（Codex 2026-11-14 P2）。
+  `@duckdb/node-api` 是 `optionalDependencies`，缺原生 binding 时 `setupFiles` 里的顶层
+  await 会抛 —— 那会让**所有**测试文件连收集都进不去，包括不碰数据库的、以及「缺依赖时
+  给安装指引」的那几条。现在预热失败只往 stderr 打一行降级说明，测试回到「谁先用谁付
+  冷启动」（慢一点，不是错）。
+  守卫**真跑一个子 vitest**（`NODE_OPTIONS=--import` 注入一个让预热抛错的全局量），
+  断言不碰数据库的用例仍然通过；变异（catch 里重抛）→ 子 vitest 失败、守卫红。
+  ⚠️ 子用例文件必须落在仓库 `tests/` 下：放在 /tmp 会因 `include` 过滤报
+  「No test files found」，退出码同为 1，看着像守卫通过。
+  子 vitest 用 `spawnSync` 的 `timeout` + `SIGKILL` 兜时间（同步等待打不断用例超时，
+  CodeRabbit 2026-11-14 major），失败诊断里带 `r.error`。
+  预热体抽成可导出的 `warmDuckDb()`，**临时目录创建也在降级范围里**（同轮 major：
+  `mkdtempSync` 失败原来绕过 catch）。这条单测直接调预热体 —— 走子 vitest 分不清是预热
+  还是 vitest 自身起不来（`TMPDIR` 指向文件时 vitest 在收集阶段就死）。变异：把
+  `mkdtempSync` 移出 try → 该用例红。
+  预热**有界**（Sourcery 2026-11-14）：setupFiles 在收集之前执行，原生绑定卡住时用例自身的
+  超时都还没生效 —— 整个 worker 挂死。现在 `Promise.race` 一个 `QIYU_WARM_TIMEOUT_MS`
+  （默认 120s）预算，超时按降级处理。⚠️ 这个定时器**不能** `unref()`：卡住的那一步若没有
+  别的 handle，事件循环里只剩它，unref 后直接「无活可做」退出，race 既不 resolve 也不
+  reject（实测：注入永不 resolve 的 await 后用例直接 60s 超时）。
+  预热体不再自己写 stderr，失败作为返回值交给 setup 入口（本文件被 setupFiles 加载时
+  `warmDuckDb` 的导入会先跑一遍预热，自己写 stderr 会让每次跑测试都多一行告警）。
+  `init()` 失败也会关库（不把文件句柄带进后续测试文件）；清理目录同样 best-effort。
+  ⚠️ Windows 上 Node 的 `os.tmpdir()` 读 `TEMP`/`TMP` 而不是 `TMPDIR`，守卫三个一起设。
+
+- **包装版 `it` 补上 vitest 的 `sequential` 与 `for`**（CodeRabbit 2026-11-14 major）。
+  不装的话调用点在**收集阶段** `TypeError`、整文件 0 条；而 `for` 与 `each` 同类（柯里化，
+  返回登记函数）—— 当成直接登记会丢表格行，执行体拿到上一层的函数、报
+  `function is not iterable`（实测）。
+  ⚠️ `it.extend` **刻意不装**：vitest 会解析执行体的源码文本校验 fixture 写法，而包装恰好
+  把执行体换成 `(...a) => f(...a)`，报 `The first argument inside a fixture must use object
+  destructuring pattern … Instead, received "..a"`。在包装下它用不了，不装反而给出更清楚的
+  `it.extend is not a function`。
+
+- **预热失败的注入改成固定模式**（Codex 2026-11-14 P2）：探针缝原先用
+  `new Function(环境变量里的代码)` —— 等于把「测试收集前以当前进程权限执行任意 JS」的能力
+  交给一个环境变量。现在只认 `throw` / `hang` 两个字面量。
+
+- **捕获助手的跨文件归属**（CodeRabbit 2026-11-14 major）：实测在 vitest 2.1.9 默认 isolation
+  下**不可达** —— 每个测试文件一个独立环境：`globalThis` 不共享（A 写的东西 B 读不到）、模块
+  重载、A 留的定时器随环境销毁。曾试着把世代状态挂到 `globalThis` 上共享，实测**跨不过去**，
+  已回退。⚠️ 这条**没有守卫**：执行顺序可以强制（临时 config + 升序 sequencer 已验证 A → B），
+  但即便顺序对了 B 也拿不到 A 的 Promise，「跨文件尾巴」构造不出来 —— 写守卫只能是假绿
+  （试过一条，钉上「B 必须拿到 A 的尾巴」后立刻红）。若将来改成单环境（`isolate: false`，
+  那也正是让预热能跨文件共享的配置），这条要重新评估。
+
+- **预热的超时边界如实收窄**（CodeRabbit 2026-11-14 major）：`Promise.race` 的预算只管
+  「一直不返回的 await」。原生绑定若**同步**卡住 JS 线程，同线程的定时器根本排不上队
+  （实测 400ms 忙等让 100ms 定时器一次没触发），进程内任何超时都拦不住 —— vitest 自己的
+  `testTimeout` 同样拦不住。把预热挪进子进程试过，**没有收益**（子进程暖的是它自己进程的原生
+  模块，worker 仍要自己加载；且 Node 自带 strip-types 解析不了源码里的 `.js` 说明符，要额外
+  引入 tsx 依赖），已回退并把这条边界写进文件头，**不放假守卫**。
+
+- **测试进程内只付一次 DuckDB 冷启动费（`tests/setup-warm.ts` + `setupFiles`）。**
+  实测：进程内**首次** `DuckDBInstance.create` 在空载时 438ms、本机高负载时 19–34s
+  （原生扩展加载 + 首次 mmap），之后同路径重开约 22ms。原先每个真库测试文件的首条用例
+  都要承担这段，`hookTimeout`/`testTimeout` 在这台机器上会直接超时。
+  现在 `setupFiles` 在**每个 worker 进程**开跑前建一个临时库、`init()`、关掉，用
+  `process` 级布尔量保证只做一次（`setupFiles` 在被测模块之前执行，且 worker 进程内跨
+  测试文件共享）。`globalSetup` 不行 —— 实测是**另一个进程**（探测 pid 45930 vs 51568），
+  预热的 native module 到不了 worker。子进程预热与模板库拷贝两条路也实测无效，理由见
+  `HANDOFF.md` §审计③。
+  收益：`tests/commands/db.test.ts` 从「首条用例常超时」变为稳定通过（A/B 各 2 轮：
+  改前 2/2 有首条超时失败，改后 2/2 全绿）；全量 2576 条在 load 511 下全绿。
+
+- **`tests/commands/db.test.ts` 全文件共用一个库路径，逐条 `resetDb()` 复置。**
+  同一文件里原先每条用例各建一个新路径的库（新路径 = 110ms 创建 + 75ms `init`，且绕不过
+  首次冷启动），现改为 `beforeAll` 建一次目录、每条用例开头 `DROP TABLE` 全部业务表再
+  `init()`。**只在真的用库的 18 条用例里调 `resetDb()`，不是 `beforeEach` 全量** ——
+  实测放 `beforeEach` 反而更慢（10.3s → 13.5s）。`hookTimeout` 提到 60s（首次 `beforeAll`
+  仍可能撞上冷启动）；两条互不相干的用例原先共用 `alien.db` 会串，改为各自独立路径。
 
 - **钉住「上一条用例的 ticking 时钟不得泄漏」的清理契约**（CodeRabbit 2026-11-12 第三轮 major）：
   新增回归用例会让 `Date.now` 每读一次 +1ms，若清理失效，后续用例会拿到停在 2026-11-11 的

@@ -11,7 +11,8 @@
 //   · `api schema` 的 data 是**对象** → 图例键是路径（`params[].auto` 这类）；
 //   · `api list` 的 data 是**根数组** → 图例键只能是行字段名（没有可写的顶层路径），
 //     且 `max_window_days` 这类字段只在部分行上存在（未登记上限的行不输出该键）。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,8 +27,7 @@ let out = ''
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-apilegend-'))
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  captureSinks((s) => { out += s }, () => {})
   vi.stubEnv('HOME', dir) // 隔离真实 ~
   vi.stubEnv('USERPROFILE', dir)
 })

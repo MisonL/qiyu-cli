@@ -1,5 +1,6 @@
 // tests/core/errors.test.ts
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, vi, beforeEach, afterEach } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { classify, redactInternal, ERROR_KINDS, type ErrorKind } from '../../src/core/errors.js'
 import { fail } from '../../src/output.js'
 
@@ -7,7 +8,7 @@ import { fail } from '../../src/output.js'
 let out = ''
 beforeEach(() => {
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
+  captureSinks((s) => { out += s }, () => {})
 })
 afterEach(() => { vi.restoreAllMocks() })
 

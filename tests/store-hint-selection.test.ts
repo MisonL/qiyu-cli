@@ -14,7 +14,8 @@
 //      空库/缺库两类端到端验证「照 hint 做 → 原命令收敛、默认库不被创建」；
 //   ② 漂移层（源码文本）：恢复命令 hint 不得再以裸命令出现（必须经共享渲染），
 //      附自检（事故原文必须红、修复后的拼接形态必须放过）。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname, relative } from 'node:path'
@@ -45,8 +46,7 @@ const defaultDbPath = (): string => join(dir, '.qiyu', 'duckdb', 'qiyu.duckdb')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-hint-'))
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  captureSinks((s) => { out += s }, () => {})
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（配置文件与默认库路径都走 HOME）
   vi.stubEnv('USERPROFILE', dir)
 })

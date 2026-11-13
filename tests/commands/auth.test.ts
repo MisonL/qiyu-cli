@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, vi, beforeEach, afterEach } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, readFileSync, statSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -39,8 +40,7 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'qiyu-auth-'))
   vi.stubEnv('HOME', home)
   vi.stubEnv('USERPROFILE', home)
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
 })
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs()

@@ -18,7 +18,8 @@
 // ⚠️ 自明清单是**契约**不是垃圾桶：每加一个词就少一分把关（同 skill-field-notes 的注释）。
 // 清单只放「字段名即含义、且值不是需要分支的机器枚举」的键。放进去之前问：Agent 会不会
 // 误读它？会 → 补释义，别进清单。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -43,8 +44,7 @@ const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-revlegend-'))
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  captureSinks((s) => { out += s }, () => {})
   vi.stubEnv('HOME', dir) // 隔离真实 ~
   vi.stubEnv('USERPROFILE', dir)
   // sync verify / sync run 的入口要求凭证存在（不看有效性）。存根值只为通过前置检查。

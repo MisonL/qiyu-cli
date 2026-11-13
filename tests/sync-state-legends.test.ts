@@ -11,7 +11,8 @@
 //
 // 本文件把**源码枚举**、**生产渲染路径**与 **README 图例**三方锁住，并把两条「字面与
 // 事实相反」的断言钉在**真跑出来的输出**上 —— 光读代码看不出引擎在失败窗之后还写 complete。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from './helpers/capture.js'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -43,7 +44,7 @@ beforeEach(() => {
   db = join(dir, 'q.db')
   cfg = { backend: 'duckdb', path: db, readOnlyRetryMs: 500, batchSize: 1000 }
   out = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
+  captureSinks((s) => { out += s }, () => {})
   vi.stubEnv('HOME', dir) // 隔离真实 ~（store 配置解析在 --db 之外仍会读它）
   vi.stubEnv('USERPROFILE', dir) // Windows 的 os.homedir() 读它
 })

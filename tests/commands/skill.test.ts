@@ -10,7 +10,8 @@
 // 但没列进 14 条的行为：where 的逐 agent 兜异常（ELOOP / ENOTDIR）、check 模式互斥、
 // install 成功后清除安装前探测提示（Task 10 审查疑虑 2 的交接）。
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, vi, beforeEach, afterEach } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import {
   chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
   rmSync, symlinkSync, writeFileSync,
@@ -35,8 +36,7 @@ beforeEach(() => {
   // macOS 上 `/var` 指向 `/private/var`：realpath 归一化后路径字符串才稳定可比。
   home = realpathSync(mkdtempSync(join(tmpdir(), 'qiyu-skillcmd-')))
   entity = join(home, 'entity')
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
   // D1：命令层的 home 走 QIYU_HOME_FOR_TEST（不 stub HOME/USERPROFILE——那正是要消灭的
   // 平台依赖）。启动探测（cli.run）仍读 process.env 的 NODE_ENV 做测试门，照旧 stub。
   vi.stubEnv(HOME_FOR_TEST_ENV, home)

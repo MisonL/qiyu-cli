@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, vi, beforeEach, afterEach } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { COMMAND_TREE } from '../../src/commands/tree.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES } from '../../src/commands/spec-types.js'
 import { authCommand } from '../../src/commands/auth.js'
@@ -30,8 +31,7 @@ let out = ''
 let err = ''
 beforeEach(() => {
   out = ''; err = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
 })
 afterEach(() => { vi.restoreAllMocks() })
 

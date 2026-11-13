@@ -3,7 +3,8 @@
 // spy stdout/stderr 双通道。
 // ⚠️ fixtures 全合成：payload 只含聚合用字段（数值/全 -1/JSON null/非数值/缺键/空对象/
 // NULL），不含任何 PII；本命令也不输出逐行数据。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,8 +24,7 @@ const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-stats-'))
   out = ''; err = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（配置文件与默认库路径都走 HOME）
   vi.stubEnv('USERPROFILE', dir)
 })

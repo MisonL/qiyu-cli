@@ -34,5 +34,7 @@ export default defineConfig({
     // 与 vitest 默认值相同，显式写出 —— 见上方注释。
     testTimeout: 5_000,
     hookTimeout: 10_000,
+    // ⚠️ 进程级 DuckDB 预热（每个 worker 只付一次冷启动），原因见该文件头。
+    setupFiles: ['tests/setup-warm.ts'],
   },
 })

@@ -3,7 +3,8 @@
 // 夹具沿 tests/commands/db.test.ts：mkdtemp + stubEnv('HOME') + 真 DuckDB 临时库 +
 // spy stdout/stderr 双通道。
 // ⚠️ fixtures 全合成：13800001111 是明显的测试号码，不使用任何真实企业数据。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
+import { it, captureSinks } from '../helpers/capture.js'
 import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,8 +27,7 @@ const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-query-'))
   out = ''; err = ''
-  vi.spyOn(process.stdout, 'write').mockImplementation((s) => { out += s; return true })
-  vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err += s; return true })
+  captureSinks((s) => { out += s }, (s) => { err += s })
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（配置文件与默认库路径都走 HOME）
   vi.stubEnv('USERPROFILE', dir)
 })
