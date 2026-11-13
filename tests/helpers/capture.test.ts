@@ -86,6 +86,19 @@ describe('tests/helpers/capture.ts', () => {
     expect(captureInstalled(), '恢复后必须认为已卸载').toBe(false)
   })
 
+  it('回调式写入必须被回调掉（Node stream 契约；否则等待它的用例只能超时）', async () => {
+    const cap = startCapture()
+    await cap.run(async () => {
+      await new Promise<void>((resolve) => { process.stdout.write('X', () => resolve()) })
+      // Node 运行时支持三参数形态，但 @types/node 的 stdout 重载没列出它 ——
+      // 按 unknown 调用以覆盖这条运行路径。
+      await new Promise<void>((resolve) => { (process.stdout.write as unknown as (c: string, e: string, cb: () => void) => boolean)('Y', 'utf8', resolve) })
+      await new Promise<void>((resolve) => { process.stderr.write('E', () => resolve()) })
+      expect(cap.out).toBe('XY')
+      expect(cap.err).toBe('E')
+    })
+  })
+
   it('本条自己的 stderr 照常入账', async () => {
     const cap = startCapture()
     await cap.run(async () => {

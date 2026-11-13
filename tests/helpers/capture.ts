@@ -62,15 +62,25 @@ const als = new AsyncLocalStorage<Buf>()
  */
 function install(): void {
   if (process.stdout.write === activeSpy) return
-  activeSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
-    const b = als.getStore() ?? fallback
-    if (b) { b.writes += 1; b.out += String(chunk) }
+  // ⚠️ `write()` 的第三个参数可能是回调（`write(chunk, cb)` 或 `write(chunk, enc, cb)`，
+  // Node 的 stream 契约是处理完 chunk 后调用它）。替身**必须**把它调掉（CodeRabbit
+  // 2026-11-13 major）：否则 `cap.run(() => new Promise(r => process.stdout.write('X', r)))`
+  // 永不 settle、那条用例只能超时失败。本仓库当前**没有**任何代码用回调式写入（已 grep），
+  // 但助手是公共夹具，照着 Node 的契约实现比赌没人用更省事。
+  const done = (args: unknown[]): boolean => {
+    const cb = args.find((a) => typeof a === 'function') as (() => void) | undefined
+    if (cb) cb()
     return true
+  }
+  activeSpy = vi.spyOn(process.stdout, 'write').mockImplementation((...args: unknown[]) => {
+    const b = als.getStore() ?? fallback
+    if (b) { b.writes += 1; b.out += String(args[0]) }
+    return done(args)
   })
-  vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+  vi.spyOn(process.stderr, 'write').mockImplementation((...args: unknown[]) => {
     const b = als.getStore() ?? fallback
-    if (b) { b.err += String(chunk) }
-    return true
+    if (b) { b.err += String(args[0]) }
+    return done(args)
   })
 }
 
