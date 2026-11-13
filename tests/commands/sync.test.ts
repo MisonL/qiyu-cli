@@ -698,6 +698,18 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
       }
     })
 
+  it('上一条用例的 ticking 时钟不得泄漏（本文件 afterEach 的 restoreAllMocks 负责恢复 spy）',
+    () => {
+      // CodeRabbit 2026-11-12（第三轮 major）质疑：`vi.unstubAllGlobals()` 不恢复 spy，
+      // 若没有别处恢复，上一条的 `Date.now` 会停在 2026-11-11 并每次 +1ms —— 后续用例
+      // 得到的是假时钟，失败会变成顺序相关。本文件 `afterEach` 里确有
+      // `vi.restoreAllMocks()`，本条把这个**清理契约**钉住：删掉那句，本条必红。
+      // 判据取「明显远离上一条用例的 tick 原点」：真实时间距今以天计，差值远大于 1 小时。
+      const tickOrigin = Date.UTC(2026, 10, 11, 13, 13, 0)
+      expect(Math.abs(Date.now() - tickOrigin),
+        'Date.now 仍停在上一条用例的假时钟上 —— afterEach 的 restoreAllMocks 没了？').toBeGreaterThan(3_600_000)
+    })
+
   it('知识库任务排序：items 先于 categories（items 为空时 categories 不会先跑报任务序错误）', async () => {
     const order: string[] = []
     const fetchMock = vi.fn().mockImplementation((url: unknown) => {
