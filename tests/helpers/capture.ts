@@ -225,6 +225,12 @@ function installShared(): void {
  * 按缓冲归属，与世代无关）。
  * 反过来，若把判据改成「按用例身份取它自己的 sink」，A 的尾巴就会追加进 **B 正在写的
  * 那个 `out`** —— 比丢弃更糟（守卫 B/I/K/M 会红，实测过）。
+ *
+ * ⚠️ 另一个边界：**hook 里的延迟写入没有世代**（`beforeEach`/`afterEach` 不在执行体的
+ * `alsGen.run` 里）。这类写入按「无上下文 = 当前世代」被接收 —— 实测 A 的 hook 里 80ms 后
+ * 落地的尾巴进了 B 的 `out`，而本条守卫选不出来（见 capture-sinks 文件头）。判断标准本身
+ * 就是「写入时刻谁在跑」，与「谁发起的」无关；要覆盖它只能给 hook 也套世代（要改 27 个
+ * 文件的 hook，超出本次范围）。本仓库现有用例的 hook 里没有延迟输出（已逐文件 grep）。
  */
 function writerIsCurrent(): boolean {
   const g = alsGen.getStore()

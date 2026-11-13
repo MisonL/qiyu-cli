@@ -8,6 +8,12 @@
 // （pid 45930 vs 51568），预热不共享。setupFiles 在本进程内、每个测试文件前执行；
 // `process` 上的标记跨模块重置存活，所以整个进程只暖一次。
 //
+// ✅ 「每个 worker 只暖一次」已实测（CodeRabbit 2026-11-14 major）：给预热加一行 stderr 探针，
+// `vitest run output/cli/errors/store-errors --maxWorkers=1` 下**四个文件只出现一次**探针；
+// vitest 2.1.9 从不启用 isolation 的单 worker 进程里复用同一 worker，setupFiles 在每个文件
+// 前重跑但被标记挡住。另外出现的第二个 pid 是 vitest 自己带特殊参数（`--config` 探测等）
+// 起的子跑，不跑测试文件。
+//
 // ⚠️ 关于「setup 先加载过 `store/duckdb` 会不会让测试文件里的 `vi.mock` 失效」
 // （CodeRabbit 2026-11-14 major）：**实测不会**。探针用 `vi.mock('../src/store/duckdb.js',
 // () => ({ createDuckDbStore: () => 'MOCKED' }))` 打桩后动态 import，拿到的就是 `MOCKED`
@@ -23,9 +29,18 @@ import { join } from 'node:path'
 const FLAG = '__qiyu_duckdb_warmed__'
 type Marked = typeof process & { [FLAG]?: true }
 
-if (!(process as Marked)[FLAG]) {
-  const dir = mkdtempSync(join(tmpdir(), 'qiyu-warm-'))
+/**
+ * 预热体：建临时库、`init()`、关掉。**所有**失败（含临时目录建不出来）都在这里被吞掉并
+ * 报到 stderr —— 导出只为可测（`tests/setup-warm.test.ts` 直接调它，不必端到端构造
+ * 「vitest 自己都起不来」的场景）。
+ */
+export async function warmDuckDb(): Promise<void> {
+  // ⚠️ 整个预热（**含临时目录创建**）都在 try 里：`mkdtempSync` 也会失败（`TMPDIR` 指向
+  // 一个文件等），放在 try 外就绕过了下面的降级（CodeRabbit 2026-11-14 major）。
+  // 清理只在目录真的建出来之后做。
+  let dir: string | undefined
   try {
+    dir = mkdtempSync(join(tmpdir(), 'qiyu-warm-'))
     // 探针缝：`tests/setup-warm.test.ts` 在**子进程**里设这个环境变量，用来验证
     // 「预热抛错不影响测试」。子进程与父进程不共享 `process`，所以经环境变量传代码串。
     if (process.env.QIYU_WARM_FAIL_INJECT) throw new Function(`return (${process.env.QIYU_WARM_FAIL_INJECT})`)()
@@ -43,7 +58,11 @@ if (!(process as Marked)[FLAG]) {
     const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
     process.stderr.write(`[setup-warm] DuckDB 预热跳过（不影响测试正确性，仅慢一点）：${msg}\n`)
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    if (dir !== undefined) rmSync(dir, { recursive: true, force: true })
   }
+}
+
+if (!(process as Marked)[FLAG]) {
+  await warmDuckDb()
   ;(process as Marked)[FLAG] = true
 }

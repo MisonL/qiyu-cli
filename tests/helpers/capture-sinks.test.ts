@@ -3,6 +3,12 @@
 // 守卫 capture.ts 的「旧夹具迁移形态」（`captureSinks` + 包装过的 `it`）。
 // 事故形态与 capture.test.ts 相同，但这里走的是**现有 27 个文件**那种写法：
 // 模块级 `let out`、`beforeEach` 刷 sink，用例体不包 `run()`。
+//
+// ⚠️ 已知边界（CodeRabbit 2026-11-14 major 的实测裁决）：**hook 里的延迟写入没有世代**
+// （`beforeEach`/`afterEach` 不在执行体的 `alsGen.run` 里），会被当成「当前世代」接收 ——
+// 实测 A 的 `beforeEach` 里 80ms 后落地的尾巴进了 B 的 `out`。本文件的守卫**选不出来**
+// （加一条也是绿），所以没有假装有守卫；要覆盖它得给 27 个文件的 hook 也套世代，超出范围。
+// 已逐文件 grep：现有用例的 hook 里没有延迟输出。
 import { describe, expect, beforeEach, vi } from 'vitest'
 import { it, captureSinks, startCapture } from './capture.js'
 

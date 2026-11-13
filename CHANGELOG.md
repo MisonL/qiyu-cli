@@ -140,6 +140,10 @@
   「No test files found」，退出码同为 1，看着像守卫通过。
   子 vitest 用 `spawnSync` 的 `timeout` + `SIGKILL` 兜时间（同步等待打不断用例超时，
   CodeRabbit 2026-11-14 major），失败诊断里带 `r.error`。
+  预热体抽成可导出的 `warmDuckDb()`，**临时目录创建也在降级范围里**（同轮 major：
+  `mkdtempSync` 失败原来绕过 catch）。这条单测直接调预热体 —— 走子 vitest 分不清是预热
+  还是 vitest 自身起不来（`TMPDIR` 指向文件时 vitest 在收集阶段就死）。变异：把
+  `mkdtempSync` 移出 try → 该用例红。
 
 - **测试进程内只付一次 DuckDB 冷启动费（`tests/setup-warm.ts` + `setupFiles`）。**
   实测：进程内**首次** `DuckDBInstance.create` 在空载时 438ms、本机高负载时 19–34s
