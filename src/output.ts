@@ -39,7 +39,7 @@ export interface ErrorInput {
    * 错误分支却沉默，而图例明说「错误分类也只有文档依据」，自相矛盾）。
    * 其余命令永远不传。
    */
-  unverifiedEndpoint?: { id: string }
+  unverifiedEndpoint?: { id: string; verified: boolean }
 }
 
 /** 真正写进 stdout 的形态：下划线命名。这是 Agent 契约的一部分，不可随意改名。 */
@@ -56,7 +56,8 @@ export interface ErrorPayload {
   confirm_arg?: '--yes'
   risk?: 'irreversible'
   target?: string
-  unverified_endpoint?: true
+  /** 错误信封：已定位接口时**显式给出** true/false（见 `ErrorInput.unverifiedEndpoint`）。 */
+  unverified_endpoint?: boolean
   endpoint?: string
 }
 
@@ -407,7 +408,12 @@ export function fail(error: ErrorInput): number {
   if (error.retryStrategy) e.retry_strategy = error.retryStrategy
   if (error.fallback) e.fallback = error.fallback
   if (error.unverifiedEndpoint) {
-    e.unverified_endpoint = true
+    // ⚠️ 键名是 `unverified_endpoint`，语义是「**未**实测」—— 必须取反。
+    // 2026-11-13 实测踩过：这里曾直接赋 `verified`，于是已实测接口输出 `true`、
+    // 未实测输出 `false`，与成功路径（未实测才给 `true`）正好相反。
+    // 错误路径显式给 true/false：已实测的接口也要说 false，Agent 才不用去猜
+    // 「键不出现」是什么意思（见 `ErrorInput.unverifiedEndpoint` 的注释）。
+    e.unverified_endpoint = !error.unverifiedEndpoint.verified
     e.endpoint = sanitizeMessage(error.unverifiedEndpoint.id)
   }
   // ⚠️ 确认字段与退出码必须由**同一个判据**决定，不能是两个独立闸门。
@@ -507,7 +513,7 @@ export function failFromTagged(e: unknown): number {
   return usageFail(sanitizeMessage(err.message ?? String(e)))
 }
 
-export function usageFail(message: string, hint?: string, unverifiedEndpoint?: { id: string }): number {
+export function usageFail(message: string, hint?: string, unverifiedEndpoint?: { id: string; verified: boolean }): number {
   // ⚠️ stderr 是不受信文本进终端的主通道（security S4）：未知参数、未知表名、DuckDB 原文
   // 都拼进 message，未经净化就能注入 ANSI/OSC 序列。净化必须在**出口**做一次，
   // 而不是靠每个调用点自觉补 —— 实测 `db describe` / `query --table` 的未知表路径补了、

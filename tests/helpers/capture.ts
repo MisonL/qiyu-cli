@@ -23,7 +23,7 @@
 // 它在同一个文件里会把 spy 状态搅乱（探针自己被探针喂假信号）。要判就保存引用、
 // 数调用次数。
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { vi } from 'vitest'
+import { vi, afterAll } from 'vitest'
 
 export interface Capture {
   readonly generation: number
@@ -37,16 +37,32 @@ export interface Capture {
 
 interface Buf { out: string; err: string; writes: number }
 
+// ⚠️ 文件结束时恢复：同 file 的最后一条用例之后，spy 会留在 `process.stdout` 上，
+// 而 vitest 2.1.9 默认 `restoreMocks:false` —— 后续测试文件的写入会被记进最后一个
+// 捕获缓冲（Codex 2026-11-13 P2 实测）。`afterAll` 必须在**收集阶段**注册，
+// 所以放在模块顶层而不是 `install()` 里。
+afterAll(() => {
+  vi.restoreAllMocks()
+  activeSpy = undefined
+})
+
 let generation = 0
-let installed = false
 let fallback: Buf | undefined
+let activeSpy: unknown
 const als = new AsyncLocalStorage<Buf>()
 
-/** 只装一次 spy（之后的所有捕获共用），按异步上下文把写入分给发起它的那条捕获。 */
+/**
+ * 确保 spy 已装上（所有捕获共用），按异步上下文把写入分给发起它的那条捕获。
+ *
+ * ⚠️ 判据是"现在挂在 `process.stdout.write` 上的是不是本助手装的那个"，不是一个
+ * `installed` 布尔量：用户自己的 `afterEach(() => vi.restoreAllMocks())` 会把 spy
+ * 摘掉，"装过"标志却仍是 true，下一条用例就会跳过安装、写入绕过缓冲
+ * （CodeRabbit 2026-11-13 major；实测 `startCapture(); restoreAllMocks();
+ * startCapture()` 后 `cap.out === ''`）。
+ */
 function install(): void {
-  if (installed) return
-  installed = true
-  vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+  if (process.stdout.write === activeSpy) return
+  activeSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
     const b = als.getStore() ?? fallback
     if (b) { b.writes += 1; b.out += String(chunk) }
     return true
@@ -78,4 +94,9 @@ export function startCapture(): Capture {
     get err(): string { return buf.err },
     run<T>(fn: () => T): T { return als.run(buf, fn) },
   })
+}
+
+/** 输出捕获当前是否仍挂着（`process.stdout.write` 还是本助手装的 spy）。 */
+export function captureInstalled(): boolean {
+  return activeSpy !== undefined && process.stdout.write === activeSpy
 }

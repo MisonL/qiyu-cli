@@ -1,5 +1,5 @@
 // src/commands/api.ts
-import { allEndpoints, byId, assertCallable, assertConfirmed } from '../core/registry/index.js'
+import { allEndpoints, byId, byIdOrUndefined, assertCallable, assertConfirmed } from '../core/registry/index.js'
 import type { EndpointSpec } from '../core/registry/index.js'
 import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
 import { call } from '../core/http.js'
@@ -501,8 +501,19 @@ async function schema(argv: string[]): Promise<number> {
 
 async function callOne(argv: string[]): Promise<number> {
   const [id] = argv
+  // ⚠️ 本函数的**每一条**错误出口都要带 `unverified_endpoint`（CodeRabbit 2026-11-13），
+  // 包括 `byId()` 之前就返回的用法错误 —— 那时 `spec` 还是 undefined，
+  // 但 `id` 本身能查注册表（`byId` 只读内存里的注册表，不联网、不抛副作用）。
+  // 图例写着「键不出现 = 该接口实测过」，若 `api call ticket.finish --body '{'` 的
+  // 用法错误不带它，Agent 会反过来推断「这个接口是实测过的」—— 又是一句与事实相反的话。
+  let spec: EndpointSpec | undefined
+  // ⚠️ 用闭包而不是当场求值：`spec` 在下方 `byId()` 才赋值，当场读会撞 TDZ。
+  // `spec` 一旦解析成功就以它为准，否则退回按 id 查（`byId()` 之前的出口）。
+  const mine = (): { id: string; verified: boolean } | undefined =>
+    spec ? unverifiedMark(spec) : unverifiedMark(byIdOrUndefined(id))
+  const failCall = (msg: string): number => usageFail(msg, undefined, mine())
   if (!id) {
-    return usageFail('用法：qiyu api call <接口id> [--body <JSON>] [--yes] [--no-validate] [--strict]')
+    return failCall('用法：qiyu api call <接口id> [--body <JSON>] [--yes] [--no-validate] [--strict]')
   }
   // ⚠️ 接口 id 必须是第一个参数。若第一个 token 是 flag（`--yes`/`--body`/`--bod`…），
   // 用户把 flag 写在了 id 之前 —— 此前它会落到 `byId('--yes')` 报出
@@ -524,7 +535,7 @@ async function callOne(argv: string[]): Promise<number> {
   // `api call --pretty --help` 报「接口 id 必须是第一个参数」而不是给帮助 ——
   // 缺 id 是硬错误，help 修不了它（与 `list()` 的「未知/位置参数 → help」同源）。
   if (id.startsWith('-') && id !== '--help' && id !== '-h') {
-    return usageFail(
+    return failCall(
       `用法：接口 id 必须是第一个参数，但你给的是 flag \`${id}\`。\n` +
         '正确写法：qiyu api call <接口id> [--body <JSON>] [--yes] [--no-validate] [--strict]',
     )
@@ -583,7 +594,7 @@ async function callOne(argv: string[]): Promise<number> {
   //     退出码 2 的语义是"改参数重来"，而这里没有任何东西需要改。
   // → 判据是**"重复是否会丢掉一个值"**，不是"是否为布尔 flag"。
   if (i >= 0 && argv.indexOf('--body', i + 1) >= 0) {
-    return usageFail('用法：--body 只能出现一次')
+    return failCall('用法：--body 只能出现一次')
   }
 
   // ⚠️ 未知参数必须报错，不能静默忽略。实测：`--bod '{"a":1}'`（拼错一个字母）
@@ -616,7 +627,7 @@ async function callOne(argv: string[]): Promise<number> {
     // ⚠️ 这一句保持**字面量**：`readme.test.ts:58` 按源文本逐字钉着它（含 `<JSON>` 占位符，
     // 渲染无法无参复现）。`command-tree.test.ts` 有一条断言把这里点名的 flag 与
     // `CALL_FLAGS` 对齐，所以它不会与 spec 漂移。
-    return usageFail(`未知参数：${describeArgs(unknown)}。可用：--body <JSON>、--yes、--no-validate、--strict、--pretty`)
+    return failCall(`未知参数：${describeArgs(unknown)}。可用：--body <JSON>、--yes、--no-validate、--strict、--pretty`)
   }
 
   // ⚠️ **位置参数同样必须报错** —— 上面那条只筛 `-` 开头的。`api call` 除接口 id
@@ -638,7 +649,7 @@ async function callOne(argv: string[]): Promise<number> {
     // 星号 —— 与 help 文本同一条规则：输出给谁看，就按谁的格式写。这句强调此前
     // 写成了 `**body 必须用 --body 传入…**`，是 stderr 通道上唯一一处 Markdown。
     // 哨兵在 tests/commands/api.test.ts 的「用法错误的 stderr 也不得出现 Markdown」。
-    return usageFail(
+    return failCall(
       `未知参数：${describeArgs(positional)}。` +
         '接口 id 之后的参数必须写成 --body <JSON> / --yes / --no-validate / --strict —— ' +
         'body 必须用 --body 传入，直接写 JSON 会被忽略（那会发出一个没有 body 的请求）',
@@ -650,7 +661,7 @@ async function callOne(argv: string[]): Promise<number> {
     const raw = argv[i + 1]
     if (raw === undefined) {
       // 静默当成 {} 会掩盖用户的输入错误，并可能触发"空 body"那条代码路径
-      return usageFail('用法：--body 后面缺少 JSON 值')
+      return failCall('用法：--body 后面缺少 JSON 值')
     }
     try {
       body = JSON.parse(raw)
@@ -658,7 +669,7 @@ async function callOne(argv: string[]): Promise<number> {
       // ⚠️ 用 describeArgs 渲染，不裸插值（2026-10-07 修）：`--body ''`（如 shell 变量未设置）
       // 会让裸插值产出 `--body 不是合法 JSON：` —— 冒号后什么都没有，退出码 2 的全部信息量归零。
       // 与 `describeArgs` 存在的理由完全同款（见 output.ts 该函数注释）。
-      return usageFail(`--body 不是合法 JSON：${describeArgs([raw])}`)
+      return failCall(`--body 不是合法 JSON：${describeArgs([raw])}`)
     }
   }
 
@@ -686,15 +697,14 @@ async function callOne(argv: string[]): Promise<number> {
   // ⚠️ 命令行已证明合法，现在才谈接口是否存在 / 可调用 / 需确认。
   // 这三者都抛异常，由下方 catch 统一映射退出码（未知 id → usage 2、
   // 不可调用 → usage 2、危险未确认 → needs_confirmation 4）。
-  // ⚠️ spec 提升到 try 外：catch 里的 mapThrownToExit 需要它来判断
+  // ⚠️ spec 提升到 try 外（已在函数顶部声明）：catch 里的 mapThrownToExit 需要它来判断
   // 「限流错误要不要附本地 fallback 建议」（G1）。byId 抛错时它仍是 undefined，
   // 那种错误是 usage，走不到 fallback 分支。
-  let spec: EndpointSpec | undefined
   /** 门禁分支的未实测标记（在 catch 里读 `spec` 前就算好，见 mapThrownToExit 头注释）。 */
-  let needsConfirmUnverified: { id: string } | undefined
+  let needsConfirmUnverified: { id: string; verified: boolean } | undefined
   try {
     spec = byId(id)
-    needsConfirmUnverified = unverifiedOf(spec)
+    needsConfirmUnverified = unverifiedMark(spec)
     assertCallable(spec)
     assertGetHasNoBody(spec, body)
     assertNoValidateStrictConflict(argv)
@@ -725,7 +735,7 @@ async function callOne(argv: string[]): Promise<number> {
     // `credentials-source.ts`，三处调用点（api/sync/sync-run）共用一份，
     // 避免「api 认配置文件、sync 只认环境变量」这种 Agent 看不出来的分叉。
     const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv())
-    if (!credOutcome.ok) return fail(credOutcome.error)
+    if (!credOutcome.ok) return fail({ ...credOutcome.error, ...(mine() ? { unverifiedEndpoint: mine() } : {}) })
     const creds = credOutcome.creds
     const r = await call(spec, body, { credentials: creds })
     // ⚠️ 「成功但查无此物」必须显式标出来。设计稿 §9.2：0 行是比报错危险得多的
@@ -799,6 +809,19 @@ function unverifiedOf(spec: EndpointSpec | undefined): { id: string } | undefine
   return spec?.verified === false ? { id: spec.id } : undefined
 }
 
+/**
+ * 错误出口专用的"接口已定位"判据：只要定位到了接口，**无论实测与否都显式给出**
+ * `unverified_endpoint: true | false`。
+ *
+ * ⚠️ 为什么错误路径与成功路径口径不同（Codex 2026-11-13 P2）：图例写「键不出现有两种可能」，
+ * 但对**已定位**的接口，Agent 需要的是确定答案而不是"可能"。成功路径保持只对未实测接口
+ * 输出（避免对所有人变成噪音），错误路径则两者都给出 —— 已实测时输出 `false`，
+ * 让「错误分类只有文档依据」这句话的适用范围不含糊。
+ */
+function unverifiedMark(spec: EndpointSpec | undefined): { id: string; verified: boolean } | undefined {
+  return spec ? { id: spec.id, verified: spec.verified === true } : undefined
+}
+
 /** 把 catch 到的异常映射为退出码与输出 —— `callOne` 与 `api schema` **共用**的唯一出口（spec §三 :207）。
  *  两类：① 已分类的业务/网络错误（kind!=='usage'）→ 只出 stdout JSON（失败也 classification 直传）；
  *        ② 其余（未知 id、不可调用、校验硬拒、`--no-validate`/`--strict` 冲突等）→ usage 双通道 + 退出码 2。
@@ -809,7 +832,7 @@ function mapThrownToExit(e: unknown, spec?: EndpointSpec): number {
   // ⚠️ 用 `Partial<QiyuError>`（src/core/errors.ts:53，`retryAfter` 是 `{seconds,source}` 对象）——
   // 不要写成 `retryAfter: number`（fail() 的入参类型是对象，tsc 会 TS2322 红）。
   const err = e as Partial<QiyuError>
-  const unverifiedEndpoint = unverifiedOf(spec)
+  const unverifiedEndpoint = unverifiedMark(spec)
   if (err.kind && err.kind !== 'usage') {
     // —— 限流 → 本地 fallback 建议（G1 交付；设计稿 §9.1 示例里声明过这两个字段）——
     //

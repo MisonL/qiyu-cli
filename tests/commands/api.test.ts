@@ -1511,7 +1511,46 @@ describe('api call —— 危险操作门禁', () => {
     vi.unstubAllGlobals()
   })
 
-  it('已实测接口的错误信封也不带 unverified_endpoint（反向）', async () => {
+  it('未实测接口在 byId 之前的用法错误也带标记（如 --body 非法 JSON，CodeRabbit 2026-11-13）', async () => {
+    // 图例写着「键不出现有两种可能」，但在此之前它只写「键不出现 = 实测过」——
+    // 而 `api call ticket.finish --body '{'` 在 byId() 之前就返回了，那时 spec 还是
+    // undefined，若这个出口不带标记，Agent 会反过来推断「这个接口是实测过的」。
+    const code = await apiCommand(['call', 'ticket.finish', '--body', '{'])
+    expect(code).toBe(2)
+    const err = JSON.parse(out).error
+    expect(err.kind).toBe('usage')
+    expect(err.unverified_endpoint, '用法错误早于 byId 返回，也必须能查到接口实测态').toBe(true)
+    expect(err.endpoint).toBe('ticket.finish')
+  })
+
+  it('未实测接口在 byId 之前的另外几条用法错误也带标记（重复 --body / 未知参数 / 缺值）', async () => {
+    // ⚠️ 用 --no-validate：否则 ticket.finish 的必填 body 校验会先一步硬拒，
+    // 这些用例就测不到各自那条分支了。
+    for (const argv of [
+      ['call', 'ticket.finish', '--body', '{}', '--body', '{}'],
+      ['call', 'ticket.finish', '--bogus'],
+      ['call', 'ticket.finish', '--body'],
+      ['call', 'ticket.finish', 'extra'],
+    ]) {
+      out = ''
+      const code = await apiCommand([...argv, '--yes', '--no-validate'])
+      expect(code, argv.join(' ')).toBe(2)
+      const err = JSON.parse(out).error
+      expect(err.kind, argv.join(' ')).toBe('usage')
+      expect(err.unverified_endpoint, `接口已定位（ticket.finish）却没有标记：${argv.join(' ')}`).toBe(true)
+      expect(err.endpoint, argv.join(' ')).toBe('ticket.finish')
+    }
+  })
+
+  it('未知 id 的用法错误不带标记（键不出现 = 没定位到接口，不是「实测过」）', async () => {
+    const code = await apiCommand(['call', 'no.such.endpoint', '--yes'])
+    expect(code).toBe(2)
+    const err = JSON.parse(out).error
+    expect(err.unverified_endpoint).toBeUndefined()
+    expect(err.endpoint).toBeUndefined()
+  })
+
+  it('已实测接口的错误信封显式给 unverified_endpoint: false（Agent 不用猜「键不出现」）', async () => {
     vi.stubEnv('QIYU_APP_KEY', 'k')
     vi.stubEnv('QIYU_APP_SECRET', 's')
     vi.stubGlobal('fetch', vi.fn().mockImplementation(() =>
@@ -1520,8 +1559,8 @@ describe('api call —— 危险操作门禁', () => {
     const code = await apiCommand(['call', 'export.session', '--yes', '--no-validate'])
     expect(code).toBe(1)
     const err = JSON.parse(out).error
-    expect(err.unverified_endpoint).toBeUndefined()
-    expect(err.endpoint).toBeUndefined()
+    expect(err.unverified_endpoint, '已定位的接口在错误信封里要给出确定答案').toBe(false)
+    expect(err.endpoint).toBe('export.session')
     vi.unstubAllGlobals()
   })
 

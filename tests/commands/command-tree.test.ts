@@ -138,7 +138,10 @@ describe('COMMAND_TREE', () => {
     // 此前得到三种答案）。它属于 GLOBAL_FLAGS，但**确实是可用 flag** —— 所以判据是
     // 「列出的 ⊆ 接受集且 = 接受集去掉 help 两项」，而不是「去掉全部全局 flag」。
     const apiSrc = readFileSync(join(srcRoot, 'api.ts'), 'utf8')
-    const m = apiSrc.match(/return usageFail\(`未知参数：\$\{describeArgs\(unknown\)\}。可用：(--body[^`\n]*)`\)/)
+    // ⚠️ 匹配的是**调用形态**（`usageFail` 或包一层 `failCall`），不是某一种函数名：
+    // 2026-11-13 把该出口收敛到 `failCall()` 后，本守卫因只认 `usageFail` 而假红。
+    // 判据是「这是一条运行时『可用：』文案」，不是「它恰好叫 usageFail」。
+    const m = apiSrc.match(/return (?:usageFail|failCall)\(`未知参数：\$\{describeArgs\(unknown\)\}。可用：(--body[^`\n]*)`\)/)
     expect(m, 'api.ts 里必须能找到 api call 的运行时「可用：」文案（而不是注释里的同款句子）').not.toBeNull()
     // 剥掉 `--body` 的取值占位符（`<JSON>`），只留 flag 名。
     const listed = m![1]!.split('、').map((s) => s.trim().split(' ')[0])

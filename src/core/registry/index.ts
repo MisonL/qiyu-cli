@@ -275,6 +275,17 @@ export function allEndpoints(): EndpointSpec[] {
   return SPECS
 }
 
+/**
+ * 按 id 查，找不到返回 `undefined`（不抛）。
+ *
+ * ⚠️ 用途只有一处（2026-11-13）：调用方在**抛错的那些出口**上也要知道接口是否实测
+ * （`api call` 的用法错误早于 `byId()` 返回），那种场合不能用抛错的 `byId`。
+ * 其余地方仍用 `byId` —— 静默返回 undefined 会让调用方崩在离病根很远的地方。
+ */
+export function byIdOrUndefined(id: unknown): EndpointSpec | undefined {
+  return typeof id === 'string' ? INDEX.get(id) : undefined
+}
+
 /** 未知 id 直接抛错 —— 静默返回 undefined 会让调用方崩在离病根很远的地方。 */
 export function byId(id: string): EndpointSpec {
   const spec = INDEX.get(id)
