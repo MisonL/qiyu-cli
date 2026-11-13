@@ -9,17 +9,20 @@
 
 ### 修复
 
-- **`api call` 调用未实测信封的接口时，`meta` 里如实声明 `unverified_endpoint: true`**：
+- **`api call` 调用未实测信封的接口时，成功与错误信封都如实声明 `unverified_endpoint: true`**：
   注册表 154 条里 73 条危险接口有 72 条从未观测过响应信封（`verified:false`、`envelope:null`），
   但 `verified` 此前**只在 `api list` 输出**、`callOne` 从不读它 —— Agent 不先跑
-  `api list --all` 就完全不知道「这次的 `not_found` 判定与 `data` 解包只是按文档推的」。
-  具体后果不是抽象的：形状未实测的接口**一律不判 `not_found`**，因为「空 `data` 是什么意思」
+  `api list --all` 就完全不知道「这次的 `not_found` 判定、`data` 解包与错误分类只是按文档推的」。
+  后果不是抽象的：不知道载荷形状的接口基本不判 `not_found`，因为「空 `data` 是什么意思」
   没人观测过 —— `envelope.ts` 记着 `deleteKnowledges` 的空数组其实是「全部删成功」，
-  按读接口判据会被报成「什么都没删」。现在调用时即声明，`meta.field_notes` 同步给出释义
-  （点明它**不是**「这次调用失败」的信号，而是「不要依据本次输出的空/非空下结论」）。
-  只在未实测时输出（已实测的接口不带此键，避免变成对所有人的噪音）；
-  双向守卫：`ticket.finish`（未实测）必须带、`export.session`（唯一实测的危险接口）必须不带，
-  两个变异（删实现 → 正向红；改无条件 → 反向红）均已验证。
+  按读接口判据会被报成「什么都没删」（唯一例外是「`message` 能解析成 JSON 且为空」的宽松分支，
+  它仍会置位并带 `warning`，图例逐字写明）。
+  现在**三条错误出口也带**（Codex 2026-11-13 P2：只在成功路径声明、而图例明说错误分类也
+  只有文档依据，等于自相矛盾）：业务错误信封、`needs_confirmation` 信封、用法错误信封的
+  `error` 里都有 `unverified_endpoint` 与 `endpoint`。
+  判据收敛为单一实现点 `unverifiedOf(spec)`，只在未实测时输出（已实测的接口不带，避免噪音）；
+  守卫覆盖两个方向（`ticket.finish` 未实测必须带、`export.session` 实测必须不带）
+  与三条错误出口，变异（删实现 / 改无条件 / 逐个拆出口）均实测变红。
 
 - **`--since` 带相对时长时，区间终点不再取决于解析耗时**：`--since 1d` 的终点原本取自
   `parseTimeArg` 内部的时钟，随后「未给 `--until`」又调了一次时钟 —— 两次 `Date.now()`
@@ -59,6 +62,15 @@
   这条 `postinstall` 只在全局安装真实触发（`npm_config_global` 判据在文件内部）。
 
 ### 测试
+
+- **新增 `tests/helpers/capture.ts`：按用例隔离 stdout/stderr 捕获**（CodeRabbit 2026-11-13 major）。
+  26 个测试文件用模块级 `let out` + `beforeEach` 重置的模式挡得住「上一条的输出漏进下一条」
+  的**状态**，挡不住**写入方**：上一条超时后，它已发出、尚未 resolve 的异步调用会在下一条
+  开始之后才写 stdout（实测 `out="FRESHTAIL"`、`writes=2`）。归属按 `AsyncLocalStorage`
+  记录的**发起者**判，而不是按「此刻挂着的 spy」判 —— 延迟回调往往在运行时才查
+  `process.stdout.write`，那时挂着的是下一条用例的 spy。守卫含一条「尾巴在中间隔着的
+  用例期间落地」的用例；变异（改用「当前活动捕获」）两条均红。
+  实测记录：vitest 2.1.9 默认 `restoreMocks:false`，跨用例不会自动恢复 spy。
 
 - **钉住「上一条用例的 ticking 时钟不得泄漏」的清理契约**（CodeRabbit 2026-11-12 第三轮 major）：
   新增回归用例会让 `Date.now` 每读一次 +1ms，若清理失效，后续用例会拿到停在 2026-11-11 的

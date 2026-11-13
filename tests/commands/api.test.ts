@@ -1433,20 +1433,68 @@ describe('api call —— 危险操作门禁', () => {
     // Agent 不先跑 `api list --all` 时，这条事实对它完全隐形。
     vi.stubEnv('QIYU_APP_KEY', 'k')
     vi.stubEnv('QIYU_APP_SECRET', 's')
+    // ⚠️ 载荷刻意**不是** `message:'{}'`：那会走宽松分支置 `not_found:true`，
+    // 是图例里点名的例外（Codex 2026-11-13 P2 指出「一律不判 not_found」与它矛盾）。
     vi.stubGlobal('fetch', vi.fn().mockImplementation(() =>
-      Promise.resolve(new Response(JSON.stringify({ code: 200, message: '{}' }),
+      Promise.resolve(new Response(JSON.stringify({ code: 200, message: '{"done":true}' }),
         { status: 200, headers: { 'content-type': 'application/json' } }))))
     // ticket.finish：callable + dangerous + verified:false（注册表实测值）
     const code = await apiCommand(['call', 'ticket.finish', '--yes', '--no-validate'])
     expect(code).toBe(0)
     const meta = JSON.parse(out).meta
     expect(meta.endpoint).toBe('ticket.finish')
+    expect(meta.not_found, '本用例刻意不触发 not_found，否则与图例的例外说明混淆').toBeUndefined()
     expect(meta.unverified_endpoint,
       '未实测信封是使用前必须知道的事实，不能只写在 api list 里').toBe(true)
     // 图例里必须逐字解释这个键的含义与后果（否则它又变成「声明了但没人读」）
     expect(meta.field_notes.unverified_endpoint).toMatch(/信封/)
     expect(meta.field_notes.unverified_endpoint).toMatch(/not_found|判据|形状/)
+    // ⚠️ 图例不得再说「一律不判 not_found」：宽松分支（message 可解析成 JSON 且为空）
+    // 仍会置位，实测 `ticket.finish` + `{code:200,message:'{}'}` → not_found:true。
+    expect(meta.field_notes.unverified_endpoint, '「一律不判」与实现的宽松分支相反，不得复活')
+      .not.toContain('一律不判 not_found')
+    expect(meta.field_notes.unverified_endpoint, '必须点明宽松分支这个例外').toMatch(/宽松分支/)
     vi.unstubAllGlobals()
+  })
+
+  it('未实测接口的业务错误：错误信封同样带 unverified_endpoint + endpoint（Codex 2026-11-13 P2）', async () => {
+    // 错误分类只有文档依据 —— 若只在成功路径声明，Agent 会把未实测接口的
+    // kind/retryable 当成确定结论。
+    vi.stubEnv('QIYU_APP_KEY', 'k')
+    vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() =>
+      Promise.resolve(new Response(JSON.stringify({ code: 14001, message: 'appKey error' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }))))
+    const code = await apiCommand(['call', 'ticket.finish', '--yes', '--no-validate'])
+    expect(code).toBe(1)
+    const err = JSON.parse(out).error
+    expect(err.code).toBe('14001')
+    expect(err.unverified_endpoint, '错误分类也只有文档依据，必须在错误信封里说出来').toBe(true)
+    expect(err.endpoint).toBe('ticket.finish')
+    vi.unstubAllGlobals()
+  })
+
+  it('未实测接口被门禁拦下：needs_confirmation 信封也带 unverified_endpoint', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k')
+    vi.stubEnv('QIYU_APP_SECRET', 's')
+    const code = await apiCommand(['call', 'ticket.finish', '--no-validate'])
+    expect(code).toBe(4)
+    const err = JSON.parse(out).error
+    expect(err.confirm_required).toBe(true)
+    expect(err.unverified_endpoint).toBe(true)
+    expect(err.endpoint).toBe('ticket.finish')
+  })
+
+  it('未实测接口的用法错误（body 校验硬拒）：错误信封同样带 unverified_endpoint', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k')
+    vi.stubEnv('QIYU_APP_SECRET', 's')
+    // 不传 --body：ticket.finish 需要 JSON 对象 body → usage 硬拒（退出码 2）
+    const code = await apiCommand(['call', 'ticket.finish', '--yes'])
+    expect(code).toBe(2)
+    const err = JSON.parse(out).error
+    expect(err.kind).toBe('usage')
+    expect(err.unverified_endpoint, '用法错误也发生在已解析到接口之后，同样要声明').toBe(true)
+    expect(err.endpoint).toBe('ticket.finish')
   })
 
   it('已实测信封的接口不带 unverified_endpoint（反向：不能对所有人一律告警）', async () => {
@@ -1460,6 +1508,20 @@ describe('api call —— 危险操作门禁', () => {
     const code = await apiCommand(['call', 'export.session', '--yes', '--no-validate'])
     expect(code).toBe(0)
     expect(JSON.parse(out).meta.unverified_endpoint).toBeUndefined()
+    vi.unstubAllGlobals()
+  })
+
+  it('已实测接口的错误信封也不带 unverified_endpoint（反向）', async () => {
+    vi.stubEnv('QIYU_APP_KEY', 'k')
+    vi.stubEnv('QIYU_APP_SECRET', 's')
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() =>
+      Promise.resolve(new Response(JSON.stringify({ code: 14001, message: 'appKey error' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }))))
+    const code = await apiCommand(['call', 'export.session', '--yes', '--no-validate'])
+    expect(code).toBe(1)
+    const err = JSON.parse(out).error
+    expect(err.unverified_endpoint).toBeUndefined()
+    expect(err.endpoint).toBeUndefined()
     vi.unstubAllGlobals()
   })
 

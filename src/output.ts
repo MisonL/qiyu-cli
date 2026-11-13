@@ -33,6 +33,13 @@ export interface ErrorInput {
   /** 被拦下的接口 id。缺省时空串 —— 但 `needs_confirmation` 下传空串是无意义的，
    *  门禁路径（任务 11）保证一定给值。 */
   target?: string
+  /**
+   * `api call` 专用：这次调用涉及**响应信封从未实测**的接口（注册表 `verified:false`）。
+   * 成功路径与错误路径**都**要带（Codex 2026-11-13 P2：只在 `ok()` 里给出声明、
+   * 错误分支却沉默，而图例明说「错误分类也只有文档依据」，自相矛盾）。
+   * 其余命令永远不传。
+   */
+  unverifiedEndpoint?: { id: string }
 }
 
 /** 真正写进 stdout 的形态：下划线命名。这是 Agent 契约的一部分，不可随意改名。 */
@@ -49,6 +56,8 @@ export interface ErrorPayload {
   confirm_arg?: '--yes'
   risk?: 'irreversible'
   target?: string
+  unverified_endpoint?: true
+  endpoint?: string
 }
 
 /**
@@ -397,6 +406,10 @@ export function fail(error: ErrorInput): number {
   if (error.retryAfter) e.retry_after = error.retryAfter
   if (error.retryStrategy) e.retry_strategy = error.retryStrategy
   if (error.fallback) e.fallback = error.fallback
+  if (error.unverifiedEndpoint) {
+    e.unverified_endpoint = true
+    e.endpoint = sanitizeMessage(error.unverifiedEndpoint.id)
+  }
   // ⚠️ 确认字段与退出码必须由**同一个判据**决定，不能是两个独立闸门。
     // 设计稿 §9.1 要求退出码 4 **必须**携带 `confirm_required`/`confirm_arg`/`risk`/`target`
     // 且 `retryable: false`。此前 `exitCodeFor(kind)` 与 `if (error.confirmRequired)` 互相独立，
@@ -494,7 +507,7 @@ export function failFromTagged(e: unknown): number {
   return usageFail(sanitizeMessage(err.message ?? String(e)))
 }
 
-export function usageFail(message: string, hint?: string): number {
+export function usageFail(message: string, hint?: string, unverifiedEndpoint?: { id: string }): number {
   // ⚠️ stderr 是不受信文本进终端的主通道（security S4）：未知参数、未知表名、DuckDB 原文
   // 都拼进 message，未经净化就能注入 ANSI/OSC 序列。净化必须在**出口**做一次，
   // 而不是靠每个调用点自觉补 —— 实测 `db describe` / `query --table` 的未知表路径补了、
@@ -507,5 +520,6 @@ export function usageFail(message: string, hint?: string): number {
     // message 去尾换行 —— stdout 的 JSON 里不该带控制字符；stderr 的文本保留换行便于阅读。
     message: safe.replace(/\n+$/, ''),
     ...(hint !== undefined ? { hint: sanitizeMessage(hint) } : {}),
+    ...(unverifiedEndpoint !== undefined ? { unverifiedEndpoint } : {}),
   })
 }

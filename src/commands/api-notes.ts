@@ -50,11 +50,16 @@ export function callFieldNotes(): Record<string, string> {
     warning: '与 not_found 同时出现的一句话说明（固定文案）',
     unverified_endpoint: 'true = 该接口的响应信封形状从未实测（注册表 `verified:false`），'
       + '本次的 `not_found` 判定、`data` 解包与错误分类都只有文档依据。'
-      + '具体后果：形状未实测的接口一律不判 not_found（空 data 是什么没人观测过 —— '
-      + '实测过 `deleteKnowledges` 的空数组是全部删成功，按读接口判据会被报成什么都没删）。'
+      + '具体后果：不知道载荷形状的接口，只有「message 能解析成 JSON 且结果为空」这类'
+      + '宽松分支仍会判 not_found（它同时带 warning），其余情形一律不判 —— '
+      + '「空 data 是什么」没人观测过，实测过 `deleteKnowledges` 的空数组是全部删成功，'
+      + '按读接口判据会被报成什么都没删。'
+      + '所以收到 not_found 仍然要怀疑，没收到 not_found 不等于有数据。'
       + '信封形状（A/B/C/D）也是推的，若与文档不符，`data` 可能取错键或落进宽松模式。'
       + '它不是这次调用失败的信号（调用本身可能完全成功），而是不要依据本次输出的'
       + '空/非空与字段形状下结论，必要时人工确认结果。'
+      + '成功信封（ok:true）在 meta 里、错误信封（ok:false）在 error 里都有这个键，'
+      + '含义相同，错误时的 kind 与 retryable 同样只有文档依据。'
       + '键不出现 = 该接口实测过（`verified:true`），不代表其余字段没有坑（见 note）',
     note: '该接口的已知坑（来自注册表，只在登记了 note 的接口上出现）。'
       + '⚠️ 它是静态说明、不是本次调用的结果',

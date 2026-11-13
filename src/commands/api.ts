@@ -690,8 +690,11 @@ async function callOne(argv: string[]): Promise<number> {
   // 「限流错误要不要附本地 fallback 建议」（G1）。byId 抛错时它仍是 undefined，
   // 那种错误是 usage，走不到 fallback 分支。
   let spec: EndpointSpec | undefined
+  /** 门禁分支的未实测标记（在 catch 里读 `spec` 前就算好，见 mapThrownToExit 头注释）。 */
+  let needsConfirmUnverified: { id: string } | undefined
   try {
     spec = byId(id)
+    needsConfirmUnverified = unverifiedOf(spec)
     assertCallable(spec)
     assertGetHasNoBody(spec, body)
     assertNoValidateStrictConflict(argv)
@@ -756,7 +759,7 @@ async function callOne(argv: string[]): Promise<number> {
       // 后果具体：信封未实测时 `not_found` 判定与 `data` 语义可能不适用
       // （`envelope.ts` 记着 `deleteKnowledges` 把「全部删成功」报成 `not_found` 的事故）。
       // 只在**未实测**时输出，已实测的接口不带此键（避免变成对所有人的噪音）。
-      ...(spec.verified === false ? { unverified_endpoint: true } : {}),
+      ...(unverifiedOf(spec) ? { unverified_endpoint: true } : {}),
     })
   } catch (e) {
     const err = e as Partial<QiyuError> & { needsConfirmation?: true; target?: string }
@@ -776,12 +779,24 @@ async function callOne(argv: string[]): Promise<number> {
         hint: '这是不可逆的写操作。**必须由人类确认**后再执行 —— 不要自动追加 --yes。' +
               '请把该操作及其目标（接口 id 见 target）复述给人类，得到许可后才可重试。',
         confirmRequired: true, target: err.target ?? id,
+        ...(needsConfirmUnverified ? { unverifiedEndpoint: needsConfirmUnverified } : {}),
       })
     }
     // 已分类的业务/网络错误与其余用法错误共用 mapThrownToExit，避免同族错误两种表现。
     // spec 传下去用于限流错误的本地 fallback 建议（G1）。
     return mapThrownToExit(e, spec)
   }
+}
+
+/**
+ * 未实测信封的唯一判据（成功路径与三条错误出口共用同一实现，Codex 2026-11-13 P2）。
+ *
+ * ⚠️ 只在 `verified === false` 时输出：`spec` 为 undefined（未知 id）时无从谈起。
+ * 错误路径也要带：`unverified_endpoint` 的图例明说「错误分类只有文档依据」——
+ * 若错误分支沉默，Agent 会把未实测接口的错误分类当成确定结论。
+ */
+function unverifiedOf(spec: EndpointSpec | undefined): { id: string } | undefined {
+  return spec?.verified === false ? { id: spec.id } : undefined
 }
 
 /** 把 catch 到的异常映射为退出码与输出 —— `callOne` 与 `api schema` **共用**的唯一出口（spec §三 :207）。
@@ -794,6 +809,7 @@ function mapThrownToExit(e: unknown, spec?: EndpointSpec): number {
   // ⚠️ 用 `Partial<QiyuError>`（src/core/errors.ts:53，`retryAfter` 是 `{seconds,source}` 对象）——
   // 不要写成 `retryAfter: number`（fail() 的入参类型是对象，tsc 会 TS2322 红）。
   const err = e as Partial<QiyuError>
+  const unverifiedEndpoint = unverifiedOf(spec)
   if (err.kind && err.kind !== 'usage') {
     // —— 限流 → 本地 fallback 建议（G1 交付；设计稿 §9.1 示例里声明过这两个字段）——
     //
@@ -836,6 +852,7 @@ function mapThrownToExit(e: unknown, spec?: EndpointSpec): number {
       message: err.message ?? String(e), hint, retryAfter: err.retryAfter,
       ...(retryStrategy !== undefined ? { retryStrategy } : {}),
       ...(fallback !== undefined ? { fallback } : {}),
+      ...(unverifiedEndpoint !== undefined ? { unverifiedEndpoint } : {}),
     })
   }
   // 用法错误走 `usageFail`（**唯一出口**，2026-11-02 收敛）。
@@ -846,7 +863,7 @@ function mapThrownToExit(e: unknown, spec?: EndpointSpec): number {
   // 都输出**缩进**的错误信封，而同一 exit 2 的 `api list extra --pretty`（走 usageFail）是紧凑的
   // —— 同一退出码两种报文形态，而 Agent 会拿缩进当「格式化已生效」的证据。
   // 那三条断言之所以没抓到：`tests/commands/api.test.ts` 只钉了走 `usageFail` 的那三条分支。
-  return usageFail(e instanceof Error ? e.message : String(e), err.hint)
+  return usageFail(e instanceof Error ? e.message : String(e), err.hint, unverifiedEndpoint)
 }
 
 /** `ParamSpec` 的浅复制 + `auto`：见 §三 `params` 说明。`auto` 只加给 query 里的鉴权参数。 */
