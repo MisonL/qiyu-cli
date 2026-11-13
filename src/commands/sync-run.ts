@@ -472,9 +472,11 @@ export async function runSyncRun(argv: string[]): Promise<number> {
     if (rangeOverride !== undefined) {
       for (const t of selected) {
         if (t.windowStartFloorDays === undefined) continue
-        // 与区间合成同一时刻：本 note 的前提是「请求终点 vs 接口下界」，而请求终点
-        // 就来自 now —— 另读一次时钟会让判据与它描述的对象差几毫秒。
-        const floor = now - t.windowStartFloorDays * DAY_MS
+        // ⚠️ 这里**当场读钟**，不用区间合成的 `now`（Codex 2026-11-12 P2）：本 note 是在
+        // 预测**引擎**的 `windowStartFloorDays` 钳制，而引擎按任务**执行时刻**的
+        // `nowOf(ctx)` 计算。整轮同步若跨过上海午夜，越早的钟越容易把「明天就能拉到」
+        // 说成「永远拉不到」。读得越晚越接近引擎的判据。
+        const floor = clock() - t.windowStartFloorDays * DAY_MS
         if (rangeOverride.end <= floor) {
           floorNotes.set(t.id, [
             `请求区间结束于 ${shanghaiIso(rangeOverride.end)}，早于该接口可得数据的最早边界 ` +
@@ -506,9 +508,12 @@ export async function runSyncRun(argv: string[]): Promise<number> {
           // 旧文案一律劝「写到次日 0 点」，照做后提示消失、该日仍未同步）。
           const dayStart = shanghaiDayStart(boundary)
           if (t.windowEndClamp === 'shanghaiYesterday') {
-            // 与区间合成同一时刻：引擎的 windowEndLimit 来自 ctx.clock 的当前时刻，
-            // 上限另读一次时钟可能跨过上海日界，与实际切窗差一天。
-            const limit = shanghaiYesterdayStart(now)
+            // ⚠️ 当场读钟（Codex 2026-11-12 P2）：本 note 预测的是引擎 `windowEndLimit`
+            // = `shanghaiYesterdayStart(nowOf(ctx))`，而 `nowOf(ctx)` 是任务**执行时刻**。
+            // 整轮同步跨过上海午夜时，早先采样的 now 会让上限停在昨天，提示于是误报
+            // 「调整 --until 也无法拉到」——而午夜后引擎上限已前移一天，把 --until 写到
+            // 次日 0 点其实能同步该整日。读得越晚越接近引擎的判据。
+            const limit = shanghaiYesterdayStart(clock())
             if (dayStart >= limit) {
               untilNotes.set(t.id, [
                 `--until 终点 ${shanghaiIso(boundary)} 不是上海日界（00:00），且 ` +
