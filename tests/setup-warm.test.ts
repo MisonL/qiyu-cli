@@ -5,15 +5,16 @@
 // 数据库的、以及「缺依赖时给安装指引」的那几条。
 //
 // ⚠️ 不用静态扫源码判（那种判据挡不住「catch 了但在 catch 里又抛」）。真跑一个子 vitest：
-// 子进程的 `process` 与父进程**不共享**，所以经环境变量传「注入一个让预热抛错的错误」的
-// 代码串，由 `setup-warm.ts` 按该变量 `new Function` 求值（只在设置了变量时）——
-// 不往 setup 里塞可被误触发的全局量。
+// 子进程的 `process` 与父进程**不共享**，所以经环境变量 `QIYU_WARM_FAIL_INJECT` 选一个
+// **固定模式**（只认 `throw` / `hang` 两个字面量，见 `setup-warm.ts`）注入失败。
+// ⚠️ 不要改回「把环境变量的内容交给 `new Function` 求值」：那等于给了这个可能被继承/误设的
+// 变量在测试收集前以当前进程权限执行任意 JS 的能力（Codex 2026-11-14 P2）。
 import { describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { warmDuckDb } from './setup-warm.js'
+import { warmDuckDb, parseBudget } from './setup-warm.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 /** `setup-warm.ts` 读取的环境变量名（两处必须一致，守卫里断言一下）。 */
@@ -96,12 +97,24 @@ describe('setup-warm：预热失败只降级、不拖垮测试', () => {
     try {
       vi.stubEnv('QIYU_WARM_TIMEOUT_MS', '100')
       // 注入「永不 resolve」的模式（`hang`）；`throw` 是立即抛错，测不到预算。
-      vi.stubEnv(INJECT_ENV, 'hang')
-      const outcome = await warmDuckDb({ ifWarmed: () => false })
+      const outcome = await warmDuckDb({ ifWarmed: () => false }, 'hang')
       expect(outcome.ok).toBe(false)
       expect(String(errOf(outcome))).toMatch(/预热超过 100ms/)
     } finally {
       vi.unstubAllEnvs()
     }
   }, 60_000)
+
+  // ⚠️ 预算本身要校验（2026-11-14 独立审计）：`Number('30s')` 是 `NaN`，Node 把 `NaN`/`Infinity`
+  // 当 1ms —— 预热必然「超时」降级、告警变成噪音；过大值会把收集拖上十分钟。这里钉住判据。
+  it('预算解析：非法值退回默认、过大值夹到上限', () => {
+    expect(parseBudget(undefined)).toBe(120_000)
+    expect(parseBudget('')).toBe(120_000)
+    expect(parseBudget('30s')).toBe(120_000)
+    expect(parseBudget('Infinity')).toBe(120_000)
+    expect(parseBudget('-5')).toBe(120_000)
+    expect(parseBudget('0')).toBe(120_000)
+    expect(parseBudget('100')).toBe(100)
+    expect(parseBudget('99999999')).toBe(600_000)
+  })
 })

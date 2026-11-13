@@ -41,6 +41,23 @@ export type WarmOutcome =
   | { ok: false; already: true }
   | { ok: false; already: false; error: unknown }
 
+const DEFAULT_BUDGET_MS = 120_000
+/** 预算上限：再大就等于没有预算，且 `setTimeout` 超过 2^31-1 会截成 1ms。 */
+const MAX_BUDGET_MS = 600_000
+
+/**
+ * 解析预热预算（毫秒）。⚠️ 不直接 `Number(env)`：`'30s'` / 拼错的值给 `NaN`，而 Node 把
+ * `NaN`/`Infinity` 当 1ms（`Infinity` 还会打 `TimeoutOverflowWarning`）—— 预热就必然「超时」
+ * 降级，每条降级告警都成了噪音，真问题反而被淹没（2026-11-14 实测确认后加校验）。
+ * 非法值一律退回默认预算；过大值夹到上限，避免预热最长把收集拖上十分钟。
+ */
+export function parseBudget(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_BUDGET_MS
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_BUDGET_MS
+  return Math.min(n, MAX_BUDGET_MS)
+}
+
 /**
  * 预热体：建临时库、`init()`、关掉。**所有**失败（含临时目录建不出来、超时）都收在这一步
  * 的返回值里，由调用方（setup 入口）打到 stderr —— 导出只为可测
@@ -52,9 +69,9 @@ export type WarmOutcome =
  * （`warmDuckDb` 的导入会先让本文件跑一遍预热），若这里直接 `process.stderr.write`，
  * 每次跑测试都会多一行「预热跳过」，还会干扰子进程守卫里对告警文本的断言。
  */
-export async function warmDuckDb(opts: { ifWarmed?: () => boolean } = {}): Promise<WarmOutcome> {
+export async function warmDuckDb(opts: { ifWarmed?: () => boolean } = {}, failInject: string | undefined = process.env.QIYU_WARM_FAIL_INJECT): Promise<WarmOutcome> {
   if ((opts.ifWarmed ?? (() => (process as Marked)[FLAG] === true))()) return { ok: false, already: true }
-  const budgetMs = Number(process.env.QIYU_WARM_TIMEOUT_MS ?? 120_000)
+  const budgetMs = parseBudget(process.env.QIYU_WARM_TIMEOUT_MS)
   // ⚠️ 整个预热（**含临时目录创建**）都在 try 里：`mkdtempSync` 也会失败（`TMPDIR` 指向
   // 一个文件等），放在 try 外就绕过了降级（CodeRabbit 2026-11-14 major）。
   // 清理同理走 best-effort（目录可能被删过、或库仍打开）。
@@ -69,7 +86,7 @@ export async function warmDuckDb(opts: { ifWarmed?: () => boolean } = {}): Promi
       // 曾经用 `new Function(环境变量里的代码)` —— 那等于给了该环境变量在测试收集前以当前进程
       // 权限执行任意 JS 的能力，一个被继承/误设的变量就能作恶）。现在只认两个字面量。
       // 注入点必须在**受超时保护的这一段里** —— 放在 race 之外就绕过了预算。
-      const inject = process.env.QIYU_WARM_FAIL_INJECT
+      const inject = failInject
       if (inject === 'throw') throw new Error('注入：模拟原生 binding 缺失')
       if (inject === 'hang') await new Promise<never>(() => {})
       const { createDuckDbStore } = await import('../src/store/duckdb.js')
