@@ -781,9 +781,24 @@ describe('duckdb —— init 与关闭', () => {
     const s = await fresh()
     await s.init()
     const before = await s.count('schema_version')
-    await expect(s.upsert('schema_version', [{ version: 1 }])).resolves.toBe(1)
-    await expect(s.upsert('schema_version', [{ version: 1 }])).resolves.toBe(1) // 再来一次不报错
-    expect(await s.count('schema_version'), '冲突行不得被插成第二行').toBe(before)
+    // ⚠️ 用一个**尚未记录**的版本号：`init()` 已经把迁移版本写进去了，拿 version 1
+    // 当「新键」会先撞上已存在的行（本用例首版就是这么误判成 0 的）。
+    await expect(s.upsert('schema_version', [{ version: 9000 }])).resolves.toBe(1)
+    // 「实际写入行数」是契约原文（types.ts `Store.upsert`）：冲突被 DO NOTHING 跳过时
+    // 一行都没写，就不能报 1（Codex PR#74 第二轮 P2）。
+    await expect(s.upsert('schema_version', [{ version: 9000 }])).resolves.toBe(0)
+    expect(await s.count('schema_version'), '冲突行不得被插成第二行').toBe(before + 1)
+    await s.close()
+  })
+
+  it('只有主键列的表：一批里「已存在 + 新行」时只数真正插进去的那几行', async () => {
+    const s = await fresh()
+    await s.init()
+    const existing = (await s.query('SELECT MAX(version) AS v FROM schema_version')).rows[0]!.v as number
+    // 同批 3 行：1 行已存在，2 行新 —— 返回值必须是 2，不是 3
+    await expect(s.upsert('schema_version', [
+      { version: existing }, { version: 9001 }, { version: 9002 },
+    ])).resolves.toBe(2)
     await s.close()
   })
 

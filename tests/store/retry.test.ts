@@ -167,12 +167,17 @@ describe('retryWithBackoff —— 有界重试', () => {
   // 真实计时必须落在 maxMs 附近。
   it('单次尝试上限随剩余预算收缩（attemptMs=5000、maxMs=60 → 墙钟 ≈ 60ms）', async () => {
     const started = Date.now()
+    let message = ''
     await expect(retryWithBackoff({
       tryOpen: () => new Promise<never>(() => {}),
       isRetryable: isLockError, maxMs: 60, intervalMs: 10, attemptMs: 5_000,
-    })).rejects.toThrow()
+    }).catch((e: Error) => { message = e.message; throw e })).rejects.toThrow()
     const elapsed = Date.now() - started
     expect(elapsed, '不能按 attemptMs 等满 5 秒').toBeLessThan(1_000)
+    // 报文要说**实际生效**的那一档（被预算夹成 ≤60ms），不能照抄配置里的 5000 ——
+    // 「日志说等了 5 秒、实际只等了 60 毫秒」是把诊断引向错误的方向。
+    expect(message).toContain('打开超时')
+    expect(message, `报文不得照抄被夹小的 attemptMs：${message}`).not.toContain('5000ms')
   })
 
   it('超时后被放弃的尝试最终成功 → 交回给 onAbandoned 清理', async () => {
@@ -193,5 +198,69 @@ describe('retryWithBackoff —— 有界重试', () => {
     resolveLate('late-conn')
     await Promise.resolve(); await Promise.resolve()
     expect(abandoned, '晚到的成功必须被清理，不能静默泄漏').toEqual(['late-conn'])
+  })
+
+  it('onAbandoned 自己抛错或返回 rejected promise → 静默吞掉，不变 unhandled rejection', async () => {
+    // CodeRabbit PR#74 第二轮：`attempt.then(cb, noop)` 的第二个参数只接住 **attempt 的**拒绝，
+    // 接不住 cb 的。Node >=15 的默认行为是 unhandled rejection 直接杀进程。
+    const rejections: unknown[] = []
+    const onRejection = (r: unknown): void => { rejections.push(r) }
+    process.on('unhandledRejection', onRejection)
+    try {
+      for (const onAbandoned of [
+        () => { throw new Error('sync cleanup failure') },
+        async () => { throw new Error('async cleanup failure') },
+      ]) {
+        let resolveLate: (v: string) => void = () => {}
+        const late = { current: new Promise<string>((r) => { resolveLate = r }) }
+        const nextAttempt = () => { const p = late.current; late.current = new Promise(() => {}); return p }
+        let t = 0
+        await expect(retryWithBackoff({
+          tryOpen: nextAttempt,
+          isRetryable: isLockError, maxMs: 60, intervalMs: 20, attemptMs: 20,
+          sleep: async (ms) => { t += ms }, now: () => t,
+          onAbandoned,
+        })).rejects.toThrow()
+        resolveLate('late-conn')
+        // 让 `then` 与 `catch` 两条微任务链都跑完，再让事件循环转一圈收 unhandledRejection
+        for (let i = 0; i < 5; i++) await Promise.resolve()
+        await new Promise((r) => setImmediate(r))
+      }
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
+    expect(rejections, '清理回调的失败不得升级为 unhandled rejection').toEqual([])
+  })
+
+  it('超时计时器不得 unref（unref 后「唯一活跃 handle 就是它自己」会让进程静默退出）', async () => {
+    // CodeRabbit PR#74 第二轮 major（实测成立）。⚠️ 为什么不是「起子进程看它退不退出」：
+    // `unref` 是写死进库里的，测试进程只有 `tryOpen: () => new Promise(() => {})` 的两种
+    // 情形 —— 留着 unref 时子进程 0.1s 就 **exit 0、零输出**；去掉后它会按超时**挂着**，
+    // 测试分不清「计时器没触发」和「触发后进程就是不退」。所以把计时器创建包一层，
+    // 直接断言「没有对超时计时器调用 unref」。
+    // ⚠️ 只接管 `setTimeout`、不接管 `unref` 本身：`sleep` 自己也可能用 unref 计时器，
+    // 全局改 `unref` 会连带判错。
+    const offenders: Error[] = []
+    const original = globalThis.setTimeout
+    const patched = ((fn: (...a: never[]) => void, ms?: number, ...rest: never[]) => {
+      const handle = original(fn, ms, ...rest)
+      const stamp = new Error('创建于')
+      handle.unref = function (this: typeof handle) {
+        offenders.push(stamp)
+        return handle
+      }
+      return handle
+    }) as unknown as typeof setTimeout
+    globalThis.setTimeout = patched
+    try {
+      // 真实计时器（不注入 sleep/now）：走的就是 withAttemptTimeout 的 setTimeout
+      await expect(retryWithBackoff({
+        tryOpen: () => new Promise(() => {}), isRetryable: () => true, maxMs: 40, attemptMs: 40,
+      })).rejects.toMatchObject({ timedOut: true })
+    } finally {
+      globalThis.setTimeout = original
+    }
+    expect(offenders, '超时计时器在 finally 里就 clearTimeout 了，unref 省不下任何东西；'
+      + '而在尝试不持有活跃 handle 时，unref 会让 Node 直接退出、超时永远不报').toEqual([])
   })
 })

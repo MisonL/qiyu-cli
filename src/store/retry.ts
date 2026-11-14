@@ -150,7 +150,11 @@ export interface RetryOpts<T> {
    * （既有调用方与测试不受影响）。
    */
   attemptMs?: number
-  /** 超时后被放弃的那次尝试**最终成功**时回调 —— 调用方据此关掉连接/实例（防泄漏）。 */
+  /**
+   * 超时后被放弃的那次尝试**最终成功**时回调 —— 调用方据此关掉连接/实例（防泄漏）。
+   * 回调抛错/返回 rejected promise 都会被吞掉（`retry.ts` 统一兜）：清理失败不该拖垮
+   * 已经给出结论的重试，也不该变成 unhandled rejection 把进程带走。
+   */
   onAbandoned?: (v: T) => void
   sleep?: (ms: number) => Promise<void>
   now?: () => number
@@ -166,12 +170,16 @@ class AttemptTimeout extends Error {
 function withAttemptTimeout<T>(p: Promise<T>, ms: number | undefined): Promise<T> {
   if (ms === undefined) return p
   let timer: ReturnType<typeof setTimeout> | undefined
-  // `unref`：这个只用于计时的 handle 不应把进程留在前台（CodeRabbit PR#74 —— 原生
-  // `create/connect` 卡住时，CLI 该按 store_locked 退出，而不是被内部计时器吊住）。
-  // 它不会让超时失效：被 race 的那条 attempt 自己持有的 I/O handle 仍然算活跃。
+  // ⚠️ **不要 unref**（CodeRabbit PR#74 第二轮 major，实测确认）：
+  // 计时器在 `finally` 里就被 `clearTimeout`，活不过这次尝试，unref 省不下任何东西；
+  // 而一旦尝试本身不持有任何活跃 handle（`new Promise(() => {})`、某些原生卡住形态），
+  // unref 的计时器会让 Node **直接退出**（实测：探针脚本 0.1s 退出、超时回调从未执行）——
+  // CLI 于是静默 exit 0、一个字都不吐，比「一直挂着」更难诊断。
+  // ⚠️ 残余边界（如实记录）：被放弃的原生调用若仍持有活跃句柄，进程可能在打出
+  // `store_locked` 之后**仍不立刻退出** —— CLI 刻意不用 `process.exit`（会截断 stdout，
+  // 见 `src/cli.ts` 入口注释），所以这里换到的是「结论一定给出」，不是「进程一定立刻结束」。
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new AttemptTimeout(ms)), ms)
-    ;(timer as { unref?: () => void }).unref?.()
   })
   return Promise.race([p, timeout]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
 }
@@ -202,14 +210,21 @@ export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
       const timedOut = e instanceof AttemptTimeout
       if (timedOut && opts.onAbandoned !== undefined) {
         // 被放弃的尝试若稍后成功，结果必须交回清理（连接/实例泄漏 = 多一个锁持有者）。
-        attempt.then((v) => opts.onAbandoned!(v), () => {})
+        // 清理回调可能抛错 —— 那是**调用方的**错误，而此刻调用方已经拿到结论：
+        // 让它在 `then` 里 reject 会变成 unhandled rejection（Node ≥15 默认杀进程），
+        // 于是「晚到的连接没关掉」升级成「整条命令崩在一行与用户无关的栈上」。
+        // 兜在这里而不是要求每个调用方自己 try：别处新增回调不会记得这件事。
+        const abandoned = attempt.then((v) => opts.onAbandoned!(v), () => {})
+        abandoned.catch(() => { /* 清理失败不掩盖原错误，也不拖垮进程 */ })
       }
       if (!timedOut && !opts.isRetryable(e)) throw e
       if (now() - start + intervalMs > opts.maxMs) {
         // 超时且没有更具体的成因时，给调用方一个可识别的锁语义（与既有 store_locked 包装同源）
         // 用自有字段而不是标准的 `cause`（那应该是 Error，写成字符串会误导诊断）
         throw timedOut
-          ? Object.assign(new Error(`打开超时（${opts.attemptMs}ms 内未返回，等待 ${opts.maxMs}ms 后放弃）`),
+          // 报文用**实际生效的**那一档上限（`attemptCap` 可能被剩余预算夹小），
+          // 不是配置里的 `attemptMs` —— 否则日志说「等了 30000ms」而实际只等了 400ms。
+          ? Object.assign(new Error(`打开超时（本次尝试 ${attemptCap ?? opts.attemptMs}ms 内未返回，等待 ${opts.maxMs}ms 后放弃）`),
             { timedOut: true })
           : e
       }

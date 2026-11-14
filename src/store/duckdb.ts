@@ -237,6 +237,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 65000 是保守值：实测该版本上限 ≥70000，勿据此放大（Q 组 Q-低-1）。
     const hardCap = Math.max(1, Math.floor(65000 / cols.length))
     const rowsPerStmt = Math.max(1, Math.min(cfg.batchSize, hardCap))
+    // `DO NOTHING` 时不能按 `batch.length` 记账（Codex PR#74 第二轮 P2）：冲突行一行都没写，
+    // 契约（types.ts `Store.upsert`「返回实际写入行数」）要求如实计数。这张表所有列都是主键，
+    // 唯一会改变行数的就是「新键插入」—— 用前后计数，与 `del` 的算法同源。
+    // `DO UPDATE` 之路不计数：新键插入、旧键更新，两者都算一次写入。
+    const countDelta = nonKey.length === 0
+    const beforeCount = countDelta ? await store.count(t.name) : 0
     for (let i = 0; i < uniq.length; i += rowsPerStmt) {
       const batch = uniq.slice(i, i + rowsPerStmt)
       const placeholders = batch.map(() => `(${cols.map(() => '?').join(', ')})`).join(', ')
@@ -246,6 +252,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         params)
       written += batch.length
     }
+    if (countDelta) return Math.max(0, (await store.count(t.name)) - beforeCount)
     return written
   }
 

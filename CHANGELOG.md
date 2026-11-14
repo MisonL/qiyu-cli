@@ -54,10 +54,14 @@
     权限读外部文件（实测）。现在建连即设 `false`；`store status` 只数**基表**，同名 view 进
     warnings（「库有漂移只警告不失败」仍是承诺），单表计数失败也只降级成警告；
   · **他人库指纹**：`store init` 不再「有个能读的 `schema_version` 就当自己的库」——
-    声明表出现声明外的列即拒绝（同名异形表此前会被 `IF NOT EXISTS` 静默沿用），
-    `store status` 对缺 `version` 列的库给「换 `--db`」而不是「备份重建」；
+    只认三种「本 CLI 不可能产出」的形态（`schema_version` 缺 `version` 列 / 声明表存在但
+    `schema_version` 零记录 / 版本号高于最新迁移）即拒绝（同名异形表此前会被 `IF NOT EXISTS`
+    静默沿用）；「声明表带声明外的列」**不**拒（schema 漂移按既有契约只警告，
+    首版把它也判成他人库，全量回归当场误伤用户改过的库），但该表转为只读打开，
+    `schema_version` 是 view 时连 `MAX(version)` 都不求值；
   · **只有主键列的表 upsert**：`schema_version` 的 `DO UPDATE SET` 空子句此前是
-    `Parser Error`，改为 `DO NOTHING`；
+    `Parser Error`，改为 `DO NOTHING`；返回值同时改为「前后行数差」，冲突行一行没写就不再
+    报成写了 1 行（`Store.upsert` 的契约原文是「实际写入行数」，Codex 2026-11-14 P2）；
   · **配置顶层不是对象**：`42` / `null` 此前被静默当成空配置回落默认库（`null` 还变成
     「用法错误」退出码 2），现在明确拒绝；
   · **网络重试不再绕过本地限频预算**：令牌只在进入重试循环前取一次，一次逻辑调用能发 3 个
@@ -65,7 +69,9 @@
     14003 重签不在其列（那是未执行的鉴权重试）；
   · **只读库打开有界**：打开调用一直不返回（网络盘 / 卡住的锁等待）时截止时间此前永远到不了，
     `store status` 会无限挂住 —— `retryWithBackoff` 增加单次尝试上限，超时按可重试处理，
-    被放弃的尝试若稍后成功则交回清理（防连接泄漏）；
+    被放弃的尝试若稍后成功则交回清理（防连接泄漏）；单次尝试上限再被剩余总预算夹住，
+    不会在 30s 预算里等到近 60s；超时计时器**不 unref**（尝试本身不持有活跃句柄时，
+    unref 计时器会让 Node 直接退出、超时永远报不出来），清理回调抛错也只吞不崩；
   · **`sync status` 等子命令的重复取值参数**：静默覆盖前一个值，而 `store` / `query` /
     `sync run` 都拒绝 —— 统一报用法错误；
   · `auth` / `api` 的 `--help` 错误码清单补上真实会出现的 `config_invalid`。
@@ -117,7 +123,7 @@
   只读形态用例从「只看退出码」改为断言**真实列与行**；时区用例的 `Promise.all` 改为顺序跑
   （`inZone` 改的是进程级 `TZ`，并发会让三个模块都在最后一个时区下初始化）；
   `db.test.ts` 如实记录「单库路径 + 超时后残留操作交错」这一已知边界。
-- - **新增 `tests/helpers/capture.ts`：按用例隔离 stdout/stderr 捕获**（CodeRabbit 2026-11-13 major）。
+- **新增 `tests/helpers/capture.ts`：按用例隔离 stdout/stderr 捕获**（CodeRabbit 2026-11-13 major）。
   27 个测试文件用模块级 `let out` + `beforeEach` 重置的模式挡得住「上一条的输出漏进下一条」
   的**状态**，挡不住**写入方**：上一条超时后，它已发出、尚未 resolve 的异步调用会在下一条
   开始之后才写 stdout（实测 `out="FRESHTAIL"`、`writes=2`）。归属按 `AsyncLocalStorage`
