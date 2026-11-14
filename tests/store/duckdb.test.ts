@@ -692,10 +692,24 @@ describe('duckdb —— init 与关闭', () => {
     return p
   }
 
+  /**
+   * 开库、确信 init 被拒、**在 finally 里关掉**（CodeRabbit PR#74 第六轮）：拒绝路径不关连接，
+   * 这条用例自己就成了下一个打开者的锁持有者 —— 用例间是否串味取决于跑哪个先。
+   * 关闭放在 `finally` 里，和断言在哪一行无关：断言由调用方写（各自的成因文案不同）。
+   */
+  const initRejects = async (path: string): Promise<unknown> => {
+    const store = await createDuckDbStore({ ...cfg, path }, 'rw')
+    try {
+      return await store.init().then(() => { throw new Error('init 本应被拒绝，却成功了') })
+    } finally {
+      await store.close()
+    }
+  }
+
   it('他人库指纹 ①：schema_version 缺 version 列 → 拒绝（不回落到「版本 0 照常迁移」）', async () => {
     const p = await rawDb('a.db', 'CREATE TABLE schema_version (version_id INTEGER, applied_at VARCHAR)')
     // 报错必须点名 schema_version —— 否则「拒绝」可能来自别的原因，判据就成了碰巧绿。
-    await expect(createDuckDbStore({ ...cfg, path: p }, 'rw').then((s) => s.init()))
+    await expect(initRejects(p))
       .rejects.toMatchObject({ kind: 'store_not_initialized',
         message: expect.stringContaining('schema_version 缺少 version 列') })
   })
@@ -704,7 +718,7 @@ describe('duckdb —— init 与关闭', () => {
     const p = await rawDb('b.db',
       'CREATE TABLE schema_version (version INTEGER)',
       'CREATE TABLE secret (k VARCHAR)')
-    await expect(createDuckDbStore({ ...cfg, path: p }, 'rw').then((s) => s.init()))
+    await expect(initRejects(p))
       .rejects.toMatchObject({ kind: 'store_not_initialized',
         message: expect.stringContaining('schema_version 没有任何记录') })
   })
@@ -713,7 +727,7 @@ describe('duckdb —— init 与关闭', () => {
     const p = await rawDb('c.db',
       'CREATE TABLE schema_version (version INTEGER)',
       'INSERT INTO schema_version VALUES (999)')
-    await expect(createDuckDbStore({ ...cfg, path: p }, 'rw').then((s) => s.init()))
+    await expect(initRejects(p))
       .rejects.toMatchObject({ kind: 'store_not_initialized',
         message: expect.stringContaining('高于本 CLI 已知的最新迁移') })
   })
@@ -727,7 +741,7 @@ describe('duckdb —— init 与关闭', () => {
     const p = await rawDb('d.db',
       'CREATE TABLE placeholder (x INTEGER)',
       'CREATE VIEW schema_version AS SELECT CAST(\'x\' AS INTEGER) AS version')
-    await expect(createDuckDbStore({ ...cfg, path: p }, 'rw').then((x) => x.init()))
+    await expect(initRejects(p))
       .rejects.toMatchObject({ kind: 'store_not_initialized',
         message: expect.stringContaining('schema_version 不是基表') })
   })
