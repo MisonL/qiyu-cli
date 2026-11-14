@@ -63,8 +63,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const inst = mode === 'ro'
       ? await mod.DuckDBInstance.create(cfg.path, { access_mode: 'READ_ONLY' })
       : await mod.DuckDBInstance.create(cfg.path)
+    let conn: unknown
     try {
-      const conn = await (inst as { connect: () => Promise<unknown> }).connect()
+      conn = await (inst as { connect: () => Promise<unknown> }).connect()
       // ⚠️ 会话级封锁外部访问（2026-11-14，历史审查 PR#4 复核）：此前只有查询沙箱
       // （`src/query/sandbox.ts` 的 `HARDENING_SQL`）设过 `enable_external_access=false`，
       // store 连接什么都没设 —— 而实测 DuckDB 默认值是 **true**。于是 `store status/init`
@@ -78,6 +79,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     } catch (e) {
       // ⚠️ R 组 R9：create 成功但 connect 失败 → instance 泄漏（锁可能随进程滞留），
       // ro 退避路径会累积 —— 失败路径自清理。
+      // ⚠️ **连接也要关**（Codex PR#74 第三轮 P2）：加固 `SET` 是在 connect **成功之后**才跑的，
+      // 它失败时只关 instance 会漏掉已建立的连接 —— DuckDB 的锁要两者都关才释放，ro 退避路径
+      // 每失败一次就多一个未关连接，后续打开更容易撞锁。先关连接，再关实例。
+      try { (conn as { closeSync?: () => void } | undefined)?.closeSync?.() } catch { /* 同上 */ }
       try { (inst as { closeSync?: () => void }).closeSync?.() } catch { /* 清理错误不掩盖原异常 */ }
       throw e
     }

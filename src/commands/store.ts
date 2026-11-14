@@ -274,13 +274,13 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // status 整条退出 1，而「库有漂移只警告」是本命令的承诺）。view/macro 与未声明表一样
     // 进 warnings、不进 tables。
     const nonBase = new Set(nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows))
-    // 单表计数失败同样降级成警告（竞态：`tables()` 之后真表被改名成 view）。
-    const countWarnings: string[] = []
     for (const n of names) {
       if (undeclared.has(n) || nonBase.has(n)) continue
-      const r = await countTable(store, n)
-      if ('error' in r) countWarnings.push(r.error)
-      else tables.push({ name: n, rows: r.rows })
+      // ⚠️ 基表的 COUNT 失败**不**降级成警告（Codex PR#74 第三轮 P1）：view 已在上面按类型
+      // 排除，所以走到这里的都是基表，数不出来就是真错（磁盘 I/O、库损坏、并发删表）——
+      // 按 spec §8.2「DuckDB 执行期错误 → internal / 退出码 1」如实失败。
+      // 把这类错误说成 warning + 退出码 0，Agent 会以为拿到的 tables 是完整的。
+      tables.push({ name: n, rows: await store.count(n) })
     }
     // ⚠️ `schema_version` 自己是 view 时**不许求值**（CodeRabbit PR#74）：列检查（version 列存在）
     // 会放行，这条 MAX(version) 仍会把 view 本体执行一遍 —— 一个 `CAST('x' AS INTEGER)` 就能
@@ -293,7 +293,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // 同一库上 `db tables` 会警告、`store status` 报 ok 且干净，README 又教 Agent
     // 「数量不等时先读 warnings」，于是 Agent 读到空 warnings 反而确认了「没事」。
     const warnings = storeTablesWarnings(names, config.path, profileFlag)
-    const allWarnings = [...(warnings ?? []), ...(nonBaseTablesWarning([...nonBase]) ?? []), ...countWarnings]
+    const allWarnings = [...(warnings ?? []), ...(nonBaseTablesWarning([...nonBase]) ?? [])]
     return ok({ path: config.path, backend: config.backend, config_path: configPath,
       config_exists: configExists,
       schema_version: Number(sv.rows[0]?.v ?? 0), tables },
@@ -303,24 +303,3 @@ export async function storeCommand(argv: string[]): Promise<number> {
   } catch (e) { return thrownToExit(e, profileFlag) } finally { await store.close() }
 }
 
-/**
- * `store status` 的逐表计数，**单表失败只降级成警告**（2026-11-14，历史审查 PR#4 复核）。
- *
- * ⚠️ 为什么需要：`information_schema.tables` 把 view 也算作表 —— 一条与声明表**同名**的
- * view（来源不明的库里可以随意写）会作为 `COUNT(*)` 的**本体**被执行，吃到的是用户权限
- * （2026-11-14 实测：含 `read_csv_auto(外部文件)` 的 `tags` view 让 status 抛 IO Error、
- * 整条命令退出 1）。store 连接现在封锁了外部访问（`createDuckDbStore` 建连即设
- * `enable_external_access=false`），但 view 读取**库内**其它表/重计算仍会执行，且失败会
- * 打断整条命令 —— 而「库有漂移只警告、不失败」是本命令对外的承诺（README / db tables 同口径）。
- * 语义上：数不出来就说数不出来，不把「不是基表」报成「未知表」。
- */
-async function countTable(
-  store: Store, name: string,
-): Promise<{ rows: number } | { error: string }> {
-  try {
-    return { rows: await store.count(name) }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    return { error: `表 ${name} 计数失败（库中同名对象不可计数，可能是 view）：${msg}` }
-  }
-}

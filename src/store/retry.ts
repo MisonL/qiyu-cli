@@ -197,7 +197,13 @@ async function runLoop<T>(opts: RetryOpts<T>, pendingAbandoned: { at: number; p:
   const now = opts.now ?? (() => Date.now())
   const start = now()
   const onAbandoned = opts.onAbandoned
+  // 上一次失败的「预算耗尽时该抛什么」。⚠️ 循环顶部还要再查一次（Codex PR#74 第三轮 P2）：
+  // `sleep` 可能比 `intervalMs` 长得多（进程被挂起、注入的 sleeper 把时钟推过头），
+  // 这时预算其实已经用光，但旧的判据只在**失败之后**比 —— 会再发起一次新的 `tryOpen`，
+  // 等于在 `readOnlyRetryMs` 到期后还去打开数据库（真实副作用：抢锁、起原生线程）。
+  let exhausted: { err: unknown } | undefined
   for (;;) {
+    if (exhausted !== undefined && now() - start >= opts.maxMs) throw exhausted.err
     let attempt: Promise<T>
     try {
       attempt = opts.tryOpen()
@@ -213,7 +219,8 @@ async function runLoop<T>(opts: RetryOpts<T>, pendingAbandoned: { at: number; p:
     }
     // 单次尝试的上限还要被**剩余总预算**夹住（CodeRabbit PR#74）：否则 30s 预算里
     // 前面撞锁花掉 29s 后，下一次尝试仍能再跑满 30s —— 实际等待近 60s。
-    // （`noRetry` 的下限 1ms 只影响等待已耗尽时的最后一击，让它有界而不是零。）
+    // `Math.max(1, …)` 只是兜住「剩余预算已 ≤0」的病态输入（1ms 的一次尝试仍是有界的）；
+    // 「预算已耗尽却还发起新尝试」由循环顶部的 `exhausted` 判据挡住，不靠这个下限。
     const remainingMs = opts.maxMs - (now() - start)
     const attemptCap = opts.attemptMs === undefined ? undefined
       : Math.max(1, Math.min(opts.attemptMs, remainingMs))
@@ -226,16 +233,16 @@ async function runLoop<T>(opts: RetryOpts<T>, pendingAbandoned: { at: number; p:
         pendingAbandoned.push({ at: againAt ?? now(), p: attempt })
       }
       if (!timedOut && !opts.isRetryable(e)) throw e
-      if (now() - start + intervalMs > opts.maxMs) {
-        // 超时且没有更具体的成因时，给调用方一个可识别的锁语义（与既有 store_locked 包装同源）
-        // 用自有字段而不是标准的 `cause`（那应该是 Error，写成字符串会误导诊断）
-        throw timedOut
-          // 报文用**实际生效的**那一档上限（`attemptCap` 可能被剩余预算夹小），
-          // 不是配置里的 `attemptMs` —— 否则日志说「等了 30000ms」而实际只等了 400ms。
-          ? Object.assign(new Error(`打开超时（本次尝试 ${attemptCap ?? opts.attemptMs}ms 内未返回，等待 ${opts.maxMs}ms 后放弃）`),
-            { timedOut: true })
-          : e
-      }
+      // 超时且没有更具体的成因时，给调用方一个可识别的锁语义（与既有 store_locked 包装同源）
+      // 用自有字段而不是标准的 `cause`（那应该是 Error，写成字符串会误导诊断）
+      const budgetSpent = timedOut
+        // 报文用**实际生效的**那一档上限（`attemptCap` 可能被剩余预算夹小），
+        // 不是配置里的 `attemptMs` —— 否则日志说「等了 30000ms」而实际只等了 400ms。
+        ? Object.assign(new Error(`打开超时（本次尝试 ${attemptCap ?? opts.attemptMs}ms 内未返回，等待 ${opts.maxMs}ms 后放弃）`),
+          { timedOut: true })
+        : e
+      exhausted = { err: budgetSpent }
+      if (now() - start + intervalMs > opts.maxMs) throw budgetSpent
       await sleep(intervalMs)
     }
   }

@@ -180,6 +180,20 @@ describe('retryWithBackoff —— 有界重试', () => {
     expect(message, `报文不得照抄被夹小的 attemptMs：${message}`).not.toContain('5000ms')
   })
 
+  it('sleep 比 intervalMs 长得多（时钟被推过预算）→ 不再发起新的打开尝试', async () => {
+    // Codex PR#74 第三轮 P2：旧判据只在**失败之后**比预算，`sleep` 把时钟推过 maxMs 后
+    // 循环仍会再调一次 `tryOpen` —— 等于在预算到期后又去打开数据库（真实副作用：抢锁）。
+    let t = 0
+    let calls = 0
+    await expect(retryWithBackoff({
+      tryOpen: () => { calls++; return Promise.reject(lockErr()) },
+      isRetryable: isLockError, maxMs: 100, intervalMs: 20, attemptMs: 5,
+      // 一次 sleep 就把时钟推过预算（真实世界：进程被挂起 / 磁盘卡住）
+      sleep: async () => { t += 150 }, now: () => t,
+    })).rejects.toThrow()
+    expect(calls, '预算耗尽后不得再打开数据库').toBe(1)
+  })
+
   it('超时后被放弃的尝试最终成功 → 交回给 onAbandoned 清理', async () => {
     // 每次尝试一个新 promise（同一个 promise 被 4 次尝试共用时，`then` 会各注册一次）
     let resolveLate: (v: string) => void = () => {}

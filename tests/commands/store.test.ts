@@ -75,6 +75,36 @@ describe('store init', () => {
     }
   })
 
+  // Codex PR#74 第三轮 P1：基表 COUNT 失败曾被降级成 warning + 退出码 0（本轮复核引入的
+  // 过度兜底）。view 已在计数前按类型排除，走到 COUNT 的都是基表 —— 数不出来是真错，
+  // 按 spec §8.2「DuckDB 执行期错误 → internal / 退出码 1」如实失败。
+  it('基表计数失败 → 1 + internal，不得以 0 + warning 返回不完整结果', { timeout: 40000 }, async () => {
+    expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
+    out = ''; err = ''
+    vi.resetModules()
+    vi.doMock('../../src/store/index.js', async (importOriginal) => {
+      const orig = await importOriginal<typeof import('../../src/store/index.js')>()
+      const { createDuckDbStore } = await import('../../src/store/duckdb.js')
+      return {
+        ...orig,
+        openStore: async (cfg: unknown, mode: unknown) => {
+          const s = await createDuckDbStore(cfg as never, mode as never)
+          // 只让计数失败：information_schema / MAX(version) 那条 query 照常
+          vi.spyOn(s, 'count').mockRejectedValue(new Error('IO Error: Could not read enough bytes from file'))
+          return s
+        },
+      }
+    })
+    const { storeCommand: mockedCommand } = await import('../../src/commands/store.js')
+    try {
+      expect(await mockedCommand(['status', '--db', dbPath()])).toBe(1)
+      expect(JSON.parse(out).error.kind).toBe('internal')
+    } finally {
+      vi.doUnmock('../../src/store/index.js')
+      vi.restoreAllMocks()
+    }
+  })
+
   it('退出码 0、输出六字段', async () => {
     expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
     const d = data()
