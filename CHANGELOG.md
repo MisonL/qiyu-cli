@@ -57,8 +57,8 @@
     （Codex 2026-11-14 P1：曾把它降级成 warning + 退出码 0，Agent 会以为拿到的是完整的 tables）；
   · **他人库指纹**：`store init` 不再「有个能读的 `schema_version` 就当自己的库」——
     只认三种「本 CLI 不可能产出」的形态（`schema_version` 缺 `version` 列 / 声明表存在但
-    `schema_version` 零记录 / 版本号高于最新迁移）即拒绝（同名异形表此前会被 `IF NOT EXISTS`
-    静默沿用）；「声明表带声明外的列」**不**拒（schema 漂移按既有契约只警告，
+    `schema_version` 零记录 / 版本号高于最新迁移 / `schema_version` 不是基表而是 view）即拒绝
+    （同名异形表此前会被 `IF NOT EXISTS` 静默沿用；view 那条同时保证**不求值**它）；「声明表带声明外的列」**不**拒（schema 漂移按既有契约只警告，
     首版把它也判成他人库，全量回归当场误伤用户改过的库）；`schema_version` 是 view 时
     连 `MAX(version)` 都不求值（否则 view 本体被当成查询执行）；
   · **只有主键列的表 upsert**：`schema_version` 的 `DO UPDATE SET` 空子句此前是

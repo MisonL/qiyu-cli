@@ -718,6 +718,20 @@ describe('duckdb —— init 与关闭', () => {
         message: expect.stringContaining('高于本 CLI 已知的最新迁移') })
   })
 
+  // CodeRabbit PR#74 第五轮：`schema_version` **是 view** 时，init 里的
+  // `SELECT COUNT(*), MAX(version)` 会把 view 本体执行一遍（`CAST('x' AS INTEGER)` 直接
+  // 报 Conversion Error → internal），既绕开了「他人库」归类，也与 CHANGELOG 里
+  // 「是 view 时连 MAX(version) 都不求值」的说法相矛盾。判据要在求值**之前**看对象类型。
+  it('他人库指纹 ④：schema_version 是 view → 拒绝且不求值它（否则 view 体被当查询执行）', async () => {
+    // 「一执行就炸」的 view（若被求值，报错会是 Conversion Error / internal）
+    const p = await rawDb('d.db',
+      'CREATE TABLE placeholder (x INTEGER)',
+      'CREATE VIEW schema_version AS SELECT CAST(\'x\' AS INTEGER) AS version')
+    await expect(createDuckDbStore({ ...cfg, path: p }, 'rw').then((x) => x.init()))
+      .rejects.toMatchObject({ kind: 'store_not_initialized',
+        message: expect.stringContaining('schema_version 不是基表') })
+  })
+
   it('他人库指纹不误伤：声明表带声明外的列（既有 schema 漂移）照常可用，只由 db tables 警告', async () => {
     // ⚠️ 首版把这一档也拒了，全量回归当场抓到（`db tables` 的漂移用例给 sessions 加了
     // rogue_col）。多列/少列是既有契约里的漂移，不属于「他人库」。

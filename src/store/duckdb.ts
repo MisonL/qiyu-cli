@@ -282,7 +282,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * ⚠️ **只认「我们绝不可能产出」的形态**（2026-11-14，历史审查 PR#4 复核实测）：
    * ① `schema_version` 没有 `version` 列 —— 我们的迁移第一版就建了它；
    * ② 有表但 `schema_version` **一行都没有** —— 我们的每次迁移都插一行，留下的库至少有一条；
-   * ③ 记录的最大版本**超过本 CLI 已知的最新迁移** —— 我们从未写过这个号。
+   * ③ 记录的最大版本**超过本 CLI 已知的最新迁移** —— 我们从未写过这个号；
+   * ④ `schema_version` **不是一个基表**（view 等）—— 我们只会建表，且求值外来 view 有副作用。
    * ⚠️ **不要**改回「声明表出现声明外的列就拒绝」（首版这么写，全量回归当场抓到）：
    * 多列/少列是**既有契约里的 schema 漂移**（`db tables` 只警告不失败、README 明写），
    * 一条手工 `ALTER TABLE … ADD COLUMN` 会被误判成他人库，`store init` 直接不可用。
@@ -290,6 +291,18 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 那时 init 不建表、只按 `storeTablesWarnings` 点名缺表 —— 不会往里写业务数据。
    */
   const detectForeignStore = async (): Promise<string | null> => {
+    // ⚠️ 先看**对象类型**再谈内容（CodeRabbit PR#74 第五轮）：`information_schema.tables` 把
+    // view 也算作表，下面那条 `MAX(version)` 会把 view 本体当查询执行 —— 一条
+    // `CREATE VIEW schema_version AS SELECT CAST('x' AS INTEGER)` 就能让 init 报
+    // Conversion Error（internal），既绕开「他人库」归类，也违背「是 view 就不求值」的说法。
+    // 本 CLI 从不把 schema_version 建成 view，所以「不是基表」本身就是他人库指纹。
+    const kindRes = await store.execSql(
+      "SELECT table_type FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'schema_version'")
+    const kind = String((kindRes as { getRowObjectsJson: () => Record<string, unknown>[] })
+      .getRowObjectsJson()[0]?.table_type ?? '')
+    if (kind.toUpperCase() !== 'BASE TABLE') {
+      return `目标数据库不是本 CLI 创建的（schema_version 不是基表，实际是 ${kind || '未知对象'}）：${cfg.path}`
+    }
     const r = await store.execSql(
       "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'main'")
     const cols = new Map<string, string[]>()
