@@ -99,6 +99,12 @@
   （`"SCHEMA_VERSION"` view）、`schemaVersionMissing` 的存在性判据（大写表名同样算存在）
   一律走它（`"TAGS"` 与 `"tags"` 视为同名）。只折叠 ASCII 字母：`"ticKets"`（U+212A）与
   `"tickets"` 在 DuckDB 里是两个对象，用 `toLowerCase()` 会误折叠成同一个名字。
+  同轮（Codex PR#76 第三轮）补齐两处**同一规则没跟上的下游**：`SCHEMA_VERSION_COLUMNS_SQL`
+  显式按小写名过滤，`"SCHEMA_VERSION"` 库查不到列 → 被误报「缺少 version 列」（实际列为空），
+  现在交给 DuckDB 解析器（目录表上不区分大小写）；`store init` 指纹里的列清单按精确表名取键，
+  同款误报，现已按 ASCII 折叠取键。`sync verify` 对「本地对象不是基表」的快照任务**不再**因
+  缺凭证报 `auth_missing` —— 那条路径根本不取上游，「缺凭证」是环境问题、会盖住本地可诊断的
+  `not_base_table` drift；所有选中的快照任务本地都不是基表时才放行结果。
 
 - **`db tables` / `store init` 与 `store status` 同口径：只认基表**（2026-11-14，PR #74 合并后自查）：
   上一轮只改了 `store status`，而同一份库里另外两条命令仍把 `information_schema` 里的 view

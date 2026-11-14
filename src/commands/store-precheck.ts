@@ -256,9 +256,12 @@ export function storeTablesWarnings(
 /**
  * 查 `schema_version` 表列名的 SQL —— **唯一字符串**（db/store/sync 三个调用点共用，
  * 各自经自己的会话执行；判据本体在 `schemaVersionMissing`）。
+ * 列名原样返回（调用方按 `versionColumns` 判），表名匹配交给 DuckDB 解析器 —— 它在
+ * 目录表上不区分大小写，`"SCHEMA_VERSION"` 表同样会返回它的列。
  */
 export const SCHEMA_VERSION_COLUMNS_SQL =
-  "SELECT column_name FROM information_schema.columns WHERE table_schema='main' AND table_name='schema_version'"
+  "SELECT column_name FROM information_schema.columns WHERE table_schema='main' "
+  + "AND lower(table_name)='schema_version'"
 
 /**
  * 库结构校验：已有 `schema_version` → `null`；否则给出**按成因分形**的失败载荷。

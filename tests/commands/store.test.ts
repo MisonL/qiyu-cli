@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { storeCommand } from '../../src/commands/store.js'
+import { dbCommand } from '../../src/commands/db.js'
+import { syncCommand } from '../../src/commands/sync.js'
 import { TABLES } from '../../src/store/schema.js'
 
 let dir = '', out = '', err = ''
@@ -400,21 +402,59 @@ describe('store status', () => {
   })
 
   it('schema_version 表名只差大小写（"SCHEMA_VERSION"）也按其列判 —— 不得误报「缺表」（Codex PR#76）', async () => {
-    // 存在性若按精确比较，带 version 列的 `"SCHEMA_VERSION"` 表会被当成「缺表」→
-    // 空库分支的 hint「请运行 store init」，而它其实是他人库。
+    // 存在性、列探测、init 的指纹都要按同一规则取（Codex PR#76 第三轮：列探测此前仍按
+    // 小写名过滤，实测「实际列：」为空 → 把可用的库说成他人库）。
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (p: string) => Promise<{ connect: () => Promise<{ run: (sql: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
+    const inst = await mod.DuckDBInstance.create(dbPath())
+    const conn = await inst.connect()
+    await conn.run('ALTER TABLE schema_version RENAME TO "SCHEMA_VERSION"')
+    conn.closeSync(); inst.closeSync()
+    // 它是完整的库（列与记录都在），四条通路都不得拒绝
+    for (const argv of [['status'], ['init']] as string[][]) {
+      out = ''
+      expect(await storeCommand([...argv, '--db', dbPath()]), `${argv[0]} 不得把大写表名的完整库判成他人库；输出：${out.slice(0, 300)}`).toBe(0)
+    }
+    out = ''
+    expect(await dbCommand(['tables', '--db', dbPath()]), `db tables 同样；输出：${out.slice(0, 300)}`).toBe(0)
+    out = ''
+    expect(await syncCommand(['verify', 'tickets.search', '--db', dbPath()]), `sync verify 同样；输出：${out.slice(0, 300)}`).toBe(1)
+    expect(JSON.parse(out).ok, 'verify 的出口是 drift（未同步），不是库结构错误').toBe(true)
+  })
+
+  it('大小写规则不吞真缺失：有表但无 schema_version 仍报「缺表」', async () => {
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (p: string) => Promise<{ connect: () => Promise<{ run: (sql: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const p = join(dir, 'alien2.db')
+    const inst = await mod.DuckDBInstance.create(p)
+    const conn = await inst.connect()
+    await conn.run('CREATE TABLE alien (a INTEGER)')
+    conn.closeSync(); inst.closeSync()
+    out = ''
+    expect(await storeCommand(['status', '--db', p])).toBe(1)
+    expect(JSON.parse(out).error.message).toMatch(/缺表/)
+  })
+
+  it('schema_version 表名只差大小写（"SCHEMA_VERSION"）且缺 version 列 → 按列判为他人库，不报「缺表」', async () => {
+    // 存在性若按精确比较，这条表会被当成「缺表」（空库分支的 hint「请运行 store init」），
+    // 而它其实是他人库 —— 判据要落到**列**上。
     const mod = (await import('@duckdb/node-api')) as unknown as {
       DuckDBInstance: { create: (p: string) => Promise<{ connect: () => Promise<{ run: (sql: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
     }
     const p = join(dir, 'upper-sv.db')
     const inst = await mod.DuckDBInstance.create(p)
     const conn = await inst.connect()
-    await conn.run('CREATE TABLE "SCHEMA_VERSION" (version INTEGER)')
+    await conn.run('CREATE TABLE "SCHEMA_VERSION" (version_id INTEGER)')
     await conn.run('CREATE TABLE alien (a INTEGER)')
     conn.closeSync(); inst.closeSync()
     out = ''
     expect(await storeCommand(['status', '--db', p])).toBe(1)
     const e = JSON.parse(out).error
     expect(e.message, '不得报成「数据库结构不完整（缺表）」').not.toMatch(/缺表/)
+    expect(e.message, '按列判：缺少 version 列').toMatch(/version 列/)
     expect(e.hint, '它是他人库 → 换 --db 路径').toMatch(/换 --db 路径/)
   })
 })

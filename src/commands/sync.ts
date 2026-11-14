@@ -41,6 +41,7 @@ import {
   ok, fail, usageFail, failFromTagged, setPretty, describeArgs,
   syncRunCommand, storeInitCommand, storeLocationOf, dbTablesCommand,
 } from '../output.js'
+import type { ErrorInput } from '../output.js'
 import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
 import {
@@ -388,14 +389,17 @@ async function syncVerify(argv: string[]): Promise<number> {
     // 「改参数重来」退出码 2 并丢掉 hint，与 auth/api 那条路径的说法相反。
   } catch (e) { return failFromTagged(e) }
 
-  // 凭证惰性解析：快照任务需要上游 fetch；纯 windowed 选中时不碰凭证
-  //（归因准确：本地核对不该因缺环境变量失败）。
+  // 凭证懒解析（Codex PR#76 第三轮）：只有**真的会发上游请求**的快照任务才算。凭证是
+  // 环境问题（auth_missing，退出码 1），而「本地同名对象不是基表」是本地可诊断的 drift ——
+  // 若后者成立，先报 auth_missing 会把真正的结论盖住。先解析一次（保持「库打不开时凭证问题
+  // 不抢先」的既有次序），**用不用**由下面的循环按实际需要决定；用不上就只告警。
   const needsUpstream = tasks.some((t) => t.kind === 'snapshot')
   let creds: { appKey: string; appSecret: string } | undefined
+  let credError: ErrorInput | null = null
   if (needsUpstream) {
     const credOutcome = resolveCredentialsUsingFile(currentCredentialEnv(), { profile: parsed.values['--profile'] })
-    if (!credOutcome.ok) return fail(credOutcome.error)
-    creds = credOutcome.creds
+    if (credOutcome.ok) creds = credOutcome.creds
+    else credError = credOutcome.error
   }
 
   const guarded = statGuard(resolved.path)
@@ -414,10 +418,16 @@ async function syncVerify(argv: string[]): Promise<number> {
     // ⚠️ 按大小写不敏感比对（Codex PR#76 实测）：一条 `"TICKETS"` view 会被 `"tickets"`
     // 解析到并被执行，所以这里不能 `Set.has()` 精确比名字。
     const nonBases = nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows)
+    const isNonBaseTask = (t: SyncTask): boolean => nonBases.some((n) => sameObjectName(t.table, n))
+    // 凭证缺失只在**确实要发上游请求**时才致命：所有选中的快照任务本地都不是基表时，
+    // 本命令根本用不上凭证 —— 如实报 drift（not_base_table）比报 auth_missing 更有用。
+    if (credError !== null && !tasks.filter((t) => t.kind === 'snapshot').every(isNonBaseTask)) {
+      return fail(credError)
+    }
     const loc = storeLocationOf(resolved.path, resolved.profileFlag)
     const tasksOut: Array<Record<string, unknown>> = []
     for (const t of tasks) {
-      const isNonBase = nonBases.some((n) => sameObjectName(t.table, n))
+      const isNonBase = isNonBaseTask(t)
       const localRows = isNonBase ? null : await store.count(t.table)
       const st = states.get(t.id)
       const stateConsistent = st !== undefined && st.rangeStatus === 'complete' && st.watermark !== null

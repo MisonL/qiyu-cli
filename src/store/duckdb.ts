@@ -309,13 +309,15 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'main'")
     const cols = new Map<string, string[]>()
     for (const row of (r as { getRowObjectsJson: () => Record<string, unknown>[] }).getRowObjectsJson()) {
-      const t = String(row.table_name)
+      // ⚠️ 表名键按大小写不敏感取的规则（Codex PR#76 第三轮）：库里的 `"SCHEMA_VERSION"`
+      // 表也要取到它自己的列，否则被误判成「缺少 version 列」。列名折叠同一规则。
+      const t = String(row.table_name).replace(/[A-Z]/g, (c) => c.toLowerCase())
       const list = cols.get(t) ?? []
-      list.push(String(row.column_name).toLowerCase())
+      list.push(String(row.column_name))
       cols.set(t, list)
     }
     const svCols = cols.get('schema_version') ?? []
-    if (!svCols.includes('version')) {
+    if (!svCols.some((c) => sameObjectName(c, 'version'))) {
       return `目标数据库不是本 CLI 创建的（schema_version 缺少 version 列，`
         + `实际列：${svCols.join('、') || '无'}）：${cfg.path}`
     }

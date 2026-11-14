@@ -1202,6 +1202,23 @@ describe('sync verify', () => {
     expect((t.drift as Array<Record<string, unknown>>).map((d) => d.kind)).toContain('not_base_table')
   })
 
+  it('快照任务本地不是基表 + 缺凭证 → 报 not_base_table 而不是 auth_missing（Codex PR#76 第三轮）', async () => {
+    // 本命令用不上凭证（不取上游），「缺凭证」不应盖住本地可诊断的 drift。
+    vi.stubEnv('QIYU_APP_KEY', '')
+    vi.stubEnv('QIYU_APP_SECRET', '')
+    const s = await fresh()
+    await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+    await s.query('DROP TABLE "staff"')
+    await s.query('CREATE VIEW "staff" AS SELECT * FROM "aux_tbl"')
+    await s.query('DROP TABLE "aux_tbl"')
+    await s.close()
+    out = ''
+    expect(await syncCommand(['verify', 'dim.staff', '--db', dbPath()])).toBe(1)
+    expect(JSON.parse(out).ok, `不得是 auth_missing 错误信封；输出：${out.slice(0, 300)}`).toBe(true)
+    const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+    expect((t.drift as Array<Record<string, unknown>>).map((d) => d.kind)).toContain('not_base_table')
+  })
+
   it('快照任务选中但缺凭证 → 1 + auth_missing；纯 windowed 不需要凭证', async () => {
     vi.stubEnv('QIYU_APP_KEY', '')
     vi.stubEnv('QIYU_APP_SECRET', '')
