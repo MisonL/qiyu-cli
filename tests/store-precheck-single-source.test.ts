@@ -28,6 +28,10 @@ import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { shellArg } from '../src/core/shell.js'
 import { dbCommand } from '../src/commands/db.js'
+import { createDuckDbStore } from '../src/store/duckdb.js'
+import type { Store } from '../src/store/types.js'
+import { TABLES, ddlFor } from '../src/store/schema.js'
+
 import { queryCommand } from '../src/commands/query.js'
 import { catalogRows, CATALOG_ROW_LIMIT } from '../src/commands/store-precheck.js'
 import { statsCommand } from '../src/commands/stats.js'
@@ -396,4 +400,55 @@ describe('catalogRows（沙箱路径的目录读取唯一入口）', () => {
     const run = async () => ({ rows: [{ table_name: 'a' }], truncated: false })
     expect(await catalogRows({ run }, 'SELECT 1')).toEqual([{ table_name: 'a' }])
   })
+})
+
+// CodeRabbit + Codex PR#78 第二轮：`catalogRows` 只收编了四条命令里的目录读取，但经
+// `openGuardedSession` 的那一次**存在性预检**（`db.ts` 读全库表名交给 `schemaVersionMissing`）
+// 仍是裸 `session.run()` 缺省 1000 行 —— `query` / `stats` / `db` 全部经它。真库的
+// `information_schema.tables` **按创建顺序**返回（探针实测、SQL 无 `ORDER BY`）：先建 1100 张
+// 无关表、再建 `schema_version`，它就排在第 1001 行之后，正常库会被说成
+// 「数据库结构不完整（缺表）」（对已有数据的库是错误建议）。
+// 用真库造（不替身任何模块）：先建本 CLI 的声明表（含 `schema_version`），再把目录撑到
+// `CATALOG_ROW_LIMIT` 之上，跑三条经 `openGuardedSession` 的读命令。
+const GUARD_READERS: Array<[string, (db: string) => Promise<number>]> = [
+  ['db tables', (db) => dbCommand(['tables', '--db', db])],
+  ['query', (db) => queryCommand(['--sql', 'SELECT 1', '--db', db])],
+  ['stats fields', (db) => statsCommand(['fields', 'daily_overview', '--db', db])],
+]
+describe('openGuardedSession 的存在性预检同样走 catalogRows（截断不得说成缺表）', () => {
+  /**
+   * ⚠️ 探针实测（2026-11-15）：DuckDB 的 `information_schema.tables` 在本机**不按建表顺序**
+   * 返回 —— `schema_version` 与 `tickets` 这类名字按字典序夹在中间，先建它们后建 1100 张
+   * `zz_*` 时 `schema_version` 仍在首页。所以「把它挤出首页」在本机造不出来；它能挡住的是
+   * 「截断页被当成完整目录」：1100 张无关表被挤出后，`db tables` 的「库中有而声明无」清单
+   * 会少报（那是 `actual` 那条读，与存在性预检同一条 SQL）。本用例钉的是**截断即拒**：
+   * 目录一旦超过上限，读命令给 internal 并点名截断，而不是在截断页上做判定。
+   */
+  const buildBigStore = async (path: string): Promise<void> => {
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      // 声明表（含 schema_version）先建，再把无关表拉到上限**之上**
+      for (const t of TABLES) await s.query(ddlFor(t))
+      for (let i = 0; i < CATALOG_ROW_LIMIT + 100; i++) {
+        await s.query(`CREATE TABLE "zz_unrelated_${String(i).padStart(5, '0')}" (id INTEGER)`)
+      }
+    } finally {
+      await s.close()
+    }
+  }
+
+  it('目录超过上限 → 三条命令都报 internal 且点名截断（不在截断页上判定）', async () => {
+    const db = join(dir, 'big.duckdb')
+    await buildBigStore(db)
+    for (const [name, run] of GUARD_READERS) {
+      out = ''
+      expect(await run(db), `${name} 应在截断时 fail-closed（而不是按截断页判定）`).toBe(1)
+      const err = errorOf()
+      expect(err.kind, `${name}：\n${out}`).toBe('internal')
+      expect(String(err.message)).toContain('截断')
+      expect(String(err.message), `${name} 不得把正常库说成缺表`).not.toContain('缺表')
+    }
+  })
+
 })

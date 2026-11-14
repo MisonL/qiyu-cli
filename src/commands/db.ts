@@ -246,9 +246,12 @@ export async function openGuardedSession(
     // 口径与实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
     // ⚠️ 成因分形与文案走 `store-precheck.ts` 的 `schemaVersionMissing`（**唯一实现点**，
     // 2026-10-31 收敛；此前 store/db/sync 三份已漂移出不同说法）。
-    const tables = await metaHint.run(
+    // ⚠️ 经 `catalogRows`（不是裸 `metaHint.run`）：目录超过沙箱缺省 1000 行时，那只是
+    // **截断页**；被挤掉的对象仍存在，据此判定「缺表 / 他人库」就是假归因。该 SQL 无
+    // `ORDER BY`，谁在首页不是契约。
+    const tables = await catalogRows(metaHint,
       "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
-    const names = tables.rows.map((r) => String(r.table_name))
+    const names = tables.map((r) => String(r.table_name))
     // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：别的工具也会建叫 schema_version 的表。
     // 只有该表在场时才补查列名 —— 零表/无该表时 `schemaVersionMissing` 不需要它。
     const versionColumns = names.some((n) => sameObjectName('schema_version', n))

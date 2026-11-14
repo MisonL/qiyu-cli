@@ -51,7 +51,9 @@
   是全目录扫描，而查询沙箱缺省只回 1000 行 —— 对象多于此的库里，排在截断之后的声明表会被误报成
   「缺表」（Codex 实测：1100 张无关表 + 目标表 → `query --table` 报 `store_not_initialized`）。
   沙箱路径的目录读取收敛到 `catalogRows()`：显式 `limit: 10000`（`run` 的上限），仍截断则报
-  `internal` 而不是把截断页当完整目录。
+  `internal` 而不是把截断页当完整目录。经 `openGuardedSession` 的那次存在性预检
+  （`db tables` / `db describe` / `query` / `stats fields` 共用）原先是裸 `session.run()`，
+  同样受 1000 行上限约束，已一并收编（Codex PR#78 第二轮 P1）。
 - **`query --table` / `stats fields` 遇同名 view 不再执行它**（2026-11-15）：此前两者只查表名在不在，
   一条底表已删的 view 会被执行，报「列 stat_date 在库中不存在」/「列 payload 不存在」，把 view 定义里的
   对象说成漂移。现在报 `store_not_initialized`「同名对象不是基表（view 等），本命令未执行它」，并给出

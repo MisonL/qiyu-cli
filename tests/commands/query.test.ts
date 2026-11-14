@@ -12,6 +12,7 @@ import { queryCommand, runDiagnosticCount } from '../../src/commands/query.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { NO_MASK_WARNING } from '../../src/query/mask.js'
 import type { Store } from '../../src/store/types.js'
+import { CATALOG_ROW_LIMIT } from '../../src/commands/store-precheck.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/db.test.ts 同款放宽）；
 // 超时用例要等 conn.interrupt 生效（实测约 300ms），一并放宽。
@@ -1241,11 +1242,35 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
   it('目录里的对象多于沙箱默认 1000 行时照样认得存在的表（CodeRabbit + Codex PR#78 实测）', async () => {
     // `OBJECT_KINDS_SQL` 是全目录扫描；`SandboxSession.run` 缺省 `limit: 1000`，一个 1100+ 对象的
     // 库会把它截断、`truncated: true`，排在截断之后的声明表就被误报成「缺表」（修复前实测）。
-    // 目标表排在目录末尾（建库顺序里 tickets / daily_overview 靠后），修复前的默认上限
-    // 1000 行会让它们落在截断之后；`catalogRows()` 显式放大上限后必须认得它们。
+    // ⚠️ 必须**真的**造出 1100+ 对象（Codex PR#78 第二轮 P2）：只 seed 25 张声明表时目录
+    // 根本不会截断，这条用例在修复前也是绿的，等于什么都没验。
     await seed()
-    expect(await qAt('--table', 'tickets')).toBe(0)
-    expect(await qAt('--table', 'daily_overview')).toBe(0)
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      for (let i = 0; i < 1100; i++) {
+        await s.query(`CREATE TABLE "zz_unrelated_${String(i).padStart(4, '0')}" (id INTEGER)`)
+      }
+    } finally { await s.close() }
+
+    // 1100+ 表仍在 `catalogRows` 的上限之内 → 照常执行，认得出声明表（修复前的默认 1000 行
+    // 会截断并误判；这里同时钉住「上限足够大」与「存在性检查走的是放大的那次读」）
+    expect(await qAt('--table', 'tickets'), out).toBe(0)
+    expect(await qAt('--table', 'daily_overview'), out).toBe(0)
+
+    // 再拉过上限：截断页不能当完整目录用 —— 直说「截断」，不说成「缺表」
+    const s2: Store = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      for (let i = 1100; i < CATALOG_ROW_LIMIT + 100; i++) {
+        await s2.query(`CREATE TABLE "zz_unrelated_${String(i).padStart(4, '0')}" (id INTEGER)`)
+      }
+    } finally { await s2.close() }
+    out = ''
+    expect(await qAt('--table', 'tickets')).toBe(1)
+    const e = errorOf()
+    expect(String(e.message)).toContain('截断')
+    expect(String(e.message), '正常库不得被说成缺表').not.toContain('缺表')
   })
 
   it('声明表被换成同名 view（底表已删）→ store_not_initialized，不执行 view、不报「列不存在」（2026-11-15）', async () => {
