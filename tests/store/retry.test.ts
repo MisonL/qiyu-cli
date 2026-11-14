@@ -200,6 +200,45 @@ describe('retryWithBackoff —— 有界重试', () => {
     expect(abandoned, '晚到的成功必须被清理，不能静默泄漏').toEqual(['late-conn'])
   })
 
+  it('tryOpen 复用同一个 promise 时，被返回的那次结果绝不能交回清理（会关掉正在用的连接）', async () => {
+    // CodeRabbit PR#74 第三轮：第一次尝试超时后，若 `tryOpen` 复用**同一个** promise，
+    // 第二次尝试会把它当作结果返回 —— 清理若在超时那一刻就注册，会抢先把返回的连接关掉。
+    let resolveShared: (v: string) => void = () => {}
+    const shared = new Promise<string>((r) => { resolveShared = r })
+    const abandoned: string[] = []
+    let attempts = 0
+    // 第二次尝试的计时器**恰好落在** promise 落定前后 —— 用真实计时器，不注入 sleep/now
+    const p = retryWithBackoff({
+      tryOpen: () => { attempts++; return shared },
+      isRetryable: isLockError, maxMs: 200, intervalMs: 5, attemptMs: 30,
+      onAbandoned: (v) => abandoned.push(v),
+    })
+    await new Promise((r) => setTimeout(r, 50))   // 第一次已超时，第二次尝试在途
+    resolveShared('the-conn')
+    await expect(p).resolves.toBe('the-conn')
+    await new Promise((r) => setImmediate(r))
+    expect(attempts, '前提：至少发生两次尝试').toBeGreaterThanOrEqual(2)
+    expect(abandoned, '返回给调用方的连接不得被清理').toEqual([])
+  })
+
+  it('tryOpen 复用同一个 promise、整轮仍以超时告终 → 只清理一次', async () => {
+    const abandoned: string[] = []
+    let attempts = 0
+    let resolveShared: (v: string) => void = () => {}
+    const shared = new Promise<string>((r) => { resolveShared = r })
+    let t = 0
+    await expect(retryWithBackoff({
+      tryOpen: () => { attempts++; return shared },
+      isRetryable: isLockError, maxMs: 100, intervalMs: 20, attemptMs: 20,
+      sleep: async (ms) => { t += ms }, now: () => t,
+      onAbandoned: (v) => abandoned.push(v),
+    })).rejects.toMatchObject({ timedOut: true })
+    resolveShared('late-conn')
+    await new Promise((r) => setImmediate(r))
+    expect(attempts, '前提：同一个 promise 被多次尝试').toBeGreaterThanOrEqual(2)
+    expect(abandoned, '同一个连接只能被关一次').toEqual(['late-conn'])
+  })
+
   it('onAbandoned 自己抛错或返回 rejected promise → 静默吞掉，不变 unhandled rejection', async () => {
     // CodeRabbit PR#74 第二轮：`attempt.then(cb, noop)` 的第二个参数只接住 **attempt 的**拒绝，
     // 接不住 cb 的。Node >=15 的默认行为是 unhandled rejection 直接杀进程。

@@ -186,10 +186,17 @@ function withAttemptTimeout<T>(p: Promise<T>, ms: number | undefined): Promise<T
 
 /** 有界重试：可重试错误按固定间隔重试至 maxMs，超限抛最后一个错误。 */
 export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
+  // 被放弃、还没交回清理的尝试（超时时刻 → 那次尝试的 promise）。清理时机见 `settle`。
+  const pendingAbandoned: { at: number; p: Promise<T> }[] = []
+  return settle(runLoop(opts, pendingAbandoned), pendingAbandoned, opts.onAbandoned)
+}
+
+async function runLoop<T>(opts: RetryOpts<T>, pendingAbandoned: { at: number; p: Promise<T> }[]): Promise<T> {
   const intervalMs = opts.intervalMs ?? 200
   const sleep = opts.sleep ?? defaultSleep
   const now = opts.now ?? (() => Date.now())
   const start = now()
+  const onAbandoned = opts.onAbandoned
   for (;;) {
     let attempt: Promise<T>
     try {
@@ -197,6 +204,12 @@ export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
     } catch (e) {
       // 同步抛出也按普通失败处理（此前会直接冒泡、绕过预算判断）
       attempt = Promise.reject(e)
+    }
+    // 这个 promise 之前超时过一次、现在又被当作新尝试（`tryOpen` 复用）→ 仍算放弃，
+    // 记下最早的超时时刻并把它从待清理表里取出来，等这一次的结果落定后再判。
+    const againAt = pendingAbandoned.find((x) => x.p === attempt)?.at
+    if (againAt !== undefined) {
+      pendingAbandoned.splice(pendingAbandoned.findIndex((x) => x.p === attempt), 1)
     }
     // 单次尝试的上限还要被**剩余总预算**夹住（CodeRabbit PR#74）：否则 30s 预算里
     // 前面撞锁花掉 29s 后，下一次尝试仍能再跑满 30s —— 实际等待近 60s。
@@ -208,14 +221,9 @@ export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
       return await withAttemptTimeout(attempt, attemptCap)
     } catch (e) {
       const timedOut = e instanceof AttemptTimeout
-      if (timedOut && opts.onAbandoned !== undefined) {
-        // 被放弃的尝试若稍后成功，结果必须交回清理（连接/实例泄漏 = 多一个锁持有者）。
-        // 清理回调可能抛错 —— 那是**调用方的**错误，而此刻调用方已经拿到结论：
-        // 让它在 `then` 里 reject 会变成 unhandled rejection（Node ≥15 默认杀进程），
-        // 于是「晚到的连接没关掉」升级成「整条命令崩在一行与用户无关的栈上」。
-        // 兜在这里而不是要求每个调用方自己 try：别处新增回调不会记得这件事。
-        const abandoned = attempt.then((v) => opts.onAbandoned!(v), () => {})
-        abandoned.catch(() => { /* 清理失败不掩盖原错误，也不拖垮进程 */ })
+      if (timedOut && onAbandoned !== undefined) {
+        // 只**登记**，此刻不注册清理（见 `settle` 的注释）：它可能被下一次尝试复用并成为结果。
+        pendingAbandoned.push({ at: againAt ?? now(), p: attempt })
       }
       if (!timedOut && !opts.isRetryable(e)) throw e
       if (now() - start + intervalMs > opts.maxMs) {
@@ -229,6 +237,28 @@ export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
           : e
       }
       await sleep(intervalMs)
+    }
+  }
+}
+
+/**
+ * 重试循环的收尾：把**没被返回**的放弃尝试交回清理。
+ *
+ * 为什么不直接写在循环体的 `finally` 里：`return` 的 `finally` 会在值交给调用方之前跑 ——
+ * 只要把「本次返回的那个 promise」也一并清理，调用方拿到的就是关掉的连接。这里改成
+ * 「循环只负责登记放弃者，收尾统一处理」，并用 `pending` 里已经剔除「已复用的那个」来保证
+ * 不会误关；三条出口（成功返回 / 不可重试抛错 / 预算耗尽抛错）由同一个 `finally` 覆盖。
+ */
+async function settle<T>(loop: Promise<T>, pending: { at: number; p: Promise<T> }[],
+  onAbandoned: ((v: T) => void) | undefined): Promise<T> {
+  try {
+    return await loop
+  } finally {
+    if (onAbandoned !== undefined) {
+      for (const x of pending) {
+        const done = x.p.then((v) => onAbandoned(v), () => {})
+        done.catch(() => { /* 清理失败不掩盖原错误，也不拖垮进程 */ })
+      }
     }
   }
 }

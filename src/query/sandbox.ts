@@ -466,13 +466,25 @@ export async function openSandbox(cfg: StoreConfig, deps: SandboxDeps = {}): Pro
       tryOpen: open,
       isRetryable: isLockError,
       maxMs: cfg.readOnlyRetryMs,
+      // ⚠️ `attemptMs` 必须传（CodeRabbit PR#74 第三轮）：不传时 `withAttemptTimeout` 直接返回
+      // 原 promise，截止时间只会在**抛错后**才比较 —— `create`/`connect` 卡住（网络盘、卡死的
+      // 锁等待）就没有任何上界，`qiyu query` / `db tables` / `stats` 会无限挂着。
+      // `store` 那条路径早已传，此处漏掉的后果是「有界打开」只覆盖了一半的只读命令。
+      attemptMs: cfg.readOnlyRetryMs,
+      // 超时被放弃的尝试若稍后成功，交回关掉（否则多一个锁持有者）。
+      onAbandoned: (r) => {
+        try { r.conn.closeSync?.() } catch { /* 清理失败不掩盖原错误 */ }
+        try { r.inst.closeSync?.() } catch { /* 同上 */ }
+      },
       sleep: deps.sleep,
       now: deps.now,
     })
     inst = r.inst
     conn = r.conn
   } catch (e) {
-    if (isLockError(e)) throw lockedError(cfg)
+    // 打开超时与撞锁是同一类后果（等不到库），走同一条 store_locked 出口 ——
+    // 否则超时会落到下面的 `classifyOpenFailure`，识别不出 → 变成「库不存在」类的误导。
+    if (isLockError(e) || (e as { timedOut?: boolean }).timedOut === true) throw lockedError(cfg)
     // 其余打开失败（库不存在 / 非 DuckDB 文件 / 权限）→ store_not_initialized（spec §十一：
     // 库不存在 → 退出码 1、hint 指 `qiyu store init`）。底层原文保留在 message 里。
     // ⚠️ 成因分流走 `store/retry.ts` 的 `classifyOpenFailure`（2026-10-31 单一实现点）：

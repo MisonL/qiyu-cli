@@ -859,6 +859,21 @@ describe('openSandbox 的错误路径', () => {
     expect(e.hint).toMatch(/npm install/)
   })
 
+  it('打开卡住（create 永不返回）→ 有界报 store_locked，而不是无限挂着', async () => {
+    // CodeRabbit PR#74 第三轮：`openSandbox` 此前不传 `attemptMs` —— `withAttemptTimeout`
+    // 直接返回原 promise，截止时间永远到不了。`store` 那条路径早就有界，`query` 这一半没有。
+    const importer = async (): Promise<unknown> => ({
+      DuckDBInstance: { create: () => new Promise(() => {}) },
+      StatementType: {},
+    })
+    const started = Date.now()
+    const e = await expectReject(
+      openSandbox({ ...cfgFor('/nonexistent/q.db'), readOnlyRetryMs: 60 }, { importer }),
+      { kind: 'store_locked' })
+    expect(e.retryable).toBe(true)
+    expect(Date.now() - started, '必须在预算附近给出结论，不能无限等').toBeLessThan(3_000)
+  })
+
   it('ro 撞锁退避超限 → store_locked + retryable + hint（注入 importer，不持真锁）', async () => {
     const importer = async (): Promise<unknown> => ({
       DuckDBInstance: {
