@@ -374,6 +374,31 @@ describe('store status', () => {
     expect(e.hint).toMatch(/换 --db 路径/)
   })
 
+  it('Unicode 大小写折叠不算同名：基表 tickets 与 "ticKets" view 共存时基表照常计数（CodeRabbit PR#76 第二轮）', async () => {
+    // DuckDB 只对 ASCII 字母大小写不敏感（实测：`"tickets"` 与 `"ticKets"`（U+212A）是两个对象），
+    // 而 JS 的 toLowerCase() 会把 K 折叠成 k —— 用它会把这个不同名的 view 认成 tickets、
+    // 把真基表也跳过（tables 少一张却只报一个「不是基表」）。
+    expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(dbPath())
+    const conn = await inst.connect()
+    await conn.run('CREATE TABLE "aux_tbl" (id VARCHAR)')
+    await conn.run('CREATE VIEW "ticKets" AS SELECT * FROM "aux_tbl"')
+    await conn.run('DROP TABLE "aux_tbl"')
+    conn.closeSync(); inst.closeSync()
+
+    out = ''
+    expect(await storeCommand(['status', '--db', dbPath()])).toBe(0)
+    const rows = data().tables as Array<{ name: string; rows: number }>
+    expect(rows.map((t) => t.name), '真基表 tickets 不得被跳过').toContain('tickets')
+    expect(rows.map((t) => t.name), 'K 那个 view 不是基表，不进 tables').not.toContain('ticKets')
+    const warnings = (JSON.parse(out).meta.warnings as string[]).join('\n')
+    expect(warnings, '它按自己的名字被点名为非基表').toContain('ticKets')
+    expect(warnings, '不得把基表 tickets 也说成不是基表').not.toMatch(/不是基表[^\n]*：tickets(、|。)/)
+  })
+
   it('schema_version 表名只差大小写（"SCHEMA_VERSION"）也按其列判 —— 不得误报「缺表」（Codex PR#76）', async () => {
     // 存在性若按精确比较，带 version 列的 `"SCHEMA_VERSION"` 表会被当成「缺表」→
     // 空库分支的 hint「请运行 store init」，而它其实是他人库。

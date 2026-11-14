@@ -97,7 +97,8 @@
   `src/store/object-kinds.ts`（唯一实现点，`store/` 不得 import `commands/`），
   `store status` / `store init` / `db tables` / `sync verify`，以及 `store init` 的他人库指纹
   （`"SCHEMA_VERSION"` view）、`schemaVersionMissing` 的存在性判据（大写表名同样算存在）
-  一律走它（`"TAGS"` 与 `"tags"` 视为同名）。
+  一律走它（`"TAGS"` 与 `"tags"` 视为同名）。只折叠 ASCII 字母：`"ticKets"`（U+212A）与
+  `"tickets"` 在 DuckDB 里是两个对象，用 `toLowerCase()` 会误折叠成同一个名字。
 
 - **`db tables` / `store init` 与 `store status` 同口径：只认基表**（2026-11-14，PR #74 合并后自查）：
   上一轮只改了 `store status`，而同一份库里另外两条命令仍把 `information_schema` 里的 view
