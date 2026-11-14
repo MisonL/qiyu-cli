@@ -255,16 +255,17 @@ export function verifyFieldNotes(): Record<string, string> {
   return {
     'tasks[].task': '任务 id（与 `sync tasks` 的 id 同源）',
     'tasks[].local_rows': '本地表的行数（COUNT(*)。与 run/status 都不同 —— 那两个命令不报本地行数）。'
-      + '⚠️ 它是当前行数：与上游不符只说明数量对不上，不说明哪几行错了（row-level 差异不做）',
+      + '⚠️ 它是当前行数：与上游不符只说明数量对不上，不说明哪几行错了（row-level 差异不做）。'
+      + '本地同名对象不是基表（view 等）时为 null —— 不执行它、不报数（drift 有 not_base_table）',
     'tasks[].state_windows_consistent': 'true = sync_state 记录为「水位已推进且 range_status=complete」。'
       + '⚠️ 这不代表数据完整；drift 为空 / 退出码 0 同样不能当完整性证据 —— '
       + '对 windowed 任务本命令只核对同步状态记录（实测中窗失败的库同样给 drift: [] 且'
       + '退出码 0），快照任务则另有上游行数核对。windowed 的完整性要另行核对两处：'
       + 'sync status 的 gaps 与 resolved_range（能否确认新鲜度见该字段的说明），'
       + '以及 sync run 的 windows.skipped（本命令与 status 都不输出它）',
-    'tasks[].expected_from_api': 'null 有两种成因，看 drift 里有没有 fetch_failed 区分：'
-      + 'windowed 任务不做上游全量重拉（成本高，恒为 null）；快照任务则是上游取数失败'
-      + '（此时 drift 里有 kind=fetch_failed 的条目）',
+    'tasks[].expected_from_api': 'null 有三种成因，看 drift 区分：windowed 任务不做上游全量重拉'
+      + '（成本高，恒为 null）；快照任务上游取数失败（drift 有 kind=fetch_failed）；'
+      + '本地同名对象不是基表所以没去取上游（drift 有 kind=not_base_table）',
     'tasks[].drift[].kind': '取值与动作见 README 的 drift 图例',
     'tasks[].drift[].detail': '给人读的中文说明；程序判断请用 kind',
   }

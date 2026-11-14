@@ -82,6 +82,15 @@
     `sync run` 都拒绝 —— 统一报用法错误；
   · `auth` / `api` 的 `--help` 错误码清单补上真实会出现的 `config_invalid`。
 
+- **`sync verify` 不再把同名 view 当表计数**（2026-11-14，同轮自查第三处入口）：上面两条
+  修的是「列清单」，`sync verify` 还会对任务表做 `COUNT(*)` —— 一条与声明表同名的 view 会让
+  verify 整条落 `internal`（实测报文还把 view 定义里的底表名说成存储损坏、建议「备份重建」）。
+  现在先按对象类型过滤：非基表不计行数（`local_rows: null`）、快照任务也不为它发上游请求，
+  `drift` 新增 `not_base_table`（README 图例与 `field_notes` 同步），`detail` 给出确认对象类型
+  与「换新路径重建库再 `sync run`」的完整命令。未修的边界：`sync run` 写同名 view 仍报
+  `write_failed`（写入本就无法成功；实测 detail 里只有底层 DuckDB 原文
+  `Catalog Error: tags is not an table`，不点名「不是基表」）。
+
 - **`db tables` / `store init` 与 `store status` 同口径：只认基表**（2026-11-14，PR #74 合并后自查）：
   上一轮只改了 `store status`，而同一份库里另外两条命令仍把 `information_schema` 里的 view
   当自己的表 —— `db tables` 会对声明名 `SELECT COUNT(*)`、把同名 view 的本体当查询执行

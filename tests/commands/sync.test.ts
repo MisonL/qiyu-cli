@@ -1140,6 +1140,51 @@ describe('sync verify', () => {
     }
   })
 
+  it('声明表被换成同名 view → drift=not_base_table，不求值 view、不归因成存储损坏（windowed）', async () => {
+    // 2026-11-14（PR #75 合并后自查）：`store.count()` 对同名 view 执行 `COUNT(*)`，view 本体
+    // 因此被当查询跑一遍 —— 底表被删的 view 会让 verify 整条落 internal（实测报文还把 view 定义
+    // 里的底表名 `aux` 说成存储损坏，并给出「备份重建」建议）。`store status` / `db tables` /
+    // `store init` 已是「只认基表、非基表进 warnings」，verify 必须同口径：无法核对 ≠ 一致。
+    const s = await fresh()
+    await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+    await s.query('DROP TABLE "tickets"')
+    await s.query('CREATE VIEW "tickets" AS SELECT * FROM "aux_tbl"')
+    await s.query('DROP TABLE "aux_tbl"')
+    await s.close()
+    out = ''
+    const code = await syncCommand(['verify', 'tickets.search', '--db', dbPath()])
+    expect(code, `drift 非空必须退 1；输出：${out.slice(0, 300)}`).toBe(1)
+    expect(JSON.parse(out).ok, '不得落 internal 错误信封').toBe(true)
+    const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+    expect(t.local_rows, 'view 没被计数，就不能报一个行数').toBeNull()
+    const drift = t.drift as Array<Record<string, unknown>>
+    expect(drift.map((d) => d.kind)).toContain('not_base_table')
+    // 报文本体不得回显 view 定义里的底层对象名（那是外部字节，不是本命令的成因）
+    expect(out).not.toMatch(/aux_tbl/)
+  })
+
+  it('快照任务的同名 view：不发上游请求，expected_from_api=null + drift=not_base_table', async () => {
+    const s = await fresh()
+    await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+    await s.query('DROP TABLE "staff"')
+    await s.query('CREATE VIEW "staff" AS SELECT * FROM "aux_tbl"')
+    await s.query('DROP TABLE "aux_tbl"')
+    await s.close()
+    const fetchMock = vi.fn(() => okA(staffRows()))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      out = ''
+      expect(await syncCommand(['verify', 'dim.staff', '--db', dbPath()])).toBe(1)
+      expect(fetchMock.mock.calls.length, '本地数不出来就无从核对，不得为此花一次上游请求').toBe(0)
+      const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+      expect(t.local_rows).toBeNull()
+      expect(t.expected_from_api).toBeNull()
+      expect((t.drift as Array<Record<string, unknown>>).map((d) => d.kind)).toContain('not_base_table')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('快照任务选中但缺凭证 → 1 + auth_missing；纯 windowed 不需要凭证', async () => {
     vi.stubEnv('QIYU_APP_KEY', '')
     vi.stubEnv('QIYU_APP_SECRET', '')

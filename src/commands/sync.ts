@@ -10,7 +10,8 @@
 //   · verify 对 snapshot 任务做三方核对（本地表行数 / 上游任务 fetch 的 apiCount /
 //     sync_state 状态），对 windowed 任务不做上游全量重拉（成本高），只核对
 //     local_rows 与 sync_state 成功状态的一致性——expected_from_api 为 null，
-//     drift 非空时 detail 说明核对方式；
+//     drift 非空时 detail 说明核对方式；本地同名对象不是基表（view 等）时不计数、
+//     也不为它发上游请求，drift 报 not_base_table（无法核对 ≠ 一致）；
 //   · install/uninstall 的平台条目生成与命令执行在 src/schedule/install.ts，
 //     平台检测与外部命令均为注入点（__setPlatform/__setRun）；
 //   · install 前置探测（E 高-1）：**必须存在真实成功证据** —— sync_state 有
@@ -27,7 +28,7 @@
 import { homedir } from 'node:os'
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing } from './store-precheck.js'
+import { SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, OBJECT_KINDS_SQL, nonBaseTables } from './store-precheck.js'
 import { SYNC_TASKS, taskById, UNSUPPORTED_DATASETS } from '../sync/registry.js'
 import { listGaps, listWatermarks } from '../sync/state.js'
 import type { SyncTask } from '../sync/types.js'
@@ -38,7 +39,7 @@ import { tableByName } from '../store/schema.js'
 import { resolveCredentialsUsingFile, currentCredentialEnv } from './credentials-source.js'
 import {
   ok, fail, usageFail, failFromTagged, setPretty, describeArgs,
-  syncRunCommand,
+  syncRunCommand, storeInitCommand, storeLocationOf, dbTablesCommand,
 } from '../output.js'
 import { runSyncRun, SYNC_RUN_USAGE, msToShanghaiIso, RUN_FLAGS } from './sync-run.js'
 import { thrownToExit } from './store.js'
@@ -357,6 +358,7 @@ export const DRIFT_KINDS = [
   'state_pending',  // 上次运行未完成/中断（range_status 非 complete）
   'count_mismatch', // 本地行数 ≠ 上游行数（仅快照任务做上游核对）
   'fetch_failed',   // 上游取数失败 —— 无法核对 ≠ 一致
+  'not_base_table', // 本地同名对象不是基表（view 等）—— 不计数、不核对
 ] as const
 export type DriftKind = typeof DRIFT_KINDS[number]
 
@@ -404,12 +406,32 @@ async function syncVerify(argv: string[]): Promise<number> {
 
   try {
     const states = await listWatermarks(store)
+    // ⚠️ 只对**基表**做 COUNT（2026-11-14，PR #75 合并后自查）：`information_schema` 把 view
+    // 也算作表，同名 view 的 `COUNT(*)` 会把 view 本体当查询执行 —— 底表被删/读外部文件时
+    // verify 整条落 internal（实测报文还把 view 定义里的底表名说成存储损坏、建议「备份重建」）。
+    // `store status` / `store init` / `db tables` 已是「只认基表、非基表进 warnings」，
+    // verify 同口径：数不出来就不报数，按 drift 点名（无法核对 ≠ 一致，沿 fetch_failed 的语义）。
+    const nonBase = new Set(nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows))
+    const loc = storeLocationOf(resolved.path, resolved.profileFlag)
     const tasksOut: Array<Record<string, unknown>> = []
     for (const t of tasks) {
-      const localRows = await store.count(t.table)
+      const isNonBase = nonBase.has(t.table)
+      const localRows = isNonBase ? null : await store.count(t.table)
       const st = states.get(t.id)
       const stateConsistent = st !== undefined && st.rangeStatus === 'complete' && st.watermark !== null
       const drift: DriftEntry[] = []
+      if (isNonBase) {
+        drift.push({
+          kind: 'not_base_table',
+          detail: `本地 ${t.table} 不是基表（view 等），未做行数核对 —— 执行它的主体会读到`
+            + '错误数据或直接失败，所以「无法核对」不等于一致。用 `' + dbTablesCommand(loc)
+            + '` 确认该名字实际是什么对象（非基表会在 meta.warnings 点名）；若本 CLI 的表已被'
+            + '同名 view 取代：先备份旧库文件，再把 --db 换成新的 .duckdb 路径跑 '
+            + storeInitCommand('<新路径>', resolved.profileFlag) + ' 建库、'
+            + syncRunCommand('<新路径>', resolved.profileFlag) + ' 重新拉取'
+            + '（把 <新路径> 整段替换成新路径，不要指回出问题的文件）',
+        })
+      }
       if (st === undefined) {
         drift.push({
           kind: 'not_synced',
@@ -427,7 +449,9 @@ async function syncVerify(argv: string[]): Promise<number> {
         })
       }
       let expectedFromApi: number | null = null
-      if (t.kind === 'snapshot') {
+      // 本地没有可数的表时无从核对：不再为此花一次上游请求（`localRows === null` 时
+      // `null !== number` 恒真，会白白把每条快照任务打成 count_mismatch）。
+      if (t.kind === 'snapshot' && localRows !== null) {
         // 上游取数 = 任务 fetch（配对口径沿引擎：apiCount 为准，缺省取行数）。
         try {
           const res = await t.fetch({ start: 0, end: Date.now(), index: 0, total: 1 },

@@ -464,6 +464,7 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 **`expected_from_api` 只对快照任务有意义**（上游 fetch 的行数）；windowed 任务不做上游
 全量重拉，该字段恒为 `null`，核对方式是「本地行数 ↔ sync_state 成功状态」的一致性
 （`state_windows_consistent`）——两种任务的核对方式不同，读 drift 前先看任务 kind。
+`local_rows` 在本地同名对象不是基表（view 等）时为 `null`（drift 有 `not_base_table`，见下图例）。
 `sync tasks` 每任务含 `sensitive_columns`——该表标注为敏感的 PII 列清单（会话/工单的
 `payload` 列在列内，它是整行 PII 的完整副本，不要 `SELECT *`）。本阶段**没有**任务的
 启用/停用机制：注册表里的任务总是全部执行（选定任务靠命令行显式列出）。
@@ -497,7 +498,10 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 **`drift[].kind` 的全部取值**（`sync verify`）：`not_synced`（从未同步 → 先 `sync run`）、
 `state_pending`（上次运行未完成或中断 → 重跑 `sync run` 补全后再 verify）、
 `count_mismatch`（本地行数 ≠ 上游行数，仅快照任务 → 重跑覆盖，持续不符报告人类）、
-`fetch_failed`（上游取数失败，**无法核对 ≠ 一致** → 稍后重试 verify）。
+`fetch_failed`（上游取数失败，**无法核对 ≠ 一致** → 稍后重试 verify）、
+`not_base_table`（本地同名对象不是基表（view 等），**未做行数核对** —— 执行它的主体会读到
+错误数据或直接失败，此时 local_rows 为 null、快照任务也不发上游请求 → 用 db tables 看
+对象类型；本 CLI 的表已被同名 view 取代时需换新路径重建库再 `sync run`，detail 里给了完整命令）。
 
 ⚠️ `sync verify` 的 `state_windows_consistent: true` **不等于「数据完整」**，`drift` 为空
 或退出码 0 **同样不能当完整性证据**。对 **windowed 任务**，本命令只核对同步状态记录，而
