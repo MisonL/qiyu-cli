@@ -206,7 +206,7 @@ describe('store status', () => {
     // 先建成一个**合法**的本 CLI 库（否则 status 会按「他人库」拒绝，测不到计数路径）。
     expect(await storeCommand(['init', '--db', p])).toBe(0)
     const mod = (await import('@duckdb/node-api')) as unknown as {
-      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown> }>; closeSync: () => void }> }
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
     }
     const inst = await mod.DuckDBInstance.create(p)
     const conn = await inst.connect()
@@ -216,7 +216,9 @@ describe('store status', () => {
     writeFileSync(csv, 'x\n1\n')
     await conn.run('DROP TABLE tags')
     await conn.run(`CREATE VIEW tags AS SELECT * FROM read_csv_auto('${csv.replace(/'/g, "''")}')`)
-    inst.closeSync()
+    // ⚠️ 连接也要关（CodeRabbit PR#74 / 本文件 N 组 N1）：`inst.closeSync()` 不解连接，
+    // 留下的写者会让下面的只读打开撞自己的锁。
+    conn.closeSync(); inst.closeSync()
 
     out = ''
     const code = await storeCommand(['status', '--db', p])
@@ -225,6 +227,30 @@ describe('store status', () => {
     const names = (d.data.tables as Array<{ name: string }>).map((t) => t.name)
     expect(names, 'view 不得被当成声明表 count 成功').not.toContain('tags')
     expect((d.meta.warnings as string[]).join('\n'), 'view 必须以缺表成因被点名，而不是静默').toContain('tags')
+  })
+
+  // CodeRabbit PR#74：`schema_version` 自己是一条 view 时，列检查（有 version 列）会放行，
+  // 而 `MAX(version)` 仍会把 view 本体执行一遍 —— 一个 `CAST('x' AS INTEGER)` 就能让整条
+  // status 退出 1，打穿「库有漂移只警告」的承诺。
+  it('schema_version 是 view 时不求值其本体：status 仍退出 0，view 进 warnings', async () => {
+    const p = dbPath()
+    expect(await storeCommand(['init', '--db', p])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(p)
+    const conn = await inst.connect()
+    // view 本体一旦被执行就必然抛错（x 不是整数）—— 这是「有没有求值」的判据本身
+    await conn.run('DROP TABLE schema_version')
+    await conn.run(`CREATE VIEW schema_version AS SELECT CAST('x' AS INTEGER) AS version`)
+    conn.closeSync(); inst.closeSync()
+
+    out = ''
+    const code = await storeCommand(['status', '--db', p])
+    expect(code, `view 本体不得被执行；实际输出：${out.slice(0, 400)}`).toBe(0)
+    expect((JSON.parse(out).meta.warnings as string[]).join('\n'),
+      'view 必须被点名为「不是基表」').toContain('schema_version')
+    expect(JSON.parse(out).data.schema_version, '不可求值的 schema_version 按 0 报').toBe(0)
   })
 
   it('status 缺表两半边：空库 → hint 含 store init；他人库 → hint 含换路径', async () => {

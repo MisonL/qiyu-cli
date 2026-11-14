@@ -166,7 +166,13 @@ class AttemptTimeout extends Error {
 function withAttemptTimeout<T>(p: Promise<T>, ms: number | undefined): Promise<T> {
   if (ms === undefined) return p
   let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new AttemptTimeout(ms)), ms) })
+  // `unref`：这个只用于计时的 handle 不应把进程留在前台（CodeRabbit PR#74 —— 原生
+  // `create/connect` 卡住时，CLI 该按 store_locked 退出，而不是被内部计时器吊住）。
+  // 它不会让超时失效：被 race 的那条 attempt 自己持有的 I/O handle 仍然算活跃。
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new AttemptTimeout(ms)), ms)
+    ;(timer as { unref?: () => void }).unref?.()
+  })
   return Promise.race([p, timeout]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
 }
 
@@ -184,8 +190,14 @@ export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
       // 同步抛出也按普通失败处理（此前会直接冒泡、绕过预算判断）
       attempt = Promise.reject(e)
     }
+    // 单次尝试的上限还要被**剩余总预算**夹住（CodeRabbit PR#74）：否则 30s 预算里
+    // 前面撞锁花掉 29s 后，下一次尝试仍能再跑满 30s —— 实际等待近 60s。
+    // （`noRetry` 的下限 1ms 只影响等待已耗尽时的最后一击，让它有界而不是零。）
+    const remainingMs = opts.maxMs - (now() - start)
+    const attemptCap = opts.attemptMs === undefined ? undefined
+      : Math.max(1, Math.min(opts.attemptMs, remainingMs))
     try {
-      return await withAttemptTimeout(attempt, opts.attemptMs)
+      return await withAttemptTimeout(attempt, attemptCap)
     } catch (e) {
       const timedOut = e instanceof AttemptTimeout
       if (timedOut && opts.onAbandoned !== undefined) {

@@ -282,7 +282,12 @@ export async function storeCommand(argv: string[]): Promise<number> {
       if ('error' in r) countWarnings.push(r.error)
       else tables.push({ name: n, rows: r.rows })
     }
-    const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
+    // ⚠️ `schema_version` 自己是 view 时**不许求值**（CodeRabbit PR#74）：列检查（version 列存在）
+    // 会放行，这条 MAX(version) 仍会把 view 本体执行一遍 —— 一个 `CAST('x' AS INTEGER)` 就能
+    // 让整条 status 退出 1，把「库有漂移只警告」的承诺打穿。按缺失读，交给 warnings 点名。
+    const sv = nonBase.has('schema_version')
+      ? { rows: [{ v: 0 }] }
+      : await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
     // ⚠️ 两半漂移都进 warnings，**唯一渲染点**在 `storeTablesWarnings`（2026-11-02 实测修）：
     // 此前这里只算「库中有而声明无」，声明表被删时 tables 少了几张却零 warnings ——
     // 同一库上 `db tables` 会警告、`store status` 报 ok 且干净，README 又教 Agent

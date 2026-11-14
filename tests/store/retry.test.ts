@@ -154,11 +154,27 @@ describe('retryWithBackoff —— 有界重试', () => {
     })
     await expect(p).rejects.toThrow(/打开超时|store_locked|占用/)
     expect(t, '总预算仍由 maxMs 兜住').toBeLessThanOrEqual(120)
-    expect(Date.now() - started, '真实时间不得无限挂住').toBeLessThan(5_000)
+    // ⚠️ 真实墙钟也要有上界（CodeRabbit PR#74：只断言假时钟不算数 —— 假时钟不计量
+    // 「等 attempt 超时」消耗的真实时间，5000ms 的宽限足以放过一次预算超支）。
+    const elapsed = Date.now() - started
+    expect(elapsed, '真实耗时必须落在总预算附近（attemptMs=30、maxMs=120）').toBeLessThan(1_000)
   })
 
   // 被放弃的那次尝试若**稍后**成功，必须交出结果让人关掉 —— 否则连接/实例泄漏
   // （ro 退避路径会累积锁持有者，正是 R9 修过的那类）。
+  // CodeRabbit PR#74：attemptMs 必须被**剩余总预算**夹住 —— 否则 30s 预算里前一次尝试
+  // 花掉 29s 后，下一次仍能再跑满 30s，实际等待接近两倍。这里让 attemptMs 远大于 maxMs，
+  // 真实计时必须落在 maxMs 附近。
+  it('单次尝试上限随剩余预算收缩（attemptMs=5000、maxMs=60 → 墙钟 ≈ 60ms）', async () => {
+    const started = Date.now()
+    await expect(retryWithBackoff({
+      tryOpen: () => new Promise<never>(() => {}),
+      isRetryable: isLockError, maxMs: 60, intervalMs: 10, attemptMs: 5_000,
+    })).rejects.toThrow()
+    const elapsed = Date.now() - started
+    expect(elapsed, '不能按 attemptMs 等满 5 秒').toBeLessThan(1_000)
+  })
+
   it('超时后被放弃的尝试最终成功 → 交回给 onAbandoned 清理', async () => {
     // 每次尝试一个新 promise（同一个 promise 被 4 次尝试共用时，`then` 会各注册一次）
     let resolveLate: (v: string) => void = () => {}
