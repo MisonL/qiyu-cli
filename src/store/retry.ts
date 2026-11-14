@@ -178,6 +178,11 @@ function withAttemptTimeout<T>(p: Promise<T>, ms: number | undefined): Promise<T
   // ⚠️ 残余边界（如实记录）：被放弃的原生调用若仍持有活跃句柄，进程可能在打出
   // `store_locked` 之后**仍不立刻退出** —— CLI 刻意不用 `process.exit`（会截断 stdout，
   // 见 `src/cli.ts` 入口注释），所以这里换到的是「结论一定给出」，不是「进程一定立刻结束」。
+  // 为什么不用「拿到结论后宽限几秒再硬退出」补这一刀（CodeRabbit PR#74 第七轮提过）：
+  // 那需要在入口调 `process.exit`，与 `tests/cli.test.ts` 的架构不变量直接冲突，而那条
+  // 不变量来自**实测事故**（管道输出 392846 字节只写出 131072，退出码仍 0、JSON 断在中间）。
+  // 「大输出被静默截断」比「错误已报出但进程多活一会儿」更贵：前者让 Agent 拿到坏 JSON
+  // 且以为成功，后者只是慢。所以这里保留残余边界，不引入退出兜底。
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new AttemptTimeout(ms)), ms)
   })

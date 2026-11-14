@@ -17,7 +17,6 @@ import { TABLES } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
 import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
-import type { Store } from '../store/types.js'
 
 /**
  * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu store …` 是否真的存在。
