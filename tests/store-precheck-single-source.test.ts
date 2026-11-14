@@ -28,7 +28,11 @@ import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { shellArg } from '../src/core/shell.js'
 import { dbCommand } from '../src/commands/db.js'
+import { createDuckDbStore } from '../src/store/duckdb.js'
+import type { Store } from '../src/store/types.js'
+
 import { queryCommand } from '../src/commands/query.js'
+import { catalogRows, CATALOG_ROW_LIMIT } from '../src/commands/store-precheck.js'
 import { statsCommand } from '../src/commands/stats.js'
 import { storeCommand } from '../src/commands/store.js'
 import { syncCommand } from '../src/commands/sync.js'
@@ -373,4 +377,85 @@ describe('单一实现点（漂移守卫）', () => {
     expect(src, '`nonRegularFileHint` 必须真的按 isDirectory 分形')
       .toMatch(/return isDirectory \? DIRECTORY_DB_HINT : NON_REGULAR_DB_HINT/)
   })
+})
+
+
+// CodeRabbit + Codex PR#78：`OBJECT_KINDS_SQL` 是全目录扫描，`SandboxSession.run` 缺省只回
+// 1000 行（实测 1125 个对象的库 → 1000 行 + truncated: true），排在截断之后的表会被误报成
+// 「缺表」。沙箱路径的目录读取一律走 `catalogRows()`：显式放大上限 + 截断即拒。
+describe('catalogRows（沙箱路径的目录读取唯一入口）', () => {
+  it('显式传最大上限（缺省 1000 行会截断全目录扫描）', async () => {
+    const run = vi.fn(async () => ({ rows: [], truncated: false }))
+    await catalogRows({ run }, 'SELECT 1')
+    expect(run).toHaveBeenCalledWith('SELECT 1', { limit: CATALOG_ROW_LIMIT })
+  })
+
+  it('截断 → 抛 internal，不把截断页当完整目录（会把存在的表说成缺失）', async () => {
+    const run = async () => ({ rows: [{ table_name: 'a' }], truncated: true })
+    await expect(catalogRows({ run }, 'SELECT 1')).rejects.toMatchObject({ kind: 'internal' })
+  })
+
+  it('未截断 → 返回行', async () => {
+    const run = async () => ({ rows: [{ table_name: 'a' }], truncated: false })
+    expect(await catalogRows({ run }, 'SELECT 1')).toEqual([{ table_name: 'a' }])
+  })
+})
+
+// CodeRabbit + Codex PR#78 第二轮：`catalogRows` 只收编了四条命令里的目录读取，但经
+// `openGuardedSession` 的那一次**存在性预检**（`db.ts` 读全库表名交给 `schemaVersionMissing`）
+// 仍是裸 `session.run()` 缺省 1000 行 —— `query` / `stats` / `db` 全部经它。真库的
+// `information_schema.tables` **按创建顺序**返回（探针实测、SQL 无 `ORDER BY`）：先建 1100 张
+// 无关表、再建 `schema_version`，它就排在第 1001 行之后，正常库会被说成
+// 「数据库结构不完整（缺表）」（对已有数据的库是错误建议）。
+// 用真库造（不替身任何模块）：先建本 CLI 的声明表（含 `schema_version`），再把目录撑到
+// `CATALOG_ROW_LIMIT` 之上，跑三条经 `openGuardedSession` 的读命令。
+const GUARD_READERS: Array<[string, (db: string) => Promise<number>]> = [
+  ['db tables', (db) => dbCommand(['tables', '--db', db])],
+  ['query', (db) => queryCommand(['--sql', 'SELECT 1', '--db', db])],
+  ['stats fields', (db) => statsCommand(['fields', 'daily_overview', '--db', db])],
+]
+describe('openGuardedSession 的存在性预检同样走 catalogRows（截断不得说成缺表）', () => {
+  /**
+   * ⚠️ 探针实测（2026-11-15）：DuckDB 的 `information_schema.tables` 在本机**不按建表顺序**
+   * 返回 —— `schema_version` 与 `tickets` 这类名字按字典序夹在中间，先建它们后建 1100 张
+   * `zz_*` 时 `schema_version` 仍在首页。所以「把它挤出首页」在本机造不出来；它能挡住的是
+   * 「截断页被当成完整目录」：1100 张无关表被挤出后，`db tables` 的「库中有而声明无」清单
+   * 会少报（那是 `actual` 那条读，与存在性预检同一条 SQL）。本用例钉的是**截断即拒**：
+   * 目录一旦超过上限，读命令给 internal 并点名截断，而不是在截断页上做判定。
+   */
+  const buildBigStore = async (path: string): Promise<void> => {
+    // 先走**正规初始化**（`init()` 跑完全部迁移、`schema_version` 有真实记录），保证夹具
+    // 在任何库结构校验下都是合法库；再把无关表拉到 `CATALOG_ROW_LIMIT` **之上**。
+    // ⚠️ 不能用「只跑 DDL」的夹具：那样既没迁移记录也没 `init()` 的副作用，用例红了分不清
+    // 是截断还是「初始化元数据缺失」（CodeRabbit PR#78 第三轮 major）。
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.init()
+      for (let i = 0; i < CATALOG_ROW_LIMIT + 100; i++) {
+        await s.query(`CREATE TABLE "zz_unrelated_${String(i).padStart(5, '0')}" (id INTEGER)`)
+      }
+    } finally {
+      await s.close()
+    }
+  }
+
+  it('目录超过上限 → 三条命令都报 internal 且点名截断（不在截断页上判定）', async () => {
+    const db = join(dir, 'big.duckdb')
+    await buildBigStore(db)
+    // 夹具自证（CodeRabbit PR#78 第三轮 major）：库已正规初始化（`init()` 跑完迁移），
+    // 所以下面三条失败只能是**截断**。前置断言：同一个库上 `db tables` 报 `internal` + 「截断」。
+    out = ''
+    expect(await dbCommand(['tables', '--db', db]), '夹具未走到截断分支:\n' + out).toBe(1)
+    expect(String(errorOf().message)).toContain('截断')
+    for (const [name, run] of GUARD_READERS) {
+      out = ''
+      expect(await run(db), `${name} 应在截断时 fail-closed（而不是按截断页判定）`).toBe(1)
+      const err = errorOf()
+      expect(err.kind, `${name}：\n${out}`).toBe('internal')
+      expect(String(err.message)).toContain('截断')
+      expect(String(err.message), `${name} 不得把正常库说成缺表`).not.toContain('缺表')
+    }
+  })
+
 })

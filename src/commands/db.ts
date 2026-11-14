@@ -23,7 +23,7 @@ import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
 import {
   SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, storeTablesWarnings,
-  OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning, sameObjectName,
+  OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning, sameObjectName, catalogRows,
 } from './store-precheck.js'
 import { suggestNames, thrownToQueryExit, missingTableCauses } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
@@ -246,13 +246,16 @@ export async function openGuardedSession(
     // 口径与实际表集查询一致：限定 table_schema='main'（别库同名表不算数）。
     // ⚠️ 成因分形与文案走 `store-precheck.ts` 的 `schemaVersionMissing`（**唯一实现点**，
     // 2026-10-31 收敛；此前 store/db/sync 三份已漂移出不同说法）。
-    const tables = await metaHint.run(
+    // ⚠️ 经 `catalogRows`（不是裸 `metaHint.run`）：目录超过沙箱缺省 1000 行时，那只是
+    // **截断页**；被挤掉的对象仍存在，据此判定「缺表 / 他人库」就是假归因。该 SQL 无
+    // `ORDER BY`，谁在首页不是契约。
+    const tables = await catalogRows(metaHint,
       "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
-    const names = tables.rows.map((r) => String(r.table_name))
+    const names = tables.map((r) => String(r.table_name))
     // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：别的工具也会建叫 schema_version 的表。
     // 只有该表在场时才补查列名 —— 零表/无该表时 `schemaVersionMissing` 不需要它。
     const versionColumns = names.some((n) => sameObjectName('schema_version', n))
-      ? (await metaHint.run(SCHEMA_VERSION_COLUMNS_SQL)).rows.map((r) => String(r.column_name))
+      ? (await catalogRows(metaHint, SCHEMA_VERSION_COLUMNS_SQL)).map((r) => String(r.column_name))
       : undefined
     const missing = schemaVersionMissing(config.path, names, versionColumns)
     if (missing !== null) {
@@ -294,9 +297,9 @@ async function dbTables(argv: string[]): Promise<number> {
     // （实测：view 底表被删 → `query_error`、退出码 2；store 连接封锁外部访问后
     // `read_csv_auto` 类 view 同样整条失败）。这与 `store status` 的口径必须一致：
     // 只数基表，非基表进 warnings（`nonBaseTablesWarning` 是唯一渲染点）。
-    const actual = await session.run(OBJECT_KINDS_SQL)
-    const actualNames = actual.rows.map((r) => String(r.table_name))
-    const nonBase = nonBaseTables(actual.rows)
+    const actual = await catalogRows(session, OBJECT_KINDS_SQL)
+    const actualNames = actual.map((r) => String(r.table_name))
+    const nonBase = nonBaseTables(actual)
     // 声明名 → 库内实际名（DuckDB 标识符大小写不敏感，Codex PR#76：`"SCHEMA_VERSION"` 就是
     // `schema_version` 本身）。下面 COUNT 用声明的名字（解析器照样能解析到），只在映射处用。
     const actualNameOf = (declared: string): string | undefined =>
@@ -314,10 +317,10 @@ async function dbTables(argv: string[]): Promise<number> {
     // 实际列集一次查全库（25 次往返 → 1 次）：时间列被删的表不能让 timeRangeOf 的
     // `MIN("c")` 在 prepare 期抛 Binder Error 把整命令打成退出码 2（Task 7 审查
     // Important #1）——缺列降级为 time_range null + warning。
-    const colRows = await session.run(
+    const colRows = await catalogRows(session,
       "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='main'")
     const columnsOf = new Map<string, Set<string>>()
-    for (const row of colRows.rows) {
+    for (const row of colRows) {
       const tableName = String(row.table_name)
       const columnName = String(row.column_name)
       const set = columnsOf.get(tableName)
@@ -453,7 +456,7 @@ async function dbDescribe(argv: string[]): Promise<number> {
     // **不执行它** —— 只出声明元数据、由 warnings 点名。此前只看表名在不在，一条底表已删的
     // `daily_overview` view 会让 `COUNT(*)` 执行 view → Catalog Error → 整条命令退出 2，
     // 报文还把 view 定义里的底表名说成「表不存在」。
-    const kinds = (await session.run(OBJECT_KINDS_SQL)).rows
+    const kinds = await catalogRows(session, OBJECT_KINDS_SQL)
     const present = kinds.some((r) => sameObjectName(String(r.table_name), table.name))
     const isNonBase = nonBaseTables(kinds).some((n) => sameObjectName(table.name, n))
     if (isNonBase) {
@@ -485,9 +488,9 @@ async function dbDescribe(argv: string[]): Promise<number> {
       // ⚠️ 必须**先于** timeRangeOf：声明的时间列若已被删，`MIN("c")` 会在 prepare 期
       // 抛 Binder Error 把整命令打成退出码 2，row_count/columns/pii_columns 全丢——
       // 而「时间列被删」只是「列集不一致」的子集，应降级为 warning + time_range null。
-      const actual = (await session.run(
+      const actual = (await catalogRows(session,
         `SELECT column_name FROM information_schema.columns WHERE table_schema='main' AND table_name='${table.name}'`))
-        .rows.map((row) => String(row.column_name))
+        .map((row) => String(row.column_name))
       const actualSet = new Set(actual)
       const declaredSet = new Set(table.columns.map((c) => c.name))
       const missing = table.columns.map((c) => c.name).filter((n) => !actualSet.has(n))

@@ -35,10 +35,11 @@ import { DB_PATH_HELP } from './store-flags.js'
 import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
   dbTablesCommand, dbDescribeCommand, syncStatusCommand, queryTableCommand, querySqlCommand,
-  SQL_ARG_REPLACE_NOTE,
+  SQL_ARG_REPLACE_NOTE, storeInitCommand,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
+import { OBJECT_KINDS_SQL, nonBaseTables, sameObjectName, catalogRows } from './store-precheck.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, helpArgsError, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -916,15 +917,29 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
     // 并照候选去查一张口径完全不同的表。口径与 `stats fields` 一致（同一条 message 形态），
     // hint 补上「声明有而库中无」的两种成因（不得承诺 store init 一定能修）。
     if (tableDef !== undefined) {
-      const exists = await session.run(
-        "SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='" +
-        tableDef.name + "'")
-      if (exists.rows.length === 0) {
+      // ⚠️ 同名对象不是基表也算「不能查」（2026-11-15，与 store status / db describe 同口径）：
+      // `information_schema` 把 view 也算作表，一条底表已删的同名 view 会一路走到执行、
+      // 由 Catalog Error 翻译成「列 stat_date 在库中不存在」，报文把 view 定义里的底表名
+      // 说成漂移 —— Agent 会以为是自己选了坏数据，而真正要做的是换新路径重建库。
+      const kinds = await catalogRows(session, OBJECT_KINDS_SQL)
+      const exists = kinds.some((r) => sameObjectName(String(r.table_name), tableDef.name))
+      const nonBase = nonBaseTables(kinds).some((n) => sameObjectName(tableDef.name, n))
+      if (!exists || nonBase) {
         return fail({
           code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
-          message: `数据库中缺表：${tableDef.name}（本表在 CLI 的表定义中存在，库里没有）`,
-          hint: missingTableCauses(opened.dbPath, opened.profileFlag) + '。用 `'
-            + dbTablesCommand(openedLoc) + '` 查看库中实际有数据的表',
+          message: nonBase
+            ? `数据库中同名对象不是基表：${tableDef.name}（view 等，本命令未执行它）`
+            : `数据库中缺表：${tableDef.name}（本表在 CLI 的表定义中存在，库里没有）`,
+          hint: nonBase
+            // 同名 view：`store init` 不会重建它（迁移已跳过），但**换新路径重建库 + sync run**
+              // 能；这段渲染与 `sync verify` 的 not_base_table detail 同口径（占位符带替换契约）。
+            ? '本地同名对象不是基表（view 等），本命令未执行它。若本 CLI 的表已被同名 view 取代：'
+              + '先备份旧库文件，再把 --db 换成新的 .duckdb 路径跑 '
+              + storeInitCommand('<新路径>', opened.profileFlag) + ' 建库、'
+              + syncRunCommand('<新路径>', opened.profileFlag) + ' 重新拉取（把 <新路径> 整段替换成新路径，'
+              + '不要指回出问题的文件）；用 `' + dbTablesCommand(openedLoc) + '` 可确认该名字实际是什么对象'
+            : missingTableCauses(opened.dbPath, opened.profileFlag) + '。用 `'
+              + dbTablesCommand(openedLoc) + '` 查看库中实际有数据的表',
         })
       }
     }

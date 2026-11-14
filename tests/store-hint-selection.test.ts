@@ -526,8 +526,14 @@ describe('恢复命令的漂移守卫（源码文本）', () => {
     const dbCode = stripCommentLines(readFileSync(join(SRC, 'commands', 'db.ts'), 'utf8'))
     expect(dbCode, '前置探测未接入调用方给的 hint（会回落到 query 口径的死路建议）')
       .toMatch(/const metaHint = probeTimeoutHint === undefined \? session : withTimeoutHint\(session, probeTimeoutHint\(loc\)\)/)
+    // ⚠️ 判据按**调用方式**而非某一种写法（Codex PR#78 第二轮 P1）：探测可以是裸
+    // `metaHint.run(...)`，也可以经 `catalogRows(metaHint, ...)` —— 但**绝不能**换成
+    // `session`（未包 hint）或另一个会话。两种合法形态都认，`session.run(` 必然不认。
     expect(dbCode, '前置探测必须经 metaHint 会话执行')
-      .toMatch(/metaHint\.run\(\s*"SELECT table_name FROM information_schema/)
+      .toMatch(/\b(?:catalogRows\(metaHint,\s*|metaHint\.run\(\s*)"SELECT table_name FROM information_schema/)
+    // 反向：任何**裸 session** 的目录存在性读都是回归（Codex PR#78 第二轮 P1 的事故形态）
+    expect(dbCode, '前置探测被换回了未注入 hint 的 session')
+      .not.toMatch(/\bsession\.run\(\s*"SELECT table_name FROM information_schema/)
     // 元数据命令必须把渲染器传进去；query 不得传（否则探测给出「改用 qiyu query --sql」）
     expect(dbCode, 'db tables/describe 未把元数据 hint 传给前置探测')
       .toMatch(/openGuardedSession\(flags, metadataTimeoutHint\)/)
