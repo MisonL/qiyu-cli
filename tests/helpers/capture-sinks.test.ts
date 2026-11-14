@@ -181,3 +181,49 @@ describe('setup 预加载不破坏 vi.mock', () => {
     expect(m.createDuckDbStore({} as never, 'rw' as never)).toBe('MOCKED')
   })
 })
+
+// ⚠️ 静态守卫：把「hook 里 await 之后才写输出」这一形态挡在门外（CodeRabbit PR#72 复核）。
+// 为什么只能静态判：这类写入在运行时**没有世代**（hook 不在 `it` 包装的 `alsGen.run` 里），
+// 会被当成当前世代接收；而它要跨两条用例才显形，行为用例写出来是**空真**（上面已注明）。
+// 判据刻意窄：只抓「同一个 hook 体里，`await` 出现在第一条输出写入之前」——
+// 现有的唯一异步 hook（`db.test.ts` 的 `beforeEach`：先刷 sink、再 stubEnv，无输出写入）
+// 自然放过。
+describe('hook 的延迟写入边界（静态守卫）', () => {
+  it('capture 使用方的异步 hook 不得在 await 之后写输出', async () => {
+    const { readdirSync, readFileSync } = await import('node:fs')
+    const { fileURLToPath } = await import('node:url')
+    const dir = fileURLToPath(new URL('../', import.meta.url))
+    const files: string[] = []
+    const walk = (d: string): void => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const p = `${d}${e.name}`
+        if (e.isDirectory()) { if (!e.name.startsWith('__')) walk(`${p}/`); continue }
+        if (!e.name.endsWith('.test.ts')) continue
+        const src = readFileSync(p, 'utf8')
+        // 只查**真的用了迁移形态**的文件（导入 capture 助手并按代收 sink）
+        if (!/helpers\/capture\.js/.test(src) || !src.includes('captureSinks(')) continue
+        files.push(p)
+      }
+    }
+    walk(dir)
+    expect(files.length, '没扫到任何 capture 使用方 —— 判据退化了').toBeGreaterThan(10)
+    const offenders: string[] = []
+    for (const f of files) {
+      const src = readFileSync(f, 'utf8')
+      // hook 体：从一行 `beforeEach(async` / `afterEach(async` / `beforeAll(async` 起，
+      // 到列 0 的 `})` 止（本仓库的 hook 都是顶层书写）。
+      const re = /^(beforeEach|afterEach|beforeAll)\(async\b[\s\S]*?^\}\)/gm
+      for (const m of src.matchAll(re)) {
+        const body = m[0]
+        const cut = body.indexOf('await')
+        if (cut === -1) continue
+        const after = body.slice(cut)
+        if (/process\.(stdout|stderr)\.write|\bout \+= |\berr \+= /.test(after)) {
+          offenders.push(`${f}: ${m[1]}(async …) 在 await 之后写输出`)
+        }
+      }
+    }
+    expect(offenders, 'hook 里 await 之后的输出没有世代，会被记进下一条用例 —— '
+      + '改用句柄形态（startCapture()+cap.run）或把写入挪到同步段').toEqual([])
+  })
+})

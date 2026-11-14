@@ -665,15 +665,35 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
 
   it('只读形态（PRAGMA 查询 / VALUES / TABLE / FROM）放行；拒绝文案与实测一致（2026-11-09 审计）', async () => {
     await seed()
-    // USAGE 与拒绝 hint 此前只说 SELECT / DESCRIBE / SHOW / EXPLAIN，实测这四种也放行：
-    for (const sql of [
-      'VALUES (1)',
-      "PRAGMA table_info('sessions')",
-      'PRAGMA database_size',
-      'TABLE sessions',
-      'FROM sessions LIMIT 1',
-    ]) {
+    // USAGE 与拒绝 hint 此前只说 SELECT / DESCRIBE / SHOW / EXPLAIN，实测这四种也放行。
+    // ⚠️ 只断言退出码 0 是**假护栏**（Sourcery PR#71 复核）：实现若「放行但返回空行/默认行」
+    // 这条照样绿，而调用方拿到的是错结果。每种形态都断言**真实结果**。
+    type Rows = Array<Record<string, unknown>>
+    const dataOf = (): { columns: string[]; rows: Rows } =>
+      JSON.parse(out).data as { columns: string[]; rows: Rows }
+    // `VALUES (1)` 的列名是 DuckDB 生成的 `col0` —— 连结果一起钉住
+    expect(await q('--sql', 'VALUES (1)'), 'VALUES (1)').toBe(0)
+    expect(dataOf()).toEqual({ columns: ['col0'], rows: [{ col0: 1 }] })
+    // `PRAGMA table_info` 必须给出 sessions 的真实列（列名 + 首列）
+    expect(await q('--sql', "PRAGMA table_info('sessions')")).toBe(0)
+    const pragma = dataOf()
+    expect(pragma.rows.length, 'PRAGMA table_info 必须给出全部列').toBeGreaterThan(3)
+    expect(pragma.rows.map((r) => String(r.name)).slice(0, 2)).toEqual(['session_id', 'payload'])
+    // `PRAGMA database_size` 返回单行元数据（数据库名是本临时库的文件名基名）
+    expect(await q('--sql', 'PRAGMA database_size')).toBe(0)
+    const size = dataOf()
+    expect(size.columns).toContain('database_size')
+    expect(size.rows.length).toBe(1)
+    // `TABLE t` / `FROM t` 是 SELECT * 的简写：必须带回该表的真实列（空表也是空行集，
+    // 但**列**不能是空的 —— 否则「放行但没执行」的回归照样绿）
+    expect(await q('--sql', 'SELECT COUNT(*) AS n FROM sessions')).toBe(0)
+    const seeded = Number(dataOf().rows[0]!.n)
+    for (const [sql, expected] of [['TABLE sessions', seeded], ['FROM sessions LIMIT 1', 1]] as const) {
       expect(await q('--sql', sql), sql).toBe(0)
+      const d = dataOf()
+      expect(d.columns.slice(0, 2), `${sql} 必须真的执行了查询`).toEqual(['session_id', 'payload'])
+      // 行数也必须对：`LIMIT 1` 返回 1 行、`TABLE` 返回全表 —— 「放行但丢结果」的回归会红
+      expect(d.rows.length, sql).toBe(expected)
     }
     // 形如赋值的 PRAGMA 解析成 SET → 拒绝；hint 必须把放行面说全（不再只列 4 个关键字）
     expect(await q('--sql', "PRAGMA enable_profiling='json'")).toBe(2)

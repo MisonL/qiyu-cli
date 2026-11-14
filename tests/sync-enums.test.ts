@@ -112,8 +112,32 @@ describe('sync 枚举 ↔ README 图例（双向）', () => {
       // 判据不该靠「值里没有数字」这条未声明的隐含假设成立。
       for (const m of src.matchAll(/reason:\s*(['"])([a-z0-9_]+)\1/g)) hits.push({ file: f, reason: m[2] })
     }
-    // 判据不能在空集合上恒真：dim / knowledge / reports / sessions 各至少一处
+    // ⚠️ 下限不能靠「别处命中凑数」（Sourcery PR#57 复核）：此前只断言 `hits >= 4`，
+    // 某个文件整段漏扫时，其余文件的二十多处命中照样满足它 —— 扫描判据静默放行。
+    // 改成**逐文件**断言：扫到 reason 字面量的文件必须出现在预期集合里，且每个文件至少一处。
+    const filesWithHits = new Set(hits.map((h) => h.file))
+    // 预期集合写死：任务层**目前**产出 gapHint 的文件（新增文件产生 tip 时必须在这里登记）
+    expect([...filesWithHits].sort(), '有任务文件整段漏扫（该文件一处 reason 都没被收进来）')
+      .toEqual(['dim.ts', 'knowledge.ts', 'reports.ts', 'sessions.ts', 'tickets.ts'])
     expect(hits.length, '没扫到任何 reason 字面量 —— 扫描判据退化了').toBeGreaterThanOrEqual(4)
+    // ⚠️ 形态白名单：`gapHint` 里出现的 `reason:` 只允许单/双引号字面量。模板串
+    // （`` reason: \`x\` ``）与计算值（`reason: SOME_CONST`）不匹配上面的扫描正则，
+    // 等于绕过枚举核对 —— 这里显式拒绝它们（宁可要求写成字面量）。
+    const NON_LITERAL = /reason:\s*([^'"\s,})]+)/g
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith('.ts')) continue
+      const src = readFileSync(`${dir}${f}`, 'utf8')
+      for (const m of src.matchAll(NON_LITERAL)) {
+        expect(false, `${f} 的 gapHint.reason 用了非字面量形态「${m[1]}」：`
+          + '扫描判据只会核对引号字面量，模板串/常量会绕过枚举').toBe(true)
+      }
+    }
+    // 双向自检：模板串与计算值两种形态必须被上面那条正则识别（防它退化成恒不命中）
+    expect([...'reason: `zzz_tpl`'.matchAll(NON_LITERAL)].map((m) => m[1])).toEqual(['`zzz_tpl`'])
+    expect([...'reason: SOME_CONST'.matchAll(NON_LITERAL)].map((m) => m[1])).toEqual(['SOME_CONST'])
+    // 合法形态（单/双引号）不得被误伤
+    expect([...'reason: \'ok_name\''.matchAll(NON_LITERAL)]).toEqual([])
+    expect([...'reason: "ok_name"'.matchAll(NON_LITERAL)]).toEqual([])
     // 判据收的是 `TASK_GAP_REASONS` 而不是 `GAP_REASONS`（CodeRabbit 2026-11-02）：
     // 任务层写 `reason: 'fetch_failed'` 能让**成功窗**的提示长出引擎失败语义 ——
     // 它属于 `ENGINE_GAP_REASONS`，用并集核对会放行（实测：改成 fetch_failed 后本测试仍全绿）。

@@ -196,6 +196,37 @@ describe('store status', () => {
     expect(JSON.parse(out).meta.warnings).toBeUndefined()
   })
 
+  // 2026-11-14（历史审查 PR#4 复核）：`store status` 对全库逐表 COUNT，DuckDB 的
+  // `information_schema.tables` **把 view 也算作表**。此前 store 连接没有设
+  // `enable_external_access=false`（实测默认 true，只有查询沙箱设过），于是来源不明的库里
+  // 一条叫 `tags` 的 view 会作为 COUNT 本体以用户权限执行（实测：读到别的表 / 可被用来
+  // 探测本地文件）。现在建连即封锁外部访问，view 的 COUNT 直接失败，按缺表成因点名。
+  it('库里的 view 不会被当表执行（store 连接封锁外部访问）', async () => {
+    const p = dbPath()
+    // 先建成一个**合法**的本 CLI 库（否则 status 会按「他人库」拒绝，测不到计数路径）。
+    expect(await storeCommand(['init', '--db', p])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown> }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(p)
+    const conn = await inst.connect()
+    // 把声明表 `tags` 换成一条同名 view，本体去读一个**真实存在的外置 CSV**：
+    // view 若被当表 COUNT，就会以用户权限执行它（封锁外部访问后这步会失败）。
+    const csv = join(dir, 'probe.csv')
+    writeFileSync(csv, 'x\n1\n')
+    await conn.run('DROP TABLE tags')
+    await conn.run(`CREATE VIEW tags AS SELECT * FROM read_csv_auto('${csv.replace(/'/g, "''")}')`)
+    inst.closeSync()
+
+    out = ''
+    const code = await storeCommand(['status', '--db', p])
+    expect(code, `view 不得让整条命令失败；实际输出：${out.slice(0, 600)}`).toBe(0)
+    const d = JSON.parse(out)
+    const names = (d.data.tables as Array<{ name: string }>).map((t) => t.name)
+    expect(names, 'view 不得被当成声明表 count 成功').not.toContain('tags')
+    expect((d.meta.warnings as string[]).join('\n'), 'view 必须以缺表成因被点名，而不是静默').toContain('tags')
+  })
+
   it('status 缺表两半边：空库 → hint 含 store init；他人库 → hint 含换路径', async () => {
     // 空库（合法 DuckDB、零表）→ 「请运行：qiyu store init」
     // ⚠️ 真实 API：instance 关闭是 closeSync()（第四轮实测）
@@ -217,6 +248,20 @@ describe('store status', () => {
     out = ''
     expect(await storeCommand(['status', '--db', alien])).toBe(1)
     e = JSON.parse(out).error
+    expect(e.hint).toMatch(/换 --db 路径/)
+
+    // 2026-11-14（历史审查 PR#4 复核）：有 `schema_version`、但 schema_version 缺 version 列
+    // 的库此前会落 internal「备份重建」—— 假归因（它不是损坏缓存，只是别人的库）。
+    // 「表名不是身份证明」当时只修了 schema_version 这一张，指向「不是本 CLI 的库」。
+    const fakeSv = join(dir, 'fakesv.db')
+    const inst3 = await mod.DuckDBInstance.create(fakeSv) as { connect: () => Promise<{ run: (sql: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }
+    const c3 = await inst3.connect()
+    await c3.run('CREATE TABLE schema_version (version_id INTEGER)')
+    c3.closeSync(); inst3.closeSync()
+    out = ''
+    expect(await storeCommand(['status', '--db', fakeSv])).toBe(1)
+    e = JSON.parse(out).error
+    expect(e.kind, '缺 version 列是「不是本 CLI 的库」，不是损坏').toBe('store_not_initialized')
     expect(e.hint).toMatch(/换 --db 路径/)
   })
 })

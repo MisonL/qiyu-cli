@@ -66,7 +66,8 @@ const TASKS_FLAGS: FlagSpec[] = [...GLOBAL_FLAGS]
 
 /**
  * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu sync …` 是否真的存在。
- * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * `flags` 是**完整接受集**（含全局 flag）；`rejected` 直接取 `REJECTED_FLAGS`（当前为空 ——
+ * `--pretty` 自 2026-10-24 G1 起已实现，不再是 rejected，见 `spec-types.ts` 顶部）。
  *
  * ⚠️ `sync run` 的 spec 在这里而不在 `sync-run.ts`：spec 描述的是**命令路径**，而路径的
  * 分派在 `syncCommand`；`runSyncRun` 只拿到剥掉 `run` 之后的参数。解析器的 flag 常量由
@@ -163,6 +164,13 @@ function parseSubFlags(argv: string[], valueFlags: string[], boolFlags: string[]
     if (valueFlags.includes(a)) {
       const v = argv[i + 1]
       if (v === undefined || v.startsWith('--')) throw new Error(`${a} 缺少取值`)
+      // ⚠️ 重复的取值参数必须报错（2026-11-14，历史审查 PR#4/PR#71 复核）：此前静默覆盖，
+      // 而 `store` / `query` / `sync run` 三处都拒绝（`store-flags.ts`、`query.ts`、
+      // `sync-run.ts`）—— 同一个输入在不同子命令上两种行为。判据是「重复会不会丢掉一个值」，
+      // 布尔 flag 反复出现是幂等的，不在其列。
+      if (Object.hasOwn(out.values, a)) {
+        throw new Error(`${a} 重复出现：只能给一次（不做静默覆盖）`)
+      }
       out.values[a] = v
       i++
     } else if (a === '--pretty') {

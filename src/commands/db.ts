@@ -41,7 +41,8 @@ import type { CommandSpec, FlagSpec } from './spec-types.js'
 
 /**
  * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu db …` 是否真的存在。
- * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * `flags` 是**完整接受集**（含全局 flag）；`rejected` 直接取 `REJECTED_FLAGS`（当前为空 ——
+ * `--pretty` 自 2026-10-24 G1 起已实现，不再是 rejected，见 `spec-types.ts` 顶部）。
  * 值位解析走共享的 `parseStoreFlags`（它从 `STORE_FLAGS` 派生接受集），与这里同源。
  */
 export const DB_SPECS: CommandSpec[] = [

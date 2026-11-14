@@ -476,6 +476,12 @@ describe('call', () => {
       // 必须与另外两支同源：不会被自动重试 + 先确认状态
       expect(err.hint, '危险接口 5xx 仍在对 Agent 说「退避重试」').toMatch(/不会.*重试/)
       expect(err.hint).toMatch(/确认当前状态/)
+      // ⚠️ Agent 读的是 message 与 hint **两者**（Sourcery PR#58 复核：此前只查 hint，
+      // 把「请退避后重试」写回 message 测试照样绿）。HTML 载体的 message 是 CLI 自己拼的，
+      // 必须一并收窄；Spring JSON 载体的 message 是服务端原文（只过脱敏），不在此列。
+      if (String((make() as Response).headers.get('content-type')).includes('text/html')) {
+        expect(err.message, '危险接口 5xx 的 message 不得留着「退避重试」').not.toMatch(/退避.*重试/)
+      }
     }
     // ⚠️ Spring JSON 载体还要过 redact（CodeRabbit PR #58）：`Object.assign` 右覆盖左，
     // 把 message 写在 Error 构造参数里会被 `err.message` 原样冲掉 —— 服务端回显的
@@ -508,6 +514,36 @@ describe('call', () => {
         .rejects.toMatchObject({ kind: 'network', retryable: true })
       expect(attempts, '读接口的瞬时 5xx 必须重试到预算耗尽（3 次）').toBe(3)
     }
+  })
+
+  // 2026-11-14（历史审查 PR#58 复核）：令牌只在进入重试循环前取一次，而每条重试分支都
+  // 会再发一个真实请求 —— `limit:1` 的接口一次逻辑调用能发出 3 个请求。修法是把「取令牌」
+  // 收敛成唯一出口 `acquireToken()`，**每次出站请求**都过它。
+  it('每条网络重试都重新取令牌：limit=1 的接口第二次请求前被本地预算拦住', async () => {
+    // `ai.knowledge.getCategoryTree` 是限频表里 1 次/1 秒的接口：首次请求耗尽窗口，
+    // 5xx 想重试时必须再取一次令牌 —— 现在取不到，报 local_rate_limit（可重试、带等待），
+    // 而不是照常发出第 2、3 个请求。
+    let attempts = 0
+    fetchMock.mockImplementation(() => {
+      attempts++
+      return Promise.resolve(new Response('<html>Bad Gateway</html>',
+        { status: 502, headers: { 'content-type': 'text/html' } }))
+    })
+    const err = await call(byId('ai.knowledge.getCategoryTree'), {}, { credentials: CREDS })
+      .catch((e) => e)
+    expect(attempts, '预算耗尽后不得再发出站请求').toBe(1)
+    expect(err).toMatchObject({ code: 'local_rate_limit', kind: 'rate_limit', retryable: true })
+    // 双向：等待 1 秒后（窗口滑过）同一接口能重新拿到令牌并正常重试 —— 判据不是「永远拦住」
+    await new Promise((r) => setTimeout(r, 1_100))
+    attempts = 0
+    fetchMock.mockImplementation(() => {
+      attempts++
+      return Promise.resolve(new Response(JSON.stringify({ code: 200, message: '{"data":[]}' }),
+        { status: 200, headers: { 'content-type': 'application/json' } }))
+    })
+    await expect(call(byId('ai.knowledge.getCategoryTree'), {}, { credentials: CREDS }))
+      .resolves.toBeTruthy()
+    expect(attempts).toBe(1)
   })
 
   it('404 且响应不是 JSON（nginx HTML）→ route_not_found，不是 internal', async () => {

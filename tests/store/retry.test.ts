@@ -140,4 +140,42 @@ describe('retryWithBackoff —— 有界重试', () => {
     expect(r).toBe(42)
     expect(sleep).not.toHaveBeenCalled()
   })
+
+  // 2026-11-14（历史审查 PR#4 复核）：截止时间此前只在 `tryOpen()` **抛错后**才比 ——
+  // 打开调用一直不返回（网络盘 / 卡住的锁等待）时，等待没有上界，`store status` 永远挂着。
+  // 现在每次尝试自带上限；超时按「可重试」处理，总预算仍由 maxMs 兜住。
+  it('单次打开卡住（永不 resolve）→ 按 attemptMs 超时并重试，总耗时不超过 maxMs', async () => {
+    let t = 0
+    const started = Date.now()
+    const p = retryWithBackoff({
+      tryOpen: () => new Promise<never>(() => {}),
+      isRetryable: isLockError, maxMs: 120, intervalMs: 20, attemptMs: 30,
+      sleep: async (ms) => { t += ms }, now: () => t,
+    })
+    await expect(p).rejects.toThrow(/打开超时|store_locked|占用/)
+    expect(t, '总预算仍由 maxMs 兜住').toBeLessThanOrEqual(120)
+    expect(Date.now() - started, '真实时间不得无限挂住').toBeLessThan(5_000)
+  })
+
+  // 被放弃的那次尝试若**稍后**成功，必须交出结果让人关掉 —— 否则连接/实例泄漏
+  // （ro 退避路径会累积锁持有者，正是 R9 修过的那类）。
+  it('超时后被放弃的尝试最终成功 → 交回给 onAbandoned 清理', async () => {
+    // 每次尝试一个新 promise（同一个 promise 被 4 次尝试共用时，`then` 会各注册一次）
+    let resolveLate: (v: string) => void = () => {}
+    const late = { current: new Promise<string>((r) => { resolveLate = r }) }
+    const nextAttempt = () => { const p = late.current; late.current = new Promise(() => {}); return p }
+    const abandoned: string[] = []
+    // ⚠️ 假时钟必须**随 sleep 前进**：`now: () => 0` 时 `now()-start+interval > maxMs` 永远不成立，
+    // 重试会一直循环（本用例首版就是这么超时的）。
+    let t = 0
+    await expect(retryWithBackoff({
+      tryOpen: nextAttempt,
+      isRetryable: isLockError, maxMs: 60, intervalMs: 20, attemptMs: 20,
+      sleep: async (ms) => { t += ms }, now: () => t,
+      onAbandoned: (v) => abandoned.push(v),
+    })).rejects.toThrow()
+    resolveLate('late-conn')
+    await Promise.resolve(); await Promise.resolve()
+    expect(abandoned, '晚到的成功必须被清理，不能静默泄漏').toEqual(['late-conn'])
+  })
 })

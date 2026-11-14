@@ -143,11 +143,34 @@ export interface RetryOpts<T> {
   isRetryable: (e: unknown) => boolean
   maxMs: number
   intervalMs?: number
+  /**
+   * 单次尝试的上限（毫秒）。⚠️ 2026-11-14（历史审查 PR#4 复核）：截止时间此前只在
+   * `tryOpen()` **抛错后**才比较，打开调用一直不返回（网络盘 / 卡住的锁等待）时等待
+   * 没有上界，`store status` 会无限挂着。不传则沿用旧的「不设单次上限」语义
+   * （既有调用方与测试不受影响）。
+   */
+  attemptMs?: number
+  /** 超时后被放弃的那次尝试**最终成功**时回调 —— 调用方据此关掉连接/实例（防泄漏）。 */
+  onAbandoned?: (v: T) => void
   sleep?: (ms: number) => Promise<void>
   now?: () => number
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** 单次尝试超时的标记（`isRetryable` 之外由 `retryWithBackoff` 自行按可重试处理）。 */
+const ATTEMPT_TIMEOUT = Symbol('attempt-timeout')
+class AttemptTimeout extends Error {
+  readonly [ATTEMPT_TIMEOUT] = true
+  constructor(ms: number) { super(`打开超过 ${ms}ms 未返回`) }
+}
+
+function withAttemptTimeout<T>(p: Promise<T>, ms: number | undefined): Promise<T> {
+  if (ms === undefined) return p
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new AttemptTimeout(ms)), ms) })
+  return Promise.race([p, timeout]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
+}
 
 /** 有界重试：可重试错误按固定间隔重试至 maxMs，超限抛最后一个错误。 */
 export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
@@ -156,11 +179,26 @@ export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
   const now = opts.now ?? (() => Date.now())
   const start = now()
   for (;;) {
+    let attempt: Promise<T>
     try {
-      return await opts.tryOpen()
+      attempt = opts.tryOpen()
     } catch (e) {
-      if (!opts.isRetryable(e)) throw e
-      if (now() - start + intervalMs > opts.maxMs) throw e
+      // 同步抛出也按普通失败处理（此前会直接冒泡、绕过预算判断）
+      attempt = Promise.reject(e)
+    }
+    try {
+      return await withAttemptTimeout(attempt, opts.attemptMs)
+    } catch (e) {
+      const timedOut = e instanceof AttemptTimeout
+      if (timedOut && opts.onAbandoned !== undefined) {
+        // 被放弃的尝试若稍后成功，结果必须交回清理（连接/实例泄漏 = 多一个锁持有者）。
+        attempt.then((v) => opts.onAbandoned!(v), () => {})
+      }
+      if (!timedOut && !opts.isRetryable(e)) throw e
+      if (now() - start + intervalMs > opts.maxMs) {
+        // 超时且没有更具体的成因时，给调用方一个可识别的锁语义（与既有 store_locked 包装同源）
+        throw timedOut ? Object.assign(new Error(`打开超时（${opts.attemptMs}ms 内未返回，等待 ${opts.maxMs}ms 后放弃）`), { cause: 'attempt_timeout' }) : e
+      }
       await sleep(intervalMs)
     }
   }

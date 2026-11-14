@@ -47,6 +47,29 @@
 
 ### 修复
 
+- **历史 PR 审查意见的逐条复核与收口（2026-11-14）**：把 73 个已合并 PR 的 128 条审查线程
+  （40 条未标记解决）+ 审查正文逐条拿到当前代码上核实，**只修仍然成立的**：
+  · **`store` 连接封锁外部访问**：DuckDB 默认 `enable_external_access=true`，而此前只有查询
+    沙箱设过这一项 —— 打开来源不明的库时，同名的 `tags` view 会作为 `COUNT(*)` 的本体以用户
+    权限读外部文件（实测）。现在建连即设 `false`；`store status` 只数**基表**，同名 view 进
+    warnings（「库有漂移只警告不失败」仍是承诺），单表计数失败也只降级成警告；
+  · **他人库指纹**：`store init` 不再「有个能读的 `schema_version` 就当自己的库」——
+    声明表出现声明外的列即拒绝（同名异形表此前会被 `IF NOT EXISTS` 静默沿用），
+    `store status` 对缺 `version` 列的库给「换 `--db`」而不是「备份重建」；
+  · **只有主键列的表 upsert**：`schema_version` 的 `DO UPDATE SET` 空子句此前是
+    `Parser Error`，改为 `DO NOTHING`；
+  · **配置顶层不是对象**：`42` / `null` 此前被静默当成空配置回落默认库（`null` 还变成
+    「用法错误」退出码 2），现在明确拒绝；
+  · **网络重试不再绕过本地限频预算**：令牌只在进入重试循环前取一次，一次逻辑调用能发 3 个
+    请求（`limit:1` 的接口）—— 收敛成唯一出口 `acquireToken()`，每次出站都过它；
+    14003 重签不在其列（那是未执行的鉴权重试）；
+  · **只读库打开有界**：打开调用一直不返回（网络盘 / 卡住的锁等待）时截止时间此前永远到不了，
+    `store status` 会无限挂住 —— `retryWithBackoff` 增加单次尝试上限，超时按可重试处理，
+    被放弃的尝试若稍后成功则交回清理（防连接泄漏）；
+  · **`sync status` 等子命令的重复取值参数**：静默覆盖前一个值，而 `store` / `query` /
+    `sync run` 都拒绝 —— 统一报用法错误；
+  · `auth` / `api` 的 `--help` 错误码清单补上真实会出现的 `config_invalid`。
+
 - **`--since` 带相对时长时，区间终点不再取决于解析耗时**：`--since 1d` 的终点原本取自
   `parseTimeArg` 内部的时钟，随后「未给 `--until`」又调了一次时钟 —— 两次 `Date.now()`
   之间只要过去 ≥1ms，区间就从「1 天」变成「1 天 + ε」，`sliceByMaxWindow(…, 6, 1)`
@@ -86,7 +109,15 @@
 
 ### 测试
 
-- **新增 `tests/helpers/capture.ts`：按用例隔离 stdout/stderr 捕获**（CodeRabbit 2026-11-13 major）。
+- **审查意见复核带出的守卫收紧**（2026-11-14）：`sync-enums` 的任务层 `reason` 扫描从
+  「至少 N 处」改为**逐文件**断言（一个文件整段漏扫不再能被别处的命中凑数），并显式拒绝
+  模板串/计算值形态；`gate-keys` 的夹具改为按 endpoint 给出「让循环转起来」的最小数据
+  （此前一律回 `'[]'`，`ticket.log` / `ticket.template.fields` 从未被真实调用 → 覆盖断言
+  空真），并补上「每个任务至少一次真实调用」下限与「声明键没被观测」白名单；`query` 的
+  只读形态用例从「只看退出码」改为断言**真实列与行**；时区用例的 `Promise.all` 改为顺序跑
+  （`inZone` 改的是进程级 `TZ`，并发会让三个模块都在最后一个时区下初始化）；
+  `db.test.ts` 如实记录「单库路径 + 超时后残留操作交错」这一已知边界。
+- - **新增 `tests/helpers/capture.ts`：按用例隔离 stdout/stderr 捕获**（CodeRabbit 2026-11-13 major）。
   27 个测试文件用模块级 `let out` + `beforeEach` 重置的模式挡得住「上一条的输出漏进下一条」
   的**状态**，挡不住**写入方**：上一条超时后，它已发出、尚未 resolve 的异步调用会在下一条
   开始之后才写 stdout（实测 `out="FRESHTAIL"`、`writes=2`）。归属按 `AsyncLocalStorage`

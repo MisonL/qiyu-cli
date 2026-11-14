@@ -11,16 +11,18 @@ import { classifyOpenFailure, openFailureHint } from '../store/retry.js'
 import { DB_PATH_HELP, parseStoreFlags } from './store-flags.js'
 import {
   SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables,
-  storeTablesWarnings,
+  storeTablesWarnings, OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning,
 } from './store-precheck.js'
 import { TABLES } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
 import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
+import type { Store } from '../store/types.js'
 
 /**
  * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu store …` 是否真的存在。
- * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * `flags` 是**完整接受集**（含全局 flag）；`rejected` 直接取 `REJECTED_FLAGS`（当前为空 ——
+ * `--pretty` 自 2026-10-24 G1 起已实现，不再是 rejected，见 `spec-types.ts` 顶部）。
  */
 export const STORE_SPECS: CommandSpec[] = [
   {
@@ -267,9 +269,18 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // `names` 来自全库 `information_schema`（含未声明表），因此必须按声明集过滤后再 COUNT；
     // 未声明的表名进 warnings（不得静默 —— 与 `db tables` 同口径，README 承诺要报警）。
     const undeclared = new Set(undeclaredTables(names))
+    // ⚠️ 只数**基表**（2026-11-14，历史审查 PR#4 复核）：`information_schema` 把 view 也算作
+    // 表，同名 view 会让 COUNT 执行它的本体（实测 `read_csv_auto` 的 view → IO Error →
+    // status 整条退出 1，而「库有漂移只警告」是本命令的承诺）。view/macro 与未声明表一样
+    // 进 warnings、不进 tables。
+    const nonBase = new Set(nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows))
+    // 单表计数失败同样降级成警告（竞态：`tables()` 之后真表被改名成 view）。
+    const countWarnings: string[] = []
     for (const n of names) {
-      if (undeclared.has(n)) continue
-      tables.push({ name: n, rows: await store.count(n) })
+      if (undeclared.has(n) || nonBase.has(n)) continue
+      const r = await countTable(store, n)
+      if ('error' in r) countWarnings.push(r.error)
+      else tables.push({ name: n, rows: r.rows })
     }
     const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
     // ⚠️ 两半漂移都进 warnings，**唯一渲染点**在 `storeTablesWarnings`（2026-11-02 实测修）：
@@ -277,11 +288,34 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // 同一库上 `db tables` 会警告、`store status` 报 ok 且干净，README 又教 Agent
     // 「数量不等时先读 warnings」，于是 Agent 读到空 warnings 反而确认了「没事」。
     const warnings = storeTablesWarnings(names, config.path, profileFlag)
+    const allWarnings = [...(warnings ?? []), ...(nonBaseTablesWarning([...nonBase]) ?? []), ...countWarnings]
     return ok({ path: config.path, backend: config.backend, config_path: configPath,
       config_exists: configExists,
       schema_version: Number(sv.rows[0]?.v ?? 0), tables },
-    warnings === undefined
+    allWarnings.length === 0
       ? { field_notes: storeFieldNotes() }
-      : { field_notes: storeFieldNotes(), warnings })
+      : { field_notes: storeFieldNotes(), warnings: allWarnings })
   } catch (e) { return thrownToExit(e, profileFlag) } finally { await store.close() }
+}
+
+/**
+ * `store status` 的逐表计数，**单表失败只降级成警告**（2026-11-14，历史审查 PR#4 复核）。
+ *
+ * ⚠️ 为什么需要：`information_schema.tables` 把 view 也算作表 —— 一条与声明表**同名**的
+ * view（来源不明的库里可以随意写）会作为 `COUNT(*)` 的**本体**被执行，吃到的是用户权限
+ * （2026-11-14 实测：含 `read_csv_auto(外部文件)` 的 `tags` view 让 status 抛 IO Error、
+ * 整条命令退出 1）。store 连接现在封锁了外部访问（`createDuckDbStore` 建连即设
+ * `enable_external_access=false`），但 view 读取**库内**其它表/重计算仍会执行，且失败会
+ * 打断整条命令 —— 而「库有漂移只警告、不失败」是本命令对外的承诺（README / db tables 同口径）。
+ * 语义上：数不出来就说数不出来，不把「不是基表」报成「未知表」。
+ */
+async function countTable(
+  store: Store, name: string,
+): Promise<{ rows: number } | { error: string }> {
+  try {
+    return { rows: await store.count(name) }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return { error: `表 ${name} 计数失败（库中同名对象不可计数，可能是 view）：${msg}` }
+  }
 }

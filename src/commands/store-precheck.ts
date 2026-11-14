@@ -191,6 +191,36 @@ export function undeclaredTablesWarning(undeclared: readonly string[]): string[]
 }
 
 /**
+ * 库内对象的**类型**清单 SQL —— 与 `SCHEMA_VERSION_COLUMNS_SQL` 同款：唯一字符串，
+ * 由各命令经自己的会话执行，判据本体在下面的纯函数里。
+ */
+export const OBJECT_KINDS_SQL =
+  "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema='main'"
+
+/**
+ * 从 `OBJECT_KINDS_SQL` 的结果里挑出**不是基表**的对象（view / 外部表等）。
+ *
+ * ⚠️ 为什么（2026-11-14，历史审查 PR#4 复核实测）：`store status` 对全库逐表 COUNT，
+ * 而 `information_schema.tables` **把 view 也算作表** —— 一条与声明表同名的 view 会作为
+ * `COUNT(*)` 的**本体**以用户权限执行（实测：含 `read_csv_auto(…/probe.csv)` 的 `tags`
+ * view 让 status 抛 IO Error、整条命令退出 1，而「库有漂移只警告、不失败」是对外承诺）。
+ * 表名匹配 ≠ 对象类型匹配：计数前必须先按类型过滤，不是基表就不执行它。
+ */
+export function nonBaseTables(rows: ReadonlyArray<Record<string, unknown>>): string[] {
+  return rows
+    .filter((r) => String(r.table_type ?? '').toUpperCase() !== 'BASE TABLE')
+    .map((r) => String(r.table_name))
+    .sort()
+}
+
+/** 「同名对象不是基表」的警告（空数组 → `undefined`，与 `undeclaredTablesWarning` 同约定）。 */
+export function nonBaseTablesWarning(nonBase: readonly string[]): string[] | undefined {
+  if (nonBase.length === 0) return undefined
+  return [`库中有同名对象但不是基表（view 等）：${nonBase.join('、')}。这些对象不被计数、`
+    + '不出现在 tables 中']
+}
+
+/**
  * 「声明 vs 实况」两个方向的 `meta.warnings` —— **唯一渲染点**（`store init` /
  * `store status` / `db tables` 三处此前各拼一遍）。
  *

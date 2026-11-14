@@ -294,7 +294,20 @@ export async function call(
   // 不再写 `GET ? undefined : buildBody(body)`：有守卫在，那是恒等分支。
   const bodyStr = buildBody(body)
 
-  if (!opts.noRetry && !bucketFor(spec).tryAcquire(now())) {
+  /**
+   * 取一次本地限频令牌；取不到按 `local_rate_limit` 抛出（退出码 1、可重试，带精确等待）。
+   *
+   * ⚠️ **每次出站请求都要经过这里**（2026-11-14，历史审查 PR#58 复核 + 独立核实）：
+   * 此前只在进入重试循环前取一次，而四条网络重试分支每条都会再发一个真实请求 ——
+   * 限频表里可发多次的接口（`data.overview.ipcc` 10/60s、`export.session` 6/10s、
+   * `ai.knowledge.getDetail` 10/s）一次逻辑调用最多发出 3 个请求、只占 1 个令牌，等于
+   * 绕过预算；超发在 sync 同进程反复调用时累积，正是「宁可慢，不超发」要挡的。
+   * `callPaced` 认得这个 code，会按 retryAfter 等待后重来。
+   * ⚠️ 14003 重签重试**不走这里**：那是**未执行**的鉴权重试（服务端在执行前拒绝），
+   * 把它计入预算会让时钟偏移的写接口直接失败在这里 —— 与它的唯一目的相反。
+   */
+  const acquireToken = (): void => {
+    if (bucketFor(spec).tryAcquire(now())) return
     const waitMs = bucketFor(spec).nextAvailableAt(now())
     throw Object.assign(
       new Error(`接口 ${spec.id} 触发本地限频，还需等待约 ${Math.ceil(waitMs / 1000)} 秒`),
@@ -303,6 +316,8 @@ export async function call(
         retryAfter: { seconds: Math.ceil(waitMs / 1000), source: 'local' } },
     )
   }
+
+  if (!opts.noRetry) acquireToken()
 
   let signedTime = Math.floor(now() / 1000)
   // 两个独立的预算：网络重试与 14003 重签重试互不挤占。
@@ -360,6 +375,7 @@ export async function call(
       }
       if (opts.noRetry || networkAttempts >= 2) throw Object.assign(new Error(err.message), err)
       await sleep(networkBackoffMs(networkAttempts))
+      acquireToken()
       networkAttempts++
       continue
     }
@@ -391,6 +407,7 @@ export async function call(
         }
         if (opts.noRetry || networkAttempts >= 2) throw Object.assign(new Error(err.message), err)
         await sleep(networkBackoffMs(networkAttempts))
+        acquireToken()
         networkAttempts++
         continue
       }
@@ -459,6 +476,7 @@ export async function call(
       // 现在四支的预算一致（同一 `networkAttempts`）。
       if (transient && !opts.noRetry && networkAttempts < 2) {
         await sleep(networkBackoffMs(networkAttempts))
+        acquireToken()
         networkAttempts++
         continue
       }
@@ -530,6 +548,7 @@ export async function call(
       // 429 不在其中：它归 rate_limit（未执行、需按冷却等待），不自动重试。
       if (err.kind === 'network' && !opts.noRetry && networkAttempts < 2) {
         await sleep(networkBackoffMs(networkAttempts))
+        acquireToken()
         networkAttempts++
         continue
       }
