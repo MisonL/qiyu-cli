@@ -261,7 +261,29 @@ describe.each([
   ['sync tasks', async (): Promise<void> => { await ok(() => syncCommand(['tasks'])) }],
   ['sync status', async (): Promise<void> => { await fresh(); await ok(() => syncCommand(['status', '--db', dbPath()])) }],
   // verify 在「有漂移」时**正确**退出 1（未同步任务不是通过）—— 本用例只查图例覆盖面。
-  ['sync verify', async (): Promise<void> => { await fresh(); await ok(() => syncCommand(['verify', '--db', dbPath()]), { code: 1 }) }],
+  // ⚠️ 必须打桩 fetch（2026-11-14，CI test (22) 连续两次红）：本文件的 `beforeEach` 把凭证
+  // 存根成 `k-test`/`s-test`，`sync verify` 选中**全部**任务时 `needsUpstream` 为真
+  // （`src/commands/sync.ts` 的 snapshot 分支），于是**真的**向 `qiyukf.com` 发起请求核对行数。
+  // CI 上这个文件的耗时实测漂到 20.6s（main，绿）/ 40s+（本分支，40s 超时）—— 同一份断言的
+  // 耗时取决于跑 CI 那一刻的外网状况，这是单元测试不该有的依赖。打桩只替换「上游返回什么」，
+  // 命令本体（含 `fetch_failed` 分支的形状）照常走。
+  ['sync verify', async (): Promise<void> => {
+    await fresh()
+    const realFetch = globalThis.fetch
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(
+      JSON.stringify({ code: 0, message: '', data: [] }),
+      { status: 200, headers: { 'content-type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await ok(() => syncCommand(['verify', '--db', dbPath()]), { code: 1 })
+    } finally {
+      vi.stubGlobal('fetch', realFetch)
+    }
+    // 断言「上游核对这条路真的走了」：否则桩是死的，图例里 `expected_from_api` 的覆盖
+    // 也就退化成窗口任务的 null，谁都发现不了换成别的命令后不再核对。
+    expect(fetchMock.mock.calls.length, 'snapshot 任务必须真的请求上游（本用例靠打桩固定结果）')
+      .toBeGreaterThan(0)
+  }],
   ['sync uninstall', async (): Promise<void> => { await ok(() => syncCommand(['uninstall'])) }],
 ])('%s：data 与 meta 的每个叶子字段都必须被图例覆盖（反向，含元素层）', (label, body) => {
   it('全覆盖', async () => {

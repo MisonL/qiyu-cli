@@ -173,8 +173,13 @@ describe('§12 第三条：同一组时间用例在三时区下结论一致', ()
     //   · 正确实现：三个时区下 `yesterday` 都按上海 09-16 回退 → 窗口恒为
     //     [上海 09-15 零点, 上海 09-16 零点)。
     //   · 若 formatter 退回默认时区：UTC/纽约下会按本机 09-15 回退，窗口整体早一天。
-    const windows = await Promise.all(ZONES.map((tz) =>
-      inZone(tz, (m) => m.parseTimeArg('yesterday', () => T2, '--since'))))
+    // ⚠️ **必须顺序跑**（CodeRabbit PR#14 复核）：`inZone` 改的是**进程级** `TZ`，
+    // 且要等一次 `await import`。`Promise.all` 会让三次调用同时进入 —— 上海设好 TZ 后
+    // 停在 import 上让出执行权，UTC/纽约紧接着把它覆盖成纽约，于是三个模块都在**纽约**
+    // 时区下初始化。现在 `SHANGHAI_DAY` 显式带 `timeZone:'Asia/Shanghai'`，窗口值仍对，
+    // 但「目标时区下构造」这件事只剩第一个时区真的被验证过 —— 断言名义上守三份、实际只守一份。
+    const windows: unknown[] = []
+    for (const tz of ZONES) windows.push(await inZone(tz, (m) => m.parseTimeArg('yesterday', () => T2, '--since')))
     for (const [i, w] of windows.entries()) {
       expect(w, `${ZONES[i]} 下 yesterday 必须按上海日历日回退`)
         .toEqual({ start: Date.UTC(2026, 8, 14, 16), end: Date.UTC(2026, 8, 15, 16) })

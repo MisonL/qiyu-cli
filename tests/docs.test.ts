@@ -96,6 +96,11 @@ describe('联动文案 —— C1 交付后不得说假话', () => {
       // 新 code 插在 confirm_required 后 —— 锚定「confirm_required / store_locked」
       // 相邻，注释里的孤立词命中不了这个形态。
       expect(s, f).toMatch(/confirm_required \/ store_locked \/ store_not_initialized/)
+      // ⚠️ `config_invalid` 是真实会出现的 kind（`auth login` 读到畸形/半坏配置时给），
+      // 但 cli.ts 有、auth.ts / api.ts 的 USAGE 清单此前都漏了（2026-11-14，历史审查 PR#71
+      // 复核）。锚定「config_insecure / config_invalid / confirm_required」这个相邻形态 ——
+      // 注释里孤立的词不算数（与上面同一条判据的口径）。
+      expect(s, f).toMatch(/config_insecure \/ config_invalid \/ confirm_required/)
     }
   })
   it('README 含两个新 code 与 store 命令', () => {

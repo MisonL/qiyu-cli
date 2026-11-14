@@ -140,4 +140,180 @@ describe('retryWithBackoff —— 有界重试', () => {
     expect(r).toBe(42)
     expect(sleep).not.toHaveBeenCalled()
   })
+
+  // 2026-11-14（历史审查 PR#4 复核）：截止时间此前只在 `tryOpen()` **抛错后**才比 ——
+  // 打开调用一直不返回（网络盘 / 卡住的锁等待）时，等待没有上界，`store status` 永远挂着。
+  // 现在每次尝试自带上限；超时按「可重试」处理，总预算仍由 maxMs 兜住。
+  it('单次打开卡住（永不 resolve）→ 按 attemptMs 超时并重试，总耗时不超过 maxMs', async () => {
+    let t = 0
+    const started = Date.now()
+    const p = retryWithBackoff({
+      tryOpen: () => new Promise<never>(() => {}),
+      isRetryable: isLockError, maxMs: 120, intervalMs: 20, attemptMs: 30,
+      sleep: async (ms) => { t += ms }, now: () => t,
+    })
+    await expect(p).rejects.toThrow(/打开超时|store_locked|占用/)
+    expect(t, '总预算仍由 maxMs 兜住').toBeLessThanOrEqual(120)
+    // ⚠️ 真实墙钟也要有上界（CodeRabbit PR#74：只断言假时钟不算数 —— 假时钟不计量
+    // 「等 attempt 超时」消耗的真实时间，5000ms 的宽限足以放过一次预算超支）。
+    const elapsed = Date.now() - started
+    expect(elapsed, '真实耗时必须落在总预算附近（attemptMs=30、maxMs=120）').toBeLessThan(1_000)
+  })
+
+  // 被放弃的那次尝试若**稍后**成功，必须交出结果让人关掉 —— 否则连接/实例泄漏
+  // （ro 退避路径会累积锁持有者，正是 R9 修过的那类）。
+  // CodeRabbit PR#74：attemptMs 必须被**剩余总预算**夹住 —— 否则 30s 预算里前一次尝试
+  // 花掉 29s 后，下一次仍能再跑满 30s，实际等待接近两倍。这里让 attemptMs 远大于 maxMs，
+  // 真实计时必须落在 maxMs 附近。
+  it('单次尝试上限随剩余预算收缩（attemptMs=5000、maxMs=60 → 墙钟 ≈ 60ms）', async () => {
+    const started = Date.now()
+    let message = ''
+    await expect(retryWithBackoff({
+      tryOpen: () => new Promise<never>(() => {}),
+      isRetryable: isLockError, maxMs: 60, intervalMs: 10, attemptMs: 5_000,
+    }).catch((e: Error) => { message = e.message; throw e })).rejects.toThrow()
+    const elapsed = Date.now() - started
+    expect(elapsed, '不能按 attemptMs 等满 5 秒').toBeLessThan(1_000)
+    // 报文要说**实际生效**的那一档（被预算夹成 ≤60ms），不能照抄配置里的 5000 ——
+    // 「日志说等了 5 秒、实际只等了 60 毫秒」是把诊断引向错误的方向。
+    expect(message).toContain('打开超时')
+    expect(message, `报文不得照抄被夹小的 attemptMs：${message}`).not.toContain('5000ms')
+  })
+
+  it('sleep 比 intervalMs 长得多（时钟被推过预算）→ 不再发起新的打开尝试', async () => {
+    // Codex PR#74 第三轮 P2：旧判据只在**失败之后**比预算，`sleep` 把时钟推过 maxMs 后
+    // 循环仍会再调一次 `tryOpen` —— 等于在预算到期后又去打开数据库（真实副作用：抢锁）。
+    let t = 0
+    let calls = 0
+    await expect(retryWithBackoff({
+      tryOpen: () => { calls++; return Promise.reject(lockErr()) },
+      isRetryable: isLockError, maxMs: 100, intervalMs: 20, attemptMs: 5,
+      // 一次 sleep 就把时钟推过预算（真实世界：进程被挂起 / 磁盘卡住）
+      sleep: async () => { t += 150 }, now: () => t,
+    })).rejects.toThrow()
+    expect(calls, '预算耗尽后不得再打开数据库').toBe(1)
+  })
+
+  it('超时后被放弃的尝试最终成功 → 交回给 onAbandoned 清理', async () => {
+    // 每次尝试一个新 promise（同一个 promise 被 4 次尝试共用时，`then` 会各注册一次）
+    let resolveLate: (v: string) => void = () => {}
+    const late = { current: new Promise<string>((r) => { resolveLate = r }) }
+    const nextAttempt = () => { const p = late.current; late.current = new Promise(() => {}); return p }
+    const abandoned: string[] = []
+    // ⚠️ 假时钟必须**随 sleep 前进**：`now: () => 0` 时 `now()-start+interval > maxMs` 永远不成立，
+    // 重试会一直循环（本用例首版就是这么超时的）。
+    let t = 0
+    await expect(retryWithBackoff({
+      tryOpen: nextAttempt,
+      isRetryable: isLockError, maxMs: 60, intervalMs: 20, attemptMs: 20,
+      sleep: async (ms) => { t += ms }, now: () => t,
+      onAbandoned: (v) => abandoned.push(v),
+    })).rejects.toThrow()
+    resolveLate('late-conn')
+    await Promise.resolve(); await Promise.resolve()
+    expect(abandoned, '晚到的成功必须被清理，不能静默泄漏').toEqual(['late-conn'])
+  })
+
+  it('tryOpen 复用同一个 promise 时，被返回的那次结果绝不能交回清理（会关掉正在用的连接）', async () => {
+    // CodeRabbit PR#74 第三轮：第一次尝试超时后，若 `tryOpen` 复用**同一个** promise，
+    // 第二次尝试会把它当作结果返回 —— 清理若在超时那一刻就注册，会抢先把返回的连接关掉。
+    let resolveShared: (v: string) => void = () => {}
+    const shared = new Promise<string>((r) => { resolveShared = r })
+    const abandoned: string[] = []
+    let attempts = 0
+    // 第二次尝试的计时器**恰好落在** promise 落定前后 —— 用真实计时器，不注入 sleep/now
+    const p = retryWithBackoff({
+      tryOpen: () => { attempts++; return shared },
+      isRetryable: isLockError, maxMs: 200, intervalMs: 5, attemptMs: 30,
+      onAbandoned: (v) => abandoned.push(v),
+    })
+    await new Promise((r) => setTimeout(r, 50))   // 第一次已超时，第二次尝试在途
+    resolveShared('the-conn')
+    await expect(p).resolves.toBe('the-conn')
+    await new Promise((r) => setImmediate(r))
+    expect(attempts, '前提：至少发生两次尝试').toBeGreaterThanOrEqual(2)
+    expect(abandoned, '返回给调用方的连接不得被清理').toEqual([])
+  })
+
+  it('tryOpen 复用同一个 promise、整轮仍以超时告终 → 只清理一次', async () => {
+    const abandoned: string[] = []
+    let attempts = 0
+    let resolveShared: (v: string) => void = () => {}
+    const shared = new Promise<string>((r) => { resolveShared = r })
+    let t = 0
+    await expect(retryWithBackoff({
+      tryOpen: () => { attempts++; return shared },
+      isRetryable: isLockError, maxMs: 100, intervalMs: 20, attemptMs: 20,
+      sleep: async (ms) => { t += ms }, now: () => t,
+      onAbandoned: (v) => abandoned.push(v),
+    })).rejects.toMatchObject({ timedOut: true })
+    resolveShared('late-conn')
+    await new Promise((r) => setImmediate(r))
+    expect(attempts, '前提：同一个 promise 被多次尝试').toBeGreaterThanOrEqual(2)
+    expect(abandoned, '同一个连接只能被关一次').toEqual(['late-conn'])
+  })
+
+  it('onAbandoned 自己抛错或返回 rejected promise → 静默吞掉，不变 unhandled rejection', async () => {
+    // CodeRabbit PR#74 第二轮：`attempt.then(cb, noop)` 的第二个参数只接住 **attempt 的**拒绝，
+    // 接不住 cb 的。Node >=15 的默认行为是 unhandled rejection 直接杀进程。
+    const rejections: unknown[] = []
+    const onRejection = (r: unknown): void => { rejections.push(r) }
+    process.on('unhandledRejection', onRejection)
+    try {
+      for (const onAbandoned of [
+        () => { throw new Error('sync cleanup failure') },
+        async () => { throw new Error('async cleanup failure') },
+      ]) {
+        let resolveLate: (v: string) => void = () => {}
+        const late = { current: new Promise<string>((r) => { resolveLate = r }) }
+        const nextAttempt = () => { const p = late.current; late.current = new Promise(() => {}); return p }
+        let t = 0
+        await expect(retryWithBackoff({
+          tryOpen: nextAttempt,
+          isRetryable: isLockError, maxMs: 60, intervalMs: 20, attemptMs: 20,
+          sleep: async (ms) => { t += ms }, now: () => t,
+          onAbandoned,
+        })).rejects.toThrow()
+        resolveLate('late-conn')
+        // 让 `then` 与 `catch` 两条微任务链都跑完，再让事件循环转一圈收 unhandledRejection
+        for (let i = 0; i < 5; i++) await Promise.resolve()
+        await new Promise((r) => setImmediate(r))
+      }
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
+    expect(rejections, '清理回调的失败不得升级为 unhandled rejection').toEqual([])
+  })
+
+  it('超时计时器不得 unref（unref 后「唯一活跃 handle 就是它自己」会让进程静默退出）', async () => {
+    // CodeRabbit PR#74 第二轮 major（实测成立）。⚠️ 为什么不是「起子进程看它退不退出」：
+    // `unref` 是写死进库里的，测试进程只有 `tryOpen: () => new Promise(() => {})` 的两种
+    // 情形 —— 留着 unref 时子进程 0.1s 就 **exit 0、零输出**；去掉后它会按超时**挂着**，
+    // 测试分不清「计时器没触发」和「触发后进程就是不退」。所以把计时器创建包一层，
+    // 直接断言「没有对超时计时器调用 unref」。
+    // ⚠️ 只接管 `setTimeout`、不接管 `unref` 本身：`sleep` 自己也可能用 unref 计时器，
+    // 全局改 `unref` 会连带判错。
+    const offenders: Error[] = []
+    const original = globalThis.setTimeout
+    const patched = ((fn: (...a: never[]) => void, ms?: number, ...rest: never[]) => {
+      const handle = original(fn, ms, ...rest)
+      const stamp = new Error('创建于')
+      handle.unref = function (this: typeof handle) {
+        offenders.push(stamp)
+        return handle
+      }
+      return handle
+    }) as unknown as typeof setTimeout
+    globalThis.setTimeout = patched
+    try {
+      // 真实计时器（不注入 sleep/now）：走的就是 withAttemptTimeout 的 setTimeout
+      await expect(retryWithBackoff({
+        tryOpen: () => new Promise(() => {}), isRetryable: () => true, maxMs: 40, attemptMs: 40,
+      })).rejects.toMatchObject({ timedOut: true })
+    } finally {
+      globalThis.setTimeout = original
+    }
+    expect(offenders, '超时计时器在 finally 里就 clearTimeout 了，unref 省不下任何东西；'
+      + '而在尝试不持有活跃 handle 时，unref 会让 Node 直接退出、超时永远不报').toEqual([])
+  })
 })

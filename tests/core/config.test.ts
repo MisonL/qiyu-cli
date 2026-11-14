@@ -57,6 +57,19 @@ describe('结构校验（fail-closed，点名键路径）', () => {
     expect(() => parseConfig({ bogus: 1 })).toThrow(/未知键：bogus/)
   })
 
+  // 2026-11-14（历史审查 PR#4 的复核）：顶层不是对象时此前**静默当成空配置** ——
+  // `Object.keys(42)` 是 `[]`、`raw.profiles` 是 undefined，于是所有调用方回落默认库/默认 robots；
+  // `null` 更糟：`Object.keys(null)` 抛 TypeError，经 `failFromTagged` 变成「用法错误」退出码 2，
+  // Agent 会以为是自己参数写错。两种都是「写坏了配置 ≠ 没配」。
+  it('顶层不是对象时明确拒绝（标量与 null 都不得当成空配置）', () => {
+    for (const bad of [42, 'x', true, [], null]) {
+      expect(() => parseConfig(bad as unknown as Record<string, unknown>), `顶层 ${JSON.stringify(bad)}`)
+        .toThrow(/配置文件 顶层 必须是对象/)
+    }
+    // 双向自检：合法的空对象照常通过（不能把「必须有键」当成判据）
+    expect(parseConfig({})).toEqual({ defaultProfile: undefined, profiles: {} })
+  })
+
   it('profile 内未知键被拒绝，且点名到 profiles.<name>.<key>', () => {
     expect(() => parseConfig({ profiles: { p: { credential: {} } } }))
       .toThrow(/profiles\.p\.credential/)

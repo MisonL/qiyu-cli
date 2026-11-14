@@ -97,6 +97,12 @@ function assertObject(v: unknown, label: string): Record<string, unknown> {
  * `store/config.ts` 的领域知识，本文件只保证「它是一个对象、键已知」。
  */
 export function parseConfig(raw: Record<string, unknown>): QiyuConfigFile {
+  // ⚠️ 顶层形态必须先验（2026-11-14，历史审查 PR#4 复核）：`readConfigRaw` 只保证
+  // 「是合法 JSON」，`as Record<string, unknown>` 是**强转**。此前标量（`42` / `"x"`）
+  // 的 `Object.keys` 是 `[]`，被静默当成空配置 → 所有调用方回落默认库/默认 robots；
+  // `null` 更糟：`Object.keys(null)` 抛 TypeError，经 `failFromTagged` 成「用法错误」，
+  // Agent 会以为自己参数写错了。配置文件写坏 ≠ 没配。
+  assertObject(raw, '顶层')
   for (const k of Object.keys(raw)) {
     if (!KNOWN_TOP.has(k)) throw new Error(`配置文件未知键：${k}`)
   }

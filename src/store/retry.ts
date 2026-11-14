@@ -143,25 +143,134 @@ export interface RetryOpts<T> {
   isRetryable: (e: unknown) => boolean
   maxMs: number
   intervalMs?: number
+  /**
+   * 单次尝试的上限（毫秒）。⚠️ 2026-11-14（历史审查 PR#4 复核）：截止时间此前只在
+   * `tryOpen()` **抛错后**才比较，打开调用一直不返回（网络盘 / 卡住的锁等待）时等待
+   * 没有上界，`store status` 会无限挂着。不传则沿用旧的「不设单次上限」语义
+   * （既有调用方与测试不受影响）。
+   */
+  attemptMs?: number
+  /**
+   * 超时后被放弃的那次尝试**最终成功**时回调 —— 调用方据此关掉连接/实例（防泄漏）。
+   * 回调抛错/返回 rejected promise 都会被吞掉（`retry.ts` 统一兜）：清理失败不该拖垮
+   * 已经给出结论的重试，也不该变成 unhandled rejection 把进程带走。
+   */
+  onAbandoned?: (v: T) => void
   sleep?: (ms: number) => Promise<void>
   now?: () => number
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
+/** 单次尝试超时：`isRetryable` 之外由 `retryWithBackoff` 自行按可重试处理。 */
+class AttemptTimeout extends Error {
+  constructor(ms: number) { super(`打开超过 ${ms}ms 未返回`) }
+}
+
+function withAttemptTimeout<T>(p: Promise<T>, ms: number | undefined): Promise<T> {
+  if (ms === undefined) return p
+  let timer: ReturnType<typeof setTimeout> | undefined
+  // ⚠️ **不要 unref**（CodeRabbit PR#74 第二轮 major，实测确认）：
+  // 计时器在 `finally` 里就被 `clearTimeout`，活不过这次尝试，unref 省不下任何东西；
+  // 而一旦尝试本身不持有任何活跃 handle（`new Promise(() => {})`、某些原生卡住形态），
+  // unref 的计时器会让 Node **直接退出**（实测：探针脚本 0.1s 退出、超时回调从未执行）——
+  // CLI 于是静默 exit 0、一个字都不吐，比「一直挂着」更难诊断。
+  // ⚠️ 残余边界（如实记录）：被放弃的原生调用若仍持有活跃句柄，进程可能在打出
+  // `store_locked` 之后**仍不立刻退出** —— CLI 刻意不用 `process.exit`（会截断 stdout，
+  // 见 `src/cli.ts` 入口注释），所以这里换到的是「结论一定给出」，不是「进程一定立刻结束」。
+  // 为什么不用「拿到结论后宽限几秒再硬退出」补这一刀（CodeRabbit PR#74 第七轮提过）：
+  // 那需要在入口调 `process.exit`，与 `tests/cli.test.ts` 的架构不变量直接冲突，而那条
+  // 不变量来自**实测事故**（管道输出 392846 字节只写出 131072，退出码仍 0、JSON 断在中间）。
+  // 「大输出被静默截断」比「错误已报出但进程多活一会儿」更贵：前者让 Agent 拿到坏 JSON
+  // 且以为成功，后者只是慢。所以这里保留残余边界，不引入退出兜底。
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new AttemptTimeout(ms)), ms)
+  })
+  return Promise.race([p, timeout]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
+}
+
 /** 有界重试：可重试错误按固定间隔重试至 maxMs，超限抛最后一个错误。 */
 export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
+  // 被放弃、还没交回清理的尝试（超时时刻 → 那次尝试的 promise）。清理时机见 `settle`。
+  const pendingAbandoned: { at: number; p: Promise<T> }[] = []
+  return settle(runLoop(opts, pendingAbandoned), pendingAbandoned, opts.onAbandoned)
+}
+
+async function runLoop<T>(opts: RetryOpts<T>, pendingAbandoned: { at: number; p: Promise<T> }[]): Promise<T> {
   const intervalMs = opts.intervalMs ?? 200
   const sleep = opts.sleep ?? defaultSleep
   const now = opts.now ?? (() => Date.now())
   const start = now()
+  const onAbandoned = opts.onAbandoned
+  // 上一次失败的「预算耗尽时该抛什么」。⚠️ 循环顶部还要再查一次（Codex PR#74 第三轮 P2）：
+  // `sleep` 可能比 `intervalMs` 长得多（进程被挂起、注入的 sleeper 把时钟推过头），
+  // 这时预算其实已经用光，但旧的判据只在**失败之后**比 —— 会再发起一次新的 `tryOpen`，
+  // 等于在 `readOnlyRetryMs` 到期后还去打开数据库（真实副作用：抢锁、起原生线程）。
+  let exhausted: { err: unknown } | undefined
   for (;;) {
+    if (exhausted !== undefined && now() - start >= opts.maxMs) throw exhausted.err
+    let attempt: Promise<T>
     try {
-      return await opts.tryOpen()
+      attempt = opts.tryOpen()
     } catch (e) {
-      if (!opts.isRetryable(e)) throw e
-      if (now() - start + intervalMs > opts.maxMs) throw e
+      // 同步抛出也按普通失败处理（此前会直接冒泡、绕过预算判断）
+      attempt = Promise.reject(e)
+    }
+    // 这个 promise 之前超时过一次、现在又被当作新尝试（`tryOpen` 复用）→ 仍算放弃，
+    // 记下最早的超时时刻并把它从待清理表里取出来，等这一次的结果落定后再判。
+    const againAt = pendingAbandoned.find((x) => x.p === attempt)?.at
+    if (againAt !== undefined) {
+      pendingAbandoned.splice(pendingAbandoned.findIndex((x) => x.p === attempt), 1)
+    }
+    // 单次尝试的上限还要被**剩余总预算**夹住（CodeRabbit PR#74）：否则 30s 预算里
+    // 前面撞锁花掉 29s 后，下一次尝试仍能再跑满 30s —— 实际等待近 60s。
+    // `Math.max(1, …)` 只是兜住「剩余预算已 ≤0」的病态输入（1ms 的一次尝试仍是有界的）；
+    // 「预算已耗尽却还发起新尝试」由循环顶部的 `exhausted` 判据挡住，不靠这个下限。
+    const remainingMs = opts.maxMs - (now() - start)
+    const attemptCap = opts.attemptMs === undefined ? undefined
+      : Math.max(1, Math.min(opts.attemptMs, remainingMs))
+    try {
+      return await withAttemptTimeout(attempt, attemptCap)
+    } catch (e) {
+      const timedOut = e instanceof AttemptTimeout
+      if (timedOut && onAbandoned !== undefined) {
+        // 只**登记**，此刻不注册清理（见 `settle` 的注释）：它可能被下一次尝试复用并成为结果。
+        pendingAbandoned.push({ at: againAt ?? now(), p: attempt })
+      }
+      if (!timedOut && !opts.isRetryable(e)) throw e
+      // 超时且没有更具体的成因时，给调用方一个可识别的锁语义（与既有 store_locked 包装同源）
+      // 用自有字段而不是标准的 `cause`（那应该是 Error，写成字符串会误导诊断）
+      const budgetSpent = timedOut
+        // 报文用**实际生效的**那一档上限（`attemptCap` 可能被剩余预算夹小），
+        // 不是配置里的 `attemptMs` —— 否则日志说「等了 30000ms」而实际只等了 400ms。
+        ? Object.assign(new Error(`打开超时（本次尝试 ${attemptCap ?? opts.attemptMs}ms 内未返回，等待 ${opts.maxMs}ms 后放弃）`),
+          { timedOut: true })
+        : e
+      exhausted = { err: budgetSpent }
+      if (now() - start + intervalMs > opts.maxMs) throw budgetSpent
       await sleep(intervalMs)
+    }
+  }
+}
+
+/**
+ * 重试循环的收尾：把**没被返回**的放弃尝试交回清理。
+ *
+ * 为什么不直接写在循环体的 `finally` 里：`return` 的 `finally` 会在值交给调用方之前跑 ——
+ * 只要把「本次返回的那个 promise」也一并清理，调用方拿到的就是关掉的连接。这里改成
+ * 「循环只负责登记放弃者，收尾统一处理」，并用 `pending` 里已经剔除「已复用的那个」来保证
+ * 不会误关；三条出口（成功返回 / 不可重试抛错 / 预算耗尽抛错）由同一个 `finally` 覆盖。
+ */
+async function settle<T>(loop: Promise<T>, pending: { at: number; p: Promise<T> }[],
+  onAbandoned: ((v: T) => void) | undefined): Promise<T> {
+  try {
+    return await loop
+  } finally {
+    if (onAbandoned !== undefined) {
+      for (const x of pending) {
+        const done = x.p.then((v) => onAbandoned(v), () => {})
+        done.catch(() => { /* 清理失败不掩盖原错误，也不拖垮进程 */ })
+      }
     }
   }
 }

@@ -38,6 +38,28 @@ describe('isModuleNotFound —— 缺失模块识别', () => {
   })
 })
 
+describe('openStore —— 加固失败时的清理（Codex PR#74 第三轮 P2）', () => {
+  // 建连后的 `SET enable_external_access=false` 失败时，只关 instance 会漏掉**已建立的连接**：
+  // DuckDB 的锁要 conn 与 inst 都关掉才释放，ro 退避路径每失败一次就多一个未关连接。
+  it('connect 成功、加固 SET 抛错 → 连接与实例都被关闭', async () => {
+    const { createDuckDbStore } = await import('../../src/store/duckdb.js')
+    const closed: string[] = []
+    const importer = async (): Promise<unknown> => ({
+      DuckDBInstance: {
+        create: async () => ({
+          connect: async () => ({
+            runAndReadAll: async () => { throw new Error('hardening failed') },
+            closeSync: () => { closed.push('conn') },
+          }),
+          closeSync: () => { closed.push('inst') },
+        }),
+      },
+    })
+    await expect(createDuckDbStore(cfg, 'ro', { importer })).rejects.toThrow(/hardening failed/)
+    expect(closed, '连接必须先于实例被关掉（漏一个就多一个锁持有者）').toEqual(['conn', 'inst'])
+  })
+})
+
 describe('openStore —— 未知后端', () => {
   it('未知 backend → usage 错误', async () => {
     await expect(openStore({ ...cfg, backend: 'oracle' as never }, 'ro')).rejects.toThrow(/oracle|未知/)

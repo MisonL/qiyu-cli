@@ -28,7 +28,8 @@ import type { CommandSpec } from './spec-types.js'
 
 /**
  * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu stats …` 是否真的存在。
- * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * `flags` 是**完整接受集**（含全局 flag）；`rejected` 直接取 `REJECTED_FLAGS`（当前为空 ——
+ * `--pretty` 自 2026-10-24 G1 起已实现，不再是 rejected，见 `spec-types.ts` 顶部）。
  * 位置参数的 `report-tables` 域就是 `REPORT_TABLES` 闭集，校验方据此比对正文里的表名。
  */
 export const STATS_SPECS: CommandSpec[] = [

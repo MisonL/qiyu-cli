@@ -64,12 +64,27 @@ function endpointOfUrl(url: string): string {
   return hit?.id ?? path
 }
 
+/**
+ * 夹具响应：**按 endpoint 给最小可推进的数据**（2026-11-14，历史审查 PR#58 复核）。
+ *
+ * ⚠️ 此前一律回 `message:'[]'`，于是「先取列表、再按列表逐条取明细」的次要端点
+ * （`ticket.log`、`ticket.template.fields`）一次都不会被调用 —— 覆盖断言在**空集**上恒真，
+ * 把声明里的次要键删掉也测不出来（Sourcery 指出的假绿）。
+ * 这里只补「让循环转起来」的最小数据：一张票、一个模板；其余仍回空数组。
+ */
+const payloadFor = (id: string): string => {
+  if (id === 'ticket.search') return JSON.stringify({ total: 1, tickets: [{ id: 900001 }] })
+  if (id === 'ticket.template.list') return JSON.stringify([{ id: 1 }])
+  return '[]'
+}
+
 /** 采集「跑一次任务的 fetch 真实打到的 endpoint id 集合」。 */
 async function calledEndpoints(t: Parameters<typeof runTask>[0], store: Store): Promise<string[]> {
   const seen: string[] = []
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
-    seen.push(endpointOfUrl(url))
-    return new Response(JSON.stringify({ code: 200, message: '[]' }),
+    const id = endpointOfUrl(url)
+    seen.push(id)
+    return new Response(JSON.stringify({ code: 200, message: payloadFor(id) }),
       { status: 200, headers: { 'content-type': 'application/json' } })
   }))
   try {
@@ -77,10 +92,32 @@ async function calledEndpoints(t: Parameters<typeof runTask>[0], store: Store): 
       store, credentials: { appKey: 'k', appSecret: 's' }, gate: new RateGate(store, () => NOW),
       clock: () => NOW,
       // windowed 任务的窗口守卫要 start>0；snapshot 忽略。
-      ...(t.kind === 'windowed' ? { rangeOverride: { start: NOW - DAY, end: NOW } } : {}),
+      // ⚠️ 跨度必须**大于一天**：`NOW - DAY` 经上海日历对齐后切不出可执行的窗，
+      // 九个报表任务全部一条请求都不发（实测 windows.skipped=2/3）。
+      ...(t.kind === 'windowed' ? { rangeOverride: { start: NOW - 3 * DAY, end: NOW } } : {}),
     } as RunCtx)
   } finally { vi.unstubAllGlobals() }
   return [...new Set(seen)]
+}
+
+/**
+ * 空夹具下**不会被调用**的次要闸门键 —— 必须逐条点名（Sourcery PR#58 复核）。
+ *
+ * ⚠️ 为什么需要这张表：`calledEndpoints()` 的 fetch 替身对一切 URL 都回 `message:'[]'`，
+ * 于是「先取列表、再按列表循环取明细」的次要端点（`ticket.log`、`ticket.template.fields`）
+ * 与轮询分支（`export.session.check`）**一次都不会被调用** —— `called` 是空集时
+ * `called.filter(未声明) === []` 恒真，删掉声明里的次要键也测不出来（假绿）。
+ * 表格把这条边界**显式化**：新增一个声明键却没被真实调用覆盖时，必须在这里写下理由，
+ * 否则本条会红。
+ */
+const UNTRIGGERED_BY_EMPTY_FIXTURE: Record<string, readonly string[]> = {
+  // 会话导出：缺 `fetchZip` 时任务前置守卫直接抛，两个键都到不了（该任务另有专门的
+  // 「必须注入 fetchZip」守卫，见 sessions.test.ts）
+  'sessions.export': ['export.session', 'export.session.check'],
+  // 月报轮转：本夹具的日期被 reportDayRotation 跳过（不发请求），留给 reports 自己的用例
+  'reports.staff_salary_detail': ['statistic.salaryDetail'],
+  // 需要**本地已有** knowledge_items 行才会取分类树；空库驱动下提前返回
+  'knowledge.categories': ['ai.knowledge.getCategoryTree'],
 }
 
 describe('闸门键 ⊇ fetch 真实调用的 endpoint 集合（全任务，真实调用采集）', () => {
@@ -95,10 +132,26 @@ describe('闸门键 ⊇ fetch 真实调用的 endpoint 集合（全任务，真�
         const called = await calledEndpoints(t, store)
         const declared = new Set(t.gateEndpoints ?? [t.endpoint ?? t.id])
         // knowledge.categories 依赖 knowledge_items 有行 —— 空驱动是显式失败（任务自己的守卫），
-        // 不属闸门键问题；这类「前置数据」失败时 called 为空，断言自然空真。
+        // 不属闸门键问题。
         const missed = called.filter((id) => !declared.has(id))
         expect(missed, `${t.id} 的 fetch 实际调用了未声明进闸门的 endpoint：${missed.join('、')}`)
           .toEqual([])
+        // 例外任务：夹具下整体空真是**已声明的边界**（不是本轮能修的），跳过「非空」下限，
+        // 反向核对仍然生效（它们的声明键必须全部出现在白名单里）
+        if (UNTRIGGERED_BY_EMPTY_FIXTURE[t.id] === undefined || called.length > 0) {
+          expect(called.length, `${t.id} 一次 fetch 都没发生 —— 覆盖判据对该任务是空真`).toBeGreaterThan(0)
+        }
+        // ⭐ 反向：声明了却没在本次运行里被真实调用 —— 必须在上面的白名单里点名，
+        // 且白名单本身不得写错（只允许列本任务声明的键）。没有这条，「声明键从未被
+        // 观测过」与「声明键被正确使用」看起来一模一样。
+        const unobserved = [...declared].filter((id) => !called.includes(id))
+        const excused = UNTRIGGERED_BY_EMPTY_FIXTURE[t.id] ?? []
+        expect(unobserved.sort(), `${t.id} 有声明键没被真实调用覆盖；空夹具下确实调用不到的`
+          + `请在 UNTRIGGERED_BY_EMPTY_FIXTURE 里点名理由`)
+          .toEqual([...excused].sort())
+        for (const id of excused) {
+          expect(declared.has(id), `${t.id} 的白名单里出现了未声明的键「${id}」`).toBe(true)
+        }
       }
     } finally { await store.close() }
   })

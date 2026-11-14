@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
@@ -676,6 +676,94 @@ describe('duckdb —— init 与关闭', () => {
     }
   })
 
+  // 2026-11-14（历史审查 PR#4 复核）：此前只要库里有个能读的 `schema_version.version`，
+  // `init` 就把外来库当成自己的 —— 实测造 `{secret 表, schema_version(version INTEGER) 空表}`
+  // 后 init 报 ok 并往里建 25 张表；同名异形表因 `IF NOT EXISTS` 被静默沿用，后续写入才炸。
+  // ⚠️ 用例分开写：一个用例里串两条断言，第一条红了第二条根本没跑（变异时实测）。
+  const rawDb = async (name: string, ...sql: string[]): Promise<string> => {
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const p = join(dir, name)
+    const inst = await mod.DuckDBInstance.create(p)
+    const conn = await inst.connect()
+    for (const q of sql) await conn.run(q)
+    conn.closeSync(); inst.closeSync()
+    return p
+  }
+
+  /**
+   * 开库、确信 init 被拒、**在 finally 里关掉**（CodeRabbit PR#74 第六轮）：拒绝路径不关连接，
+   * 这条用例自己就成了下一个打开者的锁持有者 —— 用例间是否串味取决于跑哪个先。
+   * 关闭放在 `finally` 里，和断言在哪一行无关：断言由调用方写（各自的成因文案不同）。
+   */
+  const initRejects = async (path: string): Promise<unknown> => {
+    const store = await createDuckDbStore({ ...cfg, path }, 'rw')
+    try {
+      return await store.init().then(() => { throw new Error('init 本应被拒绝，却成功了') })
+    } finally {
+      await store.close()
+    }
+  }
+
+  it('他人库指纹 ①：schema_version 缺 version 列 → 拒绝（不回落到「版本 0 照常迁移」）', async () => {
+    const p = await rawDb('a.db', 'CREATE TABLE schema_version (version_id INTEGER, applied_at VARCHAR)')
+    // 报错必须点名 schema_version —— 否则「拒绝」可能来自别的原因，判据就成了碰巧绿。
+    await expect(initRejects(p))
+      .rejects.toMatchObject({ kind: 'store_not_initialized',
+        message: expect.stringContaining('schema_version 缺少 version 列') })
+  })
+
+  it('他人库指纹 ②：有表但 schema_version 一条记录都没有 → 拒绝', async () => {
+    const p = await rawDb('b.db',
+      'CREATE TABLE schema_version (version INTEGER)',
+      'CREATE TABLE secret (k VARCHAR)')
+    await expect(initRejects(p))
+      .rejects.toMatchObject({ kind: 'store_not_initialized',
+        message: expect.stringContaining('schema_version 没有任何记录') })
+  })
+
+  it('他人库指纹 ③：记录的版本高于本 CLI 最新迁移 → 拒绝（不按陌生版本号「已是最新」）', async () => {
+    const p = await rawDb('c.db',
+      'CREATE TABLE schema_version (version INTEGER)',
+      'INSERT INTO schema_version VALUES (999)')
+    await expect(initRejects(p))
+      .rejects.toMatchObject({ kind: 'store_not_initialized',
+        message: expect.stringContaining('高于本 CLI 已知的最新迁移') })
+  })
+
+  // CodeRabbit PR#74 第五轮：`schema_version` **是 view** 时，init 里的
+  // `SELECT COUNT(*), MAX(version)` 会把 view 本体执行一遍（`CAST('x' AS INTEGER)` 直接
+  // 报 Conversion Error → internal），既绕开了「他人库」归类，也与 CHANGELOG 里
+  // 「是 view 时连 MAX(version) 都不求值」的说法相矛盾。判据要在求值**之前**看对象类型。
+  it('他人库指纹 ④：schema_version 是 view → 拒绝且不求值它（否则 view 体被当查询执行）', async () => {
+    // 「一执行就炸」的 view（若被求值，报错会是 Conversion Error / internal）
+    const p = await rawDb('d.db',
+      'CREATE TABLE placeholder (x INTEGER)',
+      'CREATE VIEW schema_version AS SELECT CAST(\'x\' AS INTEGER) AS version')
+    await expect(initRejects(p))
+      .rejects.toMatchObject({ kind: 'store_not_initialized',
+        message: expect.stringContaining('schema_version 不是基表') })
+  })
+
+  it('他人库指纹不误伤：声明表带声明外的列（既有 schema 漂移）照常可用，只由 db tables 警告', async () => {
+    // ⚠️ 首版把这一档也拒了，全量回归当场抓到（`db tables` 的漂移用例给 sessions 加了
+    // rogue_col）。多列/少列是既有契约里的漂移，不属于「他人库」。
+    const s = await fresh()
+    await s.query('ALTER TABLE "sessions" ADD COLUMN rogue_col VARCHAR')
+    await s.close()
+    // 已初始化的库再 init：不报他人库，照常成功
+    const again = await createDuckDbStore(cfg, 'rw')
+    await expect(again.init()).resolves.toBeUndefined()
+    await again.close()
+  })
+
+  it('他人库指纹不误伤：零表的新库照常 init 成功', async () => {
+    const s = await fresh()
+    expect(await s.tables()).toContain('tags')
+    await s.close()
+  })
+
   it('执行期错误（约束违约）经 upsert 抛出 → 无 kind，命令层归 internal（验收 54）', async () => {
     const s = await fresh()
     // 绕过预检直接塞脏数据再读回，或以字面 SQL 注入类型不符值 —— 证明执行期
@@ -698,6 +786,48 @@ describe('duckdb —— init 与关闭', () => {
     expect(n).toBe(1)
     expect(await store.count('tags')).toBe(1)
     await store.close()
+  })
+
+  // 2026-11-14（历史审查 PR#4 复核）：store 连接此前什么都没设，而实测 DuckDB 默认
+  // `enable_external_access = true` —— 打开来源不明的库时，库里声明的 view 会以用户
+  // 权限读本地文件/发网络请求。只有查询沙箱设过这一项，store 侧完全没有防线。
+  it('store 连接封锁外部访问（enable_external_access=false），读外置文件必须失败', async () => {
+    const s = await fresh()
+    const now = await s.query("SELECT current_setting('enable_external_access') AS v")
+    expect(String(now.rows[0]?.v), 'store 连接必须自证封锁，不能只靠 DuckDB 默认值').toBe('false')
+    const csv = join(dir, 'probe.csv')
+    writeFileSync(csv, 'x\n1\n')
+    await expect(s.query(`SELECT * FROM read_csv_auto('${csv.replace(/'/g, "''")}')`))
+      .rejects.toThrow(/external access|Permission|not allowed/i)
+    await s.close()
+  })
+
+  // 2026-11-14（历史审查 PR#4 复核）：`schema_version` 的唯一列就是主键，`nonKey` 为空，
+  // 此前拼出 `ON CONFLICT (...) DO UPDATE SET ` 的空子句 —— DuckDB 报 `Parser Error:
+  // syntax error at end of input`，upsert 契约对这张表不成立（`assertTable` 是放行的）。
+  it('只有主键列的表也能 upsert（DO NOTHING），且重复写不产生第二行', async () => {
+    const s = await fresh()
+    await s.init()
+    const before = await s.count('schema_version')
+    // ⚠️ 用一个**尚未记录**的版本号：`init()` 已经把迁移版本写进去了，拿 version 1
+    // 当「新键」会先撞上已存在的行（本用例首版就是这么误判成 0 的）。
+    await expect(s.upsert('schema_version', [{ version: 9000 }])).resolves.toBe(1)
+    // 「实际写入行数」是契约原文（types.ts `Store.upsert`）：冲突被 DO NOTHING 跳过时
+    // 一行都没写，就不能报 1（Codex PR#74 第二轮 P2）。
+    await expect(s.upsert('schema_version', [{ version: 9000 }])).resolves.toBe(0)
+    expect(await s.count('schema_version'), '冲突行不得被插成第二行').toBe(before + 1)
+    await s.close()
+  })
+
+  it('只有主键列的表：一批里「已存在 + 新行」时只数真正插进去的那几行', async () => {
+    const s = await fresh()
+    await s.init()
+    const existing = (await s.query('SELECT MAX(version) AS v FROM schema_version')).rows[0]!.v as number
+    // 同批 3 行：1 行已存在，2 行新 —— 返回值必须是 2，不是 3
+    await expect(s.upsert('schema_version', [
+      { version: existing }, { version: 9001 }, { version: 9002 },
+    ])).resolves.toBe(2)
+    await s.close()
   })
 
   it('delete 未知表 → usage；在事务内则加入事务（回滚可撤）', async () => {

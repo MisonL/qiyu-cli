@@ -1794,6 +1794,16 @@ describe('区间语义与 notes（2026-11-10 审计）', () => {
     expect(code).toBe(2)
     expect(String(JSON.parse(out).error.message)).toMatch(/--db 重复出现/)
   })
+  // 2026-11-14（历史审查 PR#4 / PR#71 复核）：`store` / `query` / `sync run` 三处都拒绝
+  // 重复的取值参数，**而彼时** `sync status` 等走 `parseSubFlags` 的子命令静默覆盖前一个值 ——
+  // 同一个输入在不同子命令上两种行为（Agent 会以为后给的那个生效）。
+  // ✅ 该行为已修：`parseSubFlags` 现在对重复的取值参数抛错（`src/commands/sync.ts`），
+  // 本用例钉住修后的行为（CodeRabbit 第八轮把这段历史描述误读成「现状」，故标注时态）。
+  it('sync status 的 --db 重复出现 → 用法错误（与 store/query/run 同一判据）', async () => {
+    const code = await syncCommand(['status', '--db', dbPath(), '--db', join(dir, 'b.db')])
+    expect(code).toBe(2)
+    expect(String(JSON.parse(out).error.message)).toMatch(/--db 重复出现/)
+  })
   it('--since 与 --until 同一天（都解析到 0 点）→ usage，hint 说明半开区间与日期语义', { timeout: 120_000 }, async () => {
     await fresh().then((s) => s.close())
     const code = await syncCommand(['run', 'tickets.search', '--db', dbPath(),

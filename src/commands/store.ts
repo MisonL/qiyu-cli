@@ -11,7 +11,7 @@ import { classifyOpenFailure, openFailureHint } from '../store/retry.js'
 import { DB_PATH_HELP, parseStoreFlags } from './store-flags.js'
 import {
   SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables,
-  storeTablesWarnings,
+  storeTablesWarnings, OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning,
 } from './store-precheck.js'
 import { TABLES } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
@@ -20,7 +20,8 @@ import type { CommandSpec } from './spec-types.js'
 
 /**
  * 命令契约（F 组 D4）：`skill check` 据此判断 skill 正文里的 `qiyu store …` 是否真的存在。
- * `flags` 是**完整接受集**（含全局 flag），`--pretty` 同时在 `rejected` 里。
+ * `flags` 是**完整接受集**（含全局 flag）；`rejected` 直接取 `REJECTED_FLAGS`（当前为空 ——
+ * `--pretty` 自 2026-10-24 G1 起已实现，不再是 rejected，见 `spec-types.ts` 顶部）。
  */
 export const STORE_SPECS: CommandSpec[] = [
   {
@@ -267,21 +268,37 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // `names` 来自全库 `information_schema`（含未声明表），因此必须按声明集过滤后再 COUNT；
     // 未声明的表名进 warnings（不得静默 —— 与 `db tables` 同口径，README 承诺要报警）。
     const undeclared = new Set(undeclaredTables(names))
+    // ⚠️ 只数**基表**（2026-11-14，历史审查 PR#4 复核）：`information_schema` 把 view 也算作
+    // 表，同名 view 会让 COUNT 执行它的本体（实测 `read_csv_auto` 的 view → IO Error →
+    // status 整条退出 1，而「库有漂移只警告」是本命令的承诺）。view/macro 与未声明表一样
+    // 进 warnings、不进 tables。
+    const nonBase = new Set(nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows))
     for (const n of names) {
-      if (undeclared.has(n)) continue
+      if (undeclared.has(n) || nonBase.has(n)) continue
+      // ⚠️ 基表的 COUNT 失败**不**降级成警告（Codex PR#74 第三轮 P1）：view 已在上面按类型
+      // 排除，所以走到这里的都是基表，数不出来就是真错（磁盘 I/O、库损坏、并发删表）——
+      // 按 spec §8.2「DuckDB 执行期错误 → internal / 退出码 1」如实失败。
+      // 把这类错误说成 warning + 退出码 0，Agent 会以为拿到的 tables 是完整的。
       tables.push({ name: n, rows: await store.count(n) })
     }
-    const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
+    // ⚠️ `schema_version` 自己是 view 时**不许求值**（CodeRabbit PR#74）：列检查（version 列存在）
+    // 会放行，这条 MAX(version) 仍会把 view 本体执行一遍 —— 一个 `CAST('x' AS INTEGER)` 就能
+    // 让整条 status 退出 1，把「库有漂移只警告」的承诺打穿。按缺失读，交给 warnings 点名。
+    const sv = nonBase.has('schema_version')
+      ? { rows: [{ v: 0 }] }
+      : await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
     // ⚠️ 两半漂移都进 warnings，**唯一渲染点**在 `storeTablesWarnings`（2026-11-02 实测修）：
     // 此前这里只算「库中有而声明无」，声明表被删时 tables 少了几张却零 warnings ——
     // 同一库上 `db tables` 会警告、`store status` 报 ok 且干净，README 又教 Agent
     // 「数量不等时先读 warnings」，于是 Agent 读到空 warnings 反而确认了「没事」。
     const warnings = storeTablesWarnings(names, config.path, profileFlag)
+    const allWarnings = [...(warnings ?? []), ...(nonBaseTablesWarning([...nonBase]) ?? [])]
     return ok({ path: config.path, backend: config.backend, config_path: configPath,
       config_exists: configExists,
       schema_version: Number(sv.rows[0]?.v ?? 0), tables },
-    warnings === undefined
+    allWarnings.length === 0
       ? { field_notes: storeFieldNotes() }
-      : { field_notes: storeFieldNotes(), warnings })
+      : { field_notes: storeFieldNotes(), warnings: allWarnings })
   } catch (e) { return thrownToExit(e, profileFlag) } finally { await store.close() }
 }
+

@@ -11,7 +11,7 @@
 // D-T3 追加：src/sync/state.ts 常量 SELECT 3 处（水位/缺口读取），不在上述 9 处内。
 // D-T11 追加：src/sync/tasks/knowledge.ts 常量 SELECT 1 处
 //（knowledge.categories 的驱动序 SELECT DISTINCT robot_id），不在上述 9 处内。
-import { MIGRATIONS, tableByName, type TableDef } from './schema.js'
+import { MIGRATIONS, TABLES, tableByName, type TableDef } from './schema.js'
 import { retryWithBackoff, isLockError, isModuleNotFound } from './retry.js'
 import type { QueryResult, Store, StoreConfig, StoreMode, WriteTx } from './types.js'
 
@@ -63,12 +63,26 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const inst = mode === 'ro'
       ? await mod.DuckDBInstance.create(cfg.path, { access_mode: 'READ_ONLY' })
       : await mod.DuckDBInstance.create(cfg.path)
+    let conn: unknown
     try {
-      const conn = await (inst as { connect: () => Promise<unknown> }).connect()
+      conn = await (inst as { connect: () => Promise<unknown> }).connect()
+      // ⚠️ 会话级封锁外部访问（2026-11-14，历史审查 PR#4 复核）：此前只有查询沙箱
+      // （`src/query/sandbox.ts` 的 `HARDENING_SQL`）设过 `enable_external_access=false`，
+      // store 连接什么都没设 —— 而实测 DuckDB 默认值是 **true**。于是 `store status/init`
+      // 打开一个来源不明的 `.duckdb` 时，库里声明的 `tags` 等 view 会作为 COUNT(*) 的
+      // 本体以用户权限执行（实测：含 `secret` 表的库里造 `tags` view，status 退出 0 并
+      // 计数成功）。只设值、**不** lock_configuration —— 那是查询沙箱的加固项；
+      // store 的写路径不需要改这个配置，锁住只会让将来正当的会话设置无从下手。
+      await (conn as { runAndReadAll: (q: string) => Promise<unknown> })
+        .runAndReadAll('SET enable_external_access=false')
       return { conn, inst }
     } catch (e) {
       // ⚠️ R 组 R9：create 成功但 connect 失败 → instance 泄漏（锁可能随进程滞留），
       // ro 退避路径会累积 —— 失败路径自清理。
+      // ⚠️ **连接也要关**（Codex PR#74 第三轮 P2）：加固 `SET` 是在 connect **成功之后**才跑的，
+      // 它失败时只关 instance 会漏掉已建立的连接 —— DuckDB 的锁要两者都关才释放，ro 退避路径
+      // 每失败一次就多一个未关连接，后续打开更容易撞锁。先关连接，再关实例。
+      try { (conn as { closeSync?: () => void } | undefined)?.closeSync?.() } catch { /* 同上 */ }
       try { (inst as { closeSync?: () => void }).closeSync?.() } catch { /* 清理错误不掩盖原异常 */ }
       throw e
     }
@@ -82,11 +96,21 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     try {
       const r = await retryWithBackoff({
         tryOpen: open, isRetryable: isLockError, maxMs: cfg.readOnlyRetryMs,
+        // 单次尝试也必须有界（2026-11-14，历史审查 PR#4 复核）：`DuckDBInstance.create` /
+        // `connect` 在网络盘或卡住的锁等待上可以永不返回，而截止时间原先只在**抛错后**才比 ——
+        // 只读命令会无限挂着。超时被放弃的尝试若后来成功，经 `onAbandoned` 关掉（否则多一个
+        // 锁持有者）。
+        attemptMs: cfg.readOnlyRetryMs,
+        onAbandoned: (r) => {
+          try { (r.conn as { closeSync?: () => void }).closeSync?.() } catch { /* 清理失败不掩盖原错误 */ }
+          try { (r.inst as { closeSync?: () => void }).closeSync?.() } catch { /* 同上 */ }
+        },
         sleep: deps.sleep, now: deps.now,
       })
       conn = r.conn; inst = r.inst
     } catch (e) {
-      if (isLockError(e)) {
+      // 打开超时（`timedOut` 标记）与撞锁是同一类后果 —— 等不到库；归 store_locked。
+      if (isLockError(e) || (e as { timedOut?: boolean }).timedOut === true) {
         const err = new Error(`数据库被写进程占用（等待 ${cfg.readOnlyRetryMs}ms 后超时）：${cfg.path}`)
         ;(err as { kind?: string }).kind = 'store_locked'
         ;(err as { retryable?: boolean }).retryable = true
@@ -169,7 +193,13 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const cols = t.columns.map((x) => x.name)
     const quoted = cols.map((x) => `"${x}"`).join(', ')
     const nonKey = cols.filter((x) => !t.primaryKey.includes(x))
-    const setClause = nonKey.map((x) => `"${x}" = excluded."${x}"`).join(', ')
+    // ⚠️ 只有主键列的表要写 `DO NOTHING`（2026-11-14，历史审查 PR#4 复核）：`schema_version`
+    // 的唯一列 `version` 就是主键，`nonKey` 为空时拼出的 `DO UPDATE SET ` 语法错误
+    // （实测 `Parser Error: syntax error at end of input`），而 `assertTable` 放行该表
+    // —— upsert 契约对这张表不成立。语义上「只有主键」的行没有可更新的列，冲突即已存在。
+    const conflictAction = nonKey.length > 0
+      ? `DO UPDATE SET ${nonKey.map((x) => `"${x}" = excluded."${x}"`).join(', ')}`
+      : 'DO NOTHING'
     const pk = t.primaryKey.map((x) => `"${x}"`).join(', ')
     // ⚠️ 同批重复主键必须先收敛（2026-11-04 修）：DuckDB 的多行 `INSERT ... ON CONFLICT
     // DO UPDATE` 在同一语句里遇到重复键时**保留第一条**（实测：两条 id=1 的行写入后是
@@ -212,15 +242,22 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 65000 是保守值：实测该版本上限 ≥70000，勿据此放大（Q 组 Q-低-1）。
     const hardCap = Math.max(1, Math.floor(65000 / cols.length))
     const rowsPerStmt = Math.max(1, Math.min(cfg.batchSize, hardCap))
+    // `DO NOTHING` 时不能按 `batch.length` 记账（Codex PR#74 第二轮 P2）：冲突行一行都没写，
+    // 契约（types.ts `Store.upsert`「返回实际写入行数」）要求如实计数。这张表所有列都是主键，
+    // 唯一会改变行数的就是「新键插入」—— 用前后计数，与 `del` 的算法同源。
+    // `DO UPDATE` 之路不计数：新键插入、旧键更新，两者都算一次写入。
+    const countDelta = nonKey.length === 0
+    const beforeCount = countDelta ? await store.count(t.name) : 0
     for (let i = 0; i < uniq.length; i += rowsPerStmt) {
       const batch = uniq.slice(i, i + rowsPerStmt)
       const placeholders = batch.map(() => `(${cols.map(() => '?').join(', ')})`).join(', ')
       const params = batch.flatMap((r) => cols.map((k) => r[k] ?? null))
       await store.execSql(
-        `INSERT INTO "${t.name}" (${quoted}) VALUES ${placeholders} ON CONFLICT (${pk}) DO UPDATE SET ${setClause}`,
+        `INSERT INTO "${t.name}" (${quoted}) VALUES ${placeholders} ON CONFLICT (${pk}) ${conflictAction}`,
         params)
       written += batch.length
     }
+    if (countDelta) return Math.max(0, (await store.count(t.name)) - beforeCount)
     return written
   }
 
@@ -237,6 +274,62 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   // （ROLLBACK 与 BEGIN/COMMIT 同为事务控制语句，闭包直调——见 upsert 处注释。）
   const safeRollback = async (): Promise<void> => {
     try { await execSql('ROLLBACK') } catch { /* 保留原错误 */ }
+  }
+
+  /**
+   * 他人库指纹（`init` 专用）：命中返回成因文案，否则 null。
+   *
+   * ⚠️ **只认「我们绝不可能产出」的形态**（2026-11-14，历史审查 PR#4 复核实测）：
+   * ① `schema_version` 没有 `version` 列 —— 我们的迁移第一版就建了它；
+   * ② 有表但 `schema_version` **一行都没有** —— 我们的每次迁移都插一行，留下的库至少有一条；
+   * ③ 记录的最大版本**超过本 CLI 已知的最新迁移** —— 我们从未写过这个号；
+   * ④ `schema_version` **不是一个基表**（view 等）—— 我们只会建表，且求值外来 view 有副作用。
+   * ⚠️ **不要**改回「声明表出现声明外的列就拒绝」（首版这么写，全量回归当场抓到）：
+   * 多列/少列是**既有契约里的 schema 漂移**（`db tables` 只警告不失败、README 明写），
+   * 一条手工 `ALTER TABLE … ADD COLUMN` 会被误判成他人库，`store init` 直接不可用。
+   * 代价如实记录：一条**版本号恰好落在我们范围内**的外来库仍可能被当成「旧版 CLI 建的库」，
+   * 那时 init 不建表、只按 `storeTablesWarnings` 点名缺表 —— 不会往里写业务数据。
+   */
+  const detectForeignStore = async (): Promise<string | null> => {
+    // ⚠️ 先看**对象类型**再谈内容（CodeRabbit PR#74 第五轮）：`information_schema.tables` 把
+    // view 也算作表，下面那条 `MAX(version)` 会把 view 本体当查询执行 —— 一条
+    // `CREATE VIEW schema_version AS SELECT CAST('x' AS INTEGER)` 就能让 init 报
+    // Conversion Error（internal），既绕开「他人库」归类，也违背「是 view 就不求值」的说法。
+    // 本 CLI 从不把 schema_version 建成 view，所以「不是基表」本身就是他人库指纹。
+    const kindRes = await store.execSql(
+      "SELECT table_type FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'schema_version'")
+    const kind = String((kindRes as { getRowObjectsJson: () => Record<string, unknown>[] })
+      .getRowObjectsJson()[0]?.table_type ?? '')
+    if (kind.toUpperCase() !== 'BASE TABLE') {
+      return `目标数据库不是本 CLI 创建的（schema_version 不是基表，实际是 ${kind || '未知对象'}）：${cfg.path}`
+    }
+    const r = await store.execSql(
+      "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'main'")
+    const cols = new Map<string, string[]>()
+    for (const row of (r as { getRowObjectsJson: () => Record<string, unknown>[] }).getRowObjectsJson()) {
+      const t = String(row.table_name)
+      const list = cols.get(t) ?? []
+      list.push(String(row.column_name).toLowerCase())
+      cols.set(t, list)
+    }
+    const svCols = cols.get('schema_version') ?? []
+    if (!svCols.includes('version')) {
+      return `目标数据库不是本 CLI 创建的（schema_version 缺少 version 列，`
+        + `实际列：${svCols.join('、') || '无'}）：${cfg.path}`
+    }
+    const svRes = await store.execSql('SELECT COUNT(*) AS n, COALESCE(MAX(version), 0) AS v FROM schema_version')
+    const rows = (svRes as { getRowObjectsJson: () => Record<string, unknown>[] }).getRowObjectsJson()
+    const n = Number(rows[0]?.n ?? 0)
+    const v = Number(rows[0]?.v ?? 0)
+    const latest = MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0)
+    if (n === 0) {
+      return `目标数据库不是本 CLI 创建的（库中有表，但 schema_version 没有任何记录）：${cfg.path}`
+    }
+    if (v > latest) {
+      return `目标数据库不是本 CLI 创建的（schema_version 记录版本 ${v}，`
+        + `高于本 CLI 已知的最新迁移 ${latest}）：${cfg.path}`
+    }
+    return null
   }
 
   // ⚠️ store 自引用：方法体经 store.execSql 调用（见下方契约）。断言目标**必须含
@@ -256,6 +349,18 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         ;(err as { kind?: string }).kind = 'store_not_initialized'
         ;(err as { hint?: string }).hint = '目标数据库不是本 CLI 创建的，请换 --db 路径'
         throw err
+      }
+      // ⚠️ 「有 schema_version」不是身份证明（2026-11-14，历史审查 PR#4 复核）：实测造一个
+      // `{secret 表, schema_version(version INTEGER) 空表}` 的外来库，init 直接报 ok 并往里
+      // 建表。指纹判据见 `detectForeignStore` 的注释（三条「我们不可能产出」的形态）。
+      if (names.includes('schema_version')) {
+        const foreign = await detectForeignStore()
+        if (foreign !== null) {
+          const err = new Error(foreign)
+          ;(err as { kind?: string }).kind = 'store_not_initialized'
+          ;(err as { hint?: string }).hint = '目标数据库不是本 CLI 创建的，请换 --db 路径'
+          throw err
+        }
       }
       const cur = names.includes('schema_version')
         ? await store.execSql('SELECT COALESCE(MAX(version), 0) AS v FROM schema_version')
