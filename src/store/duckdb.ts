@@ -104,7 +104,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       })
       conn = r.conn; inst = r.inst
     } catch (e) {
-      // 打开超时（`attempt_timeout`）与撞锁是同一类后果 —— 等不到库，别重试了；归 store_locked。
+      // 打开超时（`timedOut` 标记）与撞锁是同一类后果 —— 等不到库；归 store_locked。
       if (isLockError(e) || (e as { timedOut?: boolean }).timedOut === true) {
         const err = new Error(`数据库被写进程占用（等待 ${cfg.readOnlyRetryMs}ms 后超时）：${cfg.path}`)
         ;(err as { kind?: string }).kind = 'store_locked'
@@ -327,10 +327,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       }
       // ⚠️ 「有 schema_version」不是身份证明（2026-11-14，历史审查 PR#4 复核）：实测造一个
       // `{secret 表, schema_version(version INTEGER) 空表}` 的外来库，init 直接报 ok 并往里
-      // 建表；同名异形表因 `IF NOT EXISTS` 被静默沿用，后续写入才炸。两道低成本指纹：
-      //   ① `schema_version` 必须有 `version` 列（大小写不敏感，与 DuckDB 解析规则一致）；
-      //   ② 已存在的**声明表**其列必须是声明列的子集（我们只会加列，不会造出多余的列）。
-      // 任一不符 → 与「有表但无 schema_version」同一条他人库防线。
+      // 建表。指纹判据见 `detectForeignStore` 的注释（三条「我们不可能产出」的形态）。
       if (names.includes('schema_version')) {
         const foreign = await detectForeignStore()
         if (foreign !== null) {
