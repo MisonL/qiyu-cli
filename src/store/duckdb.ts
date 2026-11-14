@@ -388,9 +388,14 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       }
     },
     async tables(): Promise<string[]> {
+      // ⚠️ 返回**声明的名字**（Codex PR#76 第四轮实测）：DuckDB 标识符大小写不敏感，
+      // `"SCHEMA_VERSION"` 与 `schema_version` 是同一个对象；调用方（store status/init、
+      // sync）拿这些名字去 `assertTable`（按声明名查）并比对声明集 —— 原样返回大写名会让
+      // `store status` 在 `count('SCHEMA_VERSION')` 上抛 usage（实测退出码 2），
+      // 并把它同时报成「声明有而库中无」与「库中有而声明无」。未声明的对象原样返回。
       const r = await store.execSql(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'`)
       return (r as { getRowObjectsJson: () => Record<string, unknown>[] }).getRowObjectsJson()
-        .map((x) => String(x.table_name)).sort()
+        .map((x) => tableByName(String(x.table_name))?.name ?? String(x.table_name)).sort()
     },
     async count(table: string): Promise<number> {
       assertTable(table)

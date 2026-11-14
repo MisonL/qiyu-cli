@@ -159,10 +159,13 @@ export function statGuard(path: string): number | null {
  * 没问「这几张是不是本 CLI 的」。
  */
 export function undeclaredTables(names: readonly string[]): string[] {
+  // ⚠️ 声明 vs 实际按大小写不敏感比（Codex PR#76 第四轮实测）：DuckDB 里 `"SCHEMA_VERSION"`
+  // 与 `schema_version` 是同一个对象，精确比较会把它同时报成「声明有而库中无」与
+  // 「库中有而声明无」，并给出「重建库」建议。
   const declared = new Set(TABLES.map((t) => t.name))
   // 排序：`information_schema` 不保证顺序，`db tables` 此前自己 `.sort()`、`store`
   // 不排序 —— 同一库两次输出 warnings 顺序不同。统一在唯一实现点排序。
-  return names.filter((n) => !declared.has(n)).sort()
+  return names.filter((n) => ![...declared].some((d) => sameObjectName(d, n))).sort()
 }
 
 /**
@@ -176,8 +179,7 @@ export function undeclaredTables(names: readonly string[]): string[] {
  * 当成没事的形态：Agent 见 warnings 为空就以为「声明与实况已对齐」。
  */
 export function declaredMissingTables(names: readonly string[]): string[] {
-  const actual = new Set(names)
-  return TABLES.map((t) => t.name).filter((n) => !actual.has(n))
+  return TABLES.map((t) => t.name).filter((n) => !names.some((a) => sameObjectName(n, a)))
 }
 
 /**

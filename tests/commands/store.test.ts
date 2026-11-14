@@ -416,6 +416,15 @@ describe('store status', () => {
     for (const argv of [['status'], ['init']] as string[][]) {
       out = ''
       expect(await storeCommand([...argv, '--db', dbPath()]), `${argv[0]} 不得把大写表名的完整库判成他人库；输出：${out.slice(0, 300)}`).toBe(0)
+      // 退出码 0 还不够：清单与漂移 warning 也按同一规则比（Codex PR#76 第四轮实测：
+      // 此前 schema_version 被报「声明有而库中无」、SCHEMA_VERSION 被报「库中有而声明无」，
+      // 还附带「重建库」建议）
+      const shown = argv[0] === 'status'
+        ? (data().tables as Array<{ name: string }>).map((t) => t.name)
+        : (data().tables as string[])
+      expect(shown, `${argv[0]} 的 tables 必须含 schema_version`).toContain('schema_version')
+      const w = (JSON.parse(out).meta?.warnings as string[] | undefined) ?? []
+      expect(w.join('\n'), `${argv[0]} 不得报 schema_version 缺失/未声明`).not.toMatch(/声明有而库中无[^。]*schema_version|库中有而声明无[^。]*SCHEMA_VERSION/)
     }
     out = ''
     expect(await dbCommand(['tables', '--db', dbPath()]), `db tables 同样；输出：${out.slice(0, 300)}`).toBe(0)

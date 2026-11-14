@@ -13,7 +13,7 @@ import {
   SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables,
   storeTablesWarnings, OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning, sameObjectName,
 } from './store-precheck.js'
-import { TABLES } from '../store/schema.js'
+import { TABLES, tableByName } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
 import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
 import type { CommandSpec } from './spec-types.js'
@@ -224,12 +224,14 @@ export async function storeCommand(argv: string[]): Promise<number> {
       // 「两边数量应当一致」就成了假话。未声明的表名进 warnings，不静默丢弃。
       const all = await store.tables()
       const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
-      const declared = new Set(TABLES.map((t) => t.name))
+      const declaredNames = TABLES.map((t) => t.name)
       // ⚠️ 同名对象不是基表（view 等）就不算「我们的表」（2026-11-14，PR #74 合并后自查）：
       // `store.tables()` 来自 `information_schema`、把 view 也算作表，init 曾把一条 view
       // 列进自己的 tables 清单（实测），而 `store status` / `db tables` 已是「只数基表 +
       // 非基表进 warnings」。三处清单同口径，README 的「两边数量应当一致」才成立。
+      // 同样按声明名归位（DuckDB 标识符大小写不敏感：`"TAGS"` view 就是 `tags` 这个名字）。
       const nonBase = nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows)
+        .map((n) => tableByName(n)?.name ?? n)
       const warnings = [
         ...(storeTablesWarnings(all, config.path, profileFlag) ?? []),
         ...(nonBaseTablesWarning(nonBase) ?? []),
@@ -237,7 +239,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
       return ok({ path: config.path, backend: config.backend, config_path: configPath,
         config_exists: configExists,
         schema_version: Number(sv.rows[0]?.v ?? 0),
-        tables: all.filter((n) => declared.has(n) && !nonBase.includes(n)) },
+        tables: all.filter((n) => declaredNames.some((d) => sameObjectName(d, n)) && !nonBase.includes(n)) },
       warnings.length === 0
         ? { field_notes: storeFieldNotes() }
         : { field_notes: storeFieldNotes(), warnings })

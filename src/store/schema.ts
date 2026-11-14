@@ -362,7 +362,12 @@ export const TABLES: TableDef[] = [
 ]
 
 export function tableByName(name: string): TableDef | undefined {
-  return TABLES.find((t) => t.name === name)
+  // 名字匹配按 DuckDB 的标识符规则：仅折叠 ASCII A–Z，不做 Unicode 折叠（Codex PR#76；
+  // 判据与 `store/object-kinds.ts` 的 `sameObjectName` 同一规则 —— schema.ts 在本模块内
+  // 不能再依赖 duckdb 层，故就地实现；`tests/store/object-kinds.test.ts` 双向钉住两者一致）。
+  const fold = (x: string): string => x.replace(/[A-Z]/g, (c) => c.toLowerCase())
+  const key = fold(name)
+  return TABLES.find((t) => fold(t.name) === key)
 }
 
 /** v1 基线批次（C1 交付的四张）；v3/v5 起的数据表批次不进 v1 建表循环。 */

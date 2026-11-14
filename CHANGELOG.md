@@ -105,6 +105,11 @@
   同款误报，现已按 ASCII 折叠取键。`sync verify` 对「本地对象不是基表」的快照任务**不再**因
   缺凭证报 `auth_missing` —— 那条路径根本不取上游，「缺凭证」是环境问题、会盖住本地可诊断的
   `not_base_table` drift；所有选中的快照任务本地都不是基表时才放行结果。
+  再一轮（Codex PR#76 第四轮）把同一条规则贯通到**清单与漂移比对**：`store.tables()` 现在返回
+  声明的名字（`"SCHEMA_VERSION"` → `schema_version`，未声明对象原样返回），`tableByName` 与
+  「声明有而库中无 / 库中有而声明无」两侧都按同一规则匹配 —— 此前完整库被改名成大写
+  `schema_version` 时，`store status` 会在 `count` 上抛 usage（退出码 2），并把它同时报成
+  「声明有而库中无」与「库中有而声明无」、附「重建库」建议。
 
 - **`db tables` / `store init` 与 `store status` 同口径：只认基表**（2026-11-14，PR #74 合并后自查）：
   上一轮只改了 `store status`，而同一份库里另外两条命令仍把 `information_schema` 里的 view
