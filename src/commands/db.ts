@@ -21,7 +21,10 @@ import { resolveStoreConfig, currentStoreEnv } from '../store/config.js'
 import { openSandbox, withTimeoutHint } from '../query/sandbox.js'
 import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
-import { SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, storeTablesWarnings } from './store-precheck.js'
+import {
+  SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, storeTablesWarnings,
+  OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning,
+} from './store-precheck.js'
 import { suggestNames, thrownToQueryExit, missingTableCauses } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
 import type { ColumnDef, TableDef, TimeColumnKind } from '../store/schema.js'
@@ -286,15 +289,23 @@ async function dbTables(argv: string[]): Promise<number> {
 
   try {
     // 实际表集 → 与声明比对（spec §8.1「声明与实况的差异不得静默」）。
-    const actual = await session.run(
-      "SELECT table_name FROM information_schema.tables WHERE table_schema='main'")
+    // ⚠️ 同时取**对象类型**（2026-11-14，PR #74 合并后自查）：`information_schema.tables` 把
+    // view 也算作表，而下面按声明名逐表 `SELECT COUNT(*)` 会把同名 view 的本体当查询执行
+    // （实测：view 底表被删 → `query_error`、退出码 2；store 连接封锁外部访问后
+    // `read_csv_auto` 类 view 同样整条失败）。这与 `store status` 的口径必须一致：
+    // 只数基表，非基表进 warnings（`nonBaseTablesWarning` 是唯一渲染点）。
+    const actual = await session.run(OBJECT_KINDS_SQL)
     const actualNames = actual.rows.map((r) => String(r.table_name))
-    const actualSet = new Set(actualNames)
+    const nonBase = nonBaseTables(actual.rows)
+    const actualSet = new Set(actualNames.filter((n) => !nonBase.includes(n)))
     // ⚠️ 两半漂移的 warning 走 `storeTablesWarnings`（**唯一渲染点**，2026-11-02 收敛）：
     // 此前本命令自己拼「声明有而库中无」+ `missingTableCauses`，而 `store status`/`init`
     // 只拼「库中有而声明无」—— 同一库两种漂移，两条命令各报一半，缺表那半在 store 上
     // 静默。这里与 store 现在共用同一个渲染器，`declaredMissing` 也不再单独算。
-    const warnings = storeTablesWarnings(actualNames, opened.dbPath, opened.profileFlag) ?? []
+    const warnings = [
+      ...(storeTablesWarnings(actualNames, opened.dbPath, opened.profileFlag) ?? []),
+      ...(nonBaseTablesWarning(nonBase) ?? []),
+    ]
 
     // 实际列集一次查全库（25 次往返 → 1 次）：时间列被删的表不能让 timeRangeOf 的
     // `MIN("c")` 在 prepare 期抛 Binder Error 把整命令打成退出码 2（Task 7 审查

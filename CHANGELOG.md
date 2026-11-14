@@ -82,6 +82,14 @@
     `sync run` 都拒绝 —— 统一报用法错误；
   · `auth` / `api` 的 `--help` 错误码清单补上真实会出现的 `config_invalid`。
 
+- **`db tables` / `store init` 与 `store status` 同口径：只认基表**（2026-11-14，PR #74 合并后自查）：
+  上一轮只改了 `store status`，而同一份库里另外两条命令仍把 `information_schema` 里的 view
+  当自己的表 —— `db tables` 会对声明名 `SELECT COUNT(*)`、把同名 view 的本体当查询执行
+  （实测：view 底表被删 → `query_error`、退出码 2），`store init` 的成功输出则把一条 view
+  列进 `tables` 清单。现在三处都只列/只数基表，非基表进 `meta.warnings`（`nonBaseTablesWarning`
+  唯一渲染点），README 承诺的「两边数量应当一致」才成立。测试夹具的 `resetDb()` 同步改成
+  「先按非基表 `DROP VIEW`，再 `DROP TABLE`」（view 残留会污染下一条用例）。
+
 - **`--since` 带相对时长时，区间终点不再取决于解析耗时**：`--since 1d` 的终点原本取自
   `parseTimeArg` 内部的时钟，随后「未给 `--until`」又调了一次时钟 —— 两次 `Date.now()`
   之间只要过去 ≥1ms，区间就从「1 天」变成「1 天 + ε」，`sliceByMaxWindow(…, 6, 1)`
