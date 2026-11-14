@@ -12,6 +12,7 @@ import { missingTableCauses } from '../../src/query/errors.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { shellArg } from '../../src/core/shell.js'
 import { TABLES, MIGRATIONS } from '../../src/store/schema.js'
+import { OBJECT_KINDS_SQL } from '../../src/commands/store-precheck.js'
 import type { Store } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/sync.test.ts 同款放宽）。
@@ -53,7 +54,14 @@ async function resetDb(): Promise<void> {
     const names = (await s.query(
       `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'`))
       .rows.map((r) => String(r.table_name))
-    for (const n of names) await s.query(`DROP TABLE IF EXISTS "${n}" CASCADE`)
+    // ⚠️ 同一名字可能是 view（本文件有「声明表被换成同名 view」的用例）：`DROP TABLE` 对
+    // view 报 `Catalog Error: Existing object tags is of type View`，于是破坏会**留到下一条
+    // 用例**（单库路径的已知边界，见文件头）。先按非基表删，再兜底按表删。
+    const kinds = new Map((await s.query(OBJECT_KINDS_SQL)).rows.map((r) => [String(r.table_name), String(r.table_type)]))
+    for (const n of names) {
+      if (kinds.get(n) !== 'BASE TABLE') await s.query(`DROP VIEW IF EXISTS "${n}" CASCADE`)
+      await s.query(`DROP TABLE IF EXISTS "${n}" CASCADE`)
+    }
     await s.init()
   } finally {
     await s.close()
@@ -227,6 +235,34 @@ describe('db tables', () => {
     // 旧的不实承诺不得被保留（复审 Minor #2：否定式断言）
     expect(text).not.toMatch(/可运行 qiyu store init 补齐建表/)
     expect(text).not.toMatch(/需重建库或重新同步/)   // 重新同步单独无法重建被删表
+  })
+
+  it('声明的表被换成同名 view → db tables 不执行它、照常成功并点名（与 store status 同口径）', async () => {
+    // 2026-11-14（PR #74 合并后自查）：`information_schema` 把 view 也算作表，`db tables`
+    // 对声明名做 `SELECT COUNT(*) FROM "<name>"` 时会把 view 本体当查询执行 —— view 的底表
+    // 被删/不可读时整条命令报 `query_error` 退出 2，而 `store status` 早已改成「只数基表、
+    // 同名 view 进 warnings」。同一份库里两条命令两种结论，正是 README 承诺「两边数量一致」的反面。
+    await resetDb()
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+      await s.query('DROP TABLE "tags"')
+      await s.query('CREATE VIEW "tags" AS SELECT * FROM "aux_tbl"')
+      // 底表删掉 → view 一执行就 Catalog Error（「有没有求值」的判据本身）
+      await s.query('DROP TABLE "aux_tbl"')
+    } finally {
+      await s.close()
+    }
+
+    const code = await dbCommand(['tables', '--db', dbPath()])
+    expect(code, `view 本体不得被执行；输出：${out.slice(0, 300)}`).toBe(0)
+    const names = (data().tables as TableOut[]).map((t) => t.name)
+    expect(names, '不是基表的同名对象不得进 tables（否则「数量一致」成了假话）').not.toContain('tags')
+    const text = (meta().warnings as string[]).join('\n')
+    expect(text, '必须点名这个对象是 view、未被计数').toMatch(/不是基表/)
+    expect(text).toContain('tags')
   })
 
   it('声明的时间列被删 → db tables 仍成功，该表 time_range 为 null + warning（不硬失败）', async () => {

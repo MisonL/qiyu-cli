@@ -225,12 +225,20 @@ export async function storeCommand(argv: string[]): Promise<number> {
       const all = await store.tables()
       const sv = await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
       const declared = new Set(TABLES.map((t) => t.name))
-      const warnings = storeTablesWarnings(all, config.path, profileFlag)
+      // ⚠️ 同名对象不是基表（view 等）就不算「我们的表」（2026-11-14，PR #74 合并后自查）：
+      // `store.tables()` 来自 `information_schema`、把 view 也算作表，init 曾把一条 view
+      // 列进自己的 tables 清单（实测），而 `store status` / `db tables` 已是「只数基表 +
+      // 非基表进 warnings」。三处清单同口径，README 的「两边数量应当一致」才成立。
+      const nonBase = nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows)
+      const warnings = [
+        ...(storeTablesWarnings(all, config.path, profileFlag) ?? []),
+        ...(nonBaseTablesWarning(nonBase) ?? []),
+      ]
       return ok({ path: config.path, backend: config.backend, config_path: configPath,
         config_exists: configExists,
         schema_version: Number(sv.rows[0]?.v ?? 0),
-        tables: all.filter((n) => declared.has(n)) },
-      warnings === undefined
+        tables: all.filter((n) => declared.has(n) && !nonBase.includes(n)) },
+      warnings.length === 0
         ? { field_notes: storeFieldNotes() }
         : { field_notes: storeFieldNotes(), warnings })
     } catch (e) { return thrownToExit(e, profileFlag) } finally { await store.close() }

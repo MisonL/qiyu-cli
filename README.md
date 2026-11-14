@@ -344,6 +344,9 @@ qiyu --version                       包版本 + skill_contract_version
 含内部表 `schema_version` / `sync_state` / `sync_gaps`，所以两边数量应当一致）；库里
 有而本 CLI **未声明**的表（旧版 CLI 或其它工具建的）不出现在 `tables` 里，而是在
 `meta.warnings` 中点名 —— 数量不等时先读 `warnings` 判成因，不要径直断定「有表缺失」。
+与声明表**同名但不是基表**的对象（view 等）同样不进 `tables`、在 `warnings` 里点名：
+`store status` / `store init` / `db tables` 都不会去执行它（一条同名 view 的本体若读外部
+文件或引用已删的表，执行它会让整条命令失败）。
 `schema_version` 要跟当前 CLI 的版本（`LATEST_VERSION`）比才有意义，小于它就是
 旧版 CLI 建的库，`store init` 只补建缺失的迁移、不重放已应用的。`store status` 的每次调用都要对
 各表做全表 `COUNT`（行数无缓存），轮询代价与数据量成正比，Agent 不应把它当作高频健康

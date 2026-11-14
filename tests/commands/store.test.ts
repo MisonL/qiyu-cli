@@ -121,6 +121,31 @@ describe('store init', () => {
       'ticket_template_fields', 'ticket_templates', 'tickets', 'transfer_human'])
   })
 
+  it('声明的表被换成同名 view → init 的 tables 不得把它当自己的表（与 status 同口径）', async () => {
+    // 2026-11-14（PR #74 合并后自查）：`store.tables()` 来自 `information_schema`，把 view
+    // 也算作表 —— init 的成功输出于是把一条 view 列进自己的 tables 清单（实测），而
+    // `store status` 早已「只数基表、同名 view 进 warnings」。三处清单必须同口径，
+    // 否则 README 的「两边数量应当一致」就是假话。
+    expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(dbPath())
+    const conn = await inst.connect()
+    await conn.run('CREATE TABLE "aux_tbl" (id VARCHAR)')
+    await conn.run('DROP TABLE "tags"')
+    await conn.run('CREATE VIEW "tags" AS SELECT * FROM "aux_tbl"')
+    conn.closeSync(); inst.closeSync()
+
+    out = ''
+    expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
+    const d = data()
+    expect(d.tables as string[], '不是基表的同名对象不得进 tables').not.toContain('tags')
+    const text = (JSON.parse(out).meta.warnings as string[]).join('\n')
+    expect(text, '必须点名「不是基表」并包含该名字').toMatch(/不是基表/)
+    expect(text).toContain('tags')
+  })
+
   it('重复 init 幂等（验收 41 + 18：schema_version 不变）', async () => {
     await storeCommand(['init', '--db', dbPath()])
     const v1 = data().schema_version
