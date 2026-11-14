@@ -1238,6 +1238,27 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect((meta().mask_warnings as string[]).some((x) => /extra_col/.test(x))).toBe(true)
   })
 
+  it('声明表被换成同名 view（底表已删）→ store_not_initialized，不执行 view、不报「列不存在」（2026-11-15）', async () => {
+    await seed()
+    const s: Store = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+      await s.query('DROP TABLE "staff_quality"')
+      await s.query('CREATE VIEW "staff_quality" AS SELECT * FROM "aux_tbl"')
+      await s.query('DROP TABLE "aux_tbl"')
+    } finally { await s.close() }
+
+    expect(await qAt('--table', 'staff_quality')).toBe(1)
+    const e = errorOf()
+    expect(e.kind).toBe('store_not_initialized')
+    expect(String(e.message), '要点名「不是基表」，而不是「列不存在」').toMatch(/不是基表/)
+    expect(String(e.message)).not.toMatch(/列 .* 在库中不存在/)
+    expect(String(e.message), '不得回显 view 定义里的底表名').not.toMatch(/aux_tbl/)
+    expect(String(e.hint), '恢复动作：换新路径重建 + sync run').toMatch(/qiyu store init/)
+    expect(String(e.hint)).toMatch(/qiyu sync run/)
+  })
+
   it('库漂移（声明表整个被删）→ store_not_initialized 退出码 1，不再伪装成拼写错误（场景 F1）', async () => {
     await seed()
     // 声明有、库里无：TABLES 认得 staff_quality，information_schema 没有。

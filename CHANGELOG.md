@@ -47,6 +47,10 @@
 
 ### 修复
 
+- **`query --table` / `stats fields` 遇同名 view 不再执行它**（2026-11-15）：此前两者只查表名在不在，
+  一条底表已删的 view 会被执行，报「列 stat_date 在库中不存在」/「列 payload 不存在」，把 view 定义里的
+  对象说成漂移。现在报 `store_not_initialized`「同名对象不是基表（view 等），本命令未执行它」，并给出
+  「备份后换新路径重建库 + `sync run`」的恢复动作（`<新路径>` 占位符附带替换契约）。
 - **`db describe` 遇同名 view 不再执行它**（2026-11-15）：此前只看表名在不在，一条底表已删的
   view 会让 `COUNT(*)` 执行它 → Catalog Error → 整条命令退出 2，报文还把 view 定义里的底表名
   说成「表不存在」。现在与 `db tables` / `store status` / `sync verify` 同口径：只出声明元数据

@@ -82,6 +82,23 @@ async function seed(): Promise<void> {
 }
 
 describe('stats fields', () => {
+  it('声明表被换成同名 view（底表已删）→ 不执行 view、不报「列 payload 不存在」（2026-11-15）', async () => {
+    const s = await fresh()
+    try {
+      await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+      await s.query('DROP TABLE "daily_overview"')
+      await s.query('CREATE VIEW "daily_overview" AS SELECT * FROM "aux_tbl"')
+      await s.query('DROP TABLE "aux_tbl"')
+    } finally { await s.close() }
+    out = ''
+    expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(1)
+    const e = errorOf()
+    expect(String(e.message)).toMatch(/不是基表/)
+    expect(String(e.message), '不得回显 view 定义里的底表名').not.toMatch(/aux_tbl/)
+    expect(String(e.hint)).toMatch(/qiyu store init/)
+    expect(String(e.hint)).toMatch(/qiyu sync run/)
+  })
+
   it('daily_overview：observed 的 rows_present/minus_one/nulls/min/max 与合成 payload 一致', async () => {
     await seed()
     expect(await statsCommand(['fields', 'daily_overview', '--db', dbPath()])).toBe(0)

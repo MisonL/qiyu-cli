@@ -19,8 +19,10 @@ import { DB_PATH_HELP, parseStoreFlags } from './store-flags.js'
 import {
   ok, fail, usageFail, sanitizeControlChars, describeArgs, setPretty, syncRunCommand,
   dbTablesCommand, dbDescribeCommand, querySqlCommand, SQL_ARG_REPLACE_NOTE, metadataTimeoutHint,
+  storeInitCommand,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
+import { OBJECT_KINDS_SQL, nonBaseTables, sameObjectName } from './store-precheck.js'
 import type { StoreLocation } from '../output.js'
 import { withTimeoutHint } from '../query/sandbox.js'
 import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
@@ -314,9 +316,24 @@ async function statsFields(argv: string[]): Promise<number> {
     // 目标表存在性校验（spec §十一「库不存在/缺表 → store_not_initialized、退出码 1」）：
     // schema_version 的库结构校验在 openGuardedSession 里已做（E 族共用，口径见 db.ts 的
     // 注释）——这里只补本命令特有的「目标表缺」分支，并给出对 stats 有意义的 hint。
-    const target = await session.run(
-      `SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='${table}'`)
-    if (target.rows.length === 0) {
+    // ⚠️ 与 `query --table` / `store status` 同口径（2026-11-15）：同名对象不是基表也不执行 ——
+    // 一条底表已删的同名 view 会一路走到 `observeSql`，报「列 payload 不存在」，把 view 定义
+    // 里的对象说成漂移（实测）。
+    const kinds = (await session.run(OBJECT_KINDS_SQL)).rows
+    const exists = kinds.some((r) => sameObjectName(String(r.table_name), table))
+    const nonBase = nonBaseTables(kinds).some((n) => sameObjectName(table, n))
+    if (nonBase) {
+      return fail({
+        code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
+        message: `数据库中同名对象不是基表：${table}（view 等，本命令未执行它）`,
+        hint: '本地同名对象不是基表（view 等），本命令未执行它。若本 CLI 的表已被同名 view 取代：'
+          + '先备份旧库文件，再把 --db 换成新的 .duckdb 路径跑 '
+          + storeInitCommand('<新路径>', opened.profileFlag) + ' 建库、'
+          + syncRunCommand('<新路径>', opened.profileFlag) + ' 重新拉取（把 <新路径> 整段替换成新路径，'
+          + '不要指回出问题的文件）',
+      })
+    }
+    if (!exists) {
       // ⚠️ 不得承诺 store init 一定能修（审查 Important #1，与 db.ts:184-189 同款）：
       // init 只重放 `version > MAX(version)` 的迁移，已迁移到最新版后被 DROP 的表
       // **不会**被重建（迁移已跳过，返回 ok 而表仍缺）——那是「成功但无效」的修复。
