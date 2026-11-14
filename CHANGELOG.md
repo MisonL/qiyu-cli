@@ -47,6 +47,14 @@
 
 ### 修复
 
+- **`db describe` 遇同名 view 不再执行它**（2026-11-15）：此前只看表名在不在，一条底表已删的
+  view 会让 `COUNT(*)` 执行它 → Catalog Error → 整条命令退出 2，报文还把 view 定义里的底表名
+  说成「表不存在」。现在与 `db tables` / `store status` / `sync verify` 同口径：只出声明元数据
+  （`row_count` / `time_range` 为 null），在 `meta.warnings` 点名「不是基表」。
+  同时修掉 `db tables` 的一处同类缺陷：同名 view 的列此前被当成「该表实际的列」做漂移比对
+  —— 列名恰好相同时让「缺列」warning 静默、不相同时凭空造出「多列/少列」；列核对的来源现在
+  只取基表。
+
 - **历史 PR 审查意见的逐条复核与收口（2026-11-14）**：把 73 个已合并 PR 的 128 条审查线程
   （40 条未标记解决）+ 审查正文逐条拿到当前代码上核实，**只修仍然成立的**：
   · **`store` 连接封锁外部访问**：DuckDB 默认 `enable_external_access=true`，而此前只有查询
