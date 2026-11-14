@@ -324,6 +324,14 @@ async function dbTables(argv: string[]): Promise<number> {
       if (set === undefined) columnsOf.set(tableName, new Set([columnName]))
       else set.add(columnName)
     }
+    // 声明表 → 库内该表**基表**的列集（2026-11-15）：同名 view 的列在这里**不算**该表的
+    // 列 —— 否则一条列名恰好相同的 view 会让「缺列」warning 静默。取不到就返 undefined，
+    // 由调用方跳过逐列核对（该名字已由 `nonBaseTablesWarning` 点名），不报假漂移。
+    const baseColumnsOf = (declared: string): Set<string> | undefined => {
+      const actual = actualNameOf(declared)
+      if (actual === undefined || !actualSet.has(actual)) return undefined
+      return columnsOf.get(actual)
+    }
 
     // 逐表：行数 + 时间范围；清单与顺序以 TABLES 为权威（裁决 R4：缺表的表整条跳过）。
     const tables: Array<{
@@ -345,7 +353,7 @@ async function dbTables(argv: string[]): Promise<number> {
       // 而 describe 才有的逐列核对在 tables 清单里缺失就是静默漂移。列集已在上面
       // 一次查全库（columnsOf），这里只做集合差，不加往返。
       const declaredCols = new Set(t.columns.map((c) => c.name))
-      const actualCols = columnsOf.get(actualName) ?? new Set<string>()
+      const actualCols = baseColumnsOf(t.name) ?? new Set<string>()
       // 时间列缺了由下面那条专门警告说明（它还要解释 time_range 为何置 null），
       // 这里排除它，避免同一事实说两遍。
       const missingCols = [...declaredCols].filter((n) => !actualCols.has(n) && n !== t.timeColumn?.name)
@@ -440,12 +448,21 @@ async function dbDescribe(argv: string[]): Promise<number> {
     metadataTimeoutHint(storeLocationOf(opened.dbPath, opened.profileFlag)))
 
   try {
-    // 表名来自 `TABLES` 闭集（代码内常量），拼进字面量安全；用户输入只用于上面的闭集查找。
-    const present = (await session.run(
-      `SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name='${table.name}'`))
-      .rows.length > 0
-
     const warnings: string[] = []
+    // ⚠️ 与 `db tables` / `store status` 同口径（2026-11-15）：同名对象不是基表（view 等）就
+    // **不执行它** —— 只出声明元数据、由 warnings 点名。此前只看表名在不在，一条底表已删的
+    // `daily_overview` view 会让 `COUNT(*)` 执行 view → Catalog Error → 整条命令退出 2，
+    // 报文还把 view 定义里的底表名说成「表不存在」。
+    const kinds = (await session.run(OBJECT_KINDS_SQL)).rows
+    const present = kinds.some((r) => sameObjectName(String(r.table_name), table.name))
+    const isNonBase = nonBaseTables(kinds).some((n) => sameObjectName(table.name, n))
+    if (isNonBase) {
+      warnings.push(`表 ${table.name} 在库中不是基表（view 等），本命令未执行它：以下为声明元数据`
+        + '（row_count/time_range 无法得知，置 null）。用 `'
+        + dbTablesCommand(storeLocationOf(opened.dbPath, opened.profileFlag))
+        + '` 确认该名字实际是什么对象')
+    }
+
     let rowCount: number | null = null
     let timeRange: { min: string; max: string } | null = null
 
@@ -457,6 +474,8 @@ async function dbDescribe(argv: string[]): Promise<number> {
       // 报 store_not_initialized）。与 db tables/query/stats 共用 missingTableCauses()。
       warnings.push(`表 ${table.name} 在库中不存在（声明有而库中无）；以下为声明元数据`
         + '（row_count/time_range 无法得知，置 null）。' + missingTableCauses(opened.dbPath, opened.profileFlag))
+    } else if (isNonBase) {
+      // 上面已点名、row_count/time_range 保持 null —— 只出声明元数据
     } else {
       const r = await session.run(`SELECT COUNT(*) AS n FROM "${table.name}"`)
       // ⚠️ COUNT 是 BIGINT，经 getRowObjectsJson() 是**字符串** —— 必须 Number() 收敛。

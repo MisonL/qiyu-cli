@@ -286,6 +286,32 @@ describe('db tables', () => {
     expect((meta().warnings as string[]).join('\n')).toContain('TAGS')
   })
 
+  it('非基表的列不得冒充基表的列集：与声明不同的 view 列只算它自己的（2026-11-15）', async () => {
+    // 2026-11-15：`columnsOf` 按名字取全库列集，同名 view 的列会被当成「该表实际的列」——
+    // 列名一致时让「缺列」warning 静默；不一致时则凭空造出「多列/少列」漂移，两边都是
+    // 对一个**根本没被计数**的对象做列核对。列核对的来源只能是基表。
+    // ⚠️ 变异边界（实测）：只把 `baseColumnsOf` 换回 `columnsOf.get(t.name)` 时本条**仍绿**
+    // —— 上面的 `actualSet.has(actualName)` 已经先把非基表排除了。要红必须同时取消基表
+    // 归位（`actualName`），也就是回到修前那种「按名字取列集」的整体形态。
+    await resetDb()
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('DROP TABLE "tickets"')
+      await s.query(`CREATE VIEW "tickets" AS SELECT 'x' AS rogue_col`)
+    } finally {
+      await s.close()
+    }
+
+    const code = await dbCommand(['tables', '--db', dbPath()])
+    expect(code, `view 本体不得被执行；输出：${out.slice(0, 300)}`).toBe(0)
+    expect((data().tables as TableOut[]).map((t) => t.name)).not.toContain('tickets')
+    const text = (meta().warnings as string[]).join('\n')
+    expect(text, '必须点名它不是基表').toMatch(/不是基表/)
+    expect(text, 'view 的列不得被当成 tickets 的列去造漂移').not.toMatch(/表 tickets 实际/)
+  })
+
   it('声明的时间列被删 → db tables 仍成功，该表 time_range 为 null + warning（不硬失败）', async () => {
     await resetDb()
     await seed()
@@ -532,6 +558,34 @@ const SESSIONS_PII = ['payload', 'userPhone', 'userName', 'userEmail',
 const sessionsDef = (): (typeof TABLES)[number] => TABLES.find((t) => t.name === 'sessions')!
 
 describe('db describe', () => {
+  it('同名 view（底表已删）→ 不执行它、退出 0、只出声明元数据并点名（与 db tables 同口径）', async () => {
+    // 2026-11-15：此前 describe 只看表名在不在，`COUNT(*)` 执行 view → Catalog Error →
+    // 退出 2，报文还把 view 定义里的底表名说成「表不存在」。
+    await resetDb()
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+      await s.query('DROP TABLE "daily_overview"')
+      await s.query('CREATE VIEW "daily_overview" AS SELECT * FROM "aux_tbl"')
+      await s.query('DROP TABLE "aux_tbl"')
+    } finally {
+      await s.close()
+    }
+
+    out = ''
+    const code = await dbCommand(['describe', 'daily_overview', '--db', dbPath()])
+    expect(code, `view 本体不得被执行；输出：${out.slice(0, 300)}`).toBe(0)
+    const d = data() as DescribeOut
+    expect(d.row_count).toBeNull()
+    expect(d.time_range).toBeNull()
+    const text = (meta().warnings as string[]).join('\n')
+    expect(text, '必须点名它不是基表').toMatch(/不是基表/)
+    expect(text, '不得再说成「在库中不存在」').not.toMatch(/在库中不存在/)
+    expect(JSON.parse(out).error, '不得回显 view 定义里的底表名').toBeUndefined()
+  })
+
   it('db describe sessions：7 键逐列 + sensitive/observed_enum/时间列/row_count/PII 列', async () => {
     await resetDb()
     await seed()
