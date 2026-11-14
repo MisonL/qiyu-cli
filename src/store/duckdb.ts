@@ -105,7 +105,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       conn = r.conn; inst = r.inst
     } catch (e) {
       // 打开超时（`attempt_timeout`）与撞锁是同一类后果 —— 等不到库，别重试了；归 store_locked。
-      if (isLockError(e) || (e as { cause?: string }).cause === 'attempt_timeout') {
+      if (isLockError(e) || (e as { timedOut?: boolean }).timedOut === true) {
         const err = new Error(`数据库被写进程占用（等待 ${cfg.readOnlyRetryMs}ms 后超时）：${cfg.path}`)
         ;(err as { kind?: string }).kind = 'store_locked'
         ;(err as { retryable?: boolean }).retryable = true

@@ -158,10 +158,8 @@ export interface RetryOpts<T> {
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-/** 单次尝试超时的标记（`isRetryable` 之外由 `retryWithBackoff` 自行按可重试处理）。 */
-const ATTEMPT_TIMEOUT = Symbol('attempt-timeout')
+/** 单次尝试超时：`isRetryable` 之外由 `retryWithBackoff` 自行按可重试处理。 */
 class AttemptTimeout extends Error {
-  readonly [ATTEMPT_TIMEOUT] = true
   constructor(ms: number) { super(`打开超过 ${ms}ms 未返回`) }
 }
 
@@ -197,7 +195,11 @@ export async function retryWithBackoff<T>(opts: RetryOpts<T>): Promise<T> {
       if (!timedOut && !opts.isRetryable(e)) throw e
       if (now() - start + intervalMs > opts.maxMs) {
         // 超时且没有更具体的成因时，给调用方一个可识别的锁语义（与既有 store_locked 包装同源）
-        throw timedOut ? Object.assign(new Error(`打开超时（${opts.attemptMs}ms 内未返回，等待 ${opts.maxMs}ms 后放弃）`), { cause: 'attempt_timeout' }) : e
+        // 用自有字段而不是标准的 `cause`（那应该是 Error，写成字符串会误导诊断）
+        throw timedOut
+          ? Object.assign(new Error(`打开超时（${opts.attemptMs}ms 内未返回，等待 ${opts.maxMs}ms 后放弃）`),
+            { timedOut: true })
+          : e
       }
       await sleep(intervalMs)
     }
