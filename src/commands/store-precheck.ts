@@ -22,6 +22,7 @@ import { lstatSync, statSync } from 'node:fs'
 import { fail, storeInitCommand } from '../output.js'
 import type { ErrorInput } from '../output.js'
 import { TABLES } from '../store/schema.js'
+import { objectKinds, isBaseTable, sameObjectName } from '../store/object-kinds.js'
 import { missingTableCauses } from '../query/errors.js'
 
 /**
@@ -158,10 +159,13 @@ export function statGuard(path: string): number | null {
  * 没问「这几张是不是本 CLI 的」。
  */
 export function undeclaredTables(names: readonly string[]): string[] {
+  // ⚠️ 声明 vs 实际按大小写不敏感比（Codex PR#76 第四轮实测）：DuckDB 里 `"SCHEMA_VERSION"`
+  // 与 `schema_version` 是同一个对象，精确比较会把它同时报成「声明有而库中无」与
+  // 「库中有而声明无」，并给出「重建库」建议。
   const declared = new Set(TABLES.map((t) => t.name))
   // 排序：`information_schema` 不保证顺序，`db tables` 此前自己 `.sort()`、`store`
   // 不排序 —— 同一库两次输出 warnings 顺序不同。统一在唯一实现点排序。
-  return names.filter((n) => !declared.has(n)).sort()
+  return names.filter((n) => ![...declared].some((d) => sameObjectName(d, n))).sort()
 }
 
 /**
@@ -175,8 +179,7 @@ export function undeclaredTables(names: readonly string[]): string[] {
  * 当成没事的形态：Agent 见 warnings 为空就以为「声明与实况已对齐」。
  */
 export function declaredMissingTables(names: readonly string[]): string[] {
-  const actual = new Set(names)
-  return TABLES.map((t) => t.name).filter((n) => !actual.has(n))
+  return TABLES.map((t) => t.name).filter((n) => !names.some((a) => sameObjectName(n, a)))
 }
 
 /**
@@ -193,6 +196,11 @@ export function undeclaredTablesWarning(undeclared: readonly string[]): string[]
 /**
  * 库内对象的**类型**清单 SQL —— 与 `SCHEMA_VERSION_COLUMNS_SQL` 同款：唯一字符串，
  * 由各命令经自己的会话执行，判据本体在下面的纯函数里。
+ *
+ * ⚠️ 必须查出**元数据里的原样名字**（不是 `lower(table_name)`，Codex PR#76）：DuckDB 的
+ * 标识符大小写不敏感 —— 引号建的 `"TICKETS"` view 会被 `"tickets"` 解析到（实测
+ * `SELECT COUNT(*) FROM "tickets"` 执行的是那个 view），而本 CLI 的表名全是小写。
+ * 判据见 `nonBaseTables()`：按「声明 vs 实际」比对，声明名一律小写，所以元数据必须保留原样。
  */
 export const OBJECT_KINDS_SQL =
   "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema='main'"
@@ -205,13 +213,18 @@ export const OBJECT_KINDS_SQL =
  * `COUNT(*)` 的**本体**以用户权限执行（实测：含 `read_csv_auto(…/probe.csv)` 的 `tags`
  * view 让 status 抛 IO Error、整条命令退出 1，而「库有漂移只警告、不失败」是对外承诺）。
  * 表名匹配 ≠ 对象类型匹配：计数前必须先按类型过滤，不是基表就不执行它。
+ *
+ * ⚠️ 大小写（Codex PR#76 实测确认）：DuckDB 标识符大小写不敏感 —— 一条 `"TICKETS"` view
+ * 会在 `COUNT(*) FROM "tickets"` 时被执行，而元数据里的名字是 `TICKETS`、本 CLI 的声明名
+ * 全是小写。调用方用**声明名**去比对时（`store status` / `db tables` / `store init` /
+ * `sync verify` / `detectForeignStore`），必须用 `sameObjectName()`，不能 `Set.has()` 精确比。
  */
 export function nonBaseTables(rows: ReadonlyArray<Record<string, unknown>>): string[] {
-  return rows
-    .filter((r) => String(r.table_type ?? '').toUpperCase() !== 'BASE TABLE')
-    .map((r) => String(r.table_name))
-    .sort()
+  return objectKinds(rows).filter((o) => !isBaseTable(o)).map((o) => o.name).sort()
 }
+
+/** 名字比对的大小写规则唯一实现点在 `store/object-kinds.ts`，此处经上面的 import 再导出。 */
+export { sameObjectName }
 
 /** 「同名对象不是基表」的警告（空数组 → `undefined`，与 `undeclaredTablesWarning` 同约定）。 */
 export function nonBaseTablesWarning(nonBase: readonly string[]): string[] | undefined {
@@ -245,9 +258,12 @@ export function storeTablesWarnings(
 /**
  * 查 `schema_version` 表列名的 SQL —— **唯一字符串**（db/store/sync 三个调用点共用，
  * 各自经自己的会话执行；判据本体在 `schemaVersionMissing`）。
+ * 列名原样返回（调用方按 `versionColumns` 判），表名匹配交给 DuckDB 解析器 —— 它在
+ * 目录表上不区分大小写，`"SCHEMA_VERSION"` 表同样会返回它的列。
  */
 export const SCHEMA_VERSION_COLUMNS_SQL =
-  "SELECT column_name FROM information_schema.columns WHERE table_schema='main' AND table_name='schema_version'"
+  "SELECT column_name FROM information_schema.columns WHERE table_schema='main' "
+  + "AND lower(table_name)='schema_version'"
 
 /**
  * 库结构校验：已有 `schema_version` → `null`；否则给出**按成因分形**的失败载荷。
@@ -268,7 +284,9 @@ export const SCHEMA_VERSION_COLUMNS_SQL =
 export function schemaVersionMissing(
   path: string, names: readonly string[], versionColumns?: readonly string[],
 ): ErrorInput | null {
-  if (names.includes('schema_version')) {
+  // ⚠️ 存在性同样大小写不敏感（Codex PR#76，与上面列名那条同一理由）：库里的
+  // `"SCHEMA_VERSION"` 表会被后续按小写名的查询解析到，按精确比较会把它当成「缺表」。
+  if (names.some((n) => sameObjectName('schema_version', n))) {
     // ⚠️ 列名比较必须与 DuckDB 的解析规则一致（Codex 2026-11-09 第十三轮 P2，真机实测）：
     // `CREATE TABLE schema_version ("VERSION" INTEGER, …)` 反射出 `VERSION`/`Version`，
     // 而 `SELECT MAX(version)` 照样解析成功 —— 旧的小写精确比较会把**可用的库**判成他人库、

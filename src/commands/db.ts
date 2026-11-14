@@ -23,7 +23,7 @@ import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
 import {
   SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, storeTablesWarnings,
-  OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning,
+  OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning, sameObjectName,
 } from './store-precheck.js'
 import { suggestNames, thrownToQueryExit, missingTableCauses } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
@@ -251,7 +251,7 @@ export async function openGuardedSession(
     const names = tables.rows.map((r) => String(r.table_name))
     // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：别的工具也会建叫 schema_version 的表。
     // 只有该表在场时才补查列名 —— 零表/无该表时 `schemaVersionMissing` 不需要它。
-    const versionColumns = names.includes('schema_version')
+    const versionColumns = names.some((n) => sameObjectName('schema_version', n))
       ? (await metaHint.run(SCHEMA_VERSION_COLUMNS_SQL)).rows.map((r) => String(r.column_name))
       : undefined
     const missing = schemaVersionMissing(config.path, names, versionColumns)
@@ -297,7 +297,11 @@ async function dbTables(argv: string[]): Promise<number> {
     const actual = await session.run(OBJECT_KINDS_SQL)
     const actualNames = actual.rows.map((r) => String(r.table_name))
     const nonBase = nonBaseTables(actual.rows)
-    const actualSet = new Set(actualNames.filter((n) => !nonBase.includes(n)))
+    // 声明名 → 库内实际名（DuckDB 标识符大小写不敏感，Codex PR#76：`"SCHEMA_VERSION"` 就是
+    // `schema_version` 本身）。下面 COUNT 用声明的名字（解析器照样能解析到），只在映射处用。
+    const actualNameOf = (declared: string): string | undefined =>
+      actualNames.find((n) => sameObjectName(n, declared))
+    const actualSet = new Set(actualNames.filter((n) => !nonBase.some((x) => sameObjectName(n, x))))
     // ⚠️ 两半漂移的 warning 走 `storeTablesWarnings`（**唯一渲染点**，2026-11-02 收敛）：
     // 此前本命令自己拼「声明有而库中无」+ `missingTableCauses`，而 `store status`/`init`
     // 只拼「库中有而声明无」—— 同一库两种漂移，两条命令各报一半，缺表那半在 store 上
@@ -330,7 +334,8 @@ async function dbTables(argv: string[]): Promise<number> {
       pii_columns: string[]
     }> = []
     for (const t of TABLES) {
-      if (!actualSet.has(t.name)) continue
+      const actualName = actualNameOf(t.name)
+      if (actualName === undefined || !actualSet.has(actualName)) continue
       const r = await session.run(`SELECT COUNT(*) AS n FROM "${t.name}"`)
       // ⚠️ COUNT 是 BIGINT，经 getRowObjectsJson() 是**字符串** —— 必须 Number() 收敛。
       const rows = Number((r.rows[0] ?? {}).n)
@@ -340,7 +345,7 @@ async function dbTables(argv: string[]): Promise<number> {
       // 而 describe 才有的逐列核对在 tables 清单里缺失就是静默漂移。列集已在上面
       // 一次查全库（columnsOf），这里只做集合差，不加往返。
       const declaredCols = new Set(t.columns.map((c) => c.name))
-      const actualCols = columnsOf.get(t.name) ?? new Set<string>()
+      const actualCols = columnsOf.get(actualName) ?? new Set<string>()
       // 时间列缺了由下面那条专门警告说明（它还要解释 time_range 为何置 null），
       // 这里排除它，避免同一事实说两遍。
       const missingCols = [...declaredCols].filter((n) => !actualCols.has(n) && n !== t.timeColumn?.name)

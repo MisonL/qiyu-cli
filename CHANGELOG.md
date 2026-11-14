@@ -82,6 +82,35 @@
     `sync run` 都拒绝 —— 统一报用法错误；
   · `auth` / `api` 的 `--help` 错误码清单补上真实会出现的 `config_invalid`。
 
+- **`sync verify` 不再把同名 view 当表计数**（2026-11-14，同轮自查第三处入口）：上面两条
+  修的是「列清单」，`sync verify` 还会对任务表做 `COUNT(*)` —— 一条与声明表同名的 view 会让
+  verify 整条落 `internal`（实测报文还把 view 定义里的底表名说成存储损坏、建议「备份重建」）。
+  现在先按对象类型过滤：非基表不计行数（`local_rows: null`）、快照任务也不为它发上游请求，
+  `drift` 新增 `not_base_table`（README 图例与 `field_notes` 同步），`detail` 给出确认对象类型
+  与「换新路径重建库再 `sync run`」的完整命令。未修的边界：`sync run` 写同名 view 仍报
+  `write_failed`（写入本就无法成功；实测 detail 里只有底层 DuckDB 原文
+  `Catalog Error: tags is not an table`，不点名「不是基表」）。
+
+- **「同名」按 DuckDB 的标识符规则比对（大小写不敏感）**（2026-11-14，Codex PR#76）：DuckDB
+  的标识符大小写不敏感 —— 一条 `"TAGS"` view 会被 `"tags"` 解析到并执行，而元数据里的名字
+  保留 `TAGS`，此前的精确比较会漏掉它、继续执行 view 本体。判据收敛到
+  `src/store/object-kinds.ts`（唯一实现点，`store/` 不得 import `commands/`），
+  `store status` / `store init` / `db tables` / `sync verify`，以及 `store init` 的他人库指纹
+  （`"SCHEMA_VERSION"` view）、`schemaVersionMissing` 的存在性判据（大写表名同样算存在）
+  一律走它（`"TAGS"` 与 `"tags"` 视为同名）。只折叠 ASCII 字母：`"ticKets"`（U+212A）与
+  `"tickets"` 在 DuckDB 里是两个对象，用 `toLowerCase()` 会误折叠成同一个名字。
+  同轮（Codex PR#76 第三轮）补齐两处**同一规则没跟上的下游**：`SCHEMA_VERSION_COLUMNS_SQL`
+  显式按小写名过滤，`"SCHEMA_VERSION"` 库查不到列 → 被误报「缺少 version 列」（实际列为空），
+  现在交给 DuckDB 解析器（目录表上不区分大小写）；`store init` 指纹里的列清单按精确表名取键，
+  同款误报，现已按 ASCII 折叠取键。`sync verify` 对「本地对象不是基表」的快照任务**不再**因
+  缺凭证报 `auth_missing` —— 那条路径根本不取上游，「缺凭证」是环境问题、会盖住本地可诊断的
+  `not_base_table` drift；所有选中的快照任务本地都不是基表时才放行结果。
+  再一轮（Codex PR#76 第四轮）把同一条规则贯通到**清单与漂移比对**：`store.tables()` 现在返回
+  声明的名字（`"SCHEMA_VERSION"` → `schema_version`，未声明对象原样返回），`tableByName` 与
+  「声明有而库中无 / 库中有而声明无」两侧都按同一规则匹配 —— 此前完整库被改名成大写
+  `schema_version` 时，`store status` 会在 `count` 上抛 usage（退出码 2），并把它同时报成
+  「声明有而库中无」与「库中有而声明无」、附「重建库」建议。
+
 - **`db tables` / `store init` 与 `store status` 同口径：只认基表**（2026-11-14，PR #74 合并后自查）：
   上一轮只改了 `store status`，而同一份库里另外两条命令仍把 `information_schema` 里的 view
   当自己的表 —— `db tables` 会对声明名 `SELECT COUNT(*)`、把同名 view 的本体当查询执行

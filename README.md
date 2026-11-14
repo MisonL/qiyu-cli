@@ -345,8 +345,10 @@ qiyu --version                       包版本 + skill_contract_version
 有而本 CLI **未声明**的表（旧版 CLI 或其它工具建的）不出现在 `tables` 里，而是在
 `meta.warnings` 中点名 —— 数量不等时先读 `warnings` 判成因，不要径直断定「有表缺失」。
 与声明表**同名但不是基表**的对象（view 等）同样不进 `tables`、在 `warnings` 里点名：
-`store status` / `store init` / `db tables` 都不会去执行它（一条同名 view 的本体若读外部
-文件或引用已删的表，执行它会让整条命令失败）。
+`store status` / `store init` / `db tables` / `sync verify` 都不会去执行它（一条同名 view 的本体
+若读外部文件或引用已删的表，执行它会让整条命令失败）。**大小写也算同名**：DuckDB 标识符
+大小写不敏感，`"TAGS"` view 会被 `"tags"` 解析到并执行。
+
 `schema_version` 要跟当前 CLI 的版本（`LATEST_VERSION`）比才有意义，小于它就是
 旧版 CLI 建的库，`store init` 只补建缺失的迁移、不重放已应用的。`store status` 的每次调用都要对
 各表做全表 `COUNT`（行数无缓存），轮询代价与数据量成正比，Agent 不应把它当作高频健康
@@ -464,6 +466,7 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 **`expected_from_api` 只对快照任务有意义**（上游 fetch 的行数）；windowed 任务不做上游
 全量重拉，该字段恒为 `null`，核对方式是「本地行数 ↔ sync_state 成功状态」的一致性
 （`state_windows_consistent`）——两种任务的核对方式不同，读 drift 前先看任务 kind。
+`local_rows` 在本地同名对象不是基表（view 等）时为 `null`（drift 有 `not_base_table`，见下图例）。
 `sync tasks` 每任务含 `sensitive_columns`——该表标注为敏感的 PII 列清单（会话/工单的
 `payload` 列在列内，它是整行 PII 的完整副本，不要 `SELECT *`）。本阶段**没有**任务的
 启用/停用机制：注册表里的任务总是全部执行（选定任务靠命令行显式列出）。
@@ -497,7 +500,10 @@ gaps, gaps_count, locked}`：`resolved_range` 是上次成功推进的水位区�
 **`drift[].kind` 的全部取值**（`sync verify`）：`not_synced`（从未同步 → 先 `sync run`）、
 `state_pending`（上次运行未完成或中断 → 重跑 `sync run` 补全后再 verify）、
 `count_mismatch`（本地行数 ≠ 上游行数，仅快照任务 → 重跑覆盖，持续不符报告人类）、
-`fetch_failed`（上游取数失败，**无法核对 ≠ 一致** → 稍后重试 verify）。
+`fetch_failed`（上游取数失败，**无法核对 ≠ 一致** → 稍后重试 verify）、
+`not_base_table`（本地同名对象不是基表（view 等），**未做行数核对** —— 执行它的主体会读到
+错误数据或直接失败，此时 local_rows 为 null、快照任务也不发上游请求 → 用 db tables 看
+对象类型；本 CLI 的表已被同名 view 取代时需换新路径重建库再 `sync run`，detail 里给了完整命令）。
 
 ⚠️ `sync verify` 的 `state_windows_consistent: true` **不等于「数据完整」**，`drift` 为空
 或退出码 0 **同样不能当完整性证据**。对 **windowed 任务**，本命令只核对同步状态记录，而

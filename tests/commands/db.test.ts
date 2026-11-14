@@ -265,6 +265,27 @@ describe('db tables', () => {
     expect(text).toContain('tags')
   })
 
+  it('同名 view 只差大小写（"TAGS"）也必须被认出、不得被执行（Codex PR#76）', async () => {
+    // DuckDB 标识符大小写不敏感：`"TAGS"` 会被 `"tags"` 解析到，元数据里的名字保留 `TAGS`。
+    await resetDb()
+    await seed()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+      await s.query('DROP TABLE "tags"')
+      await s.query('CREATE VIEW "TAGS" AS SELECT * FROM "aux_tbl"')
+      await s.query('DROP TABLE "aux_tbl"')
+    } finally {
+      await s.close()
+    }
+
+    const code = await dbCommand(['tables', '--db', dbPath()])
+    expect(code, `view 本体不得被执行；输出：${out.slice(0, 300)}`).toBe(0)
+    expect((data().tables as TableOut[]).map((t) => t.name)).not.toContain('tags')
+    expect((meta().warnings as string[]).join('\n')).toContain('TAGS')
+  })
+
   it('声明的时间列被删 → db tables 仍成功，该表 time_range 为 null + warning（不硬失败）', async () => {
     await resetDb()
     await seed()
