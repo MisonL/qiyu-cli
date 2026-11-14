@@ -23,7 +23,7 @@ import type { SandboxSession } from '../query/sandbox.js'
 import { timeShapeClauses } from '../query/time-shape.js'
 import {
   SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, storeTablesWarnings,
-  OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning,
+  OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning, sameObjectName,
 } from './store-precheck.js'
 import { suggestNames, thrownToQueryExit, missingTableCauses } from '../query/errors.js'
 import { TABLES, tableByName } from '../store/schema.js'
@@ -251,7 +251,7 @@ export async function openGuardedSession(
     const names = tables.rows.map((r) => String(r.table_name))
     // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：别的工具也会建叫 schema_version 的表。
     // 只有该表在场时才补查列名 —— 零表/无该表时 `schemaVersionMissing` 不需要它。
-    const versionColumns = names.includes('schema_version')
+    const versionColumns = names.some((n) => sameObjectName('schema_version', n))
       ? (await metaHint.run(SCHEMA_VERSION_COLUMNS_SQL)).rows.map((r) => String(r.column_name))
       : undefined
     const missing = schemaVersionMissing(config.path, names, versionColumns)
@@ -297,7 +297,7 @@ async function dbTables(argv: string[]): Promise<number> {
     const actual = await session.run(OBJECT_KINDS_SQL)
     const actualNames = actual.rows.map((r) => String(r.table_name))
     const nonBase = nonBaseTables(actual.rows)
-    const actualSet = new Set(actualNames.filter((n) => !nonBase.includes(n)))
+    const actualSet = new Set(actualNames.filter((n) => !nonBase.some((x) => sameObjectName(n, x))))
     // ⚠️ 两半漂移的 warning 走 `storeTablesWarnings`（**唯一渲染点**，2026-11-02 收敛）：
     // 此前本命令自己拼「声明有而库中无」+ `missingTableCauses`，而 `store status`/`init`
     // 只拼「库中有而声明无」—— 同一库两种漂移，两条命令各报一半，缺表那半在 store 上

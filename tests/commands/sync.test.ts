@@ -1185,6 +1185,23 @@ describe('sync verify', () => {
     }
   })
 
+  it('同名 view 只差大小写（"TICKETS"）同样报 not_base_table（Codex PR#76）', async () => {
+    // DuckDB 标识符大小写不敏感：`"TICKETS"` view 会被 `"tickets"` 解析到并执行，
+    // 集合精确比对会漏掉它 → verify 又落 internal。
+    const s = await fresh()
+    await s.query('CREATE TABLE "aux_tbl" (id VARCHAR)')
+    await s.query('DROP TABLE "tickets"')
+    await s.query('CREATE VIEW "TICKETS" AS SELECT * FROM "aux_tbl"')
+    await s.query('DROP TABLE "aux_tbl"')
+    await s.close()
+    out = ''
+    expect(await syncCommand(['verify', 'tickets.search', '--db', dbPath()])).toBe(1)
+    expect(JSON.parse(out).ok, `不得落 internal 错误信封；输出：${out.slice(0, 300)}`).toBe(true)
+    const t = (data().tasks as Array<Record<string, unknown>>)[0]!
+    expect(t.local_rows).toBeNull()
+    expect((t.drift as Array<Record<string, unknown>>).map((d) => d.kind)).toContain('not_base_table')
+  })
+
   it('快照任务选中但缺凭证 → 1 + auth_missing；纯 windowed 不需要凭证', async () => {
     vi.stubEnv('QIYU_APP_KEY', '')
     vi.stubEnv('QIYU_APP_SECRET', '')

@@ -146,6 +146,34 @@ describe('store init', () => {
     expect(text).toContain('tags')
   })
 
+  it('同名 view 只差大小写（"TAGS"）也必须被认出、不得计数（Codex PR#76）', async () => {
+    // DuckDB 标识符大小写不敏感：`"TAGS"` view 会被 `"tags"` 解析到并执行（实测
+    // `SELECT COUNT(*) FROM "tags"` 执行的就是它），而元数据里的名字保留 `TAGS`。
+    // 精确字符串比较会漏掉它 —— 底表被删时 status 仍会落 internal、init 仍会把它列进 tables。
+    expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(dbPath())
+    const conn = await inst.connect()
+    await conn.run('CREATE TABLE "aux_tbl" (id VARCHAR)')
+    await conn.run('DROP TABLE "tags"')
+    await conn.run('CREATE VIEW "TAGS" AS SELECT * FROM "aux_tbl"')
+    await conn.run('DROP TABLE "aux_tbl"')
+    conn.closeSync(); inst.closeSync()
+
+    // status：view 本体不得被执行（底表已删 → 一执行就 Catalog Error）
+    out = ''
+    expect(await storeCommand(['status', '--db', dbPath()])).toBe(0)
+    const s = data()
+    expect((s.tables as Array<{ name: string }>).map((t) => t.name)).not.toContain('tags')
+    expect((JSON.parse(out).meta.warnings as string[]).join('\n')).toContain('TAGS')
+
+    out = ''
+    expect(await storeCommand(['init', '--db', dbPath()])).toBe(0)
+    expect(data().tables as string[]).not.toContain('tags')
+  })
+
   it('重复 init 幂等（验收 41 + 18：schema_version 不变）', async () => {
     await storeCommand(['init', '--db', dbPath()])
     const v1 = data().schema_version
@@ -344,6 +372,25 @@ describe('store status', () => {
     e = JSON.parse(out).error
     expect(e.kind, '缺 version 列是「不是本 CLI 的库」，不是损坏').toBe('store_not_initialized')
     expect(e.hint).toMatch(/换 --db 路径/)
+  })
+
+  it('schema_version 表名只差大小写（"SCHEMA_VERSION"）也按其列判 —— 不得误报「缺表」（Codex PR#76）', async () => {
+    // 存在性若按精确比较，带 version 列的 `"SCHEMA_VERSION"` 表会被当成「缺表」→
+    // 空库分支的 hint「请运行 store init」，而它其实是他人库。
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (p: string) => Promise<{ connect: () => Promise<{ run: (sql: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const p = join(dir, 'upper-sv.db')
+    const inst = await mod.DuckDBInstance.create(p)
+    const conn = await inst.connect()
+    await conn.run('CREATE TABLE "SCHEMA_VERSION" (version INTEGER)')
+    await conn.run('CREATE TABLE alien (a INTEGER)')
+    conn.closeSync(); inst.closeSync()
+    out = ''
+    expect(await storeCommand(['status', '--db', p])).toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.message, '不得报成「数据库结构不完整（缺表）」').not.toMatch(/缺表/)
+    expect(e.hint, '它是他人库 → 换 --db 路径').toMatch(/换 --db 路径/)
   })
 })
 

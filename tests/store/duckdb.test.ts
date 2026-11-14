@@ -746,6 +746,16 @@ describe('duckdb —— init 与关闭', () => {
         message: expect.stringContaining('schema_version 不是基表') })
   })
 
+  it('他人库指纹 ④b：schema_version 是**大写** view（"SCHEMA_VERSION"）同样拒绝（Codex PR#76）', async () => {
+    // DuckDB 按标识符解析（大小写不敏感）：小写的 `MAX(version) FROM schema_version` 会执行这条 view。
+    const p = await rawDb('d2.db',
+      'CREATE TABLE placeholder (x INTEGER)',
+      'CREATE VIEW "SCHEMA_VERSION" AS SELECT CAST(\'x\' AS INTEGER) AS version')
+    await expect(initRejects(p))
+      .rejects.toMatchObject({ kind: 'store_not_initialized',
+        message: expect.stringContaining('schema_version 不是基表') })
+  })
+
   it('他人库指纹不误伤：声明表带声明外的列（既有 schema 漂移）照常可用，只由 db tables 警告', async () => {
     // ⚠️ 首版把这一档也拒了，全量回归当场抓到（`db tables` 的漂移用例给 sessions 加了
     // rogue_col）。多列/少列是既有契约里的漂移，不属于「他人库」。

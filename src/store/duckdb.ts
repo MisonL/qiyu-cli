@@ -12,6 +12,7 @@
 // D-T11 追加：src/sync/tasks/knowledge.ts 常量 SELECT 1 处
 //（knowledge.categories 的驱动序 SELECT DISTINCT robot_id），不在上述 9 处内。
 import { MIGRATIONS, TABLES, tableByName, type TableDef } from './schema.js'
+import { objectKinds, isBaseTable, sameObjectName } from './object-kinds.js'
 import { retryWithBackoff, isLockError, isModuleNotFound } from './retry.js'
 import type { QueryResult, Store, StoreConfig, StoreMode, WriteTx } from './types.js'
 
@@ -296,12 +297,13 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // `CREATE VIEW schema_version AS SELECT CAST('x' AS INTEGER)` 就能让 init 报
     // Conversion Error（internal），既绕开「他人库」归类，也违背「是 view 就不求值」的说法。
     // 本 CLI 从不把 schema_version 建成 view，所以「不是基表」本身就是他人库指纹。
+    // ⚠️ 同上按大小写不敏感取（`"SCHEMA_VERSION"` view 同样会被下面那条按小写名的查询执行）。
     const kindRes = await store.execSql(
-      "SELECT table_type FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'schema_version'")
-    const kind = String((kindRes as { getRowObjectsJson: () => Record<string, unknown>[] })
-      .getRowObjectsJson()[0]?.table_type ?? '')
-    if (kind.toUpperCase() !== 'BASE TABLE') {
-      return `目标数据库不是本 CLI 创建的（schema_version 不是基表，实际是 ${kind || '未知对象'}）：${cfg.path}`
+      "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'main'")
+    const svKind = objectKinds((kindRes as { getRowObjectsJson: () => Record<string, unknown>[] })
+      .getRowObjectsJson()).find((o) => sameObjectName(o.name, 'schema_version'))
+    if (svKind !== undefined && !isBaseTable(svKind)) {
+      return `目标数据库不是本 CLI 创建的（schema_version 不是基表，实际是 ${svKind.type || '未知对象'}）：${cfg.path}`
     }
     const r = await store.execSql(
       "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'main'")
@@ -340,10 +342,14 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     async init() {
       if (mode === 'ro') throw usage('只读模式下不能初始化（需 rw 模式）')
       // 他人库防线（spec §6.1）：已有表但无 schema_version → 拒绝。
-      const existing = await store.execSql(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'`)
-      const names = (existing as { getRowObjectsJson: () => Record<string, unknown>[] }).getRowObjectsJson()
-        .map((r) => String(r.table_name))
-      if (names.length > 0 && !names.includes('schema_version')) {
+      const existing = await store.execSql(`SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'main'`)
+      const kinds = objectKinds((existing as { getRowObjectsJson: () => Record<string, unknown>[] })
+        .getRowObjectsJson())
+      const names = kinds.map((k) => k.name)
+      // ⚠️ 存在性与类型都按大小写不敏感判（Codex PR#76）：DuckDB 标识符大小写不敏感，
+      // 一条 `"SCHEMA_VERSION"` view 会被下面的 `MAX(version)` 按小写名执行。
+      const svKind = kinds.find((k) => sameObjectName(k.name, 'schema_version'))
+      if (names.length > 0 && svKind === undefined) {
         // ⚠️ 他人库 → store_not_initialized、退出码 1（spec §8.2 成因 6）——不是 usage。
         const err = new Error(`目标数据库不是本 CLI 创建的（含表 ${names.join(', ')}）：${cfg.path}`)
         ;(err as { kind?: string }).kind = 'store_not_initialized'
@@ -353,7 +359,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // ⚠️ 「有 schema_version」不是身份证明（2026-11-14，历史审查 PR#4 复核）：实测造一个
       // `{secret 表, schema_version(version INTEGER) 空表}` 的外来库，init 直接报 ok 并往里
       // 建表。指纹判据见 `detectForeignStore` 的注释（三条「我们不可能产出」的形态）。
-      if (names.includes('schema_version')) {
+      if (svKind !== undefined) {
         const foreign = await detectForeignStore()
         if (foreign !== null) {
           const err = new Error(foreign)
@@ -362,7 +368,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           throw err
         }
       }
-      const cur = names.includes('schema_version')
+      const cur = svKind !== undefined
         ? await store.execSql('SELECT COALESCE(MAX(version), 0) AS v FROM schema_version')
         : null
       const v = cur === null ? 0 : Number((cur as { getRowObjectsJson: () => Record<string, unknown>[] }).getRowObjectsJson()[0].v)

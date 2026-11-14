@@ -11,7 +11,7 @@ import { classifyOpenFailure, openFailureHint } from '../store/retry.js'
 import { DB_PATH_HELP, parseStoreFlags } from './store-flags.js'
 import {
   SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, nonRegularFileHint, undeclaredTables,
-  storeTablesWarnings, OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning,
+  storeTablesWarnings, OBJECT_KINDS_SQL, nonBaseTables, nonBaseTablesWarning, sameObjectName,
 } from './store-precheck.js'
 import { TABLES } from '../store/schema.js'
 import { storeFieldNotes } from './store-notes.js'
@@ -262,7 +262,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // ⚠️ 成因分形（他人库不引导向 init）在共享实现里，口径与 db/sync 逐字一致。
     // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：他人工具的 schema_version 无 version 列时，
     // 旧判据放行，下面的 MAX(version) 抛 Binder Error 落 internal「备份重建」—— 假归因。
-    const versionColumns = names.includes('schema_version')
+    const versionColumns = names.some((n) => sameObjectName('schema_version', n))
       ? (await store.query(SCHEMA_VERSION_COLUMNS_SQL)).rows.map((r) => String(r.column_name))
       : undefined
     const missing = schemaVersionMissing(config.path, names, versionColumns)
@@ -280,9 +280,11 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // 表，同名 view 会让 COUNT 执行它的本体（实测 `read_csv_auto` 的 view → IO Error →
     // status 整条退出 1，而「库有漂移只警告」是本命令的承诺）。view/macro 与未声明表一样
     // 进 warnings、不进 tables。
-    const nonBase = new Set(nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows))
+    // ⚠️ 比对大小写不敏感（Codex PR#76 实测）：一条 `"TICKETS"` view 会被 `"tickets"` 解析
+    // 到并被执行，而元数据里的名字保留原样 —— `Set.has()` 精确比会漏掉它。
+    const nonBase = nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows)
     for (const n of names) {
-      if (undeclared.has(n) || nonBase.has(n)) continue
+      if (undeclared.has(n) || nonBase.some((x) => sameObjectName(n, x))) continue
       // ⚠️ 基表的 COUNT 失败**不**降级成警告（Codex PR#74 第三轮 P1）：view 已在上面按类型
       // 排除，所以走到这里的都是基表，数不出来就是真错（磁盘 I/O、库损坏、并发删表）——
       // 按 spec §8.2「DuckDB 执行期错误 → internal / 退出码 1」如实失败。
@@ -292,7 +294,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // ⚠️ `schema_version` 自己是 view 时**不许求值**（CodeRabbit PR#74）：列检查（version 列存在）
     // 会放行，这条 MAX(version) 仍会把 view 本体执行一遍 —— 一个 `CAST('x' AS INTEGER)` 就能
     // 让整条 status 退出 1，把「库有漂移只警告」的承诺打穿。按缺失读，交给 warnings 点名。
-    const sv = nonBase.has('schema_version')
+    const sv = nonBase.some((x) => sameObjectName('schema_version', x))
       ? { rows: [{ v: 0 }] }
       : await store.query('SELECT COALESCE(MAX(version),0) AS v FROM schema_version')
     // ⚠️ 两半漂移都进 warnings，**唯一渲染点**在 `storeTablesWarnings`（2026-11-02 实测修）：
@@ -300,7 +302,7 @@ export async function storeCommand(argv: string[]): Promise<number> {
     // 同一库上 `db tables` 会警告、`store status` 报 ok 且干净，README 又教 Agent
     // 「数量不等时先读 warnings」，于是 Agent 读到空 warnings 反而确认了「没事」。
     const warnings = storeTablesWarnings(names, config.path, profileFlag)
-    const allWarnings = [...(warnings ?? []), ...(nonBaseTablesWarning([...nonBase]) ?? [])]
+    const allWarnings = [...(warnings ?? []), ...(nonBaseTablesWarning(nonBase) ?? [])]
     return ok({ path: config.path, backend: config.backend, config_path: configPath,
       config_exists: configExists,
       schema_version: Number(sv.rows[0]?.v ?? 0), tables },

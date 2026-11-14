@@ -91,6 +91,14 @@
   `write_failed`（写入本就无法成功；实测 detail 里只有底层 DuckDB 原文
   `Catalog Error: tags is not an table`，不点名「不是基表」）。
 
+- **「同名」按 DuckDB 的标识符规则比对（大小写不敏感）**（2026-11-14，Codex PR#76）：DuckDB
+  的标识符大小写不敏感 —— 一条 `"TAGS"` view 会被 `"tags"` 解析到并执行，而元数据里的名字
+  保留 `TAGS`，此前的精确比较会漏掉它、继续执行 view 本体。判据收敛到
+  `src/store/object-kinds.ts`（唯一实现点，`store/` 不得 import `commands/`），
+  `store status` / `store init` / `db tables` / `sync verify`，以及 `store init` 的他人库指纹
+  （`"SCHEMA_VERSION"` view）、`schemaVersionMissing` 的存在性判据（大写表名同样算存在）
+  一律走它（`"TAGS"` 与 `"tags"` 视为同名）。
+
 - **`db tables` / `store init` 与 `store status` 同口径：只认基表**（2026-11-14，PR #74 合并后自查）：
   上一轮只改了 `store status`，而同一份库里另外两条命令仍把 `information_schema` 里的 view
   当自己的表 —— `db tables` 会对声明名 `SELECT COUNT(*)`、把同名 view 的本体当查询执行

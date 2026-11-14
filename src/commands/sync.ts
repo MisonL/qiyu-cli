@@ -28,7 +28,7 @@
 import { homedir } from 'node:os'
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, OBJECT_KINDS_SQL, nonBaseTables } from './store-precheck.js'
+import { SCHEMA_VERSION_COLUMNS_SQL, statGuard, schemaVersionMissing, OBJECT_KINDS_SQL, nonBaseTables, sameObjectName } from './store-precheck.js'
 import { SYNC_TASKS, taskById, UNSUPPORTED_DATASETS } from '../sync/registry.js'
 import { listGaps, listWatermarks } from '../sync/state.js'
 import type { SyncTask } from '../sync/types.js'
@@ -247,7 +247,7 @@ async function openRo(
     const names = await store.tables()
     // ⚠️ 表名不是身份证明（2026-11-07 审查实测）：他人工具的 schema_version 可能没有
     // version 列 —— 只认表名会让后续查询落 internal，把「不是本 CLI 的库」说成损坏。
-    const versionColumns = names.includes('schema_version')
+    const versionColumns = names.some((n) => sameObjectName('schema_version', n))
       ? (await store.query(SCHEMA_VERSION_COLUMNS_SQL)).rows.map((r) => String(r.column_name))
       : undefined
     const missing = schemaVersionMissing(config.path, names, versionColumns)
@@ -411,11 +411,13 @@ async function syncVerify(argv: string[]): Promise<number> {
     // verify 整条落 internal（实测报文还把 view 定义里的底表名说成存储损坏、建议「备份重建」）。
     // `store status` / `store init` / `db tables` 已是「只认基表、非基表进 warnings」，
     // verify 同口径：数不出来就不报数，按 drift 点名（无法核对 ≠ 一致，沿 fetch_failed 的语义）。
-    const nonBase = new Set(nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows))
+    // ⚠️ 按大小写不敏感比对（Codex PR#76 实测）：一条 `"TICKETS"` view 会被 `"tickets"`
+    // 解析到并被执行，所以这里不能 `Set.has()` 精确比名字。
+    const nonBases = nonBaseTables((await store.query(OBJECT_KINDS_SQL)).rows)
     const loc = storeLocationOf(resolved.path, resolved.profileFlag)
     const tasksOut: Array<Record<string, unknown>> = []
     for (const t of tasks) {
-      const isNonBase = nonBase.has(t.table)
+      const isNonBase = nonBases.some((n) => sameObjectName(t.table, n))
       const localRows = isNonBase ? null : await store.count(t.table)
       const st = states.get(t.id)
       const stateConsistent = st !== undefined && st.rangeStatus === 'complete' && st.watermark !== null
