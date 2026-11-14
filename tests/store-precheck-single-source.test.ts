@@ -30,7 +30,6 @@ import { shellArg } from '../src/core/shell.js'
 import { dbCommand } from '../src/commands/db.js'
 import { createDuckDbStore } from '../src/store/duckdb.js'
 import type { Store } from '../src/store/types.js'
-import { TABLES, ddlFor } from '../src/store/schema.js'
 
 import { queryCommand } from '../src/commands/query.js'
 import { catalogRows, CATALOG_ROW_LIMIT } from '../src/commands/store-precheck.js'
@@ -425,11 +424,14 @@ describe('openGuardedSession 的存在性预检同样走 catalogRows（截断不
    * 目录一旦超过上限，读命令给 internal 并点名截断，而不是在截断页上做判定。
    */
   const buildBigStore = async (path: string): Promise<void> => {
+    // 先走**正规初始化**（`init()` 跑完全部迁移、`schema_version` 有真实记录），保证夹具
+    // 在任何库结构校验下都是合法库；再把无关表拉到 `CATALOG_ROW_LIMIT` **之上**。
+    // ⚠️ 不能用「只跑 DDL」的夹具：那样既没迁移记录也没 `init()` 的副作用，用例红了分不清
+    // 是截断还是「初始化元数据缺失」（CodeRabbit PR#78 第三轮 major）。
     const s: Store = await createDuckDbStore(
       { backend: 'duckdb', path, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
     try {
-      // 声明表（含 schema_version）先建，再把无关表拉到上限**之上**
-      for (const t of TABLES) await s.query(ddlFor(t))
+      await s.init()
       for (let i = 0; i < CATALOG_ROW_LIMIT + 100; i++) {
         await s.query(`CREATE TABLE "zz_unrelated_${String(i).padStart(5, '0')}" (id INTEGER)`)
       }
@@ -441,6 +443,11 @@ describe('openGuardedSession 的存在性预检同样走 catalogRows（截断不
   it('目录超过上限 → 三条命令都报 internal 且点名截断（不在截断页上判定）', async () => {
     const db = join(dir, 'big.duckdb')
     await buildBigStore(db)
+    // 夹具自证（CodeRabbit PR#78 第三轮 major）：库已正规初始化（`init()` 跑完迁移），
+    // 所以下面三条失败只能是**截断**。前置断言：同一个库上 `db tables` 报 `internal` + 「截断」。
+    out = ''
+    expect(await dbCommand(['tables', '--db', db]), '夹具未走到截断分支:\n' + out).toBe(1)
+    expect(String(errorOf().message)).toContain('截断')
     for (const [name, run] of GUARD_READERS) {
       out = ''
       expect(await run(db), `${name} 应在截断时 fail-closed（而不是按截断页判定）`).toBe(1)
