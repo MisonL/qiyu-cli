@@ -22,7 +22,7 @@ import {
   storeInitCommand,
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
-import { OBJECT_KINDS_SQL, nonBaseTables, sameObjectName } from './store-precheck.js'
+import { OBJECT_KINDS_SQL, nonBaseTables, sameObjectName, catalogRows } from './store-precheck.js'
 import type { StoreLocation } from '../output.js'
 import { withTimeoutHint } from '../query/sandbox.js'
 import { GLOBAL_FLAGS, helpArgsError, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS, STORE_FLAGS } from './spec-types.js'
@@ -319,7 +319,7 @@ async function statsFields(argv: string[]): Promise<number> {
     // ⚠️ 与 `query --table` / `store status` 同口径（2026-11-15）：同名对象不是基表也不执行 ——
     // 一条底表已删的同名 view 会一路走到 `observeSql`，报「列 payload 不存在」，把 view 定义
     // 里的对象说成漂移（实测）。
-    const kinds = (await session.run(OBJECT_KINDS_SQL)).rows
+    const kinds = await catalogRows(session, OBJECT_KINDS_SQL)
     const exists = kinds.some((r) => sameObjectName(String(r.table_name), table))
     const nonBase = nonBaseTables(kinds).some((n) => sameObjectName(table, n))
     if (nonBase) {

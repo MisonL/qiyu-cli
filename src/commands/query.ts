@@ -39,7 +39,7 @@ import {
   storeLocationFromFlags, storeLocationOf,
 } from '../output.js'
 import type { StoreLocation } from '../output.js'
-import { OBJECT_KINDS_SQL, nonBaseTables, sameObjectName } from './store-precheck.js'
+import { OBJECT_KINDS_SQL, nonBaseTables, sameObjectName, catalogRows } from './store-precheck.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, helpArgsError, REJECTED_FLAGS, STORE_FLAGS, valueFlagNames } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -921,7 +921,7 @@ export async function queryCommand(argv: string[], deps: QueryDeps = {}): Promis
       // `information_schema` 把 view 也算作表，一条底表已删的同名 view 会一路走到执行、
       // 由 Catalog Error 翻译成「列 stat_date 在库中不存在」，报文把 view 定义里的底表名
       // 说成漂移 —— Agent 会以为是自己选了坏数据，而真正要做的是换新路径重建库。
-      const kinds = (await session.run(OBJECT_KINDS_SQL)).rows
+      const kinds = await catalogRows(session, OBJECT_KINDS_SQL)
       const exists = kinds.some((r) => sameObjectName(String(r.table_name), tableDef.name))
       const nonBase = nonBaseTables(kinds).some((n) => sameObjectName(tableDef.name, n))
       if (!exists || nonBase) {

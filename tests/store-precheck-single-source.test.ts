@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url'
 import { shellArg } from '../src/core/shell.js'
 import { dbCommand } from '../src/commands/db.js'
 import { queryCommand } from '../src/commands/query.js'
+import { catalogRows, CATALOG_ROW_LIMIT } from '../src/commands/store-precheck.js'
 import { statsCommand } from '../src/commands/stats.js'
 import { storeCommand } from '../src/commands/store.js'
 import { syncCommand } from '../src/commands/sync.js'
@@ -372,5 +373,27 @@ describe('单一实现点（漂移守卫）', () => {
     const src = readFileSync(join(ROOT, SINGLE_SOURCE), 'utf8')
     expect(src, '`nonRegularFileHint` 必须真的按 isDirectory 分形')
       .toMatch(/return isDirectory \? DIRECTORY_DB_HINT : NON_REGULAR_DB_HINT/)
+  })
+})
+
+
+// CodeRabbit + Codex PR#78：`OBJECT_KINDS_SQL` 是全目录扫描，`SandboxSession.run` 缺省只回
+// 1000 行（实测 1125 个对象的库 → 1000 行 + truncated: true），排在截断之后的表会被误报成
+// 「缺表」。沙箱路径的目录读取一律走 `catalogRows()`：显式放大上限 + 截断即拒。
+describe('catalogRows（沙箱路径的目录读取唯一入口）', () => {
+  it('显式传最大上限（缺省 1000 行会截断全目录扫描）', async () => {
+    const run = vi.fn(async () => ({ rows: [], truncated: false }))
+    await catalogRows({ run }, 'SELECT 1')
+    expect(run).toHaveBeenCalledWith('SELECT 1', { limit: CATALOG_ROW_LIMIT })
+  })
+
+  it('截断 → 抛 internal，不把截断页当完整目录（会把存在的表说成缺失）', async () => {
+    const run = async () => ({ rows: [{ table_name: 'a' }], truncated: true })
+    await expect(catalogRows({ run }, 'SELECT 1')).rejects.toMatchObject({ kind: 'internal' })
+  })
+
+  it('未截断 → 返回行', async () => {
+    const run = async () => ({ rows: [{ table_name: 'a' }], truncated: false })
+    expect(await catalogRows({ run }, 'SELECT 1')).toEqual([{ table_name: 'a' }])
   })
 })

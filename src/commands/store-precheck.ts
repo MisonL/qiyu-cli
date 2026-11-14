@@ -206,6 +206,36 @@ export const OBJECT_KINDS_SQL =
   "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema='main'"
 
 /**
+ * 目录类 SQL（`OBJECT_KINDS_SQL` / `SCHEMA_VERSION_COLUMNS_SQL`）经查询沙箱执行时的行数上限 ——
+ * **必须显式传**（CodeRabbit + Codex PR#78 实测）：`SandboxSession.run` 缺省 `limit: 1000`，
+ * 一个 1125 个对象的库会返回 1000 行并置 `truncated: true`（探针实测），于是目标表若排在
+ * 截断之后就被误报成「缺表」。10000 是 `run` 允许的最大值；对象数超过它仍会截断，
+ * 判定前必须检查 `truncated`（沿 `catalogRows()` 的 fail-closed 处理）。
+ *
+ * `store.query()`（非沙箱路径）没有行数上限，不需要这个常量。
+ */
+export const CATALOG_ROW_LIMIT = 10000
+
+/**
+ * 目录查询的**唯一读取点**（沙箱路径）：显式放大上限，并拒绝在截断结果上做「存不存在 /
+ * 是不是基表」的判定 —— 截断页当成完整目录，会把真实存在的表说成缺失（假归因）。
+ */
+export async function catalogRows(
+  session: { run: (sql: string, opts?: { limit?: number }) => Promise<{ rows: Array<Record<string, unknown>>; truncated: boolean }> },
+  sql: string,
+): Promise<Array<Record<string, unknown>>> {
+  const r = await session.run(sql, { limit: CATALOG_ROW_LIMIT })
+  if (r.truncated) {
+    throw Object.assign(
+      new Error(`库内对象超过 ${CATALOG_ROW_LIMIT} 个，目录查询被截断，无法可靠判定表是否存在`),
+      { kind: 'internal', retryable: false,
+        hint: '请在库侧减少对象数量（例如删除测试用的临时表）后重试；本地库只是缓存，'
+          + '换一个 --db 指向新建的库也能绕过' })
+  }
+  return r.rows
+}
+
+/**
  * 从 `OBJECT_KINDS_SQL` 的结果里挑出**不是基表**的对象（view / 外部表等）。
  *
  * ⚠️ 为什么（2026-11-14，历史审查 PR#4 复核实测）：`store status` 对全库逐表 COUNT，

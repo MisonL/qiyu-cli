@@ -1238,6 +1238,16 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect((meta().mask_warnings as string[]).some((x) => /extra_col/.test(x))).toBe(true)
   })
 
+  it('目录里的对象多于沙箱默认 1000 行时照样认得存在的表（CodeRabbit + Codex PR#78 实测）', async () => {
+    // `OBJECT_KINDS_SQL` 是全目录扫描；`SandboxSession.run` 缺省 `limit: 1000`，一个 1100+ 对象的
+    // 库会把它截断、`truncated: true`，排在截断之后的声明表就被误报成「缺表」（修复前实测）。
+    // 目标表排在目录末尾（建库顺序里 tickets / daily_overview 靠后），修复前的默认上限
+    // 1000 行会让它们落在截断之后；`catalogRows()` 显式放大上限后必须认得它们。
+    await seed()
+    expect(await qAt('--table', 'tickets')).toBe(0)
+    expect(await qAt('--table', 'daily_overview')).toBe(0)
+  })
+
   it('声明表被换成同名 view（底表已删）→ store_not_initialized，不执行 view、不报「列不存在」（2026-11-15）', async () => {
     await seed()
     const s: Store = await createDuckDbStore(
