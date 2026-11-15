@@ -186,7 +186,10 @@ export function runFieldNotes(): Record<string, string> {
       + '报告人类核对接口形态）；其余可能只是筛选没命中或空窗本来为空，未必缺数据',
     'tasks[].gaps[].reason': '缺口成因（取值与动作见 README 的 gaps 图例）',
     'tasks[].gaps[].detail': '给人读的说明（本命令是引擎产出的原文）。⚠️ 对丢失档的 reason，'
-      + '这里给出的是丢失规模；其余 reason 下它只是描述，不代表数据缺失',
+      + '这里给出的是丢失规模；其余 reason 下它只是描述，不代表数据缺失。'
+      + '⚠️ `write_failed` 的 detail 若点名「库里的同名对象不是基表（view 等）」，'
+      + '那是某张声明表已被同名 view 取代：重跑必然再失败，按 detail 给出的'
+      + '「备份旧库 → 换新路径 store init → sync run」重建',
     'tasks[].gaps[].range': '本命令的缺口区间已格式化成 `+08:00` ISO（与 resolved_range 同一套时间解析）。'
       + '⚠️ `sync status` 的同名字段不是这个形态：那边原样回显 `sync_gaps` 的 epoch 毫秒字符串'
       + '（引擎落库的存储值）—— 跨命令比较缺口区间前先统一形态',
@@ -228,7 +231,10 @@ export function statusFieldNotes(): Record<string, string> {
     // `"2026-11-04T02:29:50.268Z"`，是 ISO 8601 UTC 字符串；反而是同条目的 range
     // 才是 epoch 毫秒字符串。两种形态在同一个 gaps[] 元素上并存，必须分开点明。
     'tasks[].gaps[].detail': '给人读的说明（引擎落库的原文）。⚠️ 对丢失档的 reason 它是丢失规模；'
-      + '其余 reason 下只是描述，不代表数据缺失',
+      + '其余 reason 下只是描述，不代表数据缺失。'
+      + '⚠️ `write_failed` 的 detail 若点名「库里的同名对象不是基表（view 等）」，'
+      + '那是某张声明表已被同名 view 取代：重跑必然再失败，按 detail 给出的'
+      + '「备份旧库 → 换新路径 store init → sync run」重建',
     'tasks[].gaps[].recorded_at': '这条缺口被记录的时刻（ISO 8601 UTC `Z` 字符串，如 '
       + '`2026-11-04T02:29:50.268Z`；落库时间）。⚠️ 它不是缺口所在区间的时间（那看 range —— '
       + '注意 range 是 epoch 毫秒字符串，两种形态），也不是「现在是否仍缺」的依据 ——'

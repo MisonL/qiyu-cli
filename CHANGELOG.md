@@ -54,6 +54,11 @@
   `internal` 而不是把截断页当完整目录。经 `openGuardedSession` 的那次存在性预检
   （`db tables` / `db describe` / `query` / `stats fields` 共用）原先是裸 `session.run()`，
   同样受 1000 行上限约束，已一并收编（Codex PR#78 第二轮 P1）。
+- **`sync run` 的 `write_failed` 点名「不是基表」并给出重建动作**（2026-11-15）：落库目标被同名
+  view 取代时，DuckDB 只回 `Catalog Error: … is not an table`，此前 gap 的 `detail` 只包成
+  「落库失败（底层：…）」—— Agent 会反复重跑必然失败的同步。现在明确说「本 CLI 的声明表在库里不是
+  基表（view 等，写入被库拒绝）」并给出与 `sync verify` 同款的「备份 → 换新路径 `store init` →
+  `sync run`」恢复动作（带本次档名、占位符附替换契约、不指回出问题的文件）；普通落库失败文案不变。
 - **`query --table` / `stats fields` 遇同名 view 不再执行它**（2026-11-15）：此前两者只查表名在不在，
   一条底表已删的 view 会被执行，报「列 stat_date 在库中不存在」/「列 payload 不存在」，把 view 定义里的
   对象说成漂移。现在报 `store_not_initialized`「同名对象不是基表（view 等），本命令未执行它」，并给出
