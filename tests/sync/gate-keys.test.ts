@@ -221,6 +221,21 @@ describe('闸门键 ⊇ fetch 真实调用的 endpoint 集合（全任务，真�
     } finally { vi.unstubAllGlobals(); await store.close() }
   })
 
+  it('声明的首键必须是任务**实际先请求**的端点（顺序是契约，CodeRabbit PR#80）', async () => {
+    // 引擎的 fetch 前预检只看 `gateEndpoints[0]`（次要端点交给 callPaced 在调用前拦）。
+    // 若把声明写成 ['次要','主要']，预检就会落在次要端点上，重新引入「未使用端点挡住任务」。
+    // 判据用**真实调用采集**（`calledEndpoints` 的第一项），不扫源码。
+    const store = await fresh()
+    try {
+      for (const t of SYNC_TASKS.filter((x) => (x.gateEndpoints?.length ?? 0) > 0)) {
+        const called = await calledEndpoints(t, store)
+        if (called.length === 0) continue   // 空夹具下不调用的任务：白名单已另行点名
+        expect(t.gateEndpoints![0], `${t.id} 的首个闸门键不是它实际先请求的端点`
+          + `（首键 ${t.gateEndpoints![0]}，实际首个请求 ${called[0]}）`).toBe(called[0])
+      }
+    } finally { await store.close() }
+  })
+
   it('行为：本次不会调用的声明端点冷却时，任务照常完成（Sourcery PR#58 复核）', async () => {
     // 实测缺陷（2026-11-15）：模板列表为空 → `dim.ticket_template_fields` 根本不会调用
     // `ticket.template.fields`，但它处于冷却时，引擎在 fetch 前按**全部声明键**检查，
