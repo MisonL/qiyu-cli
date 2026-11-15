@@ -135,6 +135,21 @@ function failDetail(label: string, e: unknown): string {
 }
 
 /**
+ * fetch 失败的原因分派：`callPaced` 在**真正要调用**的端点冷却时抛 `rate_limit_local`
+ * （Sourcery PR#58 复核，2026-11-15）。那是「本窗没发请求 / 已发部分请求但未落库」的
+ * 限频，不是取数失败 —— 记成 fetch_failed 会让 Agent 去查接口形态而不是等冷却。
+ */
+function fetchGapReason(e: unknown): 'fetch_failed' | 'rate_limit_local' {
+  return (e as { kind?: string }).kind === 'rate_limit_local' ? 'rate_limit_local' : 'fetch_failed'
+}
+
+function fetchGapDetail(e: unknown): string {
+  return fetchGapReason(e) === 'rate_limit_local'
+    ? (e instanceof Error ? e.message : String(e))
+    : failDetail('取数失败', e)
+}
+
+/**
  * DuckDB 对「INSERT / DELETE 的目标不是基表」（同名 view 等）的原文：
  * `Catalog Error: tags is not an table`（实测，2026-11-15；DELETE 侧另有
  * `Binder Error: Can only delete from base table`）。
@@ -314,22 +329,29 @@ function gapHintDetail(hint: { detail: string; fixture?: string }): string {
 const GATE_WAIT_BUDGET = 3
 const GATE_WAIT_FALLBACK_MS = 1_000
 
+/**
+ * 任务的主端点（每个任务必然先调它）：fetch 前的**快速失败**预检只看这一把键。
+ *
+ * ⚠️ 为什么不再预检**全部**声明键（Sourcery PR#58 复核，2026-11-15 实测）：声明式地
+ * 在 fetch 前检查 `gateEndpoints` 全部键，会把「本次根本不会调用」的端点冷却也算成失败 ——
+ * 实测 `ticket.template.fields` 冷却 + 模板列表为空时，`dim.ticket_template_fields`
+ * 一发请求都不发就被记成 `failed` + `rate_limit_local`，而空快照本该删掉旧字段行。
+ * 次要端点改由 `callPaced` 在**真正调用前**逐一拦（那里才是「会不会调用」的唯一答案）。
+ * 主端点预检保留：常见成因（主端点冷却）仍然在发请求前就失败，语义没变。
+ */
 async function acquireGated(ctx: RunCtx, task: SyncTask): Promise<void> {
-  // ⚠️ 每个声明的 endpoint 都要 acquire（2026-11-02 实测修）：`callPaced` 命中远端限频
-  // 时 penalize 写的是**那个** endpoint 的冷却行，这里只查 `task.endpoint` 会漏掉
-  // 任务实际调用、却被限流的其它端点（ticket.logs 的 ticket.log、dim 的 template.list）。
-  // 漏掉的冷却读不到 → 下一窗照旧超发。逐个等，都到点才放行（慢不是错）。
-  for (const key of gateKeysOf(task)) {
-    for (let waits = 0; ; waits++) {
-      try {
-        // 冷却是持久化的：读库也在 store 上，撞锁走同一有界重试（B 中-4）。
-        await withStoreRetries(ctx, () => ctx.gate.acquire(key))
-        break
-      } catch (e) {
-        if ((e as { kind?: string }).kind !== 'rate_limit_local' || waits >= GATE_WAIT_BUDGET) throw e
-        const wait = clampGateWait((e as { retryAfter?: number }).retryAfter ?? 0) || GATE_WAIT_FALLBACK_MS
-        await engineSleep(ctx, wait)
-      }
+  // `gateKeysOf` 的第一把键恒为主端点（`gateEndpoints` 缺省回退成 `[endpoint ?? id]`，
+  // 且 `assertGateContracts` 保证声明时必须包含主端点）。
+  const key = gateKeysOf(task)[0]
+  for (let waits = 0; ; waits++) {
+    try {
+      // 冷却是持久化的：读库也在 store 上，撞锁走同一有界重试（B 中-4）。
+      await withStoreRetries(ctx, () => ctx.gate.acquire(key))
+      return
+    } catch (e) {
+      if ((e as { kind?: string }).kind !== 'rate_limit_local' || waits >= GATE_WAIT_BUDGET) throw e
+      const wait = clampGateWait((e as { retryAfter?: number }).retryAfter ?? 0) || GATE_WAIT_FALLBACK_MS
+      await engineSleep(ctx, wait)
     }
   }
 }
@@ -677,7 +699,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       } catch (e) {
         failed++
         contiguousBroken = true
-        await storeGap(ctx, task, w, 'fetch_failed', failDetail('取数失败', e), gaps)
+        await storeGap(ctx, task, w, fetchGapReason(e), fetchGapDetail(e), gaps)
         continue
       }
 
@@ -817,7 +839,7 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     try {
       fetchRes = await withRetries(ctx, () => fetchWithFakeEmptyRetry(task, ref, ctx), isTransient)
     } catch (e) {
-      await storeGap(ctx, task, resolvedRange, 'fetch_failed', failDetail('取数失败', e), gaps)
+      await storeGap(ctx, task, resolvedRange, fetchGapReason(e), fetchGapDetail(e), gaps)
       return snapshotResult(task, resolvedRange, gaps, 0, 0, 0, 1, 'failed')
     }
 
@@ -1079,7 +1101,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
         } catch (e) {
           plan.failed++
           plan.contiguousBroken = true
-          await storeGap(ctx, task, w, 'fetch_failed', failDetail('取数失败', e), plan.gaps)
+          await storeGap(ctx, task, w, fetchGapReason(e), fetchGapDetail(e), plan.gaps)
           continue
         }
 

@@ -181,13 +181,24 @@ describe('闸门键 ⊇ fetch 真实调用的 endpoint 集合（全任务，真�
       expect(await readCooldown(store, 'ticket.log'), '第一轮必须写出 ticket.log 的冷却行')
         .toBeGreaterThan(NOW)
 
-      // 第二轮：冷却未到点 → 引擎必须在 acquire 处拦住，网络上一发都不许有
+      // 第二轮：冷却未到点 → 必须在**冷却的那个端点**（ticket.log）处拦住。
+      // ⚠️ 数量口径变了（2026-11-15，Sourcery PR#58）：主端点 ticket.search 不受影响，
+      // 会正常发一次；被冷却的 ticket.log 一发都不许有。此前断言「整窗零请求」，
+      // 与「未使用端点不该拦住任务」的修复方向相反（那会误伤本次不调用的端点）。
       const second: string[] = []
-      vi.stubGlobal('fetch', vi.fn(async (url: string) => { second.push(String(url)); throw new Error('不该发请求') }))
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        second.push(String(url))
+        if (String(url).includes('/ticket/log')) throw new Error('冷却中的 ticket.log 不该收到请求')
+        return new Response(JSON.stringify({
+          code: 200, message: JSON.stringify({ total: 1, tickets: [{ id: 900001 }] }),
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }))
       const r = await runTask(t, ctx(new RateGate(store, () => NOW)))
       vi.unstubAllGlobals()
-      expect(r.gaps.map((g) => g.reason), '被拦时必须记 rate_limit_local gap').toEqual(['rate_limit_local'])
-      expect(second, '限流端点（ticket.log）的冷却没被读到 —— 下一轮照旧超发').toEqual([])
+      expect(r.gaps.map((g) => g.reason), '被拦时必须记 rate_limit_local gap（不是 fetch_failed）')
+        .toEqual(['rate_limit_local'])
+      expect(second.filter((u) => u.includes('/ticket/log')),
+        '限流端点（ticket.log）的冷却没被读到 —— 下一轮照旧超发').toEqual([])
     } finally { vi.unstubAllGlobals(); await store.close() }
   })
 
@@ -207,6 +218,61 @@ describe('闸门键 ⊇ fetch 真实调用的 endpoint 集合（全任务，真�
       vi.unstubAllGlobals()
       expect(r.gaps.map((g) => g.reason)).toEqual(['rate_limit_local'])
       expect(second, 'template.list 的冷却没被读到 —— 下一轮照旧超发').toEqual([])
+    } finally { vi.unstubAllGlobals(); await store.close() }
+  })
+
+  it('行为：本次不会调用的声明端点冷却时，任务照常完成（Sourcery PR#58 复核）', async () => {
+    // 实测缺陷（2026-11-15）：模板列表为空 → `dim.ticket_template_fields` 根本不会调用
+    // `ticket.template.fields`，但它处于冷却时，引擎在 fetch 前按**全部声明键**检查，
+    // 于是一发请求都不发就把本窗记成 `failed` + `rate_limit_local`，库里的旧字段行继续留着
+    // （空快照本该把旧行删掉）。冷却只该拦住**真正要调用**的端点。
+    const store = await fresh()
+    const t = DIM_TASKS.find((x) => x.id === 'dim.ticket_template_fields')!
+    try {
+      await new RateGate(store, () => NOW).penalize('ticket.template.fields', 3600)
+      const seen: string[] = []
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        seen.push(String(url))
+        // 模板列表为空：任务据此提交空快照，不会去取 template.fields
+        return new Response(JSON.stringify({ code: 200, message: '[]' }),
+          { status: 200, headers: { 'content-type': 'application/json' } })
+      }))
+      const r = await runTask(t, {
+        store, credentials: { appKey: 'k', appSecret: 's' }, gate: new RateGate(store, () => NOW),
+        clock: () => NOW, sleep: async () => {},
+      } as RunCtx)
+      vi.unstubAllGlobals()
+      expect(r.gaps.map((g) => g.reason), '未使用端点的冷却不该记成失败缺口').toEqual([])
+      expect(r.status, '未使用端点的冷却不该把任务打成 failed').toBe('complete')
+      // 空结果会触发一次「假空重试」（spec §5.2），所以同一次 fetch 里有 2 个 list 请求；
+      // 关键是**没有**任何 template.fields 请求
+      expect(seen.filter((u) => u.includes('/ticket/template/fields')),
+        '模板列表为空时不该去取 template.fields').toEqual([])
+    } finally { vi.unstubAllGlobals(); await store.close() }
+  })
+
+  it('行为：真正被调用的次要端点冷却时，在那个端点处拦下（不是整个窗一发不发）', async () => {
+    // 与上一条互补：这次模板列表**非空**，任务会去取 template.fields —— 它冷却时必须在
+    // 调用它之前拦下（写一行 rate_limit_local gap），且**不对它发请求**。
+    const store = await fresh()
+    const t = DIM_TASKS.find((x) => x.id === 'dim.ticket_template_fields')!
+    try {
+      await new RateGate(store, () => NOW).penalize('ticket.template.fields', 3600)
+      const seen: string[] = []
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        seen.push(String(url))
+        return new Response(JSON.stringify({ code: 200, message: JSON.stringify([{ id: 1 }]) }),
+          { status: 200, headers: { 'content-type': 'application/json' } })
+      }))
+      const r = await runTask(t, {
+        store, credentials: { appKey: 'k', appSecret: 's' }, gate: new RateGate(store, () => NOW),
+        clock: () => NOW, sleep: async () => {},
+      } as RunCtx)
+      vi.unstubAllGlobals()
+      expect(r.gaps.map((g) => g.reason), '被冷却端点必须记 rate_limit_local gap')
+        .toEqual(['rate_limit_local'])
+      expect(seen.filter((u) => u.includes('/ticket/template/fields')),
+        '冷却中的端点一发请求都不许有').toEqual([])
     } finally { vi.unstubAllGlobals(); await store.close() }
   })
 

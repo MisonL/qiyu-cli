@@ -50,6 +50,13 @@ function paceCtx(gate?: RateGate): FetchCtx {
 let waits: number[] = []
 let penalize: ReturnType<typeof vi.fn>
 
+/**
+ * 最小闸门替身：`callPaced` 现在**真正调用前**会 acquire 该 endpoint 的冷却
+ * （Sourcery PR#58：未使用端点不该被拦），所以替身必须提供 `acquire`。
+ * `acquire` 默认放行；要测「冷却中」的形态时用 `rejectingGate`。
+ */
+const fakeGate = (): RateGate => ({ penalize, acquire: async () => {} } as unknown as RateGate)
+
 beforeEach(() => {
   waits = []
   penalize = vi.fn(async () => {})
@@ -62,7 +69,7 @@ describe('任务层 callPaced —— 远端限频 penalize 接线（中-1 / B �
     callMock.mockRejectedValueOnce(remoteLimitError(5))
       .mockResolvedValueOnce({ ok: true, payload: { sessions: 1 } } as CallResult)
     const res = await callPaced('statistic.overview', {}, paceCtx(
-      { penalize } as unknown as RateGate))
+      fakeGate()))
     expect(res.payload).toEqual({ sessions: 1 })
     expect(penalize).toHaveBeenCalledTimes(1)
     // B 中-6 钉死：键是 **endpoint id**（注册表 id / RATE_LIMITS 的键），不是任务 id。
@@ -74,8 +81,7 @@ describe('任务层 callPaced —— 远端限频 penalize 接线（中-1 / B �
 
   it('持续远端限频 → 有界重试（3 次等待）后抛出，penalize 逐次写冷却（同一把键）', async () => {
     callMock.mockRejectedValue(remoteLimitError(5))
-    await expect(callPaced('statistic.overview', {}, paceCtx(
-      { penalize } as unknown as RateGate))).rejects.toThrow('限流')
+    await expect(callPaced('statistic.overview', {}, paceCtx(fakeGate()))).rejects.toThrow('限流')
     expect(callMock).toHaveBeenCalledTimes(4)   // 初次 + 3 次等待重试
     expect(penalize).toHaveBeenCalledTimes(3)
     expect(penalize.mock.calls.every((c) => c[0] === 'statistic.overview')).toBe(true)
@@ -94,7 +100,7 @@ describe('任务层 callPaced —— 远端限频 penalize 接线（中-1 / B �
     callMock.mockRejectedValueOnce(localLimitError(30))
       .mockResolvedValueOnce({ ok: true, payload: { sessions: 2 } } as CallResult)
     const res = await callPaced('statistic.overview', {}, paceCtx(
-      { penalize } as unknown as RateGate))
+      fakeGate()))
     expect(res.payload).toEqual({ sessions: 2 })
     expect(penalize).not.toHaveBeenCalled()
     expect(waits).toEqual([31_000])
@@ -103,7 +109,7 @@ describe('任务层 callPaced —— 远端限频 penalize 接线（中-1 / B �
   it('B 低-2：retryAfter 天文数字 → 单次等待封顶（不把同步挂死）', async () => {
     callMock.mockRejectedValueOnce(remoteLimitError(86_400 * 365))   // 一年
       .mockResolvedValueOnce({ ok: true, payload: { ok: 1 } } as CallResult)
-    await callPaced('statistic.overview', {}, paceCtx({ penalize } as unknown as RateGate))
+    await callPaced('statistic.overview', {}, paceCtx(fakeGate()))
     expect(waits).toEqual([MAX_GATE_WAIT_MS])
   })
 
@@ -112,13 +118,13 @@ describe('任务层 callPaced —— 远端限频 penalize 接线（中-1 / B �
       code: '14009', kind: 'rate_limit', retryable: true,
     }))
       .mockResolvedValueOnce({ ok: true, payload: { ok: 1 } } as CallResult)
-    await callPaced('statistic.overview', {}, paceCtx({ penalize } as unknown as RateGate))
+    await callPaced('statistic.overview', {}, paceCtx(fakeGate()))
     expect(waits).toEqual([31_000])      // 兜底 30s + 1s 余量
     waits = []
     callMock.mockReset()
     callMock.mockRejectedValueOnce(remoteLimitError(0))
       .mockResolvedValueOnce({ ok: true, payload: { ok: 1 } } as CallResult)
-    await callPaced('statistic.overview', {}, paceCtx({ penalize } as unknown as RateGate))
+    await callPaced('statistic.overview', {}, paceCtx(fakeGate()))
     expect(waits).toEqual([1_000])       // 0 秒不是「立刻重试」而是最小等待
   })
 })
