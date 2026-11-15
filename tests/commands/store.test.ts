@@ -281,6 +281,40 @@ describe('store status', () => {
     expect(JSON.parse(out).meta.warnings).toBeUndefined()
   })
 
+  it('声明表在库里被删 → init/status 都点名「声明有而库中无」+ 成因 + 不谎称能补建（历史审查 PR#4 复核）', async () => {
+    // 事故事实（Sourcery PR#4-7「Missing tables pass initialization」）：库记录着最新
+    // schema_version、却少一张声明表时，`init` 跳过全部迁移（只重放 version > MAX(version)
+    // 的）→ 被删的表**不会**被重建；若此时再报"初始化成功、一切正常"，调用方读到的是
+    // 一份缺表却自称完整的库。
+    // 现在的口径不变的是**退出码**（README：库有漂移只警告、不失败 —— 与 db tables 同口径），
+    // 变的是**必须如实点名**：缺哪张、为什么、以及"store init 不会重建它"。
+    const p = dbPath()
+    expect(await storeCommand(['init', '--db', p])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(p)
+    const conn = await inst.connect()
+    await conn.run('DROP TABLE "tickets"')
+    conn.closeSync(); inst.closeSync()
+
+    for (const sub of ['init', 'status'] as const) {
+      out = ''
+      expect(await storeCommand([sub, '--db', p]), `${sub}：漂移不失败（README 口径）`).toBe(0)
+      const d = JSON.parse(out) as { data: { tables: unknown; schema_version: number }; meta: { warnings?: string[] } }
+      const text = (d.meta.warnings ?? []).join('\n')
+      expect(text, `${sub} 必须点名缺表（不得报干净的 ok）`).toMatch(/声明有而库中无/)
+      expect(text).toContain('tickets')
+      // 不许谎称"再 init 一次就好" —— 迁移已到最新版时它不会重建
+      expect(text).toMatch(/store init 不会重建/)
+      // 版本号仍在最新：证明"跳过迁移"确实发生了（这是缺表不会被补的机制）
+      expect(d.data.schema_version, `${sub}：库版本仍是最新，故 init 不会重放迁移`).toBeGreaterThan(0)
+      // 表清单不得把缺的表当成在
+      const names = (Array.isArray(d.data.tables) ? d.data.tables : (d.data.tables as Array<{ name: string }>).map((t) => t.name)) as string[]
+      expect(names).not.toContain('tickets')
+    }
+  })
+
   // 2026-11-14（历史审查 PR#4 复核）：`store status` 对全库逐表 COUNT，DuckDB 的
   // `information_schema.tables` **把 view 也算作表**。此前 store 连接没有设
   // `enable_external_access=false`（实测默认 true，只有查询沙箱设过），于是来源不明的库里

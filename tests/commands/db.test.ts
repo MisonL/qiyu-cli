@@ -4,7 +4,7 @@
 // ⚠️ fixtures 全合成：13800001111 是明显的测试号码，不使用任何真实企业数据。
 import { describe, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest'
 import { it, captureSinks } from '../helpers/capture.js'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { copyFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { dbCommand } from '../../src/commands/db.js'
@@ -12,7 +12,6 @@ import { missingTableCauses } from '../../src/query/errors.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { shellArg } from '../../src/core/shell.js'
 import { TABLES, MIGRATIONS } from '../../src/store/schema.js'
-import { OBJECT_KINDS_SQL } from '../../src/commands/store-precheck.js'
 import type { Store } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/sync.test.ts 同款放宽）。
@@ -20,60 +19,47 @@ import type { Store } from '../../src/store/types.js'
 // （本机负载高时实测 10–34s），vitest 默认 10s 会先把它判超时。
 vi.setConfig({ testTimeout: 15_000, hookTimeout: 60_000 })
 
-// ⚠️ **整个文件只用一个库文件**（2026-11-13 性能改造）。原先是 `beforeEach` 里
-// `mkdtemp` 新目录、每条用例各建一个库 —— 而 `@duckdb/node-api` 的实例缓存**按路径**
-// 生效（`tests/fixtures/corrupt-db.ts` 记着这条），换路径就等于每次都付一次
-// 「打开 + 25 张表迁移」。实测（本机负载 88）：新建库 ~500–800ms/条，
-// 同路径「DROP 全部表 + 重新迁移」~140ms/条，冷启动只付一次。
-// 语义不变：每条用例开始前库都被重置成「刚 init 完」的状态（见 `resetDb()`），
-// 包括会篡改 schema 的用例（删表、删列）—— 它们留下的破坏也一并清掉。
-//
-// ⚠️ **已知边界**（2026-11-14，历史审查 PR#72 复核）：单库路径换来的是「一条用例超时后，
-// 它仍在跑的异步操作会与下一条的 `resetDb()`（DROP + 迁移）交错」。vitest 不会取消已超时
-// 用例的执行，而本文件不为此设防 —— 代价是偶发的、报错点可能落在**下一条**用例上。
-// 不改成「每条用例独立路径」是因为那要重新付冷启动与迁移的全价（见上段实测）。
+// ⚠️ **每条用例一个库文件，从"热模板"复制**（2026-11-15，历史审查 PR#72 收口）。
+// 演进史：① `beforeEach` 里 `mkdtemp` 新目录各建库 → 每条都付「打开 + 25 表迁移」
+// （本机负载 88 实测 ~500–800ms/条）；② 全文件单库 + 每条 `DROP 全部表 + 重新迁移`
+// （~140ms/条），代价是**已知边界**：用例超时后它仍在跑的异步操作会与下一条的
+// `resetDb()` 交错（vitest 不取消已超时用例的执行），破坏可能落到**下一条**头上；
+// ③ 现在：`beforeAll` 建一次模板库（冷启动 + 迁移只付一次），`beforeEach` 把模板
+// **复制**成本条的 `q-<n>.duckdb`（复制 ~ms 级，不跑迁移、不重开冷启动）。
+// 于是"上一条的尾巴写坏了下一条的夹具"这条路**不存在**了：尾巴写的是它自己那个文件。
 let dir = ''
 let out = ''
 let err = ''
-const dbPath = (): string => join(dir, 'q.db')
+/** 模板库：`beforeAll` 建好（跑完全部迁移）后只读，`beforeEach` 从它复制。 */
+const templatePath = (): string => join(dir, 'template.duckdb')
+let testSeq = 0
+/** 本条用例的库文件。每次调用返回同一个值（`beforeEach` 里推进序号）。 */
+const dbPath = (): string => join(dir, `q-${testSeq}.duckdb`)
 
 /**
- * 把库恢复成「刚 store init 完」：删掉全部表（含用例中途建的 `rogue_table`）再迁移。
+ * 把本条的库恢复成「刚 store init 完」：从模板复制覆盖。
  *
- * ⚠️ **只给真正用库的用例调用**，不放进 `beforeEach`（2026-11-13 实测）：本文件有
- * 三条用例根本不碰 `q.db`（两条「库不存在 / 空库 / 他人库」用的是各自的路径，
- * 一条是纯参数错误），给它们也重置一遍等于凭空加 3×140ms。放进 `beforeEach`
- * 首次实测反而比改造前更慢（10.3s → 13.5s）。
+ * ⚠️ 保留这个函数名是因为它被 26 处调用（每条用例开头「重置夹具」的语义没变），
+ * 但实现从「DROP 全部表 + 重新迁移」换成了**整文件复制** —— 幂等、便宜，
+ * 且不会与任何仍在跑的旧操作共享同一个文件。
  */
 async function resetDb(): Promise<void> {
-  const s = await createDuckDbStore(
-    { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
-  try {
-    // 表名用 `query()` + `information_schema` 取（`tableNames()` 只列声明过的表，
-    // 而「多一张表」那条用例会建 `rogue_table`，它也必须被清掉）。
-    const names = (await s.query(
-      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'`))
-      .rows.map((r) => String(r.table_name))
-    // ⚠️ 同一名字可能是 view（本文件有「声明表被换成同名 view」的用例）：`DROP TABLE` 对
-    // view 报 `Catalog Error: Existing object tags is of type View`，于是破坏会**留到下一条
-    // 用例**（单库路径的已知边界，见文件头）。先按非基表删，再兜底按表删。
-    const kinds = new Map((await s.query(OBJECT_KINDS_SQL)).rows.map((r) => [String(r.table_name), String(r.table_type)]))
-    for (const n of names) {
-      if (kinds.get(n) !== 'BASE TABLE') await s.query(`DROP VIEW IF EXISTS "${n}" CASCADE`)
-      await s.query(`DROP TABLE IF EXISTS "${n}" CASCADE`)
-    }
-    await s.init()
-  } finally {
-    await s.close()
-  }
+  copyFileSync(templatePath(), dbPath())
 }
+
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-db-'))
-  // 冷启动只付一次：`beforeAll` 里先建好库，后续每条用例的 `resetDb()` 走同路径快路径。
-  await resetDb()
+  // 冷启动与迁移只付一次：建**模板库**（25 张表全建好），之后每条用例复制它。
+  const s = await createDuckDbStore(
+    { backend: 'duckdb', path: templatePath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+  try { await s.init() } finally { await s.close() }
 })
-beforeEach(async () => {
+beforeEach(() => {
+  testSeq += 1
+  // 每条用例拿到**自己的库文件**：上一条用例超时后仍在跑的异步写，写的是它自己那个
+  // 文件，碰不到本条的夹具（PR#72 的原始顾虑就此消失，不再是"已知边界"）。
+  copyFileSync(templatePath(), dbPath())
   out = ''; err = ''
   captureSinks((s) => { out += s }, (s) => { err += s })
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（配置文件与默认库路径都走 HOME）
@@ -82,7 +68,17 @@ beforeEach(async () => {
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs()
 })
-afterAll(() => { rmSync(dir, { recursive: true, force: true }) })
+afterAll(() => {
+  // ⚠️ 清理**不得让本文件失败**，但也不能静默（历史审查 PR#73）：Windows 上 DuckDB 的
+  // `closeSync()` 未及时释放句柄时，`rmSync` 会 EBUSY/EPERM —— 那是临时目录残留，
+  // 不是测试结论，所以降级成 stderr 提示。实测已确认 `beforeAll` 抛错时 `afterAll`
+  // **仍会执行**（临时用例：beforeAll 抛错 → 打印 `afterAll 执行了`），所以"setup 失败
+  // 就没人清理"的说法不成立；剩下的只是句柄时序。
+  try { rmSync(dir, { recursive: true, force: true }) } catch (e) {
+    process.stderr.write(`[db.test] 临时目录清理失败（可安全忽略，路径：${dir}）：`
+      + `${e instanceof Error ? e.message : String(e)}\n`)
+  }
+})
 
 const data = (): Record<string, unknown> => JSON.parse(out).data
 const meta = (): Record<string, unknown> => JSON.parse(out).meta
@@ -877,5 +873,45 @@ describe('db describe', () => {
     expect(await dbCommand(['describe', '--help', '--bogus'])).toBe(2)
     expect(err).toMatch(/未知参数/)
     expect(errorOf().kind).toBe('usage')
+  })
+})
+
+describe('夹具隔离（历史审查 PR#72 收口）', () => {
+  let prevDbPath = ''
+
+  it('【前一条】把本条库改坏，并留一条 80ms 后才执行的"尾巴"', async () => {
+    prevDbPath = dbPath()
+    const s = await createDuckDbStore(
+      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try { await s.query('DROP TABLE "sessions"') } finally { await s.close() }
+    // 模拟"用例超时后仍在跑的异步操作"：它落到的是**本条自己的**库文件。
+    setTimeout(() => {
+      void (async () => {
+        const t = await createDuckDbStore(
+          { backend: 'duckdb', path: prevDbPath, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+        try { await t.query('DROP TABLE "tickets"') } finally { await t.close() }
+      })()
+    }, 80)
+  })
+
+  it('【本条】库仍是完整的 25 张表 —— 上一条的破坏与尾巴都碰不到它', async () => {
+    // 等到上一条那条尾巴真的落地（它在别处写，写坏了也不影响这里）
+    await new Promise((r) => setTimeout(r, 150))
+    // ⚠️ 判定顺序：先看**数据**再看路径 —— 若只断言"路径不同"，把夹具改回单库时
+    // 第一条就红，看不出"尾巴真的写坏了本条"这个更有说服力的形态（变异验证过）。
+    expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
+    expect((data().tables as TableOut[]).map((t) => t.name), '上一条删掉的表不得消失').toHaveLength(25)
+    expect(dbPath(), '每条用例必须拿到自己的库文件').not.toBe(prevDbPath)
+    // 反过来确认"上一条真的把破坏留下了"—— 否则本条通过也可能只是因为它没动手
+    const broken = await createDuckDbStore(
+      { backend: 'duckdb', path: prevDbPath, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+    try {
+      const names = (await broken.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"))
+        .rows.map((r) => String(r.table_name))
+      expect(names, '上一条的库里确实少了 sessions/tickets（证明破坏真的发生了）')
+        .not.toContain('sessions')
+      expect(names).not.toContain('tickets')
+    } finally { await broken.close() }
   })
 })

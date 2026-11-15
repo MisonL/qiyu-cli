@@ -198,6 +198,13 @@ export async function storeCommand(argv: string[]): Promise<number> {
         message: `不是普通文件：${config.path}`, hint: nonRegularFileHint(false) })
     }
     if (st !== undefined && st.isSymbolicLink() === true) {
+      // ⚠️ 这条检查**不是安全边界**（历史审查 PR#4「Symlink checks can be bypassed」复核）：
+      // `lstat` 与随后 DuckDB 的 `create` 之间仍有 TOCTOU 窗口，能把路径换成链接的进程
+      // 同样能直接改写库里内容 —— 那已经是"同一用户权限下的任意文件写"，不是本 CLI 能靠
+      // 一次 lstat 拦住的威胁。DuckDB 的打开接口没有 `O_NOFOLLOW` 之类的入口，所以这里
+      // 只做**防误用**（用户/脚本把 --db 指到链接上时立刻说清楚），并在测试里钉住拒绝行为
+      // （tests/commands/store.test.ts 的「--db 是符号链接」用例）。不要把它当成安全承诺写进
+      // 文档；真要防篡改，正确做法是给库文件与父目录设权限（0600/0700）。
       return fail({ code: 'store_not_initialized', kind: 'store_not_initialized', retryable: false,
         message: `目标是符号链接：${config.path}`, hint: '--db 目标是符号链接，请给出真实路径' })
     }

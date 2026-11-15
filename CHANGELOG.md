@@ -47,6 +47,17 @@
 
 ### 修复
 
+- **同一 Store 实例上的并发写不得并入别人的事务**（2026-11-15，Sourcery PR#4-6 复核）：`inTx` 是
+  整个实例共享的布尔，事务外另一条异步链调用 `upsert` / `delete` 时会被当成「事务内」直接写进
+  别人未提交的事务 —— 对方回滚，这次写入就**静默消失**，而 `upsert` 还返回了成功行数（实测：
+  事务外那条 resolves，回滚后 `count === 0`）。归属改用 `AsyncLocalStorage` 令牌：只有从
+  `transaction()` 回调内部发起的写才算事务内，其余一律 `internal` 拒绝并说明「并入会随对方回滚
+  一起消失」。单连接 + `await` 串行的既有用法（`store init`/`status`、sync 引擎）行为不变。
+- **声明表被删时的「缺表」半边在 `store init` / `store status` 都有行为用例**（2026-11-15，
+  Sourcery PR#4-7 复核）：库记录着最新 `schema_version` 却少一张声明表时，`init` 会跳过全部
+  迁移、被删的表**不会**重建。退出码仍按 README 契约只警告（与 `db tables` 同口径），但
+  `meta.warnings` 必须点名缺哪张、给出成因与对策，并明写「`store init` 不会重建该表」——
+  新增用例把这条钉在 `init` 与 `status` 两侧（此前只有「库中有而声明无」那半边有行为用例）。
 - **目录查询显式放大上限、截断即拒**（2026-11-15，CodeRabbit + Codex PR#78）：`OBJECT_KINDS_SQL`
   是全目录扫描，而查询沙箱缺省只回 1000 行 —— 对象多于此的库里，排在截断之后的声明表会被误报成
   「缺表」（Codex 实测：1100 张无关表 + 目标表 → `query --table` 报 `store_not_initialized`）。
@@ -188,6 +199,21 @@
 
 ### 测试
 
+- **capture 助手的两条结构性边界改由静态守卫关闭**（2026-11-15，Sourcery PR#72 收口）：迁移形态
+  （`captureSinks`）的 sink 是模块级变量，并发与 hook 延迟写入这两类形态在机制上无法归属
+  （写时刻已换世代）。新增两条全仓扫描：用了 `captureSinks` 的文件**不得**出现
+  `it/test/describe.concurrent`（白名单只有 `capture-sinks.test.ts`，且带「豁免已过期」检查），
+  且 hook 体里不得留下未 await 的延迟工作（`setTimeout`/`setInterval`/`setImmediate`/
+  `queueMicrotask`/`.then(`/`void x`）。判据的边界如实写在注释里（只认直接写在 hook 体里的
+  调度形态），两条都做了变异验证。
+- **`db.test.ts` 夹具改成"每条用例一个库、从热模板复制"**（2026-11-15，同上）：`beforeAll` 建
+  一次模板库（冷启动 + 25 表迁移只付一次），`beforeEach` 把模板复制成本条的 `q-<n>.duckdb`。
+  此前「单库 + 每条 DROP 全部表重迁移」的已知边界（超时用例的残留操作与下一条的 `resetDb()`
+  交错）就此消失 —— 残留操作写的是它自己那个文件。新增隔离用例：上一条删表并留一条 80ms 后
+  落地的写入，本条仍须拿到完整的 25 张表（变异验证：改回单路径即红，报「24 张」）。
+  `afterAll` 的临时目录清理也不再把整个文件判失败（Windows 句柄时序），只降级成 stderr 提示；
+  另实测确认 `beforeAll` 抛错时 `afterAll` **仍会执行**（临时用例），故「setup 失败就没人清理」
+  这条旧顾虑不成立。
 - **审查意见复核带出的守卫收紧**（2026-11-14）：`sync-enums` 的任务层 `reason` 扫描从
   「至少 N 处」改为**逐文件**断言（一个文件整段漏扫不再能被别处的命中凑数），并显式拒绝
   模板串/计算值形态；`gate-keys` 的夹具改为按 endpoint 给出「让循环转起来」的最小数据

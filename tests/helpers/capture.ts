@@ -19,8 +19,9 @@
 // ⚠️ 归属按**写入时刻的异步上下文**判（CodeRabbit 2026-11-13 major）：延迟回调
 // 在运行时才查 `process.stdout.write`，那时挂着的是下一条用例装的 spy。所以 spy
 // 只有一套，写入者带着 `it` 包装版在执行时建立的**世代号**；**旧世代的写入一律丢弃**
-// （上一条用例超时后落地的尾巴不会进下一条的 `out`）。并发用例的边界如实写在
-// `writerIsCurrent` 的注释里 —— 本节说的「隔离」不覆盖 `it.concurrent`。
+// （上一条用例超时后落地的尾巴不会进下一条的 `out`）。并发用例与 hook 延迟写入这两个
+// 机制上兜不住的形态，由 `tests/helpers/capture.test.ts` 的**静态守卫禁止落地**（细节见
+// `writerIsCurrent` 的注释）。
 // 世代号由包装版 `it` 在执行时建立（见 `it` 的注释），不需要改动用例体。
 //
 // ⚠️ 写入回调：替身必须把 `write(chunk, cb)` / `write(chunk, enc, cb)` 的完成回调
@@ -243,18 +244,29 @@ function installShared(): void {
  * 写入者是「当前世代」吗？只接当前世代（或没有世代上下文，如 hook / 模块级代码）的写入。
  *
  * ⚠️ 判据是「== 最新推进到的世代」，并发用例下这个判据**不成立**（A 的 body 可能在 B 的
- * `beforeEach` 之后执行，最新世代已是 B 的）。这是**如实承认的边界**，不是遗漏：
- * 迁移形态的 sink 写的是模块级 `out`，两条并发用例本就在往同一个变量里写，任何归属都
- * 无法隔离它们。**要并发隔离就用句柄形态**（`startCapture()` + `cap.run()`：`alsBuf`
- * 按缓冲归属，与世代无关）。
+ * `beforeEach` 之后执行，最新世代已是 B 的）。**机制上无解**：迁移形态的 sink 写的是模块级
+ * `out`，两条并发用例本就在往同一个变量里写，任何归属都无法隔离它们。
+ * 真的需要并发，正确做法是**句柄形态**（`startCapture()` + `cap.run()`：`alsBuf` 按缓冲
+ * 归属，与世代无关），且**每一次写入都要落在某条 `cap.run()` 里** —— 未包住的写入走模块级
+ * `fallback`，那才是会串的那条路径。
  * 反过来，若把判据改成「按用例身份取它自己的 sink」，A 的尾巴就会追加进 **B 正在写的
  * 那个 `out`** —— 比丢弃更糟（守卫 B/I/K/M 会红，实测过）。
+ *
+ * ⚠️ **于是这条边界改由静态守卫关闭**（2026-11-15，Sourcery PR#72 收口）：用了
+ * `captureSinks` 的文件**不得**出现 `.concurrent`（`it`/`test`/`describe` 皆禁），
+ * 唯一的白名单是 `helpers/capture-sinks.test.ts`（它用不重叠的 concurrent 体证明
+ * "concurrent 体的尾巴不会漏进下一条"，正是本条不变量的证据）。守卫在
+ * `tests/helpers/capture.test.ts`，含白名单过期检查。
  *
  * ⚠️ 另一个边界：**hook 里的延迟写入没有世代**（`beforeEach`/`afterEach` 不在执行体的
  * `alsGen.run` 里）。这类写入按「无上下文 = 当前世代」被接收 —— 实测 A 的 hook 里 80ms 后
  * 落地的尾巴进了 B 的 `out`，而本条守卫选不出来（见 capture-sinks 文件头）。判断标准本身
- * 就是「写入时刻谁在跑」，与「谁发起的」无关；要覆盖它只能给 hook 也套世代（要改 27 个
- * 文件的 hook，超出本次范围）。本仓库现有用例的 hook 里没有延迟输出（已逐文件 grep）。
+ * 就是「写入时刻谁在跑」，与「谁发起的」无关；要覆盖它只能给 hook 也套世代（要改 29 个
+ * 文件的 hook 导入）。
+ * **同样改由静态守卫关闭**：用了 `captureSinks` 的文件，hook 体里不得留下未 await 的
+ * 延迟工作（`setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`/`.then(`/`void x`）
+ * —— hook 里把活 await 到底就不会有"落地时已换世代"的写入。判据的**边界如实记录**：
+ * 只认直接写在 hook 体里的调度形态；hook 调用的辅助函数内部排定时器看不出来。
  */
 function writerIsCurrent(): boolean {
   const g = alsGen.getStore()

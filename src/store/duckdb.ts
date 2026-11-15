@@ -11,6 +11,7 @@
 // D-T3 追加：src/sync/state.ts 常量 SELECT 3 处（水位/缺口读取），不在上述 9 处内。
 // D-T11 追加：src/sync/tasks/knowledge.ts 常量 SELECT 1 处
 //（knowledge.categories 的驱动序 SELECT DISTINCT robot_id），不在上述 9 处内。
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { MIGRATIONS, TABLES, tableByName, type TableDef } from './schema.js'
 import { objectKinds, isBaseTable, sameObjectName } from './object-kinds.js'
 import { retryWithBackoff, isLockError, isModuleNotFound } from './retry.js'
@@ -48,6 +49,10 @@ function usage(msg: string): Error {
   ;(e as { kind?: string }).kind = 'usage'
   return e
 }
+
+/** 事务归属的异步上下文。⚠️ 必须**每个 Store 实例一份**（在 `createDuckDbStore` 内建），
+ *  否则同一进程里两个实例的事务令牌会互相干扰。 */
+type TxAls = AsyncLocalStorage<symbol>
 
 export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps: DuckDbDeps = {}): Promise<Store> {
   let mod: { DuckDBInstance: { create: (p: string, o?: unknown) => Promise<unknown> } }
@@ -153,6 +158,18 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   }
   let closed = false
   let inTx = false
+  /**
+   * 当前事务的**所有者令牌**（历史审查 PR#4 复核）。
+   *
+   * ⚠️ 事故事实：`inTx` 是**整个 Store 实例共享的布尔**，所以「事务外另一条异步链」调用
+   * `upsert`/`delete` 时会被当成「事务内」，直接被写进别人那条未提交的事务 —— 对方回滚，
+   * 这一行就**静默消失**，而 `upsert` 还返回了成功行数（实测：outside 分支 resolves，
+   * 回滚后 `count === 0`）。报错是可修的，"成功却丢数据"不可发现。
+   * 归属判据用 `AsyncLocalStorage`：只有从 `transaction()` 回调**内部**发起的写才算事务内。
+   * 单连接、`await` 串行的既有用法（store init/status、sync 引擎）行为完全不变。
+   */
+  let txToken: symbol | undefined
+  const alsTx: TxAls = new AsyncLocalStorage<symbol>()
 
   // ⚠️ 所有语句执行收敛到这一个方法 —— 测试 spy 的落点（spec §5.3）。
   // ⚠️ **挂载与调用契约（v3.1 定死，消除二选一）**：
@@ -174,6 +191,26 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const t = tableByName(name)
     if (!t) throw usage(`未知表：${name}`)
     return t
+  }
+
+  /**
+   * 写操作的事务归属守卫：有事务开着、但**当前异步链不是它的所有者** → 拒绝。
+   *
+   * ⚠️ 为什么必须拒绝而不是"照旧并入"：并入后成功返回、随对方回滚而丢失（见 `txToken`）。
+   * 为什么是 `internal` 而不是 `usage`：这不是调用方参数写错，是本进程内两条异步链
+   * 同时写同一个 Store 实例 —— 唯一正确的修法是调用方串行化（Store 契约见文件头）。
+   */
+  const assertTxOwnership = (): void => {
+    if (!inTx) return
+    if (alsTx.getStore() === txToken) return
+    const err = new Error(
+      '同一个 Store 实例上有事务未提交时，另一条异步链又发起了写操作 —— 已拒绝，'
+      + '否则这次写入会被并入那条事务并随它一起回滚（表现为"写入成功但数据消失"）。'
+      + 'Store 的并发契约是"同一实例上的写必须串行 await"（见 src/store/duckdb.ts 文件头）',
+    )
+    ;(err as { kind?: string }).kind = 'internal'
+    ;(err as { hint?: string }).hint = '让同一个 Store 实例上的写操作串行执行：不要用 Promise.all 并行调用 upsert/delete/transaction'
+    throw err
   }
 
   const assertRows = (t: TableDef, rows: Record<string, unknown>[]): void => {
@@ -264,6 +301,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
 
   const del = async (tname: string, where: string, params: unknown[] = []): Promise<number> => {
     const t = assertTable(tname)
+    assertTxOwnership()
     const before = await store.count(tname)
     await store.execSql(`DELETE FROM "${t.name}" WHERE ${where}`, params)
     const after = await store.count(tname)
@@ -406,7 +444,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     async upsert(table: string, rows: Record<string, unknown>[]): Promise<number> {
       const t = assertTable(table)
       assertRows(t, rows)
-      if (inTx) return doUpsert(t, rows)
+      // ⚠️ `inTx` 的语义是「本实例上有事务开着」，不等于「调用者在那个事务里」——
+      // 归属必须由 `assertTxOwnership` 判（历史审查 PR#4 复核）。
+      if (inTx) {
+        assertTxOwnership()
+        return doUpsert(t, rows)
+      }
       // ⚠️ BEGIN/COMMIT 闭包直调 execSql：测试 spy 只断言**数据语句**条数（语句数 == 批次
       // 数），事务控制语句不走 store.execSql 属性查找（与测试为权威的裁定一致）。
       await execSql('BEGIN')
@@ -424,6 +467,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       if (inTx) throw usage('不得嵌套事务')
       await execSql('BEGIN')
       inTx = true
+      const token = Symbol('store-tx')
+      txToken = token
       try {
         // ⚠️ 真实投影而非 cast：WriteTx 类型上不含 query/init/close（spec §4.2.6 防线分层），
         // 运行时对象也不得携带 —— 直接传 store 的话 `Object.keys(tx)` 可枚举出 query。
@@ -434,7 +479,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           delete: (t: string, w: string, p?: unknown[]) => store.delete(t, w, p),
           transaction: <U>(f: (tx2: WriteTx) => Promise<U>) => store.transaction(f),
         }
-        const r = await fn(tx)
+        // ⚠️ 回调必须在**带令牌的异步上下文**里执行：`tx.upsert`/`tx.delete` 也走
+        // `assertTxOwnership`，靠这里建立的上下文才认得出"这是事务内的写"。
+        const r = await alsTx.run(token, () => fn(tx))
         await execSql('COMMIT')
         return r
       } catch (e) {
@@ -442,6 +489,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         throw e
       } finally {
         inTx = false
+        txToken = undefined
       }
     },
     async query(sql: string, params?: unknown[]): Promise<QueryResult> {

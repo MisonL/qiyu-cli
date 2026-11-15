@@ -281,6 +281,41 @@ describe('duckdb —— 事务', () => {
     })).rejects.toThrow(/嵌套|usage/)
     await s.close()
   })
+
+  it('事务外的另一条异步链 upsert → 拒绝，不得并入别人的事务（历史审查 PR#4 复核）', async () => {
+    // 事故事实（Sourcery PR#4）：`inTx` 是**整个 Store 实例共享的布尔**，于是事务外的
+    // 调用方会被当成「事务内」，直接被写进别人那条未提交的事务里 —— 对方一旦回滚，
+    // 这一行的写入**静默消失**，而 upsert 还返回了成功行数。
+    // 后果不是「报错」而是「成功却丢数据」：Agent 收到 1 行写入成功，库里却没有。
+    // 实测形态（修前，本条红）：outside 分支 resolves，tx 回滚后 count === 0。
+    const s = await fresh()
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const tx = s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FF0000' }])
+      await gate          // 事务挂在这里，等外面的第二次写先发生
+      throw new Error('boom')
+    })
+    // 等到事务确实已开始（第一条写落了）
+    for (let i = 0; i < 100 && (await s.query('SELECT 1')).rows.length === 0; i++) await new Promise((r) => setTimeout(r, 5))
+    const outside = await s.upsert('tags', [{ id: '2', name: 'B', color: '#00FF00' }])
+      .then(() => null, (e: unknown) => e)
+    // 同一道判据必须覆盖**所有写原语**，不能只修被点名的那一个 `upsert`：
+    // `delete` 走的是同一条「并入当前事务」的路径（修前：DELETE 落在别人的事务里，
+    // 回滚后那条删除也一起消失，而返回值还说删了 0 行）。
+    const outsideDel = await s.delete('tags', 'id = ?', ['1']).then(() => null, (e: unknown) => e)
+    release()
+    await tx.catch(() => {})
+    expect(outside, '事务外的写必须被拒绝，不能静默并入别人的事务').not.toBeNull()
+    expect(outside).toMatchObject({ kind: 'internal' })
+    expect((outside as Error).message).toMatch(/事务/)
+    expect(outsideDel, 'delete 同样不得被并入别人的事务').toMatchObject({ kind: 'internal' })
+    // 拒绝之后库里必须干净：tx 回滚，且那一行从未被写入
+    expect(await s.count('tags')).toBe(0)
+    // 事务结束之后，普通 upsert 恢复正常（守卫不粘滞）
+    await expect(s.upsert('tags', [{ id: '3', name: 'C', color: '#0000FF' }])).resolves.toBe(1)
+    await s.close()
+  })
 })
 
 describe('duckdb —— init 与关闭', () => {
