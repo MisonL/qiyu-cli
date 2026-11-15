@@ -47,6 +47,11 @@
 
 ### 修复
 
+- **capture 守卫不得把「返回定时器句柄」当成已交付**（2026-11-15，Codex PR#81 第二轮 P2）：
+  `setTimeout` 返回的是句柄不是 Promise —— `beforeEach(() => setTimeout(…, 80))` 与块体里的
+  `return setTimeout(…)` 都不被 vitest 等待，回调照样在之后落地（Codex 用独立 vitest 探针
+  复现：尾巴进了下一条的 `out`，而判据返回空）。现在只有「`await`」或「返回/表达式体 + 包进
+  `new Promise(...)`/`.then(...)`」才算已交付；`then` 回调内部排的定时器仍照报。
 - **测试夹具的两处时序/重载隐患**（2026-11-15，CodeRabbit PR#81 第二轮）：`itBound` 改为包
   **第一个函数实参**（`it(名, 执行体, 超时)` 重载下"最后一位"是数字，按 last 取会拿不到执行体 →
   它不套 ALS 绑定，超时用例恢复后又读到下一条的库路径）；`afterAll` 清理前把隔离用例留下的
