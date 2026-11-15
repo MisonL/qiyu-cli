@@ -47,6 +47,13 @@
 
 ### 修复
 
+- **capture 守卫的判据从「语句里有没有 await」改为「谁在等这次调度」**（2026-11-15，
+  CodeRabbit PR#81 第三轮，一假阳性一假阴性）：`await Promise.resolve().then(() => setTimeout(…))`
+  里的 `await` 等的是回调的返回值（一个句柄），定时器之后才落地 → 尾巴照样漏（假阴性）；
+  而 `await new Promise((r) => { setTimeout(r, 80) })` 是正确写法，却因回扫被执行体的 `{`
+  挡住而误报（假阳性）。现在定时器必须**包进 `new Promise(...)` 且那个 promise 被
+  await/return**；`.then` 链本身产 promise，等它被交出去即可；`void` 永远算脱手。
+  15 种形态的正反控（含上述两条与「await 的 executor 内部再排 .then」）全部写进自检。
 - **capture 守卫不得把「返回定时器句柄」当成已交付**（2026-11-15，Codex PR#81 第二轮 P2）：
   `setTimeout` 返回的是句柄不是 Promise —— `beforeEach(() => setTimeout(…, 80))` 与块体里的
   `return setTimeout(…)` 都不被 vitest 等待，回调照样在之后落地（Codex 用独立 vitest 探针

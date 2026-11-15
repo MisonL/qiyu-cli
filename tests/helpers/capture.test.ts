@@ -147,53 +147,75 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
   const SCHEDULING = /\b(?:setTimeout|setInterval|setImmediate|queueMicrotask)\s*\(|\.then\s*\(|\bvoid\s+[a-zA-Z_$]/g
 
   /**
-   * hook 体里**真正危险**的调度：把「已 await / 已 return 的调度」排除掉。
+   * hook 体里**真正危险**的调度：判据是「**谁在等这次调度的完成**」，不是「语句里有没有 await」。
    *
-   * ⚠️ 为什么要区分（CodeRabbit + Codex PR#81）：`beforeEach(async () => { await new
-   * Promise((r) => setTimeout(r, 80)) })` 这种写法**不会**留下跨用例尾巴 —— vitest 会等
-   * hook 的 promise 落定。此前一视同仁地报 `setTimeout(`，等于让"按提示把活 await 完"的
-   * 人照样红，提示与判据自相矛盾。
-   * 判据：看该调度所在的**语句**（回扫到最近的 `;` / `{` / `}` / 行首）里有没有
-   * `await` / `return`。有 → 视为已等待；没有 → 脱手调度。
-   * 边界如实记录（不做类型分析、不跟跨语句）：`const p = new Promise(…); await p` 这种
-   * 「先存再 await」的写法会被判成危险（误报方向），以及 hook 调用的辅助函数内部排
-   * 定时器完全看不出来（漏报方向）。
+   * ⚠️ 为什么不能只看语句里有没有 `await`（CodeRabbit PR#81 第三轮，两条实测）：
+   *   · 假阴性 —— `await Promise.resolve().then(() => setTimeout(w, 80))`：`await` 等的是**回调
+   *     的返回值**（一个 Timeout 句柄），定时器照样之后才落地 → 尾巴照样漏。
+   *   · 假阳性 —— `await new Promise((r) => { setTimeout(r, 80) })`：这是**正确**写法，
+   *     但回扫语句会被执行体的 `{` 挡住、读不到 `await`。
+   * 于是判据改成"就近问等待关系"：
+   *   ① 定时器/微任务（`setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`）返回的是
+   *      **句柄**，只有把它包进 `new Promise((r) => …)` 且**那个 promise** 被 await/return 给
+   *      vitest 时，hook 才真的等到它完成；
+   *   ② `.then(...)` 本身产出 promise，所以只要**这个 `.then` 调用链**被 await/return 即可；
+   *      它回调里再排的定时器会被 ① 单独判（不在等待链上 → 报）；
+   *   ③ `void …` 永远是脱手。
+   * 边界如实记录（静态判据不跟数据流）：`const p = new Promise(…); await p` 这种"先存再 await"
+   * 会被判成危险（误报方向，可接受）；hook 调用的辅助函数内部排定时器完全看不出来（漏报方向）。
    */
-  /** `at` 处是否落在某次 `callee`（如 `new Promise(`）的实参括号**内部**。 */
-  function insideCall(text: string, at: number, callee: string): boolean {
+
+  /** `at` 处落在的最内层 `callee(...)` 实参内部的起始下标；不在任何一次调用里返回 -1。 */
+  function enclosingCall(text: string, at: number, callee: string): number {
+    let found = -1
     let from = 0
     for (;;) {
       const i = text.indexOf(callee, from)
-      if (i === -1 || i > at) return false
-      // 从 callee 的 `(` 起配对：只要 at 之前没配平到 0，就说明 at 在里面
+      if (i === -1 || i > at) return found
       let depth = 0
       for (let k = i + callee.length - 1; k < at; k++) {
         const c = text[k]
         if (c === '(') depth++
         else if (c === ')') depth--
       }
-      if (depth > 0) return true
+      if (depth > 0) found = i
       from = i + callee.length
     }
+  }
+
+  /**
+   * `idx` 处的表达式是否被 `await` / `return` / 表达式体箭头**交给** vitest 等待。
+   *
+   * 判据：① 表达式体箭头（匹配点之前没有 `{`）→ 整个表达式就是 hook 的返回值；
+   * ② 否则看该表达式所在的**语句**（回扫到最近的 `;` / `{` / `}` / 行首）里有没有
+   * `await` / `return`。回扫到 `{` 就停是正确的 —— 需要跨层判断的场景（块体执行器的
+   * `new Promise`）走的是"检查那个 `new Promise(` 所在的语句"，而不是定时器自己的语句。
+   */
+  function isAwaitedOrReturned(body: string, idx: number): boolean {
+    if (!body.slice(0, idx).includes('{')) return true
+    let start = idx
+    while (start > 0 && !';{}\n'.includes(body[start - 1]!)) start--
+    const seg = body.slice(start, idx)
+    return /\bawait\b/.test(seg) || /\breturn\b/.test(seg)
   }
 
   function hazardHits(body: string): Array<{ token: string; awaited: boolean }> {
     const out: Array<{ token: string; awaited: boolean }> = []
     for (const m of body.matchAll(SCHEDULING)) {
       const at = m.index!
-      let start = at
-      while (start > 0 && !';{}\n'.includes(body[start - 1]!)) start--
-      const seg = body.slice(start, at)
-      const hasAwait = /\bawait\b/.test(seg)
-      // 「返回出去的东西是 Promise 吗」—— `return` / 表达式体箭头都算把值交回 vitest。
-      const returnsValue = /\breturn\b/.test(seg) || !body.slice(0, at).includes('{')
-      // ⚠️ 关键区别（Codex PR#81 第二轮 P2，实测漏报）：`setTimeout` 返回的是**定时器句柄**，
-      // 不是 Promise —— `beforeEach(() => setTimeout(…, 80))` 与块体里的 `return setTimeout(…)`
-      // 都不被 vitest 等待，回调照样在之后落地。唯一正确的"等待"写法是把定时器包进 promise
-      // 再 await/return：`await new Promise((r) => setTimeout(r, 80))`。
       const isThen = m[0].startsWith('.then')
-      const awaited = hasAwait
-        || (returnsValue && (isThen || insideCall(body, at, 'new Promise(')))
+      const isVoid = m[0].startsWith('void')
+      let awaited = false
+      if (!isVoid) {
+        if (isThen) {
+          // ② `.then` 产出 promise：等它被交出去即可
+          awaited = isAwaitedOrReturned(body, at)
+        } else {
+          // ① 定时器是句柄：必须包进 `new Promise(...)`，且**那个 promise** 被交出去
+          const p = enclosingCall(body, at, 'new Promise(')
+          awaited = p >= 0 && isAwaitedOrReturned(body, p)
+        }
+      }
       out.push({ token: m[0].trim(), awaited })
     }
     return out.filter((h) => !h.awaited)
@@ -287,49 +309,50 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         + '把工作 await 完（hook 支持 async），或改用句柄形态并让写入全在 cap.run() 内').toEqual([])
     })
 
-  it('判据本身不许退化：两条正则对合成样本必须真的命中（双向）', () => {
+  it('判据本身不许退化：15 种调度形态逐条定档（双向，含 CR/Codex 报过的假阳性与假阴性）', () => {
     // ⚠️ 样本一律用 `join` 拼出来，**不在源码里写字面量**：本文件也在扫描范围内，
     // 一条字面量 `beforeEach(() => { setTimeout…` 会让守卫扫到自己的反例（自证）。
-    // 拼接后本文件的源码里既没有 `captureSinks(`、也没有 hook 危险形态，扫描它是空操作。
+    const bt = (...parts: string[]): string => parts.join('')
+    const hit = (body: string): string[] => hazardHits(body).map((h) => h.token)
     const conc = /\b(?:it|test|describe)\.concurrent\b/g
-    const bad = ['before', 'Each(() => { set', 'Timeout(() => { process.stdout.write("x") }, 80) })'].join('')
-    expect(hazardHits(bad).map((h) => h.token), 'hook 危险形态必须被认出').toEqual(['setTimeout('])
-    const good = ['before', "Each(async () => { await seed(); process.stdout.write('x') })"].join('')
-    expect(hazardHits(good), '单纯 await 别的东西的 hook 不得被误伤').toEqual([])
-    // ⚠️ 正控（CodeRabbit + Codex PR#81）：**直接 await 定时器**的合法写法必须放过 ——
-    // 否则"按提示 await 到底"仍然红，提示与判据自相矛盾。
-    const awaitedTimer = ['before', 'Each(async () => { await new Promise((r) => set',
-      'Timeout(r, 80)) })'].join('')
-    expect(hazardHits(awaitedTimer), '已 await 的定时器不得被报成脱手调度').toEqual([])
-    // 反控：把 await 去掉，同一个形态必须被认出（证明上一条不是因为判据失效而放过）
-    const detached = ['before', 'Each(() => { new Promise((r) => set',
-      'Timeout(r, 80)) })'].join('')
-    expect(hazardHits(detached).map((h) => h.token), '去掉 await 后必须被判为脱手调度')
+
+    // —— 必须报（脱手调度 / 只等句柄）——
+    expect(hit(bt('(() => { set', 'Timeout(w, 80) })')), '块体里脱手排定时器').toEqual(['setTimeout('])
+    // Codex PR#81 第二轮：`setTimeout` 返回句柄，不是 Promise
+    expect(hit(bt('(() => set', 'Timeout(w, 80))')), '表达式体箭头返回句柄').toEqual(['setTimeout('])
+    expect(hit(bt('(() => { return set', 'Timeout(w, 80) })')), 'return 句柄也不等于等它完成')
       .toEqual(['setTimeout('])
-    // 反控：返回 **Promise** 的写法已交付（`.then` 链本身就是 promise）
-    const returned = ['before', 'Each(() => Promise.resolve().', 'then(() => process.stdout.write("x")))'].join('')
-    expect(hazardHits(returned), 'return 出去的 .then 链同样不会漏').toEqual([])
-    // ⚠️ 但**返回定时器句柄**不算已交付（Codex PR#81 第二轮 P2，实测：尾巴仍会漏进下一条）：
-    // `setTimeout` 返回 Timeout 对象，vitest 不会等它的回调。
-    const retHandle = ['before', 'Each(() => { return set', 'Timeout(() => process.stdout.write("x"), 80) })'].join('')
-    expect(hazardHits(retHandle).map((h) => h.token), 'return setTimeout 不是 await，必须仍报')
+    expect(hit(bt('(() => { new Promise((r) => set', 'Timeout(r, 80)) })')), 'promise 没被交出去')
       .toEqual(['setTimeout('])
-    const exprHandle = ['before', 'Each(() => set', 'Timeout(() => process.stdout.write("x"), 80))'].join('')
-    expect(hazardHits(exprHandle).map((h) => h.token), '表达式体箭头返回句柄同样必须报')
-      .toEqual(['setTimeout('])
-    // 正控：包进 promise 再返回/await 才是真的等待
-    const wrapped = ['before', 'Each(() => new Promise((r) => set', 'Timeout(r, 80)))'].join('')
-    expect(hazardHits(wrapped), '包进 promise 并返回给 vitest 的定时器不算泄漏').toEqual([])
-    // 边界：`return …then(() => setTimeout(…))` 里的定时器**不在** hook 的等待链上
-    // （then 回调跑完就返回，定时器之后才落地）—— 必须报。
-    const timerInThen = ['before', 'Each(() => { return Promise.resolve().',
-      'then(() => set', 'Timeout(() => process.stdout.write("x"), 80)) })'].join('')
-    expect(hazardHits(timerInThen).map((h) => h.token), 'then 回调里排的定时器仍会漏，必须报')
-      .toEqual(['setTimeout('])
-    // `.concurrent` 命中、「迁移形态入口」命中、句柄形态不命中
-    expect([...(('it.' + 'concurrent("x", () => {})')).matchAll(conc)]).toHaveLength(1)
-    expect([...(('describe.' + 'concurrent("y", () => {})')).matchAll(conc)]).toHaveLength(1)
-    expect(/\bcaptureSinks\s*\(/.test(['capture', 'Sinks((a) => {}, (b) => {})'].join(''))).toBe(true)
+    // CodeRabbit PR#81 第三轮（假阴性）：`await` 等的是 then 回调的返回值，定时器之后才落地
+    expect(hit(bt('(async () => { await Promise.resolve().', 'then(() => set',
+      'Timeout(w, 80)) })')), 'await 里嵌 .then 排的定时器仍会漏').toEqual(['setTimeout('])
+    expect(hit(bt('(() => { return Promise.resolve().', 'then(() => set',
+      'Timeout(w, 80)) })')), 'return 的 .then 里排定时器仍会漏').toEqual(['setTimeout('])
+    // `await` 的 executor 里再排 `.then`（那条 then 不在等待链上）
+    expect(hit(bt('(async () => { await new Promise((r) => { Promise.resolve().',
+      'then(() => set', 'Timeout(r, 80)) }) })')),
+      'await 的 executor 内部 .then 仍会漏').toEqual(['.then('])
+    expect(hit(bt('(() => { void seed() })')), 'void 掉未等待的调用').toEqual(['void s'])
+
+    // —— 必须放过（真的等到了）——
+    // CodeRabbit PR#81 第三轮（假阳性）：块体执行器的 `new Promise` 是正确写法
+    expect(hit(bt('(async () => { await new Promise((r) => { set', 'Timeout(r, 80) }) })')),
+      'await new Promise 的块体执行器不得误伤').toEqual([])
+    expect(hit(bt('(async () => { await new Promise((r) => set', 'Timeout(r, 80)) })')),
+      'await new Promise 的表达式执行器').toEqual([])
+    expect(hit(bt('(async () => { await (new Promise((r) => set', 'Timeout(r, 80)))) })')),
+      'await 外面多一层括号').toEqual([])
+    expect(hit(bt('(() => new Promise((r) => set', 'Timeout(r, 80)))')),
+      '把 promise 表达式体返回给 vitest').toEqual([])
+    expect(hit(bt('(() => Promise.resolve().', 'then(w))')), '表达式体返回 .then 链').toEqual([])
+    expect(hit(bt('(async () => { await p.', 'then(w) })')), 'await 一条 .then 链').toEqual([])
+    expect(hit(bt('(async () => { await seed() })')), 'await 别的东西（无调度）').toEqual([])
+
+    // —— 并发那条判据：命中 / 不命中 ——
+    expect([...bt('it.', 'concurrent("x", () => {})').matchAll(conc)]).toHaveLength(1)
+    expect([...bt('describe.', 'concurrent("y", () => {})').matchAll(conc)]).toHaveLength(1)
+    expect(/\bcaptureSinks\s*\(/.test(bt('capture', 'Sinks((a) => {}, (b) => {})'))).toBe(true)
     expect(/\bcaptureSinks\s*\(/.test('const cap = startCapture()')).toBe(false)
-  })
+  });
 })
