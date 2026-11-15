@@ -47,6 +47,12 @@
 
 ### 修复
 
+- **事务归属判据下沉到语句派发点**（2026-11-15，CodeRabbit + Codex PR#81）：只在 `upsert`/`del`
+  入口判一次不够 —— 入口到语句之间隔着 `count` 等 await，别的调用方正好在这段窗口里开事务，
+  那条写仍会被并进去、随它回滚（`del` 的截胡路径已补回归用例：先卡在 `count` 里、再让对方
+  开事务，DELETE 必须被拒绝）。`close()` 也补上 `AsyncLocalStorage.disable()`：执行过 `run()`
+  的实例会被 Node 的全局 `storageList` 强引用，不关它，反复「建 → 用 → 关」的进程会一直攒
+  实例（Codex 实测：关掉 40 个 Store 后仍有 40 个 ALS 处于启用态）。
 - **同一 Store 实例上的并发写不得并入别人的事务**（2026-11-15，Sourcery PR#4-6 复核）：`inTx` 是
   整个实例共享的布尔，事务外另一条异步链调用 `upsert` / `delete` 时会被当成「事务内」直接写进
   别人未提交的事务 —— 对方回滚，这次写入就**静默消失**，而 `upsert` 还返回了成功行数（实测：
@@ -206,6 +212,12 @@
   且 hook 体里不得留下未 await 的延迟工作（`setTimeout`/`setInterval`/`setImmediate`/
   `queueMicrotask`/`.then(`/`void x`）。判据的边界如实写在注释里（只认直接写在 hook 体里的
   调度形态），两条都做了变异验证。
+- **capture 守卫的两处判据修正**（2026-11-15，CodeRabbit + Codex PR#81）：① 白名单键必须按 `/`
+  归一化 —— Windows 上 `relative()` 返回 `helpers\capture-sinks.test.ts`，直接查表落空会让豁免
+  文件自己被判违规（守卫在 Windows 上恒红）；② 区分「已 await/return 的调度」与「脱手调度」——
+  `beforeEach(async () => { await new Promise((r) => setTimeout(r, 80)) })` 不会留下跨用例尾巴，
+  此前一视同仁地报 `setTimeout(`，等于让"照提示 await 完"的人照样红；判据看调度所在语句有无
+  `await`/`return`、以及是否表达式体箭头，正控/反控都写进自检。
 - **`db.test.ts` 夹具改成"每条用例一个库、从热模板复制"**（2026-11-15，同上）：`beforeAll` 建
   一次模板库（冷启动 + 25 表迁移只付一次），`beforeEach` 把模板复制成本条的 `q-<n>.duckdb`。
   此前「单库 + 每条 DROP 全部表重迁移」的已知边界（超时用例的残留操作与下一条的 `resetDb()`

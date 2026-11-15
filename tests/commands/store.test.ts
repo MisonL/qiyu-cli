@@ -281,6 +281,15 @@ describe('store status', () => {
     expect(JSON.parse(out).meta.warnings).toBeUndefined()
   })
 
+  it('表名提取判据自身双向：字符串数组与 {name,rows} 数组都取到名字（CodeRabbit + Codex PR#81）', () => {
+    const namesOf = (tables: unknown): string[] => (tables as Array<string | { name: string }>)
+      .map((x) => (typeof x === 'string' ? x : x.name))
+    expect(namesOf(['a', 'b'])).toEqual(['a', 'b'])
+    expect(namesOf([{ name: 'tickets', rows: 0 }])).toEqual(['tickets'])
+    // 反控：漏取名字时（把对象当成名字）这条会红
+    expect(namesOf([{ name: 'tickets', rows: 0 }])).not.toContain('[object Object]')
+  })
+
   it('声明表在库里被删 → init/status 都点名「声明有而库中无」+ 成因 + 不谎称能补建（历史审查 PR#4 复核）', async () => {
     // 事故事实（Sourcery PR#4-7「Missing tables pass initialization」）：库记录着最新
     // schema_version、却少一张声明表时，`init` 跳过全部迁移（只重放 version > MAX(version)
@@ -309,8 +318,15 @@ describe('store status', () => {
       expect(text).toMatch(/store init 不会重建/)
       // 版本号仍在最新：证明"跳过迁移"确实发生了（这是缺表不会被补的机制）
       expect(d.data.schema_version, `${sub}：库版本仍是最新，故 init 不会重放迁移`).toBeGreaterThan(0)
-      // 表清单不得把缺的表当成在
-      const names = (Array.isArray(d.data.tables) ? d.data.tables : (d.data.tables as Array<{ name: string }>).map((t) => t.name)) as string[]
+      // 表清单不得把缺的表当成在。
+      // ⚠️ 必须**先取出名字**再断言（CodeRabbit + Codex PR#81）：`init` 的 tables 是字符串
+      // 数组、`status` 的是 `{name, rows}` 数组，两者都 `Array.isArray === true` ——
+      // 首版按「数组就原样用」写，status 那条拿对象数组去 `not.toContain('tickets')`
+      // 恒真（对象 !== 'tickets'），错返回 tickets 条目也照样绿（Codex 探针实测）。
+      const namesOf = (tables: unknown): string[] => (tables as Array<string | { name: string }>)
+        .map((x) => (typeof x === 'string' ? x : x.name))
+      const names = namesOf(d.data.tables)
+      expect(names, `${sub} 的 tables 必须真的是表名（判据自身不得空转）`).toContain('schema_version')
       expect(names).not.toContain('tickets')
     }
   })

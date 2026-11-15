@@ -274,6 +274,48 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('delete 在 await count 期间被别人的事务截胡 → 拒绝（CodeRabbit PR#81 major）', async () => {
+    // 事故路径：`del` 先 `count`（await）再 DELETE。若归属检查只在**入口**判一次，
+    // 别的调用方正好在这段 await 里开事务，那条 DELETE 就被并进去、随对方回滚一起消失
+    // （而返回值还说「删了 N 行」）。判据必须贴着语句派发。
+    const s = await fresh()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FF0000' }])
+    const origCount = s.count.bind(s)
+    let enteredCount!: () => void
+    const inCount = new Promise<void>((r) => { enteredCount = r })
+    let releaseCount!: () => void
+    const countGate = new Promise<void>((r) => { releaseCount = r })
+    ;(s as unknown as { count: (t: string) => Promise<number> }).count = async (t: string) => {
+      enteredCount()
+      await countGate
+      return origCount(t)
+    }
+    const delP = s.delete('tags', 'id = ?', ['1']).then(() => null, (e: unknown) => e)
+    await inCount                       // delete 已卡在 count 里
+    // 此时开一条事务（`inTx` 在这一刻变成 true），并把它**挂住**直到观察到结论 ——
+    // 否则它会在我们放行 count 之前就 COMMIT，`inTx` 已回到 false，这条用例变成空转
+    // （首版就是这么写的，实测 delete 静默通过）。
+    let txReady!: () => void
+    const txStarted = new Promise<void>((r) => { txReady = r })
+    let releaseTx!: () => void
+    const txHold = new Promise<void>((r) => { releaseTx = r })
+    const tx = s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#00FF00' }])
+      txReady()
+      await txHold
+    })
+    await txStarted
+    releaseCount()                      // 让那条 DELETE 走到派发点
+    const delErr = await delP
+    releaseTx()
+    await tx
+    expect(delErr, '截胡的 DELETE 必须被拒绝，不能静默并入别人的事务').toMatchObject({ kind: 'internal' })
+    // 数据面证据：那一行既没被删（DELETE 没执行），事务那一行正常提交
+    const after = (await s.query('SELECT id FROM tags ORDER BY id')).rows.map((r) => String(r.id))
+    expect(after).toEqual(['1', '2'])
+    await s.close()
+  })
+
   it('tx 内嵌套 transaction() → usage', async () => {
     const s = await fresh()
     await expect(s.transaction(async (tx) => {
@@ -291,13 +333,18 @@ describe('duckdb —— 事务', () => {
     const s = await fresh()
     let release!: () => void
     const gate = new Promise<void>((r) => { release = r })
+    let ready!: () => void
+    const txReady = new Promise<void>((r) => { ready = r })
     const tx = s.transaction(async (t) => {
       await t.upsert('tags', [{ id: '1', name: 'A', color: '#FF0000' }])
+      // ⚠️ 就绪信号必须由**事务内部**发出（CodeRabbit PR#81 major）：此前用
+      // `s.query('SELECT 1')` 空转等「事务开起来了」，而那条查询恒有行 —— 循环立刻退出，
+      // 外面的写可能在 BEGIN 之前就跑了，正确实现下这条用例反而会随机红。
+      ready()
       await gate          // 事务挂在这里，等外面的第二次写先发生
       throw new Error('boom')
     })
-    // 等到事务确实已开始（第一条写落了）
-    for (let i = 0; i < 100 && (await s.query('SELECT 1')).rows.length === 0; i++) await new Promise((r) => setTimeout(r, 5))
+    await txReady
     const outside = await s.upsert('tags', [{ id: '2', name: 'B', color: '#00FF00' }])
       .then(() => null, (e: unknown) => e)
     // 同一道判据必须覆盖**所有写原语**，不能只修被点名的那一个 `upsert`：

@@ -290,6 +290,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       const batch = uniq.slice(i, i + rowsPerStmt)
       const placeholders = batch.map(() => `(${cols.map(() => '?').join(', ')})`).join(', ')
       const params = batch.flatMap((r) => cols.map((k) => r[k] ?? null))
+      // ⚠️ 归属检查必须**贴着语句派发**，不能只在 `upsert` 入口判一次（CodeRabbit PR#81）：
+      // 入口到这条 INSERT 之间隔着 `beforeCount` 等 await，别的调用方可能正好在这段窗口里
+      // 开事务 —— 那时这次 INSERT 会被并入它、随它回滚，又变回"成功却丢数据"。
+      assertTxOwnership()
       await store.execSql(
         `INSERT INTO "${t.name}" (${quoted}) VALUES ${placeholders} ON CONFLICT (${pk}) ${conflictAction}`,
         params)
@@ -301,8 +305,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
 
   const del = async (tname: string, where: string, params: unknown[] = []): Promise<number> => {
     const t = assertTable(tname)
-    assertTxOwnership()
     const before = await store.count(tname)
+    // ⚠️ 同理（CodeRabbit PR#81 major）：入口判一次不够 —— `count` 是 await，期间别的
+    // 调用方可以开事务，随后这条 DELETE 就被并进去。检查贴着 DELETE 派发。
+    assertTxOwnership()
     await store.execSql(`DELETE FROM "${t.name}" WHERE ${where}`, params)
     const after = await store.count(tname)
     return Math.max(0, before - after)
@@ -446,6 +452,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       assertRows(t, rows)
       // ⚠️ `inTx` 的语义是「本实例上有事务开着」，不等于「调用者在那个事务里」——
       // 归属必须由 `assertTxOwnership` 判（历史审查 PR#4 复核）。
+      // 入口这一处只做**快速失败**（省掉开自己那条事务的功夫）；真正的判定在
+      // `doUpsert` 贴着 INSERT 的那次 —— 见那里的注释。
       if (inTx) {
         assertTxOwnership()
         return doUpsert(t, rows)
@@ -511,6 +519,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 锁随进程存活、永不超时释放；先关 conn 再关 inst。
       try { (conn as { closeSync?: () => void }).closeSync?.() } catch { /* 清理期错误不掩盖 */ }
       try { (inst as { closeSync?: () => void }).closeSync?.() } catch { /* 清理期错误不掩盖 */ }
+      // ⚠️ 事务归属的 ALS 必须显式 `disable()`（Codex PR#81 P2，实测确认）：执行过
+      // `run()` 的实例会被 Node 的全局 `storageList` **强引用**，只关 DuckDB 不关它，
+      // 反复「建 Store → 跑事务 → 关」的进程/测试会把实例一直攒着（本地 async_hooks
+      // 后端实测：关掉 40 个 Store 后仍有 40 个 ALS 处于启用态），并拖慢之后每个异步资源
+      // 的传播。`disable()` 幂等，包 try 防老运行时不支持。
+      try { alsTx.disable() } catch { /* 不支持 disable 的运行时：忽略 */ }
     },
   } as unknown as Store & { execSql: typeof execSql }
   // ⚠️ 挂载契约见上方 execSql 注释：不可枚举 + writable + configurable（缺 configurable

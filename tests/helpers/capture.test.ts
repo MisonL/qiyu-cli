@@ -10,7 +10,7 @@
 // ② 用户的 `afterEach(restoreAllMocks)` 摘掉 spy 后，助手若不重装，写入直接绕过缓冲。
 import { describe, it, expect, vi } from 'vitest'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startCapture, captureInstalled } from './capture.js'
 import { argRange, blankComments } from './source-scan.js'
@@ -143,6 +143,38 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     return out
   }
 
+  /** 调度形态（不论是否 await）：定时器 / 微任务 / 浮空 promise。 */
+  const SCHEDULING = /\b(?:setTimeout|setInterval|setImmediate|queueMicrotask)\s*\(|\.then\s*\(|\bvoid\s+[a-zA-Z_$]/g
+
+  /**
+   * hook 体里**真正危险**的调度：把「已 await / 已 return 的调度」排除掉。
+   *
+   * ⚠️ 为什么要区分（CodeRabbit + Codex PR#81）：`beforeEach(async () => { await new
+   * Promise((r) => setTimeout(r, 80)) })` 这种写法**不会**留下跨用例尾巴 —— vitest 会等
+   * hook 的 promise 落定。此前一视同仁地报 `setTimeout(`，等于让"按提示把活 await 完"的
+   * 人照样红，提示与判据自相矛盾。
+   * 判据：看该调度所在的**语句**（回扫到最近的 `;` / `{` / `}` / 行首）里有没有
+   * `await` / `return`。有 → 视为已等待；没有 → 脱手调度。
+   * 边界如实记录（不做类型分析、不跟跨语句）：`const p = new Promise(…); await p` 这种
+   * 「先存再 await」的写法会被判成危险（误报方向），以及 hook 调用的辅助函数内部排
+   * 定时器完全看不出来（漏报方向）。
+   */
+  function hazardHits(body: string): Array<{ token: string; awaited: boolean }> {
+    const out: Array<{ token: string; awaited: boolean }> = []
+    for (const m of body.matchAll(SCHEDULING)) {
+      const at = m.index!
+      let start = at
+      while (start > 0 && !';{}\n'.includes(body[start - 1]!)) start--
+      // ① 语句里有 await / return → 已交付；
+      // ② 写法是**表达式体箭头**（`beforeEach(() => Promise…then(…)`）：整个表达式就是
+      //    hook 的返回值，vitest 会等它 —— 判据是"匹配点之前都没有 `{`"。
+      const awaited = /\b(?:await|return)\b/.test(body.slice(start, at))
+        || !body.slice(0, at).includes('{')
+      out.push({ token: m[0].trim(), awaited })
+    }
+    return out.filter((h) => !h.awaited)
+  }
+
   /**
    * 该文件是否用「模块级 sink」形态（迁移形态；`captureSinks` 是它的唯一入口）。
    * ⚠️ 用 `RegExp` 构造而不是正则字面量：本文件也在扫描范围内，字面量会让守卫扫到
@@ -171,7 +203,11 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       // 结论：本助手服务的文件一律不用 `.concurrent`（白名单见 `CONCURRENT_EXEMPT`）。
       const hits: string[] = []
       for (const f of testFiles(SRC_TESTS)) {
-        const rel = relative(SRC_TESTS, f)
+        // ⚠️ 必须归一化分隔符（CodeRabbit + Codex PR#81）：Windows 上 `relative()` 返回
+        // `helpers\capture-sinks.test.ts`，白名单键写的是 `helpers/capture-sinks.test.ts`，
+        // 查表必然落空 → 白名单文件自己被判成违规、守卫在 Windows 上恒红（实测：
+        // `path.win32.relative` 下命中 3 处）。
+        const rel = relative(SRC_TESTS, f).split(sep).join('/')
         if (CONCURRENT_EXEMPT[rel] !== undefined) continue
         const text = blankComments(readFileSync(f, 'utf8'))
         // ⚠️ 判「是不是迁移形态」必须用**抹掉注释后**的文本：本文件的注释里就写着
@@ -189,6 +225,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       // `.concurrent`），否则删掉那条并发用例后豁免会一直留着，将来同名文件重新引入
       // 并发时就静默放行了。
       for (const rel of Object.keys(CONCURRENT_EXEMPT)) {
+        expect(rel, 'CONCURRENT_EXEMPT 的键必须是 / 分隔（与上面的归一化一致）').not.toContain('\\')
         const p = join(SRC_TESTS, rel)
         expect(existsSync(p), `CONCURRENT_EXEMPT 里的 ${rel} 不存在（清单过期）`).toBe(true)
         expect(blankComments(readFileSync(p, 'utf8')), `${rel} 已不再用 .concurrent，请从 CONCURRENT_EXEMPT 删除`)
@@ -208,17 +245,17 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       // 判据边界（如实记录）：只认**直接**写在 hook 体里的这几种调度形态；若 hook 调了一个
       // 内部排定时器的辅助函数，静态扫描看不出来 —— 那种情况由 `writerIsCurrent` 的注释
       // 说明的边界承载，本守卫不假装覆盖它。
-      const HAZARD = /\b(?:setTimeout|setInterval|setImmediate|queueMicrotask)\s*\(|\.then\s*\(|\bvoid\s+[a-zA-Z_$]/g
       const hits: string[] = []
       for (const f of testFiles(SRC_TESTS)) {
+        const rel = relative(SRC_TESTS, f).split(sep).join('/')
         const text = blankComments(readFileSync(f, 'utf8'))
         if (!usesMigratedForm(text)) continue
         for (const m of text.matchAll(/\b(?:beforeEach|afterEach)\s*\(/g)) {
           const [s, e] = argRange(text, m.index! + m[0].length)
           const body = text.slice(s, e)
           const line = text.slice(0, m.index!).split('\n').length
-          for (const h of body.matchAll(HAZARD)) {
-            hits.push(`${relative(SRC_TESTS, f)}:${line} hook 体里出现「${h[0].trim()}」`)
+          for (const h of hazardHits(body)) {
+            hits.push(`${rel}:${line} hook 体里出现「${h.token}」${h.awaited ? '（已 await）' : ''}`)
           }
         }
       }
@@ -230,13 +267,24 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // ⚠️ 样本一律用 `join` 拼出来，**不在源码里写字面量**：本文件也在扫描范围内，
     // 一条字面量 `beforeEach(() => { setTimeout…` 会让守卫扫到自己的反例（自证）。
     // 拼接后本文件的源码里既没有 `captureSinks(`、也没有 hook 危险形态，扫描它是空操作。
-    const HAZARD = /\b(?:setTimeout|setInterval|setImmediate|queueMicrotask)\s*\(|\.then\s*\(|\bvoid\s+[a-zA-Z_$]/g
     const conc = /\b(?:it|test|describe)\.concurrent\b/g
     const bad = ['before', 'Each(() => { set', 'Timeout(() => { process.stdout.write("x") }, 80) })'].join('')
-    expect([...bad.matchAll(HAZARD)].map((m) => m[0].trim()), 'hook 危险形态必须被认出')
-      .toEqual(['setTimeout('])
+    expect(hazardHits(bad).map((h) => h.token), 'hook 危险形态必须被认出').toEqual(['setTimeout('])
     const good = ['before', "Each(async () => { await seed(); process.stdout.write('x') })"].join('')
-    expect([...good.matchAll(HAZARD)], 'await 到底的 hook 不得被误伤').toEqual([])
+    expect(hazardHits(good), '单纯 await 别的东西的 hook 不得被误伤').toEqual([])
+    // ⚠️ 正控（CodeRabbit + Codex PR#81）：**直接 await 定时器**的合法写法必须放过 ——
+    // 否则"按提示 await 到底"仍然红，提示与判据自相矛盾。
+    const awaitedTimer = ['before', 'Each(async () => { await new Promise((r) => set',
+      'Timeout(r, 80)) })'].join('')
+    expect(hazardHits(awaitedTimer), '已 await 的定时器不得被报成脱手调度').toEqual([])
+    // 反控：把 await 去掉，同一个形态必须被认出（证明上一条不是因为判据失效而放过）
+    const detached = ['before', 'Each(() => { new Promise((r) => set',
+      'Timeout(r, 80)) })'].join('')
+    expect(hazardHits(detached).map((h) => h.token), '去掉 await 后必须被判为脱手调度')
+      .toEqual(['setTimeout('])
+    // 反控：`return` 也算已交付（vitest 会等 hook 返回值）
+    const returned = ['before', 'Each(() => Promise.resolve().', 'then(() => process.stdout.write("x")))'].join('')
+    expect(hazardHits(returned), 'return 出去的 .then 链同样不会漏').toEqual([])
     // `.concurrent` 命中、「迁移形态入口」命中、句柄形态不命中
     expect([...(('it.' + 'concurrent("x", () => {})')).matchAll(conc)]).toHaveLength(1)
     expect([...(('describe.' + 'concurrent("y", () => {})')).matchAll(conc)]).toHaveLength(1)
