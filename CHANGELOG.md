@@ -47,6 +47,11 @@
 
 ### 修复
 
+- **capture 守卫再补两处识别面**（2026-11-15，Codex PR#81 第三轮）：① TS 构造函数可带类型实参，
+  按字面量 `new Promise(` 找会漏掉 `await new Promise<void>((r) => setTimeout(r, 40))` —— 那是
+  **正确**写法却被判成脱手（假阳性），现在 `new Promise` 后可选跳过 `<…>`；② 并发还可以用
+  **选项对象**开启（`it(名, { concurrent: true }, fn)`），只认 `.concurrent` 会静默放行
+  （Codex 探针：两条用例都读到 `AB`），现在一并拦，且 `concurrent: false` 不误伤。
 - **capture 守卫的判据从「语句里有没有 await」改为「谁在等这次调度」**（2026-11-15，
   CodeRabbit PR#81 第三轮，一假阳性一假阴性）：`await Promise.resolve().then(() => setTimeout(…))`
   里的 `await` 等的是回调的返回值（一个句柄），定时器之后才落地 → 尾巴照样漏（假阴性）；

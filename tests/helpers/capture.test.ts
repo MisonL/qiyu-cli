@@ -165,15 +165,33 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
    * 会被判成危险（误报方向，可接受）；hook 调用的辅助函数内部排定时器完全看不出来（漏报方向）。
    */
 
-  /** `at` 处落在的最内层 `callee(...)` 实参内部的起始下标；不在任何一次调用里返回 -1。 */
+  /**
+   * `at` 处落在的最内层 `callee(...)` 实参内部的起始下标；不在任何一次调用里返回 -1。
+   *
+   * ⚠️ `callee` 给 `new Promise`（不带括号），这里自己找它的 `(` —— 因为 TS 的构造函数可以带
+   * 类型实参：`new Promise<void>((r) => setTimeout(r, 40))`（Codex PR#81 第三轮 P2 实测：
+   * 按字面量 `'new Promise('` 找会漏掉这种写法，把**正确**的等待判成脱手调度）。
+   */
   function enclosingCall(text: string, at: number, callee: string): number {
     let found = -1
     let from = 0
     for (;;) {
       const i = text.indexOf(callee, from)
       if (i === -1 || i > at) return found
+      // 跳过可选的 `<…>` 类型实参，定位实参列表的 `(`
+      let j = i + callee.length
+      while (text[j] === ' ' || text[j] === '\t') j++
+      if (text[j] === '<') {
+        let d = 0
+        for (; j < text.length; j++) {
+          if (text[j] === '<') d++
+          else if (text[j] === '>') { d--; if (d === 0) { j++; break } }
+        }
+        while (text[j] === ' ' || text[j] === '\t') j++
+      }
+      if (text[j] !== '(') { from = i + callee.length; continue }
       let depth = 0
-      for (let k = i + callee.length - 1; k < at; k++) {
+      for (let k = j; k < at; k++) {
         const c = text[k]
         if (c === '(') depth++
         else if (c === ')') depth--
@@ -212,7 +230,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
           awaited = isAwaitedOrReturned(body, at)
         } else {
           // ① 定时器是句柄：必须包进 `new Promise(...)`，且**那个 promise** 被交出去
-          const p = enclosingCall(body, at, 'new Promise(')
+          const p = enclosingCall(body, at, 'new Promise')
           awaited = p >= 0 && isAwaitedOrReturned(body, p)
         }
       }
@@ -228,6 +246,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
    */
   const MIGRATED_ENTRY = new RegExp('\\bcaptureSinks\\s*\\(')
   const usesMigratedForm = (src: string): boolean => MIGRATED_ENTRY.test(src)
+
+  /** 选项对象形态的并发开关（`it(名, { concurrent: true }, fn)`）。 */
+  const CONCURRENT_OPT = /\bconcurrent\s*:\s*true\b/g
 
   /**
    * `.concurrent` 的**豁免清单**：只允许"专门证明并发行为"的文件，且必须自带理由。
@@ -263,6 +284,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         // `describe.concurrent(`（describe 级并发同样让用例并行）
         for (const m of text.matchAll(/\b(?:it|test|describe)\.concurrent\b/g)) {
           hits.push(`${rel}:${text.slice(0, m.index!).split('\n').length}`)
+        }
+        // ⚠️ 选项对象形态（Codex PR#81 第三轮 P2）：`it('A', { concurrent: true }, fn)` 与
+        // `describe('g', { concurrent: true }, fn)` 同样让用例并行 —— 只认 `.concurrent`
+        // 会静默放行（Codex 探针：两条用例都读到 `AB`）。
+        for (const m of text.matchAll(CONCURRENT_OPT)) {
+          hits.push(`${rel}:${text.slice(0, m.index!).split('\n').length}（选项对象 concurrent: true）`)
         }
       }
       expect(hits, '这些文件同时用了 captureSinks 与 .concurrent —— 并发下写入无法归属，'
@@ -349,9 +376,18 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hit(bt('(async () => { await p.', 'then(w) })')), 'await 一条 .then 链').toEqual([])
     expect(hit(bt('(async () => { await seed() })')), 'await 别的东西（无调度）').toEqual([])
 
+    // Codex PR#81 第三轮：带类型实参的 `new Promise<void>(…)` 是正确写法，不得误伤
+    expect(hit(bt('(async () => { await new Promise<void>((r) => set', 'Timeout(r, 40)) })')),
+      'new Promise<void> 也算包装').toEqual([])
+    expect(hit(bt('(() => new Promise<void>((r) => set', 'Timeout(r, 40)))')),
+      '返回 new Promise<void>').toEqual([])
+
     // —— 并发那条判据：命中 / 不命中 ——
     expect([...bt('it.', 'concurrent("x", () => {})').matchAll(conc)]).toHaveLength(1)
     expect([...bt('describe.', 'concurrent("y", () => {})').matchAll(conc)]).toHaveLength(1)
+    // 选项对象形态（Codex PR#81 第三轮）：命中 `concurrent: true`，不误伤 `concurrent: false`
+    expect([...bt("it('A', { con", 'current: true }, () => {})').matchAll(CONCURRENT_OPT)]).toHaveLength(1)
+    expect([...bt("it('B', { con", 'current: false }, () => {})').matchAll(CONCURRENT_OPT)]).toHaveLength(0)
     expect(/\bcaptureSinks\s*\(/.test(bt('capture', 'Sinks((a) => {}, (b) => {})'))).toBe(true)
     expect(/\bcaptureSinks\s*\(/.test('const cap = startCapture()')).toBe(false)
   });
