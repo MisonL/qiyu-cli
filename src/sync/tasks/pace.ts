@@ -59,6 +59,29 @@ export function nowIsoOf(ctx: PaceCtx): string {
  */
 export async function callPaced(endpointId: string, body: unknown, ctx: PaceCtx,
   attempt = 0): Promise<CallResult> {
+  // ⚠️ 真正要调用时才查这个端点的冷却（Sourcery PR#58 复核，2026-11-15 实测）：引擎在
+  // fetch 前只预检主端点（按全部声明键预检会误伤「本次不调用」的端点，见 `acquireGated`）。
+  // 这里 15 处任务调用全经本函数 —— 是「会不会调用」的唯一准确答案。
+  // ⚠️ 只在**首次尝试**查（`attempt === 0`）：重试路径上的等待已经为这次的 retryAfter
+  // 付过时间，再查会撞上「我们自己的 penalize 刚写下的冷却行」把自己锁死（实测：
+  // 14009 → penalize 写冷却 → 紧随的重试被自己的冷却拦住 → 整窗 partial）。
+  if (ctx.gate !== undefined && attempt === 0) {
+    for (let waits = 0; ; waits++) {
+      let cooled: { kind?: string; retryAfter?: number; message?: string } | null = null
+      try {
+        await ctx.gate.acquire(endpointId)
+      } catch (e) {
+        cooled = e as { kind?: string; retryAfter?: number; message?: string }
+        if (cooled.kind !== 'rate_limit_local') throw e
+      }
+      if (cooled === null) break
+      // 有界等待（复用引擎的预算口径）：到点重查，预算耗尽才上抛 —— 上抛后由引擎记
+      // `rate_limit_local` gap（不是 fetch_failed），本窗不落任何数据。
+      if (waits >= MAX_PACE_ATTEMPTS) throw cooled
+      const seconds = Math.ceil((cooled.retryAfter ?? 0) / 1000)
+      await sleep(clampGateWait((seconds + 1) * 1000) || GATE_WAIT_MIN_MS)
+    }
+  }
   try {
     return await call(byId(endpointId), body, { credentials: ctx.credentials })
   } catch (e) {

@@ -54,6 +54,12 @@
   `internal` 而不是把截断页当完整目录。经 `openGuardedSession` 的那次存在性预检
   （`db tables` / `db describe` / `query` / `stats fields` 共用）原先是裸 `session.run()`，
   同样受 1000 行上限约束，已一并收编（Codex PR#78 第二轮 P1）。
+- **限频闸门只看「本次真正要调用」的端点**（2026-11-15，Sourcery PR#58 复核）：fetch 前按
+  `gateEndpoints` 全部声明键预检，会把本次根本不调用的端点冷却也算成失败 —— 实测
+  `ticket.template.fields` 冷却 + 模板列表为空时，`dim.ticket_template_fields` 一发请求都不发
+  就被记成 `failed` + `rate_limit_local`，空快照本该删掉的旧字段行继续留着。现在引擎只预检
+  主端点（常见成因仍在发请求前失败），次要端点由 `callPaced` 在**调用前**有界等待/拦截；
+  被冷却端点拦下时记 `rate_limit_local` 而不是 `fetch_failed`。
 - **`sync run` 的 `write_failed` 点名「不是基表」并给出重建动作**（2026-11-15）：落库目标被同名
   view 取代时，DuckDB 只回 `Catalog Error: … is not an table`，此前 gap 的 `detail` 只包成
   「落库失败（底层：…）」—— Agent 会反复重跑必然失败的同步。现在明确说「本 CLI 的声明表在库里不是
