@@ -848,7 +848,7 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     } catch (e) {
       const isMismatch = (e as { code?: string }).code === 'count_mismatch'
       await storeGap(ctx, task, resolvedRange, isMismatch ? 'count_mismatch' : 'write_failed',
-        isMismatch ? (e as Error).message : failDetail('落库失败', e), gaps)
+        isMismatch ? (e as Error).message : writeFailedDetail(e, ctx), gaps)
       return snapshotResult(task, resolvedRange, gaps, fetchRes.rows.length, 0, 0, 1, 'failed')
     }
 
@@ -1106,7 +1106,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
           const isMismatch = (e as { code?: string }).code === 'count_mismatch'
           plan.written += kept.length
           await storeGap(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
-            isMismatch ? (e as Error).message : failDetail('落库失败', e), plan.gaps)
+            isMismatch ? (e as Error).message : writeFailedDetail(e, { storeLocation: ctx.storeLocation }), plan.gaps)
           continue
         }
         for (const h of (Array.isArray(fetchRes.gapHint) ? fetchRes.gapHint : [fetchRes.gapHint])) {

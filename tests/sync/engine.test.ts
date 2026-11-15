@@ -132,6 +132,25 @@ describe('落库时同名对象不是基表（view 等）', () => {
   })
 })
 
+describe('快照型任务的 write_failed 同口径', () => {
+  it('快照写同名 view → detail 同样点名「不是基表」并给出重建动作（第二处出口）', async () => {
+    const store = await fresh()
+    await store.query('DROP TABLE "tags"')
+    await store.query('CREATE VIEW "tags" AS SELECT CAST(1 AS VARCHAR) AS id, CAST(2 AS VARCHAR) AS name, CAST(3 AS VARCHAR) AS color WHERE 1 = 0')
+    const task = fakeTask({
+      kind: 'snapshot',
+      fetch: async () => ({ rows: [{ id: 'x', name: 'n', color: 'c' }], apiCount: 1 }),
+    })
+    const r = await runTask(task, ctx(store, { storeLocation: { db: cfg.path } }))
+    expect(r.status).toBe('failed')
+    const detail = String((await listGaps(store, task.id))[0].detail)
+    expect(detail, '快照路径丢了成因点名').toMatch(/不是基表/)
+    expect(detail).not.toMatch(/is not an table/)
+    expect(detail).toMatch(/store init/)
+    await store.close()
+  })
+})
+
 describe('红线 2：配对核对', () => {
   it('fetched ≠ written（enrich 淘汰行）→ count_mismatch gap + partial', async () => {
     const store = await fresh()
