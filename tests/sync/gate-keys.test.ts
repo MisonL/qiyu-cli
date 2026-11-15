@@ -237,6 +237,11 @@ describe('闸门键 ⊇ fetch 真实调用的 endpoint 集合（全任务，真�
   })
 
   it('行为：本次不会调用的声明端点冷却时，任务照常完成（Sourcery PR#58 复核）', async () => {
+    // ⚠️ 显式证据（CodeRabbit PR#80 两轮都在问这件事）：`callPaced` 的等待走 pace 模块级的
+    // `sleep`，**不是** 引擎 ctx 的 `sleep`。本文件 `beforeEach` 已 `__setSleep(()=>{})`，
+    // 这里再装一个会记账的替身，断言「pace 的等待确实被接管」(否则 3600 秒冷却会真等)。
+    const paceWaits: number[] = []
+    __setSleep(async (ms) => { paceWaits.push(ms) })
     // 实测缺陷（2026-11-15）：模板列表为空 → `dim.ticket_template_fields` 根本不会调用
     // `ticket.template.fields`，但它处于冷却时，引擎在 fetch 前按**全部声明键**检查，
     // 于是一发请求都不发就把本窗记成 `failed` + `rate_limit_local`，库里的旧字段行继续留着
@@ -263,6 +268,9 @@ describe('闸门键 ⊇ fetch 真实调用的 endpoint 集合（全任务，真�
       // 关键是**没有**任何 template.fields 请求
       expect(seen.filter((u) => u.includes('/ticket/template/fields')),
         '模板列表为空时不该去取 template.fields').toEqual([])
+      // pace 的等待被测试替身接管（否则 3600 秒冷却会真等）—— 同时证明本次**没有**等待：
+      // 未使用端点的冷却根本不该触发任何等待
+      expect(paceWaits, '未使用端点的冷却不该产生任何 pace 等待').toEqual([])
     } finally { vi.unstubAllGlobals(); await store.close() }
   })
 
