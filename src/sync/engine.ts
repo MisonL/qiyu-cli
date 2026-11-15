@@ -330,7 +330,7 @@ const GATE_WAIT_BUDGET = 3
 const GATE_WAIT_FALLBACK_MS = 1_000
 
 /**
- * 任务的主端点（每个任务必然先调它）：fetch 前的**快速失败**预检只看这一把键。
+ * 任务的**首次请求端点**（`gateKeysOf` 的首键）：fetch 前的**快速失败**预检只看这一把键。
  *
  * ⚠️ 为什么不再预检**全部**声明键（Sourcery PR#58 复核，2026-11-15 实测）：声明式地
  * 在 fetch 前检查 `gateEndpoints` 全部键，会把「本次根本不会调用」的端点冷却也算成失败 ——
@@ -340,8 +340,11 @@ const GATE_WAIT_FALLBACK_MS = 1_000
  * 主端点预检保留：常见成因（主端点冷却）仍然在发请求前就失败，语义没变。
  */
 async function acquireGated(ctx: RunCtx, task: SyncTask): Promise<void> {
-  // `gateKeysOf` 的第一把键恒为主端点（`gateEndpoints` 缺省回退成 `[endpoint ?? id]`，
-  // 且 `assertGateContracts` 保证声明时必须包含主端点）。
+  // 首键 = 任务**实际先请求**的那个端点（`gateEndpoints` 缺省回退成 `[endpoint ?? id]`；
+  // 多端点任务的声明按「先调的在前」写，实测 dim.ticket_template_fields 先 list 后 fields）。
+  // ⚠️ 不要改成「`endpoint` 声明的那个」：`dim.ticket_template_fields` 的 `endpoint` 是
+  // `ticket.template.fields`，而它第一次发的是 `ticket.template.list` —— 预检要拦的是
+  // 「马上要发的这一发」，声明字段只是写库/文档归属。
   const key = gateKeysOf(task)[0]
   for (let waits = 0; ; waits++) {
     try {
