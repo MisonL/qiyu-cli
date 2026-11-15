@@ -449,6 +449,8 @@ export async function runSyncRun(argv: string[]): Promise<number> {
       credentials: creds,
       gate: new RateGate(store, clock),
       clock,
+      // gap detail 的恢复动作要复现本次库选择（裸命令会去操作默认库）
+      storeLocation: { db: resolved.config.path, ...(resolved.profileFlag !== undefined ? { profileFlag: resolved.profileFlag } : {}) },
     }
     const onProgress = flags['--quiet'] === undefined
       ? (line: string): void => { process.stderr.write(line + '\n') }

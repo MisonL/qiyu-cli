@@ -36,6 +36,7 @@ import {
 import type { WatermarkState } from './state.js'
 import { sliceByMaxWindow } from './windowing.js'
 import { isLockError } from '../store/retry.js'
+import { storeInitCommand, syncRunCommand } from '../output.js'
 import { clampGateWait } from './rate-gate.js'
 import { shanghaiDayIso, shanghaiDayStart, shanghaiYesterdayStart } from './day.js'
 import type {
@@ -131,6 +132,38 @@ function resolveRangeStart(task: SyncTask, ctx: RunCtx, state: WatermarkState,
 function failDetail(label: string, e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e)
   return `${label}（底层：${raw}）`
+}
+
+/**
+ * DuckDB 对「INSERT / DELETE 的目标不是基表」（同名 view 等）的原文：
+ * `Catalog Error: tags is not an table`（实测，2026-11-15；DELETE 侧另有
+ * `Binder Error: Can only delete from base table`）。
+ * ⚠️ 匹配前先剥一层可能的包装前缀？不需要：两个 store 路径（`upsert` 的 usage 包装只发生在
+ * 列校验，而 view 的列集若对得上就一路走到 INSERT）与 `delete` 都直接抛驱动原文。
+ */
+function isNotAnTableError(raw: string): boolean {
+  return /\bis not an table\b|\bCan only delete from base table\b/i.test(raw)
+}
+
+/**
+ * `write_failed` 的 detail（唯一渲染点）：普通落库失败保持原有的 `落库失败（底层：…）`；
+ * 目标对象不是基表时**点名成因**并给出与 `sync verify` 的 `not_base_table`、
+ * `query --table`、`stats fields` 同一套恢复动作 —— 否则 Agent 只会反复重跑 `sync run`。
+ * 不回显 DuckDB 原文里被操作的对象名（那是用户自己的表名，不是故障点；原文对 Agent 无益）。
+ */
+function writeFailedDetail(e: unknown, ctx: { storeLocation?: { db: string; profileFlag?: string } }): string {
+  const raw = e instanceof Error ? e.message : String(e)
+  if (!isNotAnTableError(raw)) return failDetail('落库失败', e)
+  const loc = ctx.storeLocation
+  const rebuild = loc === undefined
+    ? '先备份旧库文件，再把 --db 换成新的 .duckdb 路径跑 qiyu store init 建库、'
+      + 'qiyu sync run 重新拉取（不要指回出问题的文件）'
+    : '先备份旧库文件，再把 --db 换成新的 .duckdb 路径跑 '
+      + storeInitCommand('<新路径>', loc.profileFlag) + ' 建库、'
+      + syncRunCommand('<新路径>', loc.profileFlag) + ' 重新拉取'
+      + '（把 <新路径> 整段替换成新路径，不要指回出问题的文件）'
+  return '落库失败：本 CLI 的一张声明表在库里不是基表（view 等，写入被库拒绝）。'
+    + '执行它的主体会读到旧数据或直接失败。' + rebuild
 }
 
 /**
@@ -678,7 +711,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
         // 实际行已随事务回滚，计入的是本窗参与核对的落库意图行数。
         writtenTotal += kept.length
         await storeGap(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
-          isMismatch ? (e as Error).message : failDetail('落库失败', e), gaps)
+          isMismatch ? (e as Error).message : writeFailedDetail(e, ctx), gaps)
         continue
       }
       resolvedEndOut = watermarkMs

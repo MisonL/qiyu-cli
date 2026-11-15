@@ -83,6 +83,55 @@ describe('红线 3：水位与数据同事务', () => {
   })
 })
 
+describe('落库时同名对象不是基表（view 等）', () => {
+  // 2026-11-15（PR #78 收尾自查）：`sync run` 写同名 view 时，DuckDB 的原文只有
+  // `Catalog Error: tags is not an table`，gap detail 曾只包成「落库失败（底层：…）」——
+  // 不点名「不是基表」，也没有与 `sync verify` 的 `not_base_table` / `query --table` /
+  // `stats fields` 同款的恢复动作。Agent 据此只会反复重跑 sync run。
+  it('write_failed 的 detail 点名「不是基表」并给出重建恢复动作', async () => {
+    const store = await fresh()
+    // 把声明表 tags 换成同名的空 view（底表已删，view 本体仍可被解析）
+    // —— upsert 走到 `INSERT INTO tags` 时 DuckDB 报 `is not an table`。
+    await store.query('DROP TABLE "tags"')
+    await store.query('CREATE VIEW "tags" AS SELECT CAST(1 AS VARCHAR) AS id, CAST(2 AS VARCHAR) AS name, CAST(3 AS VARCHAR) AS color WHERE 1 = 0')
+    const task = fakeTask({
+      table: 'tags',
+      fetch: async () => ({ rows: [{ id: 'x', name: 'n', color: 'c' }], apiCount: 1 }),
+    })
+    const r = await runTask(task, ctx(store))
+    expect(r.status).toBe('partial')
+    const gaps = await listGaps(store, task.id)
+    expect(gaps.length).toBe(1)
+    expect(gaps[0].reason).toBe('write_failed')
+    const detail = String(gaps[0].detail)
+    expect(detail, '要点名「不是基表」而不是只透 DuckDB 原文').toMatch(/不是基表/)
+    expect(detail, '不得把 view 定义里的对象名当成故障点').not.toMatch(/is not an table/)
+    expect(detail, '恢复动作：备份 + 新路径 store init + sync run').toMatch(/store init/)
+    expect(detail).toMatch(/sync run/)
+    expect(detail).toMatch(/备份/)
+    await store.close()
+  })
+
+  it('带 storeLocation 时恢复动作复现本次 --db（裸命令会去操作默认库）', async () => {
+    const store = await fresh()
+    await store.query('DROP TABLE "tags"')
+    await store.query('CREATE VIEW "tags" AS SELECT CAST(1 AS VARCHAR) AS id, CAST(2 AS VARCHAR) AS name, CAST(3 AS VARCHAR) AS color WHERE 1 = 0')
+    const task = fakeTask({
+      table: 'tags',
+      fetch: async () => ({ rows: [{ id: 'x', name: 'n', color: 'c' }], apiCount: 1 }),
+    })
+    await runTask(task, ctx(store, { storeLocation: { db: cfg.path, profileFlag: 'alpha' } }))
+    const detail = String((await listGaps(store, task.id))[0].detail)
+    // --db 按契约是 `<新路径>` 占位符（旧库要留着备份，不能指回它）；本次的档名必须复现
+    //（同一份 config 下不同档的 options/robots 不同，裸 sync run 会拉错数据集）
+    expect(detail, 'store init 必须带本次的档名').toContain("store init --db '<新路径>' --profile alpha")
+    expect(detail, 'sync run 必须带本次的档名').toContain("sync run --db '<新路径>' --profile alpha")
+    expect(detail, '不得指回出问题的库').not.toContain(`--db ${cfg.path}`)
+    expect(detail, '占位符必须附带替换契约').toContain('<新路径>')
+    await store.close()
+  })
+})
+
 describe('红线 2：配对核对', () => {
   it('fetched ≠ written（enrich 淘汰行）→ count_mismatch gap + partial', async () => {
     const store = await fresh()

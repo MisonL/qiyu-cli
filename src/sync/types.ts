@@ -312,4 +312,11 @@ export interface RunCtx {
   rangeOverride?: Range
   /** 限频等待注入点（中-2①）：gate 冷却等待的 sleep 实现；缺省真实 setTimeout，测试注入假时钟推进。 */
   sleep?: (ms: number) => Promise<void>
+  /**
+   * 本次运行的库定位（已解析的绝对路径 + 显式档名），命令层透传。
+   * 只用于**恢复动作**的渲染：gap detail 里点名 `store init` / `sync run` 时必须复现
+   * 本次选择（裸命令会去操作默认库，照做后原命令仍报同一句 —— 见 `output.ts` 的
+   * `storeInitCommand` 注释）。缺省（测试/未接线）时 detail 退回不含具体路径的说法。
+   */
+  storeLocation?: { db: string; profileFlag?: string }
 }
