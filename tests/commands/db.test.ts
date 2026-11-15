@@ -31,6 +31,8 @@ vi.setConfig({ testTimeout: 15_000, hookTimeout: 60_000 })
 let dir = ''
 let out = ''
 let err = ''
+/** 「夹具隔离」用例留下的延迟操作 —— `afterAll` 清理前把它抽干（见那里的注释）。 */
+let pendingTail: Promise<void> | undefined
 /** 模板库：`beforeAll` 建好（跑完全部迁移）后只读，`beforeEach` 从它复制。 */
 const templatePath = (): string => join(dir, 'template.duckdb')
 let testSeq = 0
@@ -54,11 +56,13 @@ const dbPath = (): string => alsDb.getStore() ?? currentDb
  * 后续 `await` 链（含定时器回调）都带着同一条路径。
  */
 const itBound: typeof it = ((name: unknown, ...rest: unknown[]) => {
-  const last = rest.length - 1
-  const body = rest[last]
-  if (typeof body === 'function') {
-    const fn = body as (...a: unknown[]) => unknown
-    rest[last] = (...a: unknown[]) => alsDb.run(currentDb, () => fn(...a))
+  // ⚠️ 包**第一个函数实参**，不能假定"执行体在最后一位"（CodeRabbit PR#81）：
+  // vitest 还有 `it(名, 执行体, 超时)` 重载，那时最后一位是数字，按 last 取会拿不到执行体、
+  // 于是它**不套 ALS 绑定** —— 超时用例恢复后又读到下一条的库路径。
+  const at = rest.findIndex((x) => typeof x === 'function')
+  if (at >= 0) {
+    const fn = rest[at] as (...a: unknown[]) => unknown
+    rest[at] = (...a: unknown[]) => alsDb.run(currentDb, () => fn(...a))
   }
   return (it as unknown as (...x: unknown[]) => unknown)(name, ...rest)
 }) as typeof it
@@ -96,12 +100,16 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs()
 })
-afterAll(() => {
+afterAll(async () => {
   // ⚠️ 清理**不得让本文件失败**，但也不能静默（历史审查 PR#73）：Windows 上 DuckDB 的
   // `closeSync()` 未及时释放句柄时，`rmSync` 会 EBUSY/EPERM —— 那是临时目录残留，
   // 不是测试结论，所以降级成 stderr 提示。实测已确认 `beforeAll` 抛错时 `afterAll`
   // **仍会执行**（临时用例：beforeAll 抛错 → 打印 `afterAll 执行了`），所以"setup 失败
   // 就没人清理"的说法不成立；剩下的只是句柄时序。
+  // ⚠️ 清理前先把「夹具隔离」留下的那条尾巴**抽干**（CodeRabbit PR#81）：用 `-t` 只跑
+  // 前一条时，尾巴在 `afterAll` 删目录之后才开库 → 目录已不在，它的 rejection 也无人接，
+  // 变成 unhandled rejection。抽干后顺序确定：尾巴先跑完，再删目录。
+  await (pendingTail ?? Promise.resolve()).catch(() => { /* 尾巴失败是它自己的事，不掩盖清理 */ })
   try { rmSync(dir, { recursive: true, force: true }) } catch (e) {
     process.stderr.write(`[db.test] 临时目录清理失败（可安全忽略，路径：${dir}）：`
       + `${e instanceof Error ? e.message : String(e)}\n`)
@@ -920,7 +928,7 @@ describe('夹具隔离（历史审查 PR#72 收口）', () => {
     // ⚠️ 不能只 `void` 掉（CodeRabbit PR#81 major）：本机慢一点时 150ms 不够等它开库 +
     // DROP 完成，断言会跑在删除之前 → 偶发假绿；而它的 rejection 也没人接。
     // 现在留下 completion promise，由下一条 `await`。
-    tailDone = new Promise<void>((resolve, reject) => {
+    pendingTail = tailDone = new Promise<void>((resolve, reject) => {
       setTimeout(() => {
         // ⚠️ 这里再调一次 `dbPath()`：它模拟"超时用例恢复后重新取路径"。绑在异步上下文里
         // 时它仍返回**本条**路径；若改成读全局序号，这里会拿到下一条的路径（变异可红）。
