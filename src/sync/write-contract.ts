@@ -58,3 +58,36 @@ export function assertWriteContracts(tasks: readonly SyncTask[]): void {
     throw new Error(`同步任务写策略声明违反契约：\n- ${violations.join('\n- ')}`)
   }
 }
+
+/**
+ * 闸门键声明的前提（加载期校验，2026-11-15，Sourcery PR#58 复核）：
+ * `gateEndpoints` 一旦声明就必须**非空**且包含主端点。空数组/漏写会静默回退成
+ * `[endpoint ?? id]`，多端点任务的次要端点冷却就永远读不到（实测形态见
+ * `tests/sync/gate-keys.test.ts` 文件头）。
+ * 不声明 `gateEndpoints` 仍是合法的「单端点任务」形态（21 个里 18 个如此）；
+ * 要挡住的是「声明了但声明不完整」——那是唯一一种「看起来配了、实际没配上」的写法。
+ */
+export function gateContractViolations(tasks: readonly SyncTask[]): string[] {
+  const out: string[] = []
+  for (const t of tasks) {
+    if (t.gateEndpoints === undefined) continue   // 单端点任务：合法，回退到 [endpoint ?? id]
+    if (!Array.isArray(t.gateEndpoints) || t.gateEndpoints.length === 0) {
+      out.push(`${t.id}：gateEndpoints 声明为空 —— 会静默回退成单键，多端点任务的次要冷却读不到；`
+        + '不需要闸门多键时请删掉该字段')
+      continue
+    }
+    const primary = t.endpoint ?? t.id
+    if (!t.gateEndpoints.includes(primary)) {
+      out.push(`${t.id}：gateEndpoints 未包含主端点 ${primary}（声明：${t.gateEndpoints.join('、')}）——`
+        + '主端点的冷却会被漏读')
+    }
+  }
+  return out
+}
+
+export function assertGateContracts(tasks: readonly SyncTask[]): void {
+  const violations = gateContractViolations(tasks)
+  if (violations.length > 0) {
+    throw new Error(`同步任务闸门键声明违反契约：\n- ${violations.join('\n- ')}`)
+  }
+}
