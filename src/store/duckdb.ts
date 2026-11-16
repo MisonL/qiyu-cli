@@ -336,6 +336,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
 
   const del = async (tname: string, where: string, params: unknown[] = []): Promise<number> => {
     const t = assertTable(tname)
+    // ⚠️ **关闭必须先于归属**（Codex PR#81 第二十五轮 P3）：事务回调里 `close()` 之后再删，
+    // 先判归属会把"连接已关"误诊成"并发竞争"（见 `upsert` 处的同款注释）。
+    if (closed) throw usage('数据库连接已关闭')
     // ⚠️ 归属检查必须**先于第一条语句**（CodeRabbit PR#81 第十轮 major，实测复现）：
     // 若只在 `count` 之后判，这条 count 自己就会在别人的事务里执行 —— 而**任何**执行期
     // 错误（实测：目标表被换成 CAST 失败的 view 时的 Conversion Error）都会把那条事务
@@ -498,6 +501,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     async upsert(table: string, rows: Record<string, unknown>[]): Promise<number> {
       const t = assertTable(table)
       assertRows(t, rows)
+      // ⚠️ **关闭必须先于归属**：事务回调里 `close()` 之后再写，`inTx` 尚未复位 —— 先判归属
+      // 会把它误诊成"并发竞争"（internal + 串行化提示），而真实原因是连接已经关了，正确
+      // 分类是 `usage`（Codex PR#81 第二十五轮 P3，实测：`count` 走 `execSql` 报 usage，
+      // `upsert`/`delete` 报 internal —— 同一个 Store 上两种说法）。
+      if (closed) throw usage('数据库连接已关闭')
       // ⚠️ `inTx` 的语义是「本实例上有事务开着」，不等于「调用者在那个事务里」——
       // 归属必须由 `assertTxOwnership` 判（历史审查 PR#4 复核）。
       // 入口这一处只做**快速失败**（省掉开自己那条事务的功夫）；真正的判定在
@@ -506,7 +514,6 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         assertTxOwnership()
         return doUpsert(t, rows)
       }
-      if (closed) throw usage('数据库连接已关闭')
       // ⚠️ 自动事务也**登记归属**（CodeRabbit PR#81 第八轮 major）：只打 BEGIN 不置 `inTx`
       // 时，另有调用方在此期间 `transaction()`，它的 BEGIN 会撞上「事务已开」而失败 ——
       // 那条失败路径若再 ROLLBACK，就会把**这里的**活动事务回滚掉，之后的批次落在事务外、

@@ -14,7 +14,7 @@ import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startCapture, captureInstalled } from './capture.js'
 import ts from 'typescript'
-import { callChain, collectCalls, lineOf, objectPropsWithUnknown, parseTs, unwrap } from './source-scan.js'
+import { callChain, collectCalls, lineOf, objectPropsWithUnknown, parseTs, staticKey, unwrap } from './source-scan.js'
 
 // ⚠️ 文件结束时 `process.stdout.write` 必须已恢复（Codex 2026-11-13 P2：vitest 2.1.9
 // 默认 `restoreMocks:false`，不恢复的话同 worker 的**下一个测试文件**会把写入记进
@@ -154,51 +154,195 @@ function isMigratedFile(sf: ts.SourceFile): boolean {
 }
 
 /**
- * 本文件顶层 `const 名 = <对象字面量>` 的初始化表达式；找不到、或该名字**另有赋值**时返回 undefined。
- * 只认顶层 const（选项对象按书写惯例出现在模块顶层）；解构 / 二次赋值 / 外部导入一律视为解析不出。
+ * 本文件里 `名` 绑到的**函数字面量 / 函数声明**（具名执行体：`function body() {}`、
+ * `const body = () => {}`、`const body = function () {}`）。找不到或另有赋值 → undefined。
+ * ⚠️ 为什么要它（Codex PR#81 第二十五轮 P2，探针复现）：`it('x', body)` 里 `body` 是**执行体**，
+ * 旧判据把它当「解析不出的选项对象」报违规 —— 合法用例过不了门禁（误报）。
  */
-function constObjectInitializer(sf: ts.SourceFile, name: string): ts.ObjectLiteralExpression | undefined {
-  let found: ts.ObjectLiteralExpression | undefined
-  let reassigned = false
+function functionBinding(sf: ts.SourceFile, name: string): boolean {
+  // 先剥别名（`const wrap = opts` 让「opts 被写过」同样作废初始值），再查写入
+  if (isMutated(sf, name)) return false
+  let found = false
+  for (const st of sf.statements) {
+    if (ts.isFunctionDeclaration(st) && st.name?.text === name) found = true
+    if (!ts.isVariableStatement(st)) continue
+    for (const d of st.declarationList.declarations) {
+      if (!ts.isIdentifier(d.name) || d.name.text !== name || d.initializer === undefined) continue
+      const init = unwrap(d.initializer)
+      if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) found = true
+      else return false
+    }
+  }
+  return found
+}
+
+/**
+ * 名字 `name` 在文件里**有没有被写过**（任何一处写入都让静态求值不可信）。
+ * 判据按「写入的**目标**」写，不按写法：`x = …`、`x.p = …`、`x['p'] = …`、`x.p++`、
+ * `Object.assign(x, …)` / `Reflect.set(x, …)` / `Object.defineProperty(x, …)` 的目标里出现
+ * `name` 都算（Codex PR#81 第二十五轮 P2，探针复现：`Object.assign(opts, …)` 与
+ * `opts['concurrent'] = …` 旧判据都不认，守卫把已被改成并发的选项当成串行放行）。
+ */
+function isMutated(sf: ts.SourceFile, name: string): boolean {
+  // ⚠️ **别名也算目标**：`const t2 = opts; Object.assign(t2, {…})` 改的仍是 opts
+  // （Codex PR#81 第二十五轮 P2 的同族形态，探针复现过旧判据放行）。先收集以 name 初始化的
+  // 顶层别名（可传递），再按「目标里出现 name 或任一别名」判。
+  const aliases = new Set<string>([name])
+  for (let changed = true; changed;) {
+    changed = false
+    for (const st of sf.statements) {
+      if (!ts.isVariableStatement(st)) continue
+      for (const d of st.declarationList.declarations) {
+        if (!ts.isIdentifier(d.name) || d.initializer === undefined) continue
+        const init = unwrap(d.initializer)
+        if (ts.isIdentifier(init) && aliases.has(init.text) && !aliases.has(d.name.text)) {
+          aliases.add(d.name.text)
+          changed = true
+        }
+      }
+    }
+  }
+  /** 表达式是不是「围绕 name 或其别名之一的引用」：`x` / `x.p` / `x['p']` / `(x as T)`。 */
+  const refersToAlias = (e: ts.Expression): boolean => {
+    const u = unwrap(e)
+    if (ts.isIdentifier(u)) return aliases.has(u.text)
+    if (ts.isPropertyAccessExpression(u)) return refersToAlias(u.expression)
+    if (ts.isElementAccessExpression(u)) return refersToAlias(u.expression)
+    return false
+  }
+  let hit = false
+  const visit = (n: ts.Node): void => {
+    if (hit) return
+    if (ts.isBinaryExpression(n) && ASSIGN_OPS.has(n.operatorToken.kind as ts.SyntaxKind) && refersToAlias(n.left)) hit = true
+    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer !== undefined
+      && aliases.has(n.name.text) && refersToAlias(n.initializer)) hit = true
+    if ((ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n))
+      && (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)
+      && refersToAlias(n.operand)) hit = true
+    if (ts.isDeleteExpression(n) && refersToAlias(n.expression)) hit = true
+    if (ts.isCallExpression(n)) {
+      // 写入函数的目标：`Object.assign(x, …)` 的目标是**第一个**实参；`Reflect.set(x, k, v)` 同理
+      const callee = unwrap(n.expression)
+      const chain = ts.isPropertyAccessExpression(callee) ? [callee.expression, callee.name.text] as const : undefined
+      const host = chain === undefined ? undefined : unwrap(chain[0])
+      if (host !== undefined && ts.isIdentifier(host)) {
+        const key = chain![1]
+        if (host.text === 'Object' && (key === 'assign' || key === 'defineProperty' || key === 'defineProperties')) {
+          const target = n.arguments[0]
+          if (target !== undefined && refersToAlias(target)) hit = true
+        }
+        if (host.text === 'Reflect' && key === 'set') {
+          const target = n.arguments[0]
+          if (target !== undefined && refersToAlias(target)) hit = true
+        }
+      }
+    }
+    ts.forEachChild(n, visit)
+  }
+  visit(sf)
+  return hit
+}
+
+/**
+ * 本文件里 `名` 绑到的**求值后不变**的常量初始化表达式（布尔字面量 / 字面量对象）；
+ * 找不到、绑到别的东西或**写过**它 → undefined。
+ * ⚠️ 判据是"被写过就作废"，与写法无关 —— 见 `isMutated`。
+ */
+function staticBindingInitializer(sf: ts.SourceFile, name: string): ts.Expression | undefined {
+  let found: ts.Expression | undefined
+  let shadowed = false
   for (const st of sf.statements) {
     if (!ts.isVariableStatement(st)) continue
     for (const d of st.declarationList.declarations) {
       if (ts.isIdentifier(d.name)) {
         if (d.name.text !== name || d.initializer === undefined) continue
-        const init = unwrap(d.initializer)
-        if (ts.isObjectLiteralExpression(init)) found = init
-        else return undefined
+        found = unwrap(d.initializer)
       } else {
         // 解构里出现同名绑定 → 值不受我们控制
         const names = d.name as ts.BindingName
         const hit = (b: ts.BindingName): boolean => ts.isIdentifier(b) ? b.text === name
           : b.elements.some((e) => !ts.isOmittedExpression(e) && hit(e.name))
-        if (hit(names)) reassigned = true
+        if (hit(names)) shadowed = true
       }
     }
   }
-  // 任何对该名字的赋值 / 声明合并，都让静态值失效
+  if (found === undefined || shadowed) return undefined
+  return isMutated(sf, name) ? undefined : found
+}
+
+/**
+ * 选项的开关值求值（**唯一实现点**）：`true` / `false` 字面量，或本文件里**求值后不变**的常量
+ * （`const enabled = true`；被写过就不算）；求不出 → undefined。
+ *
+ * ⚠️ **为什么只留这一个纯取值函数、把比较留给调用点**（2026-11-17 实测，定位花了很久）：
+ * 早先有调用方把「取值 + 三态」包成本函数内的局部闭包（`const flag = v => …`，返回 `'on' | 'no'`
+ * 字符串或内联三元），结果同一个值在 `if` 里被静默判错 —— `const seq = seqB === false ? …` 之后
+ * `seq === 'on'` 恒为假、整条分支永不进入，而单独调用同一个闭包却返回正确值。改成本函数的
+ * 布尔返回值后调用点一次就对。**改这里时：保持返回布尔或 undefined，不要在中间引入字符串
+ * 三态/局部闭包**，并跑 `套件计算键 + 括号` / `布尔常量为真 → 并发` 两条自检。
+ */
+function boolLiteralValue(sf: ts.SourceFile, e: ts.Expression): boolean | undefined {
+  const u = unwrap(e)
+  if (ts.isIdentifier(u)) {
+    const init = staticBindingInitializer(sf, u.text)
+    return init === undefined ? undefined : boolLiteralValue(sf, init)
+  }
+  if (u.kind === ts.SyntaxKind.TrueKeyword) return true
+  if (u.kind === ts.SyntaxKind.FalseKeyword) return false
+  return undefined
+}
+
+/**
+ * 本文件顶层 `const 名 = <对象字面量>` 的初始化表达式；找不到、或该名字**另有赋值**时返回 undefined。
+ * 只认顶层 const（选项对象按书写惯例出现在模块顶层）；解构 / 二次赋值 / 外部导入一律视为解析不出。
+ */
+function constObjectInitializer(sf: ts.SourceFile, name: string): ts.ObjectLiteralExpression | undefined {
+  const init = staticBindingInitializer(sf, name)
+  return init !== undefined && ts.isObjectLiteralExpression(init) ? init : undefined
+}
+
+/** 赋值运算符：`=` 与全部复合赋值（`||=` / `&&=` / `??=` 等）都是写入。 */
+const ASSIGN_OPS = new Set<ts.SyntaxKind>([
+  ts.SyntaxKind.EqualsToken, ts.SyntaxKind.PlusEqualsToken, ts.SyntaxKind.MinusEqualsToken,
+  ts.SyntaxKind.AsteriskEqualsToken, ts.SyntaxKind.SlashEqualsToken,
+  ts.SyntaxKind.AsteriskAsteriskEqualsToken, ts.SyntaxKind.PercentEqualsToken,
+  ts.SyntaxKind.LessThanLessThanEqualsToken, ts.SyntaxKind.GreaterThanGreaterThanEqualsToken,
+  ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken, ts.SyntaxKind.AmpersandEqualsToken,
+  ts.SyntaxKind.BarEqualsToken, ts.SyntaxKind.CaretEqualsToken,
+  ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+  ts.SyntaxKind.QuestionQuestionEqualsToken,
+])
+
+/**
+ * `concurrentViolations` 里「看不清就不放行」的四类文案的共同片段（自检把它们归为 unknown）。
+ * 判据新增一种"看不见"的成因时要同步加在这里 —— 否则自检会把它错归成 `opt`（判成并发）。
+ */
+const COULD_NOT_SEE = ['无法静态解析', '无法静态求值', '来自访问器', '未知来源的键'] as const
+
+/**
+ * 仓扫用的**粗筛**：本文件里有没有出现 `.concurrent` 修饰链或选项对象的 `concurrent` 键。
+ * 它只在"没有"时下结论（"这个文件不可能开并发"）；有则交给 `concurrentViolations` 细判。
+ * ⚠️ 为什么需要它（Codex PR#81 第二十五轮 P2）：细判会把**求不出的选项位**一律报出来
+ * （`itBound 里的 it(name, ...rest)`、`it('…', async () => {}, 40_000)` 的超时数字），这是
+ * 合理的"看不见就不放行"；但用作**仓扫**时会把合法文件报成红。仓扫问的是"这个文件的注册
+ * 调用会不会登记并发"，`concurrent` 三个字在整份语法树里一次都没出现时，答案确定是"不会"。
+ */
+function mayRegisterConcurrent(sf: ts.SourceFile): boolean {
+  let hit = false
   const visit = (n: ts.Node): void => {
-    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
-      && ts.isIdentifier(n.left) && n.left.text === name) reassigned = true
-    // `const` 不保证对象不可变：`options.concurrent = true` 同样让初始值失效
-    // （Codex PR#81 第二十四轮 P2）
-    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
-      && ts.isPropertyAccessExpression(n.left) && ts.isIdentifier(n.left.expression)
-      && n.left.expression.text === name) reassigned = true
-    if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)
-      && ts.isIdentifier(n.expression.expression) && n.expression.expression.text === name
-      && ['Object.assign', 'Object.defineProperty', 'Object.defineProperties', 'Reflect.set'].includes(
-        n.expression.getText(sf))) reassigned = true
-    if (ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) {
-      const op = n.operator
-      if ((op === ts.SyntaxKind.PlusPlusToken || op === ts.SyntaxKind.MinusMinusToken)
-        && ts.isIdentifier(n.operand) && n.operand.text === name) reassigned = true
+    if (hit) return
+    if (ts.isCallExpression(n)) {
+      const c = callChain(n)
+      if (c !== undefined && c.chain.some((seg) => seg === 'concurrent')) { hit = true; return }
     }
+    if (ts.isPropertyAssignment(n) && ts.isComputedPropertyName(n.name) && staticKey(n.name.expression) === 'concurrent') { hit = true; return }
+    // 标识符 / 字符串形态（`it['concurrent']`、`{ 'concurrent': … }`、`const opts = {…}` 的变量名）
+    if (ts.isIdentifier(n) && n.text === 'concurrent') { hit = true; return }
+    if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && n.text === 'concurrent') { hit = true; return }
     ts.forEachChild(n, visit)
   }
   visit(sf)
-  return reassigned ? undefined : found
+  return hit
 }
 
 /**
@@ -213,11 +357,32 @@ function constObjectInitializer(sf: ts.SourceFile, name: string): ts.ObjectLiter
  */
 function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: string }> {
   const out: Array<{ line: number; why: string }> = []
-  const isTrue = (v: ts.Expression | undefined): boolean =>
-    v !== undefined && unwrap(v).kind === ts.SyntaxKind.TrueKeyword
-  const isFalse = (v: ts.Expression | undefined): boolean =>
-    v !== undefined && unwrap(v).kind === ts.SyntaxKind.FalseKeyword
   const seen = new Set<number>()
+  const isFn = (e: ts.Expression): boolean => {
+    const u = unwrap(e)
+    return ts.isArrowFunction(u) || ts.isFunctionExpression(u)
+      || (ts.isIdentifier(u) && functionBinding(sf, u.text))
+  }
+  /** 选项对象的形状，或"求不出"的成因（报违规时的文案要用）。 */
+  type Resolved =
+    | { kind: 'obj'; node: ts.ObjectLiteralExpression }
+    | { kind: 'ident'; node: ts.Identifier }
+    | { kind: 'dynamic'; text: string }
+  const resolveOptions = (a: ts.Expression): Resolved => {
+    const u = unwrap(a)
+    if (ts.isObjectLiteralExpression(u)) return { kind: 'obj', node: u }
+    if (ts.isIdentifier(u)) {
+      // ⚠️ 选项位可以是**标识符**（`const options = { concurrent: true }; it('x', options, fn)`）：
+      // Vitest 2.1.9 照常按它登记并发（CodeRabbit PR#81 第二十四轮 minor，探针确认）。
+      // 先在本文件里静态解析 `const 名 = <对象字面量>`；解析不出（外部导入 / 被写过）就
+      // **不许放行** —— 与未知展开同一个判据。
+      const init = constObjectInitializer(sf, u.text)
+      return init === undefined ? { kind: 'ident', node: u } : { kind: 'obj', node: init }
+    }
+    // 调用返回值 / 条件表达式 / 变量引用 … 静态求不出 —— 同样**不许放行**
+    // （Codex PR#81 第二十五轮 P2，探针复现：`it('x', getOptions(), fn)` 与三元表达式旧判据直接跳过）。
+    return { kind: 'dynamic', text: a.getText(sf) }
+  }
   for (const call of collectCalls(sf)) {
     const c = callChain(call)
     if (c === undefined) continue
@@ -239,41 +404,86 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       // （Codex PR#81 第二十四轮 P2：只认第 2 个时 `it('x', () => {}, { concurrent: true })`
       // 漏判，`it('x', body)` 的具名执行体又被误报为未知选项）。
       // ⚠️ 标识符**不是**自证：`optI1` 既可能是 `const optI1 = {…}`（选项）也可能是具名执行体
-      // （`it('x', body)`）。判据：能解析成本文件顶层对象字面量的 → 选项；否则按位置 ——
-      // `parseArguments` 只在**第 2 个**实参是函数时把第 3 个当选项，否则第 2 个就是选项。
-      const arrowOrFn = (e: ts.Expression): boolean => {
-        const u = unwrap(e)
-        return ts.isArrowFunction(u) || ts.isFunctionExpression(u)
-      }
-      const rest = call.arguments.slice(1)
-      const optionArgs = rest.length > 0 && arrowOrFn(rest[0]!) ? rest.slice(1) : rest.slice(0, 1)
-      for (const a of optionArgs) {
-        // ⚠️ 选项位可以是**标识符**（`const options = { concurrent: true }; it('x', options, fn)`）：
-        // Vitest 2.1.9 照常按它登记并发（CodeRabbit PR#81 第二十四轮 minor，探针确认）。
-        // 先在本文件里静态解析 `const 名 = <对象字面量>`；解析不出（外部导入 / 调用返回值 /
-        // 重新赋值过）就**不许放行** —— 与未知展开同一个判据。
-        let u = unwrap(a)
-        let unresolved = false
-        if (ts.isIdentifier(u)) {
-          const init = constObjectInitializer(sf, u.text)
-          if (init === undefined) unresolved = true
-          else u = init
-        }
-        if (unresolved) {
-          out.push({ line: lineOf(sf, call), why: `选项对象是标识符 ${a.getText(sf)}，无法静态解析` })
+      // （`it('x', body)`）。判据：能解析成本文件顶层对象字面量 / 函数字面量的 → 按各自语义；
+      // 否则按位置 —— `parseArguments` 只在**第 2 个**实参是函数时把第 3 个当选项，否则第 2 个
+      // 就是选项。
+      // ⚠️ **登记调用本身也可以经 `.call` / `.apply`**（Codex PR#81 第二十五轮 P2，探针复现：
+      // `it.call(null, 名, 选项, 体)` / `it.apply(null, [名, 选项, 体])` 是有效登记，Vitest 照常
+      // 按选项登记并发）：先把实参还原成登记形态再定位选项与执行体。
+      let args: readonly ts.Expression[] = call.arguments
+      const lastSeg = c.chain[c.chain.length - 1]
+      if (c.chain.length > 1 && (lastSeg === 'call' || lastSeg === 'apply')) {
+        // ⚠️ `Function.prototype.apply(thisArg, argsArray)` 的**第一个实参是 thisArg** —— 之前这里
+        // 把 `call.arguments[0]`（thisArg，实测是 `null`）当成实参数组，`it.apply(null, [...])`
+        // 直接被判成「实参数组无法静态解析」（Codex PR#81 第二十五轮 P2 的修复本身没生效，
+        // 直到有自检样本才暴露）。数组是**第二个**实参。
+        const arg0 = call.arguments[0]
+        const target = lastSeg === 'apply' ? (call.arguments[1] === undefined ? undefined : unwrap(call.arguments[1])) : undefined
+        if (lastSeg === 'call') args = call.arguments.slice(1)
+        else if (target !== undefined && ts.isArrayLiteralExpression(target)) {
+          // ⚠️ 数组里有展开 / 洞（`[...rest]`、`[名, , {}]`）时位置不可静态确定 —— 按"看不清的选项"报
+          if (target.elements.some((e) => ts.isSpreadElement(e) || ts.isOmittedExpression(e))) {
+            out.push({ line: lineOf(sf, call), why: `.apply 的实参数组含展开 / 空位，无法确定选项位置` })
+            seen.add(lineOf(sf, call))
+            continue
+          }
+          args = target.elements as readonly ts.Expression[]
+        } else {
+          out.push({ line: lineOf(sf, call), why: `.apply 的实参数组是表达式 ${arg0 === undefined ? '（缺省）' : call.getText(sf)}，无法静态解析` })
           seen.add(lineOf(sf, call))
           continue
         }
-        if (!ts.isObjectLiteralExpression(u)) continue
-        const { props, mayHaveUnknown } = objectPropsWithUnknown(u)
-        if (isTrue(props.get('concurrent'))) {
-          out.push({ line: lineOf(sf, call), why: '选项对象 concurrent: true' })
+      }
+      const rest = args.slice(1)
+      const optionArgs = rest.length > 0 && isFn(rest[0]!) ? rest.slice(1) : rest.slice(0, 1)
+      for (const a of optionArgs) {
+        const r = resolveOptions(a)
+        if (r.kind !== 'obj') {
+          out.push({
+            line: lineOf(sf, call),
+            why: r.kind === 'ident'
+              ? `选项对象是标识符 ${r.node.text}，无法静态解析`
+              : `选项位是表达式 ${r.text}，无法静态求值`,
+          })
+          seen.add(lineOf(sf, call))
+          continue
+        }
+        const u = r.node
+        const { props, mayHaveUnknown, accessorKeys } = objectPropsWithUnknown(u)
+        // ⚠️ 选项值同样要静态求：`{ concurrent: enabled }`（`const enabled = true`）与
+        // `{ concurrent: 1 > 0 }` 在 Vitest 里都是真值 → 并发（Codex PR#81 第二十五轮 P2，
+        // 探针复现：旧判据只认字面量 `true`，标识符/表达式被当成"没开"）。
+        // 三态：`'on'` 为真、`'no'` 为假、`'unknown'` 静态求不出（**不许放行**）。
+        // ⚠️ 不用布尔 + undefined 两态：那会把「求不出」和「为假」混成一个判据 ——
+        // `{ concurrent: cond }` 会被当成串行放行。
+        // ⚠️ **三态求值保持内联**：2026-11-17 实测，把它封装成本函数内的箭头函数再调用时，
+        // 调用方拿到的是错值（`'no'` 一路），`if (seq === 'on')` 两者都不成立 —— 分支静默
+        // 失效；同一个箭头函数单独调用却返回正确值（差异只在调用点形状，根因未查明）。
+        // 内联后分支恢复。换实现时请保持内联，并跑 `套件计算键 + 括号` 那条自检。
+        // 三态求值：`true` 为真、`false` 为假、`undefined` 求不出（**不许放行**）。
+        // ⚠️ 必须把「求不出」和「为假」分开 —— 两态会把 `{ concurrent: cond }` 当串行放行。
+        const concVal = props.get('concurrent')
+        if (props.get('concurrent') !== undefined && boolLiteralValue(sf, props.get('concurrent')!) === true) {
+          out.push({ line: lineOf(sf, call), why: '选项对象 concurrent 为真' })
+          seen.add(lineOf(sf, call))
+          continue
+        }
+        if (props.get('concurrent') !== undefined && boolLiteralValue(sf, props.get('concurrent')!) === undefined) {
+          out.push({ line: lineOf(sf, call), why: `选项对象的 concurrent 值 ${concVal!.getText(sf)} 无法静态求值` })
           seen.add(lineOf(sf, call))
           continue
         }
         // `describe`/`suite` 上的 `sequential: false` 与 `concurrent: true` 等价
-        if (SUITES.has(base) && isFalse(props.get('sequential'))) {
-          out.push({ line: lineOf(sf, call), why: '套件选项 sequential: false' })
+        const seqVal = SUITES.has(base) ? props.get('sequential') : undefined
+        // 访问器声明的键：值是读的时候才求得的，`props.get` 是 undefined —— 不能当成「没写」
+        const seqGet = accessorKeys.has('sequential')
+        if (!seqGet && seqVal !== undefined && boolLiteralValue(sf, seqVal) === false) {
+          out.push({ line: lineOf(sf, call), why: '套件选项 sequential 为假' })
+          seen.add(lineOf(sf, call))
+          continue
+        }
+        if (SUITES.has(base) && (seqGet || (seqVal !== undefined && boolLiteralValue(sf, seqVal) === undefined))) {
+          out.push({ line: lineOf(sf, call), why: `套件选项的 sequential 值 ${seqVal === undefined ? '访问器' : seqVal.getText(sf)} 无法静态求值` })
           seen.add(lineOf(sf, call))
           continue
         }
@@ -281,16 +491,16 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         // 只看 `props.get` 会把「可能开了并发」当成「确定没开」（CodeRabbit PR#81 第二十三轮）。
         // 判据是静态守卫：**看不见就不许放行**，除非同一个对象里显式声明了串行（`concurrent: false`）。
         // getter 的 `concurrent` 值是**读的时候才知道**（`{ get concurrent() { return true } }`）——
-        // Vitest 会读它并登记并发，`props.get` 拿到 `undefined`，不能当成「没声明」
-        // （Codex PR#81 第二十四轮 P2）。
-        const concurrentUnknown = props.has('concurrent') && props.get('concurrent') === undefined
-        if (concurrentUnknown) {
+        // Vitest 会读它并登记并发，`props.get` 拿到 `undefined` —— 上面的三态求值拿到 `undefined`
+        // 会把它当 `'off'`，所以这里单独拦（Codex PR#81 第二十四轮 P2）。
+        if (accessorKeys.has('concurrent')) {
           out.push({ line: lineOf(sf, call), why: '选项对象的 concurrent 来自访问器，值在运行时才知道' })
           seen.add(lineOf(sf, call))
           continue
         }
-        const explicitOff = props.has('concurrent') && isFalse(props.get('concurrent'))
-        const suiteExplicitSeq = SUITES.has(base) && props.has('sequential') && isTrue(props.get('sequential'))
+        const concW = props.get('concurrent')
+        const explicitOff = concW !== undefined && boolLiteralValue(sf, concW) === false
+        const suiteExplicitSeq = seqVal !== undefined && boolLiteralValue(sf, seqVal) === false
         if (mayHaveUnknown && !explicitOff && !suiteExplicitSeq) {
           out.push({ line: lineOf(sf, call), why: '选项对象含未知来源的键（展开 / 动态键），无法确认未开启并发' })
           seen.add(lineOf(sf, call))
@@ -319,7 +529,12 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       : chain
     return c.length === 1 && HOOK_HOOKS.has(c[0]!.toLowerCase())
   }
-  /** 这个调用是否处在 `await` 的表达式里（含 `return await`、`x = await …`）。 */
+  /**
+   * 这个调用**本身**是否被 directly `await`（含 `return await`、`x = await …`、括号 / 断言包装）。
+   * ⚠️ **不穿透外层调用**：`await ignore(x.then(w))` 只等 `ignore` 返回的那个值 —— 它若把实参
+   * 原样返回才顺便等到 `w`，否则 `w` 照样落在 hook 之后（Codex PR#81 第二十五轮 P2，探针
+   * 复现：旧判据跨过调用实参去找 `await`，把这种写法放行了）。
+   */
   const isAwaited = (n: ts.Node): boolean => {
     let e: ts.Node = n
     while (e.parent !== undefined) {
@@ -327,7 +542,6 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       if (ts.isAwaitExpression(p)) return true
       if (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isNonNullExpression(p)
         || ts.isSatisfiesExpression(p) || ts.isTypeAssertionExpression(p)) { e = p; continue }
-      if (ts.isCallExpression(p)) { e = p; continue }
       return false
     }
     return false
@@ -341,13 +555,21 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       if (innerName === undefined) {
         // 基座求不出名字（`(pending ?? Promise.resolve()).finally(w)` 的 `??` 表达式）时，
         // 名字链整条丢失 —— 但**末段的回调方法**静态可见（Codex PR#81 第二十四轮 P2）。
-        const callee = unwrap(inner.expression)
-        const lastSeg = ts.isPropertyAccessExpression(callee) ? callee.name.text
-          : ts.isElementAccessExpression(callee) ? (() => {
-            const k = unwrap(callee.argumentExpression)
-            return ts.isStringLiteral(k) || ts.isNoSubstitutionTemplateLiteral(k) ? k.text : undefined
-          })()
-            : undefined
+        const segOf = (c: ts.Expression): string | undefined => {
+          const u = unwrap(c)
+          return ts.isPropertyAccessExpression(u) ? u.name.text
+            : ts.isElementAccessExpression(u) ? staticKey(u.argumentExpression)
+              : undefined
+        }
+        let callee = unwrap(inner.expression)
+        let lastSeg = segOf(callee)
+        // ⚠️ 未知基座分支同样要先剥 `call`/`apply`（Codex PR#81 第二十五轮 P2，探针复现：
+        // `(pending ?? Promise.resolve()).then.call(pending, w)` 的末段是 `call`，不剥就看不见
+        // 它调的是 `then` —— 而这段尾巴照样在 hook 之后执行 `w`）。
+        if (lastSeg === 'call' || lastSeg === 'apply') {
+          callee = unwrap((callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
+          lastSeg = segOf(callee)
+        }
         // ⚠️ **被 await 的不算**：`await (pendingTail ?? …).catch(…)` 的尾巴当场收口，
         // 不会落进下一条用例（实测：db.test.ts 的 afterAll 清理正是这种写法，误报过）。
         if (lastSeg !== undefined && ['then', 'catch', 'finally'].includes(lastSeg) && !isAwaited(inner)) {
@@ -470,6 +692,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       const hits: string[] = []
       for (const { rel, sf } of migratedFiles()) {
         if (CONCURRENT_EXEMPT[rel] !== undefined) continue
+        if (!mayRegisterConcurrent(sf)) continue
         for (const v of concurrentViolations(sf)) hits.push(`${rel}:${v.line}（${v.why}）`)
       }
       expect(hits, '这些文件同时用了 captureSinks 与 .concurrent —— 并发下写入无法归属，'
@@ -527,8 +750,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       const out: string[] = []
       for (const v of concurrentViolations(parseTs(src))) {
         if (v.why.startsWith('.concurrent')) out.push(`alias:${v.why.replace('.concurrent 修饰链：', '')}`)
-        else if (v.why.includes('未知来源') || v.why.includes('无法静态解析')
-          || v.why.includes('来自访问器')) out.push('unknown')
+        // 「求不出」一律归 unknown —— 判据按**为什么看不见**分了几种文案（无法静态解析 /
+        // 无法静态求值 / 来自访问器 / 未知来源的键），自检只关心「不许放行」
+        else if (COULD_NOT_SEE.some((s) => v.why.includes(s))) out.push('unknown')
         else out.push('opt')
       }
       return out
@@ -570,6 +794,15 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookHits(`${H}(() => { ${ST}.call(null, cb, 1) })`), 'setTimeout.call').toEqual([`${ST}(`])
     expect(hookHits(`${H}(() => { globalThis.${ST}.apply(null, [cb, 1]) })`), 'globalThis.setTimeout.apply')
       .toEqual([`globalThis.${ST}(`])
+    // `await` 只算**直接**等待：`await ignore(x.then(w))` 等的是 ignore 的返回值，不是 w
+    // （Codex PR#81 第二十五轮 P2，探针复现：旧判据跨过调用实参去找 await，把这种写法放行了）
+    expect(hookHits(`${H}(async () => { await ignore((pending ?? Promise.resolve()).then(w)) })`),
+      '跨一层调用的实参不算被等待').toEqual(['?.then('])
+    // 未知基座分支同样先剥 call/apply（Codex PR#81 第二十五轮 P2）：末段是 `call` 时也要认出 `then`
+    expect(hookHits(`${H}(() => { (pending ?? Promise.resolve()).then.call(pending, w) })`),
+      '未知基座 + .call').toEqual(['?.then('])
+    expect(hookHits(`${H}(() => { (pending ?? Promise.resolve())['catch'].apply(pending, [w]) })`),
+      '未知基座 + 下标 + .apply').toEqual(['?.catch('])
     // 反例：普通 Promise 用法与无关的 .then 不是 hook 体里的延迟写入
     expect(hookHits(`${H}(async () => { await Promise.resolve() })`), 'await 不排异步尾巴').toEqual([])
     // 正控：helper 调用 / 字符串里的同名文本 / 别处的同名调用都不算（逐条对应审查报出的形态）
@@ -691,11 +924,57 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 同一片段里声明 + 使用（解析只在本文件内，跨样本不共享）
     expect(concHits(`const optO2 = ${JSON.stringify({ concurrent: false })}\nit('O2', () => {}, optO2)`),
       '执行体在前、串行选项在后').toEqual([])
-    // 属性写入使 const 初始值失效（同一文件里 optI2 未被写入 → 上一条仍按初始化值判）
-    expect(concHits(`const optW = ${JSON.stringify({ concurrent: false })}
-optW.concurrent = true
-it('O3', optW, () => {})`),
+    // 写入使 const 初始值失效（同一文件里 optI2 未被写入 → 上一条仍按初始化值判）。
+    // ⚠️ 判据按「写入的**目标**」写、不按写法（Codex PR#81 第二十五轮 P2 探针复现：
+    // `Object.assign(opts, …)` 与 `opts['concurrent'] = …` 旧判据都不认，守卫把已被改成并发的
+    // 选项当成串行**放行** —— 每一行都必须各自咬住一种写法，见同轮变异验证）。
+    const W = JSON.stringify({ concurrent: false })
+    expect(concHits(`const optW = ${W}\noptW.concurrent = true\nit('O3', optW, () => {})`),
       '属性写入后初始值不可信').toEqual(['unknown'])
+    expect(concHits(`const optW2 = ${W}\noptW2['concurrent'] = true\nit('O3b', optW2, () => {})`),
+      '下标写入与点号同义').toEqual(['unknown'])
+    expect(concHits(`const optW3 = ${W}\nObject.assign(optW3, { concurrent: true })\nit('O3c', optW3, () => {})`),
+      'Object.assign 的目标是第一个实参').toEqual(['unknown'])
+    expect(concHits(`const optW4 = ${W}\nReflect.set(optW4, 'concurrent', true)\nit('O3d', optW4, () => {})`),
+      'Reflect.set 的目标是第一个实参').toEqual(['unknown'])
+    expect(concHits(`const optW5 = ${W}\nconst alias5 = optW5\nObject.assign(alias5, { concurrent: true })\nit('O3e', optW5, () => {})`),
+      '别名写入打的是同一个对象').toEqual(['unknown'])
+    expect(concHits(`const optW6 = ${W}\noptW6.concurrent ||= true\nit('O3f', optW6, () => {})`),
+      '复合赋值也是写入').toEqual(['unknown'])
+    // 反例：写入的是**别的**对象 / 只是读，初始值仍可信
+    expect(concHits(`const optW7 = ${W}\nconst other7 = { concurrent: false }\nObject.assign(other7, { concurrent: true })\nit('O3g', optW7, () => {})`),
+      '别的对象被写不影响本对象').toEqual([])
+    expect(concHits(`const optW8 = ${W}\nconsole.log(optW8.concurrent)\nit('O3h', optW8, () => {})`),
+      '只读不写').toEqual([])
+    // 选项值同样要静态求值（Codex PR#81 第二十五轮 P2）：标识符常量按值判，别的表达式不许放行
+    expect(concHits(`const enabled = true\nit('V1', { concurrent: enabled }, () => {})`),
+      '布尔常量为真 → 并发').toEqual(['opt'])
+    expect(concHits(`const disabled = false\nit('V2', { concurrent: disabled }, () => {})`),
+      '布尔常量为假 → 串行').toEqual([])
+    expect(concHits(`let mutable = true\nmutable = false\nit('V3', { concurrent: mutable }, () => {})`),
+      '被写过的常量不可信').toEqual(['unknown'])
+    expect(concHits(`it('V4', { concurrent: 1 > 0 }, () => {})`), '非字面量表达式无法静态求值').toEqual(['unknown'])
+    // describe/suite 的 sequential 与 concurrent 同理
+    expect(concHits(`const seqOff = false\ndescribe('V5', { sequential: seqOff }, () => {})`),
+      'sequential 取常量假 → 等价并发').toEqual(['opt'])
+    expect(concHits(`describe('V6', { get sequential() { return false } }, () => {})`),
+      'sequential 来自访问器 → 值运行时才知道').toEqual(['unknown'])
+    // 选项位不是对象字面量 / 常量：调用返回值、条件表达式都不许放行（Codex PR#81 第二十五轮 P2）
+    expect(concHits(`const getOptions = () => ({ concurrent: true })\nit('V7', getOptions(), () => {})`),
+      '调用返回值无法静态求值').toEqual(['unknown'])
+    expect(concHits(`it('V8', condition ? { concurrent: true } : { concurrent: false }, () => {})`),
+      '条件表达式两个分支都要看').toEqual(['unknown'])
+    // 登记调用经 .call / .apply（Codex PR#81 第二十五轮 P2）：实参要按登记形态还原
+    expect(concHits(`it.call(null, 'C1', { concurrent: true }, () => {})`), '.call 的登记实参').toEqual(['opt'])
+    expect(concHits(`it.apply(null, ['C2', { concurrent: true }, () => {}])`), '.apply 的实参数组').toEqual(['opt'])
+    expect(concHits(`it.call(null, 'C3', () => {})`), '.call 的合法串行登记').toEqual([])
+    // 具名执行体：`function body() {}` / `const body = () => {}` 是执行体，不是选项（误报回归）
+    expect(concHits(`function bodyFn() {}\nit('N1', bodyFn)`), '函数声明作执行体').toEqual([])
+    expect(concHits(`const bodyAr = () => {}\nit('N2', bodyAr)`), '箭头常量作执行体').toEqual([])
+    // 执行体在前时第 3 个才是选项：`bodyAr2` 在那里是**选项位**、求不出的标识符 → 不许放行
+    expect(concHits(`const bodyAr2 = () => {}\nit('N3', () => {}, bodyAr2)`), '求不出的选项位').toEqual(['unknown'])
+    expect(concHits(`const bodyAr3 = () => {}\nconst opt3 = { concurrent: false }\nit('N4', bodyAr3, opt3)`),
+      '具名执行体 + 常量选项').toEqual([])
     // getter 的 concurrent：值在运行时才知道
     expect(concHits(`it('O4', { get con${'current() { return true }'}, })`), 'getter 并发值未知').toEqual(['unknown'])
     // 未知**计算键访问器**同样可能覆盖任何键

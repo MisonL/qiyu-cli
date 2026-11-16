@@ -241,16 +241,23 @@ export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Exp
 export function objectPropsWithUnknown(obj: ts.ObjectLiteralExpression): {
   props: Map<string, ts.Expression | undefined>
   mayHaveUnknown: boolean
+  /**
+   * 顶层**访问器**（getter / setter）声明的静态键。`props` 里这些键的值是 `undefined`
+   * （运行时才知道），与「来自未知展开」无法区分 —— 调用方需要分开报时看这里。
+   */
+  accessorKeys: Set<string>
 } {
   return objectPropsInner(obj)
 }
 
-/** 递归返回「映射 + 是否可能含未知键（未知展开）」，让不确定性传播到外层。 */
+/** 递归返回「映射 + 是否可能含未知键（未知展开）+ 访问器键」，让不确定性传播到外层。 */
 function objectPropsInner(obj: ts.ObjectLiteralExpression): {
   props: Map<string, ts.Expression | undefined>
   mayHaveUnknown: boolean
+  accessorKeys: Set<string>
 } {
   const out = new Map<string, ts.Expression | undefined>()
+  const accessorKeys = new Set<string>()
   let mayHaveUnknown = false
   for (const p of obj.properties) {
     if (ts.isPropertyAssignment(p)) {
@@ -261,6 +268,7 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
         // （CodeRabbit PR#81 第二十二轮 minor：只置标记而保留旧值，`{ concurrent: true,
         // [key]: false }` 仍返回 true，而 key 可能就是 'concurrent'）。
         out.clear()
+        accessorKeys.clear()
         mayHaveUnknown = true
       }
     } else if (ts.isShorthandPropertyAssignment(p)) {
@@ -270,24 +278,28 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
       // ⚠️ 计算键也要认静态字面量（`get ['concurrent']()`）：传 false 会把字面量键当成
       // 未知键、进而清空外层全部已知值（Codex PR#81 第二十一轮 P2 的**误报**与漏检各一例）。
       const k = staticPropKey(p.name, true)
-      if (k !== undefined) out.set(k, undefined)
-      else { out.clear(); mayHaveUnknown = true }
+      if (k !== undefined) { out.set(k, undefined); accessorKeys.add(k) }
+      else { out.clear(); accessorKeys.clear(); mayHaveUnknown = true }
     } else if (ts.isSpreadAssignment(p)) {
       const src = unwrap(p.expression)
       if (ts.isObjectLiteralExpression(src)) {
         const inner = objectPropsInner(src)
         // 内层若含未知展开，它可能覆盖**外层**已有的键 —— 先清空再合并内层已知值。
-        if (inner.mayHaveUnknown) out.clear()
+        if (inner.mayHaveUnknown) { out.clear(); accessorKeys.clear() }
         for (const [k, v] of inner.props) out.set(k, v)
+        // 内层访问器覆写同名键：键同样记进本层的访问器集合 —— 只把值置 undefined 的话，
+        // 外层无法与「未知展开留下的空值」区分（Codex PR#81 第二十五轮 P2 的成因之一）。
+        for (const k of inner.accessorKeys) { out.set(k, undefined); accessorKeys.add(k) }
         if (inner.mayHaveUnknown) mayHaveUnknown = true
       } else {
         // 未知展开：可能覆盖任何键 —— 已知值全部作废，之后显式赋值再重新确定。
         out.clear()
+        accessorKeys.clear()
         mayHaveUnknown = true
       }
     }
   }
-  return { props: out, mayHaveUnknown }
+  return { props: out, mayHaveUnknown, accessorKeys }
 }
 
 /** 属性名 → 静态字符串键；动态键（变量 / 调用）返回 undefined。 */

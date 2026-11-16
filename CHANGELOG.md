@@ -47,6 +47,22 @@
 
 ### 修复
 
+- **静态守卫再补八种形态，并修掉上一轮两处没真正生效的修复**（2026-11-17，Codex PR#81 第二十五轮
+  P2 ×8 + P3 ×1，逐条探针复现）：
+  `Object.assign(opts, …)` / `opts['concurrent'] = …` / `Reflect.set` / 复合赋值 / **经别名**的写入
+  （判据按「写入的**目标**」收敛到 `isMutated` 一个实现点，并跟踪 `const alias = opts`）·
+  `{ concurrent: enabled }` 与套件 `{ sequential: seqOff }` 这类**常量开关值**（求值后不变才认，
+  被写过就作废）· `it('x', getOptions(), fn)` / 三元表达式这类**求不出的选项位**（不再静默跳过）·
+  `await ignore(x.then(w))`（`await` 只算**直接**等待，不穿透外层调用实参）·
+  未知基座分支先剥 `call/apply`（`(pending ?? P()).then.call(p, w)`）·
+  `it.call` / `it.apply` 形态的登记实参还原（`.apply` 的实参数组是**第二个**实参——上一轮写成
+  第一个、被自检样本抓出从未生效）· `function body() {}` / `const body = () => {}` 具名执行体
+  当选项误报；并在仓库扫描前加**粗筛**（语法树里完全没有 `concurrent` 的文件直接放行，细判继续
+  对求不出的选项位报未知）。
+  另修 **`upsert` / `delete` 在 `close()` 之后的错误分类**：事务回调里先关闭再写/删，原先判归属
+  在前、报 `internal`「并发竞争」，与同一 Store 上 `count` 的 `usage`「数据库连接已关闭」互相矛盾；
+  现在三条路径一致报 usage。八处守卫变异 + 两处关闭变异各自变红。
+
 - **静态守卫的十种等价写法**（2026-11-17，Codex PR#81 第二十四轮 P2 ×8 + P3 ×1，逐条探针复现）：
   `it(名, 体, 选项)` 的重载位置（按「谁是函数」定位，不固定第 2 个）· 选项对象的**属性写入**
   （`optW.concurrent = true` 让 `const` 初始值失效）· getter 的 `concurrent` 值运行时才知

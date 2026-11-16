@@ -306,6 +306,28 @@ describe('duckdb —— 事务', () => {
     expect(runs, '关闭后的回滚路径不得再进入上下文').toBe(1)
   })
 
+  it('事务回调里 close() 之后再写/删/读 → 一律 usage「数据库连接已关闭」，不得误诊成并发竞争（Codex PR#81 第二十五轮 P3）', async () => {
+    // 事故路径（实测复现）：`transaction(async () => { await s.close(); await s.upsert(…) })` 时
+    // `inTx` 还没复位，写路径若先判归属就抛 internal + 「不要用 Promise.all 并行调用…」——
+    // 成因说反了（真实原因是连接已关，唯一修法是别在关闭后继续用）。同一个 Store 上 `count`
+    // 走 `execSql`（先判 closed）报的是 usage —— 三路必须同一口径。
+    const cases: Array<[string, (s: Store) => Promise<unknown>]> = [
+      ['upsert', (s) => s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])],
+      ['delete', (s) => s.delete('tags', 'TRUE')],
+      ['count', (s) => s.count('tags')],
+    ]
+    for (const [name, act] of cases) {
+      const s = await fresh()
+      const err = await s.transaction(async () => {
+        await s.close()
+        return act(s)
+      }).then(() => null, (e: unknown) => e)
+      expect(err, `${name}：关闭后必须报 usage`).toMatchObject({ kind: 'usage' })
+      expect((err as Error).message, `${name}：报错点名真正成因（连接已关闭），不得说成并发竞争`)
+        .toContain('数据库连接已关闭')
+    }
+  })
+
   it('事务进行中：所有者链自己的读照常工作；只有**别的链**的读才被拒（CodeRabbit PR#81 第二十一轮 major 的反面证据）', async () => {
     // CR 担心的形态：闸门下移到 `execSql` 后读语句也过归属检查，会不会把**既有调用方**的读
     // 从「能跑」变成 `internal`。判据是「谁在发」：同一事务所有者链里的读（tx.count / tx.tables）
