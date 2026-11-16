@@ -98,13 +98,44 @@ function eachInvocation(sf: ts.SourceFile, fn: (n: ts.CallExpression | ts.NewExp
 
 const argsOf = (n: ts.CallExpression | ts.NewExpression): readonly ts.Expression[] => n.arguments ?? []
 
+/**
+ * 被调者的**名字链**（`usageFail` → `['usageFail']`；`process.stderr.write` → 三段）。
+ * ⚠️ 不能用 `getText(sf)` 比对（CodeRabbit PR#81 第十四轮）：它返回**源码原文**，跨行
+ * （`process.stderr\n  .write(…)`）、可选链（`process.stderr?.write(…)`）、中间夹注释都会
+ * 让字符串对不上、规则静默跳过那次调用（真实扫描照样全绿）。AST 名字链对这些形态一致。
+ */
+function calleeNameChain(n: ts.CallExpression | ts.NewExpression): string[] {
+  const out: string[] = []
+  let e: ts.Expression = unwrap(n.expression)
+  for (;;) {
+    if (ts.isIdentifier(e)) { out.unshift(e.text); return out }
+    if (ts.isPropertyAccessExpression(e) || ts.isPropertyAccessChain?.(e) === true) {
+      const pa = e as ts.PropertyAccessExpression
+      out.unshift(pa.name.text)
+      e = unwrap(pa.expression)
+      continue
+    }
+    if (ts.isCallExpression(e)) { e = unwrap(e.expression); continue }   // 极少见：`f()()` 取 f
+    return []   // 认不出来 → 空链，规则自然不命中
+  }
+}
+
+/**
+ * 该调用的名字链是否等于 `want`（逐段）。
+ * ⚠️ 不再接收 `sf`：历史版本用 `getText(sf)` 比对、跨行与可选链会静默漏判（本条注释即理由）。
+ */
+const named = (n: ts.CallExpression | ts.NewExpression, ...want: string[]): boolean => {
+  const got = calleeNameChain(n)
+  return got.length === want.length && got.every((seg, i) => seg === want[i])
+}
+
 /** `usageFail(...)` 的文案里没有 `**`（逐字写进 stderr）。 */
 const USAGE_FAIL: Rule = {
   name: 'usageFail',
   hit: (sf) => {
     const out: string[] = []
     eachInvocation(sf, (n, line) => {
-      if (!ts.isCallExpression(n) || n.expression.getText(sf) !== 'usageFail') return
+      if (!ts.isCallExpression(n) || !named(n, 'usageFail')) return
       const why = starsIn(argsOf(n))
       if (why !== undefined) out.push(`L${line}  ${why}`)
     })
@@ -122,7 +153,7 @@ const THROW_ERROR: Rule = {
   hit: (sf) => {
     const out: string[] = []
     eachInvocation(sf, (n, line) => {
-      if (!ts.isNewExpression(n) || n.expression.getText(sf) !== 'Error') return
+      if (!ts.isNewExpression(n) || !named(n, 'Error')) return
       let up: ts.Node = n
       while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) up = up.parent
       if (up.parent === undefined) return
@@ -139,7 +170,7 @@ const STDERR_WRITE: Rule = {
   hit: (sf) => {
     const out: string[] = []
     eachInvocation(sf, (n, line) => {
-      if (!ts.isCallExpression(n) || n.expression.getText(sf) !== 'process.stderr.write') return
+      if (!ts.isCallExpression(n) || !named(n, 'process', 'stderr', 'write')) return
       const [first] = argsOf(n)
       if (first === undefined) return
       const why = starsIn([first])
@@ -243,13 +274,16 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "process.stderr.write('告' + '警' + '*' + '*' + 'x' + '*' + '*')",  // 同上，stderr 通道
       "const CONCAT_USAGE = '用法：' + '*粗' + '*体*' + '*'",           // 同上：**单段都不含 `**`**，只有拼接结果含
       "usageFail(prefix + '*')",                                       // 含变量：拼接结果不在静态边界内，不算
+      "process.stderr\n  .write('换行点号：**x**')",                     // 跨行属性访问（CR 第十四轮）
+      "process.stderr?.write('可选链：**y**')",                          // 可选链（同上）
       'usageFail(`outer ${String(`)`)} **bad**`)',                    // 嵌套模板：真调用、星号在字面段
     ].join('\n')
     const sf = parseTs(fake)
     expect(USAGE_FAIL.hit(sf), 'usageFail 规则：字面量 1 条 + 嵌套模板 1 条 + 常量拼接 1 条；含变量那条不算')
       .toHaveLength(3)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行各一条；非 throw 的 new Error 不算').toHaveLength(2)
-    expect(STDERR_WRITE.hit(sf), 'stderr 规则：字符串实参 + 模板实参 + 常量拼接各一条').toHaveLength(3)
+    expect(STDERR_WRITE.hit(sf),
+      'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链各一条').toHaveLength(5)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)
     // 注释里的 `**` 不是字面量；模板里的字面段是（这条钉住 literalTexts 的两半）
     const cmt = parseTs('// **这是注释**\nconst a = `x **y** ${z}`')

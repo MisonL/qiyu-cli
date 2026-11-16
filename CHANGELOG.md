@@ -47,6 +47,14 @@
 
 ### 修复
 
+- **两条扫描器健壮性 / 判据精确性修正**（2026-11-16，CodeRabbit PR#81 第十四轮）：
+  ① **临时文件竞态**（major）：仓库里确有测试在 `tests/` 下**临时**写 `.test.ts` 再删掉
+  （`setup-warm.test.ts` 的子 vitest 用例，名字带 pid），缓存扫描的 `readdirSync` 与
+  `readFileSync` 之间它可能已被删除 —— 现在 `ENOENT` 直接跳过该文件（文件都不在了，
+  没有要守的东西），其它 IO 错误照旧抛。② **调用名比对**（minor）：四条纯文本通道规则
+  原用 `getText(sf) === 'process.stderr.write'`，跨行点号（`process.stderr\n  .write(…)`）、
+  可选链（`process.stderr?.write(…)`）都对不上 —— 规则静默跳过那次调用、真实扫描照样全绿。
+  改为 AST 名字链逐段比对；自检补跨行 + 可选链两条样本，变异（退回 `getText`）实测变红。
 - **名字链递归穿透 + 常量拼接识别**（2026-11-16，CodeRabbit PR#81 第十三轮，两条 minor）：
   ① `callChain` 改为递归 —— 属性访问保留名字、调用 / 标签模板穿透基座，`it.skipIf(false).each([1])('case', { concurrent: true }, …)`
   这种「条件基座 + 选项位并发」的外层调用不再判成 `undefined`（原先只穿一层，叠加修饰就丢链）；

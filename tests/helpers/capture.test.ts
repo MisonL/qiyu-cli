@@ -250,12 +250,25 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     return out
   }
 
-  /** 每个测试文件解析一次（两条守卫与白名单检查共用）。 */
+  /**
+   * 每个测试文件解析一次（两条守卫与白名单检查共用）。
+   * ⚠️ `readdirSync` 与 `readFileSync` 之间有竞态（CodeRabbit PR#81 第十四轮）：仓库里确有
+   * 测试在 `tests/` 下**临时**写 `.test.ts` 再删掉（`setup-warm.test.ts` 的子 vitest 用例，
+   * 名字带 `process.pid`），并行跑时它可能在两次调用之间消失 —— 读到 `ENOENT` 不是"守卫
+   * 发现了问题"，直接跳过这个文件（文件都已经没了，不存在要守的东西）。
+   */
   const parsed = new Map<string, ts.SourceFile>()
-  function parsedOf(f: string): ts.SourceFile {
+  function parsedOf(f: string): ts.SourceFile | undefined {
     const hit = parsed.get(f)
     if (hit !== undefined) return hit
-    const sf = parseTs(readFileSync(f, 'utf8'), relative(SRC_TESTS, f))
+    let text: string
+    try {
+      text = readFileSync(f, 'utf8')
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw e
+    }
+    const sf = parseTs(text, relative(SRC_TESTS, f))
     parsed.set(f, sf)
     return sf
   }
@@ -265,6 +278,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     const out: Array<{ rel: string; sf: ts.SourceFile }> = []
     for (const f of testFiles(SRC_TESTS)) {
       const sf = parsedOf(f)
+      if (sf === undefined) continue
       if (!isMigratedFile(sf)) continue
       out.push({ rel: relative(SRC_TESTS, f).split(sep).join('/'), sf })
     }
@@ -311,7 +325,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         expect(rel, 'CONCURRENT_EXEMPT 的键必须是 / 分隔（与上面的归一化一致）').not.toContain('\\')
         const p = join(SRC_TESTS, rel)
         expect(existsSync(p), `CONCURRENT_EXEMPT 里的 ${rel} 不存在（清单过期）`).toBe(true)
-        const still = concurrentViolations(parsedOf(p)).some((v) => v.why.startsWith('.concurrent'))
+        const sfExempt = parsedOf(p)
+        expect(sfExempt, `CONCURRENT_EXEMPT 里的 ${rel} 读不到`).toBeDefined()
+        const still = concurrentViolations(sfExempt!).some((v) => v.why.startsWith('.concurrent'))
         expect(still, `${rel} 已不再用 .concurrent，请从 CONCURRENT_EXEMPT 删除`).toBe(true)
       }
     })
