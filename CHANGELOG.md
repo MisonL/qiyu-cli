@@ -47,6 +47,13 @@
 
 ### 修复
 
+- **静态判据再把「同一套语法里合法写法」补齐两处**（2026-11-16，Codex PR#81 第十二轮，
+  均为 P2）：① 属性基座是**调用**的修饰链（`it.skipIf(false).concurrent(…)`）——`callChain`
+  穿透基座时把修饰尾巴一起接上（`it.skipIf.concurrent`），原先整条链判成 `undefined`；
+  被调表达式带非空断言（`setTimeout!(…)`）编译后照常调度，`calleeChain` 统一先 `unwrap`；
+  ② 计算属性键的表达式被括号 / 断言包住（`{ [('concurrent')]: true }`、`{ ['concurrent' as const]: true }`）
+  仍是静态字面量键，识别前先 `unwrap`。三个变异（计算键不剥包装 / 不穿调用基座 /
+  `calleeChain` 不剥包装）各自变红。
 - **外部写的第一条语句报错也会污掉所有者的事务**（2026-11-16，CodeRabbit PR#81 第十轮
   major，真库实测复现）：`del` 原先「先 `count`、后判归属」。若目标表被换成执行即报错的
   view（实测 `CAST` 失败的 `WHERE`），这条 count 就在**别人的事务里**执行并把它标成

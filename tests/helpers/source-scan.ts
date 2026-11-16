@@ -78,11 +78,13 @@ export function unwrap(node: ts.Expression): ts.Expression {
 
 /** 标识符 / 属性访问链 → 段名数组（`it.concurrent` → `['it','concurrent']`）；其余返回 undefined。 */
 export function calleeChain(node: ts.Expression): string[] | undefined {
-  if (ts.isIdentifier(node)) return [node.text]
-  if (ts.isParenthesizedExpression(node)) return calleeChain(node.expression)
-  if (ts.isPropertyAccessExpression(node)) {
-    const base = calleeChain(node.expression)
-    return base === undefined ? undefined : [...base, node.name.text]
+  const u = unwrap(node)
+  if (ts.isIdentifier(u)) return [u.text]
+  // `it.skipIf(false).concurrent(…)`：属性基座是一次**调用** —— 链只保留静态可判的尾巴
+  // （这里给出 `undefined` 而不会谎报名字），由 `callChain` 处理「基座是调用」的穿透。
+  if (ts.isPropertyAccessExpression(u)) {
+    const base = calleeChain(u.expression)
+    return base === undefined ? undefined : [...base, u.name.text]
   }
   return undefined
 }
@@ -93,16 +95,35 @@ export function calleeChain(node: ts.Expression): string[] | undefined {
  * `viaCall` 表示中间跨过了一层「先调用再调用」。
  */
 export function callChain(call: ts.CallExpression): { chain: string[]; viaCall: boolean } | undefined {
-  let e: ts.Expression = call.expression
+  // 修饰名（`it.skipIf(false).concurrent` 里的 `concurrent`）先攒着，穿透基座后再接上 ——
+  // 只穿不透时会把尾巴丢掉，`concurrent` 就认不出来了（Codex PR#81 第十二轮）。
+  const tail: string[] = []
   let viaCall = false
+  const resolve = (node: ts.Expression): string[] | undefined => {
+    const chain = calleeChain(node)
+    return chain === undefined ? undefined : [...chain, ...tail]
+  }
+  let e: ts.Expression = call.expression
   for (;;) {
     if (ts.isCallExpression(e)) { viaCall = true; e = e.expression; continue }
+    // `it.skipIf(false).concurrent(…)`：基座是**调用**而尾巴是修饰名 —— 穿透基座取名字链，
+    // 基底调用的名字（`skipIf`）与尾巴一起拼成 `it.skipIf.concurrent` —— 判据只看「链里有没有
+    // `concurrent`」，保留它能让报错文案如实呈现源码里的写法。
+    if (ts.isPropertyAccessExpression(e)) {
+      const base = unwrap(e.expression)
+      if (ts.isCallExpression(base)) {
+        tail.unshift(e.name.text)
+        viaCall = true
+        e = base.expression
+        continue
+      }
+    }
     // 标签模板：`it.each\`a|b\`(名, 选, 体)` —— 标签是内层表达式（Codex PR#81 第十轮）
     if (ts.isTaggedTemplateExpression(e)) { viaCall = true; e = e.tag; continue }
     if (ts.isNonNullExpression(e) || ts.isParenthesizedExpression(e)) { e = e.expression; continue }
     break
   }
-  const chain = calleeChain(e)
+  const chain = resolve(e)
   return chain === undefined ? undefined : { chain, viaCall }
 }
 
@@ -157,7 +178,9 @@ export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Exp
       if (ts.isIdentifier(n)) out.set(n.text, p.initializer)
       else if (ts.isStringLiteral(n) || ts.isNumericLiteral(n)) out.set(n.text, p.initializer)
       else if (ts.isComputedPropertyName(n)) {
-        const e = n.expression
+        // ⚠️ 键表达式可能是括号 / 断言包装后的字面量（`{ [('concurrent')]: true }`、
+        // `{ ['concurrent' as const]: true }`，Codex PR#81 第十二轮）—— 先剥离包装再认字面量。
+        const e = unwrap(n.expression)
         if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e) || ts.isNumericLiteral(e)) {
           out.set(e.text, p.initializer)
         }
