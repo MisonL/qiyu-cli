@@ -280,6 +280,32 @@ describe('duckdb —— 事务', () => {
     expect(runs, '关闭后不得再进入上下文（那会把 disable 过的实例重新启用）').toBe(before)
   })
 
+  it('事务进行中被 close：失败路径的回滚不得再进入上下文（CodeRabbit PR#81 第十九轮 minor）', async () => {
+    // 事故路径：`close()` 置 `closed` 并 `alsTx.disable()`；进行中的事务下一次语句（通常是
+    // COMMIT）报「连接已关闭」→ catch 里原样 `alsTx.run(token, safeRollback)` 又把它启用，
+    // 而 `safeRollback` 因 `closed` 必然失败、之后也没人 disable。每次「事务中关库」都漏一个。
+    let runs = 0
+    const makeAls = (): FakeAls => {
+      const real = new AsyncLocalStorage<symbol>()
+      return {
+        run: <T>(store: symbol, f: () => T): T => { runs++; return real.run(store, f) },
+        getStore: () => real.getStore(),
+        disable: () => real.disable(),
+      }
+    }
+    const s = await createDuckDbStore(cfg, 'rw', { makeAls })
+    await s.init()
+    const tx = s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      await s.close()                       // 事务进行中关库：后续语句必失败
+    })
+    const err = await tx.then(() => null, (e: unknown) => e)
+    expect(err, '事务中的语句在关闭后报 usage').toMatchObject({ kind: 'usage' })
+    // 正常路径上 BEGIN / 回调 / COMMIT 共用**一次** `alsTx.run`：`runs === 1`。
+    // 回滚若也进入上下文就是 2 —— 精确断言，宽松的 `<= n` 会被正常路径自身满足。
+    expect(runs, '关闭后的回滚路径不得再进入上下文').toBe(1)
+  })
+
   it('成功提交', async () => {
     const s = await fresh()
     await s.transaction(async (tx) => { await tx.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }]) })

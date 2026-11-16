@@ -47,6 +47,15 @@
 
 ### 修复
 
+- **关闭后的回滚路径 + throw 规则止于函数边界**（2026-11-17，CodeRabbit PR#81 第十九轮 minor ×2；
+  Codex 第十九轮无新发现）：
+  ① `close()` 在事务进行中时，catch 里原样 `alsTx.run(token, safeRollback)` 会把 disable 过的
+  上下文**重新启用**，而 `safeRollback` 因 `closed` 必然失败、之后也没人 disable —— 每次
+  「事务中关库」漏一个启用态上下文。收敛到 `rollbackInTx`（关闭时直接跳过）；用例以 `makeAls`
+  精确断言「进出上下文的次数 = 1」，变异实测 2 变红。
+  ② `THROW_ERROR` 向上回溯时越过函数边界：`throw Object.assign(new Error('clean'), { makeError:
+  () => new Error('**x**') })` 里回调的 message 永远不会被抛出，却被判成违规（探针复现）。
+  回溯止于箭头 / 函数表达式 / 声明 / 方法 / 访问器 / 构造函数，自检补该反例，变异实测变红。
 - **关闭后的入口、静态展开与逗号表达式**（2026-11-17，Codex PR#81 第十八轮 P2 ×3、
   CodeRabbit 疑问型 finding ×1，逐条探针复现）：
   ① `transaction()` 入口没查 `closed`：`close()` 里 `disable()` 过的事务上下文会被

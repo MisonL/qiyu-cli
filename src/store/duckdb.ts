@@ -359,6 +359,17 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   }
 
   /**
+   * 在令牌上下文里 ROLLBACK。⚠️ **关闭后不得进入上下文**（CodeRabbit PR#81 第十九轮 minor）：
+   * `close()` 已把 ALS `disable()` 掉，而 `alsTx.run()` 会把它**重新启用**、失败路径又不再
+   * disable —— 「事务进行中被 close」每次都在攒一个启用态上下文。`execSql` 在这种情况下
+   * 本来也必然抛「连接已关闭」，回滚必然失败，所以直接跳过。
+   */
+  const rollbackInTx = async (token: TxToken): Promise<void> => {
+    if (closed) return
+    await alsTx.run(token, () => safeRollback())
+  }
+
+  /**
    * 他人库指纹（`init` 专用）：命中返回成因文案，否则 null。
    *
    * ⚠️ **只认「我们绝不可能产出」的形态**（2026-11-14，历史审查 PR#4 复核实测）：
@@ -519,7 +530,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           return written
         })
       } catch (e) {
-        await alsTx.run(token, () => safeRollback())
+        await rollbackInTx(token)
         throw e
       } finally {
         inTx = false
@@ -587,7 +598,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       } catch (e) {
         // ROLLBACK 也走 `execSql`：在令牌上下文里发，闸门才认得它属于本事务（若 BEGIN 都没
         // 成功，`safeRollback` 吞掉「没有事务」的次生错误）。
-        await alsTx.run(token, () => safeRollback())
+        await rollbackInTx(token)
         throw e
       } finally {
         inTx = false

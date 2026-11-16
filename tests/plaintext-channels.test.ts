@@ -136,16 +136,26 @@ const USAGE_FAIL: Rule = {
  * `throw` 里的 `new Error(...)`（含 `throw Object.assign(new Error(…))`）。
  * 两条出口都会把 message 变成人读文本：`callOne` 的 catch 直接写 stderr；未捕获时
  * Node 默认打印器把 message 与堆栈一起打到终端。AST 判据天然跨行、跨嵌套。
+ * ⚠️ 向上回溯**止于函数边界**（CodeRabbit PR#81 第十九轮 minor，探针复现）：
+ * `throw Object.assign(new Error('clean'), { makeError: () => new Error('**x**') })` 里
+ * 回调内的 `new Error` 不在执行路径上 —— 它的 message 永远不会被抛出。函数边界包括
+ * 箭头函数 / 函数表达式 / 声明 / 方法 / 访问器 / 构造函数。
  */
 const THROW_ERROR: Rule = {
   name: 'throw new Error',
   hit: (sf) => {
     const out: string[] = []
+    const isFnBoundary = (n: ts.Node): boolean =>
+      ts.isArrowFunction(n) || ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n)
+      || ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)
+      || ts.isConstructorDeclaration(n)
     eachInvocation(sf, (n, line) => {
       if (!ts.isNewExpression(n) || !named(n, 'Error')) return
       let up: ts.Node = n
-      while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) up = up.parent
-      if (up.parent === undefined) return
+      while (up.parent !== undefined && !ts.isThrowStatement(up.parent) && !isFnBoundary(up.parent)) {
+        up = up.parent
+      }
+      if (up.parent === undefined || !ts.isThrowStatement(up.parent)) return
       const why = starsIn(argsOf(n))
       if (why !== undefined) out.push(`L${line}  ${why}`)
     })
@@ -254,6 +264,8 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw new Error('崩溃：**别**')",                              // THROW 命中 1
       "throw Object.assign(\n  new Error('跨行：**也别**'),\n  { code: 'usage' })", // 跨行也命中
       "const e = new Error('非抛出：**不算**')",                       // 不是 throw，不算
+      // 函数边界内的 new Error 不在执行路径上（CR 第十九轮）：工厂回调里的 message 永远不会被抛出
+      "throw Object.assign(new Error('干净'), { makeError: () => new Error('**未抛出**') })",
       "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
       "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
