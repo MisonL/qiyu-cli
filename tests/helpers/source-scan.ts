@@ -76,12 +76,14 @@ export function unwrap(node: ts.Expression): ts.Expression {
   return n
 }
 
-/** 标识符 / 属性访问链 → 段名数组（`it.concurrent` → `['it','concurrent']`）；其余返回 undefined。 */
+/**
+ * 被调表达式的**静态**名字链：标识符 / 属性访问（`globalThis.setTimeout` → 两段）。
+ * 基座是调用（`it.skipIf(false).concurrent`）时**只取穿透之上的名字链**由 `callChain` 负责 ——
+ * 本函数遇到它返回 undefined（不谎报一半的链）。
+ */
 export function calleeChain(node: ts.Expression): string[] | undefined {
   const u = unwrap(node)
   if (ts.isIdentifier(u)) return [u.text]
-  // `it.skipIf(false).concurrent(…)`：属性基座是一次**调用** —— 链只保留静态可判的尾巴
-  // （这里给出 `undefined` 而不会谎报名字），由 `callChain` 处理「基座是调用」的穿透。
   if (ts.isPropertyAccessExpression(u)) {
     const base = calleeChain(u.expression)
     return base === undefined ? undefined : [...base, u.name.text]
@@ -90,40 +92,32 @@ export function calleeChain(node: ts.Expression): string[] | undefined {
 }
 
 /**
- * 调用表达式的「名字链」：链式登记 `it.each(表)(名, 选项, 体)` 的**外层**调用，其
- * expression 本身也是 CallExpression —— 这时取最内层被调用者的名字链。
- * `viaCall` 表示中间跨过了一层「先调用再调用」。
+ * 调用表达式的「名字链」：属性访问保留名字、调用 / 标签模板穿透基座。
+ * - 链式登记：`it.each(表)('名', 选项, 体)` 的外层调用 → `['it','each']`；
+ * - 条件基座：`it.skipIf(false).concurrent(…)` → `['it','skipIf','concurrent']`；
+ * - 叠加修饰：`it.skipIf(false).concurrent.each([1])('case', …)` → `['it','skipIf','concurrent','each']`
+ *   （递归穿透；只穿一层会在叠加修饰时判成 undefined）。
+ * `viaCall` 表示链里跨过了至少一层调用（对判据无影响，仅供报错文案区分）。
  */
 export function callChain(call: ts.CallExpression): { chain: string[]; viaCall: boolean } | undefined {
-  // 修饰名（`it.skipIf(false).concurrent` 里的 `concurrent`）先攒着，穿透基座后再接上 ——
-  // 只穿不透时会把尾巴丢掉，`concurrent` 就认不出来了（Codex PR#81 第十二轮）。
-  const tail: string[] = []
+  // 递归解析：属性访问**保留名字**、调用 / 标签模板**穿透基座**，于是
+  // `it.skipIf(false).concurrent.each([1])('case', …)` 与 `it.each(表)('名', …)` 都能得到
+  // 完整的名字链（CodeRabbit PR#81 第十三轮：只穿一层调用会在叠加修饰时判成 undefined）。
   let viaCall = false
   const resolve = (node: ts.Expression): string[] | undefined => {
-    const chain = calleeChain(node)
-    return chain === undefined ? undefined : [...chain, ...tail]
-  }
-  let e: ts.Expression = call.expression
-  for (;;) {
-    if (ts.isCallExpression(e)) { viaCall = true; e = e.expression; continue }
-    // `it.skipIf(false).concurrent(…)`：基座是**调用**而尾巴是修饰名 —— 穿透基座取名字链，
-    // 基底调用的名字（`skipIf`）与尾巴一起拼成 `it.skipIf.concurrent` —— 判据只看「链里有没有
-    // `concurrent`」，保留它能让报错文案如实呈现源码里的写法。
+    const e = unwrap(node)
+    if (ts.isIdentifier(e)) return [e.text]
     if (ts.isPropertyAccessExpression(e)) {
-      const base = unwrap(e.expression)
-      if (ts.isCallExpression(base)) {
-        tail.unshift(e.name.text)
-        viaCall = true
-        e = base.expression
-        continue
-      }
+      const base = resolve(e.expression)
+      return base === undefined ? undefined : [...base, e.name.text]
     }
-    // 标签模板：`it.each\`a|b\`(名, 选, 体)` —— 标签是内层表达式（Codex PR#81 第十轮）
-    if (ts.isTaggedTemplateExpression(e)) { viaCall = true; e = e.tag; continue }
-    if (ts.isNonNullExpression(e) || ts.isParenthesizedExpression(e)) { e = e.expression; continue }
-    break
+    if (ts.isCallExpression(e) || ts.isTaggedTemplateExpression(e)) {
+      viaCall = true
+      return ts.isCallExpression(e) ? resolve(e.expression) : resolve(e.tag)
+    }
+    return undefined
   }
-  const chain = resolve(e)
+  const chain = resolve(call.expression)
   return chain === undefined ? undefined : { chain, viaCall }
 }
 

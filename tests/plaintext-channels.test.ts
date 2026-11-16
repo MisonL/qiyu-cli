@@ -34,7 +34,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
-import { lineOf, literalTexts, parseTs } from './helpers/source-scan.js'
+import { lineOf, literalTexts, parseTs, unwrap } from './helpers/source-scan.js'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SRC = join(ROOT, 'src')
@@ -59,9 +59,30 @@ interface Hit { file: string; line: number; snippet: string }
  */
 type Rule = { name: string; hit: (sf: ts.SourceFile) => string[] }
 
-/** 实参里含 `**` 时的说明（取命中段附近文本，便于定位）。 */
+/**
+ * 常量字符串表达式的**拼接结果**：`'*' + '*bad*' + '*'` 单独看每段都没有 `**`，拼起来却有。
+ * 只对「全由字面量 / `+` / 括号组成」的表达式求值（其余返回 undefined）—— 运行时的拼接
+ * 本来就不在本文件的边界内（见文件头的「只看字面量」）。
+ */
+function constConcat(node: ts.Expression): string | undefined {
+  const u = unwrap(node)
+  if (ts.isStringLiteral(u) || ts.isNoSubstitutionTemplateLiteral(u)) return u.text
+  if (ts.isParenthesizedExpression(u)) return constConcat(u.expression)
+  if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const l = constConcat(u.left)
+    const r = constConcat(u.right)
+    return l === undefined || r === undefined ? undefined : l + r
+  }
+  return undefined
+}
+
+/** 实参里含 `**` 时的说明：逐字面量看，**也**看常量拼接的结果（CodeRabbit PR#81 第十三轮）。 */
 function starsIn(args: readonly ts.Expression[]): string | undefined {
   const texts = args.flatMap((a) => literalTexts(a))
+  for (const a of args) {
+    const cc = constConcat(a)
+    if (cc !== undefined && cc.includes('**')) texts.push(cc)
+  }
   if (!texts.some((t) => t.includes('**'))) return undefined
   return texts.filter((t) => t.includes('**')).join(' | ').replace(/\s+/g, ' ').slice(0, 120)
 }
@@ -141,6 +162,9 @@ const USAGE_CONST: Rule = {
       for (const d of st.declarationList.declarations) {
         if (!ts.isIdentifier(d.name) || !/USAGE/.test(d.name.text) || d.initializer === undefined) continue
         const texts = literalTexts(d.initializer)
+        // 常量初始化表达式本身可能是拼接（`'a' + '**b**'`）—— 整段求值再判一次
+        const whole = constConcat(d.initializer)
+        if (whole !== undefined && whole.includes('**')) texts.push(whole)
         if (!texts.some((t) => t.includes('**'))) continue
         out.push(`L${lineOf(sf, d)}  ${d.name.text} = `
           + texts.filter((t) => t.includes('**')).join(' | ').replace(/\s+/g, ' ').slice(0, 120))
@@ -215,13 +239,18 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
       "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
       "const NOT_LABEL = '**不算**'",                                  // 名字不含 USAGE
+      "usageFail('*' + '*bad*' + '*')",                                // 常量拼接：单段无 **，拼起来有（CR 第十三轮）
+      "process.stderr.write('告' + '警' + '*' + '*' + 'x' + '*' + '*')",  // 同上，stderr 通道
+      "const CONCAT_USAGE = '用法：' + '*粗' + '*体*' + '*'",           // 同上：**单段都不含 `**`**，只有拼接结果含
+      "usageFail(prefix + '*')",                                       // 含变量：拼接结果不在静态边界内，不算
       'usageFail(`outer ${String(`)`)} **bad**`)',                    // 嵌套模板：真调用、星号在字面段
     ].join('\n')
     const sf = parseTs(fake)
-    expect(USAGE_FAIL.hit(sf), 'usageFail 规则：两条真违规（含嵌套模板那条），字符串样本不算').toHaveLength(2)
+    expect(USAGE_FAIL.hit(sf), 'usageFail 规则：字面量 1 条 + 嵌套模板 1 条 + 常量拼接 1 条；含变量那条不算')
+      .toHaveLength(3)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行各一条；非 throw 的 new Error 不算').toHaveLength(2)
-    expect(STDERR_WRITE.hit(sf), 'stderr 规则：字符串实参 + 模板实参各一条').toHaveLength(2)
-    expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：只认名字带 USAGE 的顶层 const').toHaveLength(1)
+    expect(STDERR_WRITE.hit(sf), 'stderr 规则：字符串实参 + 模板实参 + 常量拼接各一条').toHaveLength(3)
+    expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)
     // 注释里的 `**` 不是字面量；模板里的字面段是（这条钉住 literalTexts 的两半）
     const cmt = parseTs('// **这是注释**\nconst a = `x **y** ${z}`')
     expect(literalTexts(cmt).filter((t) => t.includes('**'))).toEqual(['x **y** '])

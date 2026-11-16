@@ -162,15 +162,19 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
     v !== undefined && unwrap(v).kind === ts.SyntaxKind.TrueKeyword
   const isFalse = (v: ts.Expression | undefined): boolean =>
     v !== undefined && unwrap(v).kind === ts.SyntaxKind.FalseKeyword
+  const seen = new Set<number>()
   for (const call of collectCalls(sf)) {
     const c = callChain(call)
     if (c === undefined) continue
     const base = c.chain[0]!
+    // 链式登记的两层调用（表格层 / 登记层）落在同一行，同一处违规只报一次
+    if (seen.has(lineOf(sf, call))) continue
     if (REGISTRARS.has(base)) {
       const isAlias = c.chain.includes('concurrent')
         || c.chain.some((seg) => seg.toLowerCase() === 'concurrent')
       if (isAlias) {
         out.push({ line: lineOf(sf, call), why: `.concurrent 修饰链：${c.chain.join('.')}` })
+        seen.add(lineOf(sf, call))
         continue
       }
       for (const a of call.arguments) {
@@ -179,10 +183,12 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         const props = objectProps(u)
         if (isTrue(props.get('concurrent'))) {
           out.push({ line: lineOf(sf, call), why: '选项对象 concurrent: true' })
+          seen.add(lineOf(sf, call))
         }
         // `describe`/`suite` 上的 `sequential: false` 与 `concurrent: true` 等价
         if (SUITES.has(base) && isFalse(props.get('sequential'))) {
           out.push({ line: lineOf(sf, call), why: '套件选项 sequential: false' })
+          seen.add(lineOf(sf, call))
         }
       }
     }
@@ -388,6 +394,17 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 基座是调用、尾巴是修饰名（Codex PR#81 第十二轮）：`it.skipIf(false).concurrent(…)`
     expect(concHits(`${bt('it.skipIf(false).', 'concurrent("q", () => {})')}`), '条件基座 + concurrent')
       .toEqual(['alias:it.skipIf.concurrent'])
+    // 叠加修饰（CodeRabbit PR#81 第十三轮）：条件基座 + concurrent + each。
+    // ⚠️ 必须**两层以上**穿透才咬人：`it.skipIf(false).concurrent(…)` 只穿一层也成立，
+    // 用单层样本时「只穿一层」的变异会存活（变异实测）。
+    expect(concHits(`${bt('it.skipIf(false).concurrent.each([1])', '("case", () => {})')}`), '叠加修饰')
+      .toEqual(['alias:it.skipIf.concurrent.each'])
+    expect(concHits(`${bt('it.runIf(a).concurrent.skip.each([1, 2])', '("case2", () => {})')}`), '三层叠加')
+      .toEqual(['alias:it.runIf.concurrent.skip.each'])
+    // ⚠️ 真正依赖**递归穿透**的是「链上没有 concurrent、并发只写在选项位」的外层调用：
+    // 内层调用（表格层）自己不含 concurrent，不会被单独判中；只穿一层时外层链为 undefined。
+    expect(concHits(`${bt('it.skipIf(false).each([1])', '("case3", { con', 'current: true }, () => {})')}`),
+      '条件基座 + each + 选项位并发').toEqual(['opt'])
     expect(concHits(`${bt("it('A', { con", 'current: true }, () => {})')}`)).toEqual(['opt'])
     expect(concHits(`${bt("it('B', { con", 'current: false }, () => {})')}`)).toEqual([])
     expect(concHits(`${bt("it('C', { 'con", "current': true }, () => {})")}`), '字符串键同属选项（Codex 第九轮）').toEqual(['opt'])
