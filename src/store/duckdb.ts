@@ -52,7 +52,16 @@ function usage(msg: string): Error {
 
 /** 事务归属的异步上下文。⚠️ 必须**每个 Store 实例一份**（在 `createDuckDbStore` 内建），
  *  否则同一进程里两个实例的事务令牌会互相干扰。 */
-type TxAls = AsyncLocalStorage<symbol>
+/**
+ * 事务令牌。区分 `transaction()` 与自动事务（upsert 自开的）：两者都登记归属，但对外
+ * 契约不同 —— 自动事务期间外部 `transaction()` 必须报「不得嵌套事务」（它是调用方之间的
+ * 竞争，不是嵌套，见 `upsert` 那里的注释）。
+ */
+type TxToken = symbol | AutoTx
+/** 自动事务的令牌类型（`kind` 只用于 `instanceof`，不读字段）。 */
+class AutoTx {}
+
+type TxAls = AsyncLocalStorage<TxToken>
 
 export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps: DuckDbDeps = {}): Promise<Store> {
   let mod: { DuckDBInstance: { create: (p: string, o?: unknown) => Promise<unknown> } }
@@ -168,7 +177,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 归属判据用 `AsyncLocalStorage`：只有从 `transaction()` 回调**内部**发起的写才算事务内。
    * 单连接、`await` 串行的既有用法（store init/status、sync 引擎）行为完全不变。
    */
-  let txToken: symbol | undefined
+  let txToken: TxToken | undefined
   const alsTx: TxAls = new AsyncLocalStorage<symbol>()
 
   // ⚠️ 所有语句执行收敛到这一个方法 —— 测试 spy 的落点（spec §5.3）。
@@ -458,20 +467,47 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         assertTxOwnership()
         return doUpsert(t, rows)
       }
-      // ⚠️ BEGIN/COMMIT 闭包直调 execSql：测试 spy 只断言**数据语句**条数（语句数 == 批次
-      // 数），事务控制语句不走 store.execSql 属性查找（与测试为权威的裁定一致）。
-      await execSql('BEGIN')
+      if (closed) throw usage('数据库连接已关闭')
+      // ⚠️ 自动事务也**登记归属**（CodeRabbit PR#81 第八轮 major）：只打 BEGIN 不置 `inTx`
+      // 时，另有调用方在此期间 `transaction()`，它的 BEGIN 会撞上「事务已开」而失败 ——
+      // 那条失败路径若再 ROLLBACK，就会把**这里的**活动事务回滚掉，之后的批次落在事务外、
+      // 最终 COMMIT 失败留下部分写入。登记后用单一令牌管住：同一实例上事实并存两种事务
+      // 从根上不存在（并发的第二次写会在 `assertTxOwnership` 被拒，且它自己的 BEGIN 不会
+      // 发出、也就没有任何人会回滚别人的事务）。
+      // 登记与整个（同步段 + 后续批次）放在同一个异步上下文里：`doUpsert` 内部贴着 INSERT
+      // 的 `assertTxOwnership` 要有令牌才认得出「这是自己那条自动事务」。
+      const token = new AutoTx()
+      inTx = true
+      txToken = token
+      let n: number
       try {
-        const n = await doUpsert(t, rows)
-        await execSql('COMMIT')
-        return n
+        n = await alsTx.run(token, async () => {
+          // BEGIN/COMMIT 闭包直调 execSql：测试 spy 只断言**数据语句**条数（语句数 == 批次
+          // 数），事务控制语句不走 store.execSql 属性查找（与测试为权威的裁定一致）。
+          // BEGIN 失败的收尾理由同 `transaction()`（见那里的实测注释）。
+          await execSql('BEGIN')
+          const written = await doUpsert(t, rows)
+          await execSql('COMMIT')
+          return written
+        })
       } catch (e) {
         await safeRollback()
         throw e
+      } finally {
+        inTx = false
+        txToken = undefined
       }
+      return n
     },
     delete: del,
     async transaction<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T> {
+      // 自动事务进行中又来 `transaction()`：在事务回调**内部**调用会落到 `alsTx.run(token)` 里、
+      // 由 `fn` 里的 `tx.transaction` 递归进入（那条路径本来就报「不得嵌套」）；这里挡的是
+      // **另一条异步链**的显式事务 —— 它不是嵌套，而是并发竞争，如实报成竞争。
+      if (inTx && txToken instanceof AutoTx) {
+        throw Object.assign(new Error('本实例上有一条自动事务（upsert/delete 自开）尚未提交，'
+          + '此时不能开始显式事务 —— 请让同一 Store 实例上的写串行 await'), { kind: 'internal' })
+      }
       if (inTx) throw usage('不得嵌套事务')
       // ⚠️ 归属登记必须**先于** `BEGIN` 的 await（CodeRabbit PR#81 第七轮 major）：原先
       // `inTx` 在 BEGIN 落定之后才置位，BEGIN 这条 await 期间它的外部写会被放行，随后的
@@ -480,8 +516,16 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       inTx = true
       txToken = token
       try {
-        // BEGIN 失败同样落入下面的 catch：`safeRollback` 吞掉「无事务可回滚」的次生错误、
-        // 原错误照常抛出；finally 复位登记。
+        // ⚠️ BEGIN **失败也要发 ROLLBACK**（2026-11-16 实测裁定，拒绝 CodeRabbit 第八轮的建议）：
+        // 手开事务存在时嵌套 BEGIN 会被 DuckDB 拒绝，**而它同时已把那条事务标记为 aborted**
+        // —— 数据在任何后续动作之前就已经废了。此时两种收尾的差别只在「失败是否可见」：
+        //   · 发 ROLLBACK：连接恢复干净，之后调用方的 COMMIT 报 `no transaction is active`
+        //     （**响亮**地告诉它事务没了）—— 实测正是如此；
+        //   · 不发 ROLLBACK：调用方的 COMMIT 返回成功，但 DuckDB 静默丢弃该事务的全部写入
+        //     （实测：行数归零、无任何报错）—— 这才是"部分写入 + 静默丢数据"。
+        // 所以这里保留 ROLLBACK；`safeRollback` 吞掉「根本没有事务」的次生错误。
+        // 真正要堵的是「BEGIN 根本不该发出」：自动事务已登记归属（见 `upsert`）、显式事务
+        // 在 BEGIN 前登记 —— 支持路径上不会再出现第二条 BEGIN（用例见 duckdb.test 的两条）。
         await execSql('BEGIN')
         // ⚠️ 真实投影而非 cast：WriteTx 类型上不含 query/init/close（spec §4.2.6 防线分层），
         // 运行时对象也不得携带 —— 直接传 store 的话 `Object.keys(tx)` 可枚举出 query。

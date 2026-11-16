@@ -398,6 +398,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // ⚠️ 样本里的调用名也要 `bt` 拼接（否则「抹字面量」那一层会把它们当字符串内容抹掉）
     expect(guardOf("beforeEach(() => { const x = '" + "(" + "'; " + "set" + "Timeout(w, 80) })")).toEqual(["set" + "Timeout("])
     expect(scanBalanced(bt("f(')"), 1)[1], '未配平必须落在文本末尾而不是 -1/抛错').toBe(bt("f(')").length)
+    // 嵌套模板：${…} 里的嵌套模板反引号不得让外层提前收尾（CodeRabbit PR#81 第八轮）
+    const nestTpl = '(() => { const s = `a${' + '`' + ')' + '`' + '}b` })'
+    expect(scanBalanced(nestTpl, nestTpl.indexOf('('))[1], '嵌套模板里的 ) 被当成了外层终点').toBe(nestTpl.length)
 
     // —— 并发那条判据：命中 / 不命中 ——
     expect([...bt('it.', 'concurrent("x", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)

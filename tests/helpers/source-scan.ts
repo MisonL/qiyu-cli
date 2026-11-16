@@ -76,7 +76,7 @@ export function blankLiterals(text: string): string {
     if (c === '/' && text[i + 1] === '/') { const s0 = i; while (i < text.length && text[i] !== '\n') i++; blank(s0, i); continue }
     if (c === '/' && text[i + 1] === '*') { const s0 = i; const e = text.indexOf('*/', i + 2); i = e === -1 ? text.length : e + 2; blank(s0, i); continue }
     if (c === '/' && regexAllowedAfter(text, i)) { const s0 = i; i = skipRegex(text, i); blank(s0, i); continue }
-    if (c === '`') { i = blankTemplate(out, text, i + 1); continue }
+    if (c === '`') { i = scanTemplate(text, i + 1, blank); continue }
     if (c === "'" || c === '"') { const s0 = i; i = skipQuote(text, i); blank(s0 + 1, i - 1); continue }
     i++
   }
@@ -84,27 +84,29 @@ export function blankLiterals(text: string): string {
 }
 
 /**
- * 抹掉模板字符串的**字面段**、保留 `${…}` 里的代码（可能嵌套模板），返回结束反引号之后
- * 的下标。`q` 指向开头反引号之后的第一个字符。
+ * 模板字符串扫描：从 `q`（开头反引号之后的第一个字符）扫到结束反引号，返回其**之后**的
+ * 下标；过程中把每个**字面段** `[a, b)` 交给 `onLiteral`（抹除用，`blankLiterals` 传）。
+ * ⚠️ `${…}` 里是**代码**：继续按词法单元扫（字符串 / 嵌套模板 / 注释 / 配对花括号），
+ * 其中的字面量同样回调 —— 嵌套模板里的 `)` 不会提前结束外层（CodeRabbit PR#81 第八轮：
+ * `` usageFail(`outer ${String(`)`)} **bad**`) `` 旧实现停在嵌套模板的反引号上）。
  */
-function blankTemplate(out: string[], text: string, q: number): number {
-  const blank = (a: number, b: number): void => {
-    for (let k = a; k < b; k++) if (out[k] !== '\n') out[k] = ' '
-  }
+function scanTemplate(text: string, q: number, onLiteral?: (a: number, b: number) => void): number {
   let litStart = q
   let i = q
   while (i < text.length) {
     const c = text[i]!
     if (c === '\\') { i += 2; continue }
-    if (c === '`') { blank(litStart, i); return i + 1 }
+    if (c === '`') { onLiteral?.(litStart, i); return i + 1 }
     if (c === '$' && text[i + 1] === '{') {
-      blank(litStart, i)
+      onLiteral?.(litStart, i)
       let depth = 0
       let k = i + 1                       // 指向 `{`
       while (k < text.length) {
         const ch = text[k]!
         if (ch === "'" || ch === '"') { k = skipQuote(text, k); continue }
-        if (ch === '`') { k = blankTemplate(out, text, k + 1); continue }
+        if (ch === '`') { k = nestedLiteral(text, k, onLiteral); continue }
+        if (ch === '/' && text[k + 1] === '/') { while (k < text.length && text[k] !== '\n') k++; continue }
+        if (ch === '/' && text[k + 1] === '*') { const t = text.indexOf('*/', k + 2); k = t === -1 ? text.length : t + 2; continue }
         if (ch === '{') depth++
         else if (ch === '}') { depth--; if (depth === 0) break }
         k++
@@ -115,8 +117,13 @@ function blankTemplate(out: string[], text: string, q: number): number {
     }
     i++
   }
-  blank(litStart, text.length)
+  onLiteral?.(litStart, text.length)
   return text.length
+}
+
+/** `${…}` 里的嵌套模板：扫描它并把字面量同样交给 `onLiteral`。返回其后下标。 */
+function nestedLiteral(text: string, k: number, onLiteral?: (a: number, b: number) => void): number {
+  return scanTemplate(text, k + 1, onLiteral)
 }
 
 /**
@@ -262,8 +269,14 @@ export function scanBalanced(text: string, open: number): [number, number] {
   return [text.length, text.length]
 }
 
-/** 跳过以 `q` 开头的字符串 / 模板，返回结束引号的下标。未闭合则返回 `text.length`。 */
+/**
+ * 跳过以 `q` 开头的字符串 / 模板字面量，返回结束引号**之后**的下标；未闭合返回
+ * `text.length`。
+ * ⚠️ 模板走 `scanTemplate`（`${…}` 里的嵌套模板与字符串一并跨过，CodeRabbit PR#81 第八轮）：
+ * 只按裸引号扫会在嵌套模板的反引号处提前收尾，后续把字面量里的 `)` 当成配对符号。
+ */
 export function skipQuote(text: string, q: number): number {
+  if (text[q] === '`') return scanTemplate(text, q + 1)
   const quote = text[q]!
   let i = q + 1
   while (i < text.length) {

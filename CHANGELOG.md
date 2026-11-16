@@ -47,6 +47,22 @@
 
 ### 修复
 
+- **自动事务（`upsert`/`delete` 自开）也登记归属，第二条 `BEGIN` 不再发出**（2026-11-16，
+  CodeRabbit PR#81 第八轮 major 的**诉求**；其收尾方案经实测否决）：自动事务原先只打
+  `BEGIN` 不置 `inTx`，并发的显式 `transaction()` 会发出第二条 BEGIN 并被 DuckDB 拒绝。
+  现在自动事务登记 `AutoTx` 令牌、并把批次放进同一异步上下文（贴着 INSERT 的归属检查认得出
+  自己），并发的显式事务**在入口**就被拒成 `internal`（不是 `usage` 嵌套）、**不发出 BEGIN**；
+  两条用例各配变异（不登记 → 报 DuckDB 原始错；不区分 AutoTx → 报 usage）。
+  ⚠️ 评审建议的「BEGIN 失败就别 ROLLBACK」被**实测否决**：手开事务存在时嵌套 BEGIN 会先
+  把那条事务标记为 aborted（数据已废），发 ROLLBACK 至少让随后的 COMMIT 报
+  `no transaction is active`（响亮）；不发则 COMMIT 成功、写入被静默丢弃（行数归零、无报错）。
+  实测证据与取舍写进 `src/store/duckdb.ts` 的代码注释，并留一条用例钉住「响亮失败」契约。
+- **`skipQuote` 处理嵌套模板**（2026-11-16，CodeRabbit PR#81 第八轮 minor）：
+  `` usageFail(`outer ${String(`)`)} **bad**`) `` 里嵌套模板的反引号会让跳过逻辑提前收尾，
+  随后把字面量里的 `)` 当成配对符号、漏检后面的真内容。模板扫描改由 `scanTemplate` 统一
+  处理（`${…}` 内继续按字符串 / 嵌套模板 / 注释 / 配对花括号扫），`skipQuote` 对模板委托
+  给它；`blankLiterals` 复用同一函数（抹字面段、保留插值代码）。变异（`skipQuote` 不认模板）
+  实测变红。
 - **`transaction()` 的归属登记提前到 `BEGIN` 之前**（2026-11-16，CodeRabbit PR#81 第七轮
   major）：原先 `inTx`/`txToken` 在 `await execSql('BEGIN')` 落定**之后**才置位，BEGIN 这条
   await 期间外部写被视为「无事务」直接放行 —— 它的 DELETE 排进这条事务、随回滚消失，

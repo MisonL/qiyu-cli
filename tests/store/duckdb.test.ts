@@ -351,6 +351,56 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('不支持路径上的第二条 BEGIN 不会发出（评审建议的核心诉求），且手开事务的失败形态是响亮的', async () => {
+    // 背景（CodeRabbit PR#81 第八轮 major 的实测裁定）：手开事务存在时，`transaction()` /
+    // `upsert` 的 BEGIN 会被 DuckDB 拒绝，**且它已把那条事务标记为 aborted** —— 不管我们
+    // 之后发不发 ROLLBACK，那条事务的数据都保不住。实测两种收尾：
+    //   · 发 ROLLBACK（本实现）：连接恢复干净；调用方随后的 COMMIT 报 `no transaction is
+    //     active`（**响亮**）；
+    //   · 不发：COMMIT 返回成功，但写入被静默丢弃（行数归零、无报错）—— 更糟。
+    // 所以收了 major 的**真正诉求**：不让第二条 BEGIN 在支持路径上出现（自动事务登记归属），
+    // 拒绝了它的收尾方案。本用例钉住两点：① 并发显式事务在入口被拒（不发 BEGIN）；
+    // ② 手开事务被撞时的失败是响亮的（COMMIT 报错），而不是静默丢数据。
+    const s = await fresh() as unknown as Store & { execSql: (q: string, p?: unknown[]) => Promise<unknown> }
+    await s.execSql('BEGIN')
+    await s.execSql(`INSERT INTO "tags" VALUES ('9', 'locked', '#000000')`)
+    await expect(s.transaction(async () => { /* 不该进来 */ })).rejects.toThrow(/within a transaction/)
+    await expect(s.execSql('COMMIT'), '被撞的手开事务必须**响亮**失败，而不是 COMMIT 成功却丢了行')
+      .rejects.toThrow(/no transaction is active/)
+    // 登记已复位、连接可用
+    await s.upsert('tags', [{ id: '7', name: 'Y', color: '#222222' }])
+    expect((await s.query('SELECT id FROM tags ORDER BY id')).rows.map((r) => String(r.id))).toEqual(['7'])
+    await s.close()
+  })
+
+  it('自动事务进行中，另一条链的显式 transaction() 在入口就被拒（不得发出 BEGIN）', async () => {
+    const s = await fresh()
+    // 用一个大批次把自动事务**挂住**在 INSERT 之前（spy 里等信号）
+    const orig = (s as unknown as { execSql: (a: string, b?: unknown[]) => Promise<unknown> }).execSql
+    let releaseInsert!: () => void
+    const insertGate = new Promise<void>((r) => { releaseInsert = r })
+    let enteredInsert!: () => void
+    const inInsert = new Promise<void>((r) => { enteredInsert = r })
+    const sqls: string[] = []
+    ;(s as unknown as { execSql: (a: string, b?: unknown[]) => Promise<unknown> }).execSql =
+      async (sql: string, p?: unknown[]) => {
+        if (sql.startsWith('INSERT')) { sqls.push('INSERT'); enteredInsert(); await insertGate }
+        else sqls.push(sql)
+        return orig(sql, p)
+      }
+    const up = s.upsert('tags', [{ id: '1', name: 'A', color: '#FF0000' }])
+    await inInsert                          // 自动事务已 BEGIN 并卡在 INSERT
+    const txErr = await s.transaction(async () => { throw new Error('不该到这里') })
+      .then(() => null, (e: unknown) => e)
+    expect(txErr, '并发显式事务必须被拒成 internal（不是 usage 嵌套）').toMatchObject({ kind: 'internal' })
+    // ⚠️ 自动事务的 BEGIN 走闭包 `execSql`（与 spy 只数数据语句的裁定一致），spy 看不到它：
+    // 这里能看到的只有那条 INSERT；被拒的显式事务若发出 BEGIN 就会多出一条。
+    expect(sqls, '被拒的显式事务不得发出 BEGIN').toEqual(['INSERT'])
+    releaseInsert()
+    expect(await up).toBe(1)
+    await s.close()
+  })
+
   it('tx 内嵌套 transaction() → usage', async () => {
     const s = await fresh()
     await expect(s.transaction(async (tx) => {
