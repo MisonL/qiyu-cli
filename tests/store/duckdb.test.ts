@@ -318,6 +318,39 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('transaction() 正卡在 BEGIN 时，外部 delete 不得被并入（CodeRabbit PR#81 第七轮 major）', async () => {
+    // 事故路径：归属登记（`inTx`/`txToken`）原先在 `await execSql('BEGIN')` **之后**才做。
+    // 于是 BEGIN 这条 await 期间 `inTx` 仍是 false：外部 `delete` 的归属检查直接放行，
+    // 它的 DELETE 被排到 BEGIN 之后 —— 并入这条事务、随它回滚而消失，而 delete 还返回
+    // 「删了 N 行」。与「await count 期间被截胡」是同一个缺口的两端（那里是入口到派发，
+    // 这里是 BEGIN 本身）。
+    const s = await fresh()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FF0000' }])
+    // ⚠️ count 必须**立即**敲定：真实 SELECT 的往返可能晚于 BEGIN 落定，窗口就关闭了，
+    // 这条用例会空转（与上面那条「首版 count 先完成」同一个坑）。
+    ;(s as unknown as { count: (t: string) => Promise<number> }).count = async () => 0
+    let releaseTx!: () => void
+    const txHold = new Promise<void>((r) => { releaseTx = r })
+    let txReady!: () => void
+    const txStarted = new Promise<void>((r) => { txReady = r })
+    const tx = s.transaction(async (t) => {
+      txReady()
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#00FF00' }])
+      await txHold
+      throw new Error('回滚')
+    }).catch(() => null)
+    // 同步紧随其后发起：此刻 transaction() 正卡在 `await execSql('BEGIN')`
+    const delP = s.delete('tags', 'id = ?', ['1']).then(() => null, (e: unknown) => e)
+    await txStarted
+    const delErr = await delP
+    releaseTx()
+    await tx
+    expect(delErr, 'BEGIN 窗口内的 DELETE 必须被拒绝，不能静默并入别人的事务').toMatchObject({ kind: 'internal' })
+    const after = (await s.query('SELECT id FROM tags ORDER BY id')).rows.map((r) => String(r.id))
+    expect(after, '回滚后那一行必须还在（DELETE 不得真的执行）').toEqual(['1'])
+    await s.close()
+  })
+
   it('tx 内嵌套 transaction() → usage', async () => {
     const s = await fresh()
     await expect(s.transaction(async (tx) => {

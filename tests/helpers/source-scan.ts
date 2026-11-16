@@ -59,10 +59,11 @@ export const OPENERS = '([{'
 export const CLOSERS = ')]}'
 
 /**
- * 把字符串 / 模板 / 正则 / 注释的**内容**抹成等长空白（保留偏移与行号）。
- * 用途：在「这段文本里有没有某个属性」这类判据里用 —— 只抹注释不够，
+ * 把字符串 / 模板的字面部分 / 正则 / 注释的**内容**抹成等长空白（保留偏移与行号）。
+ * 用途：在「这段文本里有没有某个属性 / 调用」这类判据里用 —— 只抹注释不够，
  * `{ label: 'concurrent: true' }` 的**值**是数据，读到它就等于误报。
- * 边界（如实记录）：模板里的 `${…}` 也被整体抹掉（不展开插值）—— 对属性扫描足够。
+ * ⚠️ 模板里的 `${…}` **保留**（CodeRabbit PR#81 第七轮）：那是代码不是字面量，
+ * `` `${setTimeout(f, 1)}` `` 真的排了一次调度、必须被看到；模板内的嵌套模板递归处理。
  */
 export function blankLiterals(text: string): string {
   const out = text.split('')
@@ -75,10 +76,47 @@ export function blankLiterals(text: string): string {
     if (c === '/' && text[i + 1] === '/') { const s0 = i; while (i < text.length && text[i] !== '\n') i++; blank(s0, i); continue }
     if (c === '/' && text[i + 1] === '*') { const s0 = i; const e = text.indexOf('*/', i + 2); i = e === -1 ? text.length : e + 2; blank(s0, i); continue }
     if (c === '/' && regexAllowedAfter(text, i)) { const s0 = i; i = skipRegex(text, i); blank(s0, i); continue }
-    if (c === "'" || c === '"' || c === '`') { const s0 = i; i = skipQuote(text, i); blank(s0 + 1, i - 1); continue }
+    if (c === '`') { i = blankTemplate(out, text, i + 1); continue }
+    if (c === "'" || c === '"') { const s0 = i; i = skipQuote(text, i); blank(s0 + 1, i - 1); continue }
     i++
   }
   return out.join('')
+}
+
+/**
+ * 抹掉模板字符串的**字面段**、保留 `${…}` 里的代码（可能嵌套模板），返回结束反引号之后
+ * 的下标。`q` 指向开头反引号之后的第一个字符。
+ */
+function blankTemplate(out: string[], text: string, q: number): number {
+  const blank = (a: number, b: number): void => {
+    for (let k = a; k < b; k++) if (out[k] !== '\n') out[k] = ' '
+  }
+  let litStart = q
+  let i = q
+  while (i < text.length) {
+    const c = text[i]!
+    if (c === '\\') { i += 2; continue }
+    if (c === '`') { blank(litStart, i); return i + 1 }
+    if (c === '$' && text[i + 1] === '{') {
+      blank(litStart, i)
+      let depth = 0
+      let k = i + 1                       // 指向 `{`
+      while (k < text.length) {
+        const ch = text[k]!
+        if (ch === "'" || ch === '"') { k = skipQuote(text, k); continue }
+        if (ch === '`') { k = blankTemplate(out, text, k + 1); continue }
+        if (ch === '{') depth++
+        else if (ch === '}') { depth--; if (depth === 0) break }
+        k++
+      }
+      i = k + 1
+      litStart = i
+      continue
+    }
+    i++
+  }
+  blank(litStart, text.length)
+  return text.length
 }
 
 /**
@@ -112,12 +150,22 @@ export function splitTopLevel(
 }
 
 /**
+ * `sel` 是否就是执行体：`() =>` / `(o) =>` / `async () =>` / `async (o) =>` / `async x =>`。
+ * ⚠️ `async` 前缀曾漏判（CodeRabbit PR#81 第七轮）：`it('safe', async () => …)` 整段被当成
+ * 选项位，执行体里的同名属性误报。
+ */
+export function isExecutor(sel: string): boolean {
+  return /^(?:async\s*)?(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(sel)
+}
+
+/**
  * 一个对象字面量（`{` 之后、配对 `}` 之前）里**可能被当成属性读到**的区间：
  * 顶层属性位 + `:` 之后的值（对象字面量逐层展开；`=>` 之后是**块**才展开）。
  * 箭头**表达式**体（`() => ({ … })`）是回调体、不展开 —— 里面的 `concurrent: true`
  * 是用户数据而不是开关（与「执行体出现在 `) => (` 之后不算」同一判据）。
  * ⚠️ 不能用正则切 `=>` / `:`（字符串里的 `"=>"`、键名后的函数返回类型注解 `): X` 都会切错）：
- * 按词法单元扫，只在深度 0 认 `=>` 与紧跟标识符尾的 `:`。
+ * 按词法单元扫，只在深度 0 认 `=>` 与紧跟**标识符尾**的 `:` —— 计算键 `['a:b']: 1` 的 `]`
+ * 后面那个 `:` 不算（第一版把 `]` / 引号也算作可接受前缀，值区间从计算键里就切歪了）。
  * 已知边界：属性值是三元 / 调用参数里的对象字面量时不展开（本仓库无此写法）。
  */
 export function propertyRanges(
@@ -137,7 +185,7 @@ export function propertyRanges(
     if (CLOSERS.includes(ch)) { stack.pop(); continue }
     if (stack.length > 0) continue
     if (ch === '=' && text[k + 1] === '>' && arrowAfter === -1) { arrowAfter = k + 2; k++; continue }
-    if (ch === ':' && colonAfter === -1 && text[k + 1] !== ':' && /[\w$\]'"]\s*$/.test(text.slice(start, k))) {
+    if (ch === ':' && colonAfter === -1 && text[k + 1] !== ':' && /[\w$]\s*$/.test(text.slice(start, k))) {
       colonAfter = k + 1
     }
   }

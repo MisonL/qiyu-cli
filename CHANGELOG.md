@@ -47,6 +47,21 @@
 
 ### 修复
 
+- **`transaction()` 的归属登记提前到 `BEGIN` 之前**（2026-11-16，CodeRabbit PR#81 第七轮
+  major）：原先 `inTx`/`txToken` 在 `await execSql('BEGIN')` 落定**之后**才置位，BEGIN 这条
+  await 期间外部写被视为「无事务」直接放行 —— 它的 DELETE 排进这条事务、随回滚消失，
+  而 `delete` 还返回「删了 N 行」（实测：BEGIN 挂住时 `delete` 返回成功、行没了；正确行为
+  是 `kind:'internal'` 拒绝、行还在）。新用例与「await count 期间被截胡」同构，变异
+  （把登记挪回 BEGIN 之后）实测变红。
+- **静态判据再补四条识别面**（2026-11-16，CodeRabbit PR#81 第七轮，均为 minor）：
+  ① `suite.concurrent` 与 `describe.concurrent` 同义，别名判据补 `suite`；
+  ② `async` 执行体（`it('safe', async () => …)`）原先不被认成执行体、整段当选项位扫描 ——
+  执行体里的同名属性误报，`isExecutor` 补 `async` 前缀与单参形态；
+  ③ hook 判据先抹字符串，`const s = 'setTimeout('` 这类惰性文本不再被判成调度；
+  ④ 模板里的 `${…}` 是**代码**不是字面量（`` `${f(setTimeout(w,1))}` `` 真排了调度），
+  字面量抹除改为「抹字面段、保留插值」，含嵌套模板。另补 `it.each(表)('名', {…}, 体)`
+  的链式登记：选项在**返回的登记调用**上，只切第一对实参会漏（表格里的同名属性仍是数据）。
+  五条各配正控，变异（去 async / 不跟链 / 不抹字符串 / 去 suite / 模板整体抹除）全红。
 - **capture 静态判据的括号配对 / 选项位识别收敛到唯一实现点，并跳过全部词法单元**
   （2026-11-16，Codex PR#81 第七、八轮，四条 P2 全部实测复现）：① 旧 `skipBalanced` 只数
   括号、不跳字符串 —— `beforeEach(() => { const x = ')'; setTimeout(w, 80) })` 让整条 hook

@@ -473,11 +473,16 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     delete: del,
     async transaction<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T> {
       if (inTx) throw usage('不得嵌套事务')
-      await execSql('BEGIN')
-      inTx = true
+      // ⚠️ 归属登记必须**先于** `BEGIN` 的 await（CodeRabbit PR#81 第七轮 major）：原先
+      // `inTx` 在 BEGIN 落定之后才置位，BEGIN 这条 await 期间它的外部写会被放行，随后的
+      // 语句排进本事务、回滚时静默消失（实测：BEGIN 挂住时外部 delete 返回成功、行没了）。
       const token = Symbol('store-tx')
+      inTx = true
       txToken = token
       try {
+        // BEGIN 失败同样落入下面的 catch：`safeRollback` 吞掉「无事务可回滚」的次生错误、
+        // 原错误照常抛出；finally 复位登记。
+        await execSql('BEGIN')
         // ⚠️ 真实投影而非 cast：WriteTx 类型上不含 query/init/close（spec §4.2.6 防线分层），
         // 运行时对象也不得携带 —— 直接传 store 的话 `Object.keys(tx)` 可枚举出 query。
         const tx: WriteTx = {
