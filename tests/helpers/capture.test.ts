@@ -211,8 +211,21 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
    */
   function isAwaitedOrReturned(body: string, idx: number): boolean {
     if (!body.slice(0, idx).includes('{')) return true
+    // ⚠️ 换行不一定是语句边界（CodeRabbit PR#81 第四轮）：`await p\n  .then(w)` 是同一个
+    // 表达式，按 `\n` 截断会读不到 `await`、把**正确**写法判成脱手。只在下一行以续行符
+    // 开头（`.`/`)`/`,`/`+`/`?`/`:`）时跳过该换行；其余换行仍视为语句边界（本仓库大量
+    // 依赖 ASI 的写法，跨过去会把上一条语句的 `await` 误算进来）。
     let start = idx
-    while (start > 0 && !';{}\n'.includes(body[start - 1]!)) start--
+    while (start > 0) {
+      const ch = body[start - 1]!
+      if (';{}'.includes(ch)) break
+      if (ch === '\n') {
+        let n = start
+        while (n < body.length && (body[n] === ' ' || body[n] === '\t')) n++
+        if (!'.,+?:)'.includes(body[n] ?? '')) break
+      }
+      start--
+    }
     const seg = body.slice(start, idx)
     return /\bawait\b/.test(seg) || /\breturn\b/.test(seg)
   }
@@ -257,7 +270,18 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     }
     if (end2 === -1) return false
     const args = body.slice(callParen + 1, end2)
-    return new RegExp(`\\b${firstParam}\\b`).test(args)
+    const gate = new RegExp(`\\b${firstParam}\\b`)
+    if (!gate.test(args)) return false
+    // ⚠️ 「形参出现在实参里」还不够（CodeRabbit PR#81 第四轮）：
+    // `new Promise((r) => { r(); setTimeout(() => { write(); r() }, 80) })` 的第一句就把
+    // promise 敲定了，定时器里的 `r()` 再也影响不到等待 —— 尾巴照样跨用例。
+    // 判据：定时器**之前**的 executor 正文里若已调用过形参，就说明完成信号先落地了 → 报。
+    const arrow = body.indexOf('=>', close)
+    if (arrow !== -1) {
+      const before = body.slice(arrow + 2, timerIdx)
+      if (new RegExp(`\\b${firstParam}\\s*\\(`).test(before)) return false
+    }
+    return true
   }
 
   function hazardHits(body: string): Array<{ token: string; awaited: boolean }> {
@@ -266,8 +290,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       const at = m.index!
       const isThen = m[0].startsWith('.then')
       const isVoid = m[0].startsWith('void')
+      // ⚠️ `setInterval` 永不算已交付（CodeRabbit PR#81 第四轮）：第一个 tick 就 resolve，
+      // 但 interval **继续**按周期写 —— 后续用例照样被污染。除非能证明被 clear 掉
+      //（静态看不出来），一律报。
+      const isInterval = m[0].startsWith('setInterval')
       let awaited = false
-      if (!isVoid) {
+      if (!isVoid && !isInterval) {
         if (isThen) {
           // ② `.then` 产出 promise：等它被交出去即可
           awaited = isAwaitedOrReturned(body, at)
@@ -367,10 +395,10 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         const rel = relative(SRC_TESTS, f).split(sep).join('/')
         const text = blankComments(readFileSync(f, 'utf8'))
         if (!usesMigratedForm(text)) continue
-        // ⚠️ `beforeAll` 也在扫描范围内（Codex PR#81 第四轮 P2）：它同样不在用例的异步
-        // 世代里，延迟写入会落进之后的某条用例。`afterAll` 不纳入 —— 它跑在全部用例之后，
-        // 没有"下一条"可污染（文件级隔离另见 capture-sinks 的注释）。
-        for (const m of text.matchAll(/\b(?:beforeEach|afterEach|beforeAll)\s*\(/g)) {
+        // ⚠️ 四类 hook 全部纳入（Codex 第四轮 + CodeRabbit 第四轮）：`beforeAll` 在用例
+        // 世代之外；**嵌套的 `afterAll` 只结束那一层 suite** —— vitest 2.1.9 里 suite A 的
+        // `afterAll` 可以跑在同级 suite B 之前，它排的延迟写入照样会落进 B。
+        for (const m of text.matchAll(/\b(?:beforeEach|afterEach|beforeAll|afterAll)\s*\(/g)) {
           const [s, e] = argRange(text, m.index! + m[0].length)
           const body = text.slice(s, e)
           const line = text.slice(0, m.index!).split('\n').length
@@ -423,6 +451,16 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hit(bt('(async () => { await p.', 'then(w) })')), 'await 一条 .then 链').toEqual([])
     expect(hit(bt('(async () => { await seed() })')), 'await 别的东西（无调度）').toEqual([])
 
+    // CodeRabbit PR#81 第四轮四条：
+    // ① `setInterval` 第一个 tick 就 resolve，但 interval 继续写 —— 永不算已交付
+    expect(hit(bt('(async () => { await new Promise((r) => set', 'Interval(() => { process.stdout.write("T"); r() }, 80)) })')),
+      'setInterval 的后续 tick 会继续污染').toEqual(['setInterval('])
+    // ② 跨行续写不得被换行截断（`await p\n  .then(w)`）
+    expect(hit(bt('(async () => { await p', '\n  .', 'then(w) })')), '跨行 await 的 .then 链').toEqual([])
+    // ③ 提前 resolve：定时器里再调 r() 也影响不到等待
+    expect(hit(bt('(async () => { await new Promise((r) => { r(); set',
+      'Timeout(() => { process.stdout.write("T"); r() }, 80) }) })')),
+      'promise 在定时器之前就敲定了').toEqual(['setTimeout('])
     // Codex PR#81 第四轮：外层 promise 已 resolve、定时器在其后独立排定 → 照样漏
     expect(hit(bt('(async () => { await new Promise((resolve) => { resolve(); set',
       'Timeout(() => process.stdout.write("T"), 80) }) })')),

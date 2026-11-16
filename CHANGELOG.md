@@ -52,6 +52,13 @@
   `duckdb.test.ts` 的硬顶用例要插 25000 行（15s → 60s）。本机负载 700–840 时它们都会
   `Test timed out`，单独重跑仍红 —— 造大夹具的固有代价，不是本次改动引入的回归
   （CI 上分别约 20s / 2s）。
+- **capture 守卫第四轮再收紧四处**（2026-11-16，CodeRabbit PR#81 第四轮）：① `setInterval`
+  的第一个 tick 就 resolve，但 interval 会继续按周期写 —— 永不算已交付；② 跨行续写
+  （`await p\n  .then(w)`）是同一个表达式，按换行截断会把正确写法误报，现只在续行符开头时
+  跨行；③ `new Promise((r) => { r(); setTimeout(…) })` 在定时器之前就敲定了 promise，
+  定时器里的 `r()` 影响不到等待 —— executor 正文在定时器之前已调用形参即报；④ 嵌套的
+  `afterAll` 只结束那一层 suite（同级 suite 的 `beforeAll` 可能在其后跑），扫描纳入全部四类 hook。
+  三处判据都做了变异验证（点位精确）。
 - **capture 守卫再收紧三处**（2026-11-15，Codex PR#81 第四轮）：① `beforeAll` 同样不在用例的
   异步世代里、延迟写入会落进之后的用例，扫描纳入它（`afterAll` 不纳入 —— 之后没有"下一条"）；
   ② 「定时器位于已 await 的 `new Promise` 内」不够：`new Promise((resolve) => { resolve();
