@@ -201,6 +201,18 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     }
   }
 
+  /** 从 `open`（指向 `(` 或 `{`）起配对，返回配对符号**之后**的下标；未配对返回 -1。 */
+  function skipBalanced(text: string, open: number): number {
+    const o = text[open]
+    const c = o === '(' ? ')' : '}'
+    let depth = 0
+    for (let k = open; k < text.length; k++) {
+      if (text[k] === o) depth++
+      else if (text[k] === c) { depth--; if (depth === 0) return k + 1 }
+    }
+    return -1
+  }
+
   /**
    * `idx` 处的表达式是否被 `await` / `return` / 表达式体箭头**交给** vitest 等待。
    *
@@ -218,7 +230,22 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     let start = idx
     while (start > 0) {
       const ch = body[start - 1]!
-      if (';{}'.includes(ch)) break
+      if (ch === '}') {
+        // ⚠️ `}` 可能是**嵌套执行器/回调**的结尾，不是语句边界（Codex PR#81 第五轮）：
+        // `await new Promise((r) => { setTimeout(r, 40) }).then(w)` 里 `.then` 的回扫会先
+        // 撞上 executor 的 `}` —— 直接停会把整条被 await 的链误报。回找到配对的 `{`，
+        // 从它往前继续看（那段属于外层表达式）。
+        let d = 0
+        let k = start - 1
+        for (; k >= 0; k--) {
+          if (body[k] === '}') d++
+          else if (body[k] === '{') { d--; if (d === 0) break }
+        }
+        if (k < 0) break
+        start = k
+        continue
+      }
+      if (ch === '{' || ch === ';') break
       if (ch === '\n') {
         let n = start
         while (n < body.length && (body[n] === ' ' || body[n] === '\t')) n++
@@ -242,23 +269,22 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
    * 边界：形参用解构（`({resolve}) => …`）或 rename 后传入都不认（误报方向，宁可多报）。
    */
   function executorGatesTimer(body: string, promiseIdx: number, timerIdx: number): boolean {
-    // `new Promise` 后面的第一个 `(` 是**构造调用的实参括号**，再下一个 `(` 才是
-    // executor 的形参表（`new Promise((r) => …)`）—— 首版只取第一个，读到的是 `(r) => …`
-    // 开头那个 `(`，`^\s*(\w+)` 永远匹配不上，判据恒为假（探针当场抓到：7 种合法写法全被报）。
+    // executor 的首个形参**按箭头语法取**（Codex PR#81 第五轮）：
+    //   · `(r) => …` / `(r, reject) => …`  → 括号形参表
+    //   · `resolve => …`                    → 无括号单参
+    // 首版「取 `new Promise` 后面的第二个 `(`」对无括号单参会把 `setTimeout(` 误认成形参表
+    // （探针复现：合法写法被判脱手）。
     const outerParen = body.indexOf('(', body.indexOf('new Promise', promiseIdx))
     if (outerParen === -1) return false
-    const parenAt = body.indexOf('(', outerParen + 1)
-    if (parenAt === -1) return false
-    // executor 的形参表：`(r) =>` / `(r, reject) =>`
-    let depth = 0
-    let close = -1
-    for (let k = parenAt; k < body.length; k++) {
-      if (body[k] === '(') depth++
-      else if (body[k] === ')') { depth--; if (depth === 0) { close = k; break } }
-    }
-    if (close === -1) return false
-    const firstParam = /^\s*([A-Za-z_$][\w$]*)/.exec(body.slice(parenAt + 1, close))?.[1]
+    const callClose = skipBalanced(body, outerParen) - 1     // 构造调用的 `)`
+    const execArg = body.slice(outerParen + 1, callClose)
+    const parenParam = /^\s*\(\s*([A-Za-z_$][\w$]*)/.exec(execArg)?.[1]
+    const bareParam = /^\s*([A-Za-z_$][\w$]*)\s*=>/.exec(execArg)?.[1]
+    const firstParam = parenParam ?? bareParam
     if (firstParam === undefined) return false
+    // executor 的形参表结束位置（用于找 `=>`）
+    const parenAt = parenParam !== undefined ? outerParen + 1 + execArg.indexOf('(', 0) : outerParen
+    const close = parenParam !== undefined ? skipBalanced(body, parenAt) - 1 : outerParen
     // 这个定时器调用的实参区间
     const callParen = body.indexOf('(', timerIdx)
     if (callParen === -1) return false
@@ -275,12 +301,24 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // ⚠️ 「形参出现在实参里」还不够（CodeRabbit PR#81 第四轮）：
     // `new Promise((r) => { r(); setTimeout(() => { write(); r() }, 80) })` 的第一句就把
     // promise 敲定了，定时器里的 `r()` 再也影响不到等待 —— 尾巴照样跨用例。
-    // 判据：定时器**之前**的 executor 正文里若已调用过形参，就说明完成信号先落地了 → 报。
+    // 判据：executor 正文中**定时器回调之外**的、出现在这个定时器之前的形参调用 —— 说明完成信号
+    // 先落地了 → 报。
+    // ⚠️ 「定时器之前」不够（Codex PR#81 第五轮）：
+    // `new Promise((r) => { setTimeout(() => { w(); r() }, 80); r() })` 的 `r()` 在定时器**之后**
+    // 的同一层，照样立刻敲定 promise（探针复现：尾巴照样落地，而上一版放过）。
+    // 所以：把定时器调用的整个实参区间**挖掉**，再看 executor 正文里还剩不剩 `r(`。
     const arrow = body.indexOf('=>', close)
-    if (arrow !== -1) {
-      const before = body.slice(arrow + 2, timerIdx)
-      if (new RegExp(`\\b${firstParam}\\s*\\(`).test(before)) return false
-    }
+    if (arrow === -1) return true
+    let execStart = arrow + 2
+    let execEnd = body.length
+    if (body[execStart] === ' ') execStart++
+    if (body[execStart] === '{') execEnd = skipBalanced(body, execStart) - 1
+    const timerStart = body.indexOf('(', timerIdx)
+    if (timerStart === -1) return true
+    const timerEnd = skipBalanced(body, timerStart)
+    if (timerEnd === -1) return true
+    const outside = body.slice(execStart, timerStart) + body.slice(timerEnd, execEnd)
+    if (new RegExp(`\\b${firstParam}\\s*\\(`).test(outside)) return false
     return true
   }
 
@@ -450,6 +488,21 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hit(bt('(() => Promise.resolve().', 'then(w))')), '表达式体返回 .then 链').toEqual([])
     expect(hit(bt('(async () => { await p.', 'then(w) })')), 'await 一条 .then 链').toEqual([])
     expect(hit(bt('(async () => { await seed() })')), 'await 别的东西（无调度）').toEqual([])
+
+    // Codex PR#81 第五轮三条：
+    // ① 定时器**注册之后**的同步 r() 同样敲定 promise（只查"定时器之前"不够）
+    expect(hit(bt('(async () => { await new Promise((r) => { set',
+      'Timeout(() => { process.stdout.write("T"); r() }, 80); r() }) })')),
+      '注册后同步 r() 也会让 hook 提前结束').toEqual(['setTimeout('])
+    // ② `new Promise(...).then(w)` 整条链被 await —— 回扫必须跨过嵌套 executor 的 `}`
+    expect(hit(bt('(async () => { await new Promise((r) => { set',
+      'Timeout(r, 40) }).then(w) })')), 'await 的 new Promise(...).then 链').toEqual([])
+    // ③ 无括号单参 executor（`resolve => …`）的形参同样要按箭头语法取
+    expect(hit(bt('(async () => { await new Promise(resolve => { set',
+      'Timeout(() => resolve(), 40) }) })')), '无括号单参 executor').toEqual([])
+    // 反控：同形态但没被交出去 → 仍须报
+    expect(hit(bt('(() => { new Promise(resolve => { set',
+      'Timeout(() => resolve(), 40) }) })')), '无括号单参但脱手').toEqual(['setTimeout('])
 
     // CodeRabbit PR#81 第四轮四条：
     // ① `setInterval` 第一个 tick 就 resolve，但 interval 继续写 —— 永不算已交付
