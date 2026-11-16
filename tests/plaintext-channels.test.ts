@@ -202,10 +202,23 @@ const THROW_ERROR: Rule = {
       while (o.parent !== undefined && ts.isParenthesizedExpression(o.parent)) o = o.parent
       const p = o.parent
       if (p === undefined) return false
-      if (ts.isPropertyAccessExpression(p) && p.expression === o) return true
-      if (ts.isElementAccessExpression(p) && p.expression === o) return true
       if (ts.isNewExpression(p) && p.expression === o) return true
+      // ⚠️ **读的是哪个属性**必须与 getter 名对得上（CodeRabbit PR#81 第二十四轮 minor）：
+      // `({ get unused() { return new Error('**x**') }, error: new Error('clean') }).error` 只执行
+      // `error`，`unused` 的 getter 从不运行 —— 原判据对任何属性读取都放行，把 `unused` 报成违规。
+      const accessed = ts.isPropertyAccessExpression(p) ? p.name.text
+        : ts.isElementAccessExpression(p) ? staticAccessKey(p.argumentExpression)
+        : undefined
+      if (accessed === undefined) return false
+      if (ts.isMethodDeclaration(fn)) return fn.name !== undefined && accessed === accessorName(fn.name)
+      if (ts.isGetAccessorDeclaration(fn)) return fn.name !== undefined && accessed === accessorName(fn.name)
       return false
+    }
+    const accessorName = (n: ts.PropertyName): string | undefined =>
+      ts.isIdentifier(n) || ts.isStringLiteral(n) || ts.isNumericLiteral(n) ? n.text : undefined
+    const staticAccessKey = (e: ts.Expression): string | undefined => {
+      const u = unwrap(e)
+      return ts.isStringLiteral(u) || ts.isNoSubstitutionTemplateLiteral(u) ? u.text : undefined
     }
     eachInvocation(sf, (n, line) => {
       if (!ts.isNewExpression(n) || !named(n, 'Error')) return
@@ -335,6 +348,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw (<() => Error>(() => new Error('**尖括号断言**')))()",
       "throw (() => new Error('**call 立即执行**')).call(null)",
       "throw ({ get value() { return new Error('**getter**') } }).value",
+      "throw ({ get unused() { return new Error('**unused**') }, error: new Error('clean') }).error",
       "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
       "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
@@ -353,7 +367,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调里的 new Error 不算').toHaveLength(8)
+      + '未调用的回调里的 new Error 不算；没被读到的 getter 不算').toHaveLength(8)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)

@@ -154,6 +154,45 @@ function isMigratedFile(sf: ts.SourceFile): boolean {
 }
 
 /**
+ * 本文件顶层 `const 名 = <对象字面量>` 的初始化表达式；找不到、或该名字**另有赋值**时返回 undefined。
+ * 只认顶层 const（选项对象按书写惯例出现在模块顶层）；解构 / 二次赋值 / 外部导入一律视为解析不出。
+ */
+function constObjectInitializer(sf: ts.SourceFile, name: string): ts.ObjectLiteralExpression | undefined {
+  let found: ts.ObjectLiteralExpression | undefined
+  let reassigned = false
+  for (const st of sf.statements) {
+    if (!ts.isVariableStatement(st)) continue
+    for (const d of st.declarationList.declarations) {
+      if (ts.isIdentifier(d.name)) {
+        if (d.name.text !== name || d.initializer === undefined) continue
+        const init = unwrap(d.initializer)
+        if (ts.isObjectLiteralExpression(init)) found = init
+        else return undefined
+      } else {
+        // 解构里出现同名绑定 → 值不受我们控制
+        const names = d.name as ts.BindingName
+        const hit = (b: ts.BindingName): boolean => ts.isIdentifier(b) ? b.text === name
+          : b.elements.some((e) => !ts.isOmittedExpression(e) && hit(e.name))
+        if (hit(names)) reassigned = true
+      }
+    }
+  }
+  // 任何对该名字的赋值 / 声明合并，都让静态值失效
+  const visit = (n: ts.Node): void => {
+    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(n.left) && n.left.text === name) reassigned = true
+    if (ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) {
+      const op = n.operator
+      if ((op === ts.SyntaxKind.PlusPlusToken || op === ts.SyntaxKind.MinusMinusToken)
+        && ts.isIdentifier(n.operand) && n.operand.text === name) reassigned = true
+    }
+    ts.forEachChild(n, visit)
+  }
+  visit(sf)
+  return reassigned ? undefined : found
+}
+
+/**
  * 并发判据（**唯一实现点**：仓库扫描与自检都调它）：返回违规说明 + 行号。
  *
  * ① `.concurrent` 修饰链：`it.concurrent(…)` / `describe.shuffle.concurrent(…)` /
@@ -184,8 +223,27 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         seen.add(lineOf(sf, call))
         continue
       }
-      for (const a of call.arguments) {
-        const u = unwrap(a)
+      // ⚠️ 只有**选项位**才判：`it.skipIf(x)` / `it.each(cases)` 的实参是条件与表格，
+      // 不是选项（2026-11-17 实测：不加这一层，auth.test 的 `posixOnly`、config-insecure 的
+      // `cases` 全被误报）。选项位 = 调用名之后的第 2 个实参（`it(名, 选项, 体)`）。
+      const optionArgs = call.arguments.slice(1, 2)
+      for (const a of optionArgs) {
+        // ⚠️ 选项位可以是**标识符**（`const options = { concurrent: true }; it('x', options, fn)`）：
+        // Vitest 2.1.9 照常按它登记并发（CodeRabbit PR#81 第二十四轮 minor，探针确认）。
+        // 先在本文件里静态解析 `const 名 = <对象字面量>`；解析不出（外部导入 / 调用返回值 /
+        // 重新赋值过）就**不许放行** —— 与未知展开同一个判据。
+        let u = unwrap(a)
+        let unresolved = false
+        if (ts.isIdentifier(u)) {
+          const init = constObjectInitializer(sf, u.text)
+          if (init === undefined) unresolved = true
+          else u = init
+        }
+        if (unresolved) {
+          out.push({ line: lineOf(sf, call), why: `选项对象是标识符 ${a.getText(sf)}，无法静态解析` })
+          seen.add(lineOf(sf, call))
+          continue
+        }
         if (!ts.isObjectLiteralExpression(u)) continue
         const { props, mayHaveUnknown } = objectPropsWithUnknown(u)
         if (isTrue(props.get('concurrent'))) {
@@ -404,7 +462,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       const out: string[] = []
       for (const v of concurrentViolations(parseTs(src))) {
         if (v.why.startsWith('.concurrent')) out.push(`alias:${v.why.replace('.concurrent 修饰链：', '')}`)
-        else if (v.why.includes('未知来源')) out.push('unknown')
+        else if (v.why.includes('未知来源') || v.why.includes('无法静态解析')) out.push('unknown')
         else out.push('opt')
       }
       return out
@@ -545,6 +603,17 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       '计算键访问器覆盖同名键 → 串行').toEqual([])
     expect(concHits(`${bt("it('S10', { con", "current: true, ...{ get ['timeout']() { return 1000 } } }, () => {})")}`),
       '别的键的访问器不得清掉并发').toEqual(['opt'])
+    // 选项位是标识符（CodeRabbit PR#81 第二十四轮 minor）：能解析的按值判，解析不出的不许放行
+    expect(concHits(`const options = ${JSON.stringify({ concurrent: true })}\nit('I1', options, () => {})`),
+      '顶层 const 的选项对象按值判').toEqual(['opt'])
+    expect(concHits(`const options = ${JSON.stringify({ concurrent: false })}\nit('I2', options, () => {})`),
+      '顶层 const 的选项对象显式串行').toEqual([])
+    expect(concHits(`const options = { con${'current: true }'}\nit('I3', options, () => {})`),
+      '顶层 const 的选项对象里写并发').toEqual(['opt'])
+    expect(concHits(`import { options } from './x'\nit('I4', options, () => {})`),
+      '外部导入的选项对象无法解析').toEqual(['unknown'])
+    expect(concHits(`it.skipIf(posixOnly)('I5', async () => {})`), 'skipIf 的条件不是选项').toEqual([])
+    expect(concHits(`it.each(cases)('I6', async () => {})`), 'each 的表格不是选项').toEqual([])
     // 未知**计算键访问器**同样可能覆盖任何键
     expect(concHits(`${bt("it('S13', { con", 'current: true, get [key]() { return false } }, () => {})')}`),
       '未知计算键访问器使旧值不可信').toEqual(['unknown'])

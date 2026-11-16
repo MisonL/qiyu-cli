@@ -47,6 +47,15 @@
 
 ### 修复
 
+- **选项位是标识符 / getter 名要核对**（2026-11-17，CodeRabbit PR#81 第二十四轮 minor ×2）：
+  ① `const options = { concurrent: true }; it('x', options, fn)` 的选项位是**标识符**，原判据直接
+  `continue` 放行（Vitest 照常按它登记并发）。现在先在本文件里静态解析顶层 `const` 的对象字面量
+  （有过二次赋值 / 解构 / 导入一律视为解析不出），解析不出就报「无法确认」。同时把判据**限定在
+  选项位**（第 2 个实参）—— 否则 `it.skipIf(posixOnly)` 的条件、`it.each(cases)` 的表格会被误报
+  （实测：auth / config-insecure 等真实用例当场变红）。
+  ② getter 判据没核对**读的是哪个属性**：`({ get unused() { … }, error: new Error('clean') }).error`
+  只执行 `error`，`unused` 的 getter 从不运行，却被报成违规。现在要求访问的属性名与 getter / 方法名一致。
+  四处变异（标识符不解析 / 解析不出放行 / 不限选项位 / 不核对 getter 名）各自变红。
 - **`.call/.apply` 调度 + getter/方法体的立即执行**（2026-11-17，Codex PR#81 第二十二轮 P2 ×2）：
   ① hook 判据里 `setTimeout.call(null, cb, 1)` / `globalThis.setTimeout.apply(null, […])` 的链末段
   多出 `call`/`apply`，原判据全漏（探针确认 hook 尾巴照样串到下一条用例）—— 匹配前先剥掉末段。
