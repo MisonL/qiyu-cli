@@ -373,6 +373,40 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('外部 delete 的第一条语句（count）报错也不得污掉所有者的事务（CodeRabbit PR#81 第十轮 major）', async () => {
+    // 事故路径（实测复现）：`del` 先 `count`、后判归属。若只在 count **之后**判，这条
+    // count 就已经落在别人的事务里执行了 —— 而**任何**执行期错误（实测：目标表被换成
+    // CAST 失败的 view）都会把那条事务标成 aborted：所有者的 COMMIT 返回**成功**，
+    // 写入却被静默丢弃（实测 tags 行数归零、无任何报错）。
+    // 判据：外部 delete 必须**一条语句都不发**被拒；所有者的写入必须在提交后真实存在。
+    const s = await fresh()
+    const sAny = s as unknown as { execSql: (q: string, p?: unknown[]) => Promise<unknown> }
+    await sAny.execSql('CREATE TABLE aux (v VARCHAR)')
+    await sAny.execSql(`INSERT INTO aux VALUES ('not-an-int')`)
+    await sAny.execSql('DROP TABLE "robot_summary"')
+    await sAny.execSql('CREATE VIEW "robot_summary" AS SELECT v FROM aux WHERE CAST(v AS INTEGER) > 0')
+    let ready!: () => void
+    const txReady = new Promise<void>((r) => { ready = r })
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const txP = s.transaction(async (tx) => {
+      await tx.upsert('tags', [{ id: '9', name: 'owner', color: '#FFF' }])
+      ready()
+      await gate
+    }).then(() => 'committed', (e: unknown) => `rejected: ${(e as Error).message}`)
+    await txReady
+    // 外部 delete 打到那张一执行就报错的 view 上
+    const outside = await s.delete('robot_summary', 'TRUE')
+      .then(() => 'ok', (e: unknown) => e)
+    expect(outside, '外部 delete 必须在发出任何语句前被拒（kind:internal），'
+      + '否则它的 count 会执行并污掉所有者的事务').toMatchObject({ kind: 'internal' })
+    release()
+    expect(await txP).toBe('committed')
+    const ids = (await s.query('SELECT id FROM tags')).rows.map((r) => String(r.id))
+    expect(ids, '所有者 COMMIT 报成功但写入被静默丢弃 —— 正是本用例要挡的形态').toEqual(['9'])
+    await s.close()
+  })
+
   it('自动事务进行中，另一条链的显式 transaction() 在入口就被拒（不得发出 BEGIN）', async () => {
     const s = await fresh()
     // 用一个大批次把自动事务**挂住**在 INSERT 之前（spy 里等信号）

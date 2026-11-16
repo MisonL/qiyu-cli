@@ -294,6 +294,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 唯一会改变行数的就是「新键插入」—— 用前后计数，与 `del` 的算法同源。
     // `DO UPDATE` 之路不计数：新键插入、旧键更新，两者都算一次写入。
     const countDelta = nonKey.length === 0
+    // ⚠️ 同 `del`：前导 count 与 INSERT 前面各判一次归属。`doUpsert` 只在事务内路径被调用
+    // （外部 upsert 已在入口被拒），但事务可能在这条计数期间被别的链抢走 —— 派发点那次
+    // 才是真正的闸门；计数前这次防的是「计数语句本身落进别人的事务并把它污掉」。
+    assertTxOwnership()
     const beforeCount = countDelta ? await store.count(t.name) : 0
     for (let i = 0; i < uniq.length; i += rowsPerStmt) {
       const batch = uniq.slice(i, i + rowsPerStmt)
@@ -314,9 +318,15 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
 
   const del = async (tname: string, where: string, params: unknown[] = []): Promise<number> => {
     const t = assertTable(tname)
+    // ⚠️ 归属检查必须**先于第一条语句**（CodeRabbit PR#81 第十轮 major，实测复现）：
+    // 若只在 `count` 之后判，这条 count 自己就会在别人的事务里执行 —— 而**任何**执行期
+    // 错误（实测：目标表被换成 CAST 失败的 view 时的 Conversion Error）都会把那条事务
+    // 标成 aborted：对方的 COMMIT 返回成功，写入却被静默丢弃（实测行数归零、无报错）。
+    // 所以外部写在这里就被拒，一条语句都不发。
+    assertTxOwnership()
     const before = await store.count(tname)
-    // ⚠️ 同理（CodeRabbit PR#81 major）：入口判一次不够 —— `count` 是 await，期间别的
-    // 调用方可以开事务，随后这条 DELETE 就被并进去。检查贴着 DELETE 派发。
+    // 派发点再判一次（CodeRabbit PR#81 major）：`count` 是 await，期间别的调用方可能开事务，
+    // 随后这条 DELETE 就被并进去。
     assertTxOwnership()
     await store.execSql(`DELETE FROM "${t.name}" WHERE ${where}`, params)
     const after = await store.count(tname)

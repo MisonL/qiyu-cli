@@ -37,7 +37,16 @@ export function lineOf(sf: ts.SourceFile, node: ts.Node): number {
   return sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
 }
 
-/** 深度优先收集节点子树里全部调用表达式（含链式写法的每一层）。 */
+/**
+ * 深度优先收集节点子树里全部调用表达式（含链式写法的每一层，以及带类型实参 /
+ * 非空断言包装的 `f<T>(…)` / `f<T>!(…)`）。
+ * ⚠️ 注册点**两种怎么找到**：
+ *   ① 它自己是个 CallExpression（`it.concurrent(…)`、`it(名, 选, 体)`）；
+ *   ② 它是**被调用的对象**（标签模板 `it.concurrent.each\`\`(名, 选, 体)` 的内层 —— 外层是
+ *      CallExpression，被调的 expression 是 TaggedTemplateExpression，见 `callChain`）。
+ *      这种内层节点自己不是外层调用，所以由调用方用 `isInvoked(node)` 决定要不要算（本仓库
+ *      没有这种写法，判据按「每个调用节点独立判」写 —— 遇到时 `callChain` 已能穿透标签模板）。
+ */
 export function collectCalls(root: ts.Node): ts.CallExpression[] {
   const out: ts.CallExpression[] = []
   const walk = (n: ts.Node): void => {
@@ -46,6 +55,25 @@ export function collectCalls(root: ts.Node): ts.CallExpression[] {
   }
   walk(root)
   return out
+}
+
+/** 该节点是不是**某个调用 / 标签模板的被调对象**（链式登记的内层）。 */
+export function isInvoked(node: ts.Node): boolean {
+  const p = node.parent
+  if (p === undefined) return false
+  if (ts.isCallExpression(p)) return p.expression === node
+  if (ts.isTaggedTemplateExpression(p)) return p.tag === node
+  return false
+}
+
+/** 剥掉括号 / 类型断言 / 非空断言等**不改变运行语义**的包装。 */
+export function unwrap(node: ts.Expression): ts.Expression {
+  let n = node
+  while (
+    ts.isParenthesizedExpression(n) || ts.isAsExpression(n)
+    || ts.isTypeAssertionExpression(n) || ts.isNonNullExpression(n) || ts.isSatisfiesExpression(n)
+  ) n = n.expression
+  return n
 }
 
 /** 标识符 / 属性访问链 → 段名数组（`it.concurrent` → `['it','concurrent']`）；其余返回 undefined。 */
@@ -67,7 +95,13 @@ export function calleeChain(node: ts.Expression): string[] | undefined {
 export function callChain(call: ts.CallExpression): { chain: string[]; viaCall: boolean } | undefined {
   let e: ts.Expression = call.expression
   let viaCall = false
-  while (ts.isCallExpression(e)) { viaCall = true; e = e.expression }
+  for (;;) {
+    if (ts.isCallExpression(e)) { viaCall = true; e = e.expression; continue }
+    // 标签模板：`it.each\`a|b\`(名, 选, 体)` —— 标签是内层表达式（Codex PR#81 第十轮）
+    if (ts.isTaggedTemplateExpression(e)) { viaCall = true; e = e.tag; continue }
+    if (ts.isNonNullExpression(e) || ts.isParenthesizedExpression(e)) { e = e.expression; continue }
+    break
+  }
   const chain = calleeChain(e)
   return chain === undefined ? undefined : { chain, viaCall }
 }

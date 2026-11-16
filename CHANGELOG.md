@@ -47,6 +47,21 @@
 
 ### 修复
 
+- **外部写的第一条语句报错也会污掉所有者的事务**（2026-11-16，CodeRabbit PR#81 第十轮
+  major，真库实测复现）：`del` 原先「先 `count`、后判归属」。若目标表被换成执行即报错的
+  view（实测 `CAST` 失败的 `WHERE`），这条 count 就在**别人的事务里**执行并把它标成
+  aborted —— 所有者的 `COMMIT` 返回**成功**、写入却被静默丢弃（实测行数归零、无任何报错）。
+  修法：归属检查前移到**第一条语句之前**，外部写在发任何语句前被拒；派发点那次检查保留
+  （`count` 的 await 期间仍可能被抢）。`doUpsert` 的计数前同样补一次。用例走真库：
+  坏 view + 所有者先成功写入 + 外部 delete，断言外部被拒成 `internal`、所有者提交后行还在；
+  变异（把检查挪回 count 之后）实测变红。
+- **静态判据再补五个形态**（2026-11-16，Codex PR#81 第十轮，均为 P2，逐条探针复现）：
+  ① `globalThis.setTimeout(…)` / `global.setTimeout(…)` 同样是调度（已知全局宿主前缀）；
+  ② 套件选项 `sequential: false` 等价于并发（`describe`/`suite` 才判，`it` 上的同名键不算）；
+  ③ `itBound`（`db.test.ts` 的包装登记函数）同样吃选项位上的 `concurrent: true`；
+  ④ 标签模板形态的 `it.each\`a|b\`(名, 选项, 体)`：`callChain` 穿透 `TaggedTemplateExpression`；
+  ⑤ 选项值被括号包起来（`{ concurrent: (true) }`）不改变语义：布尔判定前 `unwrap`
+  （括号 / `as` / 非空断言 / `satisfies`）。五个变异各自变红。
 - **静态扫描整体改用 TypeScript 语法树（AST），手写词法器全部删除**（2026-11-16，PR#81
   第七~九轮 20+ 条审查的收敛决定）：`capture.test.ts` 的两条 capture 守卫、`plaintext-channels`
   的四条纯文本通道规则，原先都建在「抹注释 → 抹字面量 → 按字符配括号取实参」的手写扫描上；

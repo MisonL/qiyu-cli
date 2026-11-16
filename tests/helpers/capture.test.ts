@@ -14,7 +14,7 @@ import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startCapture, captureInstalled } from './capture.js'
 import ts from 'typescript'
-import { calleeChain, callChain, collectCalls, lineOf, objectProps, parseTs } from './source-scan.js'
+import { calleeChain, callChain, collectCalls, lineOf, objectProps, parseTs, unwrap } from './source-scan.js'
 
 // ⚠️ 文件结束时 `process.stdout.write` 必须已恢复（Codex 2026-11-13 P2：vitest 2.1.9
 // 默认 `restoreMocks:false`，不恢复的话同 worker 的**下一个测试文件**会把写入记进
@@ -126,12 +126,20 @@ describe('tests/helpers/capture.ts', () => {
 })
 
 
-/** 注册函数基名。`suite` 是 `describe` 的别名（CodeRabbit PR#81 第七轮）。 */
-const REGISTRARS = new Set(['it', 'test', 'describe', 'suite'])
+/**
+ * 注册函数基名。`suite` 是 `describe` 的别名（CodeRabbit PR#81 第七轮）；
+ * `itBound` 是 `db.test.ts` 里「注册用例并把库路径绑进异步上下文」的包装（Codex PR#81
+ * 第十轮）—— 它把选项原样转给捕获助手的 `it`，所以选项位上的并发开关同样生效。
+ */
+const REGISTRARS = new Set(['it', 'test', 'describe', 'suite', 'itBound'])
+/** 套件级 `sequential: false` 同样让用例并行（Vitest 2.1.9，Codex PR#81 第十轮）。 */
+const SUITES = new Set(['describe', 'suite'])
 /** 调度原语名（定时器 / 微任务）。 */
 const HOOK_FORBIDDEN = new Set(['setTimeout', 'setInterval', 'setImmediate', 'queueMicrotask'])
-/** 四类 hook：全都在用例的异步世代之外（嵌套 `afterAll` 同样覆盖 —— 按调用点扫，不看层级）。 */
-const HOOK_HOOKS = new Set(['beforeEach', 'afterEach', 'beforeAll', 'afterAll'])
+/** 调度原语的宿主：`globalThis.setTimeout(…)` / `global.setTimeout(…)` 同样是调度。 */
+const GLOBAL_HOSTS = new Set(['globalThis', 'global', 'window', 'self'])
+/** hook 名。大小写不敏感（`beforeEach` / `beforeeach` 都按同一规则，Codex PR#81 第十轮）。 */
+const HOOK_HOOKS = new Set(['beforeeach', 'aftereach', 'beforeall', 'afterall'])
 
 /** 迁移形态（用了 `captureSinks(`）的语法树判据。字符串 / 注释里的提及不算。 */
 function isMigratedFile(sf: ts.SourceFile): boolean {
@@ -150,18 +158,32 @@ function isMigratedFile(sf: ts.SourceFile): boolean {
  */
 function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: string }> {
   const out: Array<{ line: number; why: string }> = []
+  const isTrue = (v: ts.Expression | undefined): boolean =>
+    v !== undefined && unwrap(v).kind === ts.SyntaxKind.TrueKeyword
+  const isFalse = (v: ts.Expression | undefined): boolean =>
+    v !== undefined && unwrap(v).kind === ts.SyntaxKind.FalseKeyword
   for (const call of collectCalls(sf)) {
     const c = callChain(call)
-    if (c === undefined || !REGISTRARS.has(c.chain[0]!)) continue
-    if (c.chain.includes('concurrent')) {
-      out.push({ line: lineOf(sf, call), why: `.concurrent 修饰链：${c.chain.join('.')}` })
-      continue
-    }
-    for (const a of call.arguments) {
-      if (!ts.isObjectLiteralExpression(a)) continue
-      const v = objectProps(a).get('concurrent')
-      if (v !== undefined && v.kind === ts.SyntaxKind.TrueKeyword) {
-        out.push({ line: lineOf(sf, call), why: '选项对象 concurrent: true' })
+    if (c === undefined) continue
+    const base = c.chain[0]!
+    if (REGISTRARS.has(base)) {
+      const isAlias = c.chain.includes('concurrent')
+        || c.chain.some((seg) => seg.toLowerCase() === 'concurrent')
+      if (isAlias) {
+        out.push({ line: lineOf(sf, call), why: `.concurrent 修饰链：${c.chain.join('.')}` })
+        continue
+      }
+      for (const a of call.arguments) {
+        const u = unwrap(a)
+        if (!ts.isObjectLiteralExpression(u)) continue
+        const props = objectProps(u)
+        if (isTrue(props.get('concurrent'))) {
+          out.push({ line: lineOf(sf, call), why: '选项对象 concurrent: true' })
+        }
+        // `describe`/`suite` 上的 `sequential: false` 与 `concurrent: true` 等价
+        if (SUITES.has(base) && isFalse(props.get('sequential'))) {
+          out.push({ line: lineOf(sf, call), why: '套件选项 sequential: false' })
+        }
       }
     }
   }
@@ -177,14 +199,20 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
  */
 function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why: string }> {
   const out: Array<{ line: number; why: string }> = []
+  const isHookName = (chain: string[] | undefined): boolean =>
+    chain !== undefined && chain.length === 1 && HOOK_HOOKS.has(chain[0]!.toLowerCase())
   for (const call of collectCalls(sf)) {
-    const name = callChain(call)?.chain
-    if (name === undefined || name.length !== 1 || !HOOK_HOOKS.has(name[0]!)) continue
+    if (!isHookName(callChain(call)?.chain)) continue
     for (const inner of collectCalls(call)) {
       const innerName = calleeChain(inner.expression)
-      if (innerName === undefined || innerName.length !== 1) continue
-      if (!HOOK_FORBIDDEN.has(innerName[0]!)) continue
-      out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${innerName[0]}(」` })
+      if (innerName === undefined) continue
+      // `setTimeout(…)` 与 `globalThis.setTimeout(…)` 都是调度；反射（`globalThis['set'+'Timeout']`）
+      // 与转调 helper 内部排调度仍看不出来（见上方边界注释）。
+      const bare = innerName.length === 2 && GLOBAL_HOSTS.has(innerName[0]!)
+        ? [innerName[1]!]
+        : innerName
+      if (bare.length !== 1 || !HOOK_FORBIDDEN.has(bare[0]!)) continue
+      out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${innerName.join('.')}(」` })
     }
   }
   return out
@@ -339,6 +367,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookHits(`${H}(async () => { await delay(80) })`), 'await helper 应放过').toEqual([])
     expect(hookHits(`${H}(() => { const sample = "${ST}(" })`), '字符串里的调用名是数据').toEqual([])
     expect(hookHits(`${H}(() => { const re = /${ST}\\(/ })`), '正则里的调用名是数据').toEqual([])
+    // 全局对象上的调度同样是调度（Codex PR#81 第十轮）
+    expect(hookHits(`${H}(() => { globalThis.${ST}(w, 80) })`)).toEqual([`globalThis.${ST}(`])
+    expect(hookHits(`${H}(() => { global.${ST}(w, 80) })`)).toEqual([`global.${ST}(`])
     expect(hookHits(`${H}(() => { /* ${ST}(1) */ })`), '注释里的调用名是数据').toEqual([])
     expect(hookHits(`${bt('function', ' f() { ', ST, '(w, 1) } ', H, '(() => { f() })')}`),
       'hook 之外的同名调用不归本 hook').toEqual([])
@@ -355,9 +386,20 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(concHits(`${bt("it('A', { con", 'current: true }, () => {})')}`)).toEqual(['opt'])
     expect(concHits(`${bt("it('B', { con", 'current: false }, () => {})')}`)).toEqual([])
     expect(concHits(`${bt("it('C', { 'con", "current': true }, () => {})")}`), '字符串键同属选项（Codex 第九轮）').toEqual(['opt'])
+    // 括号 / 断言包装不改变语义（Codex PR#81 第十轮）
+    expect(concHits(`${bt("it('C2', { con", 'current: (true) }, () => {})')}`), '括号包装').toEqual(['opt'])
+    // `sequential: false` 在套件上等价并发；`it` 上的同名键不算（不是套件选项）
+    expect(concHits(`${bt("describe('G', { se", 'quential: false }, () => {})')}`), '套件 sequential:false').toEqual(['opt'])
+    expect(concHits(`${bt("it('G2', { se", 'quential: false }, () => {})')}`)).toEqual([])
+    // itBound 是 db.test.ts 的包装登记函数（Codex PR#81 第十轮）
+    expect(concHits(`${bt("itBound('H', { con", 'current: true }, () => {})')}`), 'itBound 的选项原样转给 it').toEqual(['opt'])
     expect(concHits(`${bt("it('D', { [", "'concurrent']: true }, () => {})")}`), '计算键同属选项').toEqual(['opt'])
     expect(concHits(`${bt("it.each([1, 2])('x', { con", 'current: true }, () => {})')}`), '链式登记的选项在外层调用上').toEqual(['opt'])
     // 反例：执行体里的属性 / 表格里的属性 / 无关对象都不是选项
+    // 标签模板形态的 each（Codex PR#81 第十轮）：it.each<反引号>a|b<反引号>(名, 选项, 体)
+    // 标签模板形态的 each（Codex PR#81 第十轮）：标签模板 + 选项对象
+    const tagSrc = bt('it.each', String.fromCharCode(96), 'a|b', String.fromCharCode(96), "('x', { con", 'current: true }, () => {})')
+    expect(concHits(tagSrc), '标签模板的 each 登记').toEqual(['opt'])
     expect(concHits(`${bt("it('E', () => { const p = { con", 'current: true } })')}`), '执行体里的是数据').toEqual([])
     expect(concHits(`${bt("it('F', async (): Promise<void> => { const p = { con", 'current: true } })')}`),
       '带返回类型的 async 执行体（Codex 第九轮）').toEqual([])
