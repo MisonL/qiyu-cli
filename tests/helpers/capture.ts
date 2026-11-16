@@ -258,21 +258,23 @@ function installShared(): void {
  * "concurrent 体的尾巴不会漏进下一条"，正是本条不变量的证据）。守卫在
  * `tests/helpers/capture.test.ts`，含白名单过期检查。
  *
- * ⚠️ 另一个边界：**hook 里的延迟写入没有世代**（`beforeEach`/`afterEach` 不在执行体的
- * `alsGen.run` 里）。这类写入按「无上下文 = 当前世代」被接收 —— 实测 A 的 hook 里 80ms 后
- * 落地的尾巴进了 B 的 `out`，而本条守卫选不出来（见 capture-sinks 文件头）。判断标准本身
- * 就是「写入时刻谁在跑」，与「谁发起的」无关；要覆盖它只能给 hook 也套世代（要改 29 个
- * 文件的 hook 导入）。
- * **同样改由静态守卫关闭**：用了 `captureSinks` 的文件，四类 hook（`beforeEach` /
- * `afterEach` / `beforeAll` / `afterAll`）体里**一律**不得出现调度原语
- * （`setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`）。需要延迟就写成模块级
- * helper，在 hook 里 `await helper()`。
- * ⚠️ 为什么是"一律禁"而不是"放过已 await 的"（PR#81 五轮审查的结论）：要静态判断"这次
- * 调度会不会被 vitest 等到"，得同时看懂 await 的对象、promise 由谁敲定、有无提前 resolve、
- * `.then` 链是否被交出去、跨行续写、无括号单参箭头……CR 与 Codex 五轮里报出 15 种形态，
- * 每轮修完下一轮又从邻角冒出来 —— **静态近似堵不完**。规则化后判据可判定、零误报。
- * 判据的边界如实记录：只见直接写在 hook 体里的字面调用；hook 调用的 helper 内部排定时器
- * 看不出来（那条要靠看 helper 的语义）。
+ * ⚠️ 第二个边界：**hook 里的延迟写入没有世代**（`beforeEach`/`afterEach` 不在执行体的
+ * `alsGen` 上下文里）。这类写入按「无上下文 = 当前世代」被接收 —— 实测 A 的 hook 里 80ms
+ * 后落地的尾巴进了 B 的 `out`。**这条边界由静态守卫关闭**（用了 `captureSinks` 的文件，
+ * 四类 hook 体里**一律**不得出现调度原语 `setTimeout`/`setInterval`/`setImmediate`/
+ * `queueMicrotask`）：需要延迟就写成模块级 helper，在 hook 里 `await helper()`。
+ * ⚠️ 能不能在**运行时**也关掉（让 hook 里排的调度捕获不到用例世代）—— 2026-11-16 试过三种
+ * 写法，**全部实测无效**，已回退、不留半成品：① `enterWith` 后接着调 `f`（被调函数的帧
+ * 仍把世代带进 hook 的调度）；② `enterWith` + `finally exit()`（探针里用例 `await` 自身的
+ * 等待便再也捕捉不到 —— 测试整体挂起）；③ 具名函数包 `try/finally exit()`（同 ②）。
+ * 现状 `run(...)` 能让 hook 尾巴被接纳，正是静态守卫必须存在的原因。
+ * ⚠️ 为什么"一律禁"而不是"放过已 await 的"（PR#81 五轮审查的收敛结论）：要静态判断
+ * 「这次调度会不会被 vitest 等到」，得同时看懂 await 的对象、promise 由谁敲定、有无提前
+ * resolve、`.then` 链是否被交出去、跨行续写、无括号单参箭头……CR 与 Codex 五轮里报出 15 种
+ * 形态，每轮修完下一轮又从邻角冒出来 —— **静态近似堵不完**。规则化后判据可判定、零误报
+ * （之后两轮对**扫描实现**的收紧见 `source-scan.ts` 文件头，与判据本身无关）。
+ * 判据的边界如实记录：只见直接写在 hook 体里的字面调用 —— hook 调用的 helper 内部排定时器
+ * 静态看不出来（要靠看 helper 的语义），运行时也没有兜底（见上一条：运行时关闭不可行）。
  */
 function writerIsCurrent(): boolean {
   const g = alsGen.getStore()

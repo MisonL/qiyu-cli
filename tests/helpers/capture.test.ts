@@ -13,7 +13,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startCapture, captureInstalled } from './capture.js'
-import { argRange, blankComments } from './source-scan.js'
+import { argRange, blankComments, blankLiterals, propertyRanges, scanBalanced, splitTopLevel } from './source-scan.js'
 
 // ⚠️ 文件结束时 `process.stdout.write` 必须已恢复（Codex 2026-11-13 P2：vitest 2.1.9
 // 默认 `restoreMocks:false`，不恢复的话同 worker 的**下一个测试文件**会把写入记进
@@ -164,18 +164,6 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
   /** 四类 hook：前两类之上都在用例世代之外；嵌套的 `afterAll` 只结束那一层 suite。 */
   const HOOK_CALL = /\b(?:beforeEach|afterEach|beforeAll|afterAll)\s*\(/g
 
-  /** 从 `open`（指向 `(` 或 `{`）起配对，返回配对符号**之后**的下标；未配对返回 -1。 */
-  function skipBalanced(text: string, open: number): number {
-    const o = text[open]
-    const c = o === '(' ? ')' : '}'
-    let depth = 0
-    for (let k = open; k < text.length; k++) {
-      if (text[k] === o) depth++
-      else if (text[k] === c) { depth--; if (depth === 0) return k + 1 }
-    }
-    return -1
-  }
-
   /** 一个 hook 体里出现的全部禁区命中（供扫描与自检共用）。 */
   function hookViolations(hookBody: string): string[] {
     return [...hookBody.matchAll(HOOK_FORBIDDEN)].map((m) => m[0].trim())
@@ -198,22 +186,55 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
   /**
    * 选项对象形态的并发开关（`it(名, { concurrent: true }, fn)`）。
    * ⚠️ 不能全文搜 `concurrent: true` —— 无关的 `const payload = { concurrent: true }`
-   * 也会命中、把串行测试判违规（CodeRabbit PR#81 第六轮）。只查注册函数调用的**实参区间**。
+   * 也会命中、把串行测试判违规（CodeRabbit PR#81 第六轮）；只查注册调用的实参区间还不够
+   * （执行体也算实参，Codex 第七轮）—— 认法见 `concurrentOptionHits`。
    */
   const CONCURRENT_OPT = /\bconcurrent\s*:\s*true\b/g
   const REGISTER_CALL = /\b(?:it|test|describe|suite)\b(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\(/g
 
-  /** 该文件里通过选项对象开启并发的注册点行号。 */
-  function concurrentOptionHits(text: string): string[] {
+  /**
+   * 该文件里通过选项对象开启并发的注册点行号。
+   *
+   * ⚠️ 只认**选项实参**，不能拿整个实参区间去搜 `concurrent: true`（Codex PR#81 第七轮 P2）：
+   * `it('safe', () => { const payload = { concurrent: true } })` 是串行用例，执行体里出现
+   * 这个属性是合法夹具 —— 那会让**整个仓库**的守卫在一个普通测试上变红（误报）。
+   *
+   * 认法是「实参形态」，不读实参内容：
+   * - `{` → 选项对象（`it(名, { … })` / `it(名, { concurrent: true }, 体)` / `it.todo(名, {…})`）。
+   *   在 `propertyRanges`（顶层属性位 + `:` 之后的对象值、`=>` 之后的块）里找开关 —— 嵌套
+   *   `retry: { concurrent: true }` 必须命中；回调体（`() => ({ … })` 表达式）与执行体里的
+   *   同名属性必须放过（Codex 第七轮；第八轮又指出正则切 `:`/`=>` 不够，已换词法扫描）。
+   * - `(` 且后面紧跟 `=>`（`() => …` / `(o) => …` / `(o = {…}) => …`）→ 本实参就是执行体，
+   *   段内什么都不算（执行体里的同名属性是用户数据）；括号包裹的对象字面量（`({ … })`）
+   *   仍算选项。
+   * - 其余（标识符 / 字符串 / 数字 / undefined）→ 不可能是执行体，整段都算。
+   * 边界（如实记录）：属性值是三元 / 调用参数里的对象字面量不展开（本仓库无此写法）；
+   * 以对象字面量结尾的两参调用（`it(名, {…})`）按 todo 形态计为并发 —— 那是误报方向的唯一
+   * 来源，且只发生在真写了这种调用时。
+   */
+  function concurrentOptionHits(rawText: string): string[] {
     const out: string[] = []
-    for (const m of text.matchAll(REGISTER_CALL)) {
-      const open = text.indexOf('(', m.index! + m[0].length - 1)
+    const blanked = blankLiterals(rawText)
+    for (const m of rawText.matchAll(REGISTER_CALL)) {
+      const open = blanked.indexOf('(', m.index! + m[0].length - 1)
       if (open === -1) continue
-      const close = skipBalanced(text, open)
-      if (close === -1) continue
-      const args = text.slice(open + 1, close - 1)
-      if (CONCURRENT_OPT.test(args)) out.push(`${text.slice(0, m.index!).split('\n').length}`)
-      CONCURRENT_OPT.lastIndex = 0    // 全局正则必须手动复位，否则漏掉同文件第二处
+      const close = scanBalanced(blanked, open)[1]
+      if (close === 0) continue
+      for (const [s0, e0] of splitTopLevel(blanked, open + 1, close - 1)) {
+        const first = blanked.slice(s0, s0 + 1)
+        const arrowBody = new RegExp('^\\([^()]*\\)\\s*=>').test(blanked.slice(s0, e0))
+        let ranges: Array<[number, number]>
+        if (first === '{') ranges = propertyRanges(blanked, s0 + 1, e0 - 1)
+        // 本实参就是执行体（`() => {…}` / `(o) => {…}`）：段内**什么都不算** ——
+        // 执行体里的 `concurrent: true` 是用户数据，不是开关
+        else if (first === '(' && arrowBody) ranges = []
+        else ranges = [[s0, e0]]
+        // ⚠️ 判据必须在**抹掉字符串内容**后做（Codex PR#81 第八轮）：`{ label: 'concurrent: true' }`
+        // 的值是数据而不是开关，在原始文本上匹配会误报。抹除保持等长偏移，区间照旧可用。
+        const flagged = ranges.some(([rs, re]) => CONCURRENT_OPT.test(blanked.slice(rs, re)))
+        CONCURRENT_OPT.lastIndex = 0    // 全局正则必须手动复位，否则同文件下一处漏判
+        if (flagged) out.push(`${rawText.slice(0, m.index!).split('\n').length}`)
+      }
     }
     return out
   }
@@ -283,8 +304,8 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         const text = blankComments(readFileSync(f, 'utf8'))
         if (!usesMigratedForm(text)) continue
         for (const m of text.matchAll(HOOK_CALL)) {
-          const close = skipBalanced(text, m.index! + m[0].length - 1)
-          if (close === -1) continue
+          const close = scanBalanced(text, m.index! + m[0].length - 1)[1]
+          if (close === 0) continue
           const body = text.slice(m.index! + m[0].length, close - 1)
           const line = text.slice(0, m.index!).split('\n').length
           for (const v of hookViolations(body)) hits.push(`${rel}:${line} hook 体里出现「${v}」`)
@@ -305,7 +326,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         const src = bt(hook, kind, '(() => { set', 'Timeout(w, 80) })')
         const m = [...src.matchAll(HOOK_CALL)]
         expect(m, `${hook}${kind} 必须被 HOOK_CALL 命中`).toHaveLength(1)
-        const body = src.slice(m[0].index! + m[0][0].length, skipBalanced(src, m[0].index! + m[0][0].length - 1) - 1)
+        const body = src.slice(m[0].index! + m[0][0].length, scanBalanced(src, m[0].index! + m[0][0].length - 1)[1] - 1)
         expect(hookViolations(body), `${hook}${kind} 里的 setTimeout 必须被报`).toEqual(['setTimeout('])
       }
     }
@@ -317,7 +338,32 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookViolations(bt('(() => set', 'Immediate(w))'))).toEqual(['setImmediate('])
     // 配对：跳过 executor 的嵌套括号后再配对（hook 体到正确的 `)` 为止）
     const nested = bt('(() => { await new Promise((r) => set', 'Timeout(r, 80)) })')
-    expect(skipBalanced(nested, nested.indexOf('(') ), '嵌套括号必须配平到 hook 的 `)`').toBe(nested.length)
+    expect(scanBalanced(nested, nested.indexOf('('))[1], '嵌套括号必须配平到 hook 的 `)`').toBe(nested.length)
+    // 字符串 / 模板 / 正则 / 注释里的括号不是配对符号（Codex PR#81 第七轮）。
+    // ⚠️ 每个样本都把禁区**放在伪括号之后**：只跳字符串、不跳正则的实现能在 `')'` 样本
+    // 上通过，必须在正则 / 模板 / 注释样本上红。
+    const guardOf = (src: string): string[] => {
+      const m = src.match(new RegExp('beforeEach\\s*\\('))!
+      const from = m.index! + m[0].length - 1
+      const body = src.slice(from + 1, scanBalanced(src, from)[1] - 1)
+      return hookViolations(body)
+    }
+    for (const q of ['`', "'", '"']) {
+      expect(guardOf(`${bt('beforeEach(() => { const x = ', q)}); ${bt('set', 'Timeout(w, 80) })')}`),
+        `字符串 ${q}…${q} 里的 ) 被当成了终点`).toEqual(['setTimeout('])
+    }
+    // ⚠️ 正则里的 `)` 必须**不带反斜杠**：`\)` 会被 `scanBalanced` 顶部的转义分支跳过，
+    // 那样「不跳正则」的实现也能通过（变异实测：带 `\\)` 时变异存活）。
+    expect(guardOf(bt('beforeEach(() => { const re = /)/; ', 'queue', 'Microtask(w) })')),
+      '正则里的 ) 被当成了终点').toEqual(['queueMicrotask('])
+    expect(guardOf(bt('beforeEach(() => { const t = `a ${f(1)} b`; ', 'set', 'Immediate(w) })')),
+      '模板里的括号被当成了配对符号').toEqual(['setImmediate('])
+    expect(guardOf(bt('beforeEach(() => { /* ) */ ', 'set', 'Interval(w, 80) })')),
+      '块注释里的 ) 被当成了终点').toEqual(['setInterval('])
+    // 字符串里的 `(` 同样不得让配对跑偏（旧实现在这里截断/吞掉整条 hook）
+    expect(guardOf(bt("beforeEach(() => { const x = '(('; ", 'set', 'Timeout(w, 80) })')))
+      .toEqual(['setTimeout('])
+    expect(scanBalanced(bt("f(')"), 1)[1], '未配平必须落在文本末尾而不是 -1/抛错').toBe(bt("f(')").length)
 
     // —— 并发那条判据：命中 / 不命中 ——
     expect([...bt('it.', 'concurrent("x", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
@@ -333,9 +379,30 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 无关对象属性不得误报（CodeRabbit PR#81 第六轮）——
     // ⚠️ 样本里必须**同时存在**一个注册调用，否则"退回全文搜索"的实现也能通过（变异实测：
     // 只放 `const payload = {...}` 时变异 2 存活）。
-    expect(concurrentOptionHits(bt("const payload = { con", "current: true }\nit('x', () => {})")))
+    // ⚠️ 无关对象必须出现在**注册调用的参数位置之外**：`it('A', {…}, () => {})` 里的对象
+    // 是合法选项位，不能拿它当「无关」。这里先放一行无关代码、再放一个真正的串行用例。
+    expect(concurrentOptionHits(bt("const payload = { con", "current: true }\nit('x', () => { const y = 1 })")))
       .toHaveLength(0)
     expect(concurrentOptionHits(bt('const payload = { con', 'current: true }'))).toHaveLength(0)
+    // 执行体里的同名属性不得误报（Codex PR#81 第七轮）：执行体也是实参，但用例是串行的
+    expect(concurrentOptionHits(bt("it('safe', () => { const p = { con", 'current: true } })')))
+      .toHaveLength(0)
+    expect(concurrentOptionHits(bt("it('safe', { time", "out: 5 }, () => { const p = { con", 'current: true } })')))
+      .toHaveLength(0)
+    // 执行体写成「返回对象字面量」同样不误报
+    expect(concurrentOptionHits(bt("it('r', { time", "out: 5 }, () => ({ con", 'current: true }))')))
+      .toHaveLength(0)
+    // 选项位的正向：选项对象里嵌套 retry、`it.todo(名, 选项)` 形态都必须命中
+    expect(concurrentOptionHits(bt("it('A', { retry: { con", 'current: true } }, () => {})'))).toHaveLength(1)
+    // 嵌套在属性值里（不在选项顶层）也必须命中；与执行体的区别就是「在不在选项对象里」
+    expect(concurrentOptionHits(bt("it('A', { onTestFailed: () => {}, o", "pts: { con", 'current: true } }, () => {})')))
+      .toHaveLength(1)
+    expect(concurrentOptionHits(bt('it.todo(', '\'A\', { con', 'current: true })'))).toHaveLength(1)
+    // 值里出现开关字符串是数据、不是开关（Codex PR#81 第八轮）
+    expect(concurrentOptionHits(bt('it(\'A\', { label: \'con', "current: true' }, () => {})"))).toHaveLength(0)
+    expect(concurrentOptionHits(bt('it(\'A\', { label: \'x\', con', 'current: true }, () => {})'))).toHaveLength(1)
+    // 首个实参是括号包裹的对象字面量：那是执行体，不是选项
+    expect(concurrentOptionHits(bt("it('A', () => { const o = { con", 'current: true } })'))).toHaveLength(0)
     // 同一文件多处注册点都要被认出（全局正则 lastIndex 复位）
     expect(concurrentOptionHits(bt("it('A', { con", "current: true }, () => {})",
       "it('B', { con", "current: true }, () => {})"))).toHaveLength(2)
