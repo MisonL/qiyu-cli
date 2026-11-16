@@ -189,6 +189,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
   const MIGRATED_ENTRY = new RegExp('\\bcaptureSinks\\s*\\(')
   const usesMigratedForm = (src: string): boolean => MIGRATED_ENTRY.test(src)
 
+  /**
+   * `.concurrent` 别名形态。⚠️ 点两侧允许空白（CodeRabbit PR#81 第五轮）：`it .concurrent(…)`
+   * 与跨行写法都是合法 JS，写死 `\.concurrent` 会静默放行。
+   */
+  const CONCURRENT_ALIAS = /\b(?:it|test|describe)\s*\.\s*concurrent\b/g
+
   /** 选项对象形态的并发开关（`it(名, { concurrent: true }, fn)`）。 */
   const CONCURRENT_OPT = /\bconcurrent\s*:\s*true\b/g
 
@@ -224,7 +230,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         if (!usesMigratedForm(text)) continue
         // `.concurrent` 的任何注册形态：`it.concurrent(` / `it.concurrent.each(` /
         // `describe.concurrent(`（describe 级并发同样让用例并行）
-        for (const m of text.matchAll(/\b(?:it|test|describe)\.concurrent\b/g)) {
+        for (const m of text.matchAll(CONCURRENT_ALIAS)) {
           hits.push(`${rel}:${text.slice(0, m.index!).split('\n').length}`)
         }
         // ⚠️ 选项对象形态（Codex PR#81 第三轮 P2）：`it('A', { concurrent: true }, fn)` 与
@@ -244,7 +250,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         const p = join(SRC_TESTS, rel)
         expect(existsSync(p), `CONCURRENT_EXEMPT 里的 ${rel} 不存在（清单过期）`).toBe(true)
         expect(blankComments(readFileSync(p, 'utf8')), `${rel} 已不再用 .concurrent，请从 CONCURRENT_EXEMPT 删除`)
-          .toMatch(/\b(?:it|test|describe)\.concurrent\b/)
+          .toMatch(CONCURRENT_ALIAS)
       }
     })
 
@@ -272,7 +278,6 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // ⚠️ 样本一律用 `join` 拼出来，**不在源码里写字面量**：本文件也在扫描范围内，
     // 字面量会让守卫扫到自己（自证）。
     const bt = (...parts: string[]): string => parts.join('')
-    const conc = /\b(?:it|test|describe)\.concurrent\b/g
 
     // 四类 hook 都必须被认出
     for (const hook of ['before', 'after']) {
@@ -295,8 +300,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(skipBalanced(nested, nested.indexOf('(') ), '嵌套括号必须配平到 hook 的 `)`').toBe(nested.length)
 
     // —— 并发那条判据：命中 / 不命中 ——
-    expect([...bt('it.', 'concurrent("x", () => {})').matchAll(conc)]).toHaveLength(1)
-    expect([...bt('describe.', 'concurrent("y", () => {})').matchAll(conc)]).toHaveLength(1)
+    expect([...bt('it.', 'concurrent("x", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
+    expect([...bt('describe.', 'concurrent("y", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
+    // 点两侧带空白 / 跨行（CodeRabbit PR#81 第五轮）：必须用 CONCURRENT_ALIAS 判，不能写死
+    expect([...bt('it ', '. concurrent("z", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
+    expect([...bt('it', '\n  .concurrent("w", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
+    expect([...bt("it('A', { con", 'current: true }, () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(0)
     expect([...bt("it('A', { con", 'current: true }, () => {})').matchAll(CONCURRENT_OPT)]).toHaveLength(1)
     expect([...bt("it('B', { con", 'current: false }, () => {})').matchAll(CONCURRENT_OPT)]).toHaveLength(0)
     expect(/\bcaptureSinks\s*\(/.test(bt('capture', 'Sinks((a) => {}, (b) => {})'))).toBe(true)

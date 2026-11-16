@@ -52,6 +52,9 @@
   `duckdb.test.ts` 的硬顶用例要插 25000 行（15s → 60s）。本机负载 700–840 时它们都会
   `Test timed out`，单独重跑仍红 —— 造大夹具的固有代价，不是本次改动引入的回归
   （CI 上分别约 20s / 2s）。
+- **`.concurrent` 别名判据允许点两侧空白**（2026-11-16，CodeRabbit PR#81 第五轮）：`it .concurrent(…)`
+  与跨行写法都是合法 JS，写死 `\.concurrent` 会静默放行；判据抽成 `CONCURRENT_ALIAS` 常量，
+  扫描、豁免过期检查与自检共用同一份。
 - **capture 的 hook 判据改成可判定的强规则**（2026-11-16，PR#81 五轮审查的收敛结论）：
   此前想"放过已 await 的调度"，于是要静态判断 await 的对象、promise 由谁敲定、有无提前
   resolve、`.then` 链是否交出去、跨行续写、无括号单参箭头……CR 与 Codex 五轮报出 15 种形态，
