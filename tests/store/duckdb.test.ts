@@ -484,6 +484,41 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('显式事务开着时，另一条链的 transaction() 报 internal（不是 usage 嵌套），读语句也不得落进去（CodeRabbit PR#81 第十七轮 minor）', async () => {
+    // 事故路径（实测复现）：原先只有「自动事务被撞」区分成 internal，持有 `symbol` 令牌的
+    // 显式事务被另一条链 `transaction()` 撞上时落到 `usage('不得嵌套事务')` —— 竞争方拿到
+    // 退出码 2 的「参数写错」信号，且没有串行化提示。它不是嵌套（不在所有者上下文里）。
+    // 另一半：闸门下移到 `execSql` 后读语句也过它，文案必须对读成立（原先说"写操作"）。
+    const s = await fresh()
+    let ready!: () => void
+    const txReady = new Promise<void>((r) => { ready = r })
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const tx = s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      ready()
+      await gate
+    })
+    await txReady
+    const race = await s.transaction(async () => 'x').then(() => null, (e: unknown) => e)
+    expect(race, '竞争方的显式事务必须报 internal（串行化），不能报成 usage 嵌套').toMatchObject({ kind: 'internal' })
+    expect((race as { hint?: string }).hint, 'internal 必须带串行化提示').toMatch(/串行/)
+    const read = await s.count('tags').then(() => null, (e: unknown) => e)
+    expect(read, '竞争方的读同样必须被拒成 internal').toMatchObject({ kind: 'internal' })
+    expect((read as Error).message, '文案必须对读成立 —— 不能只说"写操作"，否则只读调用方会被引到错误成因上')
+      // ⚠️ 锚在**被改动的那句**（"又发起了 X"）上，不能只匹配 /读/：消息后半句本来就解释
+      // 了读的后果，只匹配 /读/ 的话把首句改回"写操作"变异也照样绿（实测存活过一轮）。
+      .toMatch(/又发起了语句/)
+    expect((read as { hint?: string }).hint).toMatch(/query/)
+    release()
+    await tx
+    // 所有者上下文里的真嵌套仍是 usage（这条不能跟着变成 internal）
+    await expect(s.transaction(async (t) => {
+      await (t as unknown as { transaction: (f: unknown) => Promise<unknown> }).transaction(async () => {})
+    })).rejects.toMatchObject({ kind: 'usage' })
+    await s.close()
+  })
+
   it('tx 内嵌套 transaction() → usage', async () => {
     const s = await fresh()
     await expect(s.transaction(async (tx) => {

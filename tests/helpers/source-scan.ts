@@ -76,10 +76,19 @@ export function unwrap(node: ts.Expression): ts.Expression {
   return n
 }
 
+/** 字面量下标访问的键（`obj['f']` / ``obj[`f`]`` 与 `obj.f` 同义）；非静态键返回 undefined。 */
+export function staticKey(node: ts.Expression): string | undefined {
+  const k = unwrap(node)
+  if (ts.isStringLiteral(k) || ts.isNoSubstitutionTemplateLiteral(k)) return k.text
+  return undefined
+}
+
 /**
  * 被调表达式的**静态**名字链：标识符 / 属性访问（`globalThis.setTimeout` → 两段）。
  * 基座是调用（`it.skipIf(false).concurrent`）时**只取穿透之上的名字链**由 `callChain` 负责 ——
  * 本函数遇到它返回 undefined（不谎报一半的链）。
+ * ⚠️ 字面量下标访问与点号同义（`process.stderr['write']`、`it['concurrent']`）—— 不认它就把
+ * 「合法写法」错判成「认不出来」，守卫静默漏掉那次调用（Codex PR#81 第十七轮 P2，探针复现）。
  */
 export function calleeChain(node: ts.Expression): string[] | undefined {
   const u = unwrap(node)
@@ -87,6 +96,12 @@ export function calleeChain(node: ts.Expression): string[] | undefined {
   if (ts.isPropertyAccessExpression(u)) {
     const base = calleeChain(u.expression)
     return base === undefined ? undefined : [...base, u.name.text]
+  }
+  if (ts.isElementAccessExpression(u)) {
+    const k = staticKey(u.argumentExpression)
+    if (k === undefined) return undefined
+    const base = calleeChain(u.expression)
+    return base === undefined ? undefined : [...base, k]
   }
   return undefined
 }
@@ -110,6 +125,13 @@ export function callChain(call: ts.CallExpression): { chain: string[]; viaCall: 
     if (ts.isPropertyAccessExpression(e)) {
       const base = resolve(e.expression)
       return base === undefined ? undefined : [...base, e.name.text]
+    }
+    // 字面量下标访问与点号同义（见 `calleeChain` 的同款注释，Codex PR#81 第十七轮 P2）
+    if (ts.isElementAccessExpression(e)) {
+      const k = staticKey(e.argumentExpression)
+      if (k === undefined) return undefined
+      const base = resolve(e.expression)
+      return base === undefined ? undefined : [...base, k]
     }
     if (ts.isCallExpression(e) || ts.isTaggedTemplateExpression(e)) {
       viaCall = true

@@ -394,6 +394,15 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 全局对象上的调度同样是调度（Codex PR#81 第十轮）
     expect(hookHits(`${H}(() => { globalThis.${ST}(w, 80) })`)).toEqual([`globalThis.${ST}(`])
     expect(hookHits(`${H}(() => { global.${ST}(w, 80) })`)).toEqual([`global.${ST}(`])
+    // 字面量下标访问与点号同义（Codex PR#81 第十七轮 P2，探针复现漏检）：`globalThis['setTimeout'](…)`
+    // 是**合法写法**、不是反射边界（反射是 `globalThis['set' + 'Timeout']`）。不认下标时
+    // `calleeChain` 返回 undefined，这条 hook 直接放行 —— 等于把守卫绕过去。
+    expect(hookHits(`${H}(() => { globalThis[${JSON.stringify(ST)}](w, 80) })`), '下标访问的全局调度')
+      .toEqual([`globalThis.${ST}(`])
+    expect(hookHits(`${H}(() => { window[${JSON.stringify(ST)}](w, 80) })`), 'window 下标访问').toEqual([`window.${ST}(`])
+    // 反例：动态键仍是已声明的反射边界（`['set' + 'Timeout']` 求不出静态名）
+    expect(hookHits(`${H}(() => { globalThis[${JSON.stringify('set')} + ${JSON.stringify('Timeout')}](w, 1) })`),
+      '反射拼接不在静态判据内（已声明的边界）').toEqual([])
     expect(hookHits(`${H}(() => { /* ${ST}(1) */ })`), '注释里的调用名是数据').toEqual([])
     expect(hookHits(`${bt('function', ' f() { ', ST, '(w, 1) } ', H, '(() => { f() })')}`),
       'hook 之外的同名调用不归本 hook').toEqual([])
@@ -410,6 +419,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 基座是调用、尾巴是修饰名（Codex PR#81 第十二轮）：`it.skipIf(false).concurrent(…)`
     expect(concHits(`${bt('it.skipIf(false).', 'concurrent("q", () => {})')}`), '条件基座 + concurrent')
       .toEqual(['alias:it.skipIf.concurrent'])
+    // 字面量下标访问与点号同义（Codex PR#81 第十七轮 P2，探针复现漏检）：不认下标时
+    // `callChain` 返回 undefined，`.concurrent` 与选项位同时漏判 —— 守卫被"合法写法"绕过。
+    expect(concHits(`${bt('it[', JSON.stringify('concurrent'), ']("x", () => {})')}`), '下标访问的并发修饰')
+      .toEqual(['alias:it.concurrent'])
+    expect(concHits(`${bt('it[', JSON.stringify('skipIf'), '](false).concurrent(' , '"q2", () => {})')}`),
+      '下标基座 + 点号修饰').toEqual(['alias:it.skipIf.concurrent'])
     // 叠加修饰（CodeRabbit PR#81 第十三轮）：条件基座 + concurrent + each。
     // ⚠️ 必须**两层以上**穿透才咬人：`it.skipIf(false).concurrent(…)` 只穿一层也成立，
     // 用单层样本时「只穿一层」的变异会存活（变异实测）。

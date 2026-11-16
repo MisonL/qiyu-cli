@@ -34,7 +34,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
-import { lineOf, literalTexts, parseTs, unwrap } from './helpers/source-scan.js'
+import { calleeChain, lineOf, literalTexts, parseTs, unwrap } from './helpers/source-scan.js'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SRC = join(ROOT, 'src')
@@ -108,43 +108,14 @@ function eachInvocation(sf: ts.SourceFile, fn: (n: ts.CallExpression | ts.NewExp
 const argsOf = (n: ts.CallExpression | ts.NewExpression): readonly ts.Expression[] => n.arguments ?? []
 
 /**
- * 被调者的**名字链**（`usageFail` → `['usageFail']`；`process.stderr.write` → 三段）。
- * ⚠️ 不能用 `getText(sf)` 比对（CodeRabbit PR#81 第十四轮）：它返回**源码原文**，跨行
- * （`process.stderr\n  .write(…)`）、可选链（`process.stderr?.write(…)`）、中间夹注释都会
- * 让字符串对不上、规则静默跳过那次调用（真实扫描照样全绿）。AST 名字链对这些形态一致。
- */
-function calleeNameChain(n: ts.CallExpression | ts.NewExpression): string[] {
-  const out: string[] = []
-  let e: ts.Expression = unwrap(n.expression)
-  for (;;) {
-    if (ts.isIdentifier(e)) { out.unshift(e.text); return out }
-    if (ts.isPropertyAccessExpression(e) || ts.isPropertyAccessChain?.(e) === true) {
-      const pa = e as ts.PropertyAccessExpression
-      out.unshift(pa.name.text)
-      e = unwrap(pa.expression)
-      continue
-    }
-    // 字面量下标访问 `process.stderr['write']` 与点号写法同义（CodeRabbit PR#81 第十五轮）
-    if (ts.isElementAccessExpression(e)) {
-      const key = unwrap(e.argumentExpression)
-      if (ts.isStringLiteral(key) || ts.isNoSubstitutionTemplateLiteral(key)) {
-        out.unshift(key.text)
-        e = unwrap(e.expression)
-        continue
-      }
-    }
-    if (ts.isCallExpression(e)) { e = unwrap(e.expression); continue }   // 极少见：`f()()` 取 f
-    return []   // 认不出来 → 空链，规则自然不命中
-  }
-}
-
-/**
  * 该调用的名字链是否等于 `want`（逐段）。
  * ⚠️ 不再接收 `sf`：历史版本用 `getText(sf)` 比对、跨行与可选链会静默漏判（本条注释即理由）。
  */
 const named = (n: ts.CallExpression | ts.NewExpression, ...want: string[]): boolean => {
-  const got = calleeNameChain(n)
-  return got.length === want.length && got.every((seg, i) => seg === want[i])
+  // ⚠️ 名字链**只许一个实现点**（`source-scan.ts`）：本文件曾有自己的一份，补下标访问时
+  // 只修了那一份，共享的那份照样漏（Codex PR#81 第十七轮 P2 在 capture 守卫上复现）。
+  const got = calleeChain(n.expression)
+  return got !== undefined && got.length === want.length && got.every((seg, i) => seg === want[i])
 }
 
 /** `usageFail(...)` 的文案里没有 `**`（逐字写进 stderr）。 */

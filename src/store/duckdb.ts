@@ -209,22 +209,27 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   }
 
   /**
-   * 写操作的事务归属守卫：有事务开着、但**当前异步链不是它的所有者** → 拒绝。
+   * 事务归属守卫：有事务开着、但**当前异步链不是它的所有者** → 拒绝。
    *
-   * ⚠️ 为什么必须拒绝而不是"照旧并入"：并入后成功返回、随对方回滚而丢失（见 `txToken`）。
+   * ⚠️ 判据覆盖**所有语句**而不只是写：单连接上的读（`query`/`count`/`tables`）同样落进
+   * 当前活动事务，它一旦执行期报错就会把那条事务标成 aborted（见 `execSql` 的注释）。
+   * 所以文案必须对读也成立 —— 只说"写操作"会把只读调用方引到错误的成因上
+   * （CodeRabbit PR#81 第十七轮 minor，实测：`count`/`query` 报出的是"写操作"）。
    * 为什么是 `internal` 而不是 `usage`：这不是调用方参数写错，是本进程内两条异步链
-   * 同时写同一个 Store 实例 —— 唯一正确的修法是调用方串行化（Store 契约见文件头）。
+   * 同时用一个 Store 实例 —— 唯一正确的修法是调用方串行化（Store 契约见文件头）。
    */
   const assertTxOwnership = (): void => {
     if (!inTx) return
     if (alsTx.getStore() === txToken) return
     const err = new Error(
-      '同一个 Store 实例上有事务未提交时，另一条异步链又发起了写操作 —— 已拒绝，'
-      + '否则这次写入会被并入那条事务并随它一起回滚（表现为"写入成功但数据消失"）。'
-      + 'Store 的并发契约是"同一实例上的写必须串行 await"（见 src/store/duckdb.ts 文件头）',
+      '同一个 Store 实例上有事务未提交时，另一条异步链又发起了语句 —— 已拒绝。'
+      + '写会被并入那条事务并随它一起回滚（表现为"写入成功但数据消失"）；'
+      + '读同样落在那条事务里，一旦执行期报错就会把它标成 aborted，'
+      + '所有者随后的 COMMIT 返回成功而写入被丢弃。'
+      + 'Store 的并发契约是"同一实例上的操作必须串行 await"（见 src/store/duckdb.ts 文件头）',
     )
     ;(err as { kind?: string }).kind = 'internal'
-    ;(err as { hint?: string }).hint = '让同一个 Store 实例上的写操作串行执行：不要用 Promise.all 并行调用 upsert/delete/transaction'
+    ;(err as { hint?: string }).hint = '让同一个 Store 实例上的操作串行执行：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
     throw err
   }
 
@@ -517,14 +522,20 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     },
     delete: del,
     async transaction<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T> {
-      // 自动事务进行中又来 `transaction()`：在事务回调**内部**调用会落到 `alsTx.run(token)` 里、
-      // 由 `fn` 里的 `tx.transaction` 递归进入（那条路径本来就报「不得嵌套」）；这里挡的是
-      // **另一条异步链**的显式事务 —— 它不是嵌套，而是并发竞争，如实报成竞争。
-      if (inTx && txToken instanceof AutoTx) {
-        throw Object.assign(new Error('本实例上有一条自动事务（upsert/delete 自开）尚未提交，'
-          + '此时不能开始显式事务 —— 请让同一 Store 实例上的写串行 await'), { kind: 'internal' })
+      // ⚠️ 用异步上下文区分两种「事务已开」（CodeRabbit PR#81 第十七轮 minor，实测复现）：
+      //   · 调用方**就在所有者上下文里**（`fn` 里的 `tx.transaction`，令牌一致）→ 真嵌套，usage；
+      //   · 调用方是**另一条异步链**（令牌不一致）→ 并发竞争，internal。
+      // 原先只对 `AutoTx` 的竞争分开报，持有 `symbol` 令牌的显式事务被撞时一律落到
+      // `usage('不得嵌套事务')` —— 实测竞争方拿到退出码 2 的「参数写错」信号，且没有串行化提示。
+      const owns = inTx && alsTx.getStore() === txToken
+      if (inTx && !owns) {
+        throw Object.assign(new Error('本实例上有一条事务尚未提交，此时另一条异步链不能开始新事务 —— '
+          + '请让同一 Store 实例上的操作串行 await'), {
+          kind: 'internal',
+          hint: '让同一个 Store 实例上的操作串行执行：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count',
+        })
       }
-      if (inTx) throw usage('不得嵌套事务')
+      if (owns) throw usage('不得嵌套事务')
       // ⚠️ 归属登记必须**先于** `BEGIN` 的 await（CodeRabbit PR#81 第七轮 major）：原先
       // `inTx` 在 BEGIN 落定之后才置位，BEGIN 这条 await 期间它的外部写会被放行，随后的
       // 语句排进本事务、回滚时静默消失（实测：BEGIN 挂住时外部 delete 返回成功、行没了）。
