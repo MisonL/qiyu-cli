@@ -136,10 +136,12 @@ const USAGE_FAIL: Rule = {
  * `throw` 里的 `new Error(...)`（含 `throw Object.assign(new Error(…))`）。
  * 两条出口都会把 message 变成人读文本：`callOne` 的 catch 直接写 stderr；未捕获时
  * Node 默认打印器把 message 与堆栈一起打到终端。AST 判据天然跨行、跨嵌套。
- * ⚠️ 向上回溯**止于函数边界**（CodeRabbit PR#81 第十九轮 minor，探针复现）：
+ * ⚠️ 向上回溯**止于未被调用的函数边界**（CodeRabbit PR#81 第十九轮 minor，探针复现）：
  * `throw Object.assign(new Error('clean'), { makeError: () => new Error('**x**') })` 里
- * 回调内的 `new Error` 不在执行路径上 —— 它的 message 永远不会被抛出。函数边界包括
- * 箭头函数 / 函数表达式 / 声明 / 方法 / 访问器 / 构造函数。
+ * 回调内的 `new Error` 不在执行路径上 —— 它的 message 永远不会被抛出。
+ * ⚠️ 但**立即调用**的函数表达式仍然执行（Codex PR#81 第二十轮 P2，探针复现）：
+ * `throw (() => new Error('**BAD**'))()` 抛的就是里面那个 Error。所以边界只在
+ * 「它是某个调用的被调对象」时被穿透，否则才停止。
  */
 const THROW_ERROR: Rule = {
   name: 'throw new Error',
@@ -149,13 +151,34 @@ const THROW_ERROR: Rule = {
       ts.isArrowFunction(n) || ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n)
       || ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)
       || ts.isConstructorDeclaration(n)
+    /**
+     * 这个函数节点是否**立即执行**（`(() => …)()` / `(function () {…})()`）。
+     * ⚠️ 括号也是包装：`(() => …)()` 里箭头的父节点是 `ParenthesizedExpression`，
+     * 只比一层父节点会把 IIFE 误判成"没被调用"（探针实测：父=ArrowFunction 的父是括号）。
+     */
+    // ⚠️ 包装不止括号：`(() => …) as F)()`、`(() => …)!()`、`satisfies` 都编译成调用
+    // （Codex PR#81 第二十轮 P2 追加探针：`as` / `!` / `satisfies` 三种形态原判据全漏），
+    // 所以复用共享的 `unwrap`（括号 / `as` / 非空断言 / `satisfies`）。
+    const isImmediatelyInvoked = (n: ts.Node): boolean => {
+      let e: ts.Expression = n as ts.Expression
+      for (;;) {
+        const p = e.parent
+        if (p !== undefined && ts.isParenthesizedExpression(p) && p.expression === e) { e = p; continue }
+        if (p !== undefined && (ts.isAsExpression(p) || ts.isNonNullExpression(p)
+          || ts.isSatisfiesExpression(p)) && p.expression === e) { e = p as ts.Expression; continue }
+        if (p !== undefined && ts.isCallExpression(p) && p.expression === e) return true
+        return false
+      }
+    }
     eachInvocation(sf, (n, line) => {
       if (!ts.isNewExpression(n) || !named(n, 'Error')) return
       let up: ts.Node = n
-      while (up.parent !== undefined && !ts.isThrowStatement(up.parent) && !isFnBoundary(up.parent)) {
+      let blocked = false
+      while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) {
+        if (isFnBoundary(up.parent) && !isImmediatelyInvoked(up.parent)) { blocked = true; break }
         up = up.parent
       }
-      if (up.parent === undefined || !ts.isThrowStatement(up.parent)) return
+      if (blocked || up.parent === undefined || !ts.isThrowStatement(up.parent)) return
       const why = starsIn(argsOf(n))
       if (why !== undefined) out.push(`L${line}  ${why}`)
     })
@@ -266,6 +289,10 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "const e = new Error('非抛出：**不算**')",                       // 不是 throw，不算
       // 函数边界内的 new Error 不在执行路径上（CR 第十九轮）：工厂回调里的 message 永远不会被抛出
       "throw Object.assign(new Error('干净'), { makeError: () => new Error('**未抛出**') })",
+      // 立即调用的 IIFE **会**执行，里面的 Error 就是被抛出的那个（Codex 第二十轮 P2）
+      "throw (() => new Error('**立即执行**'))()",
+      "throw ((() => new Error('**断言包装**')) as () => Error)()",
+      "throw ((() => new Error('**非空断言**'))!)()",
       "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
       "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
@@ -283,7 +310,8 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     const sf = parseTs(fake)
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
-    expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行各一条；非 throw 的 new Error 不算').toHaveLength(2)
+    expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 三种包装各一条；非 throw 的 new Error 与'
+      + '未调用的回调里的 new Error 不算').toHaveLength(5)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)
