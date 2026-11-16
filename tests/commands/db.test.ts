@@ -946,6 +946,11 @@ describe('夹具隔离（历史审查 PR#72 收口）', () => {
   })
 
   itBound('【本条】库仍是完整的 25 张表 —— 上一条的破坏与尾巴都碰不到它', async () => {
+    // ⚠️ 前置状态缺了就**显式失败**（Codex PR#81 第四轮 P2）：这条用例靠上一条设
+    // `prevDbPath` / `tailDone` / `pathSeenByTail`。用 `-t` 只筛这一条时它们都是初始值，
+    // 断言会全部空转却显示 passed（实测 `1 passed, 26 skipped` 什么都没验证）。
+    expect(prevDbPath, '此用例必须与【前一条】一起跑（`-t 夹具隔离` 或整文件）；'
+      + '单独筛它时前置状态不存在，会假绿').not.toBe('')
     // 等上一条那条尾巴**真的完成**（它在别处写，写坏了也不影响这里）
     const early = await dbCommand(['tables', '--db', dbPath()])
     expect(early, '尾巴落地前本条就该是好的').toBe(0)

@@ -193,7 +193,9 @@ describe('duckdb —— upsert 契约', () => {
 
   // ⚠️ N 组 N6 实测：本用例真库耗时 ≈2.7s（25000 行 2 条 upsert 语句）——
   // 5s testTimeout 内但余量 <40%，单独放宽到 15s 防慢机器/冷启动抖动。
-  it('batchSize 大于硬顶时被 65000 参数硬顶二次切住（M2：行数 = min(batchSize, floor(65000/列数))）', { timeout: 15_000 }, async () => {
+  // ⚠️ 放宽到 60s（2026-11-16 实测）：25000 行的截断库插入 + count，本机负载 700+ 时 15s 必爆
+  //（单独重跑仍超时，与改动无关；CI 上约 2s）。同理下一条 2500 行的用例保持 15s 不变。
+  it('batchSize 大于硬顶时被 65000 参数硬顶二次切住（M2：行数 = min(batchSize, floor(65000/列数))）', { timeout: 60_000 }, async () => {
     // batchSize=25000、tags 3 列：硬顶 floor(65000/3)=21666 行/语句
     // → 25000 行拆 2 条语句（超大 batchSize 仍被硬顶切住）。
     const s = await createDuckDbStore({ ...cfg, batchSize: 25000 }, 'rw')

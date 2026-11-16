@@ -217,6 +217,49 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     return /\bawait\b/.test(seg) || /\breturn\b/.test(seg)
   }
 
+  /**
+   * 该定时器是否**真的承载了**那个 `new Promise` 的完成信号（Codex PR#81 第四轮 P2）。
+   *
+   * ⚠️ 只看「位于已 await 的 `new Promise` 内」不够：`await new Promise((resolve) => {
+   * resolve(); setTimeout(() => process.stdout.write('tail'), 80) })` 里外层 promise 早已
+   * resolve，定时器是**之后独立排定**的 —— 它照样跨用例落地（Codex 探针复现，上一版判据放过）。
+   * 判据：取 executor 的第一个形参名，要求它**出现在这个定时器调用的实参里**
+   * （`setTimeout(r, 80)` / `setTimeout(() => { …; r() }, 80)`）。没出现 → 完成信号与定时器
+   * 无关 → 报。
+   * 边界：形参用解构（`({resolve}) => …`）或 rename 后传入都不认（误报方向，宁可多报）。
+   */
+  function executorGatesTimer(body: string, promiseIdx: number, timerIdx: number): boolean {
+    // `new Promise` 后面的第一个 `(` 是**构造调用的实参括号**，再下一个 `(` 才是
+    // executor 的形参表（`new Promise((r) => …)`）—— 首版只取第一个，读到的是 `(r) => …`
+    // 开头那个 `(`，`^\s*(\w+)` 永远匹配不上，判据恒为假（探针当场抓到：7 种合法写法全被报）。
+    const outerParen = body.indexOf('(', body.indexOf('new Promise', promiseIdx))
+    if (outerParen === -1) return false
+    const parenAt = body.indexOf('(', outerParen + 1)
+    if (parenAt === -1) return false
+    // executor 的形参表：`(r) =>` / `(r, reject) =>`
+    let depth = 0
+    let close = -1
+    for (let k = parenAt; k < body.length; k++) {
+      if (body[k] === '(') depth++
+      else if (body[k] === ')') { depth--; if (depth === 0) { close = k; break } }
+    }
+    if (close === -1) return false
+    const firstParam = /^\s*([A-Za-z_$][\w$]*)/.exec(body.slice(parenAt + 1, close))?.[1]
+    if (firstParam === undefined) return false
+    // 这个定时器调用的实参区间
+    const callParen = body.indexOf('(', timerIdx)
+    if (callParen === -1) return false
+    let d2 = 0
+    let end2 = -1
+    for (let k = callParen; k < body.length; k++) {
+      if (body[k] === '(') d2++
+      else if (body[k] === ')') { d2--; if (d2 === 0) { end2 = k; break } }
+    }
+    if (end2 === -1) return false
+    const args = body.slice(callParen + 1, end2)
+    return new RegExp(`\\b${firstParam}\\b`).test(args)
+  }
+
   function hazardHits(body: string): Array<{ token: string; awaited: boolean }> {
     const out: Array<{ token: string; awaited: boolean }> = []
     for (const m of body.matchAll(SCHEDULING)) {
@@ -229,9 +272,10 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
           // ② `.then` 产出 promise：等它被交出去即可
           awaited = isAwaitedOrReturned(body, at)
         } else {
-          // ① 定时器是句柄：必须包进 `new Promise(...)`，且**那个 promise** 被交出去
+          // ① 定时器是句柄：必须包进 `new Promise(...)`、**那个 promise** 被交出去，
+          //    且定时器真的承载了它的完成信号（见 executorGatesTimer）
           const p = enclosingCall(body, at, 'new Promise')
-          awaited = p >= 0 && isAwaitedOrReturned(body, p)
+          awaited = p >= 0 && isAwaitedOrReturned(body, p) && executorGatesTimer(body, p, at)
         }
       }
       out.push({ token: m[0].trim(), awaited })
@@ -306,7 +350,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       }
     })
 
-  it('用了 captureSinks 的文件，hook 体里不得**留下**未 await 的延迟工作（写入会漏进下一条）',
+  it('用了 captureSinks 的文件，hook 体（含 beforeAll）不得**留下**未 await 的延迟工作',
     () => {
       // 事故形态（Sourcery PR#72）：`beforeEach`/`afterEach` 里排一个 80ms 后落地的写入，
       // 它落地时下一条用例的 `captureSinks` 已经装好 —— `writerIsCurrent()` 把"没有世代
@@ -323,7 +367,10 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         const rel = relative(SRC_TESTS, f).split(sep).join('/')
         const text = blankComments(readFileSync(f, 'utf8'))
         if (!usesMigratedForm(text)) continue
-        for (const m of text.matchAll(/\b(?:beforeEach|afterEach)\s*\(/g)) {
+        // ⚠️ `beforeAll` 也在扫描范围内（Codex PR#81 第四轮 P2）：它同样不在用例的异步
+        // 世代里，延迟写入会落进之后的某条用例。`afterAll` 不纳入 —— 它跑在全部用例之后，
+        // 没有"下一条"可污染（文件级隔离另见 capture-sinks 的注释）。
+        for (const m of text.matchAll(/\b(?:beforeEach|afterEach|beforeAll)\s*\(/g)) {
           const [s, e] = argRange(text, m.index! + m[0].length)
           const body = text.slice(s, e)
           const line = text.slice(0, m.index!).split('\n').length
@@ -336,7 +383,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         + '把工作 await 完（hook 支持 async），或改用句柄形态并让写入全在 cap.run() 内').toEqual([])
     })
 
-  it('判据本身不许退化：15 种调度形态逐条定档（双向，含 CR/Codex 报过的假阳性与假阴性）', () => {
+  it('判据本身不许退化：调度形态逐条定档（双向，含 CR/Codex 各轮报过的假阳性与假阴性）', () => {
     // ⚠️ 样本一律用 `join` 拼出来，**不在源码里写字面量**：本文件也在扫描范围内，
     // 一条字面量 `beforeEach(() => { setTimeout…` 会让守卫扫到自己的反例（自证）。
     const bt = (...parts: string[]): string => parts.join('')
@@ -376,6 +423,18 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hit(bt('(async () => { await p.', 'then(w) })')), 'await 一条 .then 链').toEqual([])
     expect(hit(bt('(async () => { await seed() })')), 'await 别的东西（无调度）').toEqual([])
 
+    // Codex PR#81 第四轮：外层 promise 已 resolve、定时器在其后独立排定 → 照样漏
+    expect(hit(bt('(async () => { await new Promise((resolve) => { resolve(); set',
+      'Timeout(() => process.stdout.write("T"), 80) }) })')),
+      'resolve() 之后才排的定时器不由该 promise 承载').toEqual(['setTimeout('])
+    // 反控：定时器**就是**完成信号的载体（直接作为 resolve 实参 / 在回调里调 r()）
+    expect(hit(bt('(async () => { await new Promise((resolve) => set',
+      'Timeout(resolve, 80)) })')), '定时器作为 resolve 实参').toEqual([])
+    expect(hit(bt('(async () => { await new Promise((r) => set',
+      'Timeout(() => { process.stdout.write("T"); r() }, 80)) })')), '回调里调 r()').toEqual([])
+    // 定时器永不 resolve（promise 永远挂着）——同样不算"等到它完成"
+    expect(hit(bt('(async () => { await new Promise((r) => { set',
+      'Timeout(() => process.stdout.write("T"), 80) }) })')), 'executor 从不 resolve').toEqual(['setTimeout('])
     // Codex PR#81 第三轮：带类型实参的 `new Promise<void>(…)` 是正确写法，不得误伤
     expect(hit(bt('(async () => { await new Promise<void>((r) => set', 'Timeout(r, 40)) })')),
       'new Promise<void> 也算包装').toEqual([])

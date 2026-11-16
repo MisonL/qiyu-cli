@@ -47,6 +47,17 @@
 
 ### 修复
 
+- **三个"大夹具"用例显式放宽超时**（2026-11-16，本机负载实测）：`query.test.ts` 与
+  `store-precheck-single-source.test.ts` 各要真造 1100 / 10100 张表（30s → 120s），
+  `duckdb.test.ts` 的硬顶用例要插 25000 行（15s → 60s）。本机负载 700–840 时它们都会
+  `Test timed out`，单独重跑仍红 —— 造大夹具的固有代价，不是本次改动引入的回归
+  （CI 上分别约 20s / 2s）。
+- **capture 守卫再收紧三处**（2026-11-15，Codex PR#81 第四轮）：① `beforeAll` 同样不在用例的
+  异步世代里、延迟写入会落进之后的用例，扫描纳入它（`afterAll` 不纳入 —— 之后没有"下一条"）；
+  ② 「定时器位于已 await 的 `new Promise` 内」不够：`new Promise((resolve) => { resolve();
+  setTimeout(…) })` 的完成信号与定时器无关，尾巴照样落地 —— 现在要求定时器**真的承载**完成
+  信号（executor 首个形参出现在该定时器调用的实参里）；③ 夹具隔离用例在 `-t` 单独筛选时前置
+  状态为空、断言全部空转却显示 passed，改为前置缺失即显式失败。
 - **capture 守卫再补两处识别面**（2026-11-15，Codex PR#81 第三轮）：① TS 构造函数可带类型实参，
   按字面量 `new Promise(` 找会漏掉 `await new Promise<void>((r) => setTimeout(r, 40))` —— 那是
   **正确**写法却被判成脱手（假阳性），现在 `new Promise` 后可选跳过 `<…>`；② 并发还可以用

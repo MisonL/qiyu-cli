@@ -1239,7 +1239,10 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect((meta().mask_warnings as string[]).some((x) => /extra_col/.test(x))).toBe(true)
   })
 
-  it('目录里的对象多于沙箱默认 1000 行时照样认得存在的表（CodeRabbit + Codex PR#78 实测）', async () => {
+  // ⚠️ 显式放宽到 120s（2026-11-16 实测）：本用例要真造 1100+ 张表，本机负载 800+ 时
+  // 30s 默认超时必爆（CI 与本机低负载下 ~20s）。这是"造大夹具"的固有代价，不是回归。
+  it('目录里的对象多于沙箱默认 1000 行时照样认得存在的表（CodeRabbit + Codex PR#78 实测）',
+    { timeout: 120_000 }, async () => {
     // `OBJECT_KINDS_SQL` 是全目录扫描；`SandboxSession.run` 缺省 `limit: 1000`，一个 1100+ 对象的
     // 库会把它截断、`truncated: true`，排在截断之后的声明表就被误报成「缺表」（修复前实测）。
     // ⚠️ 必须**真的**造出 1100+ 对象（Codex PR#78 第二轮 P2）：只 seed 25 张声明表时目录
