@@ -192,6 +192,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   // ③ 挂为**不可枚举**（不污染 JSON 输出与接口形状）。
   const execSql = async (sql: string, params: unknown[] = []): Promise<unknown> => {
     if (closed) throw usage('数据库连接已关闭')
+    // ⚠️ **一切语句派发都过归属闸门**（CodeRabbit PR#81 第十六轮 major，实测复现）：单连接
+    // 上的语句会加入当前活动事务 —— 包括读语句。别人的事务开着时，另一条链发出的 SELECT
+    // 也落在那条事务里；它一旦执行期报错（实测：目标表是 CAST 失败的 view），DuckDB 就把
+    // 那条事务标成 aborted：所有者的 COMMIT 返回成功、写入却被静默丢弃。
+    // 只守方法入口不够：入口与该语句之间隔着 await（`del` 的 count），窗口仍在。
+    assertTxOwnership()
     // 统一走 runAndReadAll：其结果带 getRowObjectsJson/columnNames（run() 的结果没有）
     return c.runAndReadAll(sql, params)
   }
@@ -491,17 +497,17 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       txToken = token
       let n: number
       try {
+        // ⚠️ BEGIN / 数据语句 / COMMIT 全在**带令牌的上下文**里（闸门下移到 `execSql` 之后，
+        // 事务控制语句也要过它，见那里的注释）；`doUpsert` 内部贴着 INSERT 的归属检查同样
+        // 靠这个上下文认出「这是自己那条自动事务」。
         n = await alsTx.run(token, async () => {
-          // BEGIN/COMMIT 闭包直调 execSql：测试 spy 只断言**数据语句**条数（语句数 == 批次
-          // 数），事务控制语句不走 store.execSql 属性查找（与测试为权威的裁定一致）。
-          // BEGIN 失败的收尾理由同 `transaction()`（见那里的实测注释）。
           await execSql('BEGIN')
           const written = await doUpsert(t, rows)
           await execSql('COMMIT')
           return written
         })
       } catch (e) {
-        await safeRollback()
+        await alsTx.run(token, () => safeRollback())
         throw e
       } finally {
         inTx = false
@@ -536,23 +542,28 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         // 所以这里保留 ROLLBACK；`safeRollback` 吞掉「根本没有事务」的次生错误。
         // 真正要堵的是「BEGIN 根本不该发出」：自动事务已登记归属（见 `upsert`）、显式事务
         // 在 BEGIN 前登记 —— 支持路径上不会再出现第二条 BEGIN（用例见 duckdb.test 的两条）。
-        await execSql('BEGIN')
-        // ⚠️ 真实投影而非 cast：WriteTx 类型上不含 query/init/close（spec §4.2.6 防线分层），
-        // 运行时对象也不得携带 —— 直接传 store 的话 `Object.keys(tx)` 可枚举出 query。
-        const tx: WriteTx = {
-          tables: () => store.tables(),
-          count: (t: string) => store.count(t),
-          upsert: (t: string, rows: Record<string, unknown>[]) => store.upsert(t, rows),
-          delete: (t: string, w: string, p?: unknown[]) => store.delete(t, w, p),
-          transaction: <U>(f: (tx2: WriteTx) => Promise<U>) => store.transaction(f),
-        }
-        // ⚠️ 回调必须在**带令牌的异步上下文**里执行：`tx.upsert`/`tx.delete` 也走
-        // `assertTxOwnership`，靠这里建立的上下文才认得出"这是事务内的写"。
-        const r = await alsTx.run(token, () => fn(tx))
-        await execSql('COMMIT')
-        return r
+        // ⚠️ BEGIN / 回调 / COMMIT 全部在**带令牌的上下文**里：闸门在 `execSql`（事务控制
+        // 语句也要过它），回调里的 `tx.upsert`/`tx.delete` 也靠这个上下文认得出
+        // "这是事务内的写"（CodeRabbit PR#81 第十六轮）。
+        return await alsTx.run(token, async () => {
+          await execSql('BEGIN')
+          // ⚠️ 真实投影而非 cast：WriteTx 类型上不含 query/init/close（spec §4.2.6 防线分层），
+          // 运行时对象也不得携带 —— 直接传 store 的话 `Object.keys(tx)` 可枚举出 query。
+          const tx: WriteTx = {
+            tables: () => store.tables(),
+            count: (t: string) => store.count(t),
+            upsert: (t: string, rows: Record<string, unknown>[]) => store.upsert(t, rows),
+            delete: (t: string, w: string, p?: unknown[]) => store.delete(t, w, p),
+            transaction: <U>(f: (tx2: WriteTx) => Promise<U>) => store.transaction(f),
+          }
+          const r = await fn(tx)
+          await execSql('COMMIT')
+          return r
+        })
       } catch (e) {
-        await safeRollback()
+        // ROLLBACK 也走 `execSql`：在令牌上下文里发，闸门才认得它属于本事务（若 BEGIN 都没
+        // 成功，`safeRollback` 吞掉「没有事务」的次生错误）。
+        await alsTx.run(token, () => safeRollback())
         throw e
       } finally {
         inTx = false

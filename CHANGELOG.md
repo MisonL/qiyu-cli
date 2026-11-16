@@ -47,6 +47,16 @@
 
 ### 修复
 
+- **归属闸门下沉到唯一的语句派发点**（2026-11-16，CodeRabbit PR#81 第十六轮 major，真库实测复现）：
+  上一轮把检查前移到了「第一条语句之前」，但 `del` 入口与该语句之间隔着 `await count` ——
+  入口放行后、count 恢复执行前，另一条链开起事务，这条 count 的 **SELECT** 仍会落进那条
+  事务；目标表一执行就报错（实测 `CAST` 失败的 view）就把事务标成 aborted，所有者的 `COMMIT`
+  返回成功、写入被静默丢弃。单连接上**读语句同样加入活动事务**，所以「只守写方法入口」从
+  原理上关不住这个窗口。修法：`execSql` 这一个派发点统一做归属检查（含 BEGIN/COMMIT/ROLLBACK），
+  `transaction()` 与自动事务的 BEGIN / 回调 / COMMIT / ROLLBACK 整段放进带令牌的
+  `alsTx.run(token, …)`。用例挂住 `count` 的 await、在窗口内开事务，断言 count 被拒成
+  `internal`、所有者提交后行还在；变异（删掉 `execSql` 里的闸门）实测变红 —— 红在「count 的
+  SELECT 被执行并以 Conversion Error 落地」这一条上。
 - **纯文本通道再补两种写法**（2026-11-16，CodeRabbit PR#81 第十五轮，两条 minor）：
   ① 字面量下标访问 `process.stderr['write'](…)` 与点号同义，名字链补 `ElementAccessExpression`
   （仅静态字面量键；`obj[k]` 仍不可判）；② 常量拼接原只看**实参根部**，

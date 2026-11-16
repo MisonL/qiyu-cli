@@ -407,6 +407,55 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('delete 的 count 在 await 期间被事务截胡 → SELECT 必须在派发点被拒，不得污掉所有者的事务（CodeRabbit PR#81 第十六轮 major）', async () => {
+    // 事故路径（实测复现，与上一条是同一缺口的另一半）：上一条是 delete **入口**时事务已开；
+    // 这一条是 delete 已过入口审查、卡在 count 的 await 里，事务随后开起来。归属若只在方法
+    // 入口判，这条 count 的 SELECT 就会落进别人的事务执行 —— 而目标表只要一执行就报错
+    // （实测：`CAST(v AS INTEGER)` 的 view 做 count），DuckDB 就把那条事务标成 aborted：
+    // 所有者的 COMMIT 返回**成功**，写入却被静默丢弃（实测 tags 行数归零、无任何报错）。
+    // 判据：count 这条语句本身必须在**派发点**（execSql 闸门）被拒 —— 它连发都不发，
+    // 就不能在别人的事务里执行期报错；所有者的写入必须在提交后真实存在。
+    const s = await fresh()
+    const sAny = s as unknown as { execSql: (q: string, p?: unknown[]) => Promise<unknown> }
+    await sAny.execSql('CREATE TABLE aux (v VARCHAR)')
+    await sAny.execSql(`INSERT INTO aux VALUES ('not-an-int')`)
+    await sAny.execSql('DROP TABLE "robot_summary"')
+    await sAny.execSql('CREATE VIEW "robot_summary" AS SELECT v FROM aux WHERE CAST(v AS INTEGER) > 0')
+    // 把 count 挂住：delete 已过入口审查、事务尚未开始 —— 正是修复前那道缺口。
+    const origCount = s.count.bind(s)
+    let enteredCount!: () => void
+    const inCount = new Promise<void>((r) => { enteredCount = r })
+    let releaseCount!: () => void
+    const countGate = new Promise<void>((r) => { releaseCount = r })
+    ;(s as unknown as { count: (t: string) => Promise<number> }).count = async (t: string) => {
+      enteredCount()
+      await countGate
+      return origCount(t)
+    }
+    const delP = s.delete('robot_summary', 'TRUE').then(() => null, (e: unknown) => e)
+    await inCount
+    // 事务在 count 的 await 期间开起来，并挂住直到 count 的结论落定
+    let txReady!: () => void
+    const txStarted = new Promise<void>((r) => { txReady = r })
+    let releaseTx!: () => void
+    const txHold = new Promise<void>((r) => { releaseTx = r })
+    const txP = s.transaction(async (tx) => {
+      await tx.upsert('tags', [{ id: '9', name: 'owner', color: '#FFF' }])
+      txReady()
+      await txHold
+    }).then(() => 'committed', (e: unknown) => `rejected: ${(e as Error).message}`)
+    await txStarted
+    releaseCount()                        // count 恢复执行 —— 修复前它的 SELECT 会落进所有者的事务
+    const delErr = await delP
+    expect(delErr, 'count 的 SELECT 必须在派发点被拒（kind:internal）—— 让它落进所有者的事务里执行，'
+      + '一次 Conversion Error 就把那条事务标成 aborted').toMatchObject({ kind: 'internal' })
+    releaseTx()
+    expect(await txP, '所有者的事务必须正常提交').toBe('committed')
+    const ids = (await s.query('SELECT id FROM tags')).rows.map((r) => String(r.id))
+    expect(ids, '所有者 COMMIT 报成功但写入被静默丢弃 —— 正是本用例要挡的形态').toEqual(['9'])
+    await s.close()
+  })
+
   it('自动事务进行中，另一条链的显式 transaction() 在入口就被拒（不得发出 BEGIN）', async () => {
     const s = await fresh()
     // 用一个大批次把自动事务**挂住**在 INSERT 之前（spy 里等信号）
