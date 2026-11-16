@@ -14,7 +14,7 @@ import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startCapture, captureInstalled } from './capture.js'
 import ts from 'typescript'
-import { calleeChain, callChain, collectCalls, lineOf, objectProps, parseTs, unwrap } from './source-scan.js'
+import { callChain, collectCalls, lineOf, objectPropsWithUnknown, parseTs, unwrap } from './source-scan.js'
 
 // ⚠️ 文件结束时 `process.stdout.write` 必须已恢复（Codex 2026-11-13 P2：vitest 2.1.9
 // 默认 `restoreMocks:false`，不恢复的话同 worker 的**下一个测试文件**会把写入记进
@@ -187,14 +187,25 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       for (const a of call.arguments) {
         const u = unwrap(a)
         if (!ts.isObjectLiteralExpression(u)) continue
-        const props = objectProps(u)
+        const { props, mayHaveUnknown } = objectPropsWithUnknown(u)
         if (isTrue(props.get('concurrent'))) {
           out.push({ line: lineOf(sf, call), why: '选项对象 concurrent: true' })
           seen.add(lineOf(sf, call))
+          continue
         }
         // `describe`/`suite` 上的 `sequential: false` 与 `concurrent: true` 等价
         if (SUITES.has(base) && isFalse(props.get('sequential'))) {
           out.push({ line: lineOf(sf, call), why: '套件选项 sequential: false' })
+          seen.add(lineOf(sf, call))
+          continue
+        }
+        // ⚠️ 未知来源的键（`{ ...opts }` / `{ [key]: … }`）让「没声明并发」变得**看不出来** ——
+        // 只看 `props.get` 会把「可能开了并发」当成「确定没开」（CodeRabbit PR#81 第二十三轮）。
+        // 判据是静态守卫：**看不见就不许放行**，除非同一个对象里显式声明了串行（`concurrent: false`）。
+        const explicitOff = props.has('concurrent') && isFalse(props.get('concurrent'))
+        const suiteExplicitSeq = SUITES.has(base) && props.has('sequential') && isTrue(props.get('sequential'))
+        if (mayHaveUnknown && !explicitOff && !suiteExplicitSeq) {
+          out.push({ line: lineOf(sf, call), why: '选项对象含未知来源的键（展开 / 动态键），无法确认未开启并发' })
           seen.add(lineOf(sf, call))
         }
       }
@@ -387,7 +398,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     const concHits = (src: string): string[] => {
       const out: string[] = []
       for (const v of concurrentViolations(parseTs(src))) {
-        out.push(v.why.startsWith('.concurrent') ? `alias:${v.why.replace('.concurrent 修饰链：', '')}` : 'opt')
+        if (v.why.startsWith('.concurrent')) out.push(`alias:${v.why.replace('.concurrent 修饰链：', '')}`)
+        else if (v.why.includes('未知来源')) out.push('unknown')
+        else out.push('opt')
       }
       return out
     }
@@ -501,19 +514,22 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 后写覆盖前写：`{ ...{ concurrent: true }, concurrent: false }` 实际是串行
     expect(concHits(`${bt("it('S3', { ...{ con", 'current: true }, con', 'current: false }, () => {})')}`),
       '展开后再写 false → 不是并发').toEqual([])
-    // 反例：展开源是变量（静态求不出）—— 判不了就不判为违规
+    // 展开源是变量（静态求不出）：**看不见就不许放行**（CodeRabbit PR#81 第二十三轮 minor）
     expect(concHits(`${bt("const o = { con", 'current: true }\nit(\'S4\', { ...o }, () => {})')}`),
-      '变量展开看不出静态值').toEqual([])
+      '变量展开无法确认未开并发 → 报违规').toEqual(['unknown'])
     // ⚠️ 未知展开**可能覆盖任何键** —— 它之前的已知值全部作废（Codex PR#81 第二十轮 P2 的**误报**：
     // `{ concurrent: true, ...opts }` 在 opts 含 `concurrent: false` 时实际串行，判成并发是错的）
     expect(concHits(`${bt("it('S5', { con", 'current: true, ...opts }, () => {})')}`),
-      '未知展开之后的旧值不可信').toEqual([])
+      '未知展开之后的旧值不可信 → 报 unknown 而不是判成并发').toEqual(['unknown'])
+    // 但同一个对象里**显式**声明串行（展开之后）就确定不并发
+    expect(concHits(`${bt("it('S5b', { ...opts, con", 'current: false }, () => {})')}`),
+      '显式 concurrent:false 收口').toEqual([])
     // 但未知展开**之后**的显式赋值重新确定值
     expect(concHits(`${bt("it('S6', { con", 'current: true, ...opts, con', 'current: true }, () => {})')}`),
       '未知展开之后的显式并发仍然可判').toEqual(['opt'])
     // 嵌套展开里的未知键同样可能覆盖**外层**的旧值（CodeRabbit PR#81 第二十一轮 minor）
     expect(concHits(`${bt("it('S8', { con", 'current: true, ...{ ...opts } }, () => {})')}`),
-      '嵌套展开的未知键向外传播').toEqual([])
+      '嵌套展开的未知键向外传播').toEqual(['unknown'])
     // 访问器的**静态计算键**同样只覆盖它自己那个键（Codex PR#81 第二十一轮 P2 的两侧）
     expect(concHits(`${bt("it('S9', { ...{ con", "current: true }, get ['con", "current']() { return false } }, () => {})")}`),
       '计算键访问器覆盖同名键 → 串行').toEqual([])
@@ -521,10 +537,10 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       '别的键的访问器不得清掉并发').toEqual(['opt'])
     // 未知**计算键访问器**同样可能覆盖任何键
     expect(concHits(`${bt("it('S13', { con", 'current: true, get [key]() { return false } }, () => {})')}`),
-      '未知计算键访问器使旧值不可信').toEqual([])
+      '未知计算键访问器使旧值不可信').toEqual(['unknown'])
     // 未知**计算键**同样可能覆盖任何键（CodeRabbit PR#81 第二十二轮 minor）
     expect(concHits(`${bt("it('S11', { con", 'current: true, [key]: false }, () => {})')}`),
-      '未知计算键使旧值不可信').toEqual([])
+      '未知计算键使旧值不可信').toEqual(['unknown'])
     // 但未知计算键**之后**的显式赋值重新确定值
     expect(concHits(`${bt("it('S12', { [key]: false, con", 'current: true }, () => {})')}`),
       '未知计算键之后的显式并发仍可判').toEqual(['opt'])

@@ -232,6 +232,19 @@ export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Exp
   return objectPropsInner(obj).props
 }
 
+/**
+ * 与 `objectProps` 相同，另给出「结果集里有没有**未知来源**的键」（未知展开 / 动态计算键）。
+ * ⚠️ 为什么必须单独给出（CodeRabbit PR#81 第二十三轮 minor）：未知展开之后映射被清空，
+ * `{ ...opts }` 与 `{}` 在 `props` 上**完全无法区分** —— 调用方只看 `props.get(k) === undefined`
+ * 会把「可能开了并发但看不出来」当成「确定没开」。判据要能看见这一点，才能决定是放过还是报。
+ */
+export function objectPropsWithUnknown(obj: ts.ObjectLiteralExpression): {
+  props: Map<string, ts.Expression | undefined>
+  mayHaveUnknown: boolean
+} {
+  return objectPropsInner(obj)
+}
+
 /** 递归返回「映射 + 是否可能含未知键（未知展开）」，让不确定性传播到外层。 */
 function objectPropsInner(obj: ts.ObjectLiteralExpression): {
   props: Map<string, ts.Expression | undefined>

@@ -47,6 +47,14 @@
 
 ### 修复
 
+- **未知来源的选项键不得当成「确定没开并发」**（2026-11-17，CodeRabbit PR#81 第二十三轮 minor，
+  并**推翻**了上一轮按 Codex 第二十轮做的一个方向）：
+  `objectProps` 在未知展开 / 动态键之后会清空已知值，于是 `it('x', { ...opts }, fn)` 与 `it('x', {},
+  fn)` 在结果上**完全无法区分** —— 守卫把「可能开了并发但看不出来」当成了「确定没开」，静默放行。
+  上一轮为了消除「`{ concurrent: true, ...opts }` 被误报」而选择了"不判"，这个方向是错的：静态守卫
+  看不见就不该放行（放弃检出的代价是串扰回归）。现在 `objectPropsWithUnknown` 单独给出「含未知来源」
+  标记，守卫在**没有显式 `concurrent: false`（套件是 `sequential: true`）**时报为违规并写明成因。
+  三向变异（去掉 unknown 判据 / 忽略显式串行 / 清空逻辑失效）各自变红。
 - **Promise 回调不限基座 + 未知计算键作废旧值**（2026-11-17，CodeRabbit PR#81 第二十二轮 minor ×2）：
   ① hook 判据只认基座是 `Promise` 的 `.then/.catch/.finally`：`slowOp().then(w)`、
   `somePromise.finally(w)` 同样是微任务、同样留延迟写入，却全漏。改为「链末段是这三个名字」即判
