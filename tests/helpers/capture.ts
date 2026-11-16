@@ -263,10 +263,16 @@ function installShared(): void {
  * 落地的尾巴进了 B 的 `out`，而本条守卫选不出来（见 capture-sinks 文件头）。判断标准本身
  * 就是「写入时刻谁在跑」，与「谁发起的」无关；要覆盖它只能给 hook 也套世代（要改 29 个
  * 文件的 hook 导入）。
- * **同样改由静态守卫关闭**：用了 `captureSinks` 的文件，hook 体里不得留下未 await 的
- * 延迟工作（`setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`/`.then(`/`void x`）
- * —— hook 里把活 await 到底就不会有"落地时已换世代"的写入。判据的**边界如实记录**：
- * 只认直接写在 hook 体里的调度形态；hook 调用的辅助函数内部排定时器看不出来。
+ * **同样改由静态守卫关闭**：用了 `captureSinks` 的文件，四类 hook（`beforeEach` /
+ * `afterEach` / `beforeAll` / `afterAll`）体里**一律**不得出现调度原语
+ * （`setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`）。需要延迟就写成模块级
+ * helper，在 hook 里 `await helper()`。
+ * ⚠️ 为什么是"一律禁"而不是"放过已 await 的"（PR#81 五轮审查的结论）：要静态判断"这次
+ * 调度会不会被 vitest 等到"，得同时看懂 await 的对象、promise 由谁敲定、有无提前 resolve、
+ * `.then` 链是否被交出去、跨行续写、无括号单参箭头……CR 与 Codex 五轮里报出 15 种形态，
+ * 每轮修完下一轮又从邻角冒出来 —— **静态近似堵不完**。规则化后判据可判定、零误报。
+ * 判据的边界如实记录：只见直接写在 hook 体里的字面调用；hook 调用的 helper 内部排定时器
+ * 看不出来（那条要靠看 helper 的语义）。
  */
 function writerIsCurrent(): boolean {
   const g = alsGen.getStore()

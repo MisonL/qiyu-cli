@@ -9,10 +9,10 @@
 // 世代状态必须挂在 `globalThis` 上才跨得过去。
 //
 // ⚠️ hook 里的延迟写入本来没有世代（`beforeEach`/`afterEach` 不在执行体的 `alsGen.run` 里），
-// 实测 A 的 `beforeEach` 里 80ms 后落地的尾巴会进 B 的 `out`。**这条边界 2026-11-15 改由
-// 静态守卫关闭**（Sourcery PR#72）：`capture.test.ts` 禁止用了 `captureSinks` 的文件在
-// hook 体里留下未 await 的延迟工作 —— 所以本文件（以及全仓）的 hook 只做同步事，
-// 延迟写入一律写在用例体里（用例体有世代，尾巴会被丢弃）。
+// 实测 A 的 `beforeEach` 里 80ms 后落地的尾巴会进 B 的 `out`。**这条边界 2026-11-16 改由
+// 静态守卫关闭**（Sourcery PR#72 + PR#81 五轮收敛）：`capture.test.ts` 禁止用了
+// `captureSinks` 的文件在四类 hook 体里出现调度原语（定时器 / 微任务）—— 所以本文件
+// （以及全仓）的 hook 只做同步事，延迟写入一律写在用例体里（用例体有世代，尾巴会被丢弃）。
 import { describe, expect, beforeEach, vi } from 'vitest'
 import { it, captureSinks, startCapture } from './capture.js'
 

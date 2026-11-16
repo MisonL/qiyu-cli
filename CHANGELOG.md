@@ -52,6 +52,14 @@
   `duckdb.test.ts` 的硬顶用例要插 25000 行（15s → 60s）。本机负载 700–840 时它们都会
   `Test timed out`，单独重跑仍红 —— 造大夹具的固有代价，不是本次改动引入的回归
   （CI 上分别约 20s / 2s）。
+- **capture 的 hook 判据改成可判定的强规则**（2026-11-16，PR#81 五轮审查的收敛结论）：
+  此前想"放过已 await 的调度"，于是要静态判断 await 的对象、promise 由谁敲定、有无提前
+  resolve、`.then` 链是否交出去、跨行续写、无括号单参箭头……CR 与 Codex 五轮报出 15 种形态，
+  每修完一轮下一轮又从邻角冒出来。现在改为：用了 `captureSinks` 的文件，四类 hook
+  （`beforeEach`/`afterEach`/`beforeAll`/`afterAll`）里**一律**不得出现调度原语
+  （`setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`），需要延迟写成模块级 helper
+  再 `await helper()`。判据可判定、零误报，代码少了 40 行启发式；边界（helper 内部排定时器
+  看不出来）如实写进注释。
 - **capture 守卫第五轮再收紧三处**（2026-11-16，Codex PR#81 第五轮）：① 提前完成检查原先只看
   定时器**之前**的 executor 正文，而 `new Promise((r) => { setTimeout(…); r() })` 的 `r()` 在
   注册之后、同一层，照样立刻敲定 promise（探针：尾巴照样落地）—— 改为把定时器实参整段挖掉后

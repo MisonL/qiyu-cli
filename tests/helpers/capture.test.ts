@@ -143,63 +143,26 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     return out
   }
 
-  /** 调度形态（不论是否 await）：定时器 / 微任务 / 浮空 promise。 */
-  const SCHEDULING = /\b(?:setTimeout|setInterval|setImmediate|queueMicrotask)\s*\(|\.then\s*\(|\bvoid\s+[a-zA-Z_$]/g
-
   /**
-   * hook 体里**真正危险**的调度：判据是「**谁在等这次调度的完成**」，不是「语句里有没有 await」。
+   * hook 体里禁止出现的**调度原语**（2026-11-16 定稿，规则取代启发式判据）。
    *
-   * ⚠️ 为什么不能只看语句里有没有 `await`（CodeRabbit PR#81 第三轮，两条实测）：
-   *   · 假阴性 —— `await Promise.resolve().then(() => setTimeout(w, 80))`：`await` 等的是**回调
-   *     的返回值**（一个 Timeout 句柄），定时器照样之后才落地 → 尾巴照样漏。
-   *   · 假阳性 —— `await new Promise((r) => { setTimeout(r, 80) })`：这是**正确**写法，
-   *     但回扫语句会被执行体的 `{` 挡住、读不到 `await`。
-   * 于是判据改成"就近问等待关系"：
-   *   ① 定时器/微任务（`setTimeout`/`setInterval`/`setImmediate`/`queueMicrotask`）返回的是
-   *      **句柄**，只有把它包进 `new Promise((r) => …)` 且**那个 promise** 被 await/return 给
-   *      vitest 时，hook 才真的等到它完成；
-   *   ② `.then(...)` 本身产出 promise，所以只要**这个 `.then` 调用链**被 await/return 即可；
-   *      它回调里再排的定时器会被 ① 单独判（不在等待链上 → 报）；
-   *   ③ `void …` 永远是脱手。
-   * 边界如实记录（静态判据不跟数据流）：`const p = new Promise(…); await p` 这种"先存再 await"
-   * 会被判成危险（误报方向，可接受）；hook 调用的辅助函数内部排定时器完全看不出来（漏报方向）。
+   * ⚠️ 为什么不下"是否被 await 了"：`beforeEach`/`afterEach`/`beforeAll`/`afterAll` 不在用例
+   * 的异步世代里（`alsGen.run` 只包用例体），它们排的延迟写入落地时按「无上下文 = 当前世代」
+   * 被接收 —— 落进此时在跑的用例。要静态判断"这次调度会不会被 vitest 等到"，得同时看懂：
+   * await 的对象是不是那个 promise、promise 是否由这次调度敲定、有没有提前 resolve、
+   * `.then` 链是否被交出去、跨行续写、无括号单参箭头……CR 与 Codex 在 PR#81 五轮里各自
+   * 报出了这些形态里的 15 种，每一轮修完下一轮又从邻角冒出来。**静态近似堵不完**。
+   *
+   * 所以改成可判定的规则：hook 体里**一律**不出现这些原语。需要延迟 / 异步的时候写成
+   * 模块级 helper（当动词用），在 hook 里 `await helper()` —— helper 内部怎么写这里不判，
+   * 但「hook 直接排调度」这个高危形态从根上不存在了。
+   * 判据边界（如实记录）：只见**直接**写在 hook 体里的字面调用；hook 调用一个内部排定时器的
+   * 辅助函数看不出来（那条路径要靠 reviewer 看 helper 的语义）。
    */
+  const HOOK_FORBIDDEN = /\b(?:setTimeout|setInterval|setImmediate|queueMicrotask)\s*\(/g
 
-  /**
-   * `at` 处落在的最内层 `callee(...)` 实参内部的起始下标；不在任何一次调用里返回 -1。
-   *
-   * ⚠️ `callee` 给 `new Promise`（不带括号），这里自己找它的 `(` —— 因为 TS 的构造函数可以带
-   * 类型实参：`new Promise<void>((r) => setTimeout(r, 40))`（Codex PR#81 第三轮 P2 实测：
-   * 按字面量 `'new Promise('` 找会漏掉这种写法，把**正确**的等待判成脱手调度）。
-   */
-  function enclosingCall(text: string, at: number, callee: string): number {
-    let found = -1
-    let from = 0
-    for (;;) {
-      const i = text.indexOf(callee, from)
-      if (i === -1 || i > at) return found
-      // 跳过可选的 `<…>` 类型实参，定位实参列表的 `(`
-      let j = i + callee.length
-      while (text[j] === ' ' || text[j] === '\t') j++
-      if (text[j] === '<') {
-        let d = 0
-        for (; j < text.length; j++) {
-          if (text[j] === '<') d++
-          else if (text[j] === '>') { d--; if (d === 0) { j++; break } }
-        }
-        while (text[j] === ' ' || text[j] === '\t') j++
-      }
-      if (text[j] !== '(') { from = i + callee.length; continue }
-      let depth = 0
-      for (let k = j; k < at; k++) {
-        const c = text[k]
-        if (c === '(') depth++
-        else if (c === ')') depth--
-      }
-      if (depth > 0) found = i
-      from = i + callee.length
-    }
-  }
+  /** 四类 hook：前两类之上都在用例世代之外；嵌套的 `afterAll` 只结束那一层 suite。 */
+  const HOOK_CALL = /\b(?:beforeEach|afterEach|beforeAll|afterAll)\s*\(/g
 
   /** 从 `open`（指向 `(` 或 `{`）起配对，返回配对符号**之后**的下标；未配对返回 -1。 */
   function skipBalanced(text: string, open: number): number {
@@ -213,140 +176,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     return -1
   }
 
-  /**
-   * `idx` 处的表达式是否被 `await` / `return` / 表达式体箭头**交给** vitest 等待。
-   *
-   * 判据：① 表达式体箭头（匹配点之前没有 `{`）→ 整个表达式就是 hook 的返回值；
-   * ② 否则看该表达式所在的**语句**（回扫到最近的 `;` / `{` / `}` / 行首）里有没有
-   * `await` / `return`。回扫到 `{` 就停是正确的 —— 需要跨层判断的场景（块体执行器的
-   * `new Promise`）走的是"检查那个 `new Promise(` 所在的语句"，而不是定时器自己的语句。
-   */
-  function isAwaitedOrReturned(body: string, idx: number): boolean {
-    if (!body.slice(0, idx).includes('{')) return true
-    // ⚠️ 换行不一定是语句边界（CodeRabbit PR#81 第四轮）：`await p\n  .then(w)` 是同一个
-    // 表达式，按 `\n` 截断会读不到 `await`、把**正确**写法判成脱手。只在下一行以续行符
-    // 开头（`.`/`)`/`,`/`+`/`?`/`:`）时跳过该换行；其余换行仍视为语句边界（本仓库大量
-    // 依赖 ASI 的写法，跨过去会把上一条语句的 `await` 误算进来）。
-    let start = idx
-    while (start > 0) {
-      const ch = body[start - 1]!
-      if (ch === '}') {
-        // ⚠️ `}` 可能是**嵌套执行器/回调**的结尾，不是语句边界（Codex PR#81 第五轮）：
-        // `await new Promise((r) => { setTimeout(r, 40) }).then(w)` 里 `.then` 的回扫会先
-        // 撞上 executor 的 `}` —— 直接停会把整条被 await 的链误报。回找到配对的 `{`，
-        // 从它往前继续看（那段属于外层表达式）。
-        let d = 0
-        let k = start - 1
-        for (; k >= 0; k--) {
-          if (body[k] === '}') d++
-          else if (body[k] === '{') { d--; if (d === 0) break }
-        }
-        if (k < 0) break
-        start = k
-        continue
-      }
-      if (ch === '{' || ch === ';') break
-      if (ch === '\n') {
-        let n = start
-        while (n < body.length && (body[n] === ' ' || body[n] === '\t')) n++
-        if (!'.,+?:)'.includes(body[n] ?? '')) break
-      }
-      start--
-    }
-    const seg = body.slice(start, idx)
-    return /\bawait\b/.test(seg) || /\breturn\b/.test(seg)
-  }
-
-  /**
-   * 该定时器是否**真的承载了**那个 `new Promise` 的完成信号（Codex PR#81 第四轮 P2）。
-   *
-   * ⚠️ 只看「位于已 await 的 `new Promise` 内」不够：`await new Promise((resolve) => {
-   * resolve(); setTimeout(() => process.stdout.write('tail'), 80) })` 里外层 promise 早已
-   * resolve，定时器是**之后独立排定**的 —— 它照样跨用例落地（Codex 探针复现，上一版判据放过）。
-   * 判据：取 executor 的第一个形参名，要求它**出现在这个定时器调用的实参里**
-   * （`setTimeout(r, 80)` / `setTimeout(() => { …; r() }, 80)`）。没出现 → 完成信号与定时器
-   * 无关 → 报。
-   * 边界：形参用解构（`({resolve}) => …`）或 rename 后传入都不认（误报方向，宁可多报）。
-   */
-  function executorGatesTimer(body: string, promiseIdx: number, timerIdx: number): boolean {
-    // executor 的首个形参**按箭头语法取**（Codex PR#81 第五轮）：
-    //   · `(r) => …` / `(r, reject) => …`  → 括号形参表
-    //   · `resolve => …`                    → 无括号单参
-    // 首版「取 `new Promise` 后面的第二个 `(`」对无括号单参会把 `setTimeout(` 误认成形参表
-    // （探针复现：合法写法被判脱手）。
-    const outerParen = body.indexOf('(', body.indexOf('new Promise', promiseIdx))
-    if (outerParen === -1) return false
-    const callClose = skipBalanced(body, outerParen) - 1     // 构造调用的 `)`
-    const execArg = body.slice(outerParen + 1, callClose)
-    const parenParam = /^\s*\(\s*([A-Za-z_$][\w$]*)/.exec(execArg)?.[1]
-    const bareParam = /^\s*([A-Za-z_$][\w$]*)\s*=>/.exec(execArg)?.[1]
-    const firstParam = parenParam ?? bareParam
-    if (firstParam === undefined) return false
-    // executor 的形参表结束位置（用于找 `=>`）
-    const parenAt = parenParam !== undefined ? outerParen + 1 + execArg.indexOf('(', 0) : outerParen
-    const close = parenParam !== undefined ? skipBalanced(body, parenAt) - 1 : outerParen
-    // 这个定时器调用的实参区间
-    const callParen = body.indexOf('(', timerIdx)
-    if (callParen === -1) return false
-    let d2 = 0
-    let end2 = -1
-    for (let k = callParen; k < body.length; k++) {
-      if (body[k] === '(') d2++
-      else if (body[k] === ')') { d2--; if (d2 === 0) { end2 = k; break } }
-    }
-    if (end2 === -1) return false
-    const args = body.slice(callParen + 1, end2)
-    const gate = new RegExp(`\\b${firstParam}\\b`)
-    if (!gate.test(args)) return false
-    // ⚠️ 「形参出现在实参里」还不够（CodeRabbit PR#81 第四轮）：
-    // `new Promise((r) => { r(); setTimeout(() => { write(); r() }, 80) })` 的第一句就把
-    // promise 敲定了，定时器里的 `r()` 再也影响不到等待 —— 尾巴照样跨用例。
-    // 判据：executor 正文中**定时器回调之外**的、出现在这个定时器之前的形参调用 —— 说明完成信号
-    // 先落地了 → 报。
-    // ⚠️ 「定时器之前」不够（Codex PR#81 第五轮）：
-    // `new Promise((r) => { setTimeout(() => { w(); r() }, 80); r() })` 的 `r()` 在定时器**之后**
-    // 的同一层，照样立刻敲定 promise（探针复现：尾巴照样落地，而上一版放过）。
-    // 所以：把定时器调用的整个实参区间**挖掉**，再看 executor 正文里还剩不剩 `r(`。
-    const arrow = body.indexOf('=>', close)
-    if (arrow === -1) return true
-    let execStart = arrow + 2
-    let execEnd = body.length
-    if (body[execStart] === ' ') execStart++
-    if (body[execStart] === '{') execEnd = skipBalanced(body, execStart) - 1
-    const timerStart = body.indexOf('(', timerIdx)
-    if (timerStart === -1) return true
-    const timerEnd = skipBalanced(body, timerStart)
-    if (timerEnd === -1) return true
-    const outside = body.slice(execStart, timerStart) + body.slice(timerEnd, execEnd)
-    if (new RegExp(`\\b${firstParam}\\s*\\(`).test(outside)) return false
-    return true
-  }
-
-  function hazardHits(body: string): Array<{ token: string; awaited: boolean }> {
-    const out: Array<{ token: string; awaited: boolean }> = []
-    for (const m of body.matchAll(SCHEDULING)) {
-      const at = m.index!
-      const isThen = m[0].startsWith('.then')
-      const isVoid = m[0].startsWith('void')
-      // ⚠️ `setInterval` 永不算已交付（CodeRabbit PR#81 第四轮）：第一个 tick 就 resolve，
-      // 但 interval **继续**按周期写 —— 后续用例照样被污染。除非能证明被 clear 掉
-      //（静态看不出来），一律报。
-      const isInterval = m[0].startsWith('setInterval')
-      let awaited = false
-      if (!isVoid && !isInterval) {
-        if (isThen) {
-          // ② `.then` 产出 promise：等它被交出去即可
-          awaited = isAwaitedOrReturned(body, at)
-        } else {
-          // ① 定时器是句柄：必须包进 `new Promise(...)`、**那个 promise** 被交出去，
-          //    且定时器真的承载了它的完成信号（见 executorGatesTimer）
-          const p = enclosingCall(body, at, 'new Promise')
-          awaited = p >= 0 && isAwaitedOrReturned(body, p) && executorGatesTimer(body, p, at)
-        }
-      }
-      out.push({ token: m[0].trim(), awaited })
-    }
-    return out.filter((h) => !h.awaited)
+  /** 一个 hook 体里出现的全部禁区命中（供扫描与自检共用）。 */
+  function hookViolations(hookBody: string): string[] {
+    return [...hookBody.matchAll(HOOK_FORBIDDEN)].map((m) => m[0].trim())
   }
 
   /**
@@ -416,129 +248,58 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       }
     })
 
-  it('用了 captureSinks 的文件，hook 体（含 beforeAll）不得**留下**未 await 的延迟工作',
+  it('用了 captureSinks 的文件，四类 hook 体里不得出现调度原语（含 beforeAll / 嵌套 afterAll）',
     () => {
-      // 事故形态（Sourcery PR#72）：`beforeEach`/`afterEach` 里排一个 80ms 后落地的写入，
-      // 它落地时下一条用例的 `captureSinks` 已经装好 —— `writerIsCurrent()` 把"没有世代
-      // 上下文"当成当前世代，于是尾巴进了**下一条**的 `out`。
-      // 为什么机制兜不住：世代号由 `it` 包装版在**用例体执行时**建立，hook 不在它的
-      // `alsGen.run` 里（要给 hook 也套世代得改 29 个文件的 hook 导入，收益与风险不成比例）。
-      // 所以这里禁掉"hook 里排延迟工作"这个形态本身：hook 里要么同步写完，要么 await 到底
-      //（`await` 的写入在 hook 结束前就落地，不会漏）。
-      // 判据边界（如实记录）：只认**直接**写在 hook 体里的这几种调度形态；若 hook 调了一个
-      // 内部排定时器的辅助函数，静态扫描看不出来 —— 那种情况由 `writerIsCurrent` 的注释
-      // 说明的边界承载，本守卫不假装覆盖它。
+      // 规则与理由见 `HOOK_FORBIDDEN` 的注释；边界：只见直接写在 hook 体里的字面调用。
       const hits: string[] = []
       for (const f of testFiles(SRC_TESTS)) {
         const rel = relative(SRC_TESTS, f).split(sep).join('/')
         const text = blankComments(readFileSync(f, 'utf8'))
         if (!usesMigratedForm(text)) continue
-        // ⚠️ 四类 hook 全部纳入（Codex 第四轮 + CodeRabbit 第四轮）：`beforeAll` 在用例
-        // 世代之外；**嵌套的 `afterAll` 只结束那一层 suite** —— vitest 2.1.9 里 suite A 的
-        // `afterAll` 可以跑在同级 suite B 之前，它排的延迟写入照样会落进 B。
-        for (const m of text.matchAll(/\b(?:beforeEach|afterEach|beforeAll|afterAll)\s*\(/g)) {
-          const [s, e] = argRange(text, m.index! + m[0].length)
-          const body = text.slice(s, e)
+        for (const m of text.matchAll(HOOK_CALL)) {
+          const close = skipBalanced(text, m.index! + m[0].length - 1)
+          if (close === -1) continue
+          const body = text.slice(m.index! + m[0].length, close - 1)
           const line = text.slice(0, m.index!).split('\n').length
-          for (const h of hazardHits(body)) {
-            hits.push(`${rel}:${line} hook 体里出现「${h.token}」${h.awaited ? '（已 await）' : ''}`)
-          }
+          for (const v of hookViolations(body)) hits.push(`${rel}:${line} hook 体里出现「${v}」`)
         }
       }
-      expect(hits, '这些 hook 里排了未 await 的延迟工作 —— 它落地的写入会漏进下一条用例的缓冲。'
-        + '把工作 await 完（hook 支持 async），或改用句柄形态并让写入全在 cap.run() 内').toEqual([])
+      expect(hits, '这些 hook 里直接排了调度（定时器 / 微任务）—— 它们不在用例的异步世代里，'
+        + '延迟写入会落进之后正在跑的用例。把延迟逻辑写成模块级 helper，在 hook 里 `await helper()`').toEqual([])
     })
 
-  it('判据本身不许退化：调度形态逐条定档（双向，含 CR/Codex 各轮报过的假阳性与假阴性）', () => {
+  it('判据本身不许退化：规则命中四类 hook、放过 await helper；并发与迁移形态判据双向', () => {
     // ⚠️ 样本一律用 `join` 拼出来，**不在源码里写字面量**：本文件也在扫描范围内，
-    // 一条字面量 `beforeEach(() => { setTimeout…` 会让守卫扫到自己的反例（自证）。
+    // 字面量会让守卫扫到自己（自证）。
     const bt = (...parts: string[]): string => parts.join('')
-    const hit = (body: string): string[] => hazardHits(body).map((h) => h.token)
     const conc = /\b(?:it|test|describe)\.concurrent\b/g
 
-    // —— 必须报（脱手调度 / 只等句柄）——
-    expect(hit(bt('(() => { set', 'Timeout(w, 80) })')), '块体里脱手排定时器').toEqual(['setTimeout('])
-    // Codex PR#81 第二轮：`setTimeout` 返回句柄，不是 Promise
-    expect(hit(bt('(() => set', 'Timeout(w, 80))')), '表达式体箭头返回句柄').toEqual(['setTimeout('])
-    expect(hit(bt('(() => { return set', 'Timeout(w, 80) })')), 'return 句柄也不等于等它完成')
-      .toEqual(['setTimeout('])
-    expect(hit(bt('(() => { new Promise((r) => set', 'Timeout(r, 80)) })')), 'promise 没被交出去')
-      .toEqual(['setTimeout('])
-    // CodeRabbit PR#81 第三轮（假阴性）：`await` 等的是 then 回调的返回值，定时器之后才落地
-    expect(hit(bt('(async () => { await Promise.resolve().', 'then(() => set',
-      'Timeout(w, 80)) })')), 'await 里嵌 .then 排的定时器仍会漏').toEqual(['setTimeout('])
-    expect(hit(bt('(() => { return Promise.resolve().', 'then(() => set',
-      'Timeout(w, 80)) })')), 'return 的 .then 里排定时器仍会漏').toEqual(['setTimeout('])
-    // `await` 的 executor 里再排 `.then`（那条 then 不在等待链上）
-    expect(hit(bt('(async () => { await new Promise((r) => { Promise.resolve().',
-      'then(() => set', 'Timeout(r, 80)) }) })')),
-      'await 的 executor 内部 .then 仍会漏').toEqual(['.then('])
-    expect(hit(bt('(() => { void seed() })')), 'void 掉未等待的调用').toEqual(['void s'])
-
-    // —— 必须放过（真的等到了）——
-    // CodeRabbit PR#81 第三轮（假阳性）：块体执行器的 `new Promise` 是正确写法
-    expect(hit(bt('(async () => { await new Promise((r) => { set', 'Timeout(r, 80) }) })')),
-      'await new Promise 的块体执行器不得误伤').toEqual([])
-    expect(hit(bt('(async () => { await new Promise((r) => set', 'Timeout(r, 80)) })')),
-      'await new Promise 的表达式执行器').toEqual([])
-    expect(hit(bt('(async () => { await (new Promise((r) => set', 'Timeout(r, 80)))) })')),
-      'await 外面多一层括号').toEqual([])
-    expect(hit(bt('(() => new Promise((r) => set', 'Timeout(r, 80)))')),
-      '把 promise 表达式体返回给 vitest').toEqual([])
-    expect(hit(bt('(() => Promise.resolve().', 'then(w))')), '表达式体返回 .then 链').toEqual([])
-    expect(hit(bt('(async () => { await p.', 'then(w) })')), 'await 一条 .then 链').toEqual([])
-    expect(hit(bt('(async () => { await seed() })')), 'await 别的东西（无调度）').toEqual([])
-
-    // Codex PR#81 第五轮三条：
-    // ① 定时器**注册之后**的同步 r() 同样敲定 promise（只查"定时器之前"不够）
-    expect(hit(bt('(async () => { await new Promise((r) => { set',
-      'Timeout(() => { process.stdout.write("T"); r() }, 80); r() }) })')),
-      '注册后同步 r() 也会让 hook 提前结束').toEqual(['setTimeout('])
-    // ② `new Promise(...).then(w)` 整条链被 await —— 回扫必须跨过嵌套 executor 的 `}`
-    expect(hit(bt('(async () => { await new Promise((r) => { set',
-      'Timeout(r, 40) }).then(w) })')), 'await 的 new Promise(...).then 链').toEqual([])
-    // ③ 无括号单参 executor（`resolve => …`）的形参同样要按箭头语法取
-    expect(hit(bt('(async () => { await new Promise(resolve => { set',
-      'Timeout(() => resolve(), 40) }) })')), '无括号单参 executor').toEqual([])
-    // 反控：同形态但没被交出去 → 仍须报
-    expect(hit(bt('(() => { new Promise(resolve => { set',
-      'Timeout(() => resolve(), 40) }) })')), '无括号单参但脱手').toEqual(['setTimeout('])
-
-    // CodeRabbit PR#81 第四轮四条：
-    // ① `setInterval` 第一个 tick 就 resolve，但 interval 继续写 —— 永不算已交付
-    expect(hit(bt('(async () => { await new Promise((r) => set', 'Interval(() => { process.stdout.write("T"); r() }, 80)) })')),
-      'setInterval 的后续 tick 会继续污染').toEqual(['setInterval('])
-    // ② 跨行续写不得被换行截断（`await p\n  .then(w)`）
-    expect(hit(bt('(async () => { await p', '\n  .', 'then(w) })')), '跨行 await 的 .then 链').toEqual([])
-    // ③ 提前 resolve：定时器里再调 r() 也影响不到等待
-    expect(hit(bt('(async () => { await new Promise((r) => { r(); set',
-      'Timeout(() => { process.stdout.write("T"); r() }, 80) }) })')),
-      'promise 在定时器之前就敲定了').toEqual(['setTimeout('])
-    // Codex PR#81 第四轮：外层 promise 已 resolve、定时器在其后独立排定 → 照样漏
-    expect(hit(bt('(async () => { await new Promise((resolve) => { resolve(); set',
-      'Timeout(() => process.stdout.write("T"), 80) }) })')),
-      'resolve() 之后才排的定时器不由该 promise 承载').toEqual(['setTimeout('])
-    // 反控：定时器**就是**完成信号的载体（直接作为 resolve 实参 / 在回调里调 r()）
-    expect(hit(bt('(async () => { await new Promise((resolve) => set',
-      'Timeout(resolve, 80)) })')), '定时器作为 resolve 实参').toEqual([])
-    expect(hit(bt('(async () => { await new Promise((r) => set',
-      'Timeout(() => { process.stdout.write("T"); r() }, 80)) })')), '回调里调 r()').toEqual([])
-    // 定时器永不 resolve（promise 永远挂着）——同样不算"等到它完成"
-    expect(hit(bt('(async () => { await new Promise((r) => { set',
-      'Timeout(() => process.stdout.write("T"), 80) }) })')), 'executor 从不 resolve').toEqual(['setTimeout('])
-    // Codex PR#81 第三轮：带类型实参的 `new Promise<void>(…)` 是正确写法，不得误伤
-    expect(hit(bt('(async () => { await new Promise<void>((r) => set', 'Timeout(r, 40)) })')),
-      'new Promise<void> 也算包装').toEqual([])
-    expect(hit(bt('(() => new Promise<void>((r) => set', 'Timeout(r, 40)))')),
-      '返回 new Promise<void>').toEqual([])
+    // 四类 hook 都必须被认出
+    for (const hook of ['before', 'after']) {
+      for (const kind of ['Each', 'All']) {
+        const src = bt(hook, kind, '(() => { set', 'Timeout(w, 80) })')
+        const m = [...src.matchAll(HOOK_CALL)]
+        expect(m, `${hook}${kind} 必须被 HOOK_CALL 命中`).toHaveLength(1)
+        const body = src.slice(m[0].index! + m[0][0].length, skipBalanced(src, m[0].index! + m[0][0].length - 1) - 1)
+        expect(hookViolations(body), `${hook}${kind} 里的 setTimeout 必须被报`).toEqual(['setTimeout('])
+      }
+    }
+    // 规则的正控：`await helper()` 不碰调度原语 → 放过
+    expect(hookViolations(bt('(async () => { await del', 'ay(80) })'))).toEqual([])
+    // `setInterval` / `queueMicrotask` / `setImmediate` 同样在禁区内
+    expect(hookViolations(bt('(() => set', 'Interval(w, 80))'))).toEqual(['setInterval('])
+    expect(hookViolations(bt('(() => queue', 'Microtask(w))'))).toEqual(['queueMicrotask('])
+    expect(hookViolations(bt('(() => set', 'Immediate(w))'))).toEqual(['setImmediate('])
+    // 配对：跳过 executor 的嵌套括号后再配对（hook 体到正确的 `)` 为止）
+    const nested = bt('(() => { await new Promise((r) => set', 'Timeout(r, 80)) })')
+    expect(skipBalanced(nested, nested.indexOf('(') ), '嵌套括号必须配平到 hook 的 `)`').toBe(nested.length)
 
     // —— 并发那条判据：命中 / 不命中 ——
     expect([...bt('it.', 'concurrent("x", () => {})').matchAll(conc)]).toHaveLength(1)
     expect([...bt('describe.', 'concurrent("y", () => {})').matchAll(conc)]).toHaveLength(1)
-    // 选项对象形态（Codex PR#81 第三轮）：命中 `concurrent: true`，不误伤 `concurrent: false`
     expect([...bt("it('A', { con", 'current: true }, () => {})').matchAll(CONCURRENT_OPT)]).toHaveLength(1)
     expect([...bt("it('B', { con", 'current: false }, () => {})').matchAll(CONCURRENT_OPT)]).toHaveLength(0)
     expect(/\bcaptureSinks\s*\(/.test(bt('capture', 'Sinks((a) => {}, (b) => {})'))).toBe(true)
     expect(/\bcaptureSinks\s*\(/.test('const cap = startCapture()')).toBe(false)
-  });
+  })
 })
