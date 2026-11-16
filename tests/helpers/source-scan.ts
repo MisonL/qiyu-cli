@@ -218,30 +218,49 @@ export function isRegistration(call: ts.CallExpression, base: readonly string[])
  *     之后的显式赋值再重新确定（`{ concurrent: true, ...opts, concurrent: true }` 仍是并发）。
  *   · **访问器**（`get concurrent()` / `set concurrent()`）同样覆盖之前的同名值。
  * 不确定状态用 `undefined` 值表示（调用方 `props.get(k)` 得到 undefined 即"无法判定"）。
+ * ⚠️ 不确定性**必须向上传播**（CodeRabbit PR#81 第二十一轮 minor）：`{ concurrent: true,
+ * ...{ ...opts } }` 里内层展开的未知键同样可能覆盖外层的 `concurrent` —— 只清空内层自己的
+ * 映射、外层原样保留旧值，就把"不确定"又算成了"确定"。
  */
 export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Expression | undefined> {
+  return objectPropsInner(obj).props
+}
+
+/** 递归返回「映射 + 是否可能含未知键（未知展开）」，让不确定性传播到外层。 */
+function objectPropsInner(obj: ts.ObjectLiteralExpression): {
+  props: Map<string, ts.Expression | undefined>
+  mayHaveUnknown: boolean
+} {
   const out = new Map<string, ts.Expression | undefined>()
+  let mayHaveUnknown = false
   for (const p of obj.properties) {
     if (ts.isPropertyAssignment(p)) {
       const k = staticPropKey(p.name, true)
       if (k !== undefined) out.set(k, p.initializer)
+      else mayHaveUnknown = true            // 动态键：键名本身求不出，可能覆盖任何键
     } else if (ts.isShorthandPropertyAssignment(p)) {
       out.set(p.name.text, p.name)
     } else if (ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) {
       // 访问器的值只有在求值时才知道 —— 它能覆盖任何同名键。
       const k = staticPropKey(p.name, false)
       if (k !== undefined) out.set(k, undefined)
+      else mayHaveUnknown = true
     } else if (ts.isSpreadAssignment(p)) {
       const src = unwrap(p.expression)
       if (ts.isObjectLiteralExpression(src)) {
-        for (const [k, v] of objectProps(src)) out.set(k, v)
+        const inner = objectPropsInner(src)
+        // 内层若含未知展开，它可能覆盖**外层**已有的键 —— 先清空再合并内层已知值。
+        if (inner.mayHaveUnknown) out.clear()
+        for (const [k, v] of inner.props) out.set(k, v)
+        if (inner.mayHaveUnknown) mayHaveUnknown = true
       } else {
         // 未知展开：可能覆盖任何键 —— 已知值全部作废，之后显式赋值再重新确定。
         out.clear()
+        mayHaveUnknown = true
       }
     }
   }
-  return out
+  return { props: out, mayHaveUnknown }
 }
 
 /** 属性名 → 静态字符串键；动态键（变量 / 调用）返回 undefined。 */

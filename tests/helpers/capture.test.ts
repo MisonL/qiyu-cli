@@ -494,6 +494,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 但未知展开**之后**的显式赋值重新确定值
     expect(concHits(`${bt("it('S6', { con", 'current: true, ...opts, con', 'current: true }, () => {})')}`),
       '未知展开之后的显式并发仍然可判').toEqual(['opt'])
+    // 嵌套展开里的未知键同样可能覆盖**外层**的旧值（CodeRabbit PR#81 第二十一轮 minor）
+    expect(concHits(`${bt("it('S8', { con", 'current: true, ...{ ...opts } }, () => {})')}`),
+      '嵌套展开的未知键向外传播').toEqual([])
     // 访问器覆盖同名值：`{ concurrent: true, get concurrent() { return false } }` 实际串行
     expect(concHits(`${bt("it('S7', { con", 'current: true, get con', 'current() { return false } }, () => {})')}`),
       '访问器覆盖').toEqual([])

@@ -306,6 +306,39 @@ describe('duckdb —— 事务', () => {
     expect(runs, '关闭后的回滚路径不得再进入上下文').toBe(1)
   })
 
+  it('事务进行中：所有者链自己的读照常工作；只有**别的链**的读才被拒（CodeRabbit PR#81 第二十一轮 major 的反面证据）', async () => {
+    // CR 担心的形态：闸门下移到 `execSql` 后读语句也过归属检查，会不会把**既有调用方**的读
+    // 从「能跑」变成 `internal`。判据是「谁在发」：同一事务所有者链里的读（tx.count / tx.tables）
+    // 与事务外的顺序读都必须照常返回，只有别的异步链在事务期间发的读才被拒。
+    const s = await fresh()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const outsideBefore = await s.count('tags')          // 事务之前：正常
+    // 注意：upsert 自开的自动事务覆盖了事务外的调用；这里随后做显式事务。
+    let ready!: () => void
+    const txReady = new Promise<void>((r) => { ready = r })
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    let insideCount = -1
+    let insideTables: string[] = []
+    const tx = s.transaction(async (tx) => {
+      await tx.upsert('tags', [{ id: '2', name: 'B', color: '#00FF00' }])
+      insideCount = await tx.count('tags')               // 所有者链的 count
+      insideTables = await tx.tables()                   // 所有者链的 tables
+      ready()
+      await gate
+    })
+    await txReady
+    const other = await s.count('tags').then(() => null, (e: unknown) => e)
+    release()
+    await tx
+    expect(outsideBefore).toBe(1)
+    expect(insideCount, '所有者链的 count 必须照常返回').toBe(2)
+    expect(insideTables, '所有者链的 tables 必须照常返回').toContain('tags')
+    expect(other, '**别的链**在事务期间的读被拒成 internal（并入会污染事务）').toMatchObject({ kind: 'internal' })
+    expect(await s.count('tags'), '事务结束后事务外的读恢复').toBe(2)
+    await s.close()
+  })
+
   it('成功提交', async () => {
     const s = await fresh()
     await s.transaction(async (tx) => { await tx.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }]) })
