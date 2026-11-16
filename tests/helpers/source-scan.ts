@@ -243,7 +243,13 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
     if (ts.isPropertyAssignment(p)) {
       const k = staticPropKey(p.name, true)
       if (k !== undefined) out.set(k, p.initializer)
-      else mayHaveUnknown = true            // 动态键：键名本身求不出，可能覆盖任何键
+      else {
+        // 动态键：键名求不出，可能覆盖**任何**已知键 —— 旧值必须作废
+        // （CodeRabbit PR#81 第二十二轮 minor：只置标记而保留旧值，`{ concurrent: true,
+        // [key]: false }` 仍返回 true，而 key 可能就是 'concurrent'）。
+        out.clear()
+        mayHaveUnknown = true
+      }
     } else if (ts.isShorthandPropertyAssignment(p)) {
       out.set(p.name.text, p.name)
     } else if (ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) {
@@ -252,7 +258,7 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
       // 未知键、进而清空外层全部已知值（Codex PR#81 第二十一轮 P2 的**误报**与漏检各一例）。
       const k = staticPropKey(p.name, true)
       if (k !== undefined) out.set(k, undefined)
-      else mayHaveUnknown = true
+      else { out.clear(); mayHaveUnknown = true }
     } else if (ts.isSpreadAssignment(p)) {
       const src = unwrap(p.expression)
       if (ts.isObjectLiteralExpression(src)) {

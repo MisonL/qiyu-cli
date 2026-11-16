@@ -47,6 +47,15 @@
 
 ### 修复
 
+- **Promise 回调不限基座 + 未知计算键作废旧值**（2026-11-17，CodeRabbit PR#81 第二十二轮 minor ×2）：
+  ① hook 判据只认基座是 `Promise` 的 `.then/.catch/.finally`：`slowOp().then(w)`、
+  `somePromise.finally(w)` 同样是微任务、同样留延迟写入，却全漏。改为「链末段是这三个名字」即判
+  （代价：`await x.then(…)` 也会被报 —— 同在 hook 里留 Promise 回调，宁可多报）；`HOOK_FORBIDDEN`
+  里的 `'then'` 是死条目（裸 `then(…)` 不是真实写法），删掉并写明边界。
+  ② `{ concurrent: true, [key]: false }`：未知计算键只置了「可能含未知」标记、**没作废旧值**，
+  `key === 'concurrent'` 时实际是串行却被判成并发。未知计算键（含访问器形式）与未知展开一样
+  先清空，之后的显式赋值再重新确定。三处变异（限回 Promise 基座 / 普通键不清空 / 访问器不清空）
+  各自变红。
 - **Promise 调度的三种形态 + 静态计算键访问器 + `.call` 立即执行**（2026-11-17，Codex PR#81 第二十一轮 P2 ×4）：
   ① hook 判据只认 `Promise….then`：`finally` / `catch` 同样是微任务回调（探针确认下一条用例拿到
   `FRESHTAIL`），一并纳入；② `new Promise(…).then(…)` 的基座是**构造调用**，`callChain` 遇到

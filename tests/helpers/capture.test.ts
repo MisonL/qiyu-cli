@@ -135,12 +135,14 @@ const REGISTRARS = new Set(['it', 'test', 'describe', 'suite', 'itBound'])
 /** 套件级 `sequential: false` 同样让用例并行（Vitest 2.1.9，Codex PR#81 第十轮）。 */
 const SUITES = new Set(['describe', 'suite'])
 /**
- * 调度原语名（定时器 / 微任务）。
+ * 调度原语名（定时器 / 微任务）—— 只放**裸调用**（`f(…)` 或宿主.原语）能命中的名字。
  * ⚠️ `nextTick` 与 `Promise.resolve().then` 的 `.then` 同属微任务（Node 实测顺序：
  * sync → nextTick → Promise.then → queueMicrotask），延迟写入同样落在下一条用例里
  * （Codex PR#81 第二十轮 P2，`FRESHTAIL` 探针复现）。
+ * ⚠️ `.then/.catch/.finally` **不在这里**：它们只在**方法链末段**才成立，由判定处单列
+ * （放进来只是死条目 —— 裸调用 `then(…)` 不是真实写法，CodeRabbit PR#81 第二十二轮 minor）。
  */
-const HOOK_FORBIDDEN = new Set(['setTimeout', 'setInterval', 'setImmediate', 'queueMicrotask', 'nextTick', 'then'])
+const HOOK_FORBIDDEN = new Set(['setTimeout', 'setInterval', 'setImmediate', 'queueMicrotask', 'nextTick'])
 /** 调度原语的宿主：`globalThis.setTimeout(…)` / `global.setTimeout(…)` 同样是调度。 */
 const GLOBAL_HOSTS = new Set(['globalThis', 'global', 'window', 'self'])
 /** hook 名。大小写不敏感（`beforeEach` / `beforeeach` 都按同一规则，Codex PR#81 第十轮）。 */
@@ -227,11 +229,11 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       const forbidden = bare.length === 1 && HOOK_FORBIDDEN.has(bare[0]!)
         // `process.nextTick(…)`：宿主是 `process`，原语是 `nextTick`
         || (bare.length === 2 && bare[0] === 'process' && bare[1] === 'nextTick')
-        // `Promise.resolve().then/catch/finally(…)`：宿主是 `Promise`，原语是三种微任务回调
-        // （Codex PR#81 第二十一轮 P2：只认 `then` 时 `finally` / `catch` 照样漏，
-        // 探针确认下一条用例拿到 `FRESHTAIL`）
-        || (bare.length >= 2 && bare[0] === 'Promise'
-          && ['then', 'catch', 'finally'].includes(bare[bare.length - 1]!))
+        // `.then/.catch/.finally(…)`：**不限于**基座是 `Promise`（CodeRabbit PR#81 第二十二轮 minor）：
+        // `slowOp().then(w)`、`somePromise.finally(w)` 同样排微任务；只认 `Promise` 基座时它们
+        // 全漏。代价是 `await x.then(…)` 也会被报 —— 那同样是"在 hook 里留下 Promise 回调"，
+        // 判据按「末段是这三个名字」写，宁可多报也不漏（判据的边界写在 `HOOK_FORBIDDEN` 注释里）。
+        || (bare.length >= 2 && ['then', 'catch', 'finally'].includes(bare[bare.length - 1]!))
       if (!forbidden) continue
       out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${innerName.join('.')}(」` })
     }
@@ -410,6 +412,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       .toEqual(['Promise.reject.catch('])
     expect(hookHits(`${H}(() => { new Promise((r) => r()).then(() => { w() }) })`), 'new Promise().then')
       .toEqual(['Promise.then('])
+    // 不限于 `Promise` 基座（CodeRabbit PR#81 第二十二轮 minor）：任何链末段的 then/catch/finally
+    expect(hookHits(`${H}(() => { slowOp().then(w) })`), '任意 Promise 链的 then').toEqual(['slowOp.then('])
+    expect(hookHits(`${H}(() => { somePromise.finally(w) })`), '任意链的 finally').toEqual(['somePromise.finally('])
+    expect(hookHits(`${H}(() => { x.catch(w) })`), '任意链的 catch').toEqual(['x.catch('])
+    // 反例：名字里只是恰好含 then 前缀的不是
+    expect(hookHits(`${H}(() => { thenable(w) })`), 'thenable 不是 .then').toEqual([])
     // 反例：普通 Promise 用法与无关的 .then 不是 hook 体里的延迟写入
     expect(hookHits(`${H}(async () => { await Promise.resolve() })`), 'await 不排异步尾巴').toEqual([])
     // 正控：helper 调用 / 字符串里的同名文本 / 别处的同名调用都不算（逐条对应审查报出的形态）
@@ -511,6 +519,15 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       '计算键访问器覆盖同名键 → 串行').toEqual([])
     expect(concHits(`${bt("it('S10', { con", "current: true, ...{ get ['timeout']() { return 1000 } } }, () => {})")}`),
       '别的键的访问器不得清掉并发').toEqual(['opt'])
+    // 未知**计算键访问器**同样可能覆盖任何键
+    expect(concHits(`${bt("it('S13', { con", 'current: true, get [key]() { return false } }, () => {})')}`),
+      '未知计算键访问器使旧值不可信').toEqual([])
+    // 未知**计算键**同样可能覆盖任何键（CodeRabbit PR#81 第二十二轮 minor）
+    expect(concHits(`${bt("it('S11', { con", 'current: true, [key]: false }, () => {})')}`),
+      '未知计算键使旧值不可信').toEqual([])
+    // 但未知计算键**之后**的显式赋值重新确定值
+    expect(concHits(`${bt("it('S12', { [key]: false, con", 'current: true }, () => {})')}`),
+      '未知计算键之后的显式并发仍可判').toEqual(['opt'])
     // 访问器覆盖同名值：`{ concurrent: true, get concurrent() { return false } }` 实际串行
     expect(concHits(`${bt("it('S7', { con", 'current: true, get con', 'current() { return false } }, () => {})')}`),
       '访问器覆盖').toEqual([])
