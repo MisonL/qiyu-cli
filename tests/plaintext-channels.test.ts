@@ -76,13 +76,22 @@ function constConcat(node: ts.Expression): string | undefined {
   return undefined
 }
 
-/** 实参里含 `**` 时的说明：逐字面量看，**也**看常量拼接的结果（CodeRabbit PR#81 第十三轮）。 */
+/** 子树里全部**可静态求值**的拼接表达式（含模板插值里的 —— CodeRabbit PR#81 第十五轮）。 */
+function concatTexts(root: ts.Node): string[] {
+  const out: string[] = []
+  const visit = (n: ts.Node): void => {
+    const cc = ts.isExpression(n) ? constConcat(n) : undefined
+    if (cc !== undefined) { out.push(cc); return }
+    ts.forEachChild(n, visit)
+  }
+  visit(root)
+  return out
+}
+
+/** 实参里含 `**` 时的说明：逐字面量看，**也**看常量拼接的结果（CodeRabbit PR#81 第十三、十五轮）。 */
 function starsIn(args: readonly ts.Expression[]): string | undefined {
   const texts = args.flatMap((a) => literalTexts(a))
-  for (const a of args) {
-    const cc = constConcat(a)
-    if (cc !== undefined && cc.includes('**')) texts.push(cc)
-  }
+  for (const a of args) texts.push(...concatTexts(a))
   if (!texts.some((t) => t.includes('**'))) return undefined
   return texts.filter((t) => t.includes('**')).join(' | ').replace(/\s+/g, ' ').slice(0, 120)
 }
@@ -114,6 +123,15 @@ function calleeNameChain(n: ts.CallExpression | ts.NewExpression): string[] {
       out.unshift(pa.name.text)
       e = unwrap(pa.expression)
       continue
+    }
+    // 字面量下标访问 `process.stderr['write']` 与点号写法同义（CodeRabbit PR#81 第十五轮）
+    if (ts.isElementAccessExpression(e)) {
+      const key = unwrap(e.argumentExpression)
+      if (ts.isStringLiteral(key) || ts.isNoSubstitutionTemplateLiteral(key)) {
+        out.unshift(key.text)
+        e = unwrap(e.expression)
+        continue
+      }
     }
     if (ts.isCallExpression(e)) { e = unwrap(e.expression); continue }   // 极少见：`f()()` 取 f
     return []   // 认不出来 → 空链，规则自然不命中
@@ -193,9 +211,8 @@ const USAGE_CONST: Rule = {
       for (const d of st.declarationList.declarations) {
         if (!ts.isIdentifier(d.name) || !/USAGE/.test(d.name.text) || d.initializer === undefined) continue
         const texts = literalTexts(d.initializer)
-        // 常量初始化表达式本身可能是拼接（`'a' + '**b**'`）—— 整段求值再判一次
-        const whole = constConcat(d.initializer)
-        if (whole !== undefined && whole.includes('**')) texts.push(whole)
+        // 常量初始化表达式本身或**其中任何子表达式**可能是拼接 —— 逐个可静态求值处都试一次
+        texts.push(...concatTexts(d.initializer))
         if (!texts.some((t) => t.includes('**'))) continue
         out.push(`L${lineOf(sf, d)}  ${d.name.text} = `
           + texts.filter((t) => t.includes('**')).join(' | ').replace(/\s+/g, ' ').slice(0, 120))
@@ -276,14 +293,16 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "usageFail(prefix + '*')",                                       // 含变量：拼接结果不在静态边界内，不算
       "process.stderr\n  .write('换行点号：**x**')",                     // 跨行属性访问（CR 第十四轮）
       "process.stderr?.write('可选链：**y**')",                          // 可选链（同上）
+      "process.stderr['write']('下标：**z**')",                          // 字面量下标访问（CR 第十五轮）
+      "usageFail(`前缀 ${'*' + '*bad2*' + '*'}`)",                       // 模板插值里的常量拼接（同上）
       'usageFail(`outer ${String(`)`)} **bad**`)',                    // 嵌套模板：真调用、星号在字面段
     ].join('\n')
     const sf = parseTs(fake)
-    expect(USAGE_FAIL.hit(sf), 'usageFail 规则：字面量 1 条 + 嵌套模板 1 条 + 常量拼接 1 条；含变量那条不算')
-      .toHaveLength(3)
+    expect(USAGE_FAIL.hit(sf),
+      'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行各一条；非 throw 的 new Error 不算').toHaveLength(2)
     expect(STDERR_WRITE.hit(sf),
-      'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链各一条').toHaveLength(5)
+      'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)
     // 注释里的 `**` 不是字面量；模板里的字面段是（这条钉住 literalTexts 的两半）
     const cmt = parseTs('// **这是注释**\nconst a = `x **y** ${z}`')

@@ -47,6 +47,12 @@
 
 ### 修复
 
+- **纯文本通道再补两种写法**（2026-11-16，CodeRabbit PR#81 第十五轮，两条 minor）：
+  ① 字面量下标访问 `process.stderr['write'](…)` 与点号同义，名字链补 `ElementAccessExpression`
+  （仅静态字面量键；`obj[k]` 仍不可判）；② 常量拼接原只看**实参根部**，
+  `` usageFail(`前缀 ${'*' + '*bad*' + '*'}`) `` 的拼接在模板插值里 —— 改为遍历实参子树里
+  每个可静态求值的表达式（`USAGE` 常量同理）。两条各配样本，变异（不遍历子树 / 不认下标）
+  实测变红。
 - **两条扫描器健壮性 / 判据精确性修正**（2026-11-16，CodeRabbit PR#81 第十四轮）：
   ① **临时文件竞态**（major）：仓库里确有测试在 `tests/` 下**临时**写 `.test.ts` 再删掉
   （`setup-warm.test.ts` 的子 vitest 用例，名字带 pid），缓存扫描的 `readdirSync` 与
