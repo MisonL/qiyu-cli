@@ -207,7 +207,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     const fake = [
       "usageFail('错误：**不要这样**')",                              // USAGE_FAIL 命中 1
       "usageFail('干净文案')",                                        // 不命中
-      "const s = 'usageFail(\'**假**\')'",                          // 字符串里，不算
+      'const s = "usageFail(\'**假**\')"',                          // 字符串里，不算
       "throw new Error('崩溃：**别**')",                              // THROW 命中 1
       "throw Object.assign(\n  new Error('跨行：**也别**'),\n  { code: 'usage' })", // 跨行也命中
       "const e = new Error('非抛出：**不算**')",                       // 不是 throw，不算
