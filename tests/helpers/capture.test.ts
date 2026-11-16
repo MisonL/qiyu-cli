@@ -134,8 +134,13 @@ describe('tests/helpers/capture.ts', () => {
 const REGISTRARS = new Set(['it', 'test', 'describe', 'suite', 'itBound'])
 /** 套件级 `sequential: false` 同样让用例并行（Vitest 2.1.9，Codex PR#81 第十轮）。 */
 const SUITES = new Set(['describe', 'suite'])
-/** 调度原语名（定时器 / 微任务）。 */
-const HOOK_FORBIDDEN = new Set(['setTimeout', 'setInterval', 'setImmediate', 'queueMicrotask'])
+/**
+ * 调度原语名（定时器 / 微任务）。
+ * ⚠️ `nextTick` 与 `Promise.resolve().then` 的 `.then` 同属微任务（Node 实测顺序：
+ * sync → nextTick → Promise.then → queueMicrotask），延迟写入同样落在下一条用例里
+ * （Codex PR#81 第二十轮 P2，`FRESHTAIL` 探针复现）。
+ */
+const HOOK_FORBIDDEN = new Set(['setTimeout', 'setInterval', 'setImmediate', 'queueMicrotask', 'nextTick', 'then'])
 /** 调度原语的宿主：`globalThis.setTimeout(…)` / `global.setTimeout(…)` 同样是调度。 */
 const GLOBAL_HOSTS = new Set(['globalThis', 'global', 'window', 'self'])
 /** hook 名。大小写不敏感（`beforeEach` / `beforeeach` 都按同一规则，Codex PR#81 第十轮）。 */
@@ -210,14 +215,21 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
   for (const call of collectCalls(sf)) {
     if (!isHookName(callChain(call)?.chain)) continue
     for (const inner of collectCalls(call)) {
-      const innerName = calleeChain(inner.expression)
+      // ⚠️ 用 `callChain` 而不是 `calleeChain`：`Promise.resolve().then(…)` 的被调对象基座是
+      // **调用**，`calleeChain` 对它返回 undefined（Codex PR#81 第二十轮 P2，探针复现）。
+      const innerName = callChain(inner)?.chain
       if (innerName === undefined) continue
       // `setTimeout(…)` 与 `globalThis.setTimeout(…)` 都是调度；反射（`globalThis['set'+'Timeout']`）
       // 与转调 helper 内部排调度仍看不出来（见上方边界注释）。
       const bare = innerName.length === 2 && GLOBAL_HOSTS.has(innerName[0]!)
         ? [innerName[1]!]
         : innerName
-      if (bare.length !== 1 || !HOOK_FORBIDDEN.has(bare[0]!)) continue
+      const forbidden = bare.length === 1 && HOOK_FORBIDDEN.has(bare[0]!)
+        // `process.nextTick(…)`：宿主是 `process`，原语是 `nextTick`
+        || (bare.length === 2 && bare[0] === 'process' && bare[1] === 'nextTick')
+        // `Promise.resolve().then(…)` / `Promise.then(…)`：宿主是 `Promise`，原语是 `then`
+        || (bare.length >= 2 && bare[0] === 'Promise' && bare[bare.length - 1] === 'then')
+      if (!forbidden) continue
       out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${innerName.join('.')}(」` })
     }
   }
@@ -385,6 +397,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookHits(`${H}(() => setInterval(w, 80))`)).toEqual(['setInterval('])
     expect(hookHits(`${H}(() => queueMicrotask(w))`)).toEqual(['queueMicrotask('])
     expect(hookHits(`${H}(() => setImmediate(w))`)).toEqual(['setImmediate('])
+    // 微任务的另两种写法（Codex PR#81 第二十轮 P2，探针复现 FRESHTAIL 串扰）
+    expect(hookHits(`${H}(() => process.nextTick(() => { w() }))`), 'nextTick 是微任务').toEqual(['process.nextTick('])
+    expect(hookHits(`${H}(() => { Promise.resolve().then(() => { w() }) })`), 'Promise.then 是微任务')
+      .toEqual(['Promise.resolve.then('])
+    // 反例：普通 Promise 用法与无关的 .then 不是 hook 体里的延迟写入
+    expect(hookHits(`${H}(async () => { await Promise.resolve() })`), 'await 不排异步尾巴').toEqual([])
     // 正控：helper 调用 / 字符串里的同名文本 / 别处的同名调用都不算（逐条对应审查报出的形态）
     expect(hookHits(`${H}(async () => { await delay(80) })`), 'await helper 应放过').toEqual([])
     expect(hookHits(`${H}(() => { const sample = "${ST}(" })`), '字符串里的调用名是数据').toEqual([])
@@ -466,9 +484,19 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 后写覆盖前写：`{ ...{ concurrent: true }, concurrent: false }` 实际是串行
     expect(concHits(`${bt("it('S3', { ...{ con", 'current: true }, con', 'current: false }, () => {})')}`),
       '展开后再写 false → 不是并发').toEqual([])
-    // 反例：展开源是变量（静态求不出）—— 已声明的边界
+    // 反例：展开源是变量（静态求不出）—— 判不了就不判为违规
     expect(concHits(`${bt("const o = { con", 'current: true }\nit(\'S4\', { ...o }, () => {})')}`),
       '变量展开看不出静态值').toEqual([])
+    // ⚠️ 未知展开**可能覆盖任何键** —— 它之前的已知值全部作废（Codex PR#81 第二十轮 P2 的**误报**：
+    // `{ concurrent: true, ...opts }` 在 opts 含 `concurrent: false` 时实际串行，判成并发是错的）
+    expect(concHits(`${bt("it('S5', { con", 'current: true, ...opts }, () => {})')}`),
+      '未知展开之后的旧值不可信').toEqual([])
+    // 但未知展开**之后**的显式赋值重新确定值
+    expect(concHits(`${bt("it('S6', { con", 'current: true, ...opts, con', 'current: true }, () => {})')}`),
+      '未知展开之后的显式并发仍然可判').toEqual(['opt'])
+    // 访问器覆盖同名值：`{ concurrent: true, get concurrent() { return false } }` 实际串行
+    expect(concHits(`${bt("it('S7', { con", 'current: true, get con', 'current() { return false } }, () => {})')}`),
+      '访问器覆盖').toEqual([])
     expect(concHits(`${bt("it('E', () => { const p = { con", 'current: true } })')}`), '执行体里的是数据').toEqual([])
     expect(concHits(`${bt("it('F', async (): Promise<void> => { const p = { con", 'current: true } })')}`),
       '带返回类型的 async 执行体（Codex 第九轮）').toEqual([])

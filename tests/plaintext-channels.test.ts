@@ -164,8 +164,12 @@ const THROW_ERROR: Rule = {
       for (;;) {
         const p = e.parent
         if (p !== undefined && ts.isParenthesizedExpression(p) && p.expression === e) { e = p; continue }
+        // 尖括号类型断言 `<F>(() => …)` 与 `as` 同义（Codex 第二十轮追加探针），一并穿透
         if (p !== undefined && (ts.isAsExpression(p) || ts.isNonNullExpression(p)
-          || ts.isSatisfiesExpression(p)) && p.expression === e) { e = p as ts.Expression; continue }
+          || ts.isSatisfiesExpression(p) || ts.isTypeAssertionExpression(p)) && p.expression === e) {
+          e = p as ts.Expression
+          continue
+        }
         if (p !== undefined && ts.isCallExpression(p) && p.expression === e) return true
         return false
       }
@@ -293,6 +297,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw (() => new Error('**立即执行**'))()",
       "throw ((() => new Error('**断言包装**')) as () => Error)()",
       "throw ((() => new Error('**非空断言**'))!)()",
+      "throw (<() => Error>(() => new Error('**尖括号断言**')))()",
       "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
       "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
@@ -310,8 +315,8 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     const sf = parseTs(fake)
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
-    expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 三种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调里的 new Error 不算').toHaveLength(5)
+    expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
+      + '未调用的回调里的 new Error 不算').toHaveLength(6)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)

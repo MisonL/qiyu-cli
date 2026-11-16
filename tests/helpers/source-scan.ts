@@ -57,13 +57,27 @@ export function collectCalls(root: ts.Node): ts.CallExpression[] {
   return out
 }
 
-/** 该节点是不是**某个调用 / 标签模板的被调对象**（链式登记的内层）。 */
+/**
+ * 该节点是不是**某个调用 / 标签模板的被调对象**（链式登记的内层）。
+ * ⚠️ 包装不改变「被调用」这一事实：`(f)(…)`、`f as T` 的调用 `(f as T)(…)`、
+ * `f!()`、`<T>f()`、`f satisfies T` 的调用 —— 它们编译后都是 `f(…)`。
+ * 只比一层父节点会把这些全判成"没被调用"（Codex PR#81 第二十轮 P2，同族缺陷）。
+ */
 export function isInvoked(node: ts.Node): boolean {
-  const p = node.parent
-  if (p === undefined) return false
-  if (ts.isCallExpression(p)) return p.expression === node
-  if (ts.isTaggedTemplateExpression(p)) return p.tag === node
-  return false
+  let e: ts.Node = node
+  for (;;) {
+    const p: ts.Node | undefined = e.parent
+    if (p === undefined) return false
+    if (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isTypeAssertionExpression(p)
+      || ts.isNonNullExpression(p) || ts.isSatisfiesExpression(p)) {
+      if (p.expression !== e) return false
+      e = p
+      continue
+    }
+    if (ts.isCallExpression(p)) return p.expression === e
+    if (ts.isTaggedTemplateExpression(p)) return p.tag === e
+    return false
+  }
 }
 
 /** 剥掉括号 / 类型断言 / 非空断言等**不改变运行语义**的包装。 */
@@ -195,35 +209,51 @@ export function isRegistration(call: ts.CallExpression, base: readonly string[])
  * 只读顶层 —— 与 Vitest 的选项契约一致（`concurrent` 是选项对象的属性）。
  * ⚠️ 字符串键（`{ 'concurrent': true }`）同样是合法选项（Codex PR#81 第九轮）：
  * AST 里它与标识符键的区别只是 `ts.isStringLiteral`，这里一并收下。
- * ⚠️ **静态对象展开**（`{ ...{ concurrent: true } }`、`{ ...{ sequential: false } }`）按属性
- * 顺序合并（Codex PR#81 第十八轮 P2，探针证实 Vitest 按合并后的值判定并发）：展开源是
- * 对象字面量时递归展开、后写覆盖前写；展开源是变量 / 调用等**求不出静态值**的形态仍不判
- * （那属于已声明的边界，与反射同类）。同一键在展开后出现多次时，**最后一次**胜出。
+ * ⚠️ **按 JS 的对象形状语义合并，后写覆盖前写**（Vitest 用 `{ ...suiteOpts, ...options }`
+ * 合并选项，见 `@vitest/runner` 的 `options = { ...currentSuite.options, ...options }`）：
+ *   · 静态对象展开（`{ ...{ concurrent: true } }`）：递归展开（Codex PR#81 第十八轮 P2）；
+ *   · **未知展开**（`{ concurrent: true, ...opts }`，`opts` 是变量）：它可能覆盖**任何**键 ——
+ *     不能因为"求不出值"就把前面的值留着（那会把串行的合法用例判成并发，Codex PR#81
+ *     第二十轮 P2 探针复现的**误报**）。此时映射进入"不确定"状态：清空已知键，
+ *     之后的显式赋值再重新确定（`{ concurrent: true, ...opts, concurrent: true }` 仍是并发）。
+ *   · **访问器**（`get concurrent()` / `set concurrent()`）同样覆盖之前的同名值。
+ * 不确定状态用 `undefined` 值表示（调用方 `props.get(k)` 得到 undefined 即"无法判定"）。
  */
-export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Expression> {
-  const out = new Map<string, ts.Expression>()
+export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Expression | undefined> {
+  const out = new Map<string, ts.Expression | undefined>()
   for (const p of obj.properties) {
     if (ts.isPropertyAssignment(p)) {
-      const n = p.name
-      if (ts.isIdentifier(n)) out.set(n.text, p.initializer)
-      else if (ts.isStringLiteral(n) || ts.isNumericLiteral(n)) out.set(n.text, p.initializer)
-      else if (ts.isComputedPropertyName(n)) {
-        // ⚠️ 键表达式可能是括号 / 断言包装后的字面量（`{ [('concurrent')]: true }`、
-        // `{ ['concurrent' as const]: true }`，Codex PR#81 第十二轮）—— 先剥离包装再认字面量。
-        const e = unwrap(n.expression)
-        if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e) || ts.isNumericLiteral(e)) {
-          out.set(e.text, p.initializer)
-        }
-      }
+      const k = staticPropKey(p.name, true)
+      if (k !== undefined) out.set(k, p.initializer)
     } else if (ts.isShorthandPropertyAssignment(p)) {
       out.set(p.name.text, p.name)
+    } else if (ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) {
+      // 访问器的值只有在求值时才知道 —— 它能覆盖任何同名键。
+      const k = staticPropKey(p.name, false)
+      if (k !== undefined) out.set(k, undefined)
     } else if (ts.isSpreadAssignment(p)) {
-      // 只展开**静态可求**的对象字面量；变量 / 调用 / 其它形态不判（已声明的边界）。
       const src = unwrap(p.expression)
       if (ts.isObjectLiteralExpression(src)) {
         for (const [k, v] of objectProps(src)) out.set(k, v)
+      } else {
+        // 未知展开：可能覆盖任何键 —— 已知值全部作废，之后显式赋值再重新确定。
+        out.clear()
       }
     }
   }
   return out
+}
+
+/** 属性名 → 静态字符串键；动态键（变量 / 调用）返回 undefined。 */
+function staticPropKey(name: ts.PropertyName, allowComputed: boolean): string | undefined {
+  if (ts.isIdentifier(name)) return name.text
+  if (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text
+  if (allowComputed && ts.isComputedPropertyName(name)) {
+    // 键表达式可能是括号 / 断言包装后的字面量（`{ [('concurrent')]: true }`，Codex PR#81 第十二轮）
+    const e = unwrap(name.expression)
+    if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e) || ts.isNumericLiteral(e)) {
+      return e.text
+    }
+  }
+  return undefined
 }

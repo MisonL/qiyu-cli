@@ -47,6 +47,16 @@
 
 ### 修复
 
+- **微任务两种写法 + 未知展开/访问器覆盖导致的误报**（2026-11-17，Codex PR#81 第二十轮 P2 ×2，
+  「尖括号断言」已在同日提交里一并修掉）：
+  ① hook 判据漏掉 `process.nextTick(…)` 与 `Promise.resolve().then(…)`：两者与
+  `queueMicrotask` 同属微任务（Node 实测顺序 sync → nextTick → then → queueMicrotask），
+  延迟写入照样串到下一条用例（Codex 的 `FRESHTAIL` 探针复现）；且 `Promise.resolve().then`
+  的被调对象基座是**调用**，`calleeChain` 对它返回 undefined —— 判据改用 `callChain`。
+  ② `objectProps` 对「未知展开」与「访问器」的处理会**误报**：`{ concurrent: true, ...opts }`
+  里 `opts` 可能含 `concurrent: false`（实际串行），原实现保留前面的 `true`，把合法的串行
+  用例判成并发。按 JS 对象形状语义修正：未知展开清空已知键（之后的显式赋值再重新确定），
+  访问器让同名键变成未知。三处变异（不清空 / 访问器不覆盖 / 去掉 nextTick 判据）各自变红。
 - **throw 规则的函数边界要区分「立即调用」**（2026-11-17，Codex PR#81 第二十轮 P2）：
   上一轮把回溯止于函数边界，但 `throw (() => new Error('**BAD**'))()` 里的 IIFE **会立即执行**，
   抛的正是里面那个 Error（Codex 用真实运行时探针逐形态确认）。边界只在「函数未被调用」时
