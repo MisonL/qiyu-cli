@@ -1,321 +1,136 @@
 // tests/helpers/source-scan.ts
 //
-// 源码扫描的**共用**小工具（原本各测试文件各写一份，2026-11-15 收敛到一处）：
-// `blankComments`（抹注释）、`blankLiterals`（抹字符串/模板/正则内容）、`argRange` /
-// `scanBalanced`（配对）、`splitTopLevel`（切实参）、`propertyRanges`（对象属性位）。
+// 静态扫描的**共用**工具。判据一律建在 TypeScript 编译器给出的**语法树**上。
 //
-// ⚠️ 为什么要共用（而不是各文件抄一份）：判据一旦有第二份实现，两处就会对「什么算注释」
-// 「什么算参数」给出不同答案 —— 同一个文件在两个守卫里结论不同时，没人能说清哪个对。
-// 现有调用点：`tests/plaintext-channels.test.ts`（全仓 Markdown 标记扫描）、
-// `tests/helpers/capture.test.ts`（capture 的两条结构性边界）。
+// ⚠️ 为什么用 AST 而不是手写词法器（2026-11-16 的收敛结论，PR#81 第七~九轮 20+ 条审查
+// 全部打在同一个东西上）：前几版是手写扫描 —— 跳字符串 / 模板 / 正则 / 注释、按字符配对
+// 括号。每一轮修完，下一轮又从邻角冒出一个新形态：
+//   `const x = ')'` 里的括号、正则 `/)/`、`` `${`a)`}` `` 的嵌套反引号、插值里的注释
+//   `/* } */`、`'a' + 'b'` 串起来的调用名、带返回类型的箭头 `async (): X =>` …
+// 这些都是「把文本当代码看」的固有误差，手工近似永远差一格。TypeScript 本来就在
+// devDependencies 里，解析耗时毫秒级，而且它对「这是不是一次调用」「这个字面量的内容
+// 是什么」「这个参数是不是箭头函数」给的是**精确**答案 —— 不需要近似。
 //
-// ⚠️ 同一判据只能有**一个实现点**（2026-11-16，Codex PR#81 第七/八轮）：`scanBalanced`
-// 曾经在 `capture.test.ts` 里另有一份（不跳字符串的 `skipBalanced`），Codex 的两个探针
-// 都打在那份复制品上。现在配对、实参切分（`splitTopLevel`）、属性位识别
-// （`propertyRanges`）、字面量抹除（`blankLiterals`）都只在这里实现。
+// 判据的边界因此变成**语言层面的、可陈述的**：例如「hook 调用的实参子树里有没有对
+// 调度原语的 CallExpression」——字符串里的同名文本自然不算，插值里的真调用自然算。
+// 剩下的边界只有一条：**反射**（`globalThis['set' + 'Timeout'](...)`）与跨模块转调，
+// 静态看不懂 —— 如实写在各自的判据注释里。
 
-/**
- * 把注释抹成等长空白（保留行号与偏移）。
- *
- * ⚠️ 不能只用正则：本仓库的注释里大量出现 `usageFail(...)`、`'**'` 这类**被讨论的**
- * 文本，纯正则会把它当代码。但也不能粗暴 `//.*$` —— `'https://…'` 里的 `//` 在字符串内。
- * 这里用一个**只认引号与注释**的小状态机：它不处理正则字面量（`/'([^']+)'/` 里的引号
- * 会被误判成字符串起止），这是已知边界 —— 在 `usageFail`/`throw` 的参数位置上出现
- * 正则字面量的可能性极低，且误判的方向是**漏报**而非误报（宁可漏一条扫描，不制造
- * 假红把真问题淹掉）。真正的兜底是 api.test.ts 的行为表。
- */
-export function blankComments(text: string): string {
-  const out = text.split('')
-  let i = 0
-  let quote: string | null = null
-  while (i < text.length) {
-    const c = text[i]!
-    const n = text[i + 1]
-    if (quote) {
-      if (c === '\\') { i += 2; continue }
-      if (c === quote) quote = null
-      i++
-      continue
-    }
-    if (c === "'" || c === '"' || c === '`') { quote = c; i++; continue }
-    if (c === '/' && n === '/') {
-      while (i < text.length && text[i] !== '\n') { out[i] = ' '; i++ }
-      continue
-    }
-    if (c === '/' && n === '*') {
-      const end = text.indexOf('*/', i + 2)
-      const stop = end === -1 ? text.length : end + 2
-      for (let k = i; k < stop; k++) if (out[k] !== '\n') out[k] = ' '
-      i = stop
-      continue
-    }
-    i++
+import ts from 'typescript'
+
+/** 解析一段源码。⚠️ 语法错误**直接抛**（而不是返回一棵残缺的树静默漏扫）。 */
+export function parseTs(text: string, label = 'scan.ts'): ts.SourceFile {
+  const sf = ts.createSourceFile(label, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  // `parseDiagnostics` 是 SourceFile 的**内部**字段（@types 没导出），运行时可读 —— 按 unknown 取。
+  const diags = (sf as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] }).parseDiagnostics ?? []
+  const d = diags[0]
+  if (d !== undefined) {
+    const at = sf.getLineAndCharacterOfPosition(d.start ?? 0)
+    throw new Error(`${label}:${at.line + 1}:${at.character + 1} 解析失败 —— `
+      + `静态扫描要求被扫文件语法正确：${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`)
   }
-  return out.join('')
+  return sf
 }
 
-/** 三种开 / 闭括号（切分与配对共用）。 */
-export const OPENERS = '([{'
-export const CLOSERS = ')]}'
+/** 1 起始的行号。 */
+export function lineOf(sf: ts.SourceFile, node: ts.Node): number {
+  return sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
+}
 
-/**
- * 把字符串 / 模板的字面部分 / 正则 / 注释的**内容**抹成等长空白（保留偏移与行号）。
- * 用途：在「这段文本里有没有某个属性 / 调用」这类判据里用 —— 只抹注释不够，
- * `{ label: 'concurrent: true' }` 的**值**是数据，读到它就等于误报。
- * ⚠️ 模板里的 `${…}` **保留**（CodeRabbit PR#81 第七轮）：那是代码不是字面量，
- * `` `${setTimeout(f, 1)}` `` 真的排了一次调度、必须被看到；模板内的嵌套模板递归处理。
- */
-export function blankLiterals(text: string): string {
-  const out = text.split('')
-  const blank = (a: number, b: number): void => {
-    for (let k = a; k < b; k++) if (out[k] !== '\n') out[k] = ' '
+/** 深度优先收集节点子树里全部调用表达式（含链式写法的每一层）。 */
+export function collectCalls(root: ts.Node): ts.CallExpression[] {
+  const out: ts.CallExpression[] = []
+  const walk = (n: ts.Node): void => {
+    if (ts.isCallExpression(n)) out.push(n)
+    ts.forEachChild(n, walk)
   }
-  let i = 0
-  while (i < text.length) {
-    const c = text[i]!
-    if (c === '/' && text[i + 1] === '/') { const s0 = i; while (i < text.length && text[i] !== '\n') i++; blank(s0, i); continue }
-    if (c === '/' && text[i + 1] === '*') { const s0 = i; const e = text.indexOf('*/', i + 2); i = e === -1 ? text.length : e + 2; blank(s0, i); continue }
-    if (c === '/' && regexAllowedAfter(text, i)) { const s0 = i; i = skipRegex(text, i); blank(s0, i); continue }
-    if (c === '`') { i = scanTemplate(text, i + 1, blank); continue }
-    if (c === "'" || c === '"') { const s0 = i; i = skipQuote(text, i); blank(s0 + 1, i - 1); continue }
-    i++
+  walk(root)
+  return out
+}
+
+/** 标识符 / 属性访问链 → 段名数组（`it.concurrent` → `['it','concurrent']`）；其余返回 undefined。 */
+export function calleeChain(node: ts.Expression): string[] | undefined {
+  if (ts.isIdentifier(node)) return [node.text]
+  if (ts.isParenthesizedExpression(node)) return calleeChain(node.expression)
+  if (ts.isPropertyAccessExpression(node)) {
+    const base = calleeChain(node.expression)
+    return base === undefined ? undefined : [...base, node.name.text]
   }
-  return out.join('')
+  return undefined
 }
 
 /**
- * 模板字符串扫描：从 `q`（开头反引号之后的第一个字符）扫到结束反引号，返回其**之后**的
- * 下标；过程中把每个**字面段** `[a, b)` 交给 `onLiteral`（抹除用，`blankLiterals` 传）。
- * ⚠️ `${…}` 里是**代码**：继续按词法单元扫（字符串 / 嵌套模板 / 注释 / 配对花括号），
- * 其中的字面量同样回调 —— 嵌套模板里的 `)` 不会提前结束外层（CodeRabbit PR#81 第八轮：
- * `` usageFail(`outer ${String(`)`)} **bad**`) `` 旧实现停在嵌套模板的反引号上）。
+ * 调用表达式的「名字链」：链式登记 `it.each(表)(名, 选项, 体)` 的**外层**调用，其
+ * expression 本身也是 CallExpression —— 这时取最内层被调用者的名字链。
+ * `viaCall` 表示中间跨过了一层「先调用再调用」。
  */
-function scanTemplate(text: string, q: number, onLiteral?: (a: number, b: number) => void): number {
-  let litStart = q
-  let i = q
-  while (i < text.length) {
-    const c = text[i]!
-    if (c === '\\') { i += 2; continue }
-    if (c === '`') { onLiteral?.(litStart, i); return i + 1 }
-    if (c === '$' && text[i + 1] === '{') {
-      onLiteral?.(litStart, i)
-      let depth = 0
-      let k = i + 1                       // 指向 `{`
-      while (k < text.length) {
-        const ch = text[k]!
-        if (ch === "'" || ch === '"') { k = skipQuote(text, k); continue }
-        if (ch === '`') { k = nestedLiteral(text, k, onLiteral); continue }
-        if (ch === '/' && text[k + 1] === '/') { while (k < text.length && text[k] !== '\n') k++; continue }
-        if (ch === '/' && text[k + 1] === '*') { const t = text.indexOf('*/', k + 2); k = t === -1 ? text.length : t + 2; continue }
-        if (ch === '{') depth++
-        else if (ch === '}') { depth--; if (depth === 0) break }
-        k++
-      }
-      i = k + 1
-      litStart = i
-      continue
-    }
-    i++
-  }
-  onLiteral?.(litStart, text.length)
-  return text.length
-}
-
-/** `${…}` 里的嵌套模板：扫描它并把字面量同样交给 `onLiteral`。返回其后下标。 */
-function nestedLiteral(text: string, k: number, onLiteral?: (a: number, b: number) => void): number {
-  return scanTemplate(text, k + 1, onLiteral)
+export function callChain(call: ts.CallExpression): { chain: string[]; viaCall: boolean } | undefined {
+  let e: ts.Expression = call.expression
+  let viaCall = false
+  while (ts.isCallExpression(e)) { viaCall = true; e = e.expression }
+  const chain = calleeChain(e)
+  return chain === undefined ? undefined : { chain, viaCall }
 }
 
 /**
- * 按**顶层**（深度 0）逗号切分 `[start, end)`：返回若干 `[s, e]` 段（各自去掉外层空白）。
- * 字符串 / 模板 / 正则 / 注释里的逗号不切分；`start === end` 表示空段。
- * ⚠️ 括号种类不符时不配平（`([)]` 视为坏输入）—— 凑配对会让区间在错误位置切开。
+ * 节点子树里全部字符串 / 模板字面量的**文本内容**（模板的 `${…}` 是代码，不算文本；
+ * 其中的字面量照常收集）。`onNode` 给需要「定位到具体字面量」的调用方（方法调用名 ——
+ * 只认字面量后面紧跟 `(` 的那种）。
  */
-export function splitTopLevel(
-  text: string, start: number, end: number,
-): Array<[number, number]> {
-  const segs: Array<[number, number]> = []
-  const stack: string[] = []
-  const trim = (a: number, b: number): [number, number] => {
-    while (a < b && /\s/.test(text[a]!)) a++
-    while (b > a && /\s/.test(text[b - 1]!)) b--
-    return [a, b]
-  }
-  let segStart = start
-  for (let k = start; k < end; k++) {
-    const ch = text[k]!
-    if (ch === '/' && text[k + 1] === '/') { while (k < end && text[k] !== '\n') k++; continue }
-    if (ch === '/' && text[k + 1] === '*') { const t = text.indexOf('*/', k + 2); k = t === -1 ? end : t + 1; continue }
-    if (ch === '/' && regexAllowedAfter(text, k)) { k = skipRegex(text, k) - 1; continue }
-    if (ch === "'" || ch === '"' || ch === '`') { k = skipQuote(text, k) - 1; continue }
-    if (OPENERS.includes(ch)) { stack.push(ch); continue }
-    if (CLOSERS.includes(ch)) { stack.pop(); continue }
-    if (ch === ',' && stack.length === 0) { segs.push([segStart, k]); segStart = k + 1 }
-  }
-  segs.push([segStart, end])
-  return segs.map(([a, b]) => trim(a, b))
-}
-
-/**
- * `sel` 是否就是执行体：`() =>` / `(o) =>` / `async () =>` / `async (o) =>` / `async x =>`。
- * ⚠️ `async` 前缀曾漏判（CodeRabbit PR#81 第七轮）：`it('safe', async () => …)` 整段被当成
- * 选项位，执行体里的同名属性误报。
- */
-export function isExecutor(sel: string): boolean {
-  return /^(?:async\s*)?(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(sel)
-}
-
-/**
- * 一个对象字面量（`{` 之后、配对 `}` 之前）里**可能被当成属性读到**的区间：
- * 顶层属性位 + `:` 之后的值（对象字面量逐层展开；`=>` 之后是**块**才展开）。
- * 箭头**表达式**体（`() => ({ … })`）是回调体、不展开 —— 里面的 `concurrent: true`
- * 是用户数据而不是开关（与「执行体出现在 `) => (` 之后不算」同一判据）。
- * ⚠️ 不能用正则切 `=>` / `:`（字符串里的 `"=>"`、键名后的函数返回类型注解 `): X` 都会切错）：
- * 按词法单元扫，只在深度 0 认 `=>` 与紧跟**标识符尾**的 `:` —— 计算键 `['a:b']: 1` 的 `]`
- * 后面那个 `:` 不算（第一版把 `]` / 引号也算作可接受前缀，值区间从计算键里就切歪了）。
- * 已知边界：属性值是三元 / 调用参数里的对象字面量时不展开（本仓库无此写法）。
- */
-export function propertyRanges(
-  text: string, start: number, end: number,
-): Array<[number, number]> {
-  const out: Array<[number, number]> = [[start, end]]
-  const stack: string[] = []
-  let arrowAfter = -1
-  let colonAfter = -1
-  for (let k = start; k < end; k++) {
-    const ch = text[k]!
-    if (ch === '/' && text[k + 1] === '/') { while (k < end && text[k] !== '\n') k++; continue }
-    if (ch === '/' && text[k + 1] === '*') { const t = text.indexOf('*/', k + 2); k = t === -1 ? end : t + 1; continue }
-    if (ch === '/' && regexAllowedAfter(text, k)) { k = skipRegex(text, k) - 1; continue }
-    if (ch === "'" || ch === '"' || ch === '`') { k = skipQuote(text, k) - 1; continue }
-    if (OPENERS.includes(ch)) { stack.push(ch); continue }
-    if (CLOSERS.includes(ch)) { stack.pop(); continue }
-    if (stack.length > 0) continue
-    if (ch === '=' && text[k + 1] === '>' && arrowAfter === -1) { arrowAfter = k + 2; k++; continue }
-    if (ch === ':' && colonAfter === -1 && text[k + 1] !== ':' && /[\w$]\s*$/.test(text.slice(start, k))) {
-      colonAfter = k + 1
+export function literalTexts(
+  node: ts.Node, onNode?: (lit: ts.StringLiteralLike, parent: ts.Node) => void,
+): string[] {
+  const out: string[] = []
+  const visit = (n: ts.Node): void => {
+    if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) {
+      out.push(n.text)
+      onNode?.(n, n.parent)
+      return
     }
-  }
-  for (const from of [colonAfter, arrowAfter]) {
-    if (from === -1) continue
-    let k = from
-    while (k < end && /\s/.test(text[k]!)) k++
-    if (text[k] === '{') {
-      const close = scanBalanced(text, k)[1]
-      if (close > k + 1) out.push(...propertyRanges(text, k + 1, Math.min(close - 1, end)))
-      return out   // 值只有这一块
+    if (ts.isTemplateExpression(n)) {
+      out.push(n.head.text)
+      for (const s of n.templateSpans) out.push(s.literal.text)
+      ts.forEachChild(n, visit)
+      return
     }
+    ts.forEachChild(n, visit)
   }
+  visit(node)
   return out
 }
 
 /**
- * 从 `(` 之后（`from` 指向 `(` 的下一个字符）做括号配对，返回参数区间 `[start, end)`。
- *
- * ⚠️ 配对的语义是「**实参区间**」还是「**执行体**」由调用点的参数位置决定，本函数不管；
- * 用它的调用点必须自己判断别的实参算不算数（`capture.test.ts` 的 `concurrent: true` 只认
- * 选项实参，见那里的 `concurrentOptionHits`）。
- *
- * ⚠️ 跳过的词法单元必须**全部**跳过：字符串 / 模板字符串 / 正则 / 注释。只跳字符串时，
- * `const re = /)/; foo()` 里的那个 `)` 会被当成实参终点 —— 区间被截短，后面的实参整个
- * 落在区间外（漏报）；「配平到错的位置」还会让 `scanBalanced` 这类调用点把后面的代码
- * 当成区间成员（Codex PR#81 第七轮：字符串里的 `)`/`(` 就能让 hook 判据整条失效）。
- * 注释本可由 `blankComments` 先抹掉，但本函数不该依赖调用方先抹 —— 直接跳过更稳。
+ * 该调用是不是「基名 + 若干修饰名」形态，且基名在 `base` 里（如注册函数 it/test/describe/suite）。
+ * 链式登记（`it.each(…)('名', …)`）会返回**两个**调用：内层（表格）与外层（登记），
+ * 两层链的基名都是 `it`。
  */
-export function argRange(text: string, from: number): [number, number] {
-  // `scanBalanced` 的 `after` 指配对 `)` **之后**；实参区间要**排除**那个 `)` 本身
-  // （与历史语义一致：`slice(s, e)` 取到的最后一个字符是最后一个实参）。
-  const [close] = scanBalanced(text, from - 1)
-  return [from, close]
+export function isRegistration(call: ts.CallExpression, base: readonly string[]): boolean {
+  const c = callChain(call)
+  return c !== undefined && base.includes(c.chain[0]!)
 }
 
 /**
- * 从 `open`（指向 `(`）起做括号配对，返回 `[close, after]`：
- * - `close`：配对的 `)` 的下标（没配上则为 `text.length`）
- * - `after`：配对符号**之后**的下标（区间右开边界）
- * 词法单元（字符串 / 模板 / 正则 / 注释）里的括号**不参与**配对。
+ * 对象字面量里**顶层**属性名与值的映射（键支持标识符、字符串、数字、计算字面量）。
+ * 只读顶层 —— 与 Vitest 的选项契约一致（`concurrent` 是选项对象的属性）。
+ * ⚠️ 字符串键（`{ 'concurrent': true }`）同样是合法选项（Codex PR#81 第九轮）：
+ * AST 里它与标识符键的区别只是 `ts.isStringLiteral`，这里一并收下。
  */
-export function scanBalanced(text: string, open: number): [number, number] {
-  let depth = 0
-  let i = open
-  while (i < text.length) {
-    const c = text[i]!
-    const next = text[i + 1]
-    if (c === '\\') { i += 2; continue }
-    if (c === '/' && next === '/') {                       // 行注释
-      while (i < text.length && text[i] !== '\n') i++
-      continue
+export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Expression> {
+  const out = new Map<string, ts.Expression>()
+  for (const p of obj.properties) {
+    if (ts.isPropertyAssignment(p)) {
+      const n = p.name
+      if (ts.isIdentifier(n)) out.set(n.text, p.initializer)
+      else if (ts.isStringLiteral(n) || ts.isNumericLiteral(n)) out.set(n.text, p.initializer)
+      else if (ts.isComputedPropertyName(n)) {
+        const e = n.expression
+        if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e) || ts.isNumericLiteral(e)) {
+          out.set(e.text, p.initializer)
+        }
+      }
+    } else if (ts.isShorthandPropertyAssignment(p)) {
+      out.set(p.name.text, p.name)
     }
-    if (c === '/' && next === '*') {                       // 块注释
-      const end = text.indexOf('*/', i + 2)
-      i = end === -1 ? text.length : end + 2
-      continue
-    }
-    if (c === '/' && regexAllowedAfter(text, i)) {         // 正则字面量
-      i = skipRegex(text, i)
-      continue
-    }
-    if (c === "'" || c === '"' || c === '`') {             // 字符串 / 模板（${…} 不展开，见注释）
-      i = skipQuote(text, i)
-      continue
-    }
-    if (c === '(') depth++
-    else if (c === ')') {
-      depth--
-      if (depth === 0) return [i, i + 1]
-    }
-    i++
   }
-  return [text.length, text.length]
-}
-
-/**
- * 跳过以 `q` 开头的字符串 / 模板字面量，返回结束引号**之后**的下标；未闭合返回
- * `text.length`。
- * ⚠️ 模板走 `scanTemplate`（`${…}` 里的嵌套模板与字符串一并跨过，CodeRabbit PR#81 第八轮）：
- * 只按裸引号扫会在嵌套模板的反引号处提前收尾，后续把字面量里的 `)` 当成配对符号。
- */
-export function skipQuote(text: string, q: number): number {
-  if (text[q] === '`') return scanTemplate(text, q + 1)
-  const quote = text[q]!
-  let i = q + 1
-  while (i < text.length) {
-    if (text[i] === '\\') { i += 2; continue }
-    if (text[i] === quote) return i + 1
-    i++
-  }
-  return text.length
-}
-
-/**
- * `/` 在此处是正则开头吗？按**前一个非空白字符**判：表达式位置的 `/` 才是正则。
- * 关键词（`return` / `typeof` / `case` 等）之后也算表达式位置。
- * 边界（如实记录）：`a / b` 这类除法前一个字符是标识符/`)`/`]` → 当除号，正确；
- * 但 `if (x) /re/.test(s)`（`if (…)` 之后的语句位置）会被当除号 —— 误判方向是
- * 「不跳正则」，退回旧行为（可能把正则里的 `)` 当配对符号），不会制造假红。
- */
-export function regexAllowedAfter(text: string, at: number): boolean {
-  let k = at - 1
-  while (k >= 0 && /\s/.test(text[k]!)) k--
-  if (k < 0) return true
-  if (/[)\]}]/.test(text[k]!)) return false
-  const word = /(\w+)$/.exec(text.slice(Math.max(0, k - 16), k + 1))
-  if (word) return /^(?:return|typeof|instanceof|case|in|of|new|delete|void|throw|do|else)$/.test(word[1]!)
-  return true   // 运算符 / 标点之后 → 表达式位置
-}
-
-/** 跳过从 `r` 开始的正则字面量，返回结束 `/flags` 之后的下标。 */
-export function skipRegex(text: string, r: number): number {
-  let i = r + 1
-  let inClass = false
-  while (i < text.length) {
-    const c = text[i]!
-    if (c === '\\') { i += 2; continue }
-    if (c === '\n') return i          // 单行正则不跨行：判错了就到此为止
-    if (c === '[') inClass = true
-    else if (c === ']') inClass = false
-    else if (c === '/' && !inClass) { i++; while (i < text.length && /[a-z]/i.test(text[i]!)) i++; return i }
-    i++
-  }
-  return text.length
+  return out
 }

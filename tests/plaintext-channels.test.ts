@@ -23,12 +23,18 @@
 // ⚠️ **边界（诚实记录）**：本文件只看**字面量**。运行时拼出来的 `**`
 // （如 `${userInput}` 里恰好带星号）它看不见 —— 那属于「不受信文本原样回显」，
 // 不是文案缺陷，由各命令的净化（sanitizeMessage）负责。
+//
+// ⚠️ 判据建在 **TypeScript 语法树**上（2026-11-16）：手写文本扫描（抹注释 → 配括号取实参）
+// 会被字符串 / 正则 / 模板里的括号骗到 —— 例如 `usageFail(`outer ${String(`)`)} **bad**`)`
+// 会在嵌套模板的反引号处提前收尾、漏掉后面的星号（CodeRabbit PR#81 第八轮）。
+// AST 直接给出「这个调用的实参是什么」，字面量与插值各归各位。
 
 import { describe, it, expect } from 'vitest'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { argRange, blankComments } from './helpers/source-scan.js'
+import ts from 'typescript'
+import { lineOf, literalTexts, parseTs } from './helpers/source-scan.js'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SRC = join(ROOT, 'src')
@@ -39,146 +45,185 @@ const walk = (dir: string): string[] =>
     return statSync(p).isDirectory() ? walk(p) : p.endsWith('.ts') ? [p] : []
   })
 
-/**
- * 从 `from` 起吃掉「字符串字面量（用 `+` 连接）」这一串，返回其原文拼接。
- * 用于精确取常量初始化表达式，而不误伤后面的代码。
- */
-function literalChain(text: string, from: number): string {
-  let i = from
-  let out = ''
-  for (;;) {
-    while (i < text.length && /\s/.test(text[i]!)) i++
-    const q = text[i]
-    if (q !== "'" && q !== '"' && q !== '`') break
-    const start = i
-    i++
-    while (i < text.length && text[i] !== q) {
-      if (text[i] === '\\') i++
-      i++
-    }
-    i++
-    out += text.slice(start, i)
-    while (i < text.length && /\s/.test(text[i]!)) i++
-    if (text[i] === '+') { i++; continue }
-    break
-  }
-  return out
-}
-
 interface Hit { file: string; line: number; snippet: string }
 
-/** 扫全仓：`pattern` 匹配到的调用，其参数区间里出现 `**` 的记一条。 */
-function scanCallArgs(pattern: RegExp): Hit[] {
+/**
+ * 「调用」的两种语法节点：函数调用 `f(...)` 与构造调用 `new F(...)`。
+ * ⚠️ 必须**都**收（2026-11-16 自检当场抓到）：`new Error('**x**')` 在 TS 语法树里是
+ * `NewExpression`、**不是** `CallExpression` —— 只扫后者时那条 throw 规则一条都命中不了，
+ * 而它在真实代码全绿的情况下看起来完全正常（空转的守卫）。
+ */
+/**
+ * 四条规则（**唯一实现点**：全仓扫描与自检都调它们）。每条接收一棵语法树，返回命中说明。
+ * 语法树里只有真正的调用会出现 —— 字符串 / 注释里的同名文本天然不算。
+ */
+type Rule = { name: string; hit: (sf: ts.SourceFile) => string[] }
+
+/** 实参里含 `**` 时的说明（取命中段附近文本，便于定位）。 */
+function starsIn(args: readonly ts.Expression[]): string | undefined {
+  const texts = args.flatMap((a) => literalTexts(a))
+  if (!texts.some((t) => t.includes('**'))) return undefined
+  return texts.filter((t) => t.includes('**')).join(' | ').replace(/\s+/g, ' ').slice(0, 120)
+}
+
+/** 遍历一棵树里的全部调用 / 构造调用。⚠️ 两种都要 —— `new Error(…)` 是 NewExpression。 */
+function eachInvocation(sf: ts.SourceFile, fn: (n: ts.CallExpression | ts.NewExpression, line: number) => void): void {
+  const visit = (n: ts.Node): void => {
+    if (ts.isCallExpression(n) || ts.isNewExpression(n)) fn(n, lineOf(sf, n))
+    ts.forEachChild(n, visit)
+  }
+  visit(sf)
+}
+
+const argsOf = (n: ts.CallExpression | ts.NewExpression): readonly ts.Expression[] => n.arguments ?? []
+
+/** `usageFail(...)` 的文案里没有 `**`（逐字写进 stderr）。 */
+const USAGE_FAIL: Rule = {
+  name: 'usageFail',
+  hit: (sf) => {
+    const out: string[] = []
+    eachInvocation(sf, (n, line) => {
+      if (!ts.isCallExpression(n) || n.expression.getText(sf) !== 'usageFail') return
+      const why = starsIn(argsOf(n))
+      if (why !== undefined) out.push(`L${line}  ${why}`)
+    })
+    return out
+  },
+}
+
+/**
+ * `throw` 里的 `new Error(...)`（含 `throw Object.assign(new Error(…))`）。
+ * 两条出口都会把 message 变成人读文本：`callOne` 的 catch 直接写 stderr；未捕获时
+ * Node 默认打印器把 message 与堆栈一起打到终端。AST 判据天然跨行、跨嵌套。
+ */
+const THROW_ERROR: Rule = {
+  name: 'throw new Error',
+  hit: (sf) => {
+    const out: string[] = []
+    eachInvocation(sf, (n, line) => {
+      if (!ts.isNewExpression(n) || n.expression.getText(sf) !== 'Error') return
+      let up: ts.Node = n
+      while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) up = up.parent
+      if (up.parent === undefined) return
+      const why = starsIn(argsOf(n))
+      if (why !== undefined) out.push(`L${line}  ${why}`)
+    })
+    return out
+  },
+}
+
+/** `process.stderr.write('…')` 的**直接实参**里没有 `**`（绕过 usageFail 的手写出口）。 */
+const STDERR_WRITE: Rule = {
+  name: 'process.stderr.write',
+  hit: (sf) => {
+    const out: string[] = []
+    eachInvocation(sf, (n, line) => {
+      if (!ts.isCallExpression(n) || n.expression.getText(sf) !== 'process.stderr.write') return
+      const [first] = argsOf(n)
+      if (first === undefined) return
+      const why = starsIn([first])
+      if (why !== undefined) out.push(`L${line}  ${why}`)
+    })
+    return out
+  },
+}
+
+/**
+ * 顶层 `const X_USAGE = <初始化表达式>` 里的字面量没有 `**`（help 走 stdout，但它是纯文本）。
+ * 模板的 `${…}` 是代码，其中字面量照收 —— 它们最终同样进 help 文本。
+ */
+const USAGE_CONST: Rule = {
+  name: 'USAGE 常量',
+  hit: (sf) => {
+    const out: string[] = []
+    for (const st of sf.statements) {
+      if (!ts.isVariableStatement(st)) continue
+      for (const d of st.declarationList.declarations) {
+        if (!ts.isIdentifier(d.name) || !/USAGE/.test(d.name.text) || d.initializer === undefined) continue
+        const texts = literalTexts(d.initializer)
+        if (!texts.some((t) => t.includes('**'))) continue
+        out.push(`L${lineOf(sf, d)}  ${d.name.text} = `
+          + texts.filter((t) => t.includes('**')).join(' | ').replace(/\s+/g, ' ').slice(0, 120))
+      }
+    }
+    return out
+  },
+}
+
+const RULES: readonly Rule[] = [USAGE_FAIL, THROW_ERROR, STDERR_WRITE, USAGE_CONST]
+
+/** 扫全仓（只跑一条规则）。 */
+function scanTree(rule: Rule): Hit[] {
   const hits: Hit[] = []
   for (const f of walk(SRC)) {
-    const raw = readFileSync(f, 'utf8')
-    const text = blankComments(raw)
-    for (const m of text.matchAll(pattern)) {
-      const [s, e] = argRange(text, m.index! + m[0].length)
-      const arg = text.slice(s, e)
-      if (!arg.includes('**')) continue
-      hits.push({
-        file: relative(ROOT, f),
-        line: text.slice(0, m.index!).split('\n').length,
-        snippet: arg.replace(/\s+/g, ' ').trim().slice(0, 120),
-      })
-    }
+    const sf = parseTs(readFileSync(f, 'utf8'), relative(ROOT, f))
+    for (const why of rule.hit(sf)) hits.push({ file: relative(ROOT, f), line: 0, snippet: why })
   }
   return hits
 }
 
-const fmt = (h: Hit): string => `${h.file}:${h.line}  ${h.snippet}`
+const fmtHit = (h: Hit): string => `${h.file}:${h.snippet}`
 
 describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —— 全仓静态扫描', () => {
   it('`usageFail(...)` 的参数里没有 `**`', () => {
     // `usageFail` 把 message **逐字**写进 stderr（`process.stderr.write(safe)`），
     // 终端里四个星号就是四个星号。
-    const hits = scanCallArgs(/\busageFail\s*\(/g)
-    expect(hits.map(fmt), `这些 usageFail 的文案里含 Markdown 标记（会原样进终端）：\n${hits.map(fmt).join('\n')}`)
+    const hits = scanTree(USAGE_FAIL)
+    expect(hits.map(fmtHit), `这些 usageFail 的文案里含 Markdown 标记（会原样进终端）：\n${hits.map(fmtHit).join('\n')}`)
       .toEqual([])
   })
 
   it('`throw new Error(...)` / `throw Object.assign(new Error(...))` 的参数里没有 `**`', () => {
-    // 两条出口都会把 message 变成人读文本：
-    //   ① `callOne` 的 catch → `process.stderr.write(message)`（usage 分支）；
-    //   ② 未捕获时 Node 默认打印器把 message 与**堆栈**一起打到终端（注册表加载期）。
     // 实测来源：`assertGetHasNoBody` 的文案曾含 `**目前没有 GET 的 query 参数通道**`，
     // 全仓没有任何测试能发现它 —— 本文件就是那次实测补上的。
-    //
-    // ⚠️ **必须允许跨行**（CodeRabbit 2026-10-26 实测发现）：真实的
-    // `throw Object.assign(` + `new Error(...)` 是**分行**写的（`http.ts:194`、`:210`），
-    // 而初版正则用了 `[^;\n]{0,60}` —— `\n` 把匹配掐死在 `Object.assign(` 之后，
-    // 于是这条规则对那两个真实调用点**完全不生效**。变异验证：给 `http.ts:195` 的
-    // message 注入 `**`，初版扫描器全绿。
-    // 改成 `[^;]`（允许换行、仍以分号封顶防止跨语句跑飞），并把行宽上限提到 200。
-    const hits = scanCallArgs(/\bthrow\b[^;]{0,200}?new\s+Error\s*\(/g)
-    expect(hits.map(fmt), `这些 throw 的文案里含 Markdown 标记：\n${hits.map(fmt).join('\n')}`)
+    // ⚠️ 必须允许跨行（CodeRabbit 2026-10-26）：真实的 `throw Object.assign(` + `new Error(…)`
+    // 是分行写的，旧正则用 `[^;\n]` 时那两个真实调用点**完全不生效**。AST 判据没有这个问题。
+    const hits = scanTree(THROW_ERROR)
+    expect(hits.map(fmtHit), `这些 throw 的文案里含 Markdown 标记：\n${hits.map(fmtHit).join('\n')}`)
       .toEqual([])
   })
 
   it('`process.stderr.write(...)` 的直接实参里没有 `**`', () => {
     // 绕过 `usageFail` 的手写出口（`callOne` catch、`query/errors.ts`、`config.ts` 的
     // 权限警告…）—— 它们同样是纯文本通道。
-    const hits = scanCallArgs(/process\.stderr\.write\s*\(/g)
-    expect(hits.map(fmt), `这些直接写 stderr 的文案里含 Markdown 标记：\n${hits.map(fmt).join('\n')}`)
+    const hits = scanTree(STDERR_WRITE)
+    expect(hits.map(fmtHit), `这些直接写 stderr 的文案里含 Markdown 标记：\n${hits.map(fmtHit).join('\n')}`)
       .toEqual([])
   })
 
   it('`USAGE` / `*_USAGE` 常量里没有 `**`（help 走 stdout，但它是纯文本）', () => {
-    // help 文本经 `process.stdout.write(USAGE)` 原样输出。它不是 JSON，因此不适用
-    // 「字段值是给 Agent 的结构化文本」这条豁免 —— 人读到的就是星号。
     // 实测来源：`sync --help` 的「安装前置：**至少成功同步过一次**」曾原样打到终端。
-    const hits: Hit[] = []
-    for (const f of walk(SRC)) {
-      const raw = readFileSync(f, 'utf8')
-      const text = blankComments(raw)
-      for (const m of text.matchAll(/(?:const|let)\s+\w*USAGE\w*\s*=\s*/g)) {
-        // 常量体 = 初始化表达式里的**字符串字面量序列**（`'a' + 'b'` 或单个模板串）。
-        // ⚠️ 不能"取到下一个顶格 const" —— 那样会把常量**之后**的函数体一起吃进来
-        // （`SCHEMA_USAGE` 后面紧跟的 `schema()` 里就有含 `**` 的 field_notes，
-        // 实测会误报）。只认字面量与 `+`，遇到别的 token 就停。
-        const body = literalChain(text, m.index! + m[0].length)
-        if (!body.includes('**')) continue
-        hits.push({
-          file: relative(ROOT, f),
-          line: text.slice(0, m.index!).split('\n').length,
-          snippet: body.replace(/\s+/g, ' ').trim().slice(0, 120),
-        })
-      }
-    }
-    expect(hits.map(fmt), `这些 help 文本里含 Markdown 标记：\n${hits.map(fmt).join('\n')}`)
+    const hits = scanTree(USAGE_CONST)
+    expect(hits.map(fmtHit), `这些 help 文本里含 Markdown 标记：\n${hits.map(fmtHit).join('\n')}`)
       .toEqual([])
   })
 
-  it('扫描器自身有牙：给一个合成的违规文案，四条规则各自都能抓到', () => {
-    // ⚠️ 没有这一条，上面四条可能是「扫了个空」——`walk` 路径写错、`blankComments`
-    // 把整个文件抹成空白，都会让它们恒绿。这里直接喂合成源码，证明扫描器认得出违规。
+  it('扫描器自身有牙：四条规则**各自**都能抓到合成违规，且不被相邻形态骗到', () => {
+    // ⚠️ 没有这一条，上面四条可能是「扫了个空」（walk 路径写错、解析出的树里没有调用）。
+    // ⚠️ 必须**逐条规则**断言「它自己命中」—— 第一版丢了这条，扫描器只收 CallExpression、
+    // `new Error(…)`（NewExpression）一条都收不到，而真实全仓扫描照样全绿（空转）。
+    // 每条样本里既有真违规、也有同形的「非违规」（字符串 / 注释里的同名文本），
+    // 双向断言：命中数必须**恰好**是真违规的个数。
     const fake = [
-      "usageFail('错误：**不要这样**')",
-      "throw new Error('崩溃：**别**')",
-      // ⚠️ 跨行形态必须有样例（CodeRabbit 2026-10-26）：真实代码里
-      // `throw Object.assign(` 与 `new Error(...)` 就是分行的，只用单行样例
-      // 会让「允许跨行」这个修复本身无人守。
-      "throw Object.assign(\n  new Error('跨行：**也别**'),\n  { code: 'usage' })",
-      "process.stderr.write('警告：**注意**')",
-      'const X_USAGE = `用法：**粗体**`',
+      "usageFail('错误：**不要这样**')",                              // USAGE_FAIL 命中 1
+      "usageFail('干净文案')",                                        // 不命中
+      "const s = 'usageFail(\'**假**\')'",                          // 字符串里，不算
+      "throw new Error('崩溃：**别**')",                              // THROW 命中 1
+      "throw Object.assign(\n  new Error('跨行：**也别**'),\n  { code: 'usage' })", // 跨行也命中
+      "const e = new Error('非抛出：**不算**')",                       // 不是 throw，不算
+      "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
+      "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
+      "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
+      "const NOT_LABEL = '**不算**'",                                  // 名字不含 USAGE
+      'usageFail(`outer ${String(`)`)} **bad**`)',                    // 嵌套模板：真调用、星号在字面段
     ].join('\n')
-    const blanked = blankComments(fake)
-    expect(blanked.includes('**')).toBe(true)
-    for (const re of [/\busageFail\s*\(/g, /\bthrow\b[^;]{0,200}?new\s+Error\s*\(/g,
-      /process\.stderr\.write\s*\(/g]) {
-      const m = re.exec(blanked)!
-      expect(m, `合成样例未被 ${re} 命中`).not.toBeNull()
-      const [s, e] = argRange(blanked, m.index + m[0].length)
-      expect(blanked.slice(s, e)).toContain('**')
-    }
-    // 跨行那条要单独钉：正则若退回 `[^;\n]`，上面循环只会命中**第一行**那个
-    // 单行样例、仍然全绿 —— 必须显式证明跨行样例被匹配到。
-    const multiline = /\bthrow\b[^;]{0,200}?new\s+Error\s*\(/g
-    const all = [...blanked.matchAll(multiline)]
-    expect(all.length, '跨行 Object.assign 样例没有被匹配到（正则退回了 [^;\\n]？）')
-      .toBeGreaterThanOrEqual(2)
-    // 注释里的 `**` 必须**不**被算作违规（本仓库注释大量使用 Markdown 强调）
-    expect(blankComments("// **这是注释**\nconst a = 1").includes('**')).toBe(false)
+    const sf = parseTs(fake)
+    expect(USAGE_FAIL.hit(sf), 'usageFail 规则：两条真违规（含嵌套模板那条），字符串样本不算').toHaveLength(2)
+    expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行各一条；非 throw 的 new Error 不算').toHaveLength(2)
+    expect(STDERR_WRITE.hit(sf), 'stderr 规则：字符串实参 + 模板实参各一条').toHaveLength(2)
+    expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：只认名字带 USAGE 的顶层 const').toHaveLength(1)
+    // 注释里的 `**` 不是字面量；模板里的字面段是（这条钉住 literalTexts 的两半）
+    const cmt = parseTs('// **这是注释**\nconst a = `x **y** ${z}`')
+    expect(literalTexts(cmt).filter((t) => t.includes('**'))).toEqual(['x **y** '])
   })
 })
