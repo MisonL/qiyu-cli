@@ -47,6 +47,15 @@
 
 ### 修复
 
+- **静态守卫的十种等价写法**（2026-11-17，Codex PR#81 第二十四轮 P2 ×8 + P3 ×1，逐条探针复现）：
+  `it(名, 体, 选项)` 的重载位置（按「谁是函数」定位，不固定第 2 个）· 选项对象的**属性写入**
+  （`optW.concurrent = true` 让 `const` 初始值失效）· getter 的 `concurrent` 值运行时才知
+  → 报未知而不是「没声明」· **hook 登记本身经 `.call`** · 基座求不出名字时仍按末段回调方法判
+  （`(pending ?? …).finally(w)`，且**被 await 的不算**——db.test 的 afterAll 清理正是这种写法）·
+  `['call']` 下标形式的立即执行 · 计算键 getter `get ['value']()` · 对象字面量的 `as` 包装 ·
+  匿名类构造函数 `new (class { constructor() { … } })()`。十处变异各自变红；其中 5 处首轮变异
+  **存活**（样本自身撞名 / 样本没落盘），补足样本后才红。
+
 - **选项位是标识符 / getter 名要核对**（2026-11-17，CodeRabbit PR#81 第二十四轮 minor ×2）：
   ① `const options = { concurrent: true }; it('x', options, fn)` 的选项位是**标识符**，原判据直接
   `continue` 放行（Vitest 照常按它登记并发）。现在先在本文件里静态解析顶层 `const` 的对象字面量

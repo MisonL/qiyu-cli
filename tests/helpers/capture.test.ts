@@ -181,6 +181,15 @@ function constObjectInitializer(sf: ts.SourceFile, name: string): ts.ObjectLiter
   const visit = (n: ts.Node): void => {
     if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
       && ts.isIdentifier(n.left) && n.left.text === name) reassigned = true
+    // `const` 不保证对象不可变：`options.concurrent = true` 同样让初始值失效
+    // （Codex PR#81 第二十四轮 P2）
+    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isPropertyAccessExpression(n.left) && ts.isIdentifier(n.left.expression)
+      && n.left.expression.text === name) reassigned = true
+    if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)
+      && ts.isIdentifier(n.expression.expression) && n.expression.expression.text === name
+      && ['Object.assign', 'Object.defineProperty', 'Object.defineProperties', 'Reflect.set'].includes(
+        n.expression.getText(sf))) reassigned = true
     if (ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) {
       const op = n.operator
       if ((op === ts.SyntaxKind.PlusPlusToken || op === ts.SyntaxKind.MinusMinusToken)
@@ -225,8 +234,19 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       }
       // ⚠️ 只有**选项位**才判：`it.skipIf(x)` / `it.each(cases)` 的实参是条件与表格，
       // 不是选项（2026-11-17 实测：不加这一层，auth.test 的 `posixOnly`、config-insecure 的
-      // `cases` 全被误报）。选项位 = 调用名之后的第 2 个实参（`it(名, 选项, 体)`）。
-      const optionArgs = call.arguments.slice(1, 2)
+      // `cases` 全被误报）。选项位**两种重载**都合法（`@vitest/runner` 的 `parseArguments`）：
+      // `it(名, 选项, 体)` 与 `it(名, 体, 选项)` —— 按「谁是函数」区分，而不是固定第 2 个
+      // （Codex PR#81 第二十四轮 P2：只认第 2 个时 `it('x', () => {}, { concurrent: true })`
+      // 漏判，`it('x', body)` 的具名执行体又被误报为未知选项）。
+      // ⚠️ 标识符**不是**自证：`optI1` 既可能是 `const optI1 = {…}`（选项）也可能是具名执行体
+      // （`it('x', body)`）。判据：能解析成本文件顶层对象字面量的 → 选项；否则按位置 ——
+      // `parseArguments` 只在**第 2 个**实参是函数时把第 3 个当选项，否则第 2 个就是选项。
+      const arrowOrFn = (e: ts.Expression): boolean => {
+        const u = unwrap(e)
+        return ts.isArrowFunction(u) || ts.isFunctionExpression(u)
+      }
+      const rest = call.arguments.slice(1)
+      const optionArgs = rest.length > 0 && arrowOrFn(rest[0]!) ? rest.slice(1) : rest.slice(0, 1)
       for (const a of optionArgs) {
         // ⚠️ 选项位可以是**标识符**（`const options = { concurrent: true }; it('x', options, fn)`）：
         // Vitest 2.1.9 照常按它登记并发（CodeRabbit PR#81 第二十四轮 minor，探针确认）。
@@ -260,6 +280,15 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         // ⚠️ 未知来源的键（`{ ...opts }` / `{ [key]: … }`）让「没声明并发」变得**看不出来** ——
         // 只看 `props.get` 会把「可能开了并发」当成「确定没开」（CodeRabbit PR#81 第二十三轮）。
         // 判据是静态守卫：**看不见就不许放行**，除非同一个对象里显式声明了串行（`concurrent: false`）。
+        // getter 的 `concurrent` 值是**读的时候才知道**（`{ get concurrent() { return true } }`）——
+        // Vitest 会读它并登记并发，`props.get` 拿到 `undefined`，不能当成「没声明」
+        // （Codex PR#81 第二十四轮 P2）。
+        const concurrentUnknown = props.has('concurrent') && props.get('concurrent') === undefined
+        if (concurrentUnknown) {
+          out.push({ line: lineOf(sf, call), why: '选项对象的 concurrent 来自访问器，值在运行时才知道' })
+          seen.add(lineOf(sf, call))
+          continue
+        }
         const explicitOff = props.has('concurrent') && isFalse(props.get('concurrent'))
         const suiteExplicitSeq = SUITES.has(base) && props.has('sequential') && isTrue(props.get('sequential'))
         if (mayHaveUnknown && !explicitOff && !suiteExplicitSeq) {
@@ -281,15 +310,51 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
  */
 function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why: string }> {
   const out: Array<{ line: number; why: string }> = []
-  const isHookName = (chain: string[] | undefined): boolean =>
-    chain !== undefined && chain.length === 1 && HOOK_HOOKS.has(chain[0]!.toLowerCase())
+  // hook 登记本身也可以是 `beforeEach.call(null, …)` / `.apply(…)`（Codex PR#81 第二十四轮 P2）：
+  // 剥掉末段 `call`/`apply` 后再认 hook 名，否则整棵回调都不被扫描。
+  const isHookName = (chain: string[] | undefined): boolean => {
+    if (chain === undefined) return false
+    const c = chain.length > 1 && (chain[chain.length - 1] === 'call' || chain[chain.length - 1] === 'apply')
+      ? chain.slice(0, -1)
+      : chain
+    return c.length === 1 && HOOK_HOOKS.has(c[0]!.toLowerCase())
+  }
+  /** 这个调用是否处在 `await` 的表达式里（含 `return await`、`x = await …`）。 */
+  const isAwaited = (n: ts.Node): boolean => {
+    let e: ts.Node = n
+    while (e.parent !== undefined) {
+      const p = e.parent
+      if (ts.isAwaitExpression(p)) return true
+      if (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isNonNullExpression(p)
+        || ts.isSatisfiesExpression(p) || ts.isTypeAssertionExpression(p)) { e = p; continue }
+      if (ts.isCallExpression(p)) { e = p; continue }
+      return false
+    }
+    return false
+  }
   for (const call of collectCalls(sf)) {
     if (!isHookName(callChain(call)?.chain)) continue
     for (const inner of collectCalls(call)) {
       // ⚠️ 用 `callChain` 而不是 `calleeChain`：`Promise.resolve().then(…)` 的被调对象基座是
       // **调用**，`calleeChain` 对它返回 undefined（Codex PR#81 第二十轮 P2，探针复现）。
       const innerName = callChain(inner)?.chain
-      if (innerName === undefined) continue
+      if (innerName === undefined) {
+        // 基座求不出名字（`(pending ?? Promise.resolve()).finally(w)` 的 `??` 表达式）时，
+        // 名字链整条丢失 —— 但**末段的回调方法**静态可见（Codex PR#81 第二十四轮 P2）。
+        const callee = unwrap(inner.expression)
+        const lastSeg = ts.isPropertyAccessExpression(callee) ? callee.name.text
+          : ts.isElementAccessExpression(callee) ? (() => {
+            const k = unwrap(callee.argumentExpression)
+            return ts.isStringLiteral(k) || ts.isNoSubstitutionTemplateLiteral(k) ? k.text : undefined
+          })()
+            : undefined
+        // ⚠️ **被 await 的不算**：`await (pendingTail ?? …).catch(…)` 的尾巴当场收口，
+        // 不会落进下一条用例（实测：db.test.ts 的 afterAll 清理正是这种写法，误报过）。
+        if (lastSeg !== undefined && ['then', 'catch', 'finally'].includes(lastSeg) && !isAwaited(inner)) {
+          out.push({ line: lineOf(sf, inner), why: `hook 体里出现「?.${lastSeg}(」` })
+        }
+        continue
+      }
       // ⚠️ `.call(…)` / `.apply(…)` 只是调用方式，被调函数不变（Codex PR#81 第二十二轮 P2：
       // `setTimeout.call(null, cb, 1)`、`globalThis.setTimeout.apply(null, […])` 的链末段多出
       // `call`/`apply`，探针确认 hook 尾巴照样串到下一条用例）。先把末段剥掉再匹配原语。
@@ -462,7 +527,8 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       const out: string[] = []
       for (const v of concurrentViolations(parseTs(src))) {
         if (v.why.startsWith('.concurrent')) out.push(`alias:${v.why.replace('.concurrent 修饰链：', '')}`)
-        else if (v.why.includes('未知来源') || v.why.includes('无法静态解析')) out.push('unknown')
+        else if (v.why.includes('未知来源') || v.why.includes('无法静态解析')
+          || v.why.includes('来自访问器')) out.push('unknown')
         else out.push('opt')
       }
       return out
@@ -494,6 +560,11 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookHits(`${H}(() => { x.catch(w) })`), '任意链的 catch').toEqual(['x.catch('])
     // 反例：名字里只是恰好含 then 前缀的不是
     expect(hookHits(`${H}(() => { thenable(w) })`), 'thenable 不是 .then').toEqual([])
+    // hook 登记本身经 `.call`（Codex PR#81 第二十四轮 P2）
+    expect(hookHits(`${H}.call(null, () => { ${ST}(w, 50) })`), 'hook 经 .call 登记').toEqual([`${ST}(`])
+    // 基座求不出名字时仍按末段回调方法判（`(pending ?? Promise.resolve()).finally(w)`）
+    expect(hookHits(`${H}(() => { (pending ?? Promise.resolve()).finally(w) })`), '?? 基座的 finally')
+      .toEqual(['?.finally('])
     // `.call` / `.apply` 只是调用方式，被调函数不变（Codex PR#81 第二十二轮 P2）
     // 报的是**剥掉 call/apply 之后**的名字（被调函数才是判据的主体）
     expect(hookHits(`${H}(() => { ${ST}.call(null, cb, 1) })`), 'setTimeout.call').toEqual([`${ST}(`])
@@ -600,20 +671,33 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       '嵌套展开的未知键向外传播').toEqual(['unknown'])
     // 访问器的**静态计算键**同样只覆盖它自己那个键（Codex PR#81 第二十一轮 P2 的两侧）
     expect(concHits(`${bt("it('S9', { ...{ con", "current: true }, get ['con", "current']() { return false } }, () => {})")}`),
-      '计算键访问器覆盖同名键 → 串行').toEqual([])
+      // 展开给了 `concurrent: true`，但后面的 getter **后写覆盖**它、值运行时才知 → 未知
+      '计算键访问器覆盖展开里的并发 → 未知').toEqual(['unknown'])
     expect(concHits(`${bt("it('S10', { con", "current: true, ...{ get ['timeout']() { return 1000 } } }, () => {})")}`),
       '别的键的访问器不得清掉并发').toEqual(['opt'])
     // 选项位是标识符（CodeRabbit PR#81 第二十四轮 minor）：能解析的按值判，解析不出的不许放行
-    expect(concHits(`const options = ${JSON.stringify({ concurrent: true })}\nit('I1', options, () => {})`),
+    expect(concHits(`const optI1 = ${JSON.stringify({ concurrent: true })}\nit('I1', optI1, () => {})`),
       '顶层 const 的选项对象按值判').toEqual(['opt'])
-    expect(concHits(`const options = ${JSON.stringify({ concurrent: false })}\nit('I2', options, () => {})`),
+    expect(concHits(`const optI2 = ${JSON.stringify({ concurrent: false })}\nit('I2', optI2, () => {})`),
       '顶层 const 的选项对象显式串行').toEqual([])
-    expect(concHits(`const options = { con${'current: true }'}\nit('I3', options, () => {})`),
+    expect(concHits(`const optI3 = { con${'current: true }'}\nit('I3', optI3, () => {})`),
       '顶层 const 的选项对象里写并发').toEqual(['opt'])
-    expect(concHits(`import { options } from './x'\nit('I4', options, () => {})`),
+    expect(concHits(`import { optI4 } from './x'\nit('I4', optI4, () => {})`),
       '外部导入的选项对象无法解析').toEqual(['unknown'])
     expect(concHits(`it.skipIf(posixOnly)('I5', async () => {})`), 'skipIf 的条件不是选项').toEqual([])
     expect(concHits(`it.each(cases)('I6', async () => {})`), 'each 的表格不是选项').toEqual([])
+    // 两种重载（Codex PR#81 第二十四轮 P2）
+    expect(concHits(`it('O1', () => {}, ${JSON.stringify({ concurrent: true })})`), '执行体在前、选项在后').toEqual(['opt'])
+    // 同一片段里声明 + 使用（解析只在本文件内，跨样本不共享）
+    expect(concHits(`const optO2 = ${JSON.stringify({ concurrent: false })}\nit('O2', () => {}, optO2)`),
+      '执行体在前、串行选项在后').toEqual([])
+    // 属性写入使 const 初始值失效（同一文件里 optI2 未被写入 → 上一条仍按初始化值判）
+    expect(concHits(`const optW = ${JSON.stringify({ concurrent: false })}
+optW.concurrent = true
+it('O3', optW, () => {})`),
+      '属性写入后初始值不可信').toEqual(['unknown'])
+    // getter 的 concurrent：值在运行时才知道
+    expect(concHits(`it('O4', { get con${'current() { return true }'}, })`), 'getter 并发值未知').toEqual(['unknown'])
     // 未知**计算键访问器**同样可能覆盖任何键
     expect(concHits(`${bt("it('S13', { con", 'current: true, get [key]() { return false } }, () => {})')}`),
       '未知计算键访问器使旧值不可信').toEqual(['unknown'])
@@ -625,7 +709,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       '未知计算键之后的显式并发仍可判').toEqual(['opt'])
     // 访问器覆盖同名值：`{ concurrent: true, get concurrent() { return false } }` 实际串行
     expect(concHits(`${bt("it('S7', { con", 'current: true, get con', 'current() { return false } }, () => {})')}`),
-      '访问器覆盖').toEqual([])
+      '同名访问器覆盖显式并发 → 值未知').toEqual(['unknown'])
     expect(concHits(`${bt("it('E', () => { const p = { con", 'current: true } })')}`), '执行体里的是数据').toEqual([])
     expect(concHits(`${bt("it('F', async (): Promise<void> => { const p = { con", 'current: true } })')}`),
       '带返回类型的 async 执行体（Codex 第九轮）').toEqual([])

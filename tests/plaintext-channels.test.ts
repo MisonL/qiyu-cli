@@ -174,9 +174,15 @@ const THROW_ERROR: Rule = {
         // （Codex PR#81 第二十一轮 P2，探针：`(() => new Error('**BAD**')).call(null)` 真的抛）。
         // ⚠️ 形态是 `Call(PropertyAccess(Arrow, 'call'), …)`：箭头先经**属性访问**再到调用 ——
         // 只判 `CallExpression` 会漏（实测：样本没命中才发现的）。
-        if (p !== undefined && ts.isPropertyAccessExpression(p) && p.expression === e
-          && (p.name.text === 'call' || p.name.text === 'apply')
-          && p.parent !== undefined && ts.isCallExpression(p.parent) && p.parent.expression === p) return true
+        // 点号与**静态下标**写法等价：`(f)['call'](null)` 同样立即执行（Codex PR#81 第二十四轮 P2）
+        const callName = p !== undefined && ts.isPropertyAccessExpression(p) && p.expression === e
+          ? p.name.text
+          : p !== undefined && ts.isElementAccessExpression(p) && p.expression === e
+            ? staticAccessKey(p.argumentExpression)
+            : undefined
+        if ((callName === 'call' || callName === 'apply')
+          && p !== undefined && p.parent !== undefined && ts.isCallExpression(p.parent)
+          && p.parent.expression === p) return true
         if (p !== undefined && ts.isCallExpression(p)) {
           if (p.expression === e) return true
         }
@@ -193,13 +199,38 @@ const THROW_ERROR: Rule = {
      * 同理 `new (class { … })()` 的构造方法在 `new` 时就跑了。
      */
     const isExecutedAccessor = (fn: ts.Node): boolean => {
+      // 匿名类构造函数：`new (class { constructor() { return new Error(…) } })()` —— 类被 `new`
+      // 实例化就执行了构造函数（Codex PR#81 第二十四轮 P2/P3）
+      if (ts.isConstructorDeclaration(fn)) {
+        let c: ts.Node = fn
+        while (c.parent !== undefined && !ts.isClassExpression(c.parent)) c = c.parent
+        if (c.parent === undefined) return false
+        let k: ts.Node = c.parent
+        for (;;) {
+          const q = k.parent
+          if (q === undefined) return false
+          if ((ts.isParenthesizedExpression(q) || ts.isAsExpression(q) || ts.isNonNullExpression(q)
+            || ts.isSatisfiesExpression(q) || ts.isTypeAssertionExpression(q)) && q.expression === k) { k = q; continue }
+          return ts.isNewExpression(q) && q.expression === k
+        }
+      }
       // getter / 方法：所属对象字面量出现在 `new` / 属性读取（被访问）的表达式中
       let e: ts.Node = fn
       while (e.parent !== undefined && !ts.isObjectLiteralExpression(e.parent)) e = e.parent
       if (e.parent === undefined) return false
       const obj = e.parent
       let o: ts.Node = obj
-      while (o.parent !== undefined && ts.isParenthesizedExpression(o.parent)) o = o.parent
+      // 括号 / `as` / 非空断言 / `satisfies` / 尖括号断言都不改变运行语义（Codex PR#81 第二十四轮 P2）
+      for (;;) {
+        const q = o.parent
+        if (q === undefined) break
+        if ((ts.isParenthesizedExpression(q) || ts.isAsExpression(q) || ts.isNonNullExpression(q)
+          || ts.isSatisfiesExpression(q) || ts.isTypeAssertionExpression(q)) && q.expression === o) {
+          o = q
+          continue
+        }
+        break
+      }
       const p = o.parent
       if (p === undefined) return false
       if (ts.isNewExpression(p) && p.expression === o) return true
@@ -214,8 +245,12 @@ const THROW_ERROR: Rule = {
       if (ts.isGetAccessorDeclaration(fn)) return fn.name !== undefined && accessed === accessorName(fn.name)
       return false
     }
-    const accessorName = (n: ts.PropertyName): string | undefined =>
-      ts.isIdentifier(n) || ts.isStringLiteral(n) || ts.isNumericLiteral(n) ? n.text : undefined
+    const accessorName = (n: ts.PropertyName): string | undefined => {
+      if (ts.isIdentifier(n) || ts.isStringLiteral(n) || ts.isNumericLiteral(n)) return n.text
+      // 静态计算键 `get ['value']()` 与 `get value()` 同义（Codex PR#81 第二十四轮 P2）
+      if (ts.isComputedPropertyName(n)) return staticAccessKey(n.expression)
+      return undefined
+    }
     const staticAccessKey = (e: ts.Expression): string | undefined => {
       const u = unwrap(e)
       return ts.isStringLiteral(u) || ts.isNoSubstitutionTemplateLiteral(u) ? u.text : undefined
@@ -227,6 +262,7 @@ const THROW_ERROR: Rule = {
       while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) {
         const p = up.parent
         const isBoundary = isFnBoundary(p) || ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p)
+          || ts.isConstructorDeclaration(p)
         if (isBoundary && !isImmediatelyInvoked(p) && !isExecutedAccessor(p)) { blocked = true; break }
         up = p
       }
@@ -348,6 +384,10 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw (<() => Error>(() => new Error('**尖括号断言**')))()",
       "throw (() => new Error('**call 立即执行**')).call(null)",
       "throw ({ get value() { return new Error('**getter**') } }).value",
+      "throw (() => new Error('**下标 call**'))['call'](null)",
+      "throw ({ get ['value2']() { return new Error('**计算键 getter**') } }).value2",
+      "throw (({ get value3() { return new Error('**as 包装**') } }) as { value3: Error }).value3",
+      "throw new (class { constructor() { this.e = new Error('**匿名类**') } })().e",
       "throw ({ get unused() { return new Error('**unused**') }, error: new Error('clean') }).error",
       "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
@@ -367,7 +407,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调里的 new Error 不算；没被读到的 getter 不算').toHaveLength(8)
+      + '未调用的回调里的 new Error 不算；没被读到的 getter 不算').toHaveLength(12)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)
