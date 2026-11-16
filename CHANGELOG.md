@@ -52,6 +52,11 @@
   `duckdb.test.ts` 的硬顶用例要插 25000 行（15s → 60s）。本机负载 700–840 时它们都会
   `Test timed out`，单独重跑仍红 —— 造大夹具的固有代价，不是本次改动引入的回归
   （CI 上分别约 20s / 2s）。
+- **`.concurrent` 判据再补两处**（2026-11-16，CodeRabbit PR#81 第六轮）：① 链式修饰符
+  （`describe.shuffle.concurrent(…)` / `it.sequential.concurrent(…)`）同样并发，判据改为扫整条
+  注册链；② 选项对象的 `concurrent: true` 只在 it/test/describe/suite 的**实参区间**里查 ——
+  全文搜索会把无关的 `const payload = { concurrent: true }` 误报成违规。两处均变异验证
+  （其中②的第一版正控不咬人，补了"无关属性与注册调用同时在场"的样本后才红）。
 - **`.concurrent` 别名判据允许点两侧空白**（2026-11-16，CodeRabbit PR#81 第五轮）：`it .concurrent(…)`
   与跨行写法都是合法 JS，写死 `\.concurrent` 会静默放行；判据抽成 `CONCURRENT_ALIAS` 常量，
   扫描、豁免过期检查与自检共用同一份。

@@ -193,10 +193,30 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
    * `.concurrent` 别名形态。⚠️ 点两侧允许空白（CodeRabbit PR#81 第五轮）：`it .concurrent(…)`
    * 与跨行写法都是合法 JS，写死 `\.concurrent` 会静默放行。
    */
-  const CONCURRENT_ALIAS = /\b(?:it|test|describe)\s*\.\s*concurrent\b/g
+  const CONCURRENT_ALIAS = /\b(?:it|test|describe)\b(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*concurrent\b/g
 
-  /** 选项对象形态的并发开关（`it(名, { concurrent: true }, fn)`）。 */
+  /**
+   * 选项对象形态的并发开关（`it(名, { concurrent: true }, fn)`）。
+   * ⚠️ 不能全文搜 `concurrent: true` —— 无关的 `const payload = { concurrent: true }`
+   * 也会命中、把串行测试判违规（CodeRabbit PR#81 第六轮）。只查注册函数调用的**实参区间**。
+   */
   const CONCURRENT_OPT = /\bconcurrent\s*:\s*true\b/g
+  const REGISTER_CALL = /\b(?:it|test|describe|suite)\b(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\(/g
+
+  /** 该文件里通过选项对象开启并发的注册点行号。 */
+  function concurrentOptionHits(text: string): string[] {
+    const out: string[] = []
+    for (const m of text.matchAll(REGISTER_CALL)) {
+      const open = text.indexOf('(', m.index! + m[0].length - 1)
+      if (open === -1) continue
+      const close = skipBalanced(text, open)
+      if (close === -1) continue
+      const args = text.slice(open + 1, close - 1)
+      if (CONCURRENT_OPT.test(args)) out.push(`${text.slice(0, m.index!).split('\n').length}`)
+      CONCURRENT_OPT.lastIndex = 0    // 全局正则必须手动复位，否则漏掉同文件第二处
+    }
+    return out
+  }
 
   /**
    * `.concurrent` 的**豁免清单**：只允许"专门证明并发行为"的文件，且必须自带理由。
@@ -236,8 +256,8 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
         // ⚠️ 选项对象形态（Codex PR#81 第三轮 P2）：`it('A', { concurrent: true }, fn)` 与
         // `describe('g', { concurrent: true }, fn)` 同样让用例并行 —— 只认 `.concurrent`
         // 会静默放行（Codex 探针：两条用例都读到 `AB`）。
-        for (const m of text.matchAll(CONCURRENT_OPT)) {
-          hits.push(`${rel}:${text.slice(0, m.index!).split('\n').length}（选项对象 concurrent: true）`)
+        for (const line of concurrentOptionHits(text)) {
+          hits.push(`${rel}:${line}（选项对象 concurrent: true）`)
         }
       }
       expect(hits, '这些文件同时用了 captureSinks 与 .concurrent —— 并发下写入无法归属，'
@@ -303,11 +323,22 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect([...bt('it.', 'concurrent("x", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
     expect([...bt('describe.', 'concurrent("y", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
     // 点两侧带空白 / 跨行（CodeRabbit PR#81 第五轮）：必须用 CONCURRENT_ALIAS 判，不能写死
+    // 链式修饰符（`describe.shuffle.concurrent` / `it.sequential.concurrent`）—— 同样并发
+    expect([...bt('describe.', 'shuffle.concurrent("g", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
     expect([...bt('it ', '. concurrent("z", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
     expect([...bt('it', '\n  .concurrent("w", () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(1)
     expect([...bt("it('A', { con", 'current: true }, () => {})').matchAll(CONCURRENT_ALIAS)]).toHaveLength(0)
-    expect([...bt("it('A', { con", 'current: true }, () => {})').matchAll(CONCURRENT_OPT)]).toHaveLength(1)
-    expect([...bt("it('B', { con", 'current: false }, () => {})').matchAll(CONCURRENT_OPT)]).toHaveLength(0)
+    expect(concurrentOptionHits(bt("it('A', { con", 'current: true }, () => {})'))).toHaveLength(1)
+    expect(concurrentOptionHits(bt("it('B', { con", 'current: false }, () => {})'))).toHaveLength(0)
+    // 无关对象属性不得误报（CodeRabbit PR#81 第六轮）——
+    // ⚠️ 样本里必须**同时存在**一个注册调用，否则"退回全文搜索"的实现也能通过（变异实测：
+    // 只放 `const payload = {...}` 时变异 2 存活）。
+    expect(concurrentOptionHits(bt("const payload = { con", "current: true }\nit('x', () => {})")))
+      .toHaveLength(0)
+    expect(concurrentOptionHits(bt('const payload = { con', 'current: true }'))).toHaveLength(0)
+    // 同一文件多处注册点都要被认出（全局正则 lastIndex 复位）
+    expect(concurrentOptionHits(bt("it('A', { con", "current: true }, () => {})",
+      "it('B', { con", "current: true }, () => {})"))).toHaveLength(2)
     expect(/\bcaptureSinks\s*\(/.test(bt('capture', 'Sinks((a) => {}, (b) => {})'))).toBe(true)
     expect(/\bcaptureSinks\s*\(/.test('const cap = startCapture()')).toBe(false)
   })
