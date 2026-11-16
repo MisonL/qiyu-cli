@@ -157,6 +157,12 @@ export function callChain(call: ts.CallExpression): { chain: string[]; viaCall: 
     if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.CommaToken) {
       return resolve(e.right)
     }
+    // `new Promise(…).then(…)`：构造调用与普通调用一样穿透基座（Codex PR#81 第二十一轮 P2，
+    // 探针复现：不穿透时 `new Promise().then(…)` 的名字链是 undefined，hook 判据漏掉它）
+    if (ts.isNewExpression(e)) {
+      viaCall = true
+      return resolve(e.expression)
+    }
     if (ts.isCallExpression(e) || ts.isTaggedTemplateExpression(e)) {
       viaCall = true
       return ts.isCallExpression(e) ? resolve(e.expression) : resolve(e.tag)
@@ -241,8 +247,10 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
     } else if (ts.isShorthandPropertyAssignment(p)) {
       out.set(p.name.text, p.name)
     } else if (ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) {
-      // 访问器的值只有在求值时才知道 —— 它能覆盖任何同名键。
-      const k = staticPropKey(p.name, false)
+      // 访问器的值只有在求值时才知道 —— 它能覆盖**它自己那个键**。
+      // ⚠️ 计算键也要认静态字面量（`get ['concurrent']()`）：传 false 会把字面量键当成
+      // 未知键、进而清空外层全部已知值（Codex PR#81 第二十一轮 P2 的**误报**与漏检各一例）。
+      const k = staticPropKey(p.name, true)
       if (k !== undefined) out.set(k, undefined)
       else mayHaveUnknown = true
     } else if (ts.isSpreadAssignment(p)) {

@@ -170,7 +170,20 @@ const THROW_ERROR: Rule = {
           e = p as ts.Expression
           continue
         }
-        if (p !== undefined && ts.isCallExpression(p) && p.expression === e) return true
+        // 立即执行不止 `f(…)`：`.call(…)` / `.apply(…)` / 标签模板同样会执行到函数体
+        // （Codex PR#81 第二十一轮 P2，探针：`(() => new Error('**BAD**')).call(null)` 真的抛）。
+        // ⚠️ 形态是 `Call(PropertyAccess(Arrow, 'call'), …)`：箭头先经**属性访问**再到调用 ——
+        // 只判 `CallExpression` 会漏（实测：样本没命中才发现的）。
+        if (p !== undefined && ts.isPropertyAccessExpression(p) && p.expression === e
+          && (p.name.text === 'call' || p.name.text === 'apply')
+          && p.parent !== undefined && ts.isCallExpression(p.parent) && p.parent.expression === p) return true
+        if (p !== undefined && ts.isCallExpression(p)) {
+          if (p.expression === e) return true
+        }
+        if (p !== undefined && ts.isTaggedTemplateExpression(p) && p.tag === e) return true
+        // ⚠️ 其它任何父节点都说明这个函数**没有被调用** —— 必须显式 `return false`。
+        // 漏掉它会 `for (;;)` 空转（2026-11-17 实测：本文件用例卡死 10 分钟以上，
+        // 探针单跑该判据才定位到）。
         return false
       }
     }
@@ -298,6 +311,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw ((() => new Error('**断言包装**')) as () => Error)()",
       "throw ((() => new Error('**非空断言**'))!)()",
       "throw (<() => Error>(() => new Error('**尖括号断言**')))()",
+      "throw (() => new Error('**call 立即执行**')).call(null)",
       "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
       "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
@@ -316,7 +330,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调里的 new Error 不算').toHaveLength(6)
+      + '未调用的回调里的 new Error 不算').toHaveLength(7)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)

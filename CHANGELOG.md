@@ -47,6 +47,17 @@
 
 ### 修复
 
+- **Promise 调度的三种形态 + 静态计算键访问器 + `.call` 立即执行**（2026-11-17，Codex PR#81 第二十一轮 P2 ×4）：
+  ① hook 判据只认 `Promise….then`：`finally` / `catch` 同样是微任务回调（探针确认下一条用例拿到
+  `FRESHTAIL`），一并纳入；② `new Promise(…).then(…)` 的基座是**构造调用**，`callChain` 遇到
+  `NewExpression` 返回 undefined —— 穿透构造调用；③ 访问器分支传了「不认计算键」，于
+  `get ['concurrent']()` 被当成未知键清空全部已知值（误报）、而 `...{ get ['timeout']() }` 又清掉
+  外层并发（漏检）—— 访问器与普通属性一样认静态计算键、只覆盖它自己那个键；④ `throw` 里的立即
+  执行不止 `f(…)`：`.call(…)` / `.apply(…)` / 标签模板同样执行到函数体（探针：`(() => new
+  Error('**BAD**')).call(null)` 真抛）；⑤（自测发现的）`isImmediatelyInvoked` 的循环在遇到非包装、
+  非调用的父节点时**没有 `return false`**，`for (;;)` 空转 —— 本文件用例卡死 10 分钟以上，单跑判据
+  才定位。`.call(…)` 的父链是「箭头 → 括号 → 属性访问 → 调用」，只判 `CallExpression` 会漏。
+  四条各配自检样本；四处变异（去掉 catch/finally / 不穿构造调用 / 访问器不认计算键 / 去掉 .call）各自变红。
 - **读语句过闸门的既有调用方核验 + 嵌套展开的不确定性传播**（2026-11-17，CodeRabbit PR#81 第二十一轮
   major 疑问型 + minor）：
   ① 闸门下移到 `execSql` 后读语句也过归属检查，CR 问「既有调用方会不会从能跑变成 `internal`」。

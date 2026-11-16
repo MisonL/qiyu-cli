@@ -227,8 +227,11 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       const forbidden = bare.length === 1 && HOOK_FORBIDDEN.has(bare[0]!)
         // `process.nextTick(…)`：宿主是 `process`，原语是 `nextTick`
         || (bare.length === 2 && bare[0] === 'process' && bare[1] === 'nextTick')
-        // `Promise.resolve().then(…)` / `Promise.then(…)`：宿主是 `Promise`，原语是 `then`
-        || (bare.length >= 2 && bare[0] === 'Promise' && bare[bare.length - 1] === 'then')
+        // `Promise.resolve().then/catch/finally(…)`：宿主是 `Promise`，原语是三种微任务回调
+        // （Codex PR#81 第二十一轮 P2：只认 `then` 时 `finally` / `catch` 照样漏，
+        // 探针确认下一条用例拿到 `FRESHTAIL`）
+        || (bare.length >= 2 && bare[0] === 'Promise'
+          && ['then', 'catch', 'finally'].includes(bare[bare.length - 1]!))
       if (!forbidden) continue
       out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${innerName.join('.')}(」` })
     }
@@ -401,6 +404,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookHits(`${H}(() => process.nextTick(() => { w() }))`), 'nextTick 是微任务').toEqual(['process.nextTick('])
     expect(hookHits(`${H}(() => { Promise.resolve().then(() => { w() }) })`), 'Promise.then 是微任务')
       .toEqual(['Promise.resolve.then('])
+    expect(hookHits(`${H}(() => { Promise.resolve().finally(() => { w() }) })`), 'finally 同样是微任务')
+      .toEqual(['Promise.resolve.finally('])
+    expect(hookHits(`${H}(() => { Promise.reject(e).catch(() => { w() }) })`), 'catch 同样是微任务')
+      .toEqual(['Promise.reject.catch('])
+    expect(hookHits(`${H}(() => { new Promise((r) => r()).then(() => { w() }) })`), 'new Promise().then')
+      .toEqual(['Promise.then('])
     // 反例：普通 Promise 用法与无关的 .then 不是 hook 体里的延迟写入
     expect(hookHits(`${H}(async () => { await Promise.resolve() })`), 'await 不排异步尾巴').toEqual([])
     // 正控：helper 调用 / 字符串里的同名文本 / 别处的同名调用都不算（逐条对应审查报出的形态）
@@ -497,6 +506,11 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 嵌套展开里的未知键同样可能覆盖**外层**的旧值（CodeRabbit PR#81 第二十一轮 minor）
     expect(concHits(`${bt("it('S8', { con", 'current: true, ...{ ...opts } }, () => {})')}`),
       '嵌套展开的未知键向外传播').toEqual([])
+    // 访问器的**静态计算键**同样只覆盖它自己那个键（Codex PR#81 第二十一轮 P2 的两侧）
+    expect(concHits(`${bt("it('S9', { ...{ con", "current: true }, get ['con", "current']() { return false } }, () => {})")}`),
+      '计算键访问器覆盖同名键 → 串行').toEqual([])
+    expect(concHits(`${bt("it('S10', { con", "current: true, ...{ get ['timeout']() { return 1000 } } }, () => {})")}`),
+      '别的键的访问器不得清掉并发').toEqual(['opt'])
     // 访问器覆盖同名值：`{ concurrent: true, get concurrent() { return false } }` 实际串行
     expect(concHits(`${bt("it('S7', { con", 'current: true, get con', 'current() { return false } }, () => {})')}`),
       '访问器覆盖').toEqual([])
