@@ -47,6 +47,21 @@
 
 ### 修复
 
+- **关闭后的入口、静态展开与逗号表达式**（2026-11-17，Codex PR#81 第十八轮 P2 ×3、
+  CodeRabbit 疑问型 finding ×1，逐条探针复现）：
+  ① `transaction()` 入口没查 `closed`：`close()` 里 `disable()` 过的事务上下文会被
+  `alsTx.run()` **重新启用**，失败路径又不再 disable —— 迟到的调用每次都在攒一个启用态
+  上下文（`upsert()` 本来就先查，这里漏了）。补上；为让这条可断言，`DuckDbDeps` 加
+  `makeAls` 构造缝（启用状态在 Node 上读不到，只能观察 `run()` 有没有被调用）。
+  ② 静态对象展开 `{ ...{ concurrent: true } }` / `{ ...{ sequential: false } }` 不被识别 ——
+  探针证实 Vitest 按合并后的值判并发，守卫却返回 `[]`。`objectProps` 按属性顺序合并静态
+  对象字面量展开（后写覆盖前写），变量展开仍不判（已声明边界）。
+  ③ 逗号表达式 `(0, setTimeout)(fn, 1)` 剥离括号后是 `BinaryExpression`，名字链返回
+  undefined —— 探针证实它照常调度。`calleeChain`/`callChain` 穿透到最右操作数。
+  ④ `sqls` 那条「被拒的显式事务不得发出 BEGIN」原是**恒真断言**：`transaction()` 的 BEGIN
+  也走闭包 `execSql`，实例属性上的 spy 看不到（实测：去掉入口守卫后 `sqls` 仍是
+  `['INSERT']`）。改为包装原生连接、在闭包层观察，变异下看到 `BEGIN, BEGIN, ROLLBACK`。
+  四处变异各自独立变红。
 - **名字链只留一个实现点 + 竞争方事务的分类**（2026-11-17，Codex PR#81 第十七轮 P2 ×2、
   CodeRabbit 第十七轮 minor ×2，逐条探针复现）：
   ① `source-scan.ts` 的 `calleeChain` / `callChain` 不认字面量下标访问，而

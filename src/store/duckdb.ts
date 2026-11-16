@@ -30,6 +30,12 @@ export interface DuckDbDeps {
   importer?: DuckDbImporter
   sleep?: (ms: number) => Promise<void>
   now?: () => number
+  /**
+   * 事务归属上下文的构造缝（默认 `new AsyncLocalStorage()`）。
+   * ⚠️ 存在的唯一理由是**让「关闭后不得再启用 ALS」可断言**（Codex PR#81 第十八轮 P2）：
+   * 启用状态在 Node 上不可读，测试只能观察 `run()` 有没有被调用 —— 那正是重新启用的唯一途径。
+   */
+  makeAls?: () => Pick<TxAls, 'run' | 'getStore' | 'disable'>
 }
 
 /** 依赖缺失 → store_not_initialized（按缺失 specifier 前缀二分 hint，spec §5.1）。 */
@@ -50,17 +56,18 @@ function usage(msg: string): Error {
   return e
 }
 
-/** 事务归属的异步上下文。⚠️ 必须**每个 Store 实例一份**（在 `createDuckDbStore` 内建），
- *  否则同一进程里两个实例的事务令牌会互相干扰。 */
 /**
- * 事务令牌。区分 `transaction()` 与自动事务（upsert 自开的）：两者都登记归属，但对外
- * 契约不同 —— 自动事务期间外部 `transaction()` 必须报「不得嵌套事务」（它是调用方之间的
- * 竞争，不是嵌套，见 `upsert` 那里的注释）。
+ * 事务令牌：每次事务一个 `symbol`，`transaction()` 与自动事务（upsert 自开的）都一样。
+ * 调用方属于哪条事务**只看异步上下文里的令牌是否相等** —— 自动事务与显式事务的区分
+ * 不需要令牌“类型”来标，用 `instanceof` 标类型的写法曾让「另一条链的 transaction()」
+ * 漏判成 `usage`（见 `transaction()` 的注释，CodeRabbit PR#81 第十七轮）。
  */
-type TxToken = symbol | AutoTx
-/** 自动事务的令牌类型（`kind` 只用于 `instanceof`，不读字段）。 */
-class AutoTx {}
+type TxToken = symbol
 
+/**
+ * 事务归属的异步上下文。⚠️ 必须**每个 Store 实例一份**（在 `createDuckDbStore` 内建），
+ * 否则同一进程里两个实例的事务令牌会互相干扰。
+ */
 type TxAls = AsyncLocalStorage<TxToken>
 
 export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps: DuckDbDeps = {}): Promise<Store> {
@@ -178,7 +185,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 单连接、`await` 串行的既有用法（store init/status、sync 引擎）行为完全不变。
    */
   let txToken: TxToken | undefined
-  const alsTx: TxAls = new AsyncLocalStorage<symbol>()
+  const alsTx: Pick<TxAls, 'run' | 'getStore' | 'disable'> = deps.makeAls?.() ?? new AsyncLocalStorage<symbol>()
 
   // ⚠️ 所有语句执行收敛到这一个方法 —— 测试 spy 的落点（spec §5.3）。
   // ⚠️ **挂载与调用契约（v3.1 定死，消除二选一）**：
@@ -497,7 +504,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 发出、也就没有任何人会回滚别人的事务）。
       // 登记与整个（同步段 + 后续批次）放在同一个异步上下文里：`doUpsert` 内部贴着 INSERT
       // 的 `assertTxOwnership` 要有令牌才认得出「这是自己那条自动事务」。
-      const token = new AutoTx()
+      const token = Symbol('store-auto-tx')
       inTx = true
       txToken = token
       let n: number
@@ -522,11 +529,17 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     },
     delete: del,
     async transaction<T>(fn: (tx: WriteTx) => Promise<T>): Promise<T> {
+      // ⚠️ `closed` 必须先于**任何** ALS 使用（Codex PR#81 第十八轮 P2，实测确认）：
+      // `alsTx.run()` 会把 `close()` 里 disable 过的实例**重新启用**（Node 的全局 storageList
+      // 强引用它），而这条失败路径不会再 disable —— 迟到的 `transaction()` 每次都在攒一个
+      // 启用态上下文。`upsert()` 本来就是这么防的，这里对齐。
+      if (closed) throw usage('数据库连接已关闭')
       // ⚠️ 用异步上下文区分两种「事务已开」（CodeRabbit PR#81 第十七轮 minor，实测复现）：
       //   · 调用方**就在所有者上下文里**（`fn` 里的 `tx.transaction`，令牌一致）→ 真嵌套，usage；
       //   · 调用方是**另一条异步链**（令牌不一致）→ 并发竞争，internal。
-      // 原先只对 `AutoTx` 的竞争分开报，持有 `symbol` 令牌的显式事务被撞时一律落到
+      // 原先只对「自动事务被撞」分开报，显式事务被撞时一律落到
       // `usage('不得嵌套事务')` —— 实测竞争方拿到退出码 2 的「参数写错」信号，且没有串行化提示。
+      // 令牌现在一律是 `symbol`：区分依据是**异步上下文里的令牌是否相等**，不是令牌类型。
       const owns = inTx && alsTx.getStore() === txToken
       if (inTx && !owns) {
         throw Object.assign(new Error('本实例上有一条事务尚未提交，此时另一条异步链不能开始新事务 —— '

@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
+import type { DuckDbDeps } from '../../src/store/duckdb.js'
 import { TABLES } from '../../src/store/schema.js'
 import type { Store, StoreConfig } from '../../src/store/types.js'
 
@@ -249,7 +251,35 @@ describe('duckdb —— upsert 契约', () => {
   })
 })
 
+type FakeAls = ReturnType<NonNullable<DuckDbDeps['makeAls']>>
+
 describe('duckdb —— 事务', () => {
+  it('关闭后调用 transaction()：发 usage，且不得重新启用事务上下文（Codex PR#81 第十八轮 P2）', async () => {
+    // 事故路径（探针复现）：`close()` 里 `alsTx.disable()` 之后，迟到的 `transaction()` 会
+    // 走到 `alsTx.run()` —— 它把实例**重新启用**（被 Node 全局 storageList 强引用），而这条
+    // 失败路径不会再 disable，每次迟到调用都在攒一个启用态上下文。`upsert()` 本来就在
+    // 入口先查 `closed`，`transaction()` 漏了。
+    // 启用状态在 Node 上读不到，所以观察**重新启用的唯一途径**：`run()` 有没有被调用。
+    let runs = 0
+    const makeAls = (): FakeAls => {
+      const real = new AsyncLocalStorage<symbol>()
+      return {
+        run: <T>(store: symbol, f: () => T): T => { runs++; return real.run(store, f) },
+        getStore: () => real.getStore(),
+        disable: () => real.disable(),
+      }
+    }
+    const s = await createDuckDbStore(cfg, 'rw', { makeAls })
+    await s.init()
+    await s.transaction(async (tx) => { await tx.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }]) })
+    const before = runs
+    expect(before, '前提：正常事务确实用了上下文').toBeGreaterThan(0)
+    await s.close()
+    const err = await s.transaction(async () => { throw new Error('不该到这里') }).then(() => null, (e: unknown) => e)
+    expect(err, '关闭后的 transaction() 必须报 usage').toMatchObject({ kind: 'usage' })
+    expect(runs, '关闭后不得再进入上下文（那会把 disable 过的实例重新启用）').toBe(before)
+  })
+
   it('成功提交', async () => {
     const s = await fresh()
     await s.transaction(async (tx) => { await tx.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }]) })
@@ -457,18 +487,49 @@ describe('duckdb —— 事务', () => {
   })
 
   it('自动事务进行中，另一条链的显式 transaction() 在入口就被拒（不得发出 BEGIN）', async () => {
-    const s = await fresh()
-    // 用一个大批次把自动事务**挂住**在 INSERT 之前（spy 里等信号）
+    // ⚠️ 「不得发出 BEGIN」必须在**闭包层**观察（CodeRabbit PR#81 第十八轮疑问，探针证实）：
+    // `transaction()` 的 BEGIN 与自动事务的 BEGIN 都走闭包 `execSql`，实例属性上的 spy 看不到。
+    // 实测（去掉入口守卫、spy 记全部语句）`sqls` 仍是 `['INSERT']` —— 原来的
+    // `toEqual(['INSERT'])` 恒真，什么也没证明。这里包装原生连接，记下每一条真正发出的语句。
+    const sqls: string[] = []
+    const realImporter = async (): Promise<unknown> => {
+      const m = await import('@duckdb/node-api')
+      const origCreate = (m as { DuckDBInstance: { create: (p: string, o?: unknown) => Promise<unknown> } })
+        .DuckDBInstance.create
+      const wrapConn = (c: unknown): unknown => {
+        const cc = c as {
+          runAndReadAll: (q: string, p?: unknown[]) => Promise<unknown>
+          closeSync?: () => void
+        }
+        return {
+          runAndReadAll: (q: string, p?: unknown[]) => {
+            sqls.push(q === 'BEGIN' || q === 'COMMIT' || q === 'ROLLBACK' ? q : q.trim().split(/\s+/)[0]!.toUpperCase())
+            return cc.runAndReadAll(q, p)
+          },
+          closeSync: () => cc.closeSync?.(),
+        }
+      }
+      return {
+        DuckDBInstance: {
+          create: async (p: string, o?: unknown) => {
+            const inst = await origCreate(p, o) as { connect: () => Promise<unknown>; closeSync?: () => void }
+            return { connect: async () => wrapConn(await inst.connect()), closeSync: () => inst.closeSync?.() }
+          },
+        },
+      }
+    }
+    const s = await createDuckDbStore(cfg, 'rw', { importer: realImporter as never })
+    await s.init()
+    sqls.length = 0                           // 只关心事务窗口内发出的语句
+    // 用一个大批次把自动事务**挂住**在 INSERT 之前（闸门里等信号）
     const orig = (s as unknown as { execSql: (a: string, b?: unknown[]) => Promise<unknown> }).execSql
     let releaseInsert!: () => void
     const insertGate = new Promise<void>((r) => { releaseInsert = r })
     let enteredInsert!: () => void
     const inInsert = new Promise<void>((r) => { enteredInsert = r })
-    const sqls: string[] = []
     ;(s as unknown as { execSql: (a: string, b?: unknown[]) => Promise<unknown> }).execSql =
       async (sql: string, p?: unknown[]) => {
-        if (sql.startsWith('INSERT')) { sqls.push('INSERT'); enteredInsert(); await insertGate }
-        else sqls.push(sql)
+        if (sql.startsWith('INSERT')) { enteredInsert(); await insertGate }
         return orig(sql, p)
       }
     const up = s.upsert('tags', [{ id: '1', name: 'A', color: '#FF0000' }])
@@ -476,11 +537,12 @@ describe('duckdb —— 事务', () => {
     const txErr = await s.transaction(async () => { throw new Error('不该到这里') })
       .then(() => null, (e: unknown) => e)
     expect(txErr, '并发显式事务必须被拒成 internal（不是 usage 嵌套）').toMatchObject({ kind: 'internal' })
-    // ⚠️ 自动事务的 BEGIN 走闭包 `execSql`（与 spy 只数数据语句的裁定一致），spy 看不到它：
-    // 这里能看到的只有那条 INSERT；被拒的显式事务若发出 BEGIN 就会多出一条。
-    expect(sqls, '被拒的显式事务不得发出 BEGIN').toEqual(['INSERT'])
+    // 此刻闭包层只应看到自动事务的那条 BEGIN（INSERT 还挂在闸门前）；被拒的显式事务
+    // 一条都不发 —— 这条断言在闭包层，实例属性 spy 看不到 BEGIN（探针证实过）。
+    expect(sqls, '被拒的显式事务不得发出 BEGIN（闭包层观察）').toEqual(['BEGIN'])
     releaseInsert()
     expect(await up).toBe(1)
+    expect(sqls, '自动事务完整序列：BEGIN → INSERT → COMMIT').toEqual(['BEGIN', 'INSERT', 'COMMIT'])
     await s.close()
   })
 

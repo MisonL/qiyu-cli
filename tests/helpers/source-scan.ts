@@ -103,6 +103,12 @@ export function calleeChain(node: ts.Expression): string[] | undefined {
     const base = calleeChain(u.expression)
     return base === undefined ? undefined : [...base, k]
   }
+  // 逗号表达式 `(0, setTimeout)(…)`：值就是**最右**那个操作数（TS 下行到 ES5 时模块引用
+  // 就是这种形态，`(0, obj.method)(…)` 保住 this 语义但被调函数不变）—— Codex PR#81
+  // 第十八轮 P2，探针证实 hook 里的 `(0, setTimeout)(fn, 1)` 照常调度、判据却返回 undefined。
+  if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return calleeChain(u.right)
+  }
   return undefined
 }
 
@@ -132,6 +138,10 @@ export function callChain(call: ts.CallExpression): { chain: string[]; viaCall: 
       if (k === undefined) return undefined
       const base = resolve(e.expression)
       return base === undefined ? undefined : [...base, k]
+    }
+    // 逗号表达式取最右操作数（见 `calleeChain` 的同款注释，Codex PR#81 第十八轮 P2）
+    if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      return resolve(e.right)
     }
     if (ts.isCallExpression(e) || ts.isTaggedTemplateExpression(e)) {
       viaCall = true
@@ -185,6 +195,10 @@ export function isRegistration(call: ts.CallExpression, base: readonly string[])
  * 只读顶层 —— 与 Vitest 的选项契约一致（`concurrent` 是选项对象的属性）。
  * ⚠️ 字符串键（`{ 'concurrent': true }`）同样是合法选项（Codex PR#81 第九轮）：
  * AST 里它与标识符键的区别只是 `ts.isStringLiteral`，这里一并收下。
+ * ⚠️ **静态对象展开**（`{ ...{ concurrent: true } }`、`{ ...{ sequential: false } }`）按属性
+ * 顺序合并（Codex PR#81 第十八轮 P2，探针证实 Vitest 按合并后的值判定并发）：展开源是
+ * 对象字面量时递归展开、后写覆盖前写；展开源是变量 / 调用等**求不出静态值**的形态仍不判
+ * （那属于已声明的边界，与反射同类）。同一键在展开后出现多次时，**最后一次**胜出。
  */
 export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Expression> {
   const out = new Map<string, ts.Expression>()
@@ -203,6 +217,12 @@ export function objectProps(obj: ts.ObjectLiteralExpression): Map<string, ts.Exp
       }
     } else if (ts.isShorthandPropertyAssignment(p)) {
       out.set(p.name.text, p.name)
+    } else if (ts.isSpreadAssignment(p)) {
+      // 只展开**静态可求**的对象字面量；变量 / 调用 / 其它形态不判（已声明的边界）。
+      const src = unwrap(p.expression)
+      if (ts.isObjectLiteralExpression(src)) {
+        for (const [k, v] of objectProps(src)) out.set(k, v)
+      }
     }
   }
   return out

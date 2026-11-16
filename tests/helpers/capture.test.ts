@@ -400,6 +400,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookHits(`${H}(() => { globalThis[${JSON.stringify(ST)}](w, 80) })`), '下标访问的全局调度')
       .toEqual([`globalThis.${ST}(`])
     expect(hookHits(`${H}(() => { window[${JSON.stringify(ST)}](w, 80) })`), 'window 下标访问').toEqual([`window.${ST}(`])
+    // 逗号表达式取最右操作数（Codex PR#81 第十八轮 P2）：`(0, setTimeout)(…)` 就是 setTimeout，
+    // 下行到 ES5 的模块引用也都是这个形态 —— 不穿透时 `calleeChain` 返回 undefined、守卫放行。
+    expect(hookHits(`${H}(() => { (0, ${ST})(w, 1) })`), '逗号表达式里的调度').toEqual([`${ST}(`])
     // 反例：动态键仍是已声明的反射边界（`['set' + 'Timeout']` 求不出静态名）
     expect(hookHits(`${H}(() => { globalThis[${JSON.stringify('set')} + ${JSON.stringify('Timeout')}](w, 1) })`),
       '反射拼接不在静态判据内（已声明的边界）').toEqual([])
@@ -457,6 +460,15 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 标签模板形态的 each（Codex PR#81 第十轮）：标签模板 + 选项对象
     const tagSrc = bt('it.each', String.fromCharCode(96), 'a|b', String.fromCharCode(96), "('x', { con", 'current: true }, () => {})')
     expect(concHits(tagSrc), '标签模板的 each 登记').toEqual(['opt'])
+    // 静态对象展开按属性顺序合并（Codex PR#81 第十八轮 P2，探针证实 Vitest 按合并后的值判并发）
+    expect(concHits(`${bt("it('S1', { ...{ con", 'current: true } }, () => {})')}`), '静态展开的选项').toEqual(['opt'])
+    expect(concHits(`${bt("describe('S2', { ...{ se", 'quential: false } }, () => {})')}`), '静态展开的套件选项').toEqual(['opt'])
+    // 后写覆盖前写：`{ ...{ concurrent: true }, concurrent: false }` 实际是串行
+    expect(concHits(`${bt("it('S3', { ...{ con", 'current: true }, con', 'current: false }, () => {})')}`),
+      '展开后再写 false → 不是并发').toEqual([])
+    // 反例：展开源是变量（静态求不出）—— 已声明的边界
+    expect(concHits(`${bt("const o = { con", 'current: true }\nit(\'S4\', { ...o }, () => {})')}`),
+      '变量展开看不出静态值').toEqual([])
     expect(concHits(`${bt("it('E', () => { const p = { con", 'current: true } })')}`), '执行体里的是数据').toEqual([])
     expect(concHits(`${bt("it('F', async (): Promise<void> => { const p = { con", 'current: true } })')}`),
       '带返回类型的 async 执行体（Codex 第九轮）').toEqual([])
