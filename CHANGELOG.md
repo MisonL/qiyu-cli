@@ -47,6 +47,13 @@
 
 ### 修复
 
+- **`.call/.apply` 调度 + getter/方法体的立即执行**（2026-11-17，Codex PR#81 第二十二轮 P2 ×2）：
+  ① hook 判据里 `setTimeout.call(null, cb, 1)` / `globalThis.setTimeout.apply(null, […])` 的链末段
+  多出 `call`/`apply`，原判据全漏（探针确认 hook 尾巴照样串到下一条用例）—— 匹配前先剥掉末段。
+  ② `THROW_ERROR` 的「未调用的函数边界」把 **getter / 对象方法体**也算成未执行：
+  `throw ({ get value() { return new Error('**BAD**') } }).value` 读取属性就执行了 getter
+  （Node 实测确实抛出 `**BAD**`），却被放行。补「所属对象被属性读取 / 下标读取 / `new`」三种
+  静态可定的执行形态。两处变异各自变红。
 - **未知来源的选项键不得当成「确定没开并发」**（2026-11-17，CodeRabbit PR#81 第二十三轮 minor，
   并**推翻**了上一轮按 Codex 第二十轮做的一个方向）：
   `objectProps` 在未知展开 / 动态键之后会清空已知值，于是 `it('x', { ...opts }, fn)` 与 `it('x', {},

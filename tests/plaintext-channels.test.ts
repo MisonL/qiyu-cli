@@ -187,13 +187,35 @@ const THROW_ERROR: Rule = {
         return false
       }
     }
+    /**
+     * getter 所属的对象字面量：`throw ({ get value() { return new Error(…) } }).value` ——
+     * **读取属性**就执行了 getter（Codex PR#81 第二十二轮 P2，Node 实测确实抛出该 message）。
+     * 同理 `new (class { … })()` 的构造方法在 `new` 时就跑了。
+     */
+    const isExecutedAccessor = (fn: ts.Node): boolean => {
+      // getter / 方法：所属对象字面量出现在 `new` / 属性读取（被访问）的表达式中
+      let e: ts.Node = fn
+      while (e.parent !== undefined && !ts.isObjectLiteralExpression(e.parent)) e = e.parent
+      if (e.parent === undefined) return false
+      const obj = e.parent
+      let o: ts.Node = obj
+      while (o.parent !== undefined && ts.isParenthesizedExpression(o.parent)) o = o.parent
+      const p = o.parent
+      if (p === undefined) return false
+      if (ts.isPropertyAccessExpression(p) && p.expression === o) return true
+      if (ts.isElementAccessExpression(p) && p.expression === o) return true
+      if (ts.isNewExpression(p) && p.expression === o) return true
+      return false
+    }
     eachInvocation(sf, (n, line) => {
       if (!ts.isNewExpression(n) || !named(n, 'Error')) return
       let up: ts.Node = n
       let blocked = false
       while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) {
-        if (isFnBoundary(up.parent) && !isImmediatelyInvoked(up.parent)) { blocked = true; break }
-        up = up.parent
+        const p = up.parent
+        const isBoundary = isFnBoundary(p) || ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p)
+        if (isBoundary && !isImmediatelyInvoked(p) && !isExecutedAccessor(p)) { blocked = true; break }
+        up = p
       }
       if (blocked || up.parent === undefined || !ts.isThrowStatement(up.parent)) return
       const why = starsIn(argsOf(n))
@@ -312,6 +334,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw ((() => new Error('**非空断言**'))!)()",
       "throw (<() => Error>(() => new Error('**尖括号断言**')))()",
       "throw (() => new Error('**call 立即执行**')).call(null)",
+      "throw ({ get value() { return new Error('**getter**') } }).value",
       "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
       "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
@@ -330,7 +353,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调里的 new Error 不算').toHaveLength(7)
+      + '未调用的回调里的 new Error 不算').toHaveLength(8)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)

@@ -232,6 +232,11 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       // **调用**，`calleeChain` 对它返回 undefined（Codex PR#81 第二十轮 P2，探针复现）。
       const innerName = callChain(inner)?.chain
       if (innerName === undefined) continue
+      // ⚠️ `.call(…)` / `.apply(…)` 只是调用方式，被调函数不变（Codex PR#81 第二十二轮 P2：
+      // `setTimeout.call(null, cb, 1)`、`globalThis.setTimeout.apply(null, […])` 的链末段多出
+      // `call`/`apply`，探针确认 hook 尾巴照样串到下一条用例）。先把末段剥掉再匹配原语。
+      const last = innerName[innerName.length - 1]
+      if (innerName.length > 1 && (last === 'call' || last === 'apply')) innerName.pop()
       // `setTimeout(…)` 与 `globalThis.setTimeout(…)` 都是调度；反射（`globalThis['set'+'Timeout']`）
       // 与转调 helper 内部排调度仍看不出来（见上方边界注释）。
       const bare = innerName.length === 2 && GLOBAL_HOSTS.has(innerName[0]!)
@@ -431,6 +436,11 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookHits(`${H}(() => { x.catch(w) })`), '任意链的 catch').toEqual(['x.catch('])
     // 反例：名字里只是恰好含 then 前缀的不是
     expect(hookHits(`${H}(() => { thenable(w) })`), 'thenable 不是 .then').toEqual([])
+    // `.call` / `.apply` 只是调用方式，被调函数不变（Codex PR#81 第二十二轮 P2）
+    // 报的是**剥掉 call/apply 之后**的名字（被调函数才是判据的主体）
+    expect(hookHits(`${H}(() => { ${ST}.call(null, cb, 1) })`), 'setTimeout.call').toEqual([`${ST}(`])
+    expect(hookHits(`${H}(() => { globalThis.${ST}.apply(null, [cb, 1]) })`), 'globalThis.setTimeout.apply')
+      .toEqual([`globalThis.${ST}(`])
     // 反例：普通 Promise 用法与无关的 .then 不是 hook 体里的延迟写入
     expect(hookHits(`${H}(async () => { await Promise.resolve() })`), 'await 不排异步尾巴').toEqual([])
     // 正控：helper 调用 / 字符串里的同名文本 / 别处的同名调用都不算（逐条对应审查报出的形态）
