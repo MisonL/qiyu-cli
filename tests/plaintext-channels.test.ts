@@ -159,6 +159,17 @@ const THROW_ERROR: Rule = {
     // ⚠️ 包装不止括号：`(() => …) as F)()`、`(() => …)!()`、`satisfies` 都编译成调用
     // （Codex PR#81 第二十轮 P2 追加探针：`as` / `!` / `satisfies` 三种形态原判据全漏），
     // 所以复用共享的 `unwrap`（括号 / `as` / 非空断言 / `satisfies`）。
+    /** `e`（函数表达式）是否被 `new` 调用 —— 包装（括号 / 断言）不算语义。 */
+    const isConstructed = (e: ts.Node): boolean => {
+      let x: ts.Node = e
+      for (;;) {
+        const q = x.parent
+        if (q === undefined) return false
+        if ((ts.isParenthesizedExpression(q) || ts.isAsExpression(q) || ts.isNonNullExpression(q)
+          || ts.isSatisfiesExpression(q) || ts.isTypeAssertionExpression(q)) && q.expression === x) { x = q; continue }
+        return ts.isNewExpression(q) && q.expression === x
+      }
+    }
     const isImmediatelyInvoked = (n: ts.Node): boolean => {
       let e: ts.Expression = n as ts.Expression
       // ⚠️ 一个对象方法的**函数体**不是表达式：从方法处必须经它的**被调形态**判（由调用方传入
@@ -204,6 +215,11 @@ const THROW_ERROR: Rule = {
           if (p.expression === e) return true
         }
         if (p !== undefined && ts.isTaggedTemplateExpression(p) && p.tag === e) return true
+        // `new (function () { return new Error(…) })()`：**函数表达式**被 `new` 调用即执行函数体
+        // （CodeRabbit/Codex PR#81 第二十九轮：此前自检里的正例被另一条反例的误报抵消，总数掩盖了漏检）。
+        // **箭头函数不可构造** —— `new (() => …)()` 抛的 TypeError 不是这个 Error。
+        // 函数表达式被 `new` 调用（括号已在上一轮穿透，`e` 此时是括号后的那个表达式）
+        if (p !== undefined && ts.isNewExpression(p) && p.expression === e && ts.isFunctionExpression(unwrap(e))) return true
         // ⚠️ 其它任何父节点都说明这个函数**没有被调用** —— 必须显式 `return false`。
         // 漏掉它会 `for (;;)` 空转（2026-11-17 实测：本文件用例卡死 10 分钟以上，
         // 探针单跑该判据才定位到）。
@@ -220,12 +236,28 @@ const THROW_ERROR: Rule = {
       // Node 实测 `throw ({ get make() { return () => new Error('**X**') } }).make()` 真的抛）：
       // 这里 `fn` 是 getter 体里返回的那个箭头 —— 是否执行取决于**返回它的 getter** 的属性
       // 是否被读后再调用，与 getter 本身同一判据，直接转交。
+      // ⚠️ 但**读 getter 只执行 getter 本身，不执行它返回的函数**（CodeRabbit/Codex PR#81 第二十九轮）：
+      // `({ get make() { return () => new Error('**X**') } }).make` 只读了属性，箭头从未被调用。
+      // 所以这里除「getter 被读」之外，还要求**读出来的那个函数被调用**。
       if ((ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))
         && fn.parent !== undefined && ts.isReturnStatement(fn.parent) && fn.parent.expression === fn) {
         let g: ts.Node | undefined = fn.parent.parent
         while (g !== undefined && (ts.isBlock(g) || ts.isCaseBlock(g) || ts.isCaseOrDefaultClause(g))) g = g.parent
-        if (g !== undefined && ts.isGetAccessorDeclaration(g)) return isExecutedAccessor(g)
-        return false
+        if (g === undefined || !ts.isGetAccessorDeclaration(g)) return false
+        if (g.name === undefined) return false
+        // getter 所属对象 → 属性读取处 → 该读取**被调用**
+        let q: ts.Node = g
+        while (q.parent !== undefined && !ts.isObjectLiteralExpression(q.parent)) q = q.parent
+        if (q.parent === undefined) return false
+        let o: ts.Node = q.parent
+        while (o.parent !== undefined && (ts.isParenthesizedExpression(o.parent) || ts.isAsExpression(o.parent)
+          || ts.isNonNullExpression(o.parent) || ts.isSatisfiesExpression(o.parent) || ts.isTypeAssertionExpression(o.parent))) o = o.parent
+        const acc = o.parent
+        if (acc === undefined) return false
+        const name = ts.isPropertyAccessExpression(acc) ? acc.name.text
+          : ts.isElementAccessExpression(acc) ? staticAccessKey(acc.argumentExpression) : undefined
+        if (name === undefined || name !== accessorName(g.name)) return false
+        return isImmediatelyInvoked(acc)
       }
       // 匿名类构造函数：`new (class { constructor() { return new Error(…) } })()` —— 类被 `new`
       // 实例化就执行了构造函数（Codex PR#81 第二十四轮 P2/P3）
@@ -520,8 +552,23 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     const sf = parseTs(fake)
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
-    expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
+    const throwHits = THROW_ERROR.hit(sf)
+    expect(throwHits, 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
       + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(21)
+    // ⚠️ **逐条断言**（CodeRabbit/Codex PR#81 第二十九轮）：只断言总数时，「一条漏检 + 一条误报」
+    // 会互相抵消，总数照样对 —— 本文件就出现过（`new (function(){…})()` 漏检被 getter 只读误报
+    // 抵消）。正例样本必须各自命中、反例样本必须各自不命中。
+    const srcOf = (key: string): string => fake.split('\n').find((l) => l.includes(key)) ?? ''
+    for (const pos of ['**getter 返回后调用**', '**展开后被调用**', '**new 函数表达式**',
+      '**属性箭头**', '**属性函数表达式**', '**方法被调用**', '**bind 立即执行**', '**逗号立即执行**',
+      '**立即执行**', '**getter**', '**匿名类**', '**展开执行 getter**']) {
+      expect(THROW_ERROR.hit(parseTs(`throw ${srcOf(pos).replace(/^\s*throw\s*/, '')}`)),
+        `正例必须命中：${pos}`).toHaveLength(1)
+    }
+    for (const neg of ['**getter 只读**', '**属性箭头未调用**', '**方法引用**', '**展开里的方法**',
+      '**展开里的箭头**', '**展开里的函数表达式**', '**未抛出**', '**非抛出**']) {
+      expect(THROW_ERROR.hit(parseTs(srcOf(neg))), `反例必须不命中：${neg}`).toEqual([])
+    }
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)
