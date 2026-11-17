@@ -14,7 +14,7 @@ import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startCapture, captureInstalled } from './capture.js'
 import ts from 'typescript'
-import { callChain, collectCalls, lineOf, objectPropsWithUnknown, parseTs, staticKey, unwrap } from './source-scan.js'
+import { calleeChain, callChain, collectCalls, lineOf, objectPropsWithUnknown, parseTs, staticKey, unwrap } from './source-scan.js'
 
 // ⚠️ 文件结束时 `process.stdout.write` 必须已恢复（Codex 2026-11-13 P2：vitest 2.1.9
 // 默认 `restoreMocks:false`，不恢复的话同 worker 的**下一个测试文件**会把写入记进
@@ -201,6 +201,18 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
           changed = true
         }
       }
+      // ⚠️ 别名不止经**声明初始化**建立：`let a; a = opts; a.concurrent = true` 同样写穿 opts
+      // （CodeRabbit PR#81 第二十六轮 minor，序列可复现）。只跟声明初始值时这个序列完全逃过
+      // 写入判据 —— `a` 从未进入别名集，就被当成无关变量。与「建立别名不算写入」同一个口径：
+      // 这句赋值本身不计为写入，只把 `a` 收进别名集。
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && ts.isIdentifier(n.left)) {
+        const init = unwrap(n.right)
+        if (ts.isIdentifier(init) && aliases.has(init.text) && !aliases.has(n.left.text)) {
+          aliases.add(n.left.text)
+          changed = true
+        }
+      }
       ts.forEachChild(n, collect)
     }
     collect(sf)
@@ -224,7 +236,10 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
    */
   const writesThroughCallee = (call: ts.CallExpression): boolean => {
     const raw = unwrap(call.expression)
-    const fnChain = callChain({ ...call, expression: raw } as ts.CallExpression)?.chain
+    // 用 `calleeChain` 而不是往 `callChain` 里塞一个改过 `expression` 的伪造节点：
+    // 写入 API 的被调方一定是标识符 / 属性访问 / 下标访问，不会是「调用基座」，两者在这里等价，
+    // 而伪节点依赖 `{...call}` 恰好把 `expression` 覆盖成唯一被读字段（自查时的加固）。
+    const fnChain = calleeChain(raw)
     if (fnChain === undefined) return false
     let name = fnChain
     let args: readonly ts.Expression[] = call.arguments
@@ -233,23 +248,25 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
     const rawEnd: string | undefined = ts.isPropertyAccessExpression(raw) ? raw.name.text
       : ts.isElementAccessExpression(raw) ? staticKey(raw.argumentExpression) : undefined
     if (name.length > 1 && (rawEnd === 'call' || rawEnd === 'apply')) {
-      const viaApply = rawEnd === 'apply'
+      // `.apply` 的实参数组（第二个实参）在确认是写入 API 之后再解析 —— 见下。
       name = name.slice(0, -1)
-      if (viaApply) {
-        const arr = call.arguments[1] === undefined ? undefined : unwrap(call.arguments[1])
-        // 实参数组看不清（变量 / 含展开）→ 目标位置不可确定，按「写过」处理
-        if (arr === undefined || !ts.isArrayLiteralExpression(arr)
-          || arr.elements.some((e) => ts.isSpreadElement(e) || ts.isOmittedExpression(e))) return true
-        args = arr.elements as readonly ts.Expression[]
-      } else {
-        args = call.arguments.slice(1)
-      }
+      if (rawEnd === 'call') args = call.arguments.slice(1)
     }
     const key = name[name.length - 1]
     if (name.length !== 2 || key === undefined) return false
     const isWriteApi = (name[0] === 'Object' && (key === 'assign' || key === 'defineProperty' || key === 'defineProperties'))
       || (name[0] === 'Reflect' && (key === 'set' || key === 'defineProperty'))
     if (!isWriteApi) return false
+    // ⚠️ 「实参数组看不清 → 保守按写过」只能在**确认是写入 API** 之后做（CodeRabbit PR#81
+    // 第二十六轮 minor，探针复现：`noop.apply(null, args)` 这类**无关**调用原先在 `isWriteApi`
+    // 判断之前就 `return true`，文件里只要出现一次，任何选项对象的初始值都作废 ——
+    // 合法串行用例全被报成「看不清」）。因此数组解析推迟到这里。
+    if (rawEnd === 'apply') {
+      const arr = call.arguments[1] === undefined ? undefined : unwrap(call.arguments[1])
+      if (arr === undefined || !ts.isArrayLiteralExpression(arr)
+        || arr.elements.some((e) => ts.isSpreadElement(e) || ts.isOmittedExpression(e))) return true
+      args = arr.elements as readonly ts.Expression[]
+    }
     const target = args[0]
     return target !== undefined && refersToAlias(target)
   }
@@ -257,7 +274,15 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
   let hit = false
   const visit = (n: ts.Node): void => {
     if (hit) return
-    if (ts.isBinaryExpression(n) && ASSIGN_OPS.has(n.operatorToken.kind as ts.SyntaxKind) && refersToAlias(n.left)) hit = true
+    // ⚠️ `别的名 = 别名` 只是**建立别名**，不是写入（CodeRabbit PR#81 第二十六轮的赋值式别名）——
+    // 左边不是别名本身时跳过。左边的属性写入（`a.p = …`）仍由 `refersToAlias` 判。
+    // 判据是「右边是不是围绕别名的引用」—— 左边是**外来名**（刚被收进别名集的 `aliasQ8`），
+    // 不能要求它已经在别名集里：`refersToAlias(n.left)` 对单纯 `aliasQ8` 恒假，那样 `hit`
+    // 根本不会被置位，这段保护形同虚设（第一版就这么写的，样本 `oQ8` 直接判红才发现）。
+    const leftIsBareNewName = ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(n.left) && refersToAlias(n.right)
+    if (ts.isBinaryExpression(n) && ASSIGN_OPS.has(n.operatorToken.kind as ts.SyntaxKind)
+      && refersToAlias(n.left) && !leftIsBareNewName) hit = true
     // ⚠️ **建立别名本身不是写入**（Codex PR#81 第二十五轮 P2 的误报）：`const a = opts` 不改变
     // opts 的任何值 —— 只有别名**之后**再写它的属性才算。首版把这一句当成写入，`const alias = o`
     // 就让合法的串行选项被判成「看不清」。
@@ -375,8 +400,12 @@ const COULD_NOT_SEE = ['无法静态解析', '无法静态求值', '来自访问
 /**
  * 迁移形态文件的并发仓扫（**唯一实现点**：白名单豁免、粗筛、细判都在这里）。
  * 输入是「文件清单」而不是目录 —— 自检可以直接喂合成样本，不需要往仓库里写临时文件。
- * ⚠️ 抽成函数是为了让**粗筛与细判两段**都能被自检跑到：只测细判时，粗筛写错（比如只认
- * `concurrent` 而漏 `sequential`）在自检里完全看不出来（CodeRabbit PR#81 第二十五轮 minor）。
+ * ⚠️ 这里**不再有粗筛**（CodeRabbit PR#81 第二十六轮 minor）：早先按「文件里出现没出现
+ * `concurrent` / `sequential` 字样」整份跳过，于是 `import { opts } from './x'; it('x', opts, fn)`
+ * 这种文件（选项来自导入、文件里没有任何开关字样）被整份跳过，细判根本不会问它 —— 而 opts
+ * 完全可能是并发的。粗筛当初要挡的误报只剩一类：**转发 helper 内部**的 `it(name, ...rest)`
+ * （db.test.ts 的 `itBound`），那一类现在由细判自己静默放行（见 `concurrentViolations` 的展开
+ * 实参分支），判据仍只有一个实现点。
  */
 function scanEntries(entries: Array<{ rel: string; sf: ts.SourceFile }>,
   exempt: Record<string, string>): string[] {
@@ -384,45 +413,9 @@ function scanEntries(entries: Array<{ rel: string; sf: ts.SourceFile }>,
   for (const { rel, sf } of entries) {
     if (exempt[rel] !== undefined) continue
     if (!isMigratedFile(sf)) continue
-    if (!mayRegisterConcurrent(sf)) continue
     for (const v of concurrentViolations(sf)) hits.push(`${rel}:${v.line}（${v.why}）`)
   }
   return hits
-}
-
-/**
- * 粗筛认的开关关键词。⚠️ 必须覆盖**判据认的全部开关**（CodeRabbit PR#81 第二十五轮 minor，
- * 探针复现：只认 `concurrent` 时 `describe('g', { sequential: false }, …)` 整个文件被粗筛跳过，
- * 细判根本没跑）。判据里新增一个开关词，这里要同步加。
- */
-const CONCURRENCY_KEYWORDS = ['concurrent', 'sequential'] as const
-
-/**
- * 仓扫用的**粗筛**：本文件里有没有出现 `.concurrent` 修饰链或选项对象的 `concurrent` 键。
- * 它只在"没有"时下结论（"这个文件不可能开并发"）；有则交给 `concurrentViolations` 细判。
- * ⚠️ 为什么需要它（Codex PR#81 第二十五轮 P2）：细判会把**求不出的选项位**一律报出来
- * （`itBound 里的 it(name, ...rest)`、`it('…', async () => {}, 40_000)` 的超时数字），这是
- * 合理的"看不见就不放行"；但用作**仓扫**时会把合法文件报成红。仓扫问的是"这个文件的注册
- * 调用会不会登记并发"，`concurrent` 三个字在整份语法树里一次都没出现时，答案确定是"不会"。
- */
-function mayRegisterConcurrent(sf: ts.SourceFile): boolean {
-  const kw = new Set<string>(CONCURRENCY_KEYWORDS)
-  let hit = false
-  const visit = (n: ts.Node): void => {
-    if (hit) return
-    if (ts.isCallExpression(n)) {
-      const c = callChain(n)
-      if (c !== undefined && c.chain.some((seg) => kw.has(seg))) { hit = true; return }
-    }
-    if (ts.isPropertyAssignment(n) && ts.isComputedPropertyName(n.name) && staticKey(n.name.expression) !== undefined
-      && kw.has(staticKey(n.name.expression)!)) { hit = true; return }
-    // 标识符 / 字符串形态（`it['concurrent']`、`{ 'concurrent': … }`、`const opts = {…}` 的变量名）
-    if (ts.isIdentifier(n) && kw.has(n.text)) { hit = true; return }
-    if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && kw.has(n.text)) { hit = true; return }
-    ts.forEachChild(n, visit)
-  }
-  visit(sf)
-  return hit
 }
 
 /**
@@ -522,7 +515,35 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         e.kind === ts.SyntaxKind.NumericLiteral
         || (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.MinusToken
           && e.operand.kind === ts.SyntaxKind.NumericLiteral)
-      const rest = args.slice(1).filter((e) => !isNumberArg(unwrap(e)))
+      // ⚠️ `undefined` 是**显式的空选项**（CodeRabbit PR#81 第二十六轮 minor，探针核对
+      // `@vitest/runner` 2.1.9 的 `parseArguments`：该实参不落入 object/number 分支 → `options`
+      // 保持 `{}`，执行体仍是那个函数）。因此它与数字超时一样**不占**选项位：
+      // `it('x', undefined, fn)` 是合法的串行登记，不该被报「选项位是表达式 undefined 无法静态求值」。
+      // 边界：标识符 `undefined` 只在文件里**没有同名声明**时才算它（`function f(undefined) {…}`
+      // 能让它变成别的值）。`void 0` 的值恒为 `undefined`（与操作数无关），一并认。
+      let undefinedShadowed = false
+      const scanUndefined = (n: ts.Node): void => {
+        if (undefinedShadowed) return
+        if ((ts.isVariableDeclaration(n) || ts.isParameter(n) || ts.isBindingElement(n))
+          && ts.isIdentifier((n as ts.VariableDeclaration).name)
+          && ((n as ts.VariableDeclaration).name as ts.Identifier).text === 'undefined') undefinedShadowed = true
+        ts.forEachChild(n, scanUndefined)
+      }
+      scanUndefined(sf)
+      const isUndefinedArg = (e: ts.Expression): boolean => {
+        const u = unwrap(e)
+        if (u.kind === ts.SyntaxKind.UndefinedKeyword) return true
+        // `void 0` 恒为 undefined（VoidExpression 的值就是 undefined，与操作数无关）
+        if (ts.isVoidExpression(u)) return true
+        return ts.isIdentifier(u) && u.text === 'undefined' && !undefinedShadowed
+      }
+      // ⚠️ **转发 helper**：`it(name, ...rest)`（db.test.ts 的 `itBound` 内部形态）的选项位
+      // 由**调用方**决定，静态看不见。原粗筛就是为挡它的误报而存在，副作用是把「选项来自导入」
+      // 的文件整份跳过（第二十六轮 minor）。现在只在这一处静默放行，并把边界如实记在这里：
+      // helper 的调用方若真的传了 `concurrent: true`，本守卫看不出来 —— 那是跨函数数据流，
+      // 超出这份单文件静态判据，需 reviewer 看 helper 的调用点。
+      if (args.some((e) => ts.isSpreadElement(e))) continue
+      const rest = args.slice(1).filter((e) => !isNumberArg(unwrap(e)) && !isUndefinedArg(e))
       const optionArgs = rest.length > 0 && isFn(rest[0]!) ? rest.slice(1) : rest.slice(0, 1)
       for (const a of optionArgs) {
         const r = resolveOptions(a)
@@ -782,16 +803,36 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       // 表格式实参（`it.each([[…]])`）与执行体里的同名属性是数据，不判（Vitest 不读它们）。
       const entries = migratedFiles()
       const hits = scanEntries(entries, CONCURRENT_EXEMPT)
-      // ⚠️ 粗筛的**两端**都要被测到（CodeRabbit PR#81 第二十五轮 minor）：上面只证明「细判对
-      // 真实文件不误报」，证明不了「只开 sequential 的文件没被粗筛整份跳过」。
+      // ⚠️ 仓扫的合成端（CodeRabbit PR#81 第二十五/二十六轮）：
+      //   ① 只开 `sequential` 的文件也要被看见（粗筛曾经只认 `concurrent` 而整份跳过）；
+      //   ② **选项来自导入**、文件里没有任何开关字样的文件不得被跳过（粗筛删除后由细判判）；
+      //   ③ **转发 helper** 的 `it(name, ...rest)` 静默放行（已声明边界，不再靠整份跳过实现）。
       expect(scanEntries(
         [{ rel: 'synthetic.ts', sf: parseTs(`capture${'Sinks(() => {})'}\ndescribe('g', { se${'quential: false }, () => {})'}`) }],
         {},
-      ), '粗筛必须认 sequential —— 否则这种文件整份被跳过').toHaveLength(1)
+      ), '套件 sequential:false 必须命中').toHaveLength(1)
       expect(scanEntries(
         [{ rel: 'synthetic2.ts', sf: parseTs(`capture${'Sinks(() => {})'}\nit('x', { se${'quential: true }, () => {})'}`) }],
         {},
-      ), '粗筛不得把只是顺带出现 sequential 的串行文件报成违规').toEqual([])
+      ), '顺带出现 sequential 的串行文件不得报违规').toEqual([])
+      expect(scanEntries(
+        [{ rel: 'synthetic3.ts', sf: parseTs(`import { opts } from './x'\ncapture${'Sinks(() => {})'}\nit('x', opts, () => {})`) }],
+        {},
+      ), '导入的选项必须经过细判（不许被整份跳过）').toHaveLength(1)
+      //   ④ 转发 helper 拆成两端：**定义体**（`it(name, ...rest)`）静默 —— 选项由调用方决定，
+      //      单文件判据看不见，如实记为边界；**调用点**照常按字面选项判（`itBound` 在登记名单里）。
+      expect(scanEntries(
+        [{ rel: 'synthetic4.ts', sf: parseTs('capture' + 'Sinks(() => {})\n'
+          + "const itBound = (name: string, ...rest: unknown[]) => it(name, ...rest)\n"
+          + "itBound('x', () => {})") }],
+        {},
+      ), '转发 helper 定义体的展开实参静默放行（已声明边界）').toEqual([])
+      expect(scanEntries(
+        [{ rel: 'synthetic5.ts', sf: parseTs('capture' + 'Sinks(() => {})\n'
+          + "const itBound = (name: string, ...rest: unknown[]) => it(name, ...rest)\n"
+          + "itBound('x', { con" + "current: true }, () => {})") }],
+        {},
+      ), '转发 helper 的调用点仍按字面选项判').toHaveLength(1)
       // 细判的合成端（不经粗筛也能咬住）
       expect(concurrentViolations(parseTs(`describe('g', { se${'quential: false }, () => {})'}`)).length,
         '细判必须认套件 sequential:false').toBe(1)
@@ -836,7 +877,6 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     })
 
   it('判据本身不许退化：两条规则的双向自检（含各轮审查报出的全部形态）', () => {
-    require('fs').writeFileSync('/tmp/hook-test.txt', 'ran ' + __filename)
     // ⚠️ 样本一律**拼**出来：本文件也在扫描范围内，字面量会让守卫扫到自己。
     const bt = (...parts: string[]): string => parts.join('')
     const ST = bt('set', 'Timeout')
@@ -1104,6 +1144,18 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 建立别名本身**不是**写入（Codex 第二十五轮 P2 的误报）
     expect(concHits(`const oQ4 = ${Zq}\nconst aliasQ4 = oQ4\nit('Q4', oQ4, () => {})`),
       '只建别名不改值').toEqual([])
+    // 别名经**赋值**建立（CodeRabbit PR#81 第二十六轮 minor，序列可复现）
+    expect(concHits(`const oQ7 = ${Zq}\nlet aliasQ7\naliasQ7 = oQ7\naliasQ7.concurrent = true\nit('Q7', oQ7, () => {})`),
+      '赋值建立的别名同样写穿原对象').toEqual(['unknown'])
+    expect(concHits(`const oQ8 = ${Zq}\nlet aliasQ8\naliasQ8 = oQ8\nit('Q8', oQ8, () => {})`),
+      '只赋值建立别名、不改值 → 仍可信').toEqual([])
+    // 无关调用不得让初始值作废（CodeRabbit PR#81 第二十六轮 minor：`.apply` 的保守分支
+    // 原先在 `isWriteApi` 判断之前就 `return true`）
+    expect(concHits(`const oQ9 = ${Zq}\nconst noopQ9 = (a: unknown) => a\nnoopQ9.apply(null, argsQ9)\nit('Q9', oQ9, () => {})`),
+      '无关的 .apply 不影响选项初始值').toEqual([])
+    // `it('x', undefined, fn)` 是合法的空选项重载（同轮 minor，探针核对 parseArguments）
+    expect(concHits(`it('QU', undefined, () => {})`), 'undefined 选项位是空选项').toEqual([])
+    expect(concHits(`it('QU2', void 0, () => {})`), 'void 0 同样空选项').toEqual([])
     // 局部别名写穿同一个对象（Codex 第二十五轮 P2）
     // ⚠️ 中间必须隔一层：别名与写入若相邻成 `const a = o; Object.assign(a, …)`，`a` 会自己出现在
     // `o` 的别名集里（它是 `const a = o` 的**被声明名**）——「只收顶层别名」的变异照样通过（等价变异）。
@@ -1124,6 +1176,11 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(concHits(bt('const enabledZc = false\nfunction setup(enabledZc) { return enabledZc }\nit(\'Zc1\', { con', 'current: enabledZc }, () => {})')),
       '参数同名同样遮蔽').toEqual(['unknown'])
     expect(concHits(bt('const enabledZd = true\nit(\'Zd1\', { con', 'current: enabledZd }, () => {})')), '无遮蔽时按常量求值').toEqual(['opt'])
+    // 后写的**展开**覆盖同名访问器（CodeRabbit PR#81 第二十六轮 minor）：
+    // `{ ...{ get concurrent() {…} }, ...{ concurrent: false } }` 实际按串行登记
+    const g2 = bt('get con', 'current() { return true }')
+    expect(concHits(bt("it('QB', { ...{ ", g2, ' }, ...{ con', 'current: false } }, () => {})')),
+      '后写展开覆盖访问器 → 值确定').toEqual([])
     // getter 的 concurrent：值在运行时才知道
     expect(concHits(`it('O4', { get con${'current() { return true }'}, })`), 'getter 并发值未知').toEqual(['unknown'])
     // 未知**计算键访问器**同样可能覆盖任何键

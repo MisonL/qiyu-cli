@@ -290,7 +290,10 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
         const inner = objectPropsInner(src)
         // 内层若含未知展开，它可能覆盖**外层**已有的键 —— 先清空再合并内层已知值。
         if (inner.mayHaveUnknown) { out.clear(); accessorKeys.clear() }
-        for (const [k, v] of inner.props) out.set(k, v)
+        // 后写的展开同样**覆盖**同名访问器：`{ ...{ get concurrent() {…} }, ...{ concurrent: false } }`
+        // 内层是普通属性，外壳的访问器标记必须清掉（CodeRabbit PR#81 第二十六轮 minor）——
+        // 否则调用方仍按「值运行时才知道」报未知，合法的串行样本被当成并发。
+        for (const [k, v] of inner.props) { out.set(k, v); accessorKeys.delete(k) }
         // 内层访问器覆写同名键：键同样记进本层的访问器集合 —— 只把值置 undefined 的话，
         // 外层无法与「未知展开留下的空值」区分（Codex PR#81 第二十五轮 P2 的成因之一）。
         for (const k of inner.accessorKeys) { out.set(k, undefined); accessorKeys.add(k) }

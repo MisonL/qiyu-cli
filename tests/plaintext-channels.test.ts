@@ -251,6 +251,11 @@ const THROW_ERROR: Rule = {
       const p = o.parent
       if (p === undefined) return false
       if (ts.isNewExpression(p) && p.expression === o) return true
+      // ⚠️ **对象展开会立即读取源对象的全部可枚举属性** → 源对象上的 getter 立刻执行
+      // （Codex PR#81 第二十六轮 P2，Node 实测：`throw ({ ...{ get error() { return new Error('**BAD**') } } }).error`
+      // 抛出的 message 就是 `**BAD**`）。只认**直接**展开：展开的源是变量（`{...src}`）时
+      // 那些 getter 写在哪份定义里，单文件语法树看不出来 —— 如实记录为边界。
+      if (ts.isSpreadAssignment(p) && p.expression === o) return true
       // ⚠️ **读的是哪个属性**必须与 getter 名对得上（CodeRabbit PR#81 第二十四轮 minor）：
       // `({ get unused() { return new Error('**x**') }, error: new Error('clean') }).error` 只执行
       // `error`，`unused` 的 getter 从不运行 —— 原判据对任何属性读取都放行，把 `unused` 报成违规。
@@ -414,6 +419,10 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw (({ get value3() { return new Error('**as 包装**') } }) as { value3: Error }).value3",
       "throw new (class { constructor() { this.e = new Error('**匿名类**') } })().e",
       "throw ({ get unused() { return new Error('**unused**') }, error: new Error('clean') }).error",
+      // 对象展开立即读取源对象的全部属性 → getter 立刻执行（Codex PR#81 第二十六轮 P2，Node 实测抛出）
+      "throw ({ ...{ get error() { return new Error('**展开执行 getter**') } } }).error",
+      // 反例：展开的源里只有**方法**（方法不执行），且读的是数据属性 —— 不算
+      "throw ({ ...{ make() { return 1 } }, error: new Error('clean3') }).error",
       // 立即执行的派生形态（Codex PR#81 第二十五轮 P2，Node 实测三条都真的抛）
       "throw (() => new Error('**bind 立即执行**')).bind(null)()",
       "throw (0, () => new Error('**逗号立即执行**'))()",
@@ -438,7 +447,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(15)
+      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(16)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)

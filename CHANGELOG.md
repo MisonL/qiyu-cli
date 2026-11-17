@@ -47,6 +47,23 @@
 
 ### 修复
 
+- **静态守卫第二组审查收口（六条误报/漏检 + 一条 Codex 漏检）**（2026-11-17，CodeRabbit PR#81
+  第二十六轮 minor ×5 + major ×1、Codex 同轮 P2 ×2，逐条探针复现）：
+  **赋值建立的别名**（`let a; a = opts; a.concurrent = true`）原先完全逃过写入判据——别名收集只跟
+  声明初始化器，`a` 从未进别名集；同时**只建立别名不算写入**（`a = opts` 本身不改值，与既有
+  `const a = opts` 同一口径）· 不是写入 API 的 `.apply`（`noop.apply(null, args)`）曾让**任何**
+  选项对象的初始值作废——`isWriteApi` 检查被移到实参数组解析之前 · `it('x', undefined, fn)` /
+  `it('x', void 0, fn)` 是合法的空选项重载（`parseArguments` 里该实参不占选项位），不再报
+  「选项位是表达式 undefined」· **仓库粗筛删除**：`import { opts } from './x'; it('x', opts, fn)`
+  这种文件里没有任何开关字样，原先被整份跳过、细判根本不问它；粗筛要挡的误报只剩转发 helper
+  内部的 `it(name, ...rest)`，改由细判在该分支静默放行（边界如实记录：helper 调用方若传了
+  `concurrent: true`，单文件静态判据看不出来）· 后写的**展开**覆盖同名访问器
+  （`{...{ get concurrent() {…} }, ...{ concurrent: false }}`）要清掉访问器标记 ·
+  **对象展开会立即执行源对象的 getter**（`throw ({ ...{ get error() {…} } }).error` 真的抛），
+  `THROW_ERROR` 判据补上这一形态 · 自检里遗留的一行调试写文件（`/tmp/hook-test.txt`）删除。
+  六处变异各自变红；其中「无关 `.apply`」首轮变异存活（还原顺序后才咬住），另一次首轮写法把
+  `refersToAlias(n.left)` 用在外来名上、保护形同虚设（样本 `oQ8` 判红才发现）。
+
 - **静态守卫第二组等价写法与两处误报**（2026-11-17，Codex PR#81 第二十五轮 P2 的后半 + CodeRabbit
   同轮 minor ×2，逐条探针复现）：
   写入 API 的**名字链与调用方式**都要还原——`Object['assign'](…)`（下标形式）、
