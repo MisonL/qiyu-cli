@@ -718,6 +718,10 @@ describe('duckdb —— 事务', () => {
           runAndReadAll: (q: string, p?: unknown[]) => Promise<unknown>
           closeSync?: () => void
         }
+        // ⚠️ 包装对象**替身整个实例**：`Store.close()` 调的是 `conn.closeSync()` / `inst.closeSync()`，
+        // 它们挂在**原型**上、对象展开 / 手写字面量都复制不到。必须把两层的 `closeSync` 都转发给原生
+        // 对象，否则 `Store.close()` 静默关不到真连接（Codex PR#81 第三十轮 P2：去掉了转发的版本里，
+        // `close()` 之后连接仍能执行 `SELECT 42`）—— 用例结束漏关连接，Windows 上还会挡住删库目录。
         return {
           runAndReadAll: (q: string, p?: unknown[]) => {
             sqls.push(q === 'BEGIN' || q === 'COMMIT' || q === 'ROLLBACK' ? q : q.trim().split(/\s+/)[0]!.toUpperCase())
@@ -735,6 +739,10 @@ describe('duckdb —— 事务', () => {
         },
       }
     }
+    // ⚠️ 包装版 Store 关不掉原生连接（见 `wrapConn` 的注释）—— 用例收尾时要直接关掉**裸 Store**：
+    // 它先 open + init 建出库文件（建表语句会进 `sqls`，之后清空），包装版随后接同一路径。
+    const raw = await createDuckDbStore(cfg, 'rw')
+    await raw.init()
     const s = await createDuckDbStore(cfg, 'rw', { importer: realImporter as never })
     await s.init()
     sqls.length = 0                           // 只关心事务窗口内发出的语句
@@ -761,6 +769,7 @@ describe('duckdb —— 事务', () => {
     expect(await up).toBe(1)
     expect(sqls, '自动事务完整序列：BEGIN → INSERT → COMMIT').toEqual(['BEGIN', 'INSERT', 'COMMIT'])
     await s.close()
+    await raw.close()
   })
 
   it('显式事务开着时，另一条链的 transaction() 报 internal（不是 usage 嵌套），读语句也不得落进去（CodeRabbit PR#81 第十七轮 minor）', async () => {

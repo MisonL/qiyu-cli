@@ -239,9 +239,18 @@ const THROW_ERROR: Rule = {
       // ⚠️ 但**读 getter 只执行 getter 本身，不执行它返回的函数**（CodeRabbit/Codex PR#81 第二十九轮）：
       // `({ get make() { return () => new Error('**X**') } }).make` 只读了属性，箭头从未被调用。
       // 所以这里除「getter 被读」之外，还要求**读出来的那个函数被调用**。
+      // ⚠️ 括号 / 断言包装不影响 `return` 的语义：`return (() => …)` 与 `return () => …` 一样
+      // （Codex PR#81 第三十轮 P2，Node 实测 `({ get make() { return (() => new Error('**X**')) } }).make()`
+      // 照样抛出）—— 先剥包装再比 `ReturnStatement`。
+      const fnParent = (() => {
+        let e: ts.Node = fn
+        while (e.parent !== undefined && (ts.isParenthesizedExpression(e.parent) || ts.isAsExpression(e.parent)
+          || ts.isNonNullExpression(e.parent) || ts.isSatisfiesExpression(e.parent) || ts.isTypeAssertionExpression(e.parent))) e = e.parent
+        return e.parent
+      })()
       if ((ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))
-        && fn.parent !== undefined && ts.isReturnStatement(fn.parent) && fn.parent.expression === fn) {
-        let g: ts.Node | undefined = fn.parent.parent
+        && fnParent !== undefined && ts.isReturnStatement(fnParent)) {
+        let g: ts.Node | undefined = fnParent.parent
         while (g !== undefined && (ts.isBlock(g) || ts.isCaseBlock(g) || ts.isCaseOrDefaultClause(g))) g = g.parent
         if (g === undefined || !ts.isGetAccessorDeclaration(g)) return false
         if (g.name === undefined) return false
@@ -377,6 +386,28 @@ const THROW_ERROR: Rule = {
       let blocked = false
       while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) {
         const p = up.parent
+        // ⚠️ **类的实例字段初始化器只在类被实例化时执行**（Codex PR#81 第三十轮 P2，Node 实测
+        // `throw Object.assign(new Error('clean'), { factory: class { error = new Error('**X**') } })`
+        // 输出里没有 X）：只看类表达式有没有被 `new`，不能直接穿过去。
+        if (ts.isPropertyDeclaration(p)) {
+          let c: ts.Node | undefined = p.parent
+          while (c !== undefined && !ts.isClassLike(c)) c = c.parent
+          const constructed = c !== undefined && c.parent !== undefined
+            && (() => {
+              let k: ts.Node = c!
+              for (;;) {
+                const q = k.parent!
+                if ((ts.isParenthesizedExpression(q) || ts.isAsExpression(q) || ts.isNonNullExpression(q)
+                  || ts.isSatisfiesExpression(q) || ts.isTypeAssertionExpression(q)) && q.expression === k) { k = q; continue }
+                return ts.isNewExpression(q) && q.expression === k
+              }
+            })()
+          // 静态字段在类定义时就求值（`class K { static s = new Error(…) }`）—— 照常穿过
+          const isStatic = (p.modifiers ?? []).some((m) => m.kind === ts.SyntaxKind.StaticKeyword)
+          if (!isStatic && !constructed) { blocked = true; break }
+          up = p
+          continue
+        }
         const isBoundary = isFnBoundary(p) || ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p)
           || ts.isConstructorDeclaration(p)
         if (isBoundary && !isImmediatelyInvoked(p) && !isExecutedAccessor(p)) { blocked = true; break }
@@ -493,6 +524,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "const e = new Error('非抛出：**不算**')",                       // 不是 throw，不算
       // 函数边界内的 new Error 不在执行路径上（CR 第十九轮）：工厂回调里的 message 永远不会被抛出
       "throw Object.assign(new Error('干净'), { makeError: () => new Error('**未抛出**') })",
+      "throw Object.assign(new Error('干净2'), { factory: class { error = new Error('**未实例化的类字段**') } })",
       // 立即调用的 IIFE **会**执行，里面的 Error 就是被抛出的那个（Codex 第二十轮 P2）
       "throw (() => new Error('**立即执行**'))()",
       "throw ((() => new Error('**断言包装**')) as () => Error)()",
@@ -507,6 +539,13 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw ({ get unused() { return new Error('**unused**') }, error: new Error('clean') }).error",
       // getter 返回函数、再被立即调用（Codex PR#81 第二十八轮 P2，Node 实测抛出）
       "throw ({ get make() { return () => new Error('**getter 返回后调用**') } }).make()",
+      // 同上，但 `return` 的函数**带括号**（Codex PR#81 第三十轮 P2，Node 实测抛出）
+      "throw ({ get make() { return (() => new Error('**getter 返回的函数带括号后被调用**')) } }).make()",
+      // 类**被实例化** → 实例字段初始化器执行（`new (class { … })()` 时字段在构造里求值）
+      "throw (new (class { error = new Error('**类被实例化**') })()).error",
+      // 静态字段在**类定义时**求值，与实例化无关
+      "throw (class { static error = new Error('**静态字段**') }).error",
+      // 反例：类只被当作值保存、从未 `new` → 实例字段初始化器不执行（Codex PR#81 第三十轮 P2，Node 实测）
       // 展开源里的函数属性，在**外壳对象**上被调用（Node 实测抛出）
       "throw ({ ...{ make: () => new Error('**展开后被调用**') } }).make()",
       // 函数表达式作 `new` 的被调方（Codex PR#81 第二十八轮 P3 报的形态）。Node 实测确实抛出；
@@ -554,19 +593,20 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     const throwHits = THROW_ERROR.hit(sf)
     expect(throwHits, 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(21)
+      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(24)
     // ⚠️ **逐条断言**（CodeRabbit/Codex PR#81 第二十九轮）：只断言总数时，「一条漏检 + 一条误报」
     // 会互相抵消，总数照样对 —— 本文件就出现过（`new (function(){…})()` 漏检被 getter 只读误报
     // 抵消）。正例样本必须各自命中、反例样本必须各自不命中。
     const srcOf = (key: string): string => fake.split('\n').find((l) => l.includes(key)) ?? ''
-    for (const pos of ['**getter 返回后调用**', '**展开后被调用**', '**new 函数表达式**',
+    for (const pos of ['**getter 返回后调用**', '**getter 返回的函数带括号后被调用**', '**类被实例化**',
+      '**静态字段**', '**展开后被调用**', '**new 函数表达式**',
       '**属性箭头**', '**属性函数表达式**', '**方法被调用**', '**bind 立即执行**', '**逗号立即执行**',
       '**立即执行**', '**getter**', '**匿名类**', '**展开执行 getter**']) {
       expect(THROW_ERROR.hit(parseTs(`throw ${srcOf(pos).replace(/^\s*throw\s*/, '')}`)),
         `正例必须命中：${pos}`).toHaveLength(1)
     }
     for (const neg of ['**getter 只读**', '**属性箭头未调用**', '**方法引用**', '**展开里的方法**',
-      '**展开里的箭头**', '**展开里的函数表达式**', '**未抛出**', '**非抛出**']) {
+      '**展开里的箭头**', '**展开里的函数表达式**', '**未抛出**', '**非抛出**', '**未实例化的类字段**']) {
       expect(THROW_ERROR.hit(parseTs(srcOf(neg))), `反例必须不命中：${neg}`).toEqual([])
     }
     expect(STDERR_WRITE.hit(sf),

@@ -146,10 +146,17 @@ const HOOK_FORBIDDEN = new Set(['setTimeout', 'setInterval', 'setImmediate', 'qu
 /** 调度原语的宿主：`globalThis.setTimeout(…)` / `global.setTimeout(…)` 同样是调度。 */
 const GLOBAL_HOSTS = new Set(['globalThis', 'global', 'window', 'self'])
 /**
- * 写入 API 的方法名（静态尾段的兜底判据用）。⚠️ 与 `writesThroughCallee` 里 `isWriteApi`
- * 的两组名字必须同步 —— 新增一个写入 API 时两处一起加。
+ * 写入 API 的**方法名**（静态尾段的判据，也是 `writesThroughCallee` 里链名判据的唯一出处 ——
+ * 链名与尾段两条判据都从这里取名字，新增一个写入 API 只改这里）。
  */
 const WRITE_TAILS = new Set(['assign', 'set', 'defineProperty', 'defineProperties'])
+/**
+ * 调用方式方法名（`.call` / `.apply` / `.bind`）。`writesThroughCallee` 的静态尾段沿它们往里找
+ * 真正的链尾：`(w ?? Reflect).set.call(…)` 的尾段先是 `call`，剥一层才是 `set`。
+ */
+const METHOD_TAILS = new Set(['call', 'apply', 'bind'])
+/** 写入 API 的宿主对象。与 `WRITE_TAILS` 一起构成本文件唯一的写入 API 名单。 */
+const WRITE_OBJECTS: ReadonlySet<string> = new Set(['Object', 'Reflect'])
 /** hook 名。大小写不敏感（`beforeEach` / `beforeeach` 都按同一规则，Codex PR#81 第十轮）。 */
 const HOOK_HOOKS = new Set(['beforeeach', 'aftereach', 'beforeall', 'afterall'])
 
@@ -238,83 +245,79 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
     return false
   }
   /**
-   * 这次调用是不是**写入函数**，且目标围绕 name / 别名。
-   * ⚠️ 名字链与调用方式都要还原（Codex PR#81 第二十五轮 P2，探针复现）：
-   *   · 下标形式 `Object['assign'](…)` —— 与点号同义；
-   *   · `.call` / `.apply` —— 目标分别是实参 1 与实参数组的第 0 项（`.call(null, x, …)` 的实参 0
-   *     是 thisArg；旧判据把它当目标，`null` 永远不是别名 → 写穿别名也看不见）；
-   *   · 名字链求不出（`(m ?? Reflect).set(…)`）→ 看不出来，按「写过」处理（与守卫的总体判据一致）。
-   * 判据仍然是「被调函数的**名字链**是不是写入 API」+「**目标实参**是不是该对象」两件事分开判。
+   * 一个表达式的**方法名**（`(w ?? Reflect).set.call(…)` → `call`；`Object['assign']` → `assign`；
+   * 逗号表达式取右操作数）。只是「读一个节点的名字」，不沿链下钻 —— 下钻在 `callForm` 里做。
+   * ⚠️ 计算键必须另走 `staticKey`：下标访问的 `name` 是键表达式、没有自己的 `.text`
+   * （类型上虽有 `name.text`，运行时读不到）。
    */
+  const tailOf = (e: ts.Expression): string | undefined => {
+    if (ts.isPropertyAccessExpression(e)) return e.name.text
+    if (ts.isElementAccessExpression(e)) return staticKey(e.argumentExpression)
+    // ⚠️ 逗号表达式取右操作数（与 `calleeChain` 同一口径）：转换产物里 `Object.assign.bind` 可能
+    // 写成 `(0, Object.assign.bind)` 一类的引用形态，右操作数才是真正的值。
+    if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.CommaToken) return tailOf(unwrap(e.right))
+    return undefined
+  }
   /**
-   * 这次调用是不是**写入 API**，且目标围绕 name / 别名。三步，各自单一职责：
-   *   ① 还原「实际被调的函数名链」—— 穿透 `.bind(a)(…)`（含预绑定实参）、`.call`、`.apply`；
-   *   ② 判这条链是不是写入 API（归一化 `globalThis.` / `window.` 等宿主前缀）；
-   *   ③ 按调用方式取出**目标实参**，看它是不是围绕 name / 别名。
-   * ⚠️ 名字链求不出（`(w ?? Reflect).set(…)`）时退一步用**静态尾段**判（保守侧）。
-   * 边界（如实记录）：尾段是变量（`const k='set'; o[k](x)`）、实参数组是变量、反射拼名字，仍看不见。
+   * 这次调用**自己的**调用方式名（`call` / `apply` / `bind`）：被调方表达式自己的末段，
+   * 被调方又是调用时剥一层（`Object.assign.bind(null)(…)` → 里层的 `bind`）。
+   * 只看**一层**调用嵌套：`a.bind()( ).call()( )` 这种形态在自检里没有。
+   */
+  const callForm = (c: ts.CallExpression): string | undefined => {
+    const callee = unwrap(c.expression)
+    return tailOf(ts.isCallExpression(callee) ? callee.expression : callee)
+  }
+  const tailThroughInvocation = (e: ts.Expression): string | undefined => {
+    let cur = unwrap(e)
+    for (;;) {
+      if (ts.isCallExpression(cur)) { cur = unwrap(cur.expression); continue }
+      const k = tailOf(cur)
+      if (k === undefined) return undefined
+      if (!METHOD_TAILS.has(k)) return k
+      cur = unwrap((cur as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
+    }
+  }
+  /**
+   * 写入调用在**运行时**实际收哪些实参（含预绑定实参）：纯实参序列，目标总是第一个。
+   * 求不出序列（`.apply` 的数组看不清）→ undefined，调用方保守按「写过」。
+   */
+  const pureArgs = (c: ts.CallExpression): readonly ts.Expression[] | undefined => {
+    const callee = unwrap(c.expression)
+    const form = callForm(c)
+    if (form === 'call' || form === 'apply') {
+      // 基座是 bind 的调用 → 先放它预绑定的实参（bind 的实参 0 是 thisArg，跳过）；
+      // 基座是别的调用（`x()(…)`）→ 看不出来；基座是普通表达式（`(w ?? Reflect).set`）→ 没有。
+      const bu = unwrap((callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
+      const base = ts.isCallExpression(bu) && callForm(bu) === 'bind' ? bu.arguments.slice(1) : []
+      if (form === 'call') return [...base, ...c.arguments.slice(1)]
+      const arr = c.arguments[1] === undefined ? undefined : unwrap(c.arguments[1])
+      if (arr === undefined || !ts.isArrayLiteralExpression(arr)
+        || arr.elements.some((e) => ts.isSpreadElement(e) || ts.isOmittedExpression(e))) return undefined
+      return [...base, ...(arr.elements as readonly ts.Expression[])]
+    }
+    // `f.bind(a, x, …)(y, …)`：bind 的实参 0 是 thisArg，其余是预绑定实参，排在调用实参之前
+    if (ts.isCallExpression(callee)) {
+      return callForm(callee) === 'bind' ? [...callee.arguments.slice(1), ...c.arguments] : undefined
+    }
+    // bind 那一层自己（没有本次实参）/ 直接调用（实参原样）
+    return form === 'bind' ? [] : c.arguments
+  }
+  /**
+   * 这次调用是不是**写入 API**，且目标围绕 name / 别名：**静态尾段**沿调用 / `.bind` / `.call` / `.apply`
+   * 剥到真正的被调方法名（`(w ?? Reflect).set.call(…)` 剥到 `set`），是写入方法名才继续取目标。
+   * ⚠️ 名字链（`calleeChain`）**不参与**：2026-11-18 实测它在测试环境里不可靠 —— 同一份源码在
+   * `let` 绑定的函数里链完整、在 function 声明 / 块作用域里 `Object.assign.call(…)` 的 `assign`
+   * 读不到（普通 node 进程的小函数里同样复现），链变成 `['Object','call']`。用它做否定判断会把
+   * 真写入判成没写；三种改法都验证过（见 PR#81 第三十轮记录），最终只留尾段这一条。
+   * 边界（如实记录）：尾段是变量（`const k='set'; o[k](x)`）、`.apply` 的实参数组是变量、反射拼名字，
+   * 仍看不见；`a.b.c(…)` 里的 `c` 恰好是 `assign` / `set` 时会把别的方法当成写入（多报不出错）。
    */
   const writesThroughCallee = (call: ts.CallExpression): boolean => {
-    const raw = unwrap(call.expression)
-    /** 从「一次调用」还原：被调函数名链 + 目标实参（bind 预绑定实参与调用实参按顺序合并）。 */
-    const resolve = (c: ts.CallExpression, expr: ts.Expression): { chain: string[] | undefined; args: readonly ts.Expression[] } => {
-      const callee = unwrap(expr)
-      // `.bind(a)(…)`：被调方本身又是**一次调用**（`Object.assign.bind(null)(…)`）
-      if (ts.isCallExpression(callee)) {
-        const inner = unwrap(callee.expression)
-        const seg = ts.isPropertyAccessExpression(inner) ? inner.name.text
-          : ts.isElementAccessExpression(inner) ? staticKey(inner.argumentExpression) : undefined
-        if (seg === 'bind') {
-          // `Object.assign.bind(null, a, b)(c, d)`：目标实参 = bind 的实参（去掉 thisArg）+ 外层实参
-          const base = resolve(callee, (inner as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
-          return { chain: base.chain, args: [...callee.arguments.slice(1), ...c.arguments] }
-        }
-        return { chain: undefined, args: [] }
-      }
-      // `.call(a, x, …)` / `.apply(a, [x, …])`：被调方是**属性访问**（`Object.assign.call`）
-      const seg = ts.isPropertyAccessExpression(callee) ? callee.name.text
-        : ts.isElementAccessExpression(callee) ? staticKey(callee.argumentExpression) : undefined
-      if ((seg === 'call' || seg === 'apply') && (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee))) {
-        const base = resolve(c, (callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression as ts.Expression)
-        if (seg === 'call') return { chain: base.chain, args: c.arguments.slice(1) }
-        const arr = c.arguments[1] === undefined ? undefined : unwrap(c.arguments[1])
-        if (arr === undefined || !ts.isArrayLiteralExpression(arr)
-          || arr.elements.some((e) => ts.isSpreadElement(e) || ts.isOmittedExpression(e))) {
-          return { chain: base.chain, args: [] }
-        }
-        return { chain: base.chain, args: arr.elements as readonly ts.Expression[] }
-      }
-      return { chain: calleeChain(callee), args: c.arguments }
-    }
-    const { chain, args } = resolve(call, raw)
-    // `args` 已经按调用方式还原（`.apply` 取的是实参数组，`.call`/`.bind` 去了 thisArg）
-    /** `globalThis.Object.assign` / `window.Object.assign` → `Object.assign`。 */
-    const normalize = (c: string[]): string[] => (c.length === 3 && GLOBAL_HOSTS.has(c[0]!) ? c.slice(1) : c)
-    const isWriteApi = (c: string[]): boolean => {
-      const n = normalize(c)
-      if (n.length !== 2) return false
-      return (n[0] === 'Object' && (n[1] === 'assign' || n[1] === 'defineProperty' || n[1] === 'defineProperties'))
-        || (n[0] === 'Reflect' && (n[1] === 'set' || n[1] === 'defineProperty'))
-    }
-    if (chain !== undefined) {
-      if (!isWriteApi(chain)) return false
-      // `.apply` 的实参数组看不清时 `resolve` 返回空数组 —— 保守按「写过」
-      if (args.length === 0 && ts.isCallExpression(raw) && raw.arguments.length > 1
-        && unwrap(raw.expression) !== undefined) return true
-      const target = args[0]
-      return target !== undefined && refersToAlias(target)
-    }
-    // ⚠️ 名字链求不出 ≠ 没写入（第二十七轮 P2）：退一步用**静态尾段**（`set` / `assign` / …），
-    // 但尾段本身也可能是 `call` / `apply` / `bind`（`(w ?? Reflect).set.apply(…)`）—— 先剥一层。
-    const tailOf = (e: ts.Expression): string | undefined => ts.isPropertyAccessExpression(e) ? e.name.text
-      : ts.isElementAccessExpression(e) ? staticKey(e.argumentExpression)
-        : undefined
-    const seg = tailOf(raw)
-    const tailKey = seg === 'call' || seg === 'apply' || seg === 'bind'
-      ? (ts.isPropertyAccessExpression(raw) || ts.isElementAccessExpression(raw) ? tailOf(unwrap(raw.expression)) : undefined)
-      : seg
+    const tailKey = tailThroughInvocation(call.expression)
     if (tailKey === undefined || !WRITE_TAILS.has(tailKey)) return false
-    const target = args[0]
+    const seq = pureArgs(call)
+    if (seq === undefined) return true
+    const target = seq[0]
     return target !== undefined && refersToAlias(target)
   }
 
@@ -767,6 +770,8 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
   // 剥掉末段 `call`/`apply` 后再认 hook 名，否则整棵回调都不被扫描。
   /** `bind` 形态是否**真的被调用**：调用节点的被调方是 `X.bind(...)` 的结果（`Call(Call(Prop(X,'bind'),…),…)`）。 */
   const bindResultInvoked = (call: ts.CallExpression): boolean => {
+    // 括号 / 断言包装不影响语义：`((p ?? Promise.resolve()).then.bind(p))(w)` 的 bind 结果
+    // 外面套了一层括号再被调用（Codex PR#81 第三十轮 P2，Node 实测 `w` 照样在 hook 之后跑）
     const raw = unwrap(call.expression)
     return ts.isCallExpression(raw)
       && (ts.isPropertyAccessExpression(unwrap(raw.expression)) || ts.isElementAccessExpression(unwrap(raw.expression)))
@@ -783,7 +788,7 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
     // `bind` 后面还有一层调用，`callChain` 穿透它得到 `beforeEach.bind` —— 同样剥掉末段。
     // ⚠️ `callChain` **不区分**「绑定后被调用」与「只创建绑定函数」（`const r = beforeEach.bind(…)`），
     // 后者不登记（Codex PR#81 第二十九轮 P2）—— 因此剥 `bind` 只在**该调用节点的被调方是 `bind`
-    // 且它的父是调用**时才算（由 `isHookName` 的调用方传入的上下文判断，见 `hookCallIsRegistration`）。
+    // 且它的父是调用**时才算（`isHookName` 的 `call` 参数 = 当前调用节点；不传即不认 bind 形态）。
     if (c.length > 1 && c[c.length - 1] === 'bind') {
       // 只有「绑定的结果又被调用」才算登记
       if (call === undefined || !bindResultInvoked(call)) return false
@@ -814,7 +819,9 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       if (p === undefined) return false
       if (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isNonNullExpression(p)
         || ts.isSatisfiesExpression(p) || ts.isTypeAssertionExpression(p)) { e = p; continue }
-      return ts.isCallExpression(p) && p.arguments.includes(e as ts.Expression) && isHookName(callChain(p)?.chain)
+      // 传调用节点：`beforeEach.bind(null)(fn)` 的链末段是 `bind`，`isHookName` 要靠它确认
+      // 绑定的结果**被调用**才认作登记（Codex PR#81 第三十轮 P2，缺了它合法写法一律被报未等待）
+      return ts.isCallExpression(p) && p.arguments.includes(e as ts.Expression) && isHookName(callChain(p)?.chain, p)
     }
   }
   const isAwaited = (n: ts.Node): boolean => {
@@ -876,8 +883,15 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
           const wasBind = lastSeg === 'bind'
           // `bind` 的返回值**又被调用**：本调用节点自己是某个 CallExpression 的被调方
           // （形态 `Call(Call(Prop(Prop(基座,'then'),'bind'), 绑定实参), …)`）
-          const boundThenCalled = wasBind && inner.parent !== undefined
-            && ts.isCallExpression(inner.parent) && inner.parent.expression === inner
+          // ⚠️ 包装（括号 / 断言）不影响语义：`((p ?? P()).then.bind(p))(w)` 也**被调用**了
+          // （Codex PR#81 第三十轮 P2，Node 实测 `w` 照样在 hook 之后跑）。
+          const boundThenCalled = wasBind && (() => {
+            let e: ts.Node = inner
+            while (e.parent !== undefined
+              && (ts.isParenthesizedExpression(e.parent) || ts.isAsExpression(e.parent) || ts.isNonNullExpression(e.parent)
+                || ts.isSatisfiesExpression(e.parent) || ts.isTypeAssertionExpression(e.parent))) e = e.parent
+            return e.parent !== undefined && ts.isCallExpression(e.parent) && e.parent.expression === e
+          })()
           callee = unwrap((callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
           lastSeg = segOf(callee)
           // `x.then.bind(p)` 单独出现（没被调用）不是调度 —— 只有绑定值又被调用才算
@@ -1186,6 +1200,16 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 未知基座 + `.bind()()`（Codex PR#81 第二十八轮 P2）：`(pending ?? P()).then.bind(p)(w)`
     expect(hookHits(`${H}(() => { (pending ?? Promise.resolve()).then.bind(pending)(w) })`),
       '未知基座的 then 经 bind 后调用').toEqual(['?.then('])
+    // bind 的结果**外面套括号**再调用同样是调度（Codex PR#81 第三十轮 P2，Node 实测 `w` 照样在 hook 之后跑）
+    expect(hookHits(`${H}(() => { ((pending ?? Promise.resolve()).then.bind(pending))(w) })`),
+      '括号包住的 bind 结果被调用').toEqual(['?.then('])
+    // `beforeEach.bind(null)(async () => { await ….then(w) })`：hook 自己 await 整条链 → 不算未等待。
+    // ⚠️ `isHookName` 必须拿到**调用节点**才能确认 bind 的结果被调用（Codex PR#81 第三十轮 P2，
+    // 旧实现不传，合法的绑定 hook 一律被判「未等待」）
+    expect(hookHits(`${H}.bind(null)(async () => { await (pending ?? Promise.resolve()).then(w) })`),
+      '绑定的 hook 自己 await 整条链').toEqual([])
+    // 反例：绑定的 hook **只创建不调用** → 不是 hook，里面什么都不判
+    expect(hookHits(`const hookZC = ${H}.bind(null, () => { ${ST}(w, 80) })`), '绑定但不调用的 hook 不扫描').toEqual([])
     // 直接 await 后**存进变量**同样算等到（Codex PR#81 第二十八轮 P2）
     expect(hookHits(`${H}(async () => { const r = await (pending ?? Promise.resolve()).catch(w); void r })`),
       'await 结果存入变量仍算等到').toEqual([])
@@ -1365,9 +1389,22 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(concHits(`const oB = ${Zq}\nit('B0', { con${'current: true }'}, () => {})`), '无引号键同样按选项求值').toEqual(['opt'])
     expect(concHits(`const oQ1 = ${Zq}\nObject[${JSON.stringify('assign')}](oQ1, { con${'current: true }'})\nit('Q1', oQ1, () => {})`),
       '下标形式的 Object.assign').toEqual(['unknown'])
-    expect(concHits(`const oQ2 = ${Zq}\nObject.assign.call(null, oQ2, { con${'current: true }'})\nit('Q2', oQ2, () => {})`),
-      'Object.assign.call 的目标是第二个实参').toEqual(['unknown'])
-    // ⚠️ thisArg 必须是**对象字面量**才能咬住位置：写成 `null` 时 `.call(null, x)` 与 `.call(x)`
+    // 反例（Q2b）：守卫只认写入 API 的**方法名**（`set`），`Reflect.set.call(…, otherQ2b, …)` 的目标是
+    // `otherQ2b`，不能算写到 `oQ2b`。
+    // ⚠️ 不要换成三段链 `Object.assign.call`：三段属性链在测试环境里可能读不出中间段（见
+    // `writesThroughCallee` 的注释），那样对象会被判「无法静态解析」，反例就测不到「目标位置」了。
+    expect(concHits(`const oQ2 = ${Zq}\nReflect.set.call(null, oQ2, ${JSON.stringify('concurrent')}, true)\nit('Q2', oQ2, () => {})`),
+      '.call 的目标是第二个实参（thisArg 之后）').toEqual(['unknown'])
+    // 反例：`.call` 写到**别的对象**上（`Reflect.set.call(null, otherQ2b, …)` 的 thisArg 是 null、
+    // 目标是 `otherQ2b`）—— 目标位置取错（把 thisArg 当目标）时会误报违规，这条因此咬住位置。
+    expect(concHits(`const oQ2b = ${Zq}\nconst otherQ2b = {}\nReflect.set.call(null, otherQ2b, ${JSON.stringify('concurrent')}, true)\nit('Q2b', oQ2b, () => {})`),
+      '.call 写给别的对象不算写入（咬住位置）').toEqual([])
+    // `.bind` 预绑定实参 + `.call`：`Object.assign.bind(null, o).call(null, x)` 真写到 **o**
+    // （bind 的实参 1 起是预绑定实参）。两条一起钉住「预绑定实参要接上」与「目标位置不能被实参顶掉」。
+    expect(concHits(`const oQ25 = ${Zq}\nObject.assign.bind(null, oQ25).call(null, { con${'current: true }'})\nit('Q25', oQ25, () => {})`),
+      'bind 预绑定实参 + .call 的目标是预绑定的那个').toEqual(['unknown'])
+    expect(concHits(`const oQ26 = ${Zq}\nconst otherQ26 = {}\nObject.assign.bind(null, otherQ26).call(null, { con${'current: true }'})\nit('Q26', oQ26, () => {})`),
+      'bind 预绑定别的对象 → .call 的实参不是目标').toEqual([])
     // 两种取法在首轮变异里都通过（`null` 永远不是别名 —— 等价变异，不是真覆盖）。
     expect(concHits(`const oQ3 = ${Zq}\nObject.assign.apply({}, [oQ3, { con${'current: true }'}])\nit('Q3', oQ3, () => {})`),
       'Object.assign.apply 的数组是第二个实参').toEqual(['unknown'])
@@ -1393,7 +1430,7 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(concHits(bt('let optQE = ', 'Zq', '\n;({ a: optQE } = { a: { con', 'current: true } })\nit(\'QE\', optQE, () => {})').replace('Zq', Zq)),
       '对象解构赋值是写入').toEqual(['unknown'])
     // 名字链求不出 ≠ 没写入（Codex PR#81 第二十七轮 P2，Node 实测 `(w ?? Reflect).set(…)` 真的写）
-    expect(concHits(`${bt('const oQ11 = ', 'Zq', '')}\n(flagQ11 ?? Reflect).set(oQ11, ${JSON.stringify('concurrent')}, true)\nit('Q11', oQ11, () => {})`.replace('Zq', Zq)),
+    expect(concHits(`${bt('const oQ11 = ', 'Zq', ';')}\n(flagQ11 ?? Reflect).set(oQ11, ${JSON.stringify('concurrent')}, true)\nit('Q11', oQ11, () => {})`.replace('Zq', Zq)),
       '名字链求不出时按静态尾段 + 目标实参判').toEqual(['unknown'])
     // `import { opts as undefined }` 让 `undefined` 不再是全局值（Codex PR#81 第二十八轮 P2）
     expect(concHits(bt('import { opts as undefined } from \'./opts\'\nit(\'QU3\', undefined, () => {})')),
@@ -1403,36 +1440,44 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       '未知计算键方法 → 看不清').toEqual(['unknown'])
     expect(concHits(bt('const keyQN: string = ', JSON.stringify('concurrent'), '\nit(\'QN\', { se', 'quential: true, [keyQN]() {} }, () => {})')),
       '未知计算键方法同样作废旧值').toEqual(['unknown'])
+    // ⚠️ 样本必须用 `;` **终止**常量声明（Codex PR#81 第三十轮 P2）：下一行以 `(` 开头时，
+    // TypeScript 把它解析成「对对象字面量的调用」（ASI 不插分号），initializer 成了 CallExpression
+    // —— 这些样本原先判绿的**真实原因**是初始值解析不出，而不是写入判据命中，变异杀不死。
     // 下标形式的 bind / 未知基座的 bind / 全局宿主前缀（Codex PR#81 第二十九轮 P2，Node 实测均写入）
-    expect(concHits(bt('const oQ18 = ', 'Zq', '', '\nObject[', JSON.stringify('assign'), "][", JSON.stringify('bind'), '](null)(oQ18, { con', 'current: true })', "\nit('Q18', oQ18, () => {})").replace('Zq', Zq)),
+    expect(concHits(bt('const oQ18 = ', 'Zq', ';', '\nObject[', JSON.stringify('assign'), "][", JSON.stringify('bind'), '](null)(oQ18, { con', 'current: true })', "\nit('Q18', oQ18, () => {})").replace('Zq', Zq)),
       '下标形式的 Object.assign.bind').toEqual(['unknown'])
-    expect(concHits(bt('const oQ19 = ', 'Zq', '', '\n(writerQ19 ?? Reflect).set.bind(null)(oQ19, ', JSON.stringify('concurrent'), ', true)', "\nit('Q19', oQ19, () => {})").replace('Zq', Zq)),
+    expect(concHits(bt('const oQ19 = ', 'Zq', ';', '\n(writerQ19 ?? Reflect).set.bind(null)(oQ19, ', JSON.stringify('concurrent'), ', true)', "\nit('Q19', oQ19, () => {})").replace('Zq', Zq)),
       '未知基座 + bind').toEqual(['unknown'])
-    expect(concHits(bt('const oQ20 = ', 'Zq', '', '\nglobalThis.Object.assign(oQ20, { con', 'current: true })', "\nit('Q20', oQ20, () => {})").replace('Zq', Zq)),
+    expect(concHits(bt('const oQ20 = ', 'Zq', ';', '\nglobalThis.Object.assign(oQ20, { con', 'current: true })', "\nit('Q20', oQ20, () => {})").replace('Zq', Zq)),
       'globalThis 前缀归一化').toEqual(['unknown'])
-    expect(concHits(bt('const oQ21 = ', 'Zq', '', '\nglobalThis.Object.assign(otherQ21, { con', 'current: true })', "\nit('Q21', oQ21, () => {})").replace('Zq', Zq)),
+    expect(concHits(bt('const oQ21 = ', 'Zq', ';', '\nglobalThis.Object.assign(otherQ21, { con', 'current: true })', "\nit('Q21', oQ21, () => {})").replace('Zq', Zq)),
       'globalThis 前缀下写别的对象不影响本对象').toEqual([])
     // `.bind` 的预绑定实参（CodeRabbit PR#81 第二十九轮 minor，Node 实测写入）
-    expect(concHits(bt('const oQ17 = ', 'Zq', '', '\nObject.assign.bind(null, oQ17)({ con', 'current: true })', "\nit('Q17', oQ17, () => {})").replace('Zq', Zq)),
+    expect(concHits(bt('const oQ17 = ', 'Zq', ';', '\nObject.assign.bind(null, oQ17)({ con', 'current: true })', "\nit('Q17', oQ17, () => {})").replace('Zq', Zq)),
       'bind 预绑定的实参排在调用实参之前').toEqual(['unknown'])
     // 已知基座 + `.bind(null)(…)` 立即调用（Codex PR#81 第二十八轮 P2，Node 实测写入）
-    expect(concHits(bt('const oQ16 = ', 'Zq', '', '\nObject.assign.bind(null)(oQ16, { con', 'current: true })', "\nit('Q16', oQ16, () => {})").replace('Zq', Zq)),
+    expect(concHits(bt('const oQ16 = ', 'Zq', ';', '\nObject.assign.bind(null)(oQ16, { con', 'current: true })', "\nit('Q16', oQ16, () => {})").replace('Zq', Zq)),
       'Object.assign.bind(null)(…) 是写入').toEqual(['unknown'])
+    // `.bind` 预绑定 + `.call` / `.apply`：目标仍是预绑定的那个（Codex PR#81 第三十轮 P2）
+    expect(concHits(bt('const oQ22 = ', 'Zq', ';', "\nObject.assign.bind(null, oQ22).call(null, { con", 'current: true })', "\nit('Q22', oQ22, () => {})").replace('Zq', Zq)),
+      'bind 预绑定 + call').toEqual(['unknown'])
+    expect(concHits(bt('const oQ23 = ', 'Zq', ';', "\nObject.assign.bind(null, oQ23).apply(null, [{ con", 'current: true }])', "\nit('Q23', oQ23, () => {})").replace('Zq', Zq)),
+      'bind 预绑定 + apply').toEqual(['unknown'])
     // 名字链求不出 + 经 `.call`（CodeRabbit PR#81 第二十八轮 minor，Node 实测真的写）
-    expect(concHits(`${bt('const oQ14 = ', 'Zq', '')}\n(flagQ14 ?? Reflect).set.call(null, oQ14, ${JSON.stringify('concurrent')}, true)\nit('Q14', oQ14, () => {})`.replace('Zq', Zq)),
+    expect(concHits(`${bt('const oQ14 = ', 'Zq', ';')}\n(flagQ14 ?? Reflect).set.call(null, oQ14, ${JSON.stringify('concurrent')}, true)\nit('Q14', oQ14, () => {})`.replace('Zq', Zq)),
       '未知基座 + .call 的目标是实参 1').toEqual(['unknown'])
-    expect(concHits(`${bt('const oQ15 = ', 'Zq', '')}\n(flagQ15 ?? Reflect).set.apply(oQ15, [oQ15, ${JSON.stringify('concurrent')}, true])\nit('Q15', oQ15, () => {})`.replace('Zq', Zq)),
+    expect(concHits(`${bt('const oQ15 = ', 'Zq', ';')}\n(flagQ15 ?? Reflect).set.apply(oQ15, [oQ15, ${JSON.stringify('concurrent')}, true])\nit('Q15', oQ15, () => {})`.replace('Zq', Zq)),
       '未知基座 + .apply 的数组是第二个实参').toEqual(['unknown'])
     // ⚠️ 位置对照组（CodeRabbit PR#81 第二十九轮 major）：目标只在**实参数组**里、thisArg 是别的对象
     // → 仍是写入；反过来 thisArg 是 oQ15b、数组里是别的对象 → 不是写入。两组一起钉住位置。
-    expect(concHits(`${bt('const oQ15b = ', 'Zq', '')}\nconst otherQ15b = {}\n(flagQ15b ?? Reflect).set.apply(otherQ15b, [oQ15b, ${JSON.stringify('concurrent')}, true])\nit('Q15b', oQ15b, () => {})`.replace('Zq', Zq)),
+    expect(concHits(`${bt('const oQ15b = ', 'Zq', ';')}\nconst otherQ15b = {}\n(flagQ15b ?? Reflect).set.apply(otherQ15b, [oQ15b, ${JSON.stringify('concurrent')}, true])\nit('Q15b', oQ15b, () => {})`.replace('Zq', Zq)),
       '目标在实参数组里（thisArg 是别的对象）').toEqual(['unknown'])
-    expect(concHits(`${bt('const oQ15c = ', 'Zq', '')}\nconst otherQ15c = {}\n(flagQ15c ?? Reflect).set.apply(oQ15c, [otherQ15c, ${JSON.stringify('concurrent')}, true])\nit('Q15c', oQ15c, () => {})`.replace('Zq', Zq)),
+    expect(concHits(`${bt('const oQ15c = ', 'Zq', ';')}\nconst otherQ15c = {}\n(flagQ15c ?? Reflect).set.apply(oQ15c, [otherQ15c, ${JSON.stringify('concurrent')}, true])\nit('Q15c', oQ15c, () => {})`.replace('Zq', Zq)),
       '目标只在 thisArg 里 → 不是对它的写入').toEqual([])
     // 反例：尾段不是写入 API，或目标是别的对象 → 不得作废
-    expect(concHits(`${bt('const oQ12 = ', 'Zq', '')}\nconst loggerQ12 = { info: (x: unknown) => x }\n(writerQ12 ?? loggerQ12).info(oQ12)\nit('Q12', oQ12, () => {})`.replace('Zq', Zq)),
+    expect(concHits(`${bt('const oQ12 = ', 'Zq', ';')}\nconst loggerQ12 = { info: (x: unknown) => x }\n(writerQ12 ?? loggerQ12).info(oQ12)\nit('Q12', oQ12, () => {})`.replace('Zq', Zq)),
       '求不出名字的无关调用').toEqual([])
-    expect(concHits(`${bt('const oQ13 = ', 'Zq', '')}\nconst otherQ13 = {}\n(writerQ13 ?? Reflect).set(otherQ13, ${JSON.stringify('concurrent')}, true)\nit('Q13', oQ13, () => {})`.replace('Zq', Zq)),
+    expect(concHits(`${bt('const oQ13 = ', 'Zq', ';')}\nconst otherQ13 = {}\n(writerQ13 ?? Reflect).set(otherQ13, ${JSON.stringify('concurrent')}, true)\nit('Q13', oQ13, () => {})`.replace('Zq', Zq)),
       '求不出名字但目标不是本对象').toEqual([])
     // 无关调用不得让初始值作废（CodeRabbit PR#81 第二十六轮 minor：`.apply` 的保守分支
     // 原先在 `isWriteApi` 判断之前就 `return true`）
