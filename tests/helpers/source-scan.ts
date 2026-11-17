@@ -262,7 +262,10 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
   for (const p of obj.properties) {
     if (ts.isPropertyAssignment(p)) {
       const k = staticPropKey(p.name, true)
-      if (k !== undefined) out.set(k, p.initializer)
+      // 普通属性**后写覆盖**同名访问器：`{ ...{ get concurrent() { return true } }, concurrent: false }`
+      // 实测按串行登记（Codex PR#81 第二十五轮 P2）—— 不清掉访问器标记，调用方会把合法串行
+      // 报成「值运行时才知道」。
+      if (k !== undefined) { out.set(k, p.initializer); accessorKeys.delete(k) }
       else {
         // 动态键：键名求不出，可能覆盖**任何**已知键 —— 旧值必须作废
         // （CodeRabbit PR#81 第二十二轮 minor：只置标记而保留旧值，`{ concurrent: true,
@@ -273,6 +276,7 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
       }
     } else if (ts.isShorthandPropertyAssignment(p)) {
       out.set(p.name.text, p.name)
+      accessorKeys.delete(p.name.text)
     } else if (ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) {
       // 访问器的值只有在求值时才知道 —— 它能覆盖**它自己那个键**。
       // ⚠️ 计算键也要认静态字面量（`get ['concurrent']()`）：传 false 会把字面量键当成

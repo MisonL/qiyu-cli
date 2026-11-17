@@ -47,6 +47,23 @@
 
 ### 修复
 
+- **静态守卫第二组等价写法与两处误报**（2026-11-17，Codex PR#81 第二十五轮 P2 的后半 + CodeRabbit
+  同轮 minor ×2，逐条探针复现）：
+  写入 API 的**名字链与调用方式**都要还原——`Object['assign'](…)`（下标形式）、
+  `Object.assign.call(thisArg, 目标, …)` 与 `Object.assign.apply(thisArg, [目标, …])`（目标分别是
+  **实参 1** 与实参数组的**第 0 项**；`.apply` 的实参数组是**第二个**实参，写成第一个时判据把
+  thisArg 当目标，自检以「写给别的对象」反例咬住）· 别名收集**下潜到全部作用域**（`describe`
+  回调里的 `const a = o; Object.assign(a, …)`）· **建立别名不算写入**（`const a = o` 不改值，
+  原先误报「看不清」）· **同名声明唯一才静态求值**（顶层 `const enabled = true` 被 `describe`
+  回调里的 `enabled` 或函数参数遮蔽时，旧判据在作用域内仍取顶层值——按保守侧整条作废）·
+  数字实参是**超时**不是选项（`it('x', fn, 40_000)` 不再被报「选项位无法静态求值」）·
+  仓库粗筛关键词补 `sequential`（只认 `concurrent` 时套件 `sequential: false` 的文件整片跳过）。
+  每处变异各自变红；其中两条首轮变异**存活**，原因是样本本身有等价形态（`.apply` 的 thisArg 写成
+  `null`、别名与写入相邻）——补「写给别的对象」反例与隔层别名样本后才咬住，另有两条样本因
+  `{"concurrent":false}` 与无引号键混用而**假绿**（判据不认无引号值也照样报 unknown），已统一键写法。
+  另修一处：`isMutated` 用「还原后的名字链尾」判断 `.call/.apply`，而还原后的链尾是 `assign`，
+  这条分支从未对 `Object.assign.call` 生效过。
+
 - **静态守卫再补八种形态，并修掉上一轮两处没真正生效的修复**（2026-11-17，Codex PR#81 第二十五轮
   P2 ×8 + P3 ×1，逐条探针复现）：
   `Object.assign(opts, …)` / `opts['concurrent'] = …` / `Reflect.set` / 复合赋值 / **经别名**的写入

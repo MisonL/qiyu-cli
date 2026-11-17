@@ -161,6 +161,8 @@ const THROW_ERROR: Rule = {
     // 所以复用共享的 `unwrap`（括号 / `as` / 非空断言 / `satisfies`）。
     const isImmediatelyInvoked = (n: ts.Node): boolean => {
       let e: ts.Expression = n as ts.Expression
+      // ⚠️ 一个对象方法的**函数体**不是表达式：从方法处必须经它的**被调形态**判（由调用方传入
+      // 方法节点时的 `e` 起步）。这里 `n` 只会是箭头 / 函数表达式 / 匿名类。
       for (;;) {
         const p = e.parent
         if (p !== undefined && ts.isParenthesizedExpression(p) && p.expression === e) { e = p; continue }
@@ -169,6 +171,21 @@ const THROW_ERROR: Rule = {
           || ts.isSatisfiesExpression(p) || ts.isTypeAssertionExpression(p)) && p.expression === e) {
           e = p as ts.Expression
           continue
+        }
+        // ⚠️ 逗号表达式 `(0, f)(…)` 的被调对象是**最右**操作数（Codex PR#81 第二十五轮 P2，
+        // 探针：`throw (0, () => new Error('**BAD**'))()` 真的抛 —— 下行到 ES5 的模块引用正是这形态）
+        if (p !== undefined && ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.CommaToken
+          && p.right === e) { e = p; continue }
+        // `.bind(thisArg)(…)`：绑定后再调用，函数体照样执行（Codex PR#81 第二十五轮 P2）
+        {
+          const bindCall = p !== undefined && ts.isCallExpression(p) && p.expression === e ? undefined : p
+          const boundName = bindCall !== undefined && ts.isPropertyAccessExpression(bindCall)
+            && bindCall.expression === e ? bindCall.name.text
+            : bindCall !== undefined && ts.isElementAccessExpression(bindCall) && bindCall.expression === e
+              ? staticAccessKey(bindCall.argumentExpression)
+              : undefined
+          if (boundName === 'bind' && bindCall !== undefined && bindCall.parent !== undefined
+            && ts.isCallExpression(bindCall.parent) && bindCall.parent.expression === bindCall) { e = bindCall.parent; continue }
         }
         // 立即执行不止 `f(…)`：`.call(…)` / `.apply(…)` / 标签模板同样会执行到函数体
         // （Codex PR#81 第二十一轮 P2，探针：`(() => new Error('**BAD**')).call(null)` 真的抛）。
@@ -241,7 +258,15 @@ const THROW_ERROR: Rule = {
         : ts.isElementAccessExpression(p) ? staticAccessKey(p.argumentExpression)
         : undefined
       if (accessed === undefined) return false
-      if (ts.isMethodDeclaration(fn)) return fn.name !== undefined && accessed === accessorName(fn.name)
+      // ⚠️ **方法读取只是拿到函数，不执行方法体**（Codex PR#81 第二十五轮 P2，Node 实测：
+      // `({ make() { return … } }).make` 不调用 `make`）—— 方法必须**被调用**（`()` / `.call` /
+      // `.apply` / `.bind()()`）才算执行；getter 则读取即执行。
+      // 被调形态复用 `isImmediatelyInvoked`（`()` / `.call` / `.apply` / `.bind()()` / 逗号表达式
+      // / 标签模板都认）—— 两边各写一份就会分叉。
+      if (ts.isMethodDeclaration(fn)) {
+        if (fn.name === undefined || accessed !== accessorName(fn.name)) return false
+        return isImmediatelyInvoked(p as ts.Node)
+      }
       if (ts.isGetAccessorDeclaration(fn)) return fn.name !== undefined && accessed === accessorName(fn.name)
       return false
     }
@@ -389,6 +414,12 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw (({ get value3() { return new Error('**as 包装**') } }) as { value3: Error }).value3",
       "throw new (class { constructor() { this.e = new Error('**匿名类**') } })().e",
       "throw ({ get unused() { return new Error('**unused**') }, error: new Error('clean') }).error",
+      // 立即执行的派生形态（Codex PR#81 第二十五轮 P2，Node 实测三条都真的抛）
+      "throw (() => new Error('**bind 立即执行**')).bind(null)()",
+      "throw (0, () => new Error('**逗号立即执行**'))()",
+      "throw ({ make() { return new Error('**方法被调用**') } }).make()",
+      // 反例：**只存方法引用、不调用** —— 方法体从不执行（Codex PR#81 第二十五轮 P2）
+      "throw Object.assign(new Error('clean2'), { factory: ({ make() { return new Error('**方法引用**') } }).make })",
       "process.stderr.write('警告：**注意**')",                        // STDERR 命中 1
       "process.stderr.write(`模板：${a}**尾**`)",                      // 模板字面段命中
       "const X_USAGE = `用法：**粗体**`",                              // USAGE_CONST 命中 1
@@ -407,7 +438,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调里的 new Error 不算；没被读到的 getter 不算').toHaveLength(12)
+      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(15)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)
