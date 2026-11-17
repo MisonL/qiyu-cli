@@ -279,6 +279,20 @@ const THROW_ERROR: Rule = {
         if (fn.name === undefined || accessed !== accessorName(fn.name)) return false
         return isImmediatelyInvoked(p as ts.Node)
       }
+      // ⚠️ **函数字面量作为属性值**（`{ make: () => … }` / `{ make: function () {…} }`）同样只能
+      // 经「读取后再调用」执行（Codex PR#81 第二十七轮 P2，Node 实测 `({ make: () => new Error('**BAD**') }).make()`
+      // 真的抛）。`isExecutedAccessor` 的入口只从箭头 / 函数表达式往上找到所属对象字面量，
+      // 到这里说明 `fn` 就是那个字面量本身 —— 与方法是同一判据（名字对得上 + 被调形态）。
+      if (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) {
+        // 属性值是字面量时 `fn.parent` 是 `PropertyAssignment`，名字在看 `obj` 之外的那一层
+        let propName: ts.PropertyName | undefined
+        for (let k: ts.Node | undefined = fn; k !== undefined; k = k.parent) {
+          if (ts.isPropertyAssignment(k)) { propName = k.name; break }
+          if (ts.isObjectLiteralExpression(k)) break
+        }
+        if (propName === undefined) return false
+        return accessed === accessorName(propName) && isImmediatelyInvoked(p as ts.Node)
+      }
       if (ts.isGetAccessorDeclaration(fn)) return fn.name !== undefined && accessed === accessorName(fn.name)
       return false
     }
@@ -434,6 +448,11 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw ({ ...{ make() { return new Error('**展开里的方法**') } }, error: new Error('clean4') }).error",
       // 反例（带星号）：展开源里的**箭头函数属性**同样不执行 —— 必须不报
       "throw ({ ...{ make: () => new Error('**展开里的箭头**') }, error: new Error('clean5') }).error",
+      // 正例：属性值上的箭头 / 函数表达式，读取后**调用**才执行（Codex PR#81 第二十七轮 P2，Node 实测）
+      "throw ({ make: () => new Error('**属性箭头**') }).make()",
+      "throw ({ make: function () { return new Error('**属性函数表达式**') } }).make()",
+      // 反例（带星号）：同一属性**只读不调** —— 不执行
+      "throw Object.assign(new Error('cleanArrow'), { v: ({ make: () => new Error('**属性箭头未调用**') }).make })",
       // 反例（带星号）：展开源里的**函数表达式属性**同理
       "throw ({ ...{ make: function () { return new Error('**展开里的函数表达式**') } }, error: new Error('clean6') }).error",
       // 立即执行的派生形态（Codex PR#81 第二十五轮 P2，Node 实测三条都真的抛）
@@ -460,7 +479,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(16)
+      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(18)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)

@@ -47,6 +47,22 @@
 
 ### 修复
 
+- **静态守卫第三组：Codex 第二十七轮的六条误报/漏检**（2026-11-17，Codex PR#81 第二十七轮
+  P1 ×1 + P2 ×6，逐条探针/Node 复现）：
+  写入 API 的**名字链求不出**时不再当作「没写入」（`(w ?? Reflect).set(opts, …)` 的基座是 `??`
+  表达式，Node 实测真的执行了 `Reflect.set`）—— 退一步按静态尾段（`assign`/`set`/`defineProperty`）
+  与第一个实参判 · **`.bind(null)(…)` 后的立即调用**：hook 登记名（`beforeEach.bind(null)(fn)`）
+  与 hook 体内的调度原语（`setTimeout.bind(null)(w, 80)`）都要还原末段 `bind`，且只对**被调用的**
+  绑定值还原（内层 `f.bind(null)` 自己不是调度，不去重会报两次）· **数字常量超时**
+  （`const TEST_TIMEOUT = 40000; it('x', fn, TEST_TIMEOUT)`）不再被当成无法解析的选项 ·
+  **执行体来自 import、选项在第三实参**（`it('x', handler, { concurrent: false })`）按
+  `parseArguments` 的「第三实参是对象优先」取选项，不再把 handler 报成选项 · **对象属性上的
+  函数字面量**（`({ make: () => new Error('**BAD**') }).make()`）读取后调用同样算执行
+  （只读不调不算）· `undefined` 遮蔽检测**按文件缓存**（同一语法树只遍历一次：仓扫用例
+  10.9s → 1.6s，原先 `api.test.ts` 是 12082 节点 × 114 次登记的全树遍历）。
+  未生效的一处已修：`staticBindingInitializer` 的同名声明计数把 `ts.BindingElement` 也算了进去
+  （它涵盖非解构的名字位），导致同名标识符被误计。六处变异各自变红。
+
 - **静态守卫第二组审查收口（六条误报/漏检 + 一条 Codex 漏检）**（2026-11-17，CodeRabbit PR#81
   第二十六轮 minor ×5 + major ×1、Codex 同轮 P2 ×2，逐条探针复现）：
   **赋值建立的别名**（`let a; a = opts; a.concurrent = true`）原先完全逃过写入判据——别名收集只跟
