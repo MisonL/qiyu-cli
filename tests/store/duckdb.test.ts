@@ -309,6 +309,133 @@ describe('duckdb —— 事务', () => {
     expect(runs, '关闭后的回滚路径不得再进入上下文').toBe(1)
   })
 
+  it('语句下发期间另一条链开启事务 → 该语句被拒、对方事务不丢写（CodeRabbit PR#81 第二十八轮 major）', async () => {
+    // 事故路径（实测复现，见 src/store/duckdb.ts 的 `txEpoch` 注释）：`execSql` 的归属检查在
+    // **下发前**，检查与驱动真正执行之间隔着 await（驱动内部 `runUntilLast` / `prepared.run()`）。
+    // 外部链的语句在这段窗口里，另一条链开了事务 —— 前者就落进后者的事务；它一旦执行期报错
+    // （CAST 失败的 view），所有者 COMMIT 返回成功而写入被静默丢弃（实测 count 从 1 变 0）。
+    //
+    // 复现：经 `deps.importer` 注入包装后的驱动 —— 连接上的 `runAndReadAll` 在真正执行外部
+    // 那条语句前，先等另一条链把事务**完整地**开起来（BEGIN 已发出）。这道闸门位于 `execSql`
+    // 的归属检查**之后**，正是事故窗口的位置。
+    const real = await import('@duckdb/node-api')
+    let release!: () => void
+    let gate: Promise<void> | undefined = undefined
+    let holdNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          return {
+            ...(inst as object),
+            connect: async () => {
+              const c = await (inst as { connect: () => Promise<unknown> }).connect()
+              return {
+                ...(c as object),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  const target = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown> }
+                  if (holdNext && sql.includes('bad_cast_q28')) {
+                    holdNext = false
+                    gate = new Promise<void>((r) => { release = r })
+                    await gate
+                  }
+                  return target.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const orig = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
+    await orig.call(s, "CREATE VIEW bad_cast_q28 AS SELECT CAST('x' AS INT) AS v")
+    holdNext = true
+    const outside = s.query('SELECT * FROM bad_cast_q28').then(() => 'ok', (e: unknown) => e)
+    // 等外部语句通过归属检查、停在驱动闸门上
+    for (let i = 0; i < 200 && gate === undefined; i++) await new Promise((r) => setImmediate(r))
+    expect(gate, '前提：外部语句确实停在下发之前的窗口里').toBeDefined()
+    // 窗口内开事务并写一行；BEGIN 发出后再放行外部语句
+    let began!: () => void
+    const beganP = new Promise<void>((r) => { began = r })
+    const tx = s.transaction(async (t) => {
+      began()
+      await new Promise((r) => setTimeout(r, 80))   // 等外部语句在事务里下发完
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+    })
+    await beganP
+    await new Promise((r) => setTimeout(r, 20))
+    release()
+    const outsideErr = await outside
+    const txErr = await tx.then(() => null, (e: unknown) => e)
+    expect(outsideErr, '窗口内下发的语句必须被拒绝（internal），不能静默落进别人的事务')
+      .toMatchObject({ kind: 'internal' })
+    // ⚠️ 这条语句是**执行期**报错的（CAST 失败在服务端才发生），事务已被标成 aborted —— 那一步
+    // 无法撤销。判据要保证的是**不静默**：所有者随后无论 COMMIT 还是写都会响亮失败（原先
+    // COMMIT 返回成功、写入被丢弃、count 从 1 变 0）。这里断言「要么成功且行在，要么失败且行不在」。
+    const rows = await s.count('tags')
+    expect(rows, '事务失败时其写入不得部分残留；成功时必须完整在库里')
+      .toBe(txErr === null ? 2 : 1)
+  })
+
+  it('语句下发期间另一条链开启事务（语句本身成功）→ 同样被拒（CodeRabbit PR#81 第二十八轮 major）', async () => {
+    // 成功路径与失败路径共用同一个判据（`txEpoch`）：这条语句若落进别人的事务，它的成功
+    // 只说明"在本事务里执行成功"，仍会随对方回滚而消失，或把对方的事务一起带下车 ——
+    // 与失败路径同样归为 internal。这条用例用**成功**的 SELECT 走一遍。
+    const real = await import('@duckdb/node-api')
+    let release!: () => void
+    let gate: Promise<void> | undefined
+    let holdNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          return {
+            ...(inst as object),
+            connect: async () => {
+              const c = await (inst as { connect: () => Promise<unknown> }).connect()
+              return {
+                ...(c as object),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  const target = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown> }
+                  if (holdNext && sql.includes('tags')) {
+                    holdNext = false
+                    gate = new Promise<void>((r) => { release = r })
+                    await gate
+                  }
+                  return target.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    holdNext = true
+    const outside = s.count('tags').then(() => 'ok', (e: unknown) => e)
+    for (let i = 0; i < 200 && gate === undefined; i++) await new Promise((r) => setImmediate(r))
+    expect(gate, '前提：外部语句停在下发之前').toBeDefined()
+    let began!: () => void
+    const beganP = new Promise<void>((r) => { began = r })
+    const tx = s.transaction(async (t) => {
+      began()
+      await new Promise((r) => setTimeout(r, 80))
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+    })
+    await beganP
+    await new Promise((r) => setTimeout(r, 20))
+    release()
+    expect(await outside, '成功路径同样必须被拒绝（internal）').toMatchObject({ kind: 'internal' })
+    await tx.then(() => null, () => null)
+  })
+
   it('事务回调里 close() 之后再写/删/读 → 一律 usage「数据库连接已关闭」，不得误诊成并发竞争（Codex PR#81 第二十五轮 P3）', async () => {
     // 事故路径（实测复现）：`transaction(async () => { await s.close(); await s.upsert(…) })` 时
     // `inTx` 还没复位，写路径若先判归属就抛 internal + 「不要用 Promise.all 并行调用…」——

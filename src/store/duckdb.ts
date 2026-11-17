@@ -185,6 +185,15 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 单连接、`await` 串行的既有用法（store init/status、sync 引擎）行为完全不变。
    */
   let txToken: TxToken | undefined
+  /**
+   * 事务「代号」：每次有事务**开启**（显式 `transaction()` 或自动事务的 BEGIN）就 +1。
+   * ⚠️ 用途（CodeRabbit PR#81 第二十八轮 major，实测复现）：`execSql` 的归属检查在**语句下发
+   * 之前**，而驱动内部的 `runUntilLast` / `prepared.run()` 之间隔着 await —— 这段时间里另一条链
+   * 若开了事务，本语句就落在它的事务里；它一旦执行期报错（实测：`SELECT` 一个 CAST 失败的
+   * view），所有者 COMMIT 返回成功、写入被静默丢弃（实测 count 从 1 变 0）。因此下发前后各取
+   * 一次代号，**跨代即拒绝**：读路径同样拒绝（它会把别人的事务标成 aborted，代价是一样的）。
+   */
+  let txEpoch = 0
   const alsTx: Pick<TxAls, 'run' | 'getStore' | 'disable'> = deps.makeAls?.() ?? new AsyncLocalStorage<symbol>()
 
   // ⚠️ 所有语句执行收敛到这一个方法 —— 测试 spy 的落点（spec §5.3）。
@@ -197,8 +206,25 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   // ② `Object.defineProperty` 必须 `writable: true, configurable: true` —— 默认
   //    configurable:false 会让 vi.spyOn 重定义属性时直接抛 TypeError；
   // ③ 挂为**不可枚举**（不污染 JSON 输出与接口形状）。
+  /** 语句下发期间事务代号变化 → `internal`，`cause` 可带驱动原文（与 `assertTxOwnership` 同一分类）。 */
+  const epochChangedError = (cause?: unknown): Error => {
+    const err = new Error(
+      '语句等待期间另一条异步链开启了事务 —— 本条语句可能落进那条事务，'
+      + '它一旦执行期报错就会把对方的事务标成 aborted（对方 COMMIT 返回成功、写入被丢弃）',
+      cause === undefined ? {} : { cause },
+    )
+    ;(err as { kind?: string }).kind = 'internal'
+    ;(err as { hint?: string }).hint = '让同一个 Store 实例上的操作串行执行：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
+    return err
+  }
+
   const execSql = async (sql: string, params: unknown[] = []): Promise<unknown> => {
     if (closed) throw usage('数据库连接已关闭')
+    // ⚠️ **语句等待期间有人开了事务**同样不安全（CodeRabbit PR#81 第二十八轮 major，实测复现：
+    // 外部 `SELECT` 与另一条链的事务交错，那条 SELECT 执行期报错 → 事务 COMMIT 返回成功而写入
+    // 被丢弃，`count` 从 1 变成 0）。归属检查只覆盖「下发前」；驱动内部 `runUntilLast` /
+    // `prepared.run()` 之间的 await 是第二个窗口，用事务代号把它封住。
+    const epochBefore = txEpoch
     // ⚠️ **一切语句派发都过归属闸门**（CodeRabbit PR#81 第十六轮 major，实测复现）：单连接
     // 上的语句会加入当前活动事务 —— 包括读语句。别人的事务开着时，另一条链发出的 SELECT
     // 也落在那条事务里；它一旦执行期报错（实测：目标表是 CAST 失败的 view），DuckDB 就把
@@ -206,7 +232,23 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 只守方法入口不够：入口与该语句之间隔着 await（`del` 的 count），窗口仍在。
     assertTxOwnership()
     // 统一走 runAndReadAll：其结果带 getRowObjectsJson/columnNames（run() 的结果没有）
-    return c.runAndReadAll(sql, params)
+    let result: unknown
+    try {
+      result = await c.runAndReadAll(sql, params)
+    } catch (e) {
+      // ⚠️ **失败路径同样要检查代号**（CodeRabbit PR#81 第二十八轮 major）：驱动报错时
+      // `runAndReadAll` 抛出，若只成功路径检查，最危险的情形（外部语句执行期报错 → 把别人的
+      // 事务标成 aborted → COMMIT 返回成功而写入被丢弃，实测 count 1→0）恰好漏网。
+      // 此时原错误被替换成归因正确的 internal，`cause` 保留驱动原文。
+      if (txEpoch !== epochBefore) throw epochChangedError(e)
+      throw e
+    }
+    // 下发期间事务代号变了 → 这条语句可能落进了别人的事务（或它自己在事务里开过又提交过）
+    if (txEpoch !== epochBefore) {
+      assertTxOwnership()
+      throw epochChangedError()
+    }
+    return result
   }
 
   const assertTable = (name: string): TableDef => {
@@ -525,6 +567,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       const token = Symbol('store-auto-tx')
       inTx = true
       txToken = token
+      txEpoch += 1
       let n: number
       try {
         // ⚠️ BEGIN / 数据语句 / COMMIT 全在**带令牌的上下文**里（闸门下移到 `execSql` 之后，
@@ -573,6 +616,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       const token = Symbol('store-tx')
       inTx = true
       txToken = token
+      txEpoch += 1
       try {
         // ⚠️ BEGIN **失败也要发 ROLLBACK**（2026-11-16 实测裁定，拒绝 CodeRabbit 第八轮的建议）：
         // 手开事务存在时嵌套 BEGIN 会被 DuckDB 拒绝，**而它同时已把那条事务标记为 aborted**

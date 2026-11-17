@@ -216,6 +216,17 @@ const THROW_ERROR: Rule = {
      * 同理 `new (class { … })()` 的构造方法在 `new` 时就跑了。
      */
     const isExecutedAccessor = (fn: ts.Node): boolean => {
+      // ⚠️ **函数在 getter 体里 `return` 出去、再被立即调用**（Codex PR#81 第二十八轮 P2，
+      // Node 实测 `throw ({ get make() { return () => new Error('**X**') } }).make()` 真的抛）：
+      // 这里 `fn` 是 getter 体里返回的那个箭头 —— 是否执行取决于**返回它的 getter** 的属性
+      // 是否被读后再调用，与 getter 本身同一判据，直接转交。
+      if ((ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))
+        && fn.parent !== undefined && ts.isReturnStatement(fn.parent) && fn.parent.expression === fn) {
+        let g: ts.Node | undefined = fn.parent.parent
+        while (g !== undefined && (ts.isBlock(g) || ts.isCaseBlock(g) || ts.isCaseOrDefaultClause(g))) g = g.parent
+        if (g !== undefined && ts.isGetAccessorDeclaration(g)) return isExecutedAccessor(g)
+        return false
+      }
       // 匿名类构造函数：`new (class { constructor() { return new Error(…) } })()` —— 类被 `new`
       // 实例化就执行了构造函数（Codex PR#81 第二十四轮 P2/P3）
       if (ts.isConstructorDeclaration(fn)) {
@@ -261,7 +272,29 @@ const THROW_ERROR: Rule = {
       // 只认**直接**展开：源是变量（`{...src}`）时 getter 写在哪份定义里，单文件语法树看不出来 ——
       // 如实记录为边界。
       if (ts.isSpreadAssignment(p) && p.expression === o) {
-        return ts.isGetAccessorDeclaration(fn)
+        // 展开本身只读值：getter 立刻执行，函数（箭头 / 方法 / 函数表达式）只是被复制成外壳
+        // 对象的同名属性 —— 是否执行取决于**外壳对象**上的用法（Codex PR#81 第二十八轮 P2，
+        // Node 实测 `({ ...{ make: () => new Error(…) } }).make()` 抛出、只读不调不抛）。
+        if (ts.isGetAccessorDeclaration(fn)) return true
+        const nameOf = (n: ts.PropertyName | undefined): string | undefined => n === undefined ? undefined
+          : ts.isIdentifier(n) || ts.isStringLiteral(n) ? n.text
+            : ts.isComputedPropertyName(n) ? staticAccessKey(n.expression) : undefined
+        const innerName = ts.isPropertyAssignment(fn.parent) ? nameOf(fn.parent.name)
+          : ts.isMethodDeclaration(fn) ? nameOf(fn.name) : undefined
+        if (innerName === undefined) return false
+        let outer: ts.Node | undefined = p.parent
+        while (outer !== undefined && !ts.isObjectLiteralExpression(outer)) outer = outer.parent
+        if (outer === undefined) return false
+        let k: ts.Node = outer
+        for (;;) {
+          const q = k.parent
+          if (q === undefined) return false
+          if ((ts.isParenthesizedExpression(q) || ts.isAsExpression(q) || ts.isNonNullExpression(q)
+            || ts.isSatisfiesExpression(q) || ts.isTypeAssertionExpression(q)) && q.expression === k) { k = q; continue }
+          const acc = ts.isPropertyAccessExpression(q) ? q.name.text
+            : ts.isElementAccessExpression(q) ? staticAccessKey(q.argumentExpression) : undefined
+          return acc === innerName && isImmediatelyInvoked(q)
+        }
       }
       // ⚠️ **读的是哪个属性**必须与 getter 名对得上（CodeRabbit PR#81 第二十四轮 minor）：
       // `({ get unused() { return new Error('**x**') }, error: new Error('clean') }).error` 只执行
@@ -440,6 +473,15 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw (({ get value3() { return new Error('**as 包装**') } }) as { value3: Error }).value3",
       "throw new (class { constructor() { this.e = new Error('**匿名类**') } })().e",
       "throw ({ get unused() { return new Error('**unused**') }, error: new Error('clean') }).error",
+      // getter 返回函数、再被立即调用（Codex PR#81 第二十八轮 P2，Node 实测抛出）
+      "throw ({ get make() { return () => new Error('**getter 返回后调用**') } }).make()",
+      // 展开源里的函数属性，在**外壳对象**上被调用（Node 实测抛出）
+      "throw ({ ...{ make: () => new Error('**展开后被调用**') } }).make()",
+      // 函数表达式作 `new` 的被调方（Codex PR#81 第二十八轮 P3 报的形态）。Node 实测确实抛出；
+      // 判据由既有路径覆盖（加专用分支后变异**不**变红 —— 等价覆盖，如实记录）。
+      "throw new (function () { return new Error('**new 函数表达式**') })()",
+      // 反例：getter 返回的函数**只读不调** —— 不执行
+      "throw Object.assign(new Error('cleanG'), { v: ({ get make() { return () => new Error('**getter 只读**') } }).make })",
       // 对象展开立即读取源对象的全部属性 → getter 立刻执行（Codex PR#81 第二十六轮 P2，Node 实测抛出）
       "throw ({ ...{ get error() { return new Error('**展开执行 getter**') } } }).error",
       // 反例：展开的源里只有**方法**（方法不执行），且读的是数据属性 —— 不算
@@ -479,7 +521,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     expect(THROW_ERROR.hit(sf), 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(18)
+      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(21)
     expect(STDERR_WRITE.hit(sf),
       'stderr 规则：字符串 + 模板 + 常量拼接 + 跨行 + 可选链 + 下标访问各一条').toHaveLength(6)
     expect(USAGE_CONST.hit(sf), 'USAGE 常量规则：名字带 USAGE 的顶层 const，含拼接那条').toHaveLength(2)

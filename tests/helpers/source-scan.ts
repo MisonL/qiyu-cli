@@ -284,6 +284,13 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
       const k = staticPropKey(p.name, true)
       if (k !== undefined) { out.set(k, undefined); accessorKeys.add(k) }
       else { out.clear(); accessorKeys.clear(); mayHaveUnknown = true }
+    } else if (ts.isMethodDeclaration(p)) {
+      // ⚠️ **对象方法**同样是选项键，值是函数 —— 真值（Codex PR#81 第二十八轮 P2：`{ [key]() {} }`
+      // 的 `key` 就是 'concurrent' 时 Vitest 照常登记并发）。键可静态确定时按「值是求不出的表达式」
+      // 记（函数对象不是布尔）；键求不出时按动态键处理（作废全部已知值）。
+      const k = staticPropKey(p.name, true)
+      if (k !== undefined) { out.set(k, undefined); accessorKeys.add(k) }
+      else { out.clear(); accessorKeys.clear(); mayHaveUnknown = true }
     } else if (ts.isSpreadAssignment(p)) {
       const src = unwrap(p.expression)
       if (ts.isObjectLiteralExpression(src)) {
