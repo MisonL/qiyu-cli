@@ -279,8 +279,13 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
     // 判据是「右边是不是围绕别名的引用」—— 左边是**外来名**（刚被收进别名集的 `aliasQ8`），
     // 不能要求它已经在别名集里：`refersToAlias(n.left)` 对单纯 `aliasQ8` 恒假，那样 `hit`
     // 根本不会被置位，这段保护形同虚设（第一版就这么写的，样本 `oQ8` 直接判红才发现）。
+    // ⚠️ 但**左边是原名自己**的赋值仍是写入：`opts = opts.next!` 让 `opts` 指向另一个对象
+    // （CodeRabbit PR#81 第二十七轮 minor）—— 初始值 `{ concurrent: false }` 不再代表登记时的值。
     const leftIsBareNewName = ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
-      && ts.isIdentifier(n.left) && refersToAlias(n.right)
+      // 判据是「左边的**绑定**是不是被重定向」：`name` 自己（原名）被赋值 → 写入；别的标识符
+      // 赋值 → 只是建立别名。不能用「左边不在别名集里」判 —— 收集循环先跑，建立别名的左边
+      // 早已在集里（样本 `oQ8` 因此判红）。
+      && ts.isIdentifier(n.left) && n.left.text !== name && refersToAlias(n.right)
     if (ts.isBinaryExpression(n) && ASSIGN_OPS.has(n.operatorToken.kind as ts.SyntaxKind)
       && refersToAlias(n.left) && !leftIsBareNewName) hit = true
     // ⚠️ **建立别名本身不是写入**（Codex PR#81 第二十五轮 P2 的误报）：`const a = opts` 不改变
@@ -542,8 +547,12 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       // 的文件整份跳过（第二十六轮 minor）。现在只在这一处静默放行，并把边界如实记在这里：
       // helper 的调用方若真的传了 `concurrent: true`，本守卫看不出来 —— 那是跨函数数据流，
       // 超出这份单文件静态判据，需 reviewer 看 helper 的调用点。
-      if (args.some((e) => ts.isSpreadElement(e))) continue
-      const rest = args.slice(1).filter((e) => !isNumberArg(unwrap(e)) && !isUndefinedArg(e))
+      // ⚠️ 但**只能豁免到展开为止**：`it('x', { concurrent: true }, ...([fn] as const))` 的选项是
+      // 显式对象、展开只补执行体（CodeRabbit PR#81 第二十七轮 minor）—— 一律跳过会把这种显式并发
+      // 放过去。因此只把展开**之前**的实参送去判。
+      const spreadAt = args.findIndex((e) => ts.isSpreadElement(e))
+      const scanArgs = spreadAt < 0 ? args : args.slice(0, spreadAt)
+      const rest = scanArgs.slice(1).filter((e) => !isNumberArg(unwrap(e)) && !isUndefinedArg(e))
       const optionArgs = rest.length > 0 && isFn(rest[0]!) ? rest.slice(1) : rest.slice(0, 1)
       for (const a of optionArgs) {
         const r = resolveOptions(a)
@@ -647,16 +656,49 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
    * 原样返回才顺便等到 `w`，否则 `w` 照样落在 hook 之后（Codex PR#81 第二十五轮 P2，探针
    * 复现：旧判据跨过调用实参去找 `await`，把这种写法放行了）。
    */
-  const isAwaited = (n: ts.Node): boolean => {
-    let e: ts.Node = n
-    while (e.parent !== undefined) {
+  /**
+   * `n` 是否**真的被 hook 等到**。
+   * ⚠️ 判据分两问（CodeRabbit PR#81 第二十七轮 minor，此前只问第一问）：
+   *   ① 从 `n` 往上，到**所在的那个函数**为止，途中遇到 `await` 了吗？
+   *   ② 那个函数**是不是 hook 的直接回调**？——`beforeEach(() => { void (async () => { await x.then(w) })() })`
+   *      里 `x.then(w)` 确实紧挨着 await，但 await 属于内层 IIFE，hook 既不返回也不 await 它，
+   *      `w` 照样落在 hook 之后。旧判据只看「最近父节点是不是 await」，这种形态被漏掉。
+   * 边界（沿用既有口径）：`await ignore(x.then(w))` 只等 `ignore` 的返回值，**不穿透调用实参** ——
+   * 途中遇到「e 是某个调用的实参」即判 false。
+   */
+  const isHookCallback = (fn: ts.Node): boolean => {
+    let e: ts.Node = fn
+    for (;;) {
       const p = e.parent
-      if (ts.isAwaitExpression(p)) return true
+      if (p === undefined) return false
       if (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isNonNullExpression(p)
         || ts.isSatisfiesExpression(p) || ts.isTypeAssertionExpression(p)) { e = p; continue }
+      return ts.isCallExpression(p) && p.arguments.includes(e as ts.Expression) && isHookName(callChain(p)?.chain)
+    }
+  }
+  const isAwaited = (n: ts.Node): boolean => {
+    let e: ts.Node = n
+    let sawAwait = false
+    for (;;) {
+      const p = e.parent
+      if (p === undefined) return false
+      if (ts.isAwaitExpression(p) && p.expression === e) { sawAwait = true; e = p; continue }
+      if (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isNonNullExpression(p)
+        || ts.isSatisfiesExpression(p) || ts.isTypeAssertionExpression(p)) { e = p; continue }
+      // 被调形态（`f()()` / 标签模板）穿过去；作为**实参**时不穿（见上方边界）
+      if (ts.isCallExpression(p)) {
+        if (p.expression === e) { e = p; continue }
+        return false
+      }
+      if (ts.isTaggedTemplateExpression(p) && p.tag === e) { e = p; continue }
+      if (ts.isFunctionLike(p) || ts.isClassLike(p)) return sawAwait && isHookCallback(p)
+      // 语句层（`await x` 的父是表达式语句、再上是块 / case 子句）继续往函数边界走。
+      // ⚠️ `ts.isStatement(Block)` 是 **false**（`Block` 的 SyntaxKind 不在 FirstStatement…
+      // LastStatement 区间里，尽管类型上它属于 Statement）—— 只写 `isStatement` 的话，
+      // `afterAll(async () => { await … })` 会在 Block 处提前 return false，真实文件误报。
+      if (ts.isStatement(p) || ts.isBlock(p) || ts.isCaseBlock(p) || ts.isCaseOrDefaultClause(p)) { e = p; continue }
       return false
     }
-    return false
   }
   for (const call of collectCalls(sf)) {
     if (!isHookName(callChain(call)?.chain)) continue
@@ -684,6 +726,10 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
         }
         // ⚠️ **被 await 的不算**：`await (pendingTail ?? …).catch(…)` 的尾巴当场收口，
         // 不会落进下一条用例（实测：db.test.ts 的 afterAll 清理正是这种写法，误报过）。
+        // ⚠️ 但「被 await」必须**真的挂在 hook 上**：`beforeEach(() => { void (async () => { await x.then(w) })() })`
+        // 里 hook 既不返回也不 await 那个 IIFE，`w` 照样落在 hook 之后（CodeRabbit PR#81 第二十七轮
+        // minor）。判据：从 `inner` 往上找 `await` 时**遇到函数边界就停**（IIFE 的 `async () =>`
+        // 是一道边界）—— `isAwaited` 现在就是这样实现的（遇到非包装父节点即返回 false）。
         if (lastSeg !== undefined && ['then', 'catch', 'finally'].includes(lastSeg) && !isAwaited(inner)) {
           out.push({ line: lineOf(sf, inner), why: `hook 体里出现「?.${lastSeg}(」` })
         }
@@ -964,6 +1010,13 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 逗号表达式取最右操作数（Codex PR#81 第十八轮 P2）：`(0, setTimeout)(…)` 就是 setTimeout，
     // 下行到 ES5 的模块引用也都是这个形态 —— 不穿透时 `calleeChain` 返回 undefined、守卫放行。
     expect(hookHits(`${H}(() => { (0, ${ST})(w, 1) })`), '逗号表达式里的调度').toEqual([`${ST}(`])
+    // 脱离的 IIFE 里的 `await` **不**豁免 hook 调度（CodeRabbit PR#81 第二十七轮 minor）：
+    // hook 既不返回也不 await 那个 IIFE，`w` 仍落在 hook 之后
+    expect(hookHits(`${H}(() => { void (async () => { await (pending ?? Promise.resolve()).then(w) })() })`),
+      'IIFE 内部的 await 不算 hook 等到了').toEqual(['?.then('])
+    // 正例：hook 直接 await 整条链 → 当场收口（db.test 的 afterAll 清理写法）
+    expect(hookHits(`${H}(async () => { await (pending ?? Promise.resolve()).catch(w) })`),
+      'hook 自己 await 整条链').toEqual([])
     // 反例：动态键仍是已声明的反射边界（`['set' + 'Timeout']` 求不出静态名）
     expect(hookHits(`${H}(() => { globalThis[${JSON.stringify('set')} + ${JSON.stringify('Timeout')}](w, 1) })`),
       '反射拼接不在静态判据内（已声明的边界）').toEqual([])
@@ -1149,10 +1202,18 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       '赋值建立的别名同样写穿原对象').toEqual(['unknown'])
     expect(concHits(`const oQ8 = ${Zq}\nlet aliasQ8\naliasQ8 = oQ8\nit('Q8', oQ8, () => {})`),
       '只赋值建立别名、不改值 → 仍可信').toEqual([])
+    // 重赋值**原名自己**同样是写入（CodeRabbit PR#81 第二十七轮 minor）：`opts = opts.next!` 之后
+    // 登记拿到的是另一个对象，静态保留的 `concurrent: false` 已经过时
+    expect(concHits(bt('const oQ10 = { con', 'current: false, next: { con', "current: true } }\noQ10 = oQ10.next!\nit('Q10', oQ10, () => {})")),
+      '原绑定被重赋值 → 初始值作废').toEqual(['unknown'])
     // 无关调用不得让初始值作废（CodeRabbit PR#81 第二十六轮 minor：`.apply` 的保守分支
     // 原先在 `isWriteApi` 判断之前就 `return true`）
     expect(concHits(`const oQ9 = ${Zq}\nconst noopQ9 = (a: unknown) => a\nnoopQ9.apply(null, argsQ9)\nit('Q9', oQ9, () => {})`),
       '无关的 .apply 不影响选项初始值').toEqual([])
+    // 展开实参**不能**抹掉它之前的显式选项（CodeRabbit PR#81 第二十七轮 minor）：
+    // `it('x', { concurrent: true }, ...([fn] as const))` 展开后按 `it(名, 选项, 体)` 登记，仍并发
+    expect(concHits(bt("it('QV', { con", 'current: true }, ...([() => {}] as const))')),
+      '展开之前的显式选项照常判').toEqual(['opt'])
     // `it('x', undefined, fn)` 是合法的空选项重载（同轮 minor，探针核对 parseArguments）
     expect(concHits(`it('QU', undefined, () => {})`), 'undefined 选项位是空选项').toEqual([])
     expect(concHits(`it('QU2', void 0, () => {})`), 'void 0 同样空选项').toEqual([])

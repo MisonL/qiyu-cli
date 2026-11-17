@@ -295,6 +295,9 @@ describe('duckdb —— 事务', () => {
     }
     const s = await createDuckDbStore(cfg, 'rw', { makeAls })
     await s.init()
+    // ⚠️ 钉住判据的前提（CodeRabbit PR#81 第二十七轮 major 的疑问：`init()` 会不会自己让
+    // `runs` 非零、使下面的精确断言与回滚无关地成立）：实测 init 不进入事务上下文。
+    expect(runs, '前提：初始化不进入事务上下文（否则下面的 runs===1 不能归因于事务）').toBe(0)
     const tx = s.transaction(async (t) => {
       await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
       await s.close()                       // 事务进行中关库：后续语句必失败
@@ -318,13 +321,19 @@ describe('duckdb —— 事务', () => {
     ]
     for (const [name, act] of cases) {
       const s = await fresh()
-      const err = await s.transaction(async () => {
+      // ⚠️ **`act(s)` 的 rejection 必须单独取**（CodeRabbit PR#81 第二十七轮 minor）：
+      // 原先只断言事务整体的 rejection —— `act` 若退化成「关闭后静默成功」，回调正常结束，
+      // 紧接着的 COMMIT 照样在已关连接上失败并报 usage，用例**照样通过**（假绿，探针确认过）。
+      // 现在把两者分开：act 自己必须拒绝且点名「数据库连接已关闭」；事务完成路径另有一条断言。
+      let actErr: unknown = 'act 未抛错'
+      const txErr = await s.transaction(async () => {
         await s.close()
-        return act(s)
+        actErr = await act(s).then(() => 'act 未抛错', (e: unknown) => e)
       }).then(() => null, (e: unknown) => e)
-      expect(err, `${name}：关闭后必须报 usage`).toMatchObject({ kind: 'usage' })
-      expect((err as Error).message, `${name}：报错点名真正成因（连接已关闭），不得说成并发竞争`)
+      expect(actErr, `${name}：关闭后 act 本身必须拒绝`).toMatchObject({ kind: 'usage' })
+      expect((actErr as Error).message, `${name}：报错点名真正成因（连接已关闭），不得说成并发竞争`)
         .toContain('数据库连接已关闭')
+      expect(txErr, `${name}：事务完成路径同样报 usage（不再静默成功）`).toMatchObject({ kind: 'usage' })
     }
   })
 

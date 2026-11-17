@@ -251,11 +251,18 @@ const THROW_ERROR: Rule = {
       const p = o.parent
       if (p === undefined) return false
       if (ts.isNewExpression(p) && p.expression === o) return true
-      // ⚠️ **对象展开会立即读取源对象的全部可枚举属性** → 源对象上的 getter 立刻执行
+      // ⚠️ **对象展开会立即读取源对象的全部可枚举属性** → 源对象上的 **getter** 立刻执行
       // （Codex PR#81 第二十六轮 P2，Node 实测：`throw ({ ...{ get error() { return new Error('**BAD**') } } }).error`
-      // 抛出的 message 就是 `**BAD**`）。只认**直接**展开：展开的源是变量（`{...src}`）时
-      // 那些 getter 写在哪份定义里，单文件语法树看不出来 —— 如实记录为边界。
-      if (ts.isSpreadAssignment(p) && p.expression === o) return true
+      // 抛出的 message 就是 `**BAD**`）。
+      // ⚠️ 但只有 **getter**：源对象里的**方法**不执行（Node 实测 `{...{ make() {…} }}` 不跑 `make`）——
+      // 首版这里对展开源一律放行，会让方法体里的 `new Error` 被误报（自检反例没加星号、没咬住）；
+      // 第二版只排除了方法、仍放行**箭头函数属性**（`make: () => new Error(…)`）—— 展开只读值、
+      // 不调用存着的函数（CodeRabbit PR#81 第二十七轮 minor）。现在**只认 getter 声明**。
+      // 只认**直接**展开：源是变量（`{...src}`）时 getter 写在哪份定义里，单文件语法树看不出来 ——
+      // 如实记录为边界。
+      if (ts.isSpreadAssignment(p) && p.expression === o) {
+        return ts.isGetAccessorDeclaration(fn)
+      }
       // ⚠️ **读的是哪个属性**必须与 getter 名对得上（CodeRabbit PR#81 第二十四轮 minor）：
       // `({ get unused() { return new Error('**x**') }, error: new Error('clean') }).error` 只执行
       // `error`，`unused` 的 getter 从不运行 —— 原判据对任何属性读取都放行，把 `unused` 报成违规。
@@ -423,6 +430,12 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw ({ ...{ get error() { return new Error('**展开执行 getter**') } } }).error",
       // 反例：展开的源里只有**方法**（方法不执行），且读的是数据属性 —— 不算
       "throw ({ ...{ make() { return 1 } }, error: new Error('clean3') }).error",
+      // 反例（带星号）：展开源里的**方法体**里有 `new Error` 但方法从不执行 —— 必须不报
+      "throw ({ ...{ make() { return new Error('**展开里的方法**') } }, error: new Error('clean4') }).error",
+      // 反例（带星号）：展开源里的**箭头函数属性**同样不执行 —— 必须不报
+      "throw ({ ...{ make: () => new Error('**展开里的箭头**') }, error: new Error('clean5') }).error",
+      // 反例（带星号）：展开源里的**函数表达式属性**同理
+      "throw ({ ...{ make: function () { return new Error('**展开里的函数表达式**') } }, error: new Error('clean6') }).error",
       // 立即执行的派生形态（Codex PR#81 第二十五轮 P2，Node 实测三条都真的抛）
       "throw (() => new Error('**bind 立即执行**')).bind(null)()",
       "throw (0, () => new Error('**逗号立即执行**'))()",
