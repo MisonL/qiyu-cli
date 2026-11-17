@@ -190,8 +190,16 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * ⚠️ 用途（CodeRabbit PR#81 第二十八轮 major，实测复现）：`execSql` 的归属检查在**语句下发
    * 之前**，而驱动内部的 `runUntilLast` / `prepared.run()` 之间隔着 await —— 这段时间里另一条链
    * 若开了事务，本语句就落在它的事务里；它一旦执行期报错（实测：`SELECT` 一个 CAST 失败的
-   * view），所有者 COMMIT 返回成功、写入被静默丢弃（实测 count 从 1 变 0）。因此下发前后各取
-   * 一次代号，**跨代即拒绝**：读路径同样拒绝（它会把别人的事务标成 aborted，代价是一样的）。
+   * view），那条事务就被 DuckDB 标成 aborted，所有者侧结果不可信。因此下发前后各取一次代号，
+   * **跨代即拒绝**：读路径同样拒绝（它会把别人的事务标成 aborted，代价是一样的）。
+   * ⚠️ **拒绝只对发起方可见**（CodeRabbit PR#81 第三十一轮 major / Codex P2，探针实测）：跨代
+   * 发生在那条语句**已被驱动执行**之后时，「拒绝」是事后归因，对方的 abort 已经发生。本机
+   * 单线程实测：被污的事务所有者随后无论 COMMIT 还是再写都会报
+   * `Current transaction is aborted` / `cannot commit - no transaction is active`（响亮失败、
+   * 事务内写入不落库），不是静默丢写 —— 由 duckdb.test 的「回调直接返回」用例钉住。
+   * 「COMMIT 返回成功而丢写」这一形态本机未能稳定构造（需要语句落在对方 BEGIN 之前执行）；
+   * 因此维护者没有引入「事务层记记号再拒绝提交」的机制（加过一版，探针证明该分支在本机
+   * 走不到，等于死代码，已撤回 —— 如实记录，不做未经验证的防御）。
    */
   let txEpoch = 0
   const alsTx: Pick<TxAls, 'run' | 'getStore' | 'disable'> = deps.makeAls?.() ?? new AsyncLocalStorage<symbol>()
@@ -210,7 +218,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   const epochChangedError = (cause?: unknown): Error => {
     const err = new Error(
       '语句等待期间另一条异步链开启了事务 —— 本条语句可能落进那条事务，'
-      + '它一旦执行期报错就会把对方的事务标成 aborted（对方 COMMIT 返回成功、写入被丢弃）',
+      + '它一旦执行期报错就会把对方的事务标成 aborted（对方随后 COMMIT / 写入会响亮失败、'
+      + '事务内写入不落库；对方若因此拿到成功，请报告）',
       cause === undefined ? {} : { cause },
     )
     ;(err as { kind?: string }).kind = 'internal'
@@ -626,6 +635,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         //   · 不发 ROLLBACK：调用方的 COMMIT 返回成功，但 DuckDB 静默丢弃该事务的全部写入
         //     （实测：行数归零、无任何报错）—— 这才是"部分写入 + 静默丢数据"。
         // 所以这里保留 ROLLBACK；`safeRollback` 吞掉「根本没有事务」的次生错误。
+        // aborted 的事务同样可被 ROLLBACK 收尾（DuckDB），外部语句污掉它的情形效果一致。
         // 真正要堵的是「BEGIN 根本不该发出」：自动事务已登记归属（见 `upsert`）、显式事务
         // 在 BEGIN 前登记 —— 支持路径上不会再出现第二条 BEGIN（用例见 duckdb.test 的两条）。
         // ⚠️ BEGIN / 回调 / COMMIT 全部在**带令牌的上下文**里：闸门在 `execSql`（事务控制

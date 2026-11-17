@@ -47,6 +47,18 @@
 
 ### 修复
 
+- **静态守卫：第三十一轮（CR 5 条 + Codex 1 条 P2）**（2026-11-18，逐条自检/Node 复现）：
+  写入判据把**展开实参**当目标不可知（`Object.assign(...[opts, { concurrent: true }])` 旧判据把
+  `SpreadElement` 当普通实参、目标判不出而放行）· `for (opts.concurrent of […])` / `for-in` 的**循环头
+  赋值目标**算写入 · `throw` 的 `new Error` 规则：边界函数的**尾值是函数字面量**（`() => function () {…}`、
+  `() => (() => …)`）时内层只是被交出、不执行（`() => new Error(…)` 与 `() => ({ make: … })` 不受影响）·
+  「getter 返回函数须调用」与尾值判据收敛到同一求值语义（`.call/.apply/.bind` 调的是内层箭头）·
+  `plaintext-channels` 自检的**逐条断言**改按所在行核对（总数断言在漏检 + 误报互相抵消时照样是绿的）·
+  `duckdb.test` 的「语句等待期间开事务」用例补**回调直接返回**形态（Codex P2：外部语句执行期报错
+  之后 COMMIT 是否静默丢写），并给新用例的驱动包装器转发两层 `closeSync`。同轮核实了 Codex 关于
+  「给事务所有者补一个 abort 记号」的建议：本机单线程实测所有者侧本就响亮失败（`Current transaction
+  is aborted` / `cannot commit - no transaction is active`），补记号的分支走不到（探针证明），
+  **不加未经验证的防御**，在 `txEpoch` 注释里如实写明边界与「COMMIT 成功而丢写」本机未能稳定构造。
 - **静态守卫：第三十轮（Codex 7 条 P2）**（2026-11-18，逐条探针复现）：
   `.bind` 预绑定实参**经 `.call` / `.apply` 调用后**仍是目标（`Object.assign.bind(null, o).call(null, x)`）·
   未知基座的 `.bind` 保留写入方法尾段（`(w ?? Reflect).set.bind(null)(opts, …)`）· `bind` 结果**被括号包住**再调用

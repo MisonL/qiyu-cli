@@ -296,11 +296,13 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       return [...base, ...(arr.elements as readonly ts.Expression[])]
     }
     // `f.bind(a, x, …)(y, …)`：bind 的实参 0 是 thisArg，其余是预绑定实参，排在调用实参之前
-    if (ts.isCallExpression(callee)) {
-      return callForm(callee) === 'bind' ? [...callee.arguments.slice(1), ...c.arguments] : undefined
-    }
-    // bind 那一层自己（没有本次实参）/ 直接调用（实参原样）
-    return form === 'bind' ? [] : c.arguments
+    if (ts.isCallExpression(callee)) return callForm(callee) === 'bind' ? [...callee.arguments.slice(1), ...c.arguments] : undefined
+    // ⚠️ **展开实参**：`Object.assign(...[opts, { concurrent: true }])` 的实参序列里出现
+    // `SpreadElement`，目标位置就看不出来（CodeRabbit PR#81 第三十一轮 minor，自检复现）——
+    // 保守按「目标不可知」处理（调用方据此算「写过」）：展开能影响的实参是它的全部元素。
+    if (form === 'bind') return []
+    if (c.arguments.some((a) => ts.isSpreadElement(a))) return undefined
+    return c.arguments
   }
   /**
    * 这次调用是不是**写入 API**，且目标围绕 name / 别名：**静态尾段**沿调用 / `.bind` / `.call` / `.apply`
@@ -359,6 +361,18 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
     if (ts.isBinaryExpression(n) && ASSIGN_OPS.has(n.operatorToken.kind as ts.SyntaxKind)
       && (refersToAlias(n.left) || destructuresAlias(unwrap(n.left)))
       && !leftIsBareNewName) hit = true
+    // ⚠️ **for-of / for-in 的右侧赋值目标同样是写入**（CodeRabbit PR#81 第三十一轮 minor，序列可复现）：
+    // `for (opts.concurrent of [true]) {}` 每一轮都给 `opts.concurrent` 赋值，却没有赋值表达式 ——
+    // 旧判据只看 BinaryExpression / 自增 / delete / 写入 API 调用，整段循环都看不见。
+    // 循环头声明（`for (const x of …)`）不是给别名赋值；其余形态逐层看目标。
+    if (ts.isForOfStatement(n) || ts.isForInStatement(n)) {
+      const init = n.initializer
+      if (ts.isVariableDeclarationList(init)) {
+        // `for (const { concurrent } of …)` 会重新绑定局部名，但不是写 opts —— 不算
+      } else if (ts.isIdentifier(init) || ts.isPropertyAccessExpression(init) || ts.isElementAccessExpression(init)) {
+        if (refersToAlias(init)) hit = true
+      } else if (destructuresAlias(init)) hit = true
+    }
     // ⚠️ **建立别名本身不是写入**（Codex PR#81 第二十五轮 P2 的误报）：`const a = opts` 不改变
     // opts 的任何值 —— 只有别名**之后**再写它的属性才算。首版把这一句当成写入，`const alias = o`
     // 就让合法的串行选项被判成「看不清」。
@@ -1406,6 +1420,17 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       'bind 预绑定实参 + .call 的目标是预绑定的那个').toEqual(['unknown'])
     expect(concHits(`const oQ26 = ${Zq}\nconst otherQ26 = {}\nObject.assign.bind(null, otherQ26).call(null, { con${'current: true }'})\nit('Q26', oQ26, () => {})`),
       'bind 预绑定别的对象 → .call 的实参不是目标').toEqual([])
+    // 展开的实参：`Object.assign(...[o, {…}])` 的展开元素里含目标 —— 目标位置看不出来，按写过（unknown）。
+    // 展开的实参里有没有目标都看不出来（展开数组是变量 / 字面量同理）—— 一律按写过。
+    expect(concHits(`const oQ28 = ${Zq}\nconst argsQ28 = [oQ28, { con${'current: true }'}] as const\nObject.assign(...argsQ28)\nit('Q28', oQ28, () => {})`),
+      '展开数组里的目标（经变量）').toEqual(['unknown'])
+    // 循环赋值目标：`for (oQ30.concurrent of [true])` 改写选项；反例是写到别的对象
+    expect(concHits(`const oQ30 = ${Zq}\nfor (oQ30.concurrent of [true]) {}\nit('Q30', oQ30, () => {})`),
+      'for-of 右侧给选项赋值').toEqual(['unknown'])
+    expect(concHits(`const oQ31 = ${Zq}\nconst otherQ31 = {}\nfor (otherQ31.concurrent of [true]) {}\nit('Q31', oQ31, () => {})`),
+      'for-of 写给别的对象不算写入').toEqual([])
+    expect(concHits(`const oQ29 = ${Zq}\nconst otherQ29 = {}\nObject.assign(...[otherQ29, { con${'current: true }'}])\nit('Q29', oQ29, () => {})`),
+      '展开数组里的目标不是它 —— 保守同样按写过').toEqual(['unknown'])
     // 两种取法在首轮变异里都通过（`null` 永远不是别名 —— 等价变异，不是真覆盖）。
     expect(concHits(`const oQ3 = ${Zq}\nObject.assign.apply({}, [oQ3, { con${'current: true }'}])\nit('Q3', oQ3, () => {})`),
       'Object.assign.apply 的数组是第二个实参').toEqual(['unknown'])

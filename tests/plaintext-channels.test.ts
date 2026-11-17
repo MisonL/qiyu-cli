@@ -143,6 +143,34 @@ const USAGE_FAIL: Rule = {
  * `throw (() => new Error('**BAD**'))()` 抛的就是里面那个 Error。所以边界只在
  * 「它是某个调用的被调对象」时被穿透，否则才停止。
  */
+// 尾位置表达式**求值后交出的函数字面量**（`() => function () {…}` 的尾值是内层函数；`() => (() => …)`
+// 的尾值是内层箭头；`() => new Error(…)` 的尾值是 `new` 产生的数据 → undefined）。只认函数数据，
+// 逗号链按 JS 求值语义取最后一项；**任何调用**（含 `.call/.apply/.bind`）的返回值都是数据，不透明。
+// `THROW_ERROR` 的尾位置判据是唯一调用点。
+const resolveTail = (e: ts.Expression): ts.Expression | undefined => {
+  const u = unwrap(e)
+  if (ts.isCallExpression(u)) {
+    if (ts.isCommaListExpression(unwrap(u.expression))) return resolveTail(unwrap(u.expression))
+    // ⚠️ 普通调用的返回值是数据（`() => function () {…}()` 交出的不是内层函数），任何调用都不透明。
+    // `(() => X).call/.apply/.bind(…)` 的同口径「内层箭头执行」已由边界处的 `isImmediatelyInvoked`
+    // 与既有 `call 立即执行` 样本承担；`() => (() => …).call(null)` 在合并样本里实测**不命中**
+    // （如实记录：`.call` 链在尾值位置不被穿透，样本 `**call 链内层**` 固定为反例）。
+    return undefined
+  }
+  if (ts.isCommaListExpression(u)) {
+    const last = u.elements[u.elements.length - 1]
+    return last === undefined ? undefined : resolveTail(last)
+  }
+  return ts.isArrowFunction(u) || ts.isFunctionExpression(u) || ts.isFunctionDeclaration(u) ? u : undefined
+}
+// `root` 的子树里是否含有 `n`（含自身）
+const containsNode = (root: ts.Node, n: ts.Node): boolean => {
+  let found = false
+  const walk = (x: ts.Node): void => { if (found) return; if (x === n) { found = true; return }; ts.forEachChild(x, walk) }
+  walk(root)
+  return found
+}
+
 const THROW_ERROR: Rule = {
   name: 'throw new Error',
   hit: (sf) => {
@@ -380,6 +408,33 @@ const THROW_ERROR: Rule = {
       const u = unwrap(e)
       return ts.isStringLiteral(u) || ts.isNoSubstitutionTemplateLiteral(u) ? u.text : undefined
     }
+    // 实例字段的所在类是否被 `new`（经由括号 / 断言包装）。字段初始化器在 new 时就执行，
+    // 其后即使「只返回了函数」也一样 —— `new (class { error = new Error(…) })()` 真的构造了。
+    const isConstructedClassField = (p: ts.PropertyDeclaration): boolean => {
+      let c: ts.Node | undefined = p.parent
+      while (c !== undefined && !ts.isClassLike(c)) c = c.parent
+      return c !== undefined && c.parent !== undefined && (() => {
+        let k: ts.Node = c!
+        for (;;) {
+          const q = k.parent!
+          if ((ts.isParenthesizedExpression(q) || ts.isAsExpression(q) || ts.isNonNullExpression(q)
+            || ts.isSatisfiesExpression(q) || ts.isTypeAssertionExpression(q)) && q.expression === k) { k = q; continue }
+          return ts.isNewExpression(q) && q.expression === k
+        }
+      })()
+    }
+    // 边界 `fn` 尾位置表达式**求值后交出的函数字面量**（`() => function () {…}` 的内层）—— 见 `resolveTail`。
+    const tailFunction = (fn: ts.Node): ts.Expression | undefined => {
+      const body = ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) || ts.isFunctionDeclaration(fn)
+        || ts.isMethodDeclaration(fn) || ts.isGetAccessorDeclaration(fn) || ts.isConstructorDeclaration(fn)
+        ? fn.body : undefined
+      if (body === undefined) return undefined
+      if (!ts.isBlock(body)) return resolveTail(body)
+      const last = body.statements[body.statements.length - 1]
+      if (last === undefined) return undefined
+      const e = ts.isReturnStatement(last) || ts.isExpressionStatement(last) ? last.expression : undefined
+      return e === undefined ? undefined : resolveTail(e)
+    }
     eachInvocation(sf, (n, line) => {
       if (!ts.isNewExpression(n) || !named(n, 'Error')) return
       let up: ts.Node = n
@@ -390,18 +445,7 @@ const THROW_ERROR: Rule = {
         // `throw Object.assign(new Error('clean'), { factory: class { error = new Error('**X**') } })`
         // 输出里没有 X）：只看类表达式有没有被 `new`，不能直接穿过去。
         if (ts.isPropertyDeclaration(p)) {
-          let c: ts.Node | undefined = p.parent
-          while (c !== undefined && !ts.isClassLike(c)) c = c.parent
-          const constructed = c !== undefined && c.parent !== undefined
-            && (() => {
-              let k: ts.Node = c!
-              for (;;) {
-                const q = k.parent!
-                if ((ts.isParenthesizedExpression(q) || ts.isAsExpression(q) || ts.isNonNullExpression(q)
-                  || ts.isSatisfiesExpression(q) || ts.isTypeAssertionExpression(q)) && q.expression === k) { k = q; continue }
-                return ts.isNewExpression(q) && q.expression === k
-              }
-            })()
+          const constructed = isConstructedClassField(p)
           // 静态字段在类定义时就求值（`class K { static s = new Error(…) }`）—— 照常穿过
           const isStatic = (p.modifiers ?? []).some((m) => m.kind === ts.SyntaxKind.StaticKeyword)
           if (!isStatic && !constructed) { blocked = true; break }
@@ -411,9 +455,33 @@ const THROW_ERROR: Rule = {
         const isBoundary = isFnBoundary(p) || ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p)
           || ts.isConstructorDeclaration(p)
         if (isBoundary && !isImmediatelyInvoked(p) && !isExecutedAccessor(p)) { blocked = true; break }
+        // ⚠️ 走到**函数边界**时，内层函数字面量就是 `up`。内层处在边界的**尾位置**（表达式体箭头本身 /
+        // 块体最后一条 `return <n>`）时，它只是被**返回**，外层被调用也不执行它：
+        // `({ make: () => function () { return new Error('**X**') } }).make()`（CodeRabbit PR#81 第三十一轮
+        // minor，Node 实测不抛）。被**调**（`(() => function () { … })()`）或嵌在别处
+        // （`() => ({ make: () => new Error(…) })`）都不算。类**被实例化**的实例字段不在此列 ——
+        // 字段初始化器在 new 时就跑了（`new (class { error = new Error(…) })()` 真的构造）。
+        if (isFnBoundary(p)) {
+          // 边界的尾值是**函数字面量**时，它只是被交出 —— 外层被调不执行它：
+          // `() => function () { return new Error(…) }`（内层函数表达式）与 `() => (() => new Error(…))`
+          // （内层箭头，`up` 在其体内）都算。⚠️ 边界体本身是 `() => new Error(…)` 时 `up` 就是被求值的
+          // 那个 `new`（尾值是数据不是函数），不算；嵌在**非尾值**处（`() => ({ make: () => new Error(…) })`）
+          // 也不执行（那由「尾值不是函数」自然放行，后续调用由 isImmediatelyInvoked 判）。
+          const tailFn = tailFunction(p)
+          // ⚠️ **元素级 + 祖先级**：尾值函数 `tailFn` 只是被**交出**，外层被调也不执行它自身 —— 而 `up`
+          // 在它的体内（`() => function () { return new Error(…) }`）同样不执行。祖先级不会误伤「尾值是
+          // 数据」的形态（`() => new Error(…)` 的尾值是 `new`，不是函数），因此只在 `tailFn` 是函数时生效。
+          const innerFn = unwrap(up as ts.Expression)
+          if (tailFn !== undefined && (tailFn === up || tailFn === innerFn || containsNode(tailFn, up))) {
+            blocked = true
+            break
+          }
+        }
         up = p
       }
-      if (blocked || up.parent === undefined || !ts.isThrowStatement(up.parent)) return
+      if (blocked || up.parent === undefined || !ts.isThrowStatement(up.parent)) {
+        return
+      }
       const why = starsIn(argsOf(n))
       if (why !== undefined) out.push(`L${line}  ${why}`)
     })
@@ -541,6 +609,14 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw ({ get make() { return () => new Error('**getter 返回后调用**') } }).make()",
       // 同上，但 `return` 的函数**带括号**（Codex PR#81 第三十轮 P2，Node 实测抛出）
       "throw ({ get make() { return (() => new Error('**getter 返回的函数带括号后被调用**')) } }).make()",
+      // 反例：属性值是**返回函数的函数**，只调了外层 —— 内层函数从未执行（CodeRabbit PR#81 第三十一轮 minor）。
+      // ⚠️ 内层用**函数表达式**：内层箭头 `() => new Error(…)` 的 `**` 文本嵌在外层箭头的体里，
+      // 「字面量文本」那一步会把它算进**外层调用**（`make()`）的实参子树 —— 报它属于「调用实参里的
+      // 字面量」这条既有规则，与本条无关；内层是函数表达式时文本只属于内层。
+      "throw ({ make: () => function () { return new Error('**只调外层FN**') } }).make()",
+      // 属性值是「返回函数的函数」的两种函数体形态：内层函数**只拿到没调用**，不得算执行
+      "throw ({ make: () => { return function () { return new Error('**只调外层A**') } } }).make()",
+      "throw ({ make: () => (() => new Error('**只调外层B**')) }).make()",
       // 类**被实例化** → 实例字段初始化器执行（`new (class { … })()` 时字段在构造里求值）
       "throw (new (class { error = new Error('**类被实例化**') })()).error",
       // 静态字段在**类定义时**求值，与实例化无关
@@ -569,6 +645,9 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       // 反例（带星号）：展开源里的**函数表达式属性**同理
       "throw ({ ...{ make: function () { return new Error('**展开里的函数表达式**') } }, error: new Error('clean6') }).error",
       // 立即执行的派生形态（Codex PR#81 第二十五轮 P2，Node 实测三条都真的抛）
+      // 反例（如实记录）：`.call` 链在**尾值位置**不被穿透 —— 外层箭头的尾值是 `.call(…)` 调用的结果，
+      // 内层箭头只是被调用的对象；合并样本里实测不命中。单独成文件时是否命中不由本样本承诺。
+      "throw (() => (() => new Error('**call 链内层**'))).call(null)",
       "throw (() => new Error('**bind 立即执行**')).bind(null)()",
       "throw (0, () => new Error('**逗号立即执行**'))()",
       "throw ({ make() { return new Error('**方法被调用**') } }).make()",
@@ -592,12 +671,32 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(USAGE_FAIL.hit(sf),
       'usageFail 规则：字面量 + 嵌套模板 + 常量拼接 + 插值里的常量拼接；含变量那条不算').toHaveLength(4)
     const throwHits = THROW_ERROR.hit(sf)
-    expect(throwHits, 'throw 规则：单行 + 跨行 + IIFE 四种包装各一条；非 throw 的 new Error 与'
-      + '未调用的回调 / 未被读到或只被引用的 getter、方法里的 new Error 不算').toHaveLength(24)
     // ⚠️ **逐条断言**（CodeRabbit/Codex PR#81 第二十九轮）：只断言总数时，「一条漏检 + 一条误报」
     // 会互相抵消，总数照样对 —— 本文件就出现过（`new (function(){…})()` 漏检被 getter 只读误报
-    // 抵消）。正例样本必须各自命中、反例样本必须各自不命中。
-    const srcOf = (key: string): string => fake.split('\n').find((l) => l.includes(key)) ?? ''
+    // 抵消）。
+    const _set = new Set(throwHits.map((h) => Number(h.slice(1).split(' ')[0])))
+    const _lines = fake.split('\n')
+    const _byKey = (k: string): number => _lines.findIndex((l) => l.startsWith(k) || (l.startsWith('throw ') && l.includes(k))) + 1
+    const _keys: Array<[string, boolean]> = [
+      ['**getter 返回后调用**', true], ['**getter 返回的函数带括号后被调用**', true], ['**类被实例化**', true],
+      ['**静态字段**', true], ['**展开后被调用**', true], ['**new 函数表达式**', true], ['**属性箭头**', true],
+      ['**属性函数表达式**', true], ['**方法被调用**', true], ['**bind 立即执行**', true], ['**逗号立即执行**', true],
+      ['**立即执行**', true], ['**getter**', true], ['**匿名类**', true], ['**展开执行 getter**', true],
+      ['**断言包装**', true], ['**非空断言**', true], ['**尖括号断言**', true], ['**call 立即执行**', true],
+      ['**下标 call**', true], ['**计算键 getter**', true], ['**as 包装**', true],
+      ['**未抛出**', false], ['**未实例化的类字段**', false], ['**只调外层FN**', false], ['**只调外层A**', false],
+      ['**只调外层B**', false], ['**getter 只读**', false], ['**展开里的方法**', false], ['**展开里的箭头**', false],
+      ['**展开里的函数表达式**', false], ['**属性箭头未调用**', false], ['**方法引用**', false], ['**unused**', false],
+      ['**call 链内层**', false],
+      ['const e = new Error', false],
+    ]
+    const _bad = _keys.map(([k, want]) => [k, _byKey(k), want, _set.has(_byKey(k))] as const)
+      .filter(([k, ln, want, got]) => ln === 0 || got !== want)
+      .map(([k, ln]) => k + '@' + ln)
+    // 已列样本必须**各自**命中/不命中（行级核对，不靠总数：漏检 + 误报会互相抵消）。
+    expect(_bad, `样本逐条不符：${JSON.stringify(_bad)}`).toEqual([])
+    // 正例逐个**单独成文件**再扫一次：确认每条违规自身就足以命中（不靠相邻样本的行号/拼接）
+    const srcOf = (key: string): string => _lines.find((l) => l.startsWith('throw ') && l.includes(key)) ?? ''
     for (const pos of ['**getter 返回后调用**', '**getter 返回的函数带括号后被调用**', '**类被实例化**',
       '**静态字段**', '**展开后被调用**', '**new 函数表达式**',
       '**属性箭头**', '**属性函数表达式**', '**方法被调用**', '**bind 立即执行**', '**逗号立即执行**',
@@ -606,7 +705,11 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
         `正例必须命中：${pos}`).toHaveLength(1)
     }
     for (const neg of ['**getter 只读**', '**属性箭头未调用**', '**方法引用**', '**展开里的方法**',
-      '**展开里的箭头**', '**展开里的函数表达式**', '**未抛出**', '**非抛出**', '**未实例化的类字段**']) {
+      '**展开里的箭头**', '**展开里的函数表达式**', '**未抛出**', '**未实例化的类字段**', '**只调外层FN**',
+      // 两条「只调外层」的关键用法：内层函数字面量在**尾位置**（块体尾 `return` / 表达式体）。Node 实测均不抛内层 message。
+      // ⚠️ 不换成 `() => () => …`：`**` 文本嵌在外层箭头体里，「调用实参文字面量」那条规则会把它算进 `make()` 的实参，
+      // 与本条判据无关（如实记录，本组只钉住尾位置判据）
+      '**只调外层A**', '**只调外层B**']) {
       expect(THROW_ERROR.hit(parseTs(srcOf(neg))), `反例必须不命中：${neg}`).toEqual([])
     }
     expect(STDERR_WRITE.hit(sf),

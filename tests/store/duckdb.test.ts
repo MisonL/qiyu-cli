@@ -381,6 +381,81 @@ describe('duckdb —— 事务', () => {
       .toBe(txErr === null ? 2 : 1)
   })
 
+  it('语句下发期间另一条链开事务、外部语句执行期报错、回调直接返回 → 事务必须响亮失败，不得 COMMIT 成功而丢写（CodeRabbit PR#81 第三十一轮 major / Codex P2）', async () => {
+    // 事故路径（探针实测，DuckDB 1.5.6）：事务内一条语句执行期报错后，DuckDB 把整条事务标成
+    // aborted —— 所有者回调若直接 return，`COMMIT` 的结局取决于时序：可能报 aborted，也可能
+    // 返回成功而事务内的写入**全部被丢弃**。外部语句的错误只 reject 给发起它的那条链，
+    // 所有者原本看不到。判据：所有者不得拿到成功；事务内写入不得残留。
+    const real = await import('@duckdb/node-api')
+    let release!: () => void
+    let gate: Promise<void> | undefined
+    let holdNext = false
+    // ⚠️ 包装对象替身整个实例：`Store.close()` 调的是 `conn.closeSync()` / `inst.closeSync()`，
+    // 它们挂在**原型**上，对象展开复制不到 —— 不转发就等于原生连接/实例泄漏（锁随进程存活）。
+    // 所以在包 `runAndReadAll` 的同时把两层 `closeSync` 一并转发（CodeRabbit PR#81 第三十一轮 major）。
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as {
+                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
+                closeSync?: () => void
+              }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (holdNext && sql.includes('bad_cast_q31')) {
+                    holdNext = false
+                    gate = new Promise<void>((r) => { release = r })
+                    await gate
+                  }
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const orig = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
+    await orig.call(s, "CREATE VIEW bad_cast_q31 AS SELECT CAST('x' AS INT) AS v")
+    holdNext = true
+    const outside = s.query('SELECT * FROM bad_cast_q31').then(() => 'ok', (e: unknown) => e)
+    for (let i = 0; i < 200 && gate === undefined; i++) await new Promise((r) => setImmediate(r))
+    expect(gate, '前提：外部语句确实停在下发之前的窗口里').toBeDefined()
+    let began!: () => void
+    const beganP = new Promise<void>((r) => { began = r })
+    const tx = s.transaction(async (t) => {
+      began()
+      await new Promise((r) => setTimeout(r, 80))
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+      // ⚠️ 关键：回调在此**直接返回**，不再发任何语句（不会因再写而偶然撞 aborted 失败）
+    })
+    await beganP
+    await new Promise((r) => setTimeout(r, 20))
+    release()
+    expect(await outside, '外部语句被拒').toMatchObject({ kind: 'internal' })
+    const txErr = await tx.then(() => null, (e: unknown) => e)
+    // 本机（单线程）实况：DuckDB 已把事务标 aborted，所有者这边 `COMMIT` 自己就报
+    // `cannot commit - no transaction is active`（响亮失败，不是静默成功）—— 探针实测。
+    // 断言只钉「不得成功且不得残留」，不钉具体文案：驱动层若以后改口径（例如整段回滚 +
+    // internal），这条依然成立。「COMMIT 返回成功而丢写」必须让这条变红。
+    expect(txErr, '事务必须响亮失败，不得返回成功').not.toBeNull()
+    expect(await s.count('tags'), '事务内的写入不得残留（要么整体回滚，要么完整提交）')
+      .toBe(txErr === null ? 2 : 1)
+  })
+
   it('语句下发期间另一条链开启事务（语句本身成功）→ 同样被拒（CodeRabbit PR#81 第二十八轮 major）', async () => {
     // 成功路径与失败路径共用同一个判据（`txEpoch`）：这条语句若落进别人的事务，它的成功
     // 只说明"在本事务里执行成功"，仍会随对方回滚而消失，或把对方的事务一起带下车 ——
