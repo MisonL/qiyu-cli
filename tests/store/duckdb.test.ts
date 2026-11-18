@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import type { DuckDbDeps } from '../../src/store/duckdb.js'
 import { TABLES } from '../../src/store/schema.js'
-import type { Store, StoreConfig } from '../../src/store/types.js'
+import type { Store, StoreConfig, QueryResult } from '../../src/store/types.js'
 
 // L1 对冲：本文件全部用例走真库（DuckDB 冷启动偶发 >5s），统一放宽到 15s。
 vi.setConfig({ testTimeout: 15_000 })
@@ -252,6 +252,8 @@ describe('duckdb —— upsert 契约', () => {
 })
 
 type FakeAls = ReturnType<NonNullable<DuckDbDeps['makeAls']>>
+/** 事务令牌的类型从依赖缝的签名里取（令牌类型不导出，测试不需要知道它的形状）。 */
+type TxStore = Parameters<FakeAls['run']>[0]
 
 describe('duckdb —— 事务', () => {
   it('关闭后调用 transaction()：发 usage，且不得重新启用事务上下文（Codex PR#81 第十八轮 P2）', async () => {
@@ -262,9 +264,9 @@ describe('duckdb —— 事务', () => {
     // 启用状态在 Node 上读不到，所以观察**重新启用的唯一途径**：`run()` 有没有被调用。
     let runs = 0
     const makeAls = (): FakeAls => {
-      const real = new AsyncLocalStorage<symbol>()
+      const real = new AsyncLocalStorage<TxStore>()
       return {
-        run: <T>(store: symbol, f: () => T): T => { runs++; return real.run(store, f) },
+        run: <T>(token: TxStore, f: () => T): T => { runs++; return real.run(token, f) },
         getStore: () => real.getStore(),
         disable: () => real.disable(),
       }
@@ -286,41 +288,38 @@ describe('duckdb —— 事务', () => {
     // 而 `safeRollback` 因 `closed` 必然失败、之后也没人 disable。每次「事务中关库」都漏一个。
     let runs = 0
     const makeAls = (): FakeAls => {
-      const real = new AsyncLocalStorage<symbol>()
+      const real = new AsyncLocalStorage<TxStore>()
       return {
-        run: <T>(store: symbol, f: () => T): T => { runs++; return real.run(store, f) },
+        run: <T>(token: TxStore, f: () => T): T => { runs++; return real.run(token, f) },
         getStore: () => real.getStore(),
         disable: () => real.disable(),
       }
     }
     const s = await createDuckDbStore(cfg, 'rw', { makeAls })
     await s.init()
-    // ⚠️ 钉住判据的前提（CodeRabbit PR#81 第二十七轮 major 的疑问：`init()` 会不会自己让
-    // `runs` 非零、使下面的精确断言与回滚无关地成立）：实测 init 不进入事务上下文。
-    expect(runs, '前提：初始化不进入事务上下文（否则下面的 runs===1 不能归因于事务）').toBe(0)
+    // ⚠️ init 的每次迁移都走**托管事务**（CR 第三十八轮 major #1），所以基线不是 0 而是
+    // 「迁移条数次」。判据改为**增量**：本次事务正常路径只应增加 1 次（BEGIN 那次），
+    // 关闭后的回滚路径不得再进入上下文（否则增量是 2）。
+    const before = runs
+    expect(before, '前提：迁移确实走了托管事务（基线为迁移条数）').toBeGreaterThan(0)
     const tx = s.transaction(async (t) => {
       await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
       await s.close()                       // 事务进行中关库：后续语句必失败
     })
     const err = await tx.then(() => null, (e: unknown) => e)
     expect(err, '事务中的语句在关闭后报 usage').toMatchObject({ kind: 'usage' })
-    // 正常路径上 BEGIN / 回调 / COMMIT 共用**一次** `alsTx.run`：`runs === 1`。
-    // 回滚若也进入上下文就是 2 —— 精确断言，宽松的 `<= n` 会被正常路径自身满足。
-    expect(runs, '关闭后的回滚路径不得再进入上下文').toBe(1)
+    expect(runs - before, '关闭后的回滚路径不得再进入上下文').toBe(1)
   })
 
-  it('语句下发期间另一条链开启事务 → 该语句被拒、对方事务不丢写（CodeRabbit PR#81 第二十八轮 major）', async () => {
-    // 事故路径（实测复现，见 src/store/duckdb.ts 的 `txEpoch` 注释）：`execSql` 的归属检查在
-    // **下发前**，检查与驱动真正执行之间隔着 await（驱动内部 `runUntilLast` / `prepared.run()`）。
-    // 外部链的语句在这段窗口里，另一条链开了事务 —— 前者就落进后者的事务；它一旦执行期报错
-    // （CAST 失败的 view），所有者 COMMIT 返回成功而写入被静默丢弃（实测 count 从 1 变 0）。
-    //
-    // 复现：经 `deps.importer` 注入包装后的驱动 —— 连接上的 `runAndReadAll` 在真正执行外部
-    // 那条语句前，先等另一条链把事务**完整地**开起来（BEGIN 已发出）。这道闸门位于 `execSql`
-    // 的归属检查**之后**，正是事故窗口的位置。
+  it('外部语句在途（尚未执行）→ 事务在 BEGIN 前被拒；语句落定后事务正常（CR 第三十八轮 major）', { timeout: 90_000 }, async () => {
+    // 新不变量（CR 第三十八轮）：**BEGIN 只在连接上没有任何在途语句时发出**。原始 SQL 无法
+    // 静态判定读写；它在 BEGIN 之后执行会落进本事务，在 ROLLBACK / COMMIT 之后执行则会在
+    // autocommit 里落库，而调用方拿到的却是失败。旧实现允许事务插进来、靠跨代记号兜底 ——
+    // 那条标记路径正是本用例替换掉的（现在按设计不可达，保留为内部不变量兜底）。
     const real = await import('@duckdb/node-api')
-    let release!: () => void
-    let gate: Promise<void> | undefined = undefined
+    const sqls: string[] = []
+    let releaseExecute!: () => void
+    let executeGate: Promise<void> | undefined
     let holdNext = false
     const importer = async (): Promise<unknown> => ({
       ...real,
@@ -330,8 +329,6 @@ describe('duckdb —— 事务', () => {
           const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
           return {
             ...(inst as object),
-            // ⚠️ `Store.close()` 调的是原型上的 `closeSync()`，对象展开复制不到 —— 两层都要转发
-            // （CodeRabbit PR#81 第三十一/三十二轮 major：不转发会泄漏原生连接与实例）
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
@@ -340,111 +337,11 @@ describe('duckdb —— 事务', () => {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
-                  const target = cc
-                  if (holdNext && sql.includes('bad_cast_q28')) {
-                    holdNext = false
-                    gate = new Promise<void>((r) => { release = r })
-                    await gate
-                  }
-                  return target.runAndReadAll(sql, params)
-                },
-              }
-            },
-          }
-        },
-      },
-    })
-    const s = await createDuckDbStore(cfg, 'rw', { importer })
-    await s.init()
-    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
-    const orig = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
-    await orig.call(s, "CREATE VIEW bad_cast_q28 AS SELECT CAST('x' AS INT) AS v")
-    holdNext = true
-    const outside = s.query('SELECT * FROM bad_cast_q28').then(() => 'ok', (e: unknown) => e)
-    // 等外部语句通过归属检查、停在驱动闸门上
-    for (let i = 0; i < 200 && gate === undefined; i++) await new Promise((r) => setImmediate(r))
-    expect(gate, '前提：外部语句确实停在下发之前的窗口里').toBeDefined()
-    // 窗口内开事务并写一行；BEGIN 发出后再放行外部语句
-    let began!: () => void
-    const beganP = new Promise<void>((r) => { began = r })
-    const tx = s.transaction(async (t) => {
-      began()
-      await new Promise((r) => setTimeout(r, 80))   // 等外部语句在事务里下发完
-      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
-    })
-    await beganP
-    await new Promise((r) => setTimeout(r, 20))
-    release()
-    const outsideErr = await outside
-    const txErr = await tx.then(() => null, (e: unknown) => e)
-    expect(outsideErr, '窗口内下发的语句必须被拒绝（internal），不能静默落进别人的事务')
-      .toMatchObject({ kind: 'internal' })
-    // ⚠️ 这条语句是**执行期**报错的（CAST 失败在服务端才发生），事务已被标成 aborted —— 那一步
-    // 无法撤销。判据要保证的是**不静默**：所有者随后无论 COMMIT 还是写都会响亮失败（原先
-    // COMMIT 返回成功、写入被丢弃、count 从 1 变 0）。这里断言「要么成功且行在，要么失败且行不在」。
-    const rows = await s.count('tags')
-    expect(rows, '事务失败时其写入不得部分残留；成功时必须完整在库里')
-      .toBe(txErr === null ? 2 : 1)
-    // ⚠️ 显式关库：包装器已转发两层 `closeSync`（见 `importer` 注释），必须真的关到原生连接与实例 ——
-    // 否则锁随进程存活，且 teardown 的 `rmSync` 会撞锁（CR 第三十二轮 major 要求先证明已关闭）。
-    await s.close()
-  })
-
-  it('语句下发期间另一条链开事务、外部语句执行期报错、回调直接返回 → 事务必须响亮失败，不得 COMMIT 成功而丢写（CodeRabbit PR#81 第三十一轮 major / Codex P2）', async () => {
-    // 事故路径（探针实测，DuckDB 1.5.6）：事务内一条语句执行期报错后，DuckDB 把整条事务标成
-    // aborted —— 所有者回调若直接 return，`COMMIT` 的结局取决于时序：可能报 aborted，也可能
-    // 返回成功而事务内的写入**全部被丢弃**。外部语句的错误只 reject 给发起它的那条链，
-    // 所有者原本看不到。判据：所有者不得拿到成功；事务内写入不得残留。
-    const real = await import('@duckdb/node-api')
-    let releaseExecute!: () => void
-    let executeGate: Promise<void> | undefined
-    let releaseDeliver!: () => void
-    let deliverGate: Promise<void> | undefined
-    let holdNext = false
-    // 事件序列（CR 第三十三轮要求证明「外部语句确实在所有者事务内执行、它的错误在 COMMIT 之后
-    // 才交回」）：前两个事件由测试在关键点追加，另两个由包装器在驱动返回 / 交回错误时记录。
-    const events: string[] = []
-    // ⚠️ 包装对象替身整个实例：`Store.close()` 调的是 `conn.closeSync()` / `inst.closeSync()`，
-    // 它们挂在**原型**上，对象展开复制不到 —— 不转发就等于原生连接/实例泄漏（锁随进程存活）。
-    // 所以在包 `runAndReadAll` 的同时把两层 `closeSync` 一并转发（CodeRabbit PR#81 第三十一轮 major）。
-    const importer = async (): Promise<unknown> => ({
-      ...real,
-      DuckDBInstance: {
-        create: async (...a: unknown[]) => {
-          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
-          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
-          return {
-            ...(inst as object),
-            closeSync: () => ii.closeSync?.(),
-            connect: async () => {
-              const c = await ii.connect()
-              const cc = c as {
-                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
-                closeSync?: () => void
-              }
-              return {
-                ...(c as object),
-                closeSync: () => cc.closeSync?.(),
-                runAndReadAll: async (sql: string, params?: unknown[]) => {
-                  if (holdNext && sql.includes('bad_cast_q31')) {
-                    // ⚠️ 两个闸门（CR 第三十五轮 major）：`execute` 挡住**下发**（让外语句在所有者
-                    // BEGIN + 写入之后才真正执行进事务），`deliver` 挡住**结果交回**。旧写法在
-                    // await 闸门之前就调了 `cc.runAndReadAll`，实际是「先执行、后起事务」而非
-                    // 「在所有者事务内执行」—— 测不到执行期污染那条路径。
-                    holdNext = false
-                    executeGate = new Promise<void>((r) => { releaseExecute = r })
-                    await executeGate
-                    events.push('external-executing')
-                    const outcome = cc.runAndReadAll(sql, params).then(() => 'ok' as const, (e: unknown) => e)
-                    await outcome
-                    events.push('external-executed')
-                    deliverGate = new Promise<void>((r) => { releaseDeliver = r })
-                    await deliverGate
-                    const res = await outcome
-                    events.push('external-settled')
-                    if (res !== 'ok') throw res
-                    return res
-                  }
+                  sqls.push(sql)
+                  if (!holdNext || !sql.includes('bad_cast_q38')) return cc.runAndReadAll(sql, params)
+                  holdNext = false
+                  executeGate = new Promise<void>((r) => { releaseExecute = r })
+                  await executeGate
                   return cc.runAndReadAll(sql, params)
                 },
               }
@@ -457,36 +354,89 @@ describe('duckdb —— 事务', () => {
     await s.init()
     await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
     const orig = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
-    await orig.call(s, "CREATE VIEW bad_cast_q31 AS SELECT CAST('x' AS INT) AS v")
+    await orig.call(s, "CREATE VIEW bad_cast_q38 AS SELECT CAST('x' AS INT) AS v")
+    sqls.length = 0
     holdNext = true
-    const outside = s.query('SELECT * FROM bad_cast_q31').then(() => 'ok', (e: unknown) => e)
-    // ⚠️ 外部语句已通过下发前的归属闸门、停在**执行**闸门上（此时还没有任何事务开着）。
-    for (let i = 0; i < 200 && executeGate === undefined; i++) await new Promise((r) => setImmediate(r))
-    expect(executeGate, '前提：外部语句确实停在下发之后、执行之前的窗口里').toBeDefined()
-    let began!: () => void
-    const beganP = new Promise<void>((r) => { began = r })
-    const tx = s.transaction(async (t) => {
-      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
-      began()
-      events.push('began')
-      // ⚠️ 所有者先写完，再放外语句**执行**：它真正落进这条事务，执行期报错把它标成 aborted。
-      releaseExecute()
-      await new Promise((r) => setTimeout(r, 80))
-      // ⚠️ 关键：回调在此**直接返回**（不再发任何语句 —— 不会被 aborted 挡住而偶然失败）
+    const outside = s.query('SELECT * FROM bad_cast_q38').then(() => 'ok', (e: unknown) => e as Error)
+    for (const deadline = Date.now() + 10_000; executeGate === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(executeGate, '前提：外部语句已通过下发检查、停在执行闸门上').toBeDefined()
+    const txErr = await s.transaction(async () => { /* 不该进来 */ })
+      .then(() => null, (e: unknown) => e as Error)
+    expect(txErr, '语句在途时不得开启事务').toMatchObject({ kind: 'internal' })
+    expect((txErr as Error).message, '成因要点名「还没交回结果」').toMatch(/还没有交回结果/)
+    expect(sqls.filter((q) => q === 'BEGIN'), '一道 BEGIN 都不许发出').toEqual([])
+    releaseExecute()
+    const outsideErr = await outside
+    expect(outsideErr, '语句自己的驱动错误必须原样交回（不是「跨代」的 internal）').not.toBeNull()
+    expect((outsideErr as Error).message, '驱动原文透传（CAST 失败）').toMatch(/Conversion|CAST|类型/)
+    // 语句落定（成功或失败都交回）之后，事务恢复正常
+    await s.transaction(async (t) => { await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }]) })
+    expect(await s.count('tags')).toBe(2)
+    await s.close()
+  })
+
+  it('外部语句已执行、结果未交回 → 同样不得开启事务；结果交回后事务正常（CR 第三十八轮 major）', { timeout: 90_000 }, async () => {
+    // 与上一条互补：语句**已执行完**，只差结果交回。驱动在「执行完、结果返回」之间还有异步点，
+    // 事务仍可能与它的落点交错，所以判据是「交回结果之前一律不开 BEGIN」。
+    const real = await import('@duckdb/node-api')
+    const sqls: string[] = []
+    let releaseDeliver!: () => void
+    let deliverGate: Promise<void> | undefined
+    let holdNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  sqls.push(sql)
+                  if (!holdNext || !sql.includes('q38_ok')) return cc.runAndReadAll(sql, params)
+                  holdNext = false
+                  const outcome = cc.runAndReadAll(sql, params)
+                  await outcome
+                  deliverGate = new Promise<void>((r) => { releaseDeliver = r })
+                  await deliverGate
+                  return outcome
+                },
+              }
+            },
+          }
+        },
+      },
     })
-    await beganP
-    await new Promise((r) => setTimeout(r, 20))
-    // ⚠️ 交付闸门**不动**：外部语句的错误直到事务落定之后才交回 —— 所有者提交时看不到任何
-    // 由「错误交回」得出的记号（`brokenTx` 在错误路径里设置，此刻还没跑）。
-    const txErr = await tx.then(() => null, (e: unknown) => e)
-    events.push('tx-settled')
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    sqls.length = 0
+    holdNext = true
+    const outside = s.query('SELECT 42 AS q38_ok').then((r) => ({ r }), (e: unknown) => ({ err: e as Error }))
+    for (const deadline = Date.now() + 10_000; deliverGate === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(deliverGate, '前提：语句已执行完、结果被扣住').toBeDefined()
+    const txErr = await s.transaction(async () => { /* 不该进来 */ })
+      .then(() => null, (e: unknown) => e as Error)
+    expect(txErr, '结果未交回时不得开启事务').toMatchObject({ kind: 'internal' })
+    expect((txErr as Error).message).toMatch(/还没有交回结果/)
+    expect(sqls.filter((q) => q === 'BEGIN'), '一道 BEGIN 都不许发出').toEqual([])
     releaseDeliver()
-    expect(await outside, '外部语句被拒').toMatchObject({ kind: 'internal' })
-    expect(txErr, '事务必须响亮失败，不得返回成功').not.toBeNull()
-    // 成因必须点名「事务未提交 + 已整体回滚」（`commitOrRefuse`），不能只说驱动原文 ——
-    // 只报驱动原文时调用方不知道数据没落库，也不会去查并行调用。
-    expect((txErr as Error).message, '成因要点名未提交与整体回滚').toMatch(/事务未提交.*已整体回滚/)
-    expect(await s.count('tags'), '事务内的写入不得残留（整体回滚）').toBe(1)
+    const out = await outside
+    expect(out, '语句自己的结果必须原样交回').toHaveProperty('r')
+    expect((out as { r: QueryResult }).r.rows[0].q38_ok).toBe(42)
+    await s.transaction(async (t) => { await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }]) })
+    expect(await s.count('tags')).toBe(2)
     await s.close()
   })
 
@@ -569,18 +519,14 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
-  it('外部（原始 SQL）DELETE 在 B 的事务内**成功**执行 → B 同样必须拒绝提交（CR 第三十六/三十七轮 major）', { timeout: 90_000 }, async () => {
-    // 失败路径有 `brokenTx`；**成功**路径同样要打记号：外部 DELETE 在 B 的事务里执行成功时行
-    // 已经真的被删了，而调用方拿到的是拒绝（跨代）。若 B 照常 COMMIT，「报了失败、数据却落库」
-    // 同时成立。执行闸门保证 DELETE 真的落进 B，交付闸门把结果扣到 B 之后。
-    // ⚠️ CR 第三十七轮之后，`store.delete()` 作为写操作会在 BEGIN 前被准入规则挡住 —— 这条
-    // 用例改用**原始 SQL**（`query`）写：它不经过写操作登记，跨代记号仍是它唯一的防线，
-    // 也正是这里刻意保留的边界（见 `admitBegin` 的注释）。
+  it('外部原始 SQL 写在途（尚未执行）→ 事务在 BEGIN 前被拒；释放后写的结果与行状态一致（CR 第三十八轮 major #5/#10）', { timeout: 90_000 }, async () => {
+    // CR 第三十八轮的疑问：B 回滚时那条被扣在**原生执行之前**的 DELETE，释放后会不会在
+    // autocommit 里删掉行、而调用方拿到 internal？新判据下它**没有**这个机会：写还在途时
+    // B 根本不许开始。释放后 DELETE 自己正常返回，行确实被删 —— 结果与事实一致。
     const real = await import('@duckdb/node-api')
+    const sqls: string[] = []
     let releaseExecute!: () => void
     let executeGate: Promise<void> | undefined
-    let releaseDeliver!: () => void
-    let deliverGate: Promise<void> | undefined
     let holdNext = false
     const importer = async (): Promise<unknown> => ({
       ...real,
@@ -590,255 +536,6 @@ describe('duckdb —— 事务', () => {
           const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
           return {
             ...(inst as object),
-            closeSync: () => ii.closeSync?.(),
-            connect: async () => {
-              const c = await ii.connect()
-              const cc = c as {
-                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
-                closeSync?: () => void
-              }
-              return {
-                ...(c as object),
-                closeSync: () => cc.closeSync?.(),
-                runAndReadAll: async (sql: string, params?: unknown[]) => {
-                  if (!holdNext || !sql.startsWith('DELETE FROM "tags"')) return cc.runAndReadAll(sql, params)
-                  holdNext = false
-                  executeGate = new Promise<void>((r) => { releaseExecute = r })
-                  await executeGate
-                  const outcome = cc.runAndReadAll(sql, params).then(() => 'ok' as const, (e: unknown) => e)
-                  await outcome
-                  deliverGate = new Promise<void>((r) => { releaseDeliver = r })
-                  await deliverGate
-                  const res = await outcome
-                  if (res !== 'ok') throw res
-                  return res
-                },
-              }
-            },
-          }
-        },
-      },
-    })
-    const s = await createDuckDbStore(cfg, 'rw', { importer })
-    await s.init()
-    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
-    holdNext = true
-    const outside = s.query(`DELETE FROM "tags" WHERE id = '1'`).then(() => 'ok', (e: unknown) => e)
-    // 原始 SQL 直接下发 DELETE —— 用限时轮询等闸门，别按 tick 数猜。
-    for (const deadline = Date.now() + 10_000; executeGate === undefined && Date.now() < deadline;) {
-      await new Promise((r) => setTimeout(r, 10))
-    }
-    expect(executeGate, '前提：DELETE 已通过下发检查、停在执行闸门上').toBeDefined()
-    // ⚠️ 时序（CR 第三十六轮）：DELETE 的**结果必须先交回**、B 之后才提交 —— 提交那一刻
-    // `foreignInFlight` 已归零，只有执行期落下的 `brokenTx` 记号拦得住（否则这条用例在
-    // 「没有记号」时也绿，钉不住任何东西）。
-    let allowReturn!: () => void
-    const returnAllowed = new Promise<void>((r) => { allowReturn = r })
-    const tx = s.transaction(async (t) => {
-      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
-      releaseExecute()
-      await returnAllowed
-    })
-    for (const deadline = Date.now() + 10_000; deliverGate === undefined && Date.now() < deadline;) {
-      await new Promise((r) => setTimeout(r, 10))
-    }
-    expect(deliverGate, '前提：DELETE 已执行完、结果被扣住').toBeDefined()
-    releaseDeliver()
-    // DELETE 被拒（跨代），行本身已被执行；B 尚未提交。
-    expect(await outside, '外部 DELETE 被拒').toMatchObject({ kind: 'internal' })
-    allowReturn()
-    const txErr = await tx.then(() => null, (e: unknown) => e)
-    expect(txErr, 'B 不得在「外部写已执行」时提交成功').not.toBeNull()
-    expect((txErr as Error).message, '成因要点名未提交').toMatch(/事务未提交/)
-    const ids = (await s.query('SELECT id FROM "tags" ORDER BY id')).rows.map((r) => String(r.id))
-    expect(ids, 'DELETE 随 B 一起回滚，行必须还在').toEqual(['1'])
-    await s.close()
-  })
-
-  it('外部语句在所有者提交之后才报错 → 同样不得 COMMIT 冒充成功（CR 第三十三轮 major）', async () => {
-    // CR 第三十三轮的两条成因：①「记号要等外部拒绝交回才设置」；②「外部语句在所有者 BEGIN
-    // **之前**就执行完」。本用例把两者同时摆正：外部语句在所有者 BEGIN 之前就已**执行完**，
-    // 但它的错误一直扣到所有者事务落定之后才交回 —— 所有者提交那一刻没有任何「错误已交回」
-    // 的记号可用，只能靠执行期就留下的证据。
-    const real = await import('@duckdb/node-api')
-    const events: string[] = []
-    let release!: () => void
-    let gate: Promise<void> | undefined
-    let holdNext = false
-    const importer = async (): Promise<unknown> => ({
-      ...real,
-      DuckDBInstance: {
-        create: async (...a: unknown[]) => {
-          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
-          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
-          return {
-            ...(inst as object),
-            closeSync: () => ii.closeSync?.(),
-            connect: async () => {
-              const c = await ii.connect()
-              const cc = c as {
-                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
-                closeSync?: () => void
-              }
-              return {
-                ...(c as object),
-                closeSync: () => cc.closeSync?.(),
-                runAndReadAll: async (sql: string, params?: unknown[]) => {
-                  if (!holdNext || !sql.includes('bad_cast_q33')) return cc.runAndReadAll(sql, params)
-                  holdNext = false
-                  gate = new Promise<void>((r) => { release = r })
-                  // 错误必须**先接住**再扣住：不接的话拒绝在闸门之前就交回调用方了。接住 = 语句
-                  // 已执行完（事务被污掉），闸门只挡住「结果 / 错误交回」。
-                  const outcome = cc.runAndReadAll(sql, params).then(() => 'ok', (e: unknown) => e)
-                  await outcome
-                  events.push('external-executed')
-                  await gate
-                  const res = await outcome
-                  events.push('external-settled')
-                  if (res !== 'ok') throw res
-                  return res
-                },
-              }
-            },
-          }
-        },
-      },
-    })
-    const s = await createDuckDbStore(cfg, 'rw', { importer })
-    await s.init()
-    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
-    const orig = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
-    await orig.call(s, "CREATE VIEW bad_cast_q33 AS SELECT CAST('x' AS INT) AS v")
-    holdNext = true
-    const outside = s.query('SELECT * FROM bad_cast_q33').then(() => 'ok', (e: unknown) => e)
-    for (let i = 0; i < 200 && gate === undefined; i++) await new Promise((r) => setImmediate(r))
-    expect(gate, '前提：外部语句确实停在下发之前的窗口里').toBeDefined()
-    let began!: () => void
-    const beganP = new Promise<void>((r) => { began = r })
-    const tx = s.transaction(async (t) => {
-      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
-      began()
-      events.push('began')
-      await new Promise((r) => setTimeout(r, 80))
-    })
-    await beganP
-    await new Promise((r) => setTimeout(r, 20))
-    // 闸门**不动**：外部错误直到所有者落定之后才交回，提交那一刻没有任何「错误已交回」的记号。
-    const txErr = await tx.then(() => null, (e: unknown) => e)
-    events.push('tx-settled')
-    release()
-    expect(await outside, '外部语句被拒').toMatchObject({ kind: 'internal' })
-    expect(events.slice(0, 3), '外部语句先执行完、所有者随后才开始、事务先落定').toEqual(
-      ['external-executed', 'began', 'tx-settled'])
-    expect(events.indexOf('tx-settled'), '事务在外部错误交回之前落定').toBeLessThan(events.indexOf('external-settled'))
-    expect(txErr, '所有者不得拿到提交成功').not.toBeNull()
-    expect((txErr as Error).message, '成因要点名未提交与整体回滚').toMatch(/事务未提交.*已整体回滚/)
-    expect(await s.count('tags'), '事务内的写入不得残留（整体回滚）').toBe(1)
-    await s.close()
-  })
-
-  it('外部语句的错误先交回、所有者随后才提交 → 同样不得 COMMIT 冒充成功（CR 第三十四轮 major）', { timeout: 90_000 }, async () => {
-    // 与上一条是**互补时序**：上一条外部拒绝扣到所有者提交之后（在途计数拦得住），这一条外部
-    // 拒绝**在所有者提交之前就已交回** —— 提交那一刻 `foreignInFlight` 已归零，只有执行期
-    // 落下的 `brokenTx` 记号能拦住。两条合起来才钉住「在途计数 + 每令牌记号」这一对判据
-    // （变异实测：删掉 `brokenTx.set` 时只有本用例变红）。
-    const real = await import('@duckdb/node-api')
-    const events: string[] = []
-    let release!: () => void
-    let gate: Promise<void> | undefined
-    let holdNext = false
-    const importer = async (): Promise<unknown> => ({
-      ...real,
-      DuckDBInstance: {
-        create: async (...a: unknown[]) => {
-          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
-          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
-          return {
-            ...(inst as object),
-            closeSync: () => ii.closeSync?.(),
-            connect: async () => {
-              const c = await ii.connect()
-              const cc = c as {
-                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
-                closeSync?: () => void
-              }
-              return {
-                ...(c as object),
-                closeSync: () => cc.closeSync?.(),
-                runAndReadAll: async (sql: string, params?: unknown[]) => {
-                  if (!holdNext || !sql.includes('bad_cast_q34')) return cc.runAndReadAll(sql, params)
-                  holdNext = false
-                  gate = new Promise<void>((r) => { release = r })
-                  // 语句先执行完（事务此刻已被污掉），错误扣在闸门上，等测试放行后**交给调用方**。
-                  const outcome = cc.runAndReadAll(sql, params).then(() => 'ok', (e: unknown) => e)
-                  await outcome
-                  events.push('external-executed')
-                  await gate
-                  events.push('external-releasing')
-                  const res = await outcome
-                  events.push('external-settled')
-                  if (res !== 'ok') throw res
-                  return res
-                },
-              }
-            },
-          }
-        },
-      },
-    })
-    const s = await createDuckDbStore(cfg, 'rw', { importer })
-    await s.init()
-    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
-    const orig = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
-    await orig.call(s, "CREATE VIEW bad_cast_q34 AS SELECT CAST('x' AS INT) AS v")
-    holdNext = true
-    const outside = s.query('SELECT * FROM bad_cast_q34').then(() => 'ok', (e: unknown) => e)
-    for (let i = 0; i < 200 && gate === undefined; i++) await new Promise((r) => setImmediate(r))
-    expect(gate, '前提：外部语句确实停在下发之前的窗口里').toBeDefined()
-    // 所有者回调在提交前**等外部错误真的交回**：测试先放行闸门、再接住外部结果，最后才放它走。
-    let began!: () => void
-    const beganP = new Promise<void>((r) => { began = r })
-    let externalDelivered!: () => void
-    const deliveredP = new Promise<void>((r) => { externalDelivered = r })
-    const tx = s.transaction(async (t) => {
-      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
-      began()
-      events.push('began')
-      await deliveredP
-    })
-    await beganP
-    release()
-    expect(await outside, '外部语句被拒').toMatchObject({ kind: 'internal' })
-    events.push('external-delivered')
-    externalDelivered()
-    // 此刻 `foreignInFlight` 已归零：只剩执行期记号 `brokenTx` 能拦住提交。
-    const txErr = await tx.then(() => null, (e: unknown) => e)
-    events.push('tx-settled')
-    expect(events.indexOf('external-delivered'), '外部错误在事务落定之前已交回').toBeLessThan(events.indexOf('tx-settled'))
-    expect(txErr, '所有者不得拿到提交成功').not.toBeNull()
-    expect((txErr as Error).message, '成因要点名未提交与整体回滚').toMatch(/事务未提交.*已整体回滚/)
-    expect(await s.count('tags'), '事务内的写入不得残留（整体回滚）').toBe(1)
-    await s.close()
-  })
-
-  it('语句下发期间另一条链开启事务（语句本身成功）→ 同样被拒（CodeRabbit PR#81 第二十八轮 major）', async () => {
-    // 成功路径与失败路径共用同一个判据（`txEpoch`）：这条语句若落进别人的事务，它的成功
-    // 只说明"在本事务里执行成功"，仍会随对方回滚而消失，或把对方的事务一起带下车 ——
-    // 与失败路径同样归为 internal。这条用例用**成功**的 SELECT 走一遍。
-    const real = await import('@duckdb/node-api')
-    let release!: () => void
-    let gate: Promise<void> | undefined
-    let holdNext = false
-    const importer = async (): Promise<unknown> => ({
-      ...real,
-      DuckDBInstance: {
-        create: async (...a: unknown[]) => {
-          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
-          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
-          return {
-            ...(inst as object),
-            // ⚠️ `Store.close()` 调的是原型上的 `closeSync()`，对象展开复制不到 —— 两层都要转发
-            // （CodeRabbit PR#81 第三十一/三十二轮 major：不转发会泄漏原生连接与实例）
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
@@ -847,13 +544,12 @@ describe('duckdb —— 事务', () => {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
-                  const target = cc
-                  if (holdNext && sql.includes('tags')) {
-                    holdNext = false
-                    gate = new Promise<void>((r) => { release = r })
-                    await gate
-                  }
-                  return target.runAndReadAll(sql, params)
+                  sqls.push(sql)
+                  if (!holdNext || !sql.startsWith('DELETE FROM "tags"')) return cc.runAndReadAll(sql, params)
+                  holdNext = false
+                  executeGate = new Promise<void>((r) => { releaseExecute = r })
+                  await executeGate
+                  return cc.runAndReadAll(sql, params)
                 },
               }
             },
@@ -864,28 +560,27 @@ describe('duckdb —— 事务', () => {
     const s = await createDuckDbStore(cfg, 'rw', { importer })
     await s.init()
     await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    sqls.length = 0
     holdNext = true
-    const outside = s.count('tags').then(() => 'ok', (e: unknown) => e)
-    for (let i = 0; i < 200 && gate === undefined; i++) await new Promise((r) => setImmediate(r))
-    expect(gate, '前提：外部语句停在下发之前').toBeDefined()
-    let began!: () => void
-    const beganP = new Promise<void>((r) => { began = r })
-    const tx = s.transaction(async (t) => {
-      began()
-      await new Promise((r) => setTimeout(r, 80))
-      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
-    })
-    await beganP
-    await new Promise((r) => setTimeout(r, 20))
-    release()
-    expect(await outside, '成功路径同样必须被拒绝（internal）').toMatchObject({ kind: 'internal' })
-    await tx.then(() => null, () => null)
+    const outside = s.query(`DELETE FROM "tags" WHERE id = '1'`)
+      .then((r) => ({ ok: r }), (e: unknown) => ({ err: e as Error }))
+    for (const deadline = Date.now() + 10_000; executeGate === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(executeGate, '前提：原始 SQL 写已下发、停在执行闸门上').toBeDefined()
+    const txErr = await s.transaction(async () => { /* 不该进来 */ })
+      .then(() => null, (e: unknown) => e as Error)
+    expect(txErr, '写在途时不得开启事务').toMatchObject({ kind: 'internal' })
+    expect((txErr as Error).message).toMatch(/还没有交回结果/)
+    expect(sqls.filter((q) => q === 'BEGIN'), '一道 BEGIN 都不许发出').toEqual([])
+    releaseExecute()
+    const out = await outside
+    expect(out, '写自己的结果必须成功交回（与事实一致）').not.toHaveProperty('err')
+    expect(await s.count('tags'), '行确实被删（写已生效）').toBe(0)
+    // 写落定之后事务恢复正常
+    await s.transaction(async (t) => { await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }]) })
+    expect(await s.count('tags')).toBe(1)
     await s.close()
-    // ⚠️ **只断言「s.close() 不抛」证明不了实例已关**（实测记录）：把三处包装器的实例 `closeSync`
-    // 转发删掉，本文件 61 条全绿；s.close() 在自己**进程内**释放实例锁（单进程重复打开会走共享/等待），
-    // 文件也能删。真实泄漏信号只出现在**跨进程**（锁随进程存活，见 duckdb.ts 的 N1 实测）。
-    // 所以这里不去造一个本机证明不了的断言（试过「删库不抛」，变异后依旧全绿，已撤）：
-    // 转发本身照 `wrapConn`（同文件，已有真实覆盖）的写法做，跨进程泄漏不在单测可达范围内 —— 如实记录。
   })
 
   it('事务回调里 close() 之后再写/删/读 → 一律 usage「数据库连接已关闭」，不得误诊成并发竞争（Codex PR#81 第二十五轮 P3）', async () => {
@@ -1614,10 +1309,13 @@ describe('duckdb —— 事务', () => {
     const txErr = await s.transaction(async () => { /* 不该进来 */ })
       .then(() => null, (e: unknown) => e as Error)
     expect(txErr, '写操作未完成时不得开启事务').toMatchObject({ kind: 'internal' })
-    expect((txErr as Error).message, '成因要点名未完成的写操作').toMatch(/写操作/)
+    // ⚠️ 判决文案来自更宽的「有语句在途」判据（CR 第三十八轮：原始 SQL 无法静态判定读写，
+    // 任何在途语句都让 BEGIN 不安全）—— 成因只要点明「有东西还没交回结果」即可。
+    expect((txErr as Error).message, '成因要点名返回结果之前的那条在途语句').toMatch(/还没有交回结果/)
     const upErr = await s.upsert('tags', [{ id: '9', name: 'X', color: '#FFF' }])
       .then(() => null, (e: unknown) => e as Error)
     expect(upErr, '自动事务同样不得在写操作未完成时发 BEGIN').toMatchObject({ kind: 'internal' })
+    expect((upErr as Error).message).toMatch(/还没有交回结果/)
     expect(sqls.filter((q) => q === 'BEGIN'), '一道 BEGIN 都不许发出').toEqual([])
     releaseExecute()
     expect(await outside, '写操作自己的结果必须准确（删了 1 行），不能是「跨代」的失败').toEqual({ n: 1 })
@@ -1625,6 +1323,302 @@ describe('duckdb —— 事务', () => {
     // 写操作落定之后事务恢复正常
     await s.transaction(async (t) => { await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }]) })
     expect(await s.count('tags')).toBe(1)
+    await s.close()
+  })
+
+  it('已结束事务的残留上下文不得再开启新事务（自动 upsert / transaction 都在换令牌前被拒）（CR 第三十八轮 major）', async () => {
+    // CR 第三十八轮 #2：`upsert` 的自动事务与 `transaction()` 会在 `alsTx.run` 里把旧令牌替换成
+    // 新令牌，替换之后 execSql 的退役检查读到的就是新令牌了 —— 残留续体（定时器）因此能开一条
+    // 全新事务并提交，调用方却以为它的写入属于那条已回滚的事务。判据：入口就拒。
+    const s = await fresh()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    let lateUpsert: Promise<unknown> | undefined
+    let lateTx: Promise<unknown> | undefined
+    await s.transaction(async () => {
+      setTimeout(() => {
+        lateUpsert = s.upsert('tags', [{ id: '9', name: 'X', color: '#FFF' }]).then(() => 'ok', (e: unknown) => e as Error)
+        lateTx = s.transaction(async () => { /* 不该进来 */ }).then(() => 'ok', (e: unknown) => e as Error)
+      }, 30)
+    })
+    for (const deadline = Date.now() + 10_000; (lateUpsert === undefined || lateTx === undefined) && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    const upOut = await lateUpsert
+    expect(upOut, '残留上下文里的 upsert 不得开新自动事务').toMatchObject({ kind: 'internal' })
+    expect((upOut as Error).message).toMatch(/事务已经结束/)
+    const txOut = await lateTx
+    expect(txOut, '残留上下文里的 transaction 同样不得开新事务').toMatchObject({ kind: 'internal' })
+    expect((txOut as Error).message).toMatch(/事务已经结束/)
+    expect(await s.count('tags'), '两次尝试都不得写入').toBe(1)
+    await s.close()
+  })
+
+  it('init 的迁移走托管事务：迁移进行中另一条链的 transaction() 在入口被拒（CR 第三十八轮 major）', { timeout: 90_000 }, async () => {
+    // CR 第三十八轮 #1：裸 `execSql('BEGIN')` 不登记归属 —— 迁移暂停时另一条链的 transaction()
+    // 会再发一条 BEGIN（DuckDB 拒绝它并把迁移事务标成 aborted），随后它的失败处理回滚掉迁移事务，
+    // init 恢复后就在事务外执行语句。托管事务把归属登记收敛到同一处。
+    const real = await import('@duckdb/node-api')
+    let releaseExecute!: () => void
+    let executeGate: Promise<void> | undefined
+    let holdNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!holdNext || !sql.includes('CREATE TABLE')) return cc.runAndReadAll(sql, params)
+                  holdNext = false
+                  executeGate = new Promise<void>((r) => { releaseExecute = r })
+                  await executeGate
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    holdNext = true
+    const initP = s.init()
+    for (const deadline = Date.now() + 10_000; executeGate === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(executeGate, '前提：迁移的第一条 DDL 已下发、停在执行闸门上').toBeDefined()
+    // 迁移事务此刻开着 —— 另一条链的 transaction() 必须在入口被拒（不得发 BEGIN）
+    const txErr = await s.transaction(async () => { /* 不该进来 */ })
+      .then(() => null, (e: unknown) => e as Error)
+    expect(txErr, '迁移进行中不得再开事务（归属登记必须覆盖迁移）').toMatchObject({ kind: 'internal' })
+    expect((txErr as Error).message).toMatch(/事务尚未提交/)
+    releaseExecute()
+    await initP
+    // 迁移已完成，事务恢复正常
+    await s.transaction(async (t) => { await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }]) })
+    expect(await s.count('tags')).toBe(1)
+    await s.close()
+  })
+
+  it('A 的提交拒绝被在 B 的回调里原样抛出 → B 仍必须回滚（拒绝按令牌归属）（CR 第三十八轮 major）', { timeout: 90_000 }, async () => {
+    // CR 第三十八轮 #3：只按错误对象的身份判断「回滚已由它负责」时，A 的拒绝对象被 B 原样抛出
+    // 会让 B 跳过回滚 —— 而 A 的回滚与 B 无关，B 的 DuckDB 事务仍开着。
+    const s = await fresh()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const refusal = await s.transaction(async (t) => {
+      void t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }]).catch(() => {})
+    }).then(() => null, (e: unknown) => e)
+    expect(refusal, '前提：A 确实被拒绝').toMatchObject({ kind: 'internal' })
+    const out = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '3', name: 'C', color: '#FFF' }])
+      throw refusal
+    }).then(() => null, (e: unknown) => e)
+    expect(out, '原对象必须原样透传').toBe(refusal)
+    expect(await s.count('tags'), 'B 的写入必须被回滚').toBe(1)
+    // B 的事务必须真的结束（若跳过回滚，这里会撞上「cannot start a transaction within a transaction」）
+    await s.transaction(async (t) => { await t.upsert('tags', [{ id: '4', name: 'D', color: '#FFF' }]) })
+    expect(await s.count('tags')).toBe(2)
+    await s.close()
+  })
+
+  it('WriteTx 是回调作用域：把投影带出回调后调用必须被拒（CR 第三十八轮 major）', async () => {
+    // CR 第三十八轮 #4：`const tx = await transaction(async (t) => t)` 返回后，投影的每个方法
+    // 原先是 Store 别名 —— 在 autocommit 里写，调用方却以为它还在事务里。
+    const s = await fresh()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const escaped = await s.transaction(async (t) => t)
+    await expect(escaped.delete('tags', 'TRUE')).rejects.toMatchObject({ kind: 'internal' })
+    await expect(escaped.upsert('tags', [{ id: '9', name: 'X', color: '#FFF' }])).rejects.toMatchObject({ kind: 'internal' })
+    await expect(escaped.tables()).rejects.toMatchObject({ kind: 'internal' })
+    await expect(escaped.transaction(async () => undefined)).rejects.toMatchObject({ kind: 'internal' })
+    expect(await s.count('tags'), '带出回调的投影不得改动数据').toBe(1)
+    await s.close()
+  })
+
+  it('事务内可恢复错误（Catalog/Binder）不影响提交；只有真的废掉事务的错误才拒绝（CR 第三十八轮 major）', async () => {
+    // 直连驱动实测（2026-11-18）：Catalog Error / Binder Error **不**废事务（后续 INSERT 正常、
+    // COMMIT 后写入落库）；Conversion Error 才把事务标成 aborted（后续语句报
+    // `Current transaction is aborted`，COMMIT 返回成功却丢写）。判据用探针问连接，不按报文猜。
+    const s = await fresh()
+    const sAny = s as unknown as { execSql: (q: string, p?: unknown[]) => Promise<unknown> }
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    // ① Catalog Error：回调接住后正常返回 → 必须照常提交
+    await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+      await sAny.execSql('SELECT * FROM no_such_table_q38').catch(() => { /* 回调自己接住 */ })
+    })
+    expect(await s.count('tags'), 'Catalog Error 不废事务，写入必须落库').toBe(2)
+    // ② Binder Error：同样可恢复
+    await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '3', name: 'C', color: '#FFF' }])
+      await sAny.execSql('SELECT no_such_column_q38 FROM tags').catch(() => { /* 回调自己接住 */ })
+    })
+    expect(await s.count('tags'), 'Binder Error 不废事务，写入必须落库').toBe(3)
+    // ③ Conversion Error：事务被废 → 必须拒绝提交并整体回滚（与上一条「事务内报错」互补）
+    await sAny.execSql("CREATE VIEW bad_cast_q38b AS SELECT CAST('x' AS INT) AS v")
+    const txErr = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '4', name: 'D', color: '#FFF' }])
+      await sAny.execSql('SELECT * FROM bad_cast_q38b').catch(() => { /* 回调自己接住 */ })
+    }).then(() => null, (e: unknown) => e as Error)
+    expect(txErr, 'Conversion Error 已废掉事务，提交必须被拒').not.toBeNull()
+    expect((txErr as Error).message).toMatch(/事务未提交.*已整体回滚/)
+    expect(await s.count('tags'), '被废事务的写入不得残留').toBe(3)
+    await s.close()
+  })
+
+  it('COMMIT 在驱动里执行期间，残留续体不得再下发语句（先退役令牌，再发 COMMIT）（CR 第三十八轮 major）', { timeout: 90_000 }, async () => {
+    // CR 第三十八轮 #9：回调返回、零在途时照常 COMMIT；但 COMMIT 的**执行**与其结果交回之间
+    // 还有窗口，残留续体（定时器）在这段时间里若仍被准入，INSERT 会排在 COMMIT 之后在 autocommit
+    // 里执行 —— 事务报成功，数据却来路不明。判据：COMMIT 下发前就退役令牌。
+    const real = await import('@duckdb/node-api')
+    let releaseDeliver!: () => void
+    let deliverGate: Promise<void> | undefined
+    let holdNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!holdNext || sql !== 'COMMIT') return cc.runAndReadAll(sql, params)
+                  holdNext = false
+                  const outcome = cc.runAndReadAll(sql, params)
+                  await outcome                       // COMMIT 已原生执行完
+                  deliverGate = new Promise<void>((r) => { releaseDeliver = r })
+                  await deliverGate                   // 结果扣住
+                  return outcome
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    holdNext = true
+    let late: Promise<unknown> | undefined
+    const txP = s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+      setTimeout(() => {
+        late = t.upsert('tags', [{ id: '3', name: 'C', color: '#FFF' }]).then(() => 'ok', (e: unknown) => e as Error)
+      }, 20)
+    }).then(() => null, (e: unknown) => e as Error)
+    for (const deadline = Date.now() + 10_000; deliverGate === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(deliverGate, '前提：COMMIT 已执行、结果被扣住').toBeDefined()
+    // 让定时器在 COMMIT 的结果交回之前触发
+    for (const deadline = Date.now() + 10_000; late === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    releaseDeliver()
+    const txErr = await txP
+    expect(txErr, '正常事务必须提交成功').toBeNull()
+    const lateOut = await late
+    expect(lateOut, 'COMMIT 执行期间的续体不得再下发语句').toMatchObject({ kind: 'internal' })
+    expect((lateOut as Error).message).toMatch(/事务已经结束/)
+    expect(await s.count('tags'), '迟到的写不得在 autocommit 里落库').toBe(2)
+    await s.close()
+  })
+
+  it('极老的事务残留上下文在 64 条事务之后仍被拒（令牌自带结束标志）（CR 第三十八轮 major）', { timeout: 120_000 }, async () => {
+    // CR 第三十八轮 #8：全局「已结束令牌集合」按 FIFO 淘汰后，极老上下文里的语句又能通过检查。
+    // 令牌改成对象、自带 `ended`，随异步上下文存活多久都有效。
+    const s = await fresh()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    let late: Promise<unknown> | undefined
+    // ⚠️ 定时器不能「到点就下发」：那样它可能在 70 条事务跑完**之前**就执行，FIFO 还没淘汰它，
+    // 用例会假绿（实测：M7 变异下仍通过）。改成等测试放行后再下发，淘汰一定已经发生。
+    let release!: () => void
+    const go = new Promise<void>((r) => { release = r })
+    await s.transaction(async () => {
+      setTimeout(() => {
+        void go.then(() => { late = s.query('SELECT 1').then(() => 'ok', (e: unknown) => e as Error) })
+      }, 0)
+    })
+    for (let i = 0; i < 70; i++) {
+      await s.transaction(async (t) => { await t.upsert('tags', [{ id: String(i + 2), name: `T${i}`, color: '#FFF' }]) })
+    }
+    release()
+    for (const deadline = Date.now() + 10_000; late === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    const out = await late
+    expect(out, '70 条事务之后，第 1 条事务的残留上下文仍必须被拒').toMatchObject({ kind: 'internal' })
+    expect((out as Error).message).toMatch(/事务已经结束/)
+    expect(await s.count('tags')).toBe(71)
+    await s.close()
+  })
+
+  it('BEGIN 原生已成功、结果交回时才拒绝 → 连接必须退役，不得留下一条还开着的事务（CR 第三十八轮疑问实测）', { timeout: 90_000 }, async () => {
+    // CR 第三十八轮 #7 的疑问：驱动能否在原生 BEGIN **成功后**才拒绝交回结果？若能，`beganTx`
+    // 若在 BEGIN 返回之后才登记就是空的 —— 随后 ROLLBACK 也失败时不会触发退役，事务其实还开着，
+    // 后续语句会落进去（Codex 复现：查询照常、再写报 `cannot start a transaction within a
+    // transaction`）。这里用导入缝**直接注入这种失败**并钉住我们的答案：禁止后续语句。
+    const real = await import('@duckdb/node-api')
+    let failBegin = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  const out = await cc.runAndReadAll(sql, params)
+                  if (sql === 'BEGIN' && failBegin) {
+                    failBegin = false
+                    throw new Error('注入：BEGIN 结果交回时被拒绝')
+                  }
+                  return out
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    failBegin = true
+    const txErr = await s.transaction(async () => { /* 不该进来 */ })
+      .then(() => null, (e: unknown) => e)
+    expect(txErr, '交回期的拒绝必须透传给调用方').not.toBeNull()
+    expect((txErr as Error).message).toMatch(/BEGIN 结果交回时被拒绝/)
+    const after = await s.count('tags').then(() => null, (e: unknown) => e as Error)
+    expect(after, '原生 BEGIN 已成功、回滚又未能确认 → 后续语句必须被拒（连接已退役）')
+      .toMatchObject({ kind: 'internal' })
+    expect((after as Error).message).toMatch(/退役|无法确认/)
     await s.close()
   })
 })
