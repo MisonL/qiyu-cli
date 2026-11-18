@@ -60,11 +60,14 @@
   调度原语 `bind` 后再 `.call` / `.apply`（`setTimeout.bind(null).call(null, w, 80)`）同样命中 ·
   `throw` 的 `new Error` 规则：**直接作为表达式语句**的调用结果被丢弃、不算抛出
   （`(() => { new Error('debug'); return new Error('clean') })()`）· `duckdb`：外部语句在事务内
-  **执行之后**报错时，`COMMIT` 可能先返回成功、事务内写入被静默丢弃 —— `execSql` 跨代且本条语句
-  确实执行过时给当时的事务留记号（`txBrokenByExternal`），所有者提交前检查、有记号就改发 ROLLBACK
-  并抛 `internal`（`commitOrRefuse`，成因写明「未提交 + 已整体回滚」）；用例把闸门放在「执行之后、
-  结果返回之前」复现，变异（绕过 `commitOrRefuse`）实测变红；三条竞态用例都显式 `close()`，
-  包装器转发两层 `closeSync`。
+  **执行之后**报错时，`COMMIT` 可能先返回成功、事务内写入被静默丢弃 —— 只要还有**别的异步链**
+  下发的语句在途（`foreignInFlight`，下发时登记、结果交回时解除），所有者提交就改发 ROLLBACK 并抛
+  `internal`（`commitOrRefuse`，成因写明「未提交 + 已整体回滚」）。⚠️ 开发中先做过「错误交回时给
+  事务打记号」的一版：CR/Codex 第三十三轮用隔离内存 DuckDB 探针证明它仍有缺口 —— 所有者提交可能
+  发生在那次拒绝交回**之前**，记号根本来不及设；改为在途计数后缺口关闭（变异 M9/M10/M13 均实测变红）。
+  两条用例（「回调直接返回」「外部语句在所有者提交之后才报错」）都**先接住**驱动的拒绝再扣闸门，
+  并断言事件顺序（外部语句先执行完 → 所有者开始 → 事务落定 → 外部错误才交回）；三条竞态用例都显式
+  `close()`，包装器转发两层 `closeSync`。
 - **静态守卫：第三十一轮（CR 5 条 + Codex 1 条 P2）**（2026-11-18，逐条自检/Node 复现）：
   写入判据把**展开实参**当目标不可知（`Object.assign(...[opts, { concurrent: true }])` 旧判据把
   `SpreadElement` 当普通实参、目标判不出而放行）· `for (opts.concurrent of […])` / `for-in` 的**循环头

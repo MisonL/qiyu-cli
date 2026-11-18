@@ -192,9 +192,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 若开了事务，本语句就落在它的事务里；它一旦执行期报错（实测：`SELECT` 一个 CAST 失败的
    * view），那条事务就被 DuckDB 标成 aborted。因此下发前后各取一次代号，**跨代即拒绝**：读路径
    * 同样拒绝（它会把别人的事务标成 aborted，代价是一样的）。
-   * ⚠️ 拒绝只对发起方可见；所有者侧靠 `txBrokenByExternal` + `commitOrRefuse` 保证**不冒充
-   * 成功**（CodeRabbit PR#81 第三十二轮 major：驱动在执行完与结果返回之间还有异步点，
-   * COMMIT 可以先落定、外部错误后到 —— 用例 `回调直接返回` 用「执行后闸门」复现过）。
+   * ⚠️ 拒绝只对发起方可见；所有者侧靠 `foreignInFlight` + `commitOrRefuse` 保证**不冒充
+   * 成功**（CodeRabbit/Codex PR#81 第三十二、三十三轮 major：驱动在执行完与结果返回之间还有
+   * 异步点，COMMIT 可以先落定、外部错误后到 —— 用例 `回调直接返回` 与 `外部语句在所有者提交
+   * 之后才报错` 用「执行后闸门」复现过）。
    */
   let txEpoch = 0
   const alsTx: Pick<TxAls, 'run' | 'getStore' | 'disable'> = deps.makeAls?.() ?? new AsyncLocalStorage<symbol>()
@@ -223,27 +224,41 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   }
 
   /**
-   * 活动事务是否被**外部语句**污掉（成因；undefined = 未见证据）。
-   * ⚠️ 为什么需要它（CodeRabbit PR#81 第三十二轮 major，README 形态复现）：外部语句可能**已经
-   * 在事务里执行并报错**（事务被 DuckDB 标成 aborted），而它的错误只 reject 给发起它的那条链 ——
-   * 若所有者随后 COMMIT，存在一条时序：`COMMIT` 先返回成功，外部错误后到，事务内写入被静默丢弃。
-   * 驱动层在「执行完、结果未返回」之间有自己的异步点，`execSql` 无法让「拒绝」变成「没发生」。
-   * 所以：跨代且本条语句**确实被驱动执行过**时，给当时在等的事务留记号；所有者在 COMMIT 前
-   * 检查它（`commitOrRefuse`），有记号就改发 ROLLBACK 并抛 internal，绝不让 COMMIT 冒充成功。
-   * 每个事务段在 BEGIN 前复位，不会串到下一个事务。
+   * 在**别的异步链**里下发、还没有交回结果的语句（数量）。
+   * ⚠️ 为什么需要它（CodeRabbit/Codex PR#81 第三十二、三十三轮 major，隔离内存 DuckDB 探针复现）：
+   * 外部语句在事务内执行期报错后，DuckDB 把事务标成 aborted —— 此后 `COMMIT` 返回成功却丢弃
+   * 全部写入（2026-11-18 直连驱动实测：`bad-err → commit-ok → COUNT 0`）。外部语句的错误只
+   * reject 给发起它的那条链，所有者看不到；驱动在「执行完、结果交回」之间还有异步点，按
+   * 「错误已交回」打记号会漏掉「提交早于交回」的时序。
+   * 所以：任一**不是当前事务上下文**下发的语句仍在途时，所有者不提交、直接拿**拒绝**
+   * （而不是等「在途语句全清」，那会把普通并发读拖成死等）。
    */
-  let txBrokenByExternal: string | undefined
+  let foreignInFlight = 0
+  /** 在途的外部语句登记：返回「这一次」的解除函数（只减一次）。 */
+  const trackForeign = (): (() => void) => {
+    foreignInFlight += 1
+    let done = false
+    return () => {
+      if (done) return
+      done = true
+      foreignInFlight -= 1
+    }
+  }
   /**
-   * 提交，或者**拒绝冒充成功**：事务已有被外部语句污掉的证据时改发 ROLLBACK 并抛 `internal`
-   * （点明成因）。不做「COMMIT 后查行数」的校验 —— aborted 之后事务内的写入在 COMMIT 之后
-   * 已无从逐个计数；只有拒绝提交才是响亮的。
+   * 提交，或者**拒绝冒充成功**：还有**别的异步链**的语句在途时（`foreignInFlight`），它的结果
+   * （可能正是让本事务 aborted 的那次拒绝）还没交回，此刻 COMMIT 无法证明自己不是「先成功、
+   * 后丢写」—— 改成 ROLLBACK 并抛 `internal`，点明成因与「已整体回滚」。
+   * ⚠️ 为什么不按「错误已交回」打记号：那样必须等驱动把拒绝交回，而所有者提交恰恰可能发生在
+   * 交回之前（CR/Codex 第三十三轮 major 的实测形态）。在途计数在**下发时**就登记，提交时同步可读。
+   * 代价如实记录：并发的普通读（`count` 等）也会让同一时刻提交的事务被拒 —— 保守侧，且与
+   * Store「同一实例操作串行 await」的契约一致。
    */
   const commitOrRefuse = async (): Promise<void> => {
-    if (txBrokenByExternal === undefined) {
+    if (foreignInFlight === 0) {
       await execSql('COMMIT')
       return
     }
-    const why = txBrokenByExternal
+    const why = `事务提交时仍有 ${foreignInFlight} 条其他异步链下发的语句没有交回结果，它执行期报错会把本事务标成 aborted`
     await safeRollback()
     const err = new Error(`事务未提交：${why} —— 该事务可能已被 DuckDB 标成 aborted，`
       + 'COMMIT 可能返回成功却丢弃全部写入，因此已整体回滚')
@@ -265,6 +280,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 只守方法入口不够：入口与该语句之间隔着 await（`del` 的 count），窗口仍在。
     assertTxOwnership()
     // 统一走 runAndReadAll：其结果带 getRowObjectsJson/columnNames（run() 的结果没有）
+    // 在**别的异步链**的上下文里下发、且此刻不在本事务里 → 登记为在途（见 `foreignInFlight`）。
+    const untrack = alsTx.getStore() === undefined ? trackForeign() : () => { /* 事务内语句：所有者自己发、自己会看到 */ }
     let result: unknown
     try {
       result = await c.runAndReadAll(sql, params)
@@ -274,16 +291,15 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 事务标成 aborted → COMMIT 返回成功而写入被丢弃，实测 count 1→0）恰好漏网。
       // 此时原错误被替换成归因正确的 internal，`cause` 保留驱动原文。
       if (txEpoch !== epochBefore) {
-        if (txToken !== undefined) {
-          txBrokenByExternal = `外部语句执行期报错，且期间另一条链开启了事务（驱动原文：${(e instanceof Error ? e.message : String(e)).slice(0, 160)}）`
-        }
         throw epochChangedError(e)
       }
       throw e
+    } finally {
+      // 结果（成功或拒绝）都已交回 —— 这条外部语句不再「在途」。
+      untrack()
     }
     // 下发期间事务代号变了 → 这条语句可能落进了别人的事务（或它自己在事务里开过又提交过）
     if (txEpoch !== epochBefore) {
-      if (txToken !== undefined) txBrokenByExternal = '语句执行期间另一条异步链开启了事务'
       assertTxOwnership()
       throw epochChangedError()
     }
@@ -612,7 +628,6 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         // ⚠️ BEGIN / 数据语句 / COMMIT 全在**带令牌的上下文**里（闸门下移到 `execSql` 之后，
         // 事务控制语句也要过它，见那里的注释）；`doUpsert` 内部贴着 INSERT 的归属检查同样
         // 靠这个上下文认出「这是自己那条自动事务」。
-        txBrokenByExternal = undefined
         n = await alsTx.run(token, async () => {
           await execSql('BEGIN')
           const written = await doUpsert(t, rows)
@@ -672,7 +687,6 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         // ⚠️ BEGIN / 回调 / COMMIT 全部在**带令牌的上下文**里：闸门在 `execSql`（事务控制
         // 语句也要过它），回调里的 `tx.upsert`/`tx.delete` 也靠这个上下文认得出
         // "这是事务内的写"（CodeRabbit PR#81 第十六轮）。
-        txBrokenByExternal = undefined
         return await alsTx.run(token, async () => {
           await execSql('BEGIN')
           // ⚠️ 真实投影而非 cast：WriteTx 类型上不含 query/init/close（spec §4.2.6 防线分层），
