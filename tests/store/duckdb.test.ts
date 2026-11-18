@@ -583,6 +583,109 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('事务回调没有 await 写就返回 → 提交必须拒绝（CR 第三十六轮 major）', { timeout: 90_000 }, async () => {
+    // 所有者自己的语句不登记 `foreignInFlight`（它归自己看得到）—— 但调用方若漏了 await，
+    // 回调返回时这条语句还在驱动里，随后可能落进别人的事务并被提交。判据：提交前统计
+    // **本令牌**在途语句（`txInFlight`），不为零就不提交。存储层只承诺 collide 会失败，
+    // 不承诺把「没 await 的写」变成成功。
+    const s = await createDuckDbStore(cfg, 'rw')
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const err = await s.transaction(async (t) => {
+      void t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])   // 故意不 await
+    }).then(() => null, (e: unknown) => e)
+    expect(err, '未 await 的写不得被当成已提交').not.toBeNull()
+    expect((err as Error).message, '成因要点名未交回的语句').toMatch(/没有交回结果/)
+    expect(await s.count('tags'), '该事务的写入不得残留').toBe(1)
+    // 串行的正常用法不受影响
+    await s.transaction(async (t) => { await t.upsert('tags', [{ id: '3', name: 'C', color: '#FFF' }]) })
+    expect(await s.count('tags')).toBe(2)
+    await s.close()
+  })
+
+  it('外部 DELETE 在 B 的事务内**成功**执行 → B 同样必须拒绝提交（CR 第三十六轮 major）', { timeout: 90_000 }, async () => {
+    // 失败路径有 `brokenTx`；**成功**路径同样要打记号：外部 DELETE 在 B 的事务里执行成功时行
+    // 已经真的被删了，而调用方拿到的是拒绝（跨代）。若 B 照常 COMMIT，「报了失败、数据却落库」
+    // 同时成立。执行闸门保证 DELETE 真的落进 B，交付闸门把结果扣到 B 之后。
+    const real = await import('@duckdb/node-api')
+    let releaseExecute!: () => void
+    let executeGate: Promise<void> | undefined
+    let releaseDeliver!: () => void
+    let deliverGate: Promise<void> | undefined
+    let holdNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as {
+                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
+                closeSync?: () => void
+              }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!holdNext || !sql.startsWith('DELETE FROM "tags"')) return cc.runAndReadAll(sql, params)
+                  holdNext = false
+                  executeGate = new Promise<void>((r) => { releaseExecute = r })
+                  await executeGate
+                  const outcome = cc.runAndReadAll(sql, params).then(() => 'ok' as const, (e: unknown) => e)
+                  await outcome
+                  deliverGate = new Promise<void>((r) => { releaseDeliver = r })
+                  await deliverGate
+                  const res = await outcome
+                  if (res !== 'ok') throw res
+                  return res
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    holdNext = true
+    const outside = s.delete('tags', "id = '1'").then(() => 'ok', (e: unknown) => e)
+    // `delete()` 先发 `count`（真驱动 I/O），再发 DELETE —— 用限时轮询等闸门，别按 tick 数猜。
+    for (const deadline = Date.now() + 10_000; executeGate === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(executeGate, '前提：DELETE 已通过下发检查、停在执行闸门上').toBeDefined()
+    // ⚠️ 时序（CR 第三十六轮）：DELETE 的**结果必须先交回**、B 之后才提交 —— 提交那一刻
+    // `foreignInFlight` 已归零，只有执行期落下的 `brokenTx` 记号拦得住（否则这条用例在
+    // 「没有记号」时也绿，钉不住任何东西）。
+    let allowReturn!: () => void
+    const returnAllowed = new Promise<void>((r) => { allowReturn = r })
+    const tx = s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+      releaseExecute()
+      await returnAllowed
+    })
+    for (const deadline = Date.now() + 10_000; deliverGate === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(deliverGate, '前提：DELETE 已执行完、结果被扣住').toBeDefined()
+    releaseDeliver()
+    // DELETE 被拒（跨代），行本身已被执行；B 尚未提交。
+    expect(await outside, '外部 DELETE 被拒').toMatchObject({ kind: 'internal' })
+    allowReturn()
+    const txErr = await tx.then(() => null, (e: unknown) => e)
+    expect(txErr, 'B 不得在「外部写已执行」时提交成功').not.toBeNull()
+    expect((txErr as Error).message, '成因要点名未提交').toMatch(/事务未提交/)
+    const ids = (await s.query('SELECT id FROM "tags" ORDER BY id')).rows.map((r) => String(r.id))
+    expect(ids, 'DELETE 随 B 一起回滚，行必须还在').toEqual(['1'])
+    await s.close()
+  })
+
   it('外部语句在所有者提交之后才报错 → 同样不得 COMMIT 冒充成功（CR 第三十三轮 major）', async () => {
     // CR 第三十三轮的两条成因：①「记号要等外部拒绝交回才设置」；②「外部语句在所有者 BEGIN
     // **之前**就执行完」。本用例把两者同时摆正：外部语句在所有者 BEGIN 之前就已**执行完**，

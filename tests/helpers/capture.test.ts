@@ -569,7 +569,7 @@ function isUndefinedShadowed(sf: ts.SourceFile): boolean {
  * `concurrentViolations` 里「看不清就不放行」的四类文案的共同片段（自检把它们归为 unknown）。
  * 判据新增一种"看不见"的成因时要同步加在这里 —— 否则自检会把它错归成 `opt`（判成并发）。
  */
-const COULD_NOT_SEE = ['无法静态解析', '无法静态求值', '来自访问器', '未知来源的键'] as const
+const COULD_NOT_SEE = ['无法静态解析', '无法静态求值', '来自访问器', '未知来源的键', '无法静态展开'] as const
 
 /**
  * 迁移形态文件的并发仓扫（**唯一实现点**：白名单豁免、粗筛、细判都在这里）。
@@ -658,6 +658,46 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       // `it.call(null, 名, 选项, 体)` / `it.apply(null, [名, 选项, 体])` 是有效登记，Vitest 照常
       // 按选项登记并发）：先把实参还原成登记形态再定位选项与执行体。
       let args: readonly ts.Expression[] = call.arguments
+      // ⚠️ **实参经展开**（`it('x', ...[{ concurrent: true }, fn] as const)`，CR 第三十六轮 major）：
+      // 展开把位置打乱，旧判据把整个实参表当成「看不清」却**看不到展开里的选项对象**，文件照样放行
+      // （Vitest 照常按并发登记）。能静态展开的字面量元组 / 数组先展开；展开后仍含无法静态求值的
+      // 展开（变量、函数调用）就维持「选项位置不可静态确定」的保守判定。
+      if (args.some((a) => ts.isSpreadElement(a))) {
+        // ⚠️ **转发 helper 定义体**（`const itBound = (name, ...rest) => it(name, ...rest)`）是
+        // 已声明边界：选项由调用方决定，单文件判据看不见（调用点照常判）。其余「静态展开不了」
+        // 的 spread 保守报「看不清」，不许静默放行。
+        const spreadSrc = (a: ts.SpreadElement): ts.Expression => unwrap(a.expression)
+        const restNames = new Set<string>()
+        const collectRest = (n: ts.Node): void => {
+          if (ts.isParameter(n) && n.dotDotDotToken !== undefined && ts.isIdentifier(n.name)) restNames.add(n.name.text)
+          ts.forEachChild(n, collectRest)
+        }
+        collectRest(sf)
+        const onlyRestSpreads = args.filter((a) => ts.isSpreadElement(a))
+          .every((a) => { const x = spreadSrc(a as ts.SpreadElement); return ts.isIdentifier(x) && restNames.has(x.text) })
+        if (onlyRestSpreads) continue
+        const flat: ts.Expression[] = []
+        let opaque = false
+        for (const a of args) {
+          if (!ts.isSpreadElement(a)) { flat.push(a); continue }
+          // 展开源可以是字面量数组 / `as const` 元组，也可以是**本文件里静态绑定的标识符**
+          // （`const tup = [...] as const; it('x', ...tup)`）—— 后者经 `staticBindingInitializer`
+          // 解析（被写过 / 同名重复声明 → 解析不出 → 按看不清处理）。
+          const spreadExpr = unwrap(a.expression)
+          const arr = ts.isIdentifier(spreadExpr)
+            ? (() => { const init = staticBindingInitializer(sf, spreadExpr.text); return init === undefined ? undefined : unwrap(init) })()
+            : spreadExpr
+          if (arr === undefined || !ts.isArrayLiteralExpression(arr)
+            || arr.elements.some((x) => ts.isSpreadElement(x) || ts.isOmittedExpression(x))) { opaque = true; break }
+          flat.push(...(arr.elements as readonly ts.Expression[]))
+        }
+        if (!opaque) args = flat
+        else {
+          out.push({ line: lineOf(sf, call), why: `实参里有无法静态展开的 spread，选项位置不可静态确定` })
+          seen.add(lineOf(sf, call))
+          continue
+        }
+      }
       const lastSeg = c.chain[c.chain.length - 1]
       if (c.chain.length > 1 && (lastSeg === 'call' || lastSeg === 'apply')) {
         // ⚠️ `Function.prototype.apply(thisArg, argsArray)` 的**第一个实参是 thisArg** —— 之前这里
@@ -1540,6 +1580,15 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       'apply 被 bind、预绑定的实参数组里是目标').toEqual(['unknown'])
     expect(concHits(`const oQ42 = ${Zq};\nconst otherQ42 = {}\nObject.assign.apply.bind(Object.assign, null, [otherQ42, { con${'current: true }'}])({ x: 1 })\nit('Q42', oQ42, () => {})`),
       'apply 被 bind、预绑定的实参数组里是别的对象 → 不算写入').toEqual([])
+
+    // 实参经**静态可展开的元组**（CR 第三十六轮 major）：`it('x', ...[{ concurrent: true }, fn] as const)`
+    // 真是并发登记；展开里是别的对象 / 无法静态展开时按各自语义处理。
+    expect(concHits(`const oQ46 = ${Zq};\nconst tupQ46 = [{ con${'current: true }'}, () => {}] as const\n(it as any)('Q46', ...tupQ46)\nit('Q46', oQ46, () => {})`),
+      '展开元组里的选项对象').toEqual(['opt'])
+    expect(concHits(`const oQ47 = ${Zq};\nconst tupQ47 = [{ se${'quential: true }'}, () => {}] as const\n(it as any)('Q47', ...tupQ47)\nit('Q47', oQ47, () => {})`),
+      '展开元组里是串行选项 → 不算并发').toEqual([])
+    expect(concHits(`const oQ48 = ${Zq};\nconst restQ48 = () => [{ con${'current: true }'}]\nit('Q48', ...restQ48())\nit('Q48', oQ48, () => {})`),
+      '展开来自函数调用 → 看不清').toEqual(['unknown'])
 
     // 写入目标是**逗号表达式**时取最右操作数（CR 第三十五轮 minor）：`(0, o)` 写的就是 o；
     // `(o, other)` 写的是别的对象 —— 两侧各一条，咬住「取哪一侧」。

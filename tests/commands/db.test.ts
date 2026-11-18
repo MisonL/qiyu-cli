@@ -930,13 +930,21 @@ describe('夹具隔离（历史审查 PR#72 收口）', () => {
     // 现在留下 completion promise，由下一条 `await`。
     pendingTail = tailDone = new Promise<void>((resolve, reject) => {
       setTimeout(() => {
-        // ⚠️ 这里再调一次 `dbPath()`：它模拟"超时用例恢复后重新取路径"。绑在异步上下文里
-        // 时它仍返回**本条**路径；若改成读全局序号，这里会拿到下一条的路径（变异可红）。
-        pathSeenByTail = dbPath()
         void (async () => {
           try {
+            // ⚠️ 先等**下一条夹具真的生效**再取路径（CR 第三十六轮 major）：只靠 80ms 时长，
+            // 机器慢时定时器可能在下一条 `beforeEach` 之前就烧掉 —— 那时全局 `currentDb` 还是
+            // 本条路径，「ALS 失效」的回归照样绿（假绿）。判据改成「全局已换到下一条」。
+            for (const deadline = Date.now() + 10_000; currentDb === prevDbPath && Date.now() < deadline;) {
+              await new Promise((r) => setTimeout(r, 10))
+            }
+            // 这里再调一次 `dbPath()`：它模拟"超时用例恢复后重新取路径"。绑在异步上下文里
+            // 时它仍返回**本条**路径；若改成读全局，这里会拿到下一条的路径（变异可红）。
+            pathSeenByTail = dbPath()
+            // 写也用**回调自己解析的路径**（不是 `prevDbPath`）：ALS 失效时它落到下一条夹具，
+            // 断言「本条 25 张表完好」当场变红（CR 第三十六轮 major）。
             const t = await createDuckDbStore(
-              { backend: 'duckdb', path: prevDbPath, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+              { backend: 'duckdb', path: pathSeenByTail, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
             try { await t.query('DROP TABLE "tickets"') } finally { await t.close() }
             resolve()
           } catch (e) { reject(e) }
