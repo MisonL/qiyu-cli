@@ -235,6 +235,31 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    */
   let foreignInFlight = 0
   /**
+   * 进行中的**多语句写操作**：事务外的 `delete`（count → DELETE → count）与事务外的 `upsert`
+   * 自动事务。⚠️ 为什么 BEGIN 必须等它们（CR 第三十七轮 major）：单连接上的语句会按**实际执行**
+   * 顺序进入当时开着的事务。写操作的两步之间若插进一条 BEGIN，DELETE 的实际执行可能早于 BEGIN
+   * （autocommit 已提交）而结果晚于 BEGIN 才交回 —— 调用方拿到「跨代」的失败，行却真的删了；
+   * 重试还会报「删了 0 行」。所以 BEGIN 前要求写操作全部落定（本操作自己除外）。
+   * 代价如实记录：写操作与事务并发发起会被拒（internal）—— Store 本契约就是同一实例串行 await。
+   */
+  const writeOpsInFlight = new Set<symbol>()
+  const enterWriteOp = (): symbol => {
+    const t = Symbol('write-op')
+    writeOpsInFlight.add(t)
+    return t
+  }
+  const leaveWriteOp = (t: symbol): void => { writeOpsInFlight.delete(t) }
+  const admitBegin = (self?: symbol): void => {
+    for (const op of writeOpsInFlight) {
+      if (op === self) continue
+      const err = new Error('另一条异步链上的写操作还没有完成（它的语句可能仍在驱动里）：'
+        + '此时开启事务会与它交错 —— 它拿到的「删改了几行」将不可信')
+      ;(err as { kind?: string }).kind = 'internal'
+      ;(err as { hint?: string }).hint = '让同一个 Store 实例上的操作串行 await：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
+      throw err
+    }
+  }
+  /**
    * 受影响的事务（令牌）与成因：外部语句**执行期报错**（跨代）或**交回时报错且期间跨代**。
    * 与在途计数互补（CR 第三十四轮 major）：计数在结果交回时归零，若错误交回早于所有者提交，
    * 提交那一刻计数已为 0 —— 只靠计数会放行（用例「外部语句的错误先交回、所有者随后才提交」钉住）。
@@ -246,6 +271,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 提交时这条语句仍在驱动里，可能落进随后开启的事务并被别人提交（CR 第三十六轮 major）。
    */
   const txInFlight = new Map<TxToken, number>()
+  /** 等在途的本事务语句落定（计数归零）时唤醒 `drainOwned`。 */
+  const drainWaiters = new Map<TxToken, Array<() => void>>()
   /** 在途的外部语句登记：返回「这一次」的解除函数（只减一次）。 */
   const trackForeign = (): (() => void) => {
     foreignInFlight += 1
@@ -264,10 +291,99 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       if (done) return
       done = true
       const rest = (txInFlight.get(token) ?? 1) - 1
-      if (rest <= 0) txInFlight.delete(token)
-      else txInFlight.set(token, rest)
+      if (rest <= 0) {
+        txInFlight.delete(token)
+        const waiters = drainWaiters.get(token)
+        if (waiters !== undefined) {
+          drainWaiters.delete(token)
+          for (const w of waiters) w()
+        }
+      } else {
+        txInFlight.set(token, rest)
+      }
     }
   }
+  /**
+   * 事务收尾前把**本事务自己**已下发的语句等回来（CR 第三十七轮 major #1）。
+   * ⚠️ 顺序不能反过来：先发 ROLLBACK 的话，驱动里那条还没执行完的语句会在事务结束后（autocommit）
+   * 执行 —— 本该被回滚的写入真的落库，而调用方看到的是「已整体回滚」。
+   * 返回 false = 超时仍无法确认（调用方必须退役连接，且**不得**再发 ROLLBACK，见 `closeTx`）。
+   * 上限 5s：正常语句是毫秒级；真的有语句卡死时不值得把调用方一直挂住。
+   */
+  const DRAIN_CAP_MS = 5_000
+  const drainOwned = async (token: TxToken): Promise<boolean> => {
+    const deadline = Date.now() + DRAIN_CAP_MS
+    while ((txInFlight.get(token) ?? 0) > 0) {
+      const left = deadline - Date.now()
+      if (left <= 0) return false
+      await new Promise<void>((resolve) => {
+        const waiters = drainWaiters.get(token) ?? []
+        waiters.push(resolve)
+        drainWaiters.set(token, waiters)
+        // 兜底唤醒：计数异常时也不能无限等（上面的 while 会再判一次）。超时前把自己从名单里
+        // 摘掉 —— 退役连接上的名单不该攒着已经没人等的闭包。
+        setTimeout(() => {
+          const list = drainWaiters.get(token)
+          if (list !== undefined) {
+            const i = list.indexOf(resolve)
+            if (i >= 0) list.splice(i, 1)
+            if (list.length === 0) drainWaiters.delete(token)
+          }
+          resolve()
+        }, Math.min(left, 250))
+      })
+    }
+    return true
+  }
+  /**
+   * 已结束（提交 / 回滚 / 拒绝）的事务令牌，按 FIFO 最多保留 64 个。
+   * ⚠️ 用途（CR 第三十七轮 major #3）：事务结束后，**残留异步上下文**里恢复的语句（回调里没 await
+   * 的写、或存到事务外再 await 的 Promise）仍带着该令牌。旧实现把它当成普通外部语句放行 ——
+   * `delete` 的 count 返回后会继续把 DELETE 发进 autocommit，行在「事务已整体回滚」之后被删掉。
+   * 令牌是 symbol，WeakSet 收不了，只能有界保留（超出 64 个只影响极老上下文的判定）。
+   */
+  const retiredTx = new Set<TxToken>()
+  const RETIRED_MAX = 64
+  const retire = (token: TxToken): void => {
+    retiredTx.add(token)
+    if (retiredTx.size > RETIRED_MAX) {
+      const oldest = retiredTx.values().next().value
+      if (oldest !== undefined) retiredTx.delete(oldest)
+    }
+  }
+  const txEndedError = (): Error => {
+    const err = new Error('该语句所属的事务已经结束（提交 / 回滚 / 拒绝）：它的结果与副作用都不可信，已拒绝。'
+      + '不要在事务回调里下发不 await 的语句，也不要把事务里的 Promise 存到事务外再 await')
+    ;(err as { kind?: string }).kind = 'internal'
+    ;(err as { hint?: string }).hint = 'await 事务回调里的每一次调用，并让同一个 Store 实例上的操作串行执行'
+    return err
+  }
+  /** BEGIN 已**成功返回**的令牌：据此区分「ROLLBACK 失败时有事务可能仍开着」与「BEGIN 本来就没成」。 */
+  const beganTx = new Set<TxToken>()
+  /**
+   * 连接退役（CR 第三十七轮 major #4）：ROLLBACK 无法确认时，DuckDB 的事务状态未知 ——
+   * 继续下发语句有可能落进一条还开着的事务。此时**不发 ROLLBACK**（在途语句可能随后在
+   * autocommit 里执行）、拒绝一切后续语句；事务由 `close()` 关闭连接时隐式结束。
+   */
+  let poisoned: string | undefined
+  const poison = (reason: string): void => { if (poisoned === undefined) poisoned = reason }
+  const poisonedError = (reason: string): Error => {
+    const err = new Error(`Store 已退役：${reason} —— 单连接的事务状态无法确认，`
+      + '任何后续语句都可能落进一条未结束的事务。请关闭该 Store 实例并重新创建后再试'
+      + '（本实例上的写入结果不可信）')
+    ;(err as { kind?: string }).kind = 'internal'
+    ;(err as { hint?: string }).hint = 'close 该 Store 并重建实例'
+    return err
+  }
+  /**
+   * `commitOrRefuse` 抛出的拒绝错误（回滚已由它负责）。
+   * ⚠️ 用**身份集合**而不是往错误对象上挂字段（CR 第三十七轮 major #2）：回调可以拒绝
+   * `undefined` / `null`（读属性直接 TypeError，原错误被吞掉），别人也能在自己的错误对象上
+   * 伪造同名标记让回滚被跳过。集合只收我们亲手抛出的那个对象。
+   */
+  const refusals = new WeakSet<object>()
+  const isRefusal = (e: unknown): boolean =>
+    ((typeof e === 'object' && e !== null) || typeof e === 'function') && refusals.has(e as object)
   /**
    * 提交，或者**拒绝冒充成功**：还有**别的异步链**的语句在途时（`foreignInFlight`），它的结果
    * （可能正是让本事务 aborted 的那次拒绝）还没交回，此刻 COMMIT 无法证明自己不是「先成功、
@@ -284,28 +400,40 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     if (marked === undefined && foreignInFlight === 0 && ownPending === 0) {
       txInFlight.delete(token)
       await execSql('COMMIT')
+      beganTx.delete(token)
+      retire(token)
       return
     }
     const why = marked
       ?? (ownPending > 0
         ? `事务回调返回时仍有 ${ownPending} 条本事务的语句没有交回结果（是不是没有 await 它们？）`
         : `事务提交时仍有 ${foreignInFlight} 条其他异步链下发的语句没有交回结果，它执行期报错会把本事务标成 aborted`)
-    const rolledBack = await safeRollback()
+    // ⚠️ 顺序：先退役令牌（停掉后续下发），再等在途语句交回，最后才 ROLLBACK（`closeTx`）。
+    const rolledBack = await closeTx(token)
     txInFlight.delete(token)
     const err = new Error(`事务未提交：${why} —— 该事务可能已被 DuckDB 标成 aborted，`
       + 'COMMIT 可能返回成功却丢弃全部写入，'
       + (rolledBack
         ? '因此已整体回滚'
-        : '**回滚也未能确认**（连接可能已关闭或事务状态未知）：不要把该事务的任何写入当成已保存'))
+        : '**回滚也未能确认**（连接可能已关闭、或还有语句未交回）：该连接已退役，'
+          + '不要把该事务的任何写入当成已保存'))
     ;(err as { kind?: string }).kind = 'internal'
     ;(err as { hint?: string }).hint = '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
-    // 回滚**已由这里负责**（唯一处理点，CR 第三十六轮 major）：外层 catch 见到这个标记就不再
+    // 回滚**已由这里负责**（唯一处理点，CR 第三十六轮 major）：外层 catch 见到这个拒绝就不再
     // 回滚第二次 —— 两次回滚里只要一次成功、另一次失败，上一行对「回滚是否确认」的说法就不可信。
-    ;(err as { txRefusal?: boolean }).txRefusal = true
+    refusals.add(err)
     throw err
   }
-  const execSql = async (sql: string, params: unknown[] = []): Promise<unknown> => {
+  const execSql = async (sql: string, params: unknown[] = [], opts?: { txControl?: boolean }): Promise<unknown> => {
     if (closed) throw usage('数据库连接已关闭')
+    // 连接已退役：事务状态无法确认，一条语句都不许再发（CR 第三十七轮 major #4）。
+    if (poisoned !== undefined) throw poisonedError(poisoned)
+    // ⚠️ **已结束事务的残留上下文**里不得再下发语句（CR 第三十七轮 major #3）：令牌过期只可能来自
+    // 「回调里没 await 的语句」或「事务里的 Promise 存到事务外再 await」—— 它的副作用与结果
+    // 都不可信。事务控制语句（ROLLBACK）走 `txControl` 豁免：收尾时必须能发出去。
+    const ctxToken = alsTx.getStore()
+    const txControl = opts?.txControl === true
+    if (!txControl && ctxToken !== undefined && retiredTx.has(ctxToken)) throw txEndedError()
     // ⚠️ **语句等待期间有人开了事务**同样不安全（CodeRabbit PR#81 第二十八轮 major，实测复现：
     // 外部 `SELECT` 与另一条链的事务交错，那条 SELECT 执行期报错 → 事务 COMMIT 返回成功而写入
     // 被丢弃，`count` 从 1 变成 0）。归属检查只覆盖「下发前」；驱动内部 `runUntilLast` /
@@ -334,6 +462,13 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // `runAndReadAll` 抛出，若只成功路径检查，最危险的情形（外部语句执行期报错 → 把别人的
       // 事务标成 aborted → COMMIT 返回成功而写入被丢弃，实测 count 1→0）恰好漏网。
       // 此时原错误被替换成归因正确的 internal，`cause` 保留驱动原文。
+      // ⚠️ **本事务自己的语句执行期报错也必须打记号**（CR 第三十七轮 major #5）：DuckDB 会把
+      // 整条事务标成 aborted；回调若接住错误正常返回，`commitOrRefuse` 看到零在途会照常
+      // COMMIT —— 驱动把已失效事务上的 COMMIT 转成 ROLLBACK 并**返回成功**，回调拿到「提交
+      // 成功」，写入却已丢。记号让提交必须被拒。
+      if (inTx && txToken !== undefined && ctxToken === txToken) {
+        brokenTx.set(txToken, `本事务内的一条语句执行期报错，DuckDB 会把整条事务标成 aborted（驱动原文：${(e instanceof Error ? e.message : String(e)).slice(0, 160)}）`)
+      }
       if (txEpoch !== epochBefore && txToken !== undefined) {
         brokenTx.set(txToken, `外部语句执行期报错，且期间另一条链开启了事务（驱动原文：${(e instanceof Error ? e.message : String(e)).slice(0, 160)}）`)
       }
@@ -345,6 +480,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 结果（成功或拒绝）都已交回 —— 这条外部语句不再「在途」。
       untrack()
     }
+    // ⚠️ 事务已结束后才交回的结果同样不可信（CR 第三十七轮 major #3）：语句可能已在回滚/提交
+    // 之后才执行（回滚后的那次执行落在 autocommit 里），调用方据此继续下一步就是错的。
+    if (!txControl && ctxToken !== undefined && retiredTx.has(ctxToken)) throw txEndedError()
     // 下发期间事务代号变了 → 这条语句可能落进了别人的事务（或它自己在事务里开过又提交过）
     if (txEpoch !== epochBefore) {
       // ⚠️ **执行成功**同样要给当前事务打记号（CR 第三十六轮 major）：外部的 DELETE 在别的事务
@@ -495,13 +633,21 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 标成 aborted：对方的 COMMIT 返回成功，写入却被静默丢弃（实测行数归零、无报错）。
     // 所以外部写在这里就被拒，一条语句都不发。
     assertTxOwnership()
-    const before = await store.count(tname)
-    // 派发点再判一次（CodeRabbit PR#81 major）：`count` 是 await，期间别的调用方可能开事务，
-    // 随后这条 DELETE 就被并进去。
-    assertTxOwnership()
-    await store.execSql(`DELETE FROM "${t.name}" WHERE ${where}`, params)
-    const after = await store.count(tname)
-    return Math.max(0, before - after)
+    // ⚠️ 事务外的 `del` 是**多语句写操作**：整个序列（count → DELETE → count）登记在册，
+    // 期间不许开事务（`admitBegin`）—— 否则 DELETE 的实际执行可能早于 BEGIN 提交、结果晚于
+    // BEGIN 交回，删改行数以「跨代失败」报出去，行却已经删了（CR 第三十七轮 major #6）。
+    const op = inTx ? undefined : enterWriteOp()
+    try {
+      const before = await store.count(tname)
+      // 派发点再判一次（CodeRabbit PR#81 major）：`count` 是 await，期间别的调用方可能开事务，
+      // 随后这条 DELETE 就被并进去。
+      assertTxOwnership()
+      await store.execSql(`DELETE FROM "${t.name}" WHERE ${where}`, params)
+      const after = await store.count(tname)
+      return Math.max(0, before - after)
+    } finally {
+      if (op !== undefined) leaveWriteOp(op)
+    }
   }
 
   // ⚠️ 回滚保护（G 组 G-3）：若回滚本身失败（如连接已被并发 close），次生错误
@@ -513,14 +659,40 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   }
 
   /**
-   * 在令牌上下文里 ROLLBACK。⚠️ **关闭后不得进入上下文**（CodeRabbit PR#81 第十九轮 minor）：
-   * `close()` 已把 ALS `disable()` 掉，而 `alsTx.run()` 会把它**重新启用**、失败路径又不再
-   * disable —— 「事务进行中被 close」每次都在攒一个启用态上下文。`execSql` 在这种情况下
-   * 本来也必然抛「连接已关闭」，回滚必然失败，所以直接跳过。
+   * 在令牌上下文里收尾：退役令牌 → 等在途语句落定 → ROLLBACK。返回**是否确认回滚成功**。
+   * ⚠️ **关闭后不得进入上下文**（CodeRabbit PR#81 第十九轮 minor）：`close()` 已把 ALS
+   * `disable()` 掉，而 `alsTx.run()` 会把它**重新启用**、失败路径又不再 disable ——
+   * 「事务进行中被 close」每次都在攒一个启用态上下文。`execSql` 在这种情况下本来也必然抛
+   * 「连接已关闭」，回滚必然失败，所以直接跳过。
    */
   const rollbackInTx = async (token: TxToken): Promise<boolean> => {
+    retire(token)
     if (closed) return false
-    return alsTx.run(token, () => safeRollback())
+    return alsTx.run(token, () => closeTx(token))
+  }
+  /**
+   * `rollbackInTx` / `commitOrRefuse` 共用的事务收尾（只在令牌上下文里调用）。
+   * 返回「回滚是否确认」；无法确认时**退役连接**并**不发 ROLLBACK**（CR 第三十七轮 major #1/#4）：
+   * 先 ROLLBACK 的话，驱动里还没执行完的语句会在事务结束后于 autocommit 里执行。
+   */
+  const closeTx = async (token: TxToken): Promise<boolean> => {
+    retire(token)
+    if (closed) return false
+    if (!(await drainOwned(token))) {
+      poison('事务内仍有语句没有交回结果，无法确认它们不会在回滚之后落库')
+      return false
+    }
+    try {
+      // 事务控制语句豁免「令牌已退役」检查，否则收尾自己的 ROLLBACK 也会被挡。
+      await execSql('ROLLBACK', [], { txControl: true })
+      beganTx.delete(token)
+      return true
+    } catch {
+      // BEGIN 都没成功 → 本来就没有事务可回滚（可以是 BEGIN 被快照拒这类响亮失败），不是「状态未知」。
+      if (beganTx.has(token)) poison('ROLLBACK 未能确认：它可能根本没有执行，事务也许仍然开着')
+      beganTx.delete(token)
+      return false
+    }
   }
 
   /**
@@ -621,6 +793,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         : null
       const v = cur === null ? 0 : Number((cur as { getRowObjectsJson: () => Record<string, unknown>[] }).getRowObjectsJson()[0].v)
       for (const m of MIGRATIONS.filter((x) => x.version > v).sort((a, b) => a.version - b.version)) {
+        // 迁移的 BEGIN 同样受「写操作未完成不许开事务」约束（CR 第三十七轮 major #6）。
+        admitBegin()
         await execSql('BEGIN')
         try {
           await m.up((sql) => store.execSql(sql).then(() => undefined))
@@ -674,26 +848,33 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 登记与整个（同步段 + 后续批次）放在同一个异步上下文里：`doUpsert` 内部贴着 INSERT
       // 的 `assertTxOwnership` 要有令牌才认得出「这是自己那条自动事务」。
       const token = Symbol('store-auto-tx')
-      inTx = true
-      txToken = token
-      txEpoch += 1
+      // 自动事务也是「写操作」：BEGIN 之前登记，且要求**别的**写操作都已落定（CR 第三十七轮
+      // major #6）。⚠️ 准入必须排在 `txEpoch += 1` / `inTx = true` **之前** —— 否则被拒的
+      // 自动事务也会推进代号，把正在执行的外部写误判成「跨代」。
+      const op = enterWriteOp()
       let n: number
       try {
+        admitBegin(op)
+        inTx = true
+        txToken = token
+        txEpoch += 1
         // ⚠️ BEGIN / 数据语句 / COMMIT 全在**带令牌的上下文**里（闸门下移到 `execSql` 之后，
         // 事务控制语句也要过它，见那里的注释）；`doUpsert` 内部贴着 INSERT 的归属检查同样
         // 靠这个上下文认出「这是自己那条自动事务」。
         n = await alsTx.run(token, async () => {
           await execSql('BEGIN')
+          beganTx.add(token)
           const written = await doUpsert(t, rows)
           await commitOrRefuse(token)
           return written
         })
       } catch (e) {
-        if ((e as { txRefusal?: boolean }).txRefusal !== true) await rollbackInTx(token)
+        if (!isRefusal(e)) await rollbackInTx(token)
         throw e
       } finally {
         inTx = false
         txToken = undefined
+        leaveWriteOp(op)
       }
       return n
     },
@@ -719,6 +900,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         })
       }
       if (owns) throw usage('不得嵌套事务')
+      // ⚠️ **BEGIN 的准入**（CR 第三十七轮 major #6）：写操作（`delete` / 自动事务）还在进行时
+      // 不许开事务 —— 单连接上的语句按实际执行顺序进入事务，写操作的 DELETE/INSERT 可能已经
+      // 提交而其结果还没交回；此时开事务会让它报「跨代失败」、行却真的改过了。
+      admitBegin()
       // ⚠️ 归属登记必须**先于** `BEGIN` 的 await（CodeRabbit PR#81 第七轮 major）：原先
       // `inTx` 在 BEGIN 落定之后才置位，BEGIN 这条 await 期间它的外部写会被放行，随后的
       // 语句排进本事务、回滚时静默消失（实测：BEGIN 挂住时外部 delete 返回成功、行没了）。
@@ -743,6 +928,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         // "这是事务内的写"（CodeRabbit PR#81 第十六轮）。
         return await alsTx.run(token, async () => {
           await execSql('BEGIN')
+          beganTx.add(token)
           // ⚠️ 真实投影而非 cast：WriteTx 类型上不含 query/init/close（spec §4.2.6 防线分层），
           // 运行时对象也不得携带 —— 直接传 store 的话 `Object.keys(tx)` 可枚举出 query。
           const tx: WriteTx = {
@@ -759,8 +945,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       } catch (e) {
         // ROLLBACK 也走 `execSql`：在令牌上下文里发，闸门才认得它属于本事务（若 BEGIN 都没
         // 成功，`safeRollback` 吞掉「没有事务」的次生错误）。⚠️ `commitOrRefuse` 抛出的拒绝
-        // 自带 `txRefusal`：回滚已由它负责，这里不再回滚第二次（CR 第三十六轮 major）。
-        if ((e as { txRefusal?: boolean }).txRefusal !== true) await rollbackInTx(token)
+        // 已在身份集合里：回滚已由它负责，这里不再回滚第二次（CR 第三十六轮 major）。
+        if (!isRefusal(e)) await rollbackInTx(token)
         throw e
       } finally {
         inTx = false
