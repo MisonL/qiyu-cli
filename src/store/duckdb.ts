@@ -290,7 +290,13 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     assertTxOwnership()
     // 统一走 runAndReadAll：其结果带 getRowObjectsJson/columnNames（run() 的结果没有）
     // 在**别的异步链**的上下文里下发、且此刻不在本事务里 → 登记为在途（见 `foreignInFlight`）。
-    const untrack = alsTx.getStore() === undefined ? trackForeign() : () => { /* 事务内语句：所有者自己发、自己会看到 */ }
+    // ⚠️ 判据是「**此刻有本实例的活动事务、且当前链就是它的所有者**」，不是「ALS 里有没有令牌」
+    // （CR 第三十五轮 major）：已完成事务 A 里排下的定时器 / 续体仍带着 A 的令牌（AsyncLocalStorage
+    // 按异步资源传播），它在 `inTx === false` 时下发的语句同样可能落进随后开启的事务 B —— 旧判据
+    // 把「有令牌」当成「在本事务里」，这条语句不登记、B 提交时计数为 0，缺口因此打开。
+    // 归属由上一行的 `assertTxOwnership()` 担保（无 await 间隔）：能走到这里且 `inTx` 为真，
+    // 当前链就一定是 `txToken` 的所有者。
+    const untrack = inTx ? () => { /* 事务内语句：所有者自己发、自己会看到 */ } : trackForeign()
     let result: unknown
     try {
       result = await c.runAndReadAll(sql, params)

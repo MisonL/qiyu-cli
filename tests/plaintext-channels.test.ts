@@ -175,6 +175,32 @@ const THROW_ERROR: Rule = {
   name: 'throw new Error',
   hit: (sf) => {
     const out: string[] = []
+    /** 剥括号 / 断言包装。 */
+    const stripWrappers = (node: ts.Node): ts.Node => {
+      let k: ts.Node = node
+      for (;;) {
+        const q = k.parent
+        if (q !== undefined && (ts.isParenthesizedExpression(q) || ts.isAsExpression(q) || ts.isNonNullExpression(q)
+          || ts.isSatisfiesExpression(q) || ts.isTypeAssertionExpression(q)) && q.expression === k) { k = q; continue }
+        return k
+      }
+    }
+    /**
+     * `fn` 的**返回值是否再被调用**（`(() => () => …)()()` / `(…)().call(null)`，CR 第三十五轮 minor，
+     * Node 实测内层体确实执行）。`fn` 本身必须是被调用的（`isImmediatelyInvoked` 另判）。
+     * 用于「尾值是函数字面量」那条规则的例外：外层被调、它的**结果**又被调，尾函数就不再只是「被交出」。
+     */
+    const returnValueInvoked = (fn: ts.Node): boolean => {
+      const callee = stripWrappers(fn)
+      const call = callee.parent
+      if (call === undefined || !ts.isCallExpression(call) || call.expression !== callee) return false
+      const outer = stripWrappers(call).parent
+      if (outer !== undefined && ts.isCallExpression(outer) && unwrap(outer.expression) === unwrap(call)) return true
+      if (outer !== undefined && ts.isPropertyAccessExpression(outer) && outer.expression === call
+        && (outer.name.text === 'call' || outer.name.text === 'apply')
+        && outer.parent !== undefined && ts.isCallExpression(outer.parent) && outer.parent.expression === outer) return true
+      return false
+    }
     const isFnBoundary = (n: ts.Node): boolean =>
       ts.isArrowFunction(n) || ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n)
       || ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)
@@ -251,6 +277,11 @@ const THROW_ERROR: Rule = {
         // ⚠️ 其它任何父节点都说明这个函数**没有被调用** —— 必须显式 `return false`。
         // 漏掉它会 `for (;;)` 空转（2026-11-17 实测：本文件用例卡死 10 分钟以上，
         // 探针单跑该判据才定位到）。
+        // ⚠️ **当前函数值是外层函数边界的尾值**（`() => (() => …)` 的内层箭头）：`p` 是箭头函数，
+        // 遍历到此处时它作为外层体被交出，外层是否被调用、其结果又是否被调，决定它是否执行。
+        if (p !== undefined && isFnBoundary(p) && tailFunction(p) !== undefined) {
+          if (isImmediatelyInvoked(p) && returnValueInvoked(p)) return true
+        }
         return false
       }
     }
@@ -440,8 +471,8 @@ const THROW_ERROR: Rule = {
       // ⚠️ **被丢弃的表达式不算抛出**（CodeRabbit PR#81 第三十二轮 minor，自检复现）：
       // `(() => { new Error('**debug**'); return new Error('clean') })()` 里第一条只是语句表达式、
       // 结果被丢弃，真正抛的是 `clean`。只排除这一种最明确的丢弃形态（直接作为语句表达式的
-      // `new`）；`return new Error(…)` / `throw new Error(…)` / 条件与逗号里的 `new` 都是「交出值」，
-      // 照常往下判。
+      // `new`）；`return new Error(…)` / `throw new Error(…)` / 条件里的 `new` 都是「交出值」，
+      // 照常往下判。逗号表达式只交出最右操作数 —— 由下面的遍历处理。
       // ⚠️ 先剥括号 / 断言包装再判（CR 第三十四轮 minor：`(new Error('**debug**'))` 的父节点是
       // ParenthesizedExpression，只看一层会把丢弃掉的报进去）
       let discarded: ts.Node = n
@@ -453,6 +484,14 @@ const THROW_ERROR: Rule = {
       let blocked = false
       while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) {
         const p = up.parent
+        // ⚠️ **逗号表达式里非最右的操作数被丢弃**（CR 第三十五轮 minor，Node 实测
+        // `throw (new Error('**debug**'), new Error('clean'))` 抛的是 clean）：被丢弃的操作数里的
+        // `new Error` 永远不是抛出的那个 —— 到此为止，不算违规。最右操作数照常往上走。
+        if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+          if (p.right !== up) break
+          up = p
+          continue
+        }
         // ⚠️ **类的实例字段初始化器只在类被实例化时执行**（Codex PR#81 第三十轮 P2，Node 实测
         // `throw Object.assign(new Error('clean'), { factory: class { error = new Error('**X**') } })`
         // 输出里没有 X）：只看类表达式有没有被 `new`，不能直接穿过去。
@@ -484,7 +523,11 @@ const THROW_ERROR: Rule = {
           // 在它的体内（`() => function () { return new Error(…) }`）同样不执行。祖先级不会误伤「尾值是
           // 数据」的形态（`() => new Error(…)` 的尾值是 `new`，不是函数），因此只在 `tailFn` 是函数时生效。
           const innerFn = unwrap(up as ts.Expression)
-          if (tailFn !== undefined && (tailFn === up || tailFn === innerFn || containsNode(tailFn, up))) {
+          // ⚠️ 例外（CR 第三十五轮 minor）：边界被调、**它的返回值又被调用**时，尾函数不是「被交出」而是
+          // 被执行 —— `throw (() => () => new Error('**X**'))()()` 与 `(…)().call(null)` 都真抛 X。
+          // 只调外层（`(() => () => new Error(…))()`）仍是反例：返回值被丢弃，尾函数不执行。
+          const tailExecuted = returnValueInvoked(p)
+          if (!tailExecuted && tailFn !== undefined && (tailFn === up || tailFn === innerFn || containsNode(tailFn, up))) {
             blocked = true
             break
           }
@@ -612,6 +655,8 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw (() => { new Error('**被丢弃**'); return new Error('clean') })()",
       // 括号包装的丢弃同样不算（CR 第三十四轮 minor）
       "throw (() => { (new Error('**括号包裹被丢弃**')); return new Error('clean') })()",
+      // 逗号表达式里非最右操作数被丢弃（CR 第三十五轮 minor）：抛的是 clean
+      "throw (new Error('**逗号丢弃**'), new Error('clean'))",
       "throw ((() => new Error('**非空断言**'))!)()",
       "throw (<() => Error>(() => new Error('**尖括号断言**')))()",
       "throw (() => new Error('**call 立即执行**')).call(null)",
@@ -704,6 +749,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       ['**只调外层B**', false], ['**getter 只读**', false], ['**展开里的方法**', false], ['**展开里的箭头**', false],
       ['**展开里的函数表达式**', false], ['**属性箭头未调用**', false], ['**方法引用**', false], ['**unused**', false],
       ['**call 链内层**', false], ['**被丢弃**', false], ['**括号包裹被丢弃**', false],
+      ['**逗号丢弃**', false],
       ['const e = new Error', false],
     ]
     const _bad = _keys.map(([k, want]) => [k, _byKey(k), want, _set.has(_byKey(k))] as const)
@@ -713,6 +759,13 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
     expect(_bad, `样本逐条不符：${JSON.stringify(_bad)}`).toEqual([])
     // 正例逐个**单独成文件**再扫一次：确认每条违规自身就足以命中（不靠相邻样本的行号/拼接）
     const srcOf = (key: string): string => _lines.find((l) => l.startsWith('throw ') && l.includes(key)) ?? ''
+    // ⚠️ 「本次调用**交出**的函数再被调用」（CR 第三十五轮 minor，Node 实测两条都真抛）：
+    // `(() => () => new Error(…))()()` / `(…)().call(null)`。没放进上面的合并样本 —— 合并源码里
+    // 外层实参里的箭头在**其它**判据里会被当成「被交出、未调用」，本组只钉住「单独成立时命中」。
+    for (const pos of ["(() => () => new Error('**返回的函数被调用**'))()()",
+      "(() => () => new Error('**call 链返回的函数被调用**'))().call(null)"]) {
+      expect(THROW_ERROR.hit(parseTs(`throw ${pos}`)), `正例必须命中：${pos}`).toHaveLength(1)
+    }
     for (const pos of ['**getter 返回后调用**', '**getter 返回的函数带括号后被调用**', '**类被实例化**',
       '**静态字段**', '**展开后被调用**', '**new 函数表达式**',
       '**属性箭头**', '**属性函数表达式**', '**方法被调用**', '**bind 立即执行**', '**逗号立即执行**',

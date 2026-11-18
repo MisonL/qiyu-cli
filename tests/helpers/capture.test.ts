@@ -242,6 +242,9 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
     if (ts.isIdentifier(u)) return aliases.has(u.text)
     if (ts.isPropertyAccessExpression(u)) return refersToAlias(u.expression)
     if (ts.isElementAccessExpression(u)) return refersToAlias(u.expression)
+    // ⚠️ 逗号表达式交出**最右**操作数：`Object.assign((0, opts), {…})` 写的是 opts（CR 第三十五轮
+    // minor，Node 实测 `opts.concurrent` 变 true）。旧判据在这里返回 false —— 真写入被放行。
+    if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.CommaToken) return refersToAlias(u.right)
     return false
   }
   const calleeValue = (expression: ts.Expression): ts.Expression => {
@@ -1538,6 +1541,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(concHits(`const oQ42 = ${Zq};\nconst otherQ42 = {}\nObject.assign.apply.bind(Object.assign, null, [otherQ42, { con${'current: true }'}])({ x: 1 })\nit('Q42', oQ42, () => {})`),
       'apply 被 bind、预绑定的实参数组里是别的对象 → 不算写入').toEqual([])
 
+    // 写入目标是**逗号表达式**时取最右操作数（CR 第三十五轮 minor）：`(0, o)` 写的就是 o；
+    // `(o, other)` 写的是别的对象 —— 两侧各一条，咬住「取哪一侧」。
+    expect(concHits(`const oQ44 = ${Zq};\nObject.assign((0, oQ44), { con${'current: true }'})\nit('Q44', oQ44, () => {})`),
+      '写入目标是逗号表达式的最右操作数').toEqual(['unknown'])
+    expect(concHits(`const oQ45 = ${Zq};\nconst otherQ45 = {}\nObject.assign((oQ45, otherQ45), { con${'current: true }'})\nit('Q45', oQ45, () => {})`),
+      '逗号表达式最右是别的对象 → 不算写入').toEqual([])
     // 展开的实参：`Object.assign(...[o, {…}])` 的展开元素里含目标 —— 目标位置看不出来，按写过（unknown）。
     // 展开的实参里有没有目标都看不出来（展开数组是变量 / 字面量同理）—— 一律按写过。
     expect(concHits(`const oQ28 = ${Zq}\nconst argsQ28 = [oQ28, { con${'current: true }'}] as const\nObject.assign(...argsQ28)\nit('Q28', oQ28, () => {})`),
