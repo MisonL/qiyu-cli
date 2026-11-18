@@ -284,23 +284,39 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
   const pureArgs = (c: ts.CallExpression): readonly ts.Expression[] | undefined => {
     const callee = unwrap(c.expression)
     const form = callForm(c)
+    // ⚠️ **`bind` 那一层自己不是写入**（Codex PR#81 第三十二轮 P2；自检 Q34/Q35）：`const f = Object.assign.bind(null, o)`
+    // 只造了绑定函数、`o` 一点没变 —— 返回**空序列**（目标 undefined → 不算写；实参里的展开也不影响）。
+    // ⚠️ 「`bind` 结果被立即调用」（`Object.assign.bind(null, o)(x)`）的 callee 就是那个 `bind` 调用，
+    // `callForm` 剥一层后也读成 `bind` —— 按 callee 是不是调用分开：是 → 预绑定实参 + 本次实参；
+    // 不是（属性 / 下标，即 `bind` 层本身）→ 空序列（被取 `.call` 时走下面的分支）。
+    if (form === 'bind') {
+      if (!ts.isCallExpression(callee)) return []
+      if (callee.arguments.some((a) => ts.isSpreadElement(a))) return undefined
+      return [...callee.arguments.slice(1), ...c.arguments]
+    }
+    // ⚠️ `call` / `apply` 分支**任何判断之前**先看展开（CodeRabbit PR#81 第三十二轮 minor）：
+    // 实参里的 `SpreadElement` 会让整条序列不可知（展开能影响它的全部元素）。
     if (form === 'call' || form === 'apply') {
+      if (c.arguments.some((a) => ts.isSpreadElement(a))) return undefined
       // 基座是 bind 的调用 → 先放它预绑定的实参（bind 的实参 0 是 thisArg，跳过）；
-      // 基座是别的调用（`x()(…)`）→ 看不出来；基座是普通表达式（`(w ?? Reflect).set`）→ 没有。
+      // 基座是写入 API 本身（`Object.assign.call(…)` / `Reflect.set.apply(…)`）→ 没有预绑定；
+      // 基座是**别的调用**（`x()(…)` / 绑定结果被调用 `Object.assign.bind(null, o)(…)`）→ 看不出
+      // 预绑定了什么，整条序列不可知；其余普通表达式（`(w ?? Reflect).set` / 绑定函数变量 `f.call(…)`）
+      // → 没有（`f.call` 的预绑定静态看不见 —— 已如实记为边界，见 `writesThroughCallee` 注释）。
       const bu = unwrap((callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
-      const base = ts.isCallExpression(bu) && callForm(bu) === 'bind' ? bu.arguments.slice(1) : []
+      let base: readonly ts.Expression[] = []
+      if (ts.isCallExpression(bu)) {
+        if (callForm(bu) !== 'bind') return undefined
+        if (bu.arguments.some((a) => ts.isSpreadElement(a))) return undefined
+        base = bu.arguments.slice(1)
+      }
       if (form === 'call') return [...base, ...c.arguments.slice(1)]
       const arr = c.arguments[1] === undefined ? undefined : unwrap(c.arguments[1])
       if (arr === undefined || !ts.isArrayLiteralExpression(arr)
         || arr.elements.some((e) => ts.isSpreadElement(e) || ts.isOmittedExpression(e))) return undefined
       return [...base, ...(arr.elements as readonly ts.Expression[])]
     }
-    // `f.bind(a, x, …)(y, …)`：bind 的实参 0 是 thisArg，其余是预绑定实参，排在调用实参之前
-    if (ts.isCallExpression(callee)) return callForm(callee) === 'bind' ? [...callee.arguments.slice(1), ...c.arguments] : undefined
-    // ⚠️ **展开实参**：`Object.assign(...[opts, { concurrent: true }])` 的实参序列里出现
-    // `SpreadElement`，目标位置就看不出来（CodeRabbit PR#81 第三十一轮 minor，自检复现）——
-    // 保守按「目标不可知」处理（调用方据此算「写过」）：展开能影响的实参是它的全部元素。
-    if (form === 'bind') return []
+    // 普通调用（`Object.assign(o, x)` / 绑定函数变量 `f(x)`）：实参里的展开同样不可知。
     if (c.arguments.some((a) => ts.isSpreadElement(a))) return undefined
     return c.arguments
   }
@@ -313,11 +329,18 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
    * 真写入判成没写；「无 `let` 时绕过链」的改法在现行环境下无法被变异杀死（等价覆盖，如实记录），
    * 不留死代码，只留尾段这一条。
    * 边界（如实记录）：尾段是变量（`const k='set'; o[k](x)`）、`.apply` 的实参数组是变量、反射拼名字，
-   * 仍看不见；`a.b.c(…)` 里的 `c` 恰好是 `assign` / `set` 时会把别的方法当成写入（多报不出错）。
+   * 仍看不见；`a.b.c(…)` 里的 `c` 恰好是 `assign` / `set` 时会把别的方法当成写入（多报不出错）；
+   * **绑定函数变量**（`const f = Object.assign.bind(null, o); f(x)` / `f.call(null, x)`）的预绑定实参
+   * 静态不追 —— 只有 `f` 本身时按「callee 不是写入 API」放过（Q33，测试钉住的是这条边界本身）。
    */
   const writesThroughCallee = (call: ts.CallExpression): boolean => {
-    const tailKey = tailThroughInvocation(call.expression)
-    if (tailKey === undefined || !WRITE_TAILS.has(tailKey)) return false
+    // 入口先按**静态尾段**认写入方法（`assign` / `set` …），再由 `pureArgs` 还原这次调用**运行时**真正
+    // 收到的实参：`bind` 层本身 → 空序列（只创建，不是写入）；`bind` 结果被调用 / `.call` / `.apply` /
+    // 普通调用 → 各自的实参序列；`.apply` 的数组看不清 → `undefined` → 按写过。猜不出就按写过。
+    // ⚠️ 开发中试过的错误写法，勿回退：① `callForm(call) === 'bind'` 在入口直接放行 —— 「`bind` 结果被
+    // 调用」的 callee 也是 `bind`，被一起放行了（Q18 变红）；② 按 `call.parent` 或节点身份
+    // （`unwrap(x) === call`）判「只创建」—— 在 vitest 转换产物里都不可靠，判据静默失效。
+    if (!WRITE_TAILS.has(tailThroughInvocation(call.expression) ?? '')) return false
     const seq = pureArgs(call)
     if (seq === undefined) return true
     const target = seq[0]
@@ -380,6 +403,8 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       && (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)
       && refersToAlias(n.operand)) hit = true
     if (ts.isDeleteExpression(n) && refersToAlias(n.expression)) hit = true
+    // ⚠️ 写入 API 的调用（`Object.assign(opts, …)` 一族）—— 判据在 `writesThroughCallee`。
+    // 这一行曾被调试代码整行替换掉，暴露出自检样本 `O3c` 是**唯一**钉住它的用例（当时只有它变红）。
     if (ts.isCallExpression(n) && writesThroughCallee(n)) hit = true
     ts.forEachChild(n, visit)
   }
@@ -672,6 +697,9 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       // ⚠️ 但**只能豁免到展开为止**：`it('x', { concurrent: true }, ...([fn] as const))` 的选项是
       // 显式对象、展开只补执行体（CodeRabbit PR#81 第二十七轮 minor）—— 一律跳过会把这种显式并发
       // 放过去。因此只把展开**之前**的实参送去判。
+      // ⚠️ 曾在这里加过一个 `fnInArray`（「数组字面量里含函数就算执行体位」）—— 它从未生效：
+      // 变异删掉后全部自检仍绿（死代码）。`.apply` 的实参数组由上面的分支整体还原成 `args`，
+      // 执行体本来就落在 `rest` 里、由 `isFn` / `thirdResolvesToObject` 认，不需要这层。
       const spreadAt = args.findIndex((e) => ts.isSpreadElement(e))
       const scanArgs = spreadAt < 0 ? args : args.slice(0, spreadAt)
       // ⚠️ 超时实参**按原始位置**识别之后才剔除（Codex PR#81 第二十九轮 P2）：`it('slow', handler, 40_000)`
@@ -785,6 +813,24 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
   // 剥掉末段 `call`/`apply` 后再认 hook 名，否则整棵回调都不被扫描。
   /** `bind` 形态是否**真的被调用**：调用节点的被调方是 `X.bind(...)` 的结果（`Call(Call(Prop(X,'bind'),…),…)`）。 */
   const bindResultInvoked = (call: ts.CallExpression): boolean => {
+    // ⚠️ `.bind(...).call(...)` / `.apply(...)`：绑定**结果**经 call/apply 被调用，同样是登记
+    // （Codex PR#81 第三十二轮 P2，Node 实测照常登记）。先剥本调用的 call/apply 层，回到调用
+    // `X.bind(...)` 的那一层再判。
+    const form = (() => {
+      const u = unwrap(call.expression)
+      return ts.isPropertyAccessExpression(u) ? u.name.text
+        : ts.isElementAccessExpression(u) ? staticKey(u.argumentExpression) : undefined
+    })()
+    if ((form === 'call' || form === 'apply') && call.arguments.length >= 1) {
+      // 被调方是 `X.bind(...)`（绑定的结果），本调用的实参 0 是 thisArg —— 只剥调用方式那一层，
+      // 再判 `X` 确实是 `….bind` 的调用。
+      const target = unwrap((unwrap(call.expression) as ts.PropertyAccessExpression).expression)
+      return ts.isCallExpression(target)
+        && (ts.isPropertyAccessExpression(unwrap(target.expression)) || ts.isElementAccessExpression(unwrap(target.expression)))
+        && (ts.isPropertyAccessExpression(unwrap(target.expression))
+          ? (unwrap(target.expression) as ts.PropertyAccessExpression).name.text === 'bind'
+          : staticKey((unwrap(target.expression) as ts.ElementAccessExpression).argumentExpression) === 'bind')
+    }
     // 括号 / 断言包装不影响语义：`((p ?? Promise.resolve()).then.bind(p))(w)` 的 bind 结果
     // 外面套了一层括号再被调用（Codex PR#81 第三十轮 P2，Node 实测 `w` 照样在 hook 之后跑）
     const raw = unwrap(call.expression)
@@ -927,7 +973,16 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       // `setTimeout.call(null, cb, 1)`、`globalThis.setTimeout.apply(null, […])` 的链末段多出
       // `call`/`apply`，探针确认 hook 尾巴照样串到下一条用例）。先把末段剥掉再匹配原语。
       const last = innerName[innerName.length - 1]
-      if (innerName.length > 1 && (last === 'call' || last === 'apply')) innerName.pop()
+      if (innerName.length > 1 && (last === 'call' || last === 'apply')) {
+        innerName.pop()
+        // ⚠️ 再剥一层 `bind`：`setTimeout.bind(null).call(null, w, 80)` 的链是
+        // `setTimeout.bind.call` —— 绑定结果经 call/apply 被调用同样是调度（Codex PR#81 第三十二轮 P2，
+        // 探针复现）。只剥紧挨着的 `bind`（`X.call` 之类的普通调法不受影响）。
+        if (innerName.length > 1 && innerName[innerName.length - 1] === 'bind'
+          && ts.isCallExpression(unwrap((unwrap(inner.expression) as ts.PropertyAccessExpression).expression))) {
+          innerName.pop()
+        }
+      }
       // `setTimeout.bind(null)(w, 80)`（Codex PR#81 第二十七轮 P2，Node 实测真的排了调度）：
       // `callChain` 穿透 `bind` 那一层调用后得到 `setTimeout.bind` —— 末段剥掉才是原语名。
       // ⚠️ 只对**被调用的**绑定值剥：`f.bind(null)(…)` 的外层调用的被调方是 `f.bind(null)`
@@ -1129,13 +1184,17 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     const hookHits = (src: string): string[] =>
       hookSchedulingViolations(parseTs(src)).map((v) => v.why.replace(/^hook 体里出现「/, '').replace(/」$/, ''))
     const concHits = (src: string): string[] => {
-      const out: string[] = []
+        const out: string[] = []
       for (const v of concurrentViolations(parseTs(src))) {
         if (v.why.startsWith('.concurrent')) out.push(`alias:${v.why.replace('.concurrent 修饰链：', '')}`)
         // 「求不出」一律归 unknown —— 判据按**为什么看不见**分了几种文案（无法静态解析 /
         // 无法静态求值 / 来自访问器 / 未知来源的键），自检只关心「不许放行」
         else if (COULD_NOT_SEE.some((s) => v.why.includes(s))) out.push('unknown')
-        else out.push('opt')
+        // 兜底必须带触发条件：任何既不是 `.concurrent`、也不含「看不清」文案的说明都是**新形态**，
+        // 不能默认算成 `opt`（那样求值崩掉 / 文案改了都会静默变成「放行」）。
+        else if (v.why.startsWith('选项对象 concurrent 为真') || v.why === '套件选项 sequential 为假') out.push('opt')
+        else out.push(`未归类：${v.why}`)
+
       }
       return out
     }
@@ -1225,6 +1284,18 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       '绑定的 hook 自己 await 整条链').toEqual([])
     // 反例：绑定的 hook **只创建不调用** → 不是 hook，里面什么都不判
     expect(hookHits(`const hookZC = ${H}.bind(null, () => { ${ST}(w, 80) })`), '绑定但不调用的 hook 不扫描').toEqual([])
+    // hook 体内的调度原语经 bind 后再经 call/apply 调用（Codex PR#81 第三十二轮 P2，探针复现）
+    // ⚠️ 断言只钉「该形态被报出、报一次」—— 可执行性即判据；具体链文案（`setTimeout(` / `setTimeout.bind(`）
+    // 取决于 `callChain` 穿透的层数，不在这里钉住
+    expect(hookHits(`${H}(() => { ${ST}.bind(null).call(null, w, 80) })`), '调度原语 bind 后经 call 调用')
+      .toHaveLength(1)
+    expect(hookHits(`${H}(() => { ${ST}.bind(null).apply(null, [w, 80]) })`), '调度原语 bind 后经 apply 调用')
+      .toHaveLength(1)
+    // 绑定的 hook 经 `.call` / `.apply` 执行同样是登记（Codex PR#81 第三十二轮 P2，Node 实测照常登记）
+    expect(hookHits(`${H}.bind(null, () => { ${ST}(w, 80) }).call(null)`), '绑定的 hook 经 call 执行')
+      .toEqual([`${ST}(`])
+    expect(hookHits(`${H}.bind(null, () => { ${ST}(w, 80) }).apply(null, [])`), '绑定的 hook 经 apply 执行')
+      .toEqual([`${ST}(`])
     // 直接 await 后**存进变量**同样算等到（Codex PR#81 第二十八轮 P2）
     expect(hookHits(`${H}(async () => { const r = await (pending ?? Promise.resolve()).catch(w); void r })`),
       'await 结果存入变量仍算等到').toEqual([])
@@ -1420,10 +1491,31 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       'bind 预绑定实参 + .call 的目标是预绑定的那个').toEqual(['unknown'])
     expect(concHits(`const oQ26 = ${Zq}\nconst otherQ26 = {}\nObject.assign.bind(null, otherQ26).call(null, { con${'current: true }'})\nit('Q26', oQ26, () => {})`),
       'bind 预绑定别的对象 → .call 的实参不是目标').toEqual([])
+    // `.call` 的基座是**别的调用**（不是 `bind`）：看不出预绑定了什么 → 整条序列不可知、按写过。
+    // 变异实测：把这一档改回「按本次实参判」后没有用例变红，才补了这条样本（Codex PR#81 第三十二轮）。
+    expect(concHits(`const oQ26b = ${Zq};\nObject.assign({}, oQ26b).call(null, { con${'current: true }'})\nit('Q26b', oQ26b, () => {})`),
+      '.call 的基座是普通调用 → 看不清').toEqual(['unknown'])
+
     // 展开的实参：`Object.assign(...[o, {…}])` 的展开元素里含目标 —— 目标位置看不出来，按写过（unknown）。
     // 展开的实参里有没有目标都看不出来（展开数组是变量 / 字面量同理）—— 一律按写过。
     expect(concHits(`const oQ28 = ${Zq}\nconst argsQ28 = [oQ28, { con${'current: true }'}] as const\nObject.assign(...argsQ28)\nit('Q28', oQ28, () => {})`),
       '展开数组里的目标（经变量）').toEqual(['unknown'])
+    // `.call` 分支同样要看展开（CodeRabbit PR#81 第三十二轮 minor）：`Object.assign.call(null, ...[o, {…}])`
+    expect(concHits(`const oQ32 = ${Zq}\nObject.assign.call(null, ...[oQ32, { con${'current: true }'}])\nit('Q32', oQ32, () => {})`),
+      '.call 的实参经展开').toEqual(['unknown'])
+    // 被调用的 `.bind`（预绑定实参）里的展开同样不可知（只创建不调用的 bind 见下方样本，不算写入）
+    expect(concHits(bt('const oQ33 = ', Zq, ';', '\nconst fQ33 = Object.assign.bind(null, oQ33, { con', 'current: true })', '\nfQ33()', "\nit('Q33', oQ33, () => {})").replace('Zq', Zq)),
+      '绑定函数变量被调用：预绑定实参静态看不见，按边界放过').toEqual([])
+
+    // 只创建、**不调用**的 `bind` 不是写入（Codex PR#81 第三十二轮 P2）；展开形态同样不算
+    expect(concHits(`const oQ34 = ${Zq}\nconst fQ34 = Object.assign.bind(null, oQ34, { con${'current: true }'})
+it('Q34', oQ34, () => {})`),
+      '只创建绑定函数不算写入').toEqual([])
+    expect(concHits(`const oQ35 = ${Zq}\nconst fQ35 = Object.assign.bind(null, ...[oQ35, { con${'current: true }'}])\nit('Q35', oQ35, () => {})`),
+      '只创建绑定函数（展开实参）同样不算写入').toEqual([])
+    // 执行体放在 `.apply` 的实参数组里：`it.apply(null, [名, {…}, 体])` 的执行体不得被当成选项
+    expect(concHits(`it.apply(null, ['Q36', { con${'current: true }'}, () => {}])`),
+      '.apply 实参数组里的执行体').toEqual(['opt'])
     // 循环赋值目标：`for (oQ30.concurrent of [true])` 改写选项；反例是写到别的对象
     expect(concHits(`const oQ30 = ${Zq}\nfor (oQ30.concurrent of [true]) {}\nit('Q30', oQ30, () => {})`),
       'for-of 右侧给选项赋值').toEqual(['unknown'])
@@ -1470,7 +1562,8 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // TypeScript 把它解析成「对对象字面量的调用」（ASI 不插分号），initializer 成了 CallExpression
     // —— 这些样本原先判绿的**真实原因**是初始值解析不出，而不是写入判据命中，变异杀不死。
     // 下标形式的 bind / 未知基座的 bind / 全局宿主前缀（Codex PR#81 第二十九轮 P2，Node 实测均写入）
-    expect(concHits(bt('const oQ18 = ', 'Zq', ';', '\nObject[', JSON.stringify('assign'), "][", JSON.stringify('bind'), '](null)(oQ18, { con', 'current: true })', "\nit('Q18', oQ18, () => {})").replace('Zq', Zq)),
+
+    expect(concHits(bt('const oQ18 = ', Zq, ';', '\nObject[', JSON.stringify('assign'), "][", JSON.stringify('bind'), '](null)(oQ18, { con', 'current: true })', "\nit('Q18', oQ18, () => {})")),
       '下标形式的 Object.assign.bind').toEqual(['unknown'])
     expect(concHits(bt('const oQ19 = ', 'Zq', ';', '\n(writerQ19 ?? Reflect).set.bind(null)(oQ19, ', JSON.stringify('concurrent'), ', true)', "\nit('Q19', oQ19, () => {})").replace('Zq', Zq)),
       '未知基座 + bind').toEqual(['unknown'])

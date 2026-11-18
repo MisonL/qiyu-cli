@@ -327,14 +327,20 @@ describe('duckdb —— 事务', () => {
       DuckDBInstance: {
         create: async (...a: unknown[]) => {
           const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
           return {
             ...(inst as object),
+            // ⚠️ `Store.close()` 调的是原型上的 `closeSync()`，对象展开复制不到 —— 两层都要转发
+            // （CodeRabbit PR#81 第三十一/三十二轮 major：不转发会泄漏原生连接与实例）
+            closeSync: () => ii.closeSync?.(),
             connect: async () => {
-              const c = await (inst as { connect: () => Promise<unknown> }).connect()
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
               return {
                 ...(c as object),
+                closeSync: () => cc.closeSync?.(),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
-                  const target = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown> }
+                  const target = cc
                   if (holdNext && sql.includes('bad_cast_q28')) {
                     holdNext = false
                     gate = new Promise<void>((r) => { release = r })
@@ -379,6 +385,9 @@ describe('duckdb —— 事务', () => {
     const rows = await s.count('tags')
     expect(rows, '事务失败时其写入不得部分残留；成功时必须完整在库里')
       .toBe(txErr === null ? 2 : 1)
+    // ⚠️ 显式关库：包装器已转发两层 `closeSync`（见 `importer` 注释），必须真的关到原生连接与实例 ——
+    // 否则锁随进程存活，且 teardown 的 `rmSync` 会撞锁（CR 第三十二轮 major 要求先证明已关闭）。
+    await s.close()
   })
 
   it('语句下发期间另一条链开事务、外部语句执行期报错、回调直接返回 → 事务必须响亮失败，不得 COMMIT 成功而丢写（CodeRabbit PR#81 第三十一轮 major / Codex P2）', async () => {
@@ -413,9 +422,13 @@ describe('duckdb —— 事务', () => {
                 closeSync: () => cc.closeSync?.(),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   if (holdNext && sql.includes('bad_cast_q31')) {
+                    // 闸门在**执行之后、结果返回之前**：语句已在事务内执行并污掉事务，外部调用方
+                    // 还没拿到错误。所有者此时 COMMIT，再放行 —— 复现「COMMIT 先落定、错误后到」。
                     holdNext = false
                     gate = new Promise<void>((r) => { release = r })
+                    const res = await cc.runAndReadAll(sql, params)
                     await gate
+                    return res
                   }
                   return cc.runAndReadAll(sql, params)
                 },
@@ -437,23 +450,25 @@ describe('duckdb —— 事务', () => {
     let began!: () => void
     const beganP = new Promise<void>((r) => { began = r })
     const tx = s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
       began()
       await new Promise((r) => setTimeout(r, 80))
-      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
-      // ⚠️ 关键：回调在此**直接返回**，不再发任何语句（不会因再写而偶然撞 aborted 失败）
+      // ⚠️ 关键：回调在此**直接返回**（不再发任何语句 —— 不会被 aborted 挡住而偶然失败）
     })
     await beganP
     await new Promise((r) => setTimeout(r, 20))
     release()
     expect(await outside, '外部语句被拒').toMatchObject({ kind: 'internal' })
     const txErr = await tx.then(() => null, (e: unknown) => e)
-    // 本机（单线程）实况：DuckDB 已把事务标 aborted，所有者这边 `COMMIT` 自己就报
-    // `cannot commit - no transaction is active`（响亮失败，不是静默成功）—— 探针实测。
-    // 断言只钉「不得成功且不得残留」，不钉具体文案：驱动层若以后改口径（例如整段回滚 +
-    // internal），这条依然成立。「COMMIT 返回成功而丢写」必须让这条变红。
+    // 本机（单线程）实况：闸门放在「执行之后、结果返回之前」，`COMMIT` 先返回成功、外部错误
+    // 后到 —— 事务内那一行被静默丢弃（探针实测：不修时 txErr 为 null、行数 1）。现在 `execSql`
+    // 跨代时给事务留记号，所有者 COMMIT 前改发 ROLLBACK + internal（`commitOrRefuse`）。
     expect(txErr, '事务必须响亮失败，不得返回成功').not.toBeNull()
-    expect(await s.count('tags'), '事务内的写入不得残留（要么整体回滚，要么完整提交）')
-      .toBe(txErr === null ? 2 : 1)
+    // 成因必须点名「事务未提交 + 已整体回滚」（`commitOrRefuse`），不能只说驱动原文 ——
+    // 只报驱动原文时调用方不知道数据没落库，也不会去查并行调用。
+    expect((txErr as Error).message, '成因要点名未提交与整体回滚').toMatch(/事务未提交.*已整体回滚/)
+    expect(await s.count('tags'), '事务内的写入不得残留（整体回滚）').toBe(1)
+    await s.close()
   })
 
   it('语句下发期间另一条链开启事务（语句本身成功）→ 同样被拒（CodeRabbit PR#81 第二十八轮 major）', async () => {
@@ -469,14 +484,20 @@ describe('duckdb —— 事务', () => {
       DuckDBInstance: {
         create: async (...a: unknown[]) => {
           const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
           return {
             ...(inst as object),
+            // ⚠️ `Store.close()` 调的是原型上的 `closeSync()`，对象展开复制不到 —— 两层都要转发
+            // （CodeRabbit PR#81 第三十一/三十二轮 major：不转发会泄漏原生连接与实例）
+            closeSync: () => ii.closeSync?.(),
             connect: async () => {
-              const c = await (inst as { connect: () => Promise<unknown> }).connect()
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
               return {
                 ...(c as object),
+                closeSync: () => cc.closeSync?.(),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
-                  const target = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown> }
+                  const target = cc
                   if (holdNext && sql.includes('tags')) {
                     holdNext = false
                     gate = new Promise<void>((r) => { release = r })
@@ -509,6 +530,12 @@ describe('duckdb —— 事务', () => {
     release()
     expect(await outside, '成功路径同样必须被拒绝（internal）').toMatchObject({ kind: 'internal' })
     await tx.then(() => null, () => null)
+    await s.close()
+    // ⚠️ **只断言「s.close() 不抛」证明不了实例已关**（实测记录）：把三处包装器的实例 `closeSync`
+    // 转发删掉，本文件 61 条全绿；s.close() 在自己**进程内**释放实例锁（单进程重复打开会走共享/等待），
+    // 文件也能删。真实泄漏信号只出现在**跨进程**（锁随进程存活，见 duckdb.ts 的 N1 实测）。
+    // 所以这里不去造一个本机证明不了的断言（试过「删库不抛」，变异后依旧全绿，已撤）：
+    // 转发本身照 `wrapConn`（同文件，已有真实覆盖）的写法做，跨进程泄漏不在单测可达范围内 —— 如实记录。
   })
 
   it('事务回调里 close() 之后再写/删/读 → 一律 usage「数据库连接已关闭」，不得误诊成并发竞争（Codex PR#81 第二十五轮 P3）', async () => {

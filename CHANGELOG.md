@@ -47,6 +47,24 @@
 
 ### 修复
 
+- **静态守卫：第三十二轮（CR 5 条 + Codex 5 条 P2）**（2026-11-18，逐条自检/探针复现）：
+  写入判据的 `bind` 语义收敛 —— ① `bind` 那句**只创建**绑定函数时不是写入（`const f = Object.assign.bind(null, o)`，
+  含展开实参形态），但**结果被立即调用**时按运行时实参判（`Object.assign['assign']['bind'](null)(o, …)`）；
+  ② 「只创建 / 被调用 / 被取 `.call`」三种形态 `callForm` 读出来都是 `bind`，只能靠**被调方类型**区分
+  （`callee` 是调用 = 被调用）——开发中试过的 `call.parent` 与节点身份（`unwrap(x) === c`）在 Vitest
+  转换产物里**都不可靠**，已弃用并写进注释；③ `.call` / `.apply` 的基座是**别的调用**时整条序列不可知
+  （`Object.assign({}, o).call(null, {…})`，补样本后变异可杀）；④ 自检里曾加的「`.apply` 实参数组里
+  含函数字面量就算执行体位」（`fnInArray`）实测是**死代码** —— 变异删掉后自检全绿，已删除并注明；
+  hook 判据：
+  绑定的 hook 经 `.call` / `.apply` 执行同样算登记（`beforeEach.bind(null).call(null, fn)`）·
+  调度原语 `bind` 后再 `.call` / `.apply`（`setTimeout.bind(null).call(null, w, 80)`）同样命中 ·
+  `throw` 的 `new Error` 规则：**直接作为表达式语句**的调用结果被丢弃、不算抛出
+  （`(() => { new Error('debug'); return new Error('clean') })()`）· `duckdb`：外部语句在事务内
+  **执行之后**报错时，`COMMIT` 可能先返回成功、事务内写入被静默丢弃 —— `execSql` 跨代且本条语句
+  确实执行过时给当时的事务留记号（`txBrokenByExternal`），所有者提交前检查、有记号就改发 ROLLBACK
+  并抛 `internal`（`commitOrRefuse`，成因写明「未提交 + 已整体回滚」）；用例把闸门放在「执行之后、
+  结果返回之前」复现，变异（绕过 `commitOrRefuse`）实测变红；三条竞态用例都显式 `close()`，
+  包装器转发两层 `closeSync`。
 - **静态守卫：第三十一轮（CR 5 条 + Codex 1 条 P2）**（2026-11-18，逐条自检/Node 复现）：
   写入判据把**展开实参**当目标不可知（`Object.assign(...[opts, { concurrent: true }])` 旧判据把
   `SpreadElement` 当普通实参、目标判不出而放行）· `for (opts.concurrent of […])` / `for-in` 的**循环头
@@ -55,10 +73,10 @@
   「getter 返回函数须调用」与尾值判据收敛到同一求值语义（`.call/.apply/.bind` 调的是内层箭头）·
   `plaintext-channels` 自检的**逐条断言**改按所在行核对（总数断言在漏检 + 误报互相抵消时照样是绿的）·
   `duckdb.test` 的「语句等待期间开事务」用例补**回调直接返回**形态（Codex P2：外部语句执行期报错
-  之后 COMMIT 是否静默丢写），并给新用例的驱动包装器转发两层 `closeSync`。同轮核实了 Codex 关于
-  「给事务所有者补一个 abort 记号」的建议：本机单线程实测所有者侧本就响亮失败（`Current transaction
-  is aborted` / `cannot commit - no transaction is active`），补记号的分支走不到（探针证明），
-  **不加未经验证的防御**，在 `txEpoch` 注释里如实写明边界与「COMMIT 成功而丢写」本机未能稳定构造。
+  之后 COMMIT 是否静默丢写），并给新用例的驱动包装器转发两层 `closeSync`。同轮曾按旧用例的时序
+  判断「所有者侧本就响亮失败、abort 记号走不到」而未加记号 —— **第三十二轮用「执行后闸门」
+  （语句执行完、结果未返回）复现出了静默丢写**（COMMIT 先成功、外部错误后到，事务内写入被丢弃），
+  该结论已撤回，见下条。
 - **静态守卫：第三十轮（Codex 7 条 P2）**（2026-11-18，逐条探针复现）：
   `.bind` 预绑定实参**经 `.call` / `.apply` 调用后**仍是目标（`Object.assign.bind(null, o).call(null, x)`）·
   未知基座的 `.bind` 保留写入方法尾段（`(w ?? Reflect).set.bind(null)(opts, …)`）· `bind` 结果**被括号包住**再调用
