@@ -234,6 +234,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * （而不是等「在途语句全清」，那会把普通并发读拖成死等）。
    */
   let foreignInFlight = 0
+  /**
+   * 受影响的事务（令牌）与成因：外部语句**执行期报错**（跨代）或**交回时报错且期间跨代**。
+   * 与在途计数互补（CR 第三十四轮 major）：计数在结果交回时归零，若错误交回早于所有者提交，
+   * 提交那一刻计数已为 0 —— 只靠计数会放行（用例「外部语句的错误先交回、所有者随后才提交」钉住）。
+   */
+  const brokenTx = new Map<TxToken, string>()
   /** 在途的外部语句登记：返回「这一次」的解除函数（只减一次）。 */
   const trackForeign = (): (() => void) => {
     foreignInFlight += 1
@@ -253,12 +259,15 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 代价如实记录：并发的普通读（`count` 等）也会让同一时刻提交的事务被拒 —— 保守侧，且与
    * Store「同一实例操作串行 await」的契约一致。
    */
-  const commitOrRefuse = async (): Promise<void> => {
-    if (foreignInFlight === 0) {
+  const commitOrRefuse = async (token: TxToken): Promise<void> => {
+    const marked = brokenTx.get(token)
+    brokenTx.delete(token) // 令牌唯一，读过即清，不会串到别的事务
+    if (marked === undefined && foreignInFlight === 0) {
       await execSql('COMMIT')
       return
     }
-    const why = `事务提交时仍有 ${foreignInFlight} 条其他异步链下发的语句没有交回结果，它执行期报错会把本事务标成 aborted`
+    const why = marked
+      ?? `事务提交时仍有 ${foreignInFlight} 条其他异步链下发的语句没有交回结果，它执行期报错会把本事务标成 aborted`
     await safeRollback()
     const err = new Error(`事务未提交：${why} —— 该事务可能已被 DuckDB 标成 aborted，`
       + 'COMMIT 可能返回成功却丢弃全部写入，因此已整体回滚')
@@ -290,6 +299,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // `runAndReadAll` 抛出，若只成功路径检查，最危险的情形（外部语句执行期报错 → 把别人的
       // 事务标成 aborted → COMMIT 返回成功而写入被丢弃，实测 count 1→0）恰好漏网。
       // 此时原错误被替换成归因正确的 internal，`cause` 保留驱动原文。
+      if (txEpoch !== epochBefore && txToken !== undefined) {
+        brokenTx.set(txToken, `外部语句执行期报错，且期间另一条链开启了事务（驱动原文：${(e instanceof Error ? e.message : String(e)).slice(0, 160)}）`)
+      }
       if (txEpoch !== epochBefore) {
         throw epochChangedError(e)
       }
@@ -631,7 +643,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         n = await alsTx.run(token, async () => {
           await execSql('BEGIN')
           const written = await doUpsert(t, rows)
-          await commitOrRefuse()
+          await commitOrRefuse(token)
           return written
         })
       } catch (e) {
@@ -699,7 +711,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
             transaction: <U>(f: (tx2: WriteTx) => Promise<U>) => store.transaction(f),
           }
           const r = await fn(tx)
-          await commitOrRefuse()
+          await commitOrRefuse(token)
           return r
         })
       } catch (e) {

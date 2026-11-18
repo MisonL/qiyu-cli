@@ -244,45 +244,55 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
     if (ts.isElementAccessExpression(u)) return refersToAlias(u.expression)
     return false
   }
-  /**
-   * 一个表达式的**方法名**（`(w ?? Reflect).set.call(…)` → `call`；`Object['assign']` → `assign`；
-   * 逗号表达式取右操作数）。只是「读一个节点的名字」，不沿链下钻 —— 下钻在 `callForm` 里做。
-   * ⚠️ 计算键必须另走 `staticKey`：下标访问的 `name` 是键表达式、没有自己的 `.text`
-   * （类型上虽有 `name.text`，运行时读不到）。
-   */
-  const tailOf = (e: ts.Expression): string | undefined => {
-    if (ts.isPropertyAccessExpression(e)) return e.name.text
-    if (ts.isElementAccessExpression(e)) return staticKey(e.argumentExpression)
-    // ⚠️ 逗号表达式取右操作数（与 `calleeChain` 同一口径）：转换产物里 `Object.assign.bind` 可能
-    // 写成 `(0, Object.assign.bind)` 一类的引用形态，右操作数才是真正的值。
-    if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.CommaToken) return tailOf(unwrap(e.right))
+  const calleeValue = (expression: ts.Expression): ts.Expression => {
+    let value = unwrap(expression)
+    while (ts.isBinaryExpression(value) && value.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      value = unwrap(value.right)
+    }
+    return value
+  }
+  const tailOf = (expression: ts.Expression): string | undefined => {
+    const value = calleeValue(expression)
+    if (ts.isPropertyAccessExpression(value)) return value.name.text
+    if (ts.isElementAccessExpression(value)) return staticKey(value.argumentExpression)
     return undefined
   }
-  /**
-   * 这次调用**自己的**调用方式名（`call` / `apply` / `bind`）：被调方表达式自己的末段，
-   * 被调方又是调用时剥一层（`Object.assign.bind(null)(…)` → 里层的 `bind`）。
-   * 只看**一层**调用嵌套：`a.bind()( ).call()( )` 这种形态在自检里没有。
-   */
-  const callForm = (c: ts.CallExpression): string | undefined => {
-    const callee = unwrap(c.expression)
+  const hostOf = (expression: ts.Expression): ts.Expression | undefined => {
+    const value = calleeValue(expression)
+    if (ts.isPropertyAccessExpression(value) || ts.isElementAccessExpression(value)) return value.expression
+    return undefined
+  }
+  const callForm = (call: ts.CallExpression): string | undefined => {
+    const callee = calleeValue(call.expression)
     return tailOf(ts.isCallExpression(callee) ? callee.expression : callee)
   }
-  const tailThroughInvocation = (e: ts.Expression): string | undefined => {
-    let cur = unwrap(e)
-    for (;;) {
-      if (ts.isCallExpression(cur)) { cur = unwrap(cur.expression); continue }
-      const k = tailOf(cur)
-      if (k === undefined) return undefined
-      if (!METHOD_TAILS.has(k)) return k
-      cur = unwrap((cur as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
+  const tailThroughInvocation = (expression: ts.Expression): string | undefined => {
+    let current: ts.Expression | undefined = expression
+    while (current !== undefined) {
+      const value = calleeValue(current)
+      if (ts.isCallExpression(value)) {
+        current = value.expression
+        continue
+      }
+      const tail = tailOf(value)
+      if (tail === undefined || !METHOD_TAILS.has(tail)) return tail
+      current = hostOf(value)
     }
+    return undefined
+  }
+  const applyArgs = (expression: ts.Expression | undefined): readonly ts.Expression[] | undefined => {
+    if (expression === undefined) return undefined
+    const array = unwrap(expression)
+    if (!ts.isArrayLiteralExpression(array)
+      || array.elements.some((element) => ts.isSpreadElement(element) || ts.isOmittedExpression(element))) return undefined
+    return array.elements as readonly ts.Expression[]
   }
   /**
    * 写入调用在**运行时**实际收哪些实参（含预绑定实参）：纯实参序列，目标总是第一个。
    * 求不出序列（`.apply` 的数组看不清）→ undefined，调用方保守按「写过」。
    */
   const pureArgs = (c: ts.CallExpression): readonly ts.Expression[] | undefined => {
-    const callee = unwrap(c.expression)
+    const callee = calleeValue(c.expression)
     const form = callForm(c)
     // ⚠️ **`bind` 那一层自己不是写入**（Codex PR#81 第三十二轮 P2；自检 Q34/Q35）：`const f = Object.assign.bind(null, o)`
     // 只造了绑定函数、`o` 一点没变 —— 返回**空序列**（目标 undefined → 不算写；实参里的展开也不影响）。
@@ -291,8 +301,20 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
     // 不是（属性 / 下标，即 `bind` 层本身）→ 空序列（被取 `.call` 时走下面的分支）。
     if (form === 'bind') {
       if (!ts.isCallExpression(callee)) return []
+      // ⚠️ 预绑定实参**与本调用实参**里的展开都不可知（CR 第三十四轮 minor：只查前者时
+      // `Object.assign.bind(null)(...[opts, {…}])` 会把 SpreadElement 当目标、判不出而放行）
       if (callee.arguments.some((a) => ts.isSpreadElement(a))) return undefined
-      return [...callee.arguments.slice(1), ...c.arguments]
+      if (c.arguments.some((a) => ts.isSpreadElement(a))) return undefined
+      // ⚠️ **`call` / `apply` 本身被 bind**（`Object.assign.call.bind(Object.assign, null, o)({…})`，
+      // CR/Codex PR#81 第三十四轮，Node 实测真写到 o）：bind 实参 0 是被绑定函数的 thisArg（即 `.call`
+      // 的宿主），实参 1 是内层 `.call` 的 thisArg —— 内层 `.call` / `.apply` 的序列要把这两个都去掉，
+      // 再往后接本次调用实参。读法是 `callee.expression`（`.bind` 属性访问）的基座尾段。
+      const args = [...callee.arguments.slice(1), ...c.arguments]
+      const host = hostOf(callee.expression)
+      const boundForm = host === undefined ? undefined : tailOf(host)
+      if (boundForm === 'call') return args.slice(1)
+      if (boundForm === 'apply') return applyArgs(args[1])
+      return args
     }
     // ⚠️ `call` / `apply` 分支**任何判断之前**先看展开（CodeRabbit PR#81 第三十二轮 minor）：
     // 实参里的 `SpreadElement` 会让整条序列不可知（展开能影响它的全部元素）。
@@ -303,7 +325,9 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       // 基座是**别的调用**（`x()(…)` / 绑定结果被调用 `Object.assign.bind(null, o)(…)`）→ 看不出
       // 预绑定了什么，整条序列不可知；其余普通表达式（`(w ?? Reflect).set` / 绑定函数变量 `f.call(…)`）
       // → 没有（`f.call` 的预绑定静态看不见 —— 已如实记为边界，见 `writesThroughCallee` 注释）。
-      const bu = unwrap((callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
+      const host = hostOf(callee)
+      if (host === undefined) return undefined
+      const bu = unwrap(host)
       let base: readonly ts.Expression[] = []
       if (ts.isCallExpression(bu)) {
         if (callForm(bu) !== 'bind') return undefined
@@ -311,10 +335,8 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
         base = bu.arguments.slice(1)
       }
       if (form === 'call') return [...base, ...c.arguments.slice(1)]
-      const arr = c.arguments[1] === undefined ? undefined : unwrap(c.arguments[1])
-      if (arr === undefined || !ts.isArrayLiteralExpression(arr)
-        || arr.elements.some((e) => ts.isSpreadElement(e) || ts.isOmittedExpression(e))) return undefined
-      return [...base, ...(arr.elements as readonly ts.Expression[])]
+      const args = applyArgs(c.arguments[1])
+      return args === undefined ? undefined : [...base, ...args]
     }
     // 普通调用（`Object.assign(o, x)` / 绑定函数变量 `f(x)`）：实参里的展开同样不可知。
     if (c.arguments.some((a) => ts.isSpreadElement(a))) return undefined
@@ -1495,6 +1517,26 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 变异实测：把这一档改回「按本次实参判」后没有用例变红，才补了这条样本（Codex PR#81 第三十二轮）。
     expect(concHits(`const oQ26b = ${Zq};\nObject.assign({}, oQ26b).call(null, { con${'current: true }'})\nit('Q26b', oQ26b, () => {})`),
       '.call 的基座是普通调用 → 看不清').toEqual(['unknown'])
+    // `.bind` 结果被调用时**调用实参**里的展开同样不可知（CR 第三十四轮 minor）
+    expect(concHits(`const oQ37 = ${Zq};\nObject.assign.bind(null)(...[oQ37, { con${'current: true }'}])\nit('Q37', oQ37, () => {})`),
+      '.bind 结果被调用，实参经展开').toEqual(['unknown'])
+    // 脱离接收者的 `.call` 在运行时会抛错，静态守卫仍需安全扫描，按方法名保守判定。
+    expect(concHits(`const oQ38 = ${Zq};\n(0, Object.assign.call)(null, oQ38, { con${'current: true }'})\nit('Q38', oQ38, () => {})`),
+      '逗号表达式里的方法尾段不能让守卫崩溃').toEqual(['unknown'])
+    expect(concHits(`const oQ39 = ${Zq};\nObject.assign.call.bind(Object.assign, null, oQ39)({ con${'current: true }'})\nit('Q39', oQ39, () => {})`),
+      'call 本身被 bind（预绑定 thisArg 与目标）').toEqual(['unknown'])
+    expect(concHits(`const oQ40 = ${Zq};\nObject.assign.bind(null).call(null, oQ40, { con${'current: true }'})\nit('Q40', oQ40, () => {})`),
+      'bind(null) 后 .call 的第二个实参是目标').toEqual(['unknown'])
+    // 反例钉住**目标位置**（Node 实测）：`Object.assign.call.bind(Object.assign, o, other)(…)` 写的是 `other`，
+    // 选项对象只作内层 `.call` 的 thisArg —— bind 实参 2 是目标、实参 1 才是内层 thisArg。
+    expect(concHits(`const oQ41 = ${Zq};\nconst otherQ41 = {}\nObject.assign.call.bind(Object.assign, oQ41, otherQ41)({ con${'current: true }'})\nit('Q41', oQ41, () => {})`),
+      'call 被 bind、写的是实参 2 → 不算写入（咬住位置）').toEqual([])
+    // 钉住**实参位置**：`Object.assign.apply.bind(Object.assign, null, [o, …])()` 真写到 o（Node 实测）；
+    // 若把 bind 实参 2 当 thisArg 丢掉、或去读本次调用的实参当数组，这条就查不到目标。
+    expect(concHits(`const oQ43 = ${Zq};\nObject.assign.apply.bind(Object.assign, null, [oQ43, { con${'current: true }'}])({ x: 1 })\nit('Q43', oQ43, () => {})`),
+      'apply 被 bind、预绑定的实参数组里是目标').toEqual(['unknown'])
+    expect(concHits(`const oQ42 = ${Zq};\nconst otherQ42 = {}\nObject.assign.apply.bind(Object.assign, null, [otherQ42, { con${'current: true }'}])({ x: 1 })\nit('Q42', oQ42, () => {})`),
+      'apply 被 bind、预绑定的实参数组里是别的对象 → 不算写入').toEqual([])
 
     // 展开的实参：`Object.assign(...[o, {…}])` 的展开元素里含目标 —— 目标位置看不出来，按写过（unknown）。
     // 展开的实参里有没有目标都看不出来（展开数组是变量 / 字面量同理）—— 一律按写过。

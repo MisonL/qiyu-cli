@@ -442,7 +442,13 @@ const THROW_ERROR: Rule = {
       // 结果被丢弃，真正抛的是 `clean`。只排除这一种最明确的丢弃形态（直接作为语句表达式的
       // `new`）；`return new Error(…)` / `throw new Error(…)` / 条件与逗号里的 `new` 都是「交出值」，
       // 照常往下判。
-      if (n.parent !== undefined && ts.isExpressionStatement(n.parent) && n.parent.expression === n) return
+      // ⚠️ 先剥括号 / 断言包装再判（CR 第三十四轮 minor：`(new Error('**debug**'))` 的父节点是
+      // ParenthesizedExpression，只看一层会把丢弃掉的报进去）
+      let discarded: ts.Node = n
+      while (discarded.parent !== undefined && (ts.isParenthesizedExpression(discarded.parent)
+        || ts.isAsExpression(discarded.parent) || ts.isNonNullExpression(discarded.parent)
+        || ts.isTypeAssertionExpression(discarded.parent) || ts.isSatisfiesExpression(discarded.parent))) discarded = discarded.parent
+      if (discarded.parent !== undefined && ts.isExpressionStatement(discarded.parent) && discarded.parent.expression === discarded) return
       let up: ts.Node = n
       let blocked = false
       while (up.parent !== undefined && !ts.isThrowStatement(up.parent)) {
@@ -604,6 +610,8 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw ((() => new Error('**断言包装**')) as () => Error)()",
       // 反例：函数体里先丢弃一个 `new Error('**debug**')`（表达式语句），真正抛的是 `clean`
       "throw (() => { new Error('**被丢弃**'); return new Error('clean') })()",
+      // 括号包装的丢弃同样不算（CR 第三十四轮 minor）
+      "throw (() => { (new Error('**括号包裹被丢弃**')); return new Error('clean') })()",
       "throw ((() => new Error('**非空断言**'))!)()",
       "throw (<() => Error>(() => new Error('**尖括号断言**')))()",
       "throw (() => new Error('**call 立即执行**')).call(null)",
@@ -695,7 +703,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       ['**未抛出**', false], ['**未实例化的类字段**', false], ['**只调外层FN**', false], ['**只调外层A**', false],
       ['**只调外层B**', false], ['**getter 只读**', false], ['**展开里的方法**', false], ['**展开里的箭头**', false],
       ['**展开里的函数表达式**', false], ['**属性箭头未调用**', false], ['**方法引用**', false], ['**unused**', false],
-      ['**call 链内层**', false], ['**被丢弃**', false],
+      ['**call 链内层**', false], ['**被丢弃**', false], ['**括号包裹被丢弃**', false],
       ['const e = new Error', false],
     ]
     const _bad = _keys.map(([k, want]) => [k, _byKey(k), want, _set.has(_byKey(k))] as const)

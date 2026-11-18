@@ -568,6 +568,90 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('外部语句的错误先交回、所有者随后才提交 → 同样不得 COMMIT 冒充成功（CR 第三十四轮 major）', { timeout: 90_000 }, async () => {
+    // 与上一条是**互补时序**：上一条外部拒绝扣到所有者提交之后（在途计数拦得住），这一条外部
+    // 拒绝**在所有者提交之前就已交回** —— 提交那一刻 `foreignInFlight` 已归零，只有执行期
+    // 落下的 `brokenTx` 记号能拦住。两条合起来才钉住「在途计数 + 每令牌记号」这一对判据
+    // （变异实测：删掉 `brokenTx.set` 时只有本用例变红）。
+    const real = await import('@duckdb/node-api')
+    const events: string[] = []
+    let release!: () => void
+    let gate: Promise<void> | undefined
+    let holdNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as {
+                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
+                closeSync?: () => void
+              }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!holdNext || !sql.includes('bad_cast_q34')) return cc.runAndReadAll(sql, params)
+                  holdNext = false
+                  gate = new Promise<void>((r) => { release = r })
+                  // 语句先执行完（事务此刻已被污掉），错误扣在闸门上，等测试放行后**交给调用方**。
+                  const outcome = cc.runAndReadAll(sql, params).then(() => 'ok', (e: unknown) => e)
+                  await outcome
+                  events.push('external-executed')
+                  await gate
+                  events.push('external-releasing')
+                  const res = await outcome
+                  events.push('external-settled')
+                  if (res !== 'ok') throw res
+                  return res
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const orig = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
+    await orig.call(s, "CREATE VIEW bad_cast_q34 AS SELECT CAST('x' AS INT) AS v")
+    holdNext = true
+    const outside = s.query('SELECT * FROM bad_cast_q34').then(() => 'ok', (e: unknown) => e)
+    for (let i = 0; i < 200 && gate === undefined; i++) await new Promise((r) => setImmediate(r))
+    expect(gate, '前提：外部语句确实停在下发之前的窗口里').toBeDefined()
+    // 所有者回调在提交前**等外部错误真的交回**：测试先放行闸门、再接住外部结果，最后才放它走。
+    let began!: () => void
+    const beganP = new Promise<void>((r) => { began = r })
+    let externalDelivered!: () => void
+    const deliveredP = new Promise<void>((r) => { externalDelivered = r })
+    const tx = s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+      began()
+      events.push('began')
+      await deliveredP
+    })
+    await beganP
+    release()
+    expect(await outside, '外部语句被拒').toMatchObject({ kind: 'internal' })
+    events.push('external-delivered')
+    externalDelivered()
+    // 此刻 `foreignInFlight` 已归零：只剩执行期记号 `brokenTx` 能拦住提交。
+    const txErr = await tx.then(() => null, (e: unknown) => e)
+    events.push('tx-settled')
+    expect(events.indexOf('external-delivered'), '外部错误在事务落定之前已交回').toBeLessThan(events.indexOf('tx-settled'))
+    expect(txErr, '所有者不得拿到提交成功').not.toBeNull()
+    expect((txErr as Error).message, '成因要点名未提交与整体回滚').toMatch(/事务未提交.*已整体回滚/)
+    expect(await s.count('tags'), '事务内的写入不得残留（整体回滚）').toBe(1)
+    await s.close()
+  })
+
   it('语句下发期间另一条链开启事务（语句本身成功）→ 同样被拒（CodeRabbit PR#81 第二十八轮 major）', async () => {
     // 成功路径与失败路径共用同一个判据（`txEpoch`）：这条语句若落进别人的事务，它的成功
     // 只说明"在本事务里执行成功"，仍会随对方回滚而消失，或把对方的事务一起带下车 ——

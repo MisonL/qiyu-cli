@@ -47,6 +47,21 @@
 
 ### 修复
 
+- **静态守卫 / duckdb：第三十四轮（CR 2 major + 2 minor + Codex 探针 3 条）**（2026-11-18，逐条探针/变异复现）：
+  `duckdb`：在途计数之外补**每事务令牌的记号** `brokenTx` —— 外部语句的错误若**先于所有者提交**交回，
+  计数已归零、只有执行期落下的记号拦得住（新用例「外部语句的错误先交回、所有者随后才提交」；变异删掉
+  `brokenTx.set` 后该用例变红，`expected null not to be null` —— 即 COMMIT 冒充成功）。原两条竞态用例在
+  该时序下与计数判据重合，属于**等效覆盖**，如实记录。
+  静态守卫：① `bind` 结果被调用时**本次调用的实参**里的展开同样不可知（`Object.assign.bind(null)(...[…])`）·
+  ② `plaintext-channels` 的「`new Error` 被丢弃」判据先剥括号 / 断言包装（`(new Error(…))` 作表达式语句
+  同样不算抛出；变异撤掉剥离后该样本与行级自检一起变红）· 静态守卫的括号 / 逗号包裹的调用方式不再崩溃：
+  `(0, Object.assign.call)(…)` 旧实现读 `.expression` 得到 `undefined`、`unwrap` 抛 TypeError，
+  **出现在任何被扫文件里都会让整个测试文件崩溃**；现统一经
+  `calleeValue()` 剥逗号与包装后再读尾段 / 宿主（`tailOf` / `callForm` / `hostOf` 同一口径）·
+  ③ `call` / `apply` 本身被 bind 时的实参序列（`Object.assign.call.bind(Object.assign, null, o)({…})`、
+  `Object.assign.apply.bind(Object.assign, null, [o, …])()`，Node 实测均真写入）：bind 实参 0 是被绑定函数
+  的 thisArg、实参 1 是内层 `.call` 的 thisArg，两者都要去掉；反例钉住位置（`call.bind(…, o, other)` 写的是
+  `other`）。变异 M1–M4（不剥逗号 / bind 丢层 / apply 取下标 0 / 方法链不传导）逐一实测变红。
 - **静态守卫：第三十二轮（CR 5 条 + Codex 5 条 P2）**（2026-11-18，逐条自检/探针复现）：
   写入判据的 `bind` 语义收敛 —— ① `bind` 那句**只创建**绑定函数时不是写入（`const f = Object.assign.bind(null, o)`，
   含展开实参形态），但**结果被立即调用**时按运行时实参判（`Object.assign['assign']['bind'](null)(o, …)`）；
