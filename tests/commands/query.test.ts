@@ -861,7 +861,11 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(String(e.hint), '不得再引导向 store init（对非 DuckDB 文件是死路）').not.toContain('store init')
   })
 
-  it('文件已损坏（截断 / 页校验和不对）→ 同一份「已损坏」hint，且不把损坏说成「不是 DuckDB 文件」', { timeout: 60_000 }, async () => {
+  it('文件已损坏（截断 / 页校验和不对）→ 同一份「已损坏」hint，且不把损坏说成「不是 DuckDB 文件」', { timeout: 180_000 }, async () => {
+    // ⚠️ 预算 180s（原 60s）与 store.test.ts 同因：`makeCorruptDb` 每种损坏都要 spawn
+    // 一个新 node 进程建真库（本进程建库会命中实例缓存、损坏不可见），新进程各付一次
+    // 原生绑定冷启动（高负载实测 10–34s/次），本用例循环两种损坏。60s 会假红成
+    // 「损坏成因归错了」；判据（kind/hint 逐字）本身不变。
     // 2026-11-05：损坏是第三种成因 —— 此前落进 sandbox 的兜底「请确认文件存在且由本 CLI
     // 创建（store init）」，而对损坏文件原地跑 store init 同样打不开。
     const { makeCorruptDb } = await import('../fixtures/corrupt-db.js')

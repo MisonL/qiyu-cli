@@ -16,7 +16,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   describeShape, describeNonJson, summarize, assertSampleable, readCreds,
-  READ_ONLY_IDS, WRITE_EFFECT_IDS,
+  READ_ONLY_IDS,
 } from '../../scripts/registry/sample.mjs'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -177,25 +177,29 @@ describe('assertSampleable —— 拒采样写接口，判据取自注册表', (
     expect(() => assertSampleable(spec(), 'some.callable.not.reviewed')).toThrow(/未经确认只读/)
   })
 
-  it('robot.session.chat 被拒（有写行为），且**注册表 note 是这条判断的依据**', () => {
-    // ⚠️ 黑名单成员必须能在注册表 note 里找到依据 —— 否则「凭印象塞进黑名单」会在
-    // 注册表早已改写后仍生效，误导下一个维护者。这条同时钉住两边。
-    expect(() => assertSampleable(spec(), 'robot.session.chat')).toThrow(/写行为/)
-    expect(String(byId['robot.session.chat']?.note ?? ''), 'note 必须点明会建会话')
+  it('robot.session.chat 被拒（dangerous:true），且**注册表 note 是这条判断的依据**', () => {
+    // ⚠️ 2026-11-19 改判：这条此前断言「被写行为黑名单拒绝」。黑名单已删 ——
+    // 「会不会写」的唯一事实源是注册表的 `dangerous`（chat 现为 true，由第一道门拦下）。
+    // 这里同时钉住**注册表这一侧的事实**：note 必须点明它会自动建会话，
+    // 否则下一个维护者看到 `dangerous:true` 会以为标错了、顺手改回去。
+    // ⚠️ 必须传**真实注册表记录**而不是 `spec()` 合成体：合成体恒为 `dangerous:false`，
+    // 那条路径只会走到白名单分支（实测：用 `spec()` 时拿到的是「未经确认只读」）。
+    const real = byId['robot.session.chat']
+    expect(() => assertSampleable(real, 'robot.session.chat')).toThrow(/危险写接口/)
+    expect(real?.dangerous, 'chat 会写（自动建会话），必须 dangerous:true').toBe(true)
+    expect(String(real?.note ?? ''), 'note 必须点明会建会话')
       .toMatch(/自动创建|创建真实会话/)
   })
 
-  it('两个名单的成员都真实存在于注册表，且黑名单不在白名单里 —— 否则名单静默失效', () => {
+  it('只读白名单的成员都真实存在于注册表、可调用、且非危险 —— 否则名单静默失效', () => {
     // 名单里一个拼错的 id 永远不生效，也不会有任何症状 —— 正是本仓库反复打的形态。
-    for (const id of [...READ_ONLY_IDS, ...WRITE_EFFECT_IDS]) {
+    for (const id of READ_ONLY_IDS) {
       const s = byId[id]
       expect(s, `名单成员 ${id} 不在注册表里`).toBeDefined()
-      expect(s.dangerous, `${id} 是 dangerous:true —— 它已被前一道门拦下，不该进这两个名单`)
+      expect(s.dangerous, `${id} 是 dangerous:true —— 它已被第一道门拦下，不该进白名单`)
         .toBe(false)
       expect(s.callable, `${id} 不可调用 —— 它根本到不了采样`).toBe(true)
     }
-    const overlap = [...READ_ONLY_IDS].filter((id) => WRITE_EFFECT_IDS.has(id))
-    expect(overlap, '同一个接口不能既在只读白名单又在写行为名单里').toEqual([])
   })
 
   it('白名单覆盖了全部 2026-10-30 采过的 20 个接口里的只读成员 —— 少一个就意味着下次采不了', () => {

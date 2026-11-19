@@ -242,9 +242,10 @@ describe('api list', () => {
   it('每条记录带 verified，且 meta 解释了它的含义', async () => {
     // ⚠️ `verified` 若只输出不解释，就是一个"声明了但没人读"的字段：
     // Agent 会看到 true/false 却不知道差别，于是把"注册了"当成"验证过了"。
-    // 当前 154 条注册表中，callable && !dangerous && verified 的接口共有 51 条
+    // 当前 154 条注册表中，callable && !dangerous && verified 的接口共有 50 条
     // （2026-10-30 实测收口：20 个只读接口里 8 个走通了成功路径；
-    // 2026-11-04 `icoutcall.history.team` 因路径修正、无成功样本而降为未实测）。
+    // 2026-11-04 `icoutcall.history.team` 因路径修正、无成功样本而降为未实测；
+    // 2026-11-19 `robot.session.chat` 改判为 dangerous:true，故从 51 降到 50）。
     await apiCommand(['list'])
     expect(rows().length).toBeGreaterThan(0)
     // 默认视图是 callable && outbound，共 136 条，其中 51 条已实测。
@@ -1179,6 +1180,27 @@ describe('api call —— 危险操作门禁', () => {
     vi.unstubAllEnvs()
   })
 
+  it('robot.session.chat 也会被门禁拦下 —— 「非破坏性」不等于「不写」（2026-11-19 改判）', async () => {
+    // ⚠️ 这条守的是一次真实的误分类：该接口在注册表里长期是 `dangerous:false`，
+    // 而它的 note 自己写着「会话不存在时会自动创建真实会话」—— 调用一次就是一次
+    // 生产写入，却没经过 `--yes`。改判后 `dangerous:true`，这里端到端证明门禁真的
+    // 作用于它（只钉注册表数据不够：`api.ts` 传给 `assertConfirmed` 的是同一个字段，
+    // 但只有跑一遍才知道这条接口走得进那个分支 —— 它有 body 参数、必填项校验在门禁之前）。
+    vi.stubEnv('QIYU_APP_KEY', 'k')
+    vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const code = await apiCommand(['call', 'robot.session.chat',
+      '--body', '{"uid":"u1","msg":{"msgType":"text","msgBody":{"content":"x"}}}'])
+    expect(code).toBe(4)
+    expect(fetchSpy, '缺 --yes 时一个请求都不许发').not.toHaveBeenCalled()
+    const e = JSON.parse(out).error
+    expect(e.confirm_required).toBe(true)
+    expect(e.target).toBe('robot.session.chat')
+    vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
+  })
+
   it('不可主动调用的接口被拦下，退出码 2（用法错误）', async () => {
     // 调用方点名了一个不该调的接口 —— 这是用法问题，不是业务失败。
     // 退出码 2 让 Agent 明白"换个接口"而不是"重试"。
@@ -1427,7 +1449,7 @@ describe('api call —— 危险操作门禁', () => {
 
   it('未实测信封的接口：调用时 meta 必须声明 unverified_endpoint（不能只在 api list 里说）', async () => {
     // ⚠️ 本仓库历史上反复出现的形态：声明在 `api list` 里、`api call` 却不读。
-    // 注册表 154 条里 136 条可调用，其中 73 条危险接口有 **72 条** `verified:false`
+    // 注册表 154 条里 136 条可调用，其中 74 条危险接口有 **73 条** `verified:false`
     // —— 只有 `export.session` 实测过。`verified` 的语义是「该接口的信封形状被真实
     // 观测过」，未实测意味着 `not_found` 判定、`data` 语义、错误分类都可能不适用
     // （`envelope.ts` 自己记着 `deleteKnowledges` 那次把「全部删成功」报成 `not_found`）。

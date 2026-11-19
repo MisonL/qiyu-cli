@@ -1155,3 +1155,72 @@ describe('CHANGELOG 声明计数与条目数一致（PR #68 第七轮）', () =>
     expect(noBold.bad).toEqual([expect.stringContaining('声明 4 / 实际 3')])
   })
 })
+
+describe('历史 spec 的陈旧「未实现」声明必须有状态注（2026-11-19 审计）', () => {
+  // 背景：`docs/superpowers/specs/2026-10-10-请求构建与body校验-design.md` 是**最后一份**
+  // 既无状态注、也未被任何测试读取的 spec —— 它的 §三 次序表里还写着
+  // 「`--pretty` → 2（尚未实现）」，而 `--pretty` 自 2026-10-24 就实现了
+  // （实测 `api schema <id> --pretty` 退出 0、输出缩进 JSON）。
+  // 危害是具体的：实施者或 Agent 照这份 spec 办事，会把一个能用的 flag 当成必然报错。
+  //
+  // 判据不锚行号、锚**语义块**：状态注那条引用块必须点名「`--pretty` 已实现」与
+  // 「`auth login` 已实现」两件事 —— 单纯出现「状态注」三个字不算（别的 spec 也有）。
+  const SPEC = 'docs/superpowers/specs/2026-10-10-请求构建与body校验-design.md'
+  /** 取文件开头连续的 `>` 引用块（状态注就贴在那里）。 */
+  function headerQuotes(md: string): string {
+    const out: string[] = []
+    for (const line of md.split('\n')) {
+      if (line.startsWith('>')) out.push(line)
+      else if (out.length > 0) break
+    }
+    return out.join('\n')
+  }
+  /** 陈旧声明本身：允许它保留（原文 + 就地作废标注），但**不得**以未标注的形态出现。 */
+  function stalePrettyClaims(md: string): string[] {
+    return md.split('\n').filter((l) => /--pretty`?\s*→\s*2/.test(l) && !/作废|已实现/.test(l))
+  }
+
+  it('状态注在场，且点名 `--pretty` 与 `auth login` 两处已被推翻的判断', () => {
+    const block = headerQuotes(read(SPEC))
+    expect(block, '文首必须有状态注引用块').toMatch(/状态注/)
+    expect(block, '状态注必须点名 --pretty 已实现（否则陈旧次序表仍会被当真）')
+      .toMatch(/`--pretty` 已于 \*\*2026-10-24\*\* 实现/)
+    expect(block, '状态注必须点名 auth login 已实现（它是「不可修类 2」举例的失效前提）')
+      .toMatch(/`auth login` 已于 \*\*2026-10-25\*\* 实现/)
+    expect(block, '状态注必须给出当前口径（缩写 0 的缩进 JSON），不能只说「已作废」')
+      .toMatch(/`api schema <id> --pretty`[\s\S]{0,40}→ 0/)
+  })
+
+  it('双向自检：事故原文必红、合法形态放过', () => {
+    const good = read(SPEC)
+    expect(stalePrettyClaims(good), '真实文件里的陈旧行必须已带作废标注').toEqual([])
+    // ① 事故原文（2026-11-19 审计时真实存在的那一行）→ 必须被抓住
+    expect(stalePrettyClaims('5. --pretty → 2（尚未实现，同 list/callOne）'))
+      .toHaveLength(1)
+    // ② 只写「已作废」不算数 —— 标注必须与「已实现」同在一行或就近可辨；这里钉住
+    //    带作废标注的合法形态被放过（否则守卫会逼人删掉原文，而原文是历史记录）
+    expect(stalePrettyClaims('5. ~~--pretty → 2（尚未实现）~~ **已作废（2026-10-24）**'))
+      .toEqual([])
+    // ③ 出现 `--pretty → 2` 但是别的命令自己的口径（不是本条）同样按陈旧声明的判据抓 ——
+    //    这条如实记录判据边界：它是**文本**判据，不认识命令上下文；真出现时要么补标注、
+    //    要么改措辞（本仓对「判据按文本表述」的边界一贯如实记录）
+    expect(stalePrettyClaims('`query --table … --pretty` → 2')).toHaveLength(1)
+  })
+
+  it('反向：状态注被删掉时必须变红（不是恒真守卫）', () => {
+    const md = read(SPEC)
+    // 状态注是一整段以 `> **⚠️ 本 spec 是 2026-10-10 的历史记录` 开头的引用块；
+    // 把它连同同一块里的所有 `>` 行一起删掉，才算「状态注被删掉」。
+    const lines = md.split('\n')
+    const blockLine = lines.findIndex((l) => /^>\s*\*\*⚠️ 本 spec 是 2026-10-10 的历史记录/.test(l))
+    expect(blockLine, '前提：状态注首行必须存在').toBeGreaterThan(-1)
+    const end = lines.findIndex((l, i) => i > blockLine && !l.startsWith('>'))
+    const blockEnd = end === -1 ? lines.length : end
+    const strippedLines = lines.filter((_, i) => i < blockLine || i >= blockEnd).join('\n')
+    expect(strippedLines, '前提：删掉后确实找不到状态注内容').not.toMatch(/10-10 的历史记录（2026-11-19 状态注）/)
+    // 用同一判据复查：整块删掉后，剩余引用块不再满足「点名两件事」
+    const block = headerQuotes(strippedLines)
+    expect(/`--pretty` 已于 \*\*2026-10-24\*\* 实现/.test(block)
+      && /`auth login` 已于 \*\*2026-10-25\*\* 实现/.test(block), '删掉状态注后判据必须失败').toBe(false)
+  })
+})

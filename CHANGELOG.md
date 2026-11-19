@@ -14,7 +14,7 @@
 ### 新增
 
 - **`api call` 调用未实测信封的接口时，成功与错误信封都如实声明 `unverified_endpoint: true`**：
-  注册表 154 条里 73 条危险接口有 72 条从未观测过响应信封（`verified:false`、`envelope:null`），
+  注册表 154 条里 74 条危险接口有 73 条从未观测过响应信封（`verified:false`、`envelope:null`），
   但 `verified` 此前**只在 `api list` 输出**、`callOne` 从不读它 —— Agent 不先跑
   `api list --all` 就完全不知道「这次的 `not_found` 判定、`data` 解包与错误分类只是按文档推的」。
   后果不是抽象的：200 响应里没有载荷键时，信封未实测的接口不判 `not_found` ——
@@ -40,6 +40,9 @@
 
 ### 文档
 
+- 为 `2026-10-10-请求构建与body校验` spec 补历史状态注：`--pretty`（2026-10-24）与 `auth login`
+  （2026-10-25）均已实现，文中相关「尚未实现」的判断作废。`tests/docs.test.ts` 新增守卫，
+  陈旧声明再出现即失败。
 - **README 可读性重构**：`## 当前状态` 只讲交付情况（skill 图例 / body 校验 / 输出格式 /
   `api list` 形态搬进 `## 输出契约`）；`status` / `range_status` 两张表的长说明移到表下；
   `## 配置凭证` 拆成四节并把权限规则重写成「一条判据 + 三档成因表 + 例外」。事实与守卫短语
@@ -47,6 +50,22 @@
 
 ### 修复
 
+- **`robot.session.chat` 改判 `dangerous:true`，`--yes` 门禁生效**（2026-11-19）：
+  该接口会自动创建真实会话（写），此前误标为 `dangerous:false`，生产写入会被门禁放行。
+  `specs.json` 与 `overrides/attrs.json` 同步改判，并删除采样器中随之变空的 `WRITE_EFFECT_IDS`
+  黑名单（「会不会写」的唯一事实源是注册表的 `dangerous`）。危险接口计数 74。
+- **静态守卫 / duckdb：第三十九轮（CR 3 major + 2 疑问）**（2026-11-19）：
+  ① **准入失败不得回滚**：`upsert` 在 BEGIN 前被拒时不再发 ROLLBACK（否则会回滚掉别人手开的
+  事务）；只有原生 BEGIN 已发出才进入回滚处理。
+  ② **提交判据数写操作而非在途语句**：新增 `txWrites` 计数，多批次写在两条 INSERT 之间不再有
+  「计数归零 → 提前 COMMIT」的窗口。
+  ③ **原始 `BEGIN`/`COMMIT`/`ROLLBACK` 一律拒收**（`usage`）：托管回调里发 `COMMIT` 不得提前
+  提交本事务。
+  ④ **COMMIT 结果未知时如实报告**：COMMIT 已下发但结果交回失败时，交回「可能已经落库，不要直接
+  重试」并退役连接；`usage`（COMMIT 未下发）照常原样交回。
+  ⑤ **收尾超时先 `interrupt()` 再放弃**：实测 `closeSync()` 不取消原生任务（进程只能被杀）；
+  中断后语句交回、照常 ROLLBACK，仍不交回才退役连接，文案说明「进程可能只能结束」。
+  全部经直连驱动实测与变异验证。
 - **静态守卫 / duckdb：第三十八轮（CR 10 major，其中 2 条为疑问；Codex 40 分钟硬超时但三个探针独立复现其中 3 条）**（2026-11-18，
   逐条导入缝复现 + 变异钉住）：
   `duckdb` 核心判据一句话：**BEGIN 只在连接静默时发出；语句不得活在它所属的事务之外**。
@@ -758,6 +777,11 @@
 
 ### 测试
 
+- **跨进程锁用例不再在高负载下假失败**（2026-11-19）：四份复制的锁夹具合并为
+  `tests/helpers/lock-holder.ts`（`spawnLockHolder` / `lockVerdict` / `seedEmptyDb`），
+  等待子进程就绪写死的 5s 换成贯穿整条用例的截止时刻；持有者执行一条语句后再报告就绪；
+  失败归因区分「锁未生效」与「锁落盘竞态」。
+  超时放宽的用例：`close 后跨进程可立即重开`（15s → 180s）、三处 `makeCorruptDb`（60s → 180s）。
 - **capture 助手的两条结构性边界改由静态守卫关闭**（2026-11-15，Sourcery PR#72 收口）：迁移形态
   （`captureSinks`）的 sink 是模块级变量，并发与 hook 延迟写入这两类形态在机制上无法归属
   （写时刻已换世代）。新增两条全仓扫描：用了 `captureSinks` 的文件**不得**出现

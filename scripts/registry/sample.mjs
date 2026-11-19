@@ -120,9 +120,11 @@ export function summarize(raw) {
 /**
  * 只放行「人工确认过是只读」的接口 —— **白名单，不是黑名单**。
  *
- * ⚠️ **`dangerous: false` 不等于只读**（CodeRabbit 2026-10-30 指出）。注册表里
- * `robot.session.chat` 就是 `dangerous:false`，但其 note 写着「会话不存在时**自动创建
- * 真实会话**」—— 一次成功采样会向生产机器人写入会话数据。
+ * ⚠️ **`dangerous: false` 不等于只读**（CodeRabbit 2026-10-30 指出）。这条不是假想：
+ * `robot.session.chat` 曾经就是 `dangerous:false` 而 note 写着「会话不存在时**自动创建
+ * 真实会话**」—— 一次成功采样会向生产机器人写入会话数据。2026-11-19 已把它的
+ * `dangerous` 改判为 `true`（见该条 note），但那次误分类正是白名单存在的理由：
+ * **注册表的 `dangerous` 可能标错，采样器不能只信它**。
  *
  * ⚠️ 为什么是白名单而不是「排除已知会写的」：排除法**默认放行**，下一个
  * `dangerous:false` 但会写数据的接口（注册表还会继续长）不需要任何人做决定就能被采样；
@@ -144,24 +146,17 @@ export const READ_ONLY_IDS = new Set([
   'icoutcall.dialogFlow.getDialogFlowList', 'icoutcall.get.customer',
   'icoutcall.get.jobdetail', 'icoutcall.get.jobproperties', 'icoutcall.phone.getLineList',
 ])
-/**
- * 明确**不采**的接口：`dangerous:false` 但有写行为。列在这里是为了让下一个人看到
- * 「为什么这个明显可调用的接口没在白名单里」—— 否则它看起来像漏登记。
- * ⚠️ 名单成员必须能在注册表 note 里找到依据（测试钉住），防止「凭印象塞进黑名单、
- * 而注册表早已把它标成别的」的漂移。
- */
-export const WRITE_EFFECT_IDS = new Set([
-  'robot.session.chat',   // note：会话不存在时自动创建真实会话
-])
 
 export function assertSampleable(spec, id) {
   if (!spec) throw new Error(`用例里的 id 不在注册表里：${id}`)
   if (spec.dangerous) throw new Error(`拒绝采样危险写接口：${id}（dangerous:true）—— 采样不得改动生产数据`)
   if (!spec.callable) throw new Error(`拒绝采样不可主动调用的接口：${id}（callable:false，path 是占位符）`)
   if (spec.path === null) throw new Error(`拒绝采样没有可用 path 的接口：${id}`)
-  if (WRITE_EFFECT_IDS.has(id)) {
-    throw new Error(`拒绝采样有写行为的接口：${id}（注册表 note 注明会改动生产数据）—— 采样只允许只读`)
-  }
+  // ⚠️ 这里曾有一份 `WRITE_EFFECT_IDS` 黑名单（唯一成员是 `robot.session.chat`）。
+  // 2026-11-19 它改判为 `dangerous:true` 后，该条已由上一行拦下 —— 黑名单成了
+  // 一个空集，且它「含 dangerous:true 成员」会与自身文档打架（假话）。删掉它：
+  // 「会不会写」这个判断的唯一事实源必须是注册表的 `dangerous`，采样器不该有第二份
+  // 容易漂移的副本；默认拒绝的白名单已经兜住「注册表标错」的情形（chat 那次就是）。
   if (!READ_ONLY_IDS.has(id)) {
     throw new Error(
       `拒绝采样未经确认只读的接口：${id} —— dangerous:false 不代表只读。` +

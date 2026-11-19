@@ -9,6 +9,7 @@ import { storeCommand } from '../../src/commands/store.js'
 import { dbCommand } from '../../src/commands/db.js'
 import { syncCommand } from '../../src/commands/sync.js'
 import { TABLES } from '../../src/store/schema.js'
+import { spawnLockHolder, lockVerdict, LOCK_BUDGET_MS } from '../helpers/lock-holder.js'
 
 let dir = '', out = '', err = ''
 const dbPath = (): string => join(dir, 'q.db')
@@ -621,7 +622,11 @@ describe('store 命令面与 help', () => {
     expect(readFileSync(p).equals(before)).toBe(true)
   })
 
-  it('--db 指向已损坏的库（截断 / 页校验和不对）→ 1 + store_not_initialized + 「先备份再重建」hint，不进 internal 兜底', { timeout: 60_000 }, async () => {
+  // ⚠️ 预算 180s（原 60s）：`makeCorruptDb` 每种损坏都要 spawn 一个**新 node 进程**建真库
+  // （本进程建库会命中实例缓存，损坏不可见），而新进程不吃 setup-warm 的预热，各付一次
+  // 原生绑定冷启动 —— 高负载实测 10–34s/次，本用例循环两种损坏即两次。60s 在负载高时
+  // 会把「机器忙」报成「损坏成因归错了」。判据本身（kind/hint 逐字）不受影响。
+  it('--db 指向已损坏的库（截断 / 页校验和不对）→ 1 + store_not_initialized + 「先备份再重建」hint，不进 internal 兜底', { timeout: 180_000 }, async () => {
     // 2026-11-05 审查修：两类损坏报文（`Could not read enough bytes…` / `Corrupt database
     // file: computed checksum…`）此前既不匹配权限也不匹配「非 DuckDB 文件」，落进 internal
     // 兜底 —— hint 是「请用 qiyu store status 检查数据库状态」，拿自己查自己。
@@ -671,7 +676,7 @@ describe('store 命令面与 help', () => {
     expect(e.message).toContain(p)
   })
 
-  it('写者撞锁不重试 → 立即抛 store_locked（跨进程持真锁，spec §5.2）', { timeout: 120_000 }, async () => {
+  it('写者撞锁不重试 → 立即抛 store_locked（跨进程持真锁，spec §5.2）', { timeout: LOCK_BUDGET_MS + 60_000 }, async () => {
     // ⚠️ 锁只在跨进程成立（第四轮实测：同进程双开不撞锁）——spawn 子进程持锁，
     // storeCommand 的写者（init 用 rw 模式）打开 → 立即失败、不走退避。
     // status 是 ro 会真退避 30s，不能在本测试用。
@@ -679,64 +684,40 @@ describe('store 命令面与 help', () => {
     // ① @duckdb/node-api 有**进程内实例缓存** —— 测试进程打开过的库再开一律
     //    命中缓存、绕过文件锁（因此不做「先 init 建库」，holder 直接对全新路径
     //    持锁，DuckDBInstance.create 会建文件）；
-    // ② 子进程打印 'locked' 时锁可能尚未真正落盘（探针 12 次中 1 次）——打印
-    //    信号不可信，需要独立子进程校验锁已生效；
+    // ② 持有者先跑一条语句再打标记（语句成功即证明写事务已取得、锁已落盘；实测
+    //    20/20 CONFLICT），再用独立子进程校验锁已生效（绕开进程内实例缓存）；
     // ③ 极少数情况下校验 CONFLICT 后写者仍能打开（锁落盘竞态窗口）——按轮
     //    重试：每轮换全新路径，直到「校验 CONFLICT 且 init 返回 1」，最多 5 轮。
-    //    锁生效是平台保证的行为（T5 duckdb.test.ts 同款用例也间歇红），重试只
-    //    对冲竞态窗口，不改变被测语义。
-    const { spawn } = await import('node:child_process')
-    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
-    const spawnHolder = async (dbPath: string) => {
-      const child = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(async ({ DuckDBInstance }) => {
-          const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
-          console.log('locked')
-          setInterval(() => {}, 1 << 30)
-          await new Promise(() => {})
-        })`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let o = ''
-      child.stdout?.on('data', (d) => { o += String(d) })
-      const ok = await new Promise<boolean>((resolve) => {
-        const iv = setInterval(() => { if (o.includes('locked')) { clearInterval(iv); resolve(true) } }, 100)
-        setTimeout(() => { clearInterval(iv); resolve(false) }, 5000)
-      })
-      if (!ok) { child.kill('SIGKILL'); throw new Error(`锁持有者未能启动：${o.slice(0, 200)}`) }
-      return child
-    }
-    // 独立子进程校验锁（绕开进程内实例缓存）：
-    const lockVerdict = async (dbPath: string): Promise<string> => {
-      const chk = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(({ DuckDBInstance }) =>
-          DuckDBInstance.create(${JSON.stringify(dbPath)}))
-          .then(() => console.log('OPENED'))
-          .catch(() => console.log('CONFLICT'))`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let co = ''
-      chk.stdout?.on('data', (d) => { co += String(d) })
-      return await new Promise<string>((resolve) => {
-        chk.on('close', () => resolve(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
-        setTimeout(() => { chk.kill('SIGKILL'); resolve('TIMEOUT') }, 10000)
-      })
-    }
+    //    锁生效是平台保证的行为，重试只对冲竞态窗口，不改变被测语义。
+    // ⚠️ 超时预算与 duckdb.test.ts 撞锁用例同因：每轮两个子进程各付一次原生绑定
+    //    冷启动（本机高负载实测 10–34s）；等待统管在 helpers 的单一截止时刻上。
+    const deadline = Date.now() + LOCK_BUDGET_MS
     let holder: import('node:child_process').ChildProcess | undefined
     try {
       let asserted = false
+      let roundsRun = 0
+      let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
+        roundsRun = round + 1
         const p = dbPath()   // 每轮换全新路径（避开本进程实例缓存）
         if (holder) holder.kill('SIGKILL')
-        holder = await spawnHolder(p)
-        if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `w-holder-${round}`, deadline })
+        if (await lockVerdict(p, dir, deadline) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        lockConfirmed++
         out = ''; err = ''
-        const t0 = Date.now()
+        const started = Date.now()
         const rc = await storeCommand(['init', '--db', p])
         if (rc !== 1) continue   // 锁竞态窗口（CONFLICT 后仍打开），换轮重来
         const e = JSON.parse(out).error
         expect(e.kind).toBe('store_locked')
         expect(e.retryable).toBe(true)
-        expect(Date.now() - t0).toBeLessThan(5000)   // 未走满 30s 退避（写者不重试）
+        // ⚠️ 判据是「没走满读者那条 30s 退避」，不是某个魔法值：写者不重试。探测到的
+        // open 耗时（进程内已预热）通常几十毫秒，这里只把「几乎肯定走了退避」挡出去。
+        expect(Date.now() - started, '写者不得重试（撞锁应立返，30s 退避是读者那条）').toBeLessThan(30_000)
         asserted = true
       }
-      expect(asserted, '5 轮内未取得「锁生效且 init 撞锁返回 1」——锁落盘竞态超预期').toBe(true)
+      expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— 锁未生效（夹具或平台行为变了），不是竞态窗口').toBeGreaterThan(0)
+      expect(asserted, `未取得「锁生效且 init 撞锁返回 1」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
       holder?.kill('SIGKILL')
     }

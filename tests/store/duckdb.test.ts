@@ -7,6 +7,7 @@ import { createDuckDbStore } from '../../src/store/duckdb.js'
 import type { DuckDbDeps } from '../../src/store/duckdb.js'
 import { TABLES } from '../../src/store/schema.js'
 import type { Store, StoreConfig, QueryResult } from '../../src/store/types.js'
+import { spawnLockHolder, lockVerdict, seedEmptyDb, LOCK_BUDGET_MS } from '../helpers/lock-holder.js'
 
 // L1 对冲：本文件全部用例走真库（DuckDB 冷启动偶发 >5s），统一放宽到 15s。
 vi.setConfig({ testTimeout: 15_000 })
@@ -511,7 +512,8 @@ describe('duckdb —— 事务', () => {
       void t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }]).catch(() => {})
     }).then(() => null, (e: unknown) => e)
     expect(err, '未 await 的写不得被当成已提交').not.toBeNull()
-    expect((err as Error).message, '成因要点名未交回的语句').toMatch(/没有交回结果/)
+    // 成因要点名「本事务还有写操作没完成」，而不是笼统的「语句没交回结果」
+    expect((err as Error).message, '成因要点名本事务未完成的写操作').toMatch(/写操作没有完成/)
     expect(await s.count('tags'), '该事务的写入不得残留').toBe(1)
     // 串行的正常用法不受影响
     await s.transaction(async (t) => { await t.upsert('tags', [{ id: '3', name: 'C', color: '#FFF' }]) })
@@ -739,25 +741,28 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
-  it('不支持路径上的第二条 BEGIN 不会发出（评审建议的核心诉求），且手开事务的失败形态是响亮的', async () => {
-    // 背景（CodeRabbit PR#81 第八轮 major 的实测裁定）：手开事务存在时，`transaction()` /
-    // `upsert` 的 BEGIN 会被 DuckDB 拒绝，**且它已把那条事务标记为 aborted** —— 不管我们
-    // 之后发不发 ROLLBACK，那条事务的数据都保不住。实测两种收尾：
-    //   · 发 ROLLBACK（本实现）：连接恢复干净；调用方随后的 COMMIT 报 `no transaction is
-    //     active`（**响亮**）；
-    //   · 不发：COMMIT 返回成功，但写入被静默丢弃（行数归零、无报错）—— 更糟。
-    // 所以收了 major 的**真正诉求**：不让第二条 BEGIN 在支持路径上出现（自动事务登记归属），
-    // 拒绝了它的收尾方案。本用例钉住两点：① 并发显式事务在入口被拒（不发 BEGIN）；
-    // ② 手开事务被撞时的失败是响亮的（COMMIT 报错），而不是静默丢数据。
-    const s = await fresh() as unknown as Store & { execSql: (q: string, p?: unknown[]) => Promise<unknown> }
-    await s.execSql('BEGIN')
-    await s.execSql(`INSERT INTO "tags" VALUES ('9', 'locked', '#000000')`)
-    await expect(s.transaction(async () => { /* 不该进来 */ })).rejects.toThrow(/within a transaction/)
-    await expect(s.execSql('COMMIT'), '被撞的手开事务必须**响亮**失败，而不是 COMMIT 成功却丢了行')
-      .rejects.toThrow(/no transaction is active/)
-    // 登记已复位、连接可用
-    await s.upsert('tags', [{ id: '7', name: 'Y', color: '#222222' }])
-    expect((await s.query('SELECT id FROM tags ORDER BY id')).rows.map((r) => String(r.id))).toEqual(['7'])
+  it('原始事务控制一律拒绝；托管回调里发 COMMIT 被挡在派发前，回调抛错仍整体回滚（CR 第三十九轮 major #4）', async () => {
+    // CR 第三十九轮的疑问：托管回调可以捕获 `store` 并发 `s.query('COMMIT')` —— 它通过归属检查，
+    // 把回调里的写入提前提交；回调随后抛错也回滚不了（「报失败、数据却落库」）。
+    // 判据：事务控制只能由 Store 自己发出；`query` / 原始 SQL 的 BEGIN / COMMIT / ROLLBACK
+    // 一律在**派发前**拒绝（usage）。
+    const s = await fresh()
+    const sAny = s as unknown as { execSql: (q: string, p?: unknown[]) => Promise<unknown> }
+    await expect(s.query('BEGIN')).rejects.toMatchObject({ kind: 'usage' })
+    await expect(s.query('COMMIT')).rejects.toMatchObject({ kind: 'usage' })
+    await expect(sAny.execSql('ROLLBACK')).rejects.toMatchObject({ kind: 'usage' })
+    // 托管回调里的原始 COMMIT：拒绝发生在派发前，回调自己的错误照常整体回滚
+    const err = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '9', name: 'X', color: '#FFF' }])
+      await expect(s.query('COMMIT')).rejects.toMatchObject({ kind: 'usage' })
+      throw new Error('boom')
+    }).then(() => null, (e: unknown) => e)
+    expect(err, '回调自己的错误原样透传').toBeInstanceOf(Error)
+    expect((err as Error).message).toBe('boom')
+    expect(await s.count('tags'), '写入必须随回调失败整体回滚').toBe(0)
+    // 托管事务本身照常可用
+    await s.transaction(async (t) => { await t.upsert('tags', [{ id: '7', name: 'Y', color: '#222222' }]) })
+    expect(await s.count('tags')).toBe(1)
     await s.close()
   })
 
@@ -1066,7 +1071,8 @@ describe('duckdb —— 事务', () => {
     releaseDeliver()
     const txErr = await tx
     expect(txErr, '未 await 的写不得被当成已提交').not.toBeNull()
-    expect((txErr as Error).message, '成因要点名未交回的语句').toMatch(/没有交回结果/)
+    // 这条写跨了多个批次，提交判据必须按「本事务的写操作」计数，而不是看某一刻的在途语句
+    expect((txErr as Error).message, '成因要点名本事务未完成的写操作').toMatch(/写操作没有完成/)
     expect(events, '那条写只允许出现一次（不得在回滚后补发）').toEqual(
       ['insert-dispatched', 'insert-executed', 'insert-returned', 'rollback-dispatched'])
     for (const deadline = Date.now() + 10_000; writeOutcome === 'pending' && Date.now() < deadline;) {
@@ -1177,7 +1183,7 @@ describe('duckdb —— 事务', () => {
       await new Promise((r) => setTimeout(r, 10))
     }
     expect(txErr, '未 await 的删除不得被当成已随事务回滚').not.toBeNull()
-    expect((txErr as Error).message).toMatch(/没有交回结果/)
+    expect((txErr as Error).message, '成因要点名本事务未完成的写操作').toMatch(/写操作没有完成/)
     expect(delOutcome, '在已结束事务里恢复的 delete 必须被拒（internal），'
       + '不能把 DELETE 发到 autocommit 里').toMatchObject({ kind: 'internal' })
     expect(events, '回滚之后那条 DELETE 不得再发出').not.toContain('delete-dispatched')
@@ -1621,6 +1627,315 @@ describe('duckdb —— 事务', () => {
     expect((after as Error).message).toMatch(/退役|无法确认/)
     await s.close()
   })
+
+  it('写操作未完成导致 upsert 准入失败 → 不得为此发 ROLLBACK（CR 第三十九轮 major）', { timeout: 90_000 }, async () => {
+    // CR 第三十九轮 #1：准入在 upsert 拿到事务、发出 BEGIN **之前**就拒绝了；旧实现仍进入
+    // 回滚处理，把 ROLLBACK 发到一条**忙着的**连接上 —— 若连接上已有手开事务，那条 ROLLBACK
+    // 会把别人的写入一起回滚掉，而且拒绝被拖到驱动回应之后。只有 BEGIN 尝试过才允许回滚。
+    const real = await import('@duckdb/node-api')
+    const sqls: string[] = []
+    let releaseExecute!: () => void
+    let executeGate: Promise<void> | undefined
+    let holdNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  sqls.push(sql)
+                  if (!holdNext || !sql.includes('q39_hold')) return cc.runAndReadAll(sql, params)
+                  holdNext = false
+                  executeGate = new Promise<void>((r) => { releaseExecute = r })
+                  await executeGate
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    sqls.length = 0
+    holdNext = true
+    const outside = s.query('SELECT 42 AS q39_hold').then((r) => ({ r }), (e: unknown) => ({ err: e as Error }))
+    for (const deadline = Date.now() + 10_000; executeGate === undefined && Date.now() < deadline;) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(executeGate, '前提：外部语句已下发、停在执行闸门上').toBeDefined()
+    const upErr = await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      .then(() => null, (e: unknown) => e as Error)
+    expect(upErr, '准入失败必须 internal').toMatchObject({ kind: 'internal' })
+    expect(sqls.filter((q) => /^\s*ROLLBACK\b/i.test(q)), '还没碰过 BEGIN，一条 ROLLBACK 都不许发').toEqual([])
+    releaseExecute()
+    expect(await outside, '外部语句自己的结果原样交回').toHaveProperty('r')
+    // 写操作照常可用
+    await s.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+    expect(await s.count('tags'), '第一次 upsert 从未开始，只有第二行').toBe(1)
+    await s.close()
+  })
+
+  it('回调没有 await 的多批次写：整条写操作完成前不得提交（不是只看单条语句）（CR 第三十九轮 major）', { timeout: 90_000 }, async () => {
+    // CR 第三十九轮 #2：多批次写两条语句之间 `txInFlight` 会瞬间归零 —— 回调没 await 它时，
+    // `commitOrRefuse` 可能恰好在「上一批已交回、下一批还没下发」的窗口里看到零并 COMMIT，
+    // 事务报成功、第二批随后被拒（只有部分行落库）。
+    // 导入缝让第一条 INSERT **不落原生**、直接返回：它的交回与下一批的下发分处两个微任务，
+    // 提交判据恰好在窗口里执行（把按语句计数改回按令牌计数即变红）。
+    const real = await import('@duckdb/node-api')
+    let fakeNext = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (fakeNext && sql.startsWith('INSERT INTO "tags"')) {
+                    fakeNext = false
+                    return { getRowObjectsJson: () => [], columnNames: () => [] }
+                  }
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore({ ...cfg, batchSize: 1 }, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '0', name: 'S', color: '#FFF' }])
+    fakeNext = true
+    const txErr = await s.transaction(async (t) => {
+      // 故意不 await：两行分成两批，第一批的交回与第二批的下发分处两个微任务
+      void t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }, { id: '2', name: 'B', color: '#FFF' }])
+        .catch(() => { /* 收尾期被拒 */ })
+    }).then(() => null, (e: unknown) => e as Error)
+    expect(txErr, '未完成的写不得被当成已提交（旧实现这里会是 null）').not.toBeNull()
+    expect((txErr as Error).message, '成因要点名未完成的写操作').toMatch(/写操作没有完成/)
+    expect(await s.count('tags'), '只保留 setup 行：事务整体回滚').toBe(1)
+    await s.close()
+  })
+
+  it('COMMIT 已执行、结果交回失败 → 必须交回「结果未知，可能已落库」并退役连接（CR 第三十九轮疑问实测）', { timeout: 90_000 }, async () => {
+    // CR 第三十九轮的疑问：原生 COMMIT 成功、结果交回失败时，调用方会不会拿到一个可以
+    // 「安全重试」的失败（而写入其实已在库里）？答案：交回结果未知的专用错误，并退役连接；
+    // 新连接核对能看到那行 —— 警告里的「可能已经落库」是事实，不是保守话术。
+    const real = await import('@duckdb/node-api')
+    let failCommit = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  const out = await cc.runAndReadAll(sql, params)
+                  if (sql === 'COMMIT' && failCommit) {
+                    failCommit = false
+                    throw new Error('注入：COMMIT 结果交回时被拒绝')
+                  }
+                  return out
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    failCommit = true
+    const txErr = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    }).then(() => null, (e: unknown) => e as Error)
+    expect(txErr, '提交结果未知必须作为失败交回').not.toBeNull()
+    expect((txErr as Error).message, '必须点明「结果未知、可能已落库」').toMatch(/提交结果未知.*可能已经落库/)
+    expect((txErr as Error).message, '必须劝阻直接重试').toMatch(/不要按失败直接重试/)
+    const after = await s.count('tags').then(() => null, (e: unknown) => e as Error)
+    expect(after, '结果未知后不得继续使用同一连接').toMatchObject({ kind: 'internal' })
+    expect((after as Error).message).toMatch(/退役|无法确认/)
+    await s.close()
+    const s2 = await createDuckDbStore(cfg, 'rw')
+    expect(await s2.count('tags'), '写入确实已经落库 —— 警告不是话术').toBe(1)
+    await s2.close()
+  })
+
+  it('收尾等不到在途语句 → 先中断再等，交回后照常 ROLLBACK（CR 第三十九轮 major：关闭不解卡）', { timeout: 90_000 }, async () => {
+    // CR 第三十九轮的疑问：drainOwned 超时后让调用方「关闭并重建」安不安全？直连驱动实测
+    // （2026-11-19）：**不安全** —— closeSync 不取消原生任务，语句仍卡在原生执行里时，
+    // 关连接/关实例各 0ms 返回，但进程再也不会自行退出（CPU 0%，被原生线程卡住，只能 kill）。
+    // 修法：超时先 interrupt()，语句以 INTERRUPT 交回后照常 ROLLBACK。
+    // 本用例走导入缝让「交回」发生在中断之后（闸门而不是真查询），把时序钉死。
+    const real = await import('@duckdb/node-api')
+    const events: string[] = []
+    let holdInsert = false
+    let releaseDeliver!: () => void
+    let deliverGate: Promise<void> | undefined
+    let interrupted = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                // 中断可由测试注入（原生连接上没有真正卡住的查询）
+                interrupt: () => {
+                  interrupted = true
+                  events.push('interrupted')
+                  releaseDeliver?.()
+                },
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') events.push('rollback-dispatched')
+                  if (!holdInsert || !sql.startsWith('INSERT INTO "tags"')) return cc.runAndReadAll(sql, params)
+                  events.push('insert-executed')
+                  holdInsert = false
+                  deliverGate = new Promise<void>((r) => { releaseDeliver = r })
+                  await deliverGate
+                  events.push('insert-returned')
+                  if (interrupted) throw new Error('INTERRUPT Error: Interrupted!')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', {
+      importer, drainCapMs: 150, drainInterruptGraceMs: 5_000,
+    })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const txErr = await s.transaction(async (t) => {
+      // 不 await：收尾时它仍在途（闸门扣着结果）
+      holdInsert = true
+      void t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }]).catch(() => {})
+    }).then(() => null, (e: unknown) => e as Error)
+    expect(txErr, '未交回的写不得被当成已提交').not.toBeNull()
+    expect(interrupted, '超时后必须先中断在途语句（否则关闭不解卡、进程卡住）').toBe(true)
+    expect(events, '中断要发生在 ROLLBACK 之前，且语句交回后照常回滚')
+      .toEqual(['insert-executed', 'interrupted', 'insert-returned', 'rollback-dispatched'])
+    // 中断路径成功 → 连接**不**退役：后续语句照常可用
+    expect(await s.count('tags'), '该事务的写入不得残留，连接未被退役').toBe(1)
+    await s.close()
+  })
+
+  it('真原生执行卡住 → interrupt() 让语句以 INTERRUPT 交回、ROLLBACK 照常确认、库不损坏（CR 第三十九轮 major）', { timeout: 90_000 }, async () => {
+    // 闸门用例把「交回发生在中断之后」的时序钉死了，但 CR 明确要求用**真实原生执行**回答
+    // 「关闭/中断到底能不能解卡」。直连驱动实测（2026-11-19，1.5.6-r.1）：
+    //  · 不回滚直接 close：连接/实例各 0ms 返回、库可重建，但进程永不退出（CPU 0%）；
+    //  · interrupt()：语句 ~100ms 内以 `INTERRUPT Error: Interrupted!` 交回，ROLLBACK 成功，
+    //    行状态不变、进程正常退出。
+    // 本用例跑真库真查询，钉死第二条：库内容不变、事务报「已整体回滚」、连接不退役。
+    // ⚠️ 宽限必须明显短于这条查询的自然耗时（本机实测 ~6s）：否则「不中断、光等」也能通过，
+    // 用例就区分不出 interrupt 有没有发（第三十九轮变异 M5 实测：宽限 10s 时该变异存活）。
+    const s = await createDuckDbStore(cfg, 'rw', { drainCapMs: 200, drainInterruptGraceMs: 2_000 })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    const txErr = await s.transaction(async (t) => {
+      void t.count('tags').catch(() => {})
+      // 不 await 的**原生重查询**（2e10 行计数，>200ms；drain 到点后必须靠 interrupt 收场）
+      void s.query('SELECT count(*) AS n FROM range(20000000000)').catch(() => {})
+    }).then(() => null, (e: unknown) => e as Error)
+    expect(txErr, '未交回的语句不得被当成已提交').not.toBeNull()
+    expect((txErr as Error).message, '中断让它交回，回滚因此可确认').toMatch(/已整体回滚/)
+    expect((txErr as Error).message, '不得声称连接退役').not.toMatch(/退役/)
+    expect(await s.count('tags'), '中断属于回滚路径，库内容不变、连接仍可用').toBe(1)
+    await s.close()
+  })
+
+  it('中断后仍不交回 → 退役连接，且错误如实说明回滚未能确认（不冒充「已回滚」）', { timeout: 90_000 }, async () => {
+    // 中断不是万能的（原生任务卡在不可中断点上）。此时 drainOwned 返回 false 的语义必须保留：
+    // 退役连接、不发 ROLLBACK、错误里写「回滚也未能确认」而不是「已整体回滚」。
+    const real = await import('@duckdb/node-api')
+    let holdInsert = false
+    let interrupted = false
+    const sqls: string[] = []
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                interrupt: () => { interrupted = true },
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  sqls.push(sql)
+                  if (!holdInsert || !sql.startsWith('INSERT INTO "tags"')) return cc.runAndReadAll(sql, params)
+                  // 永远不交回：模拟卡在不可中断的原生点上
+                  await new Promise(() => {})
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', {
+      importer, drainCapMs: 150, drainInterruptGraceMs: 150,
+    })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    holdInsert = true
+    const txErr = await s.transaction(async (t) => {
+      void t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }]).catch(() => {})
+    }).then(() => null, (e: unknown) => e as Error)
+    expect(interrupted, '前提：确实中断过').toBe(true)
+    expect((txErr as Error).message, '回滚未确认时不得说「已整体回滚」').toMatch(/回滚也未能确认/)
+    expect(sqls.filter((q) => q === 'ROLLBACK'), '无法确认时不得发 ROLLBACK').toEqual([])
+    const after = await s.count('tags').then(() => null, (e: unknown) => e as Error)
+    expect(after, '退役后任何后续语句都必须被拒').toMatchObject({ kind: 'internal' })
+    expect((after as Error).message).toMatch(/退役|无法确认/)
+    await s.close()
+  })
 })
 
 describe('duckdb —— init 与关闭', () => {
@@ -1695,7 +2010,12 @@ describe('duckdb —— init 与关闭', () => {
     await ro.close()
   })
 
-  it('close 后跨进程可立即重开（N1 钉死：close 必须真释放锁）', async () => {
+  it('close 后跨进程可立即重开（N1 钉死：close 必须真释放锁）', { timeout: 180_000 }, async () => {
+    // ⚠️ 单独放宽到 180s（文件默认 15s）：本用例要 spawn 一个**新 node 进程**，它不吃
+    // `tests/setup-warm.ts` 的进程内预热，必须自己付一次原生绑定冷启动。高负载实测
+    // 首开 10–34s，极端记录 89.5s（见 HANDOFF / 记忆 local-load-slow-duckdb-startup），
+    // 15s 会把「机器忙」报成「close 没放锁」。等待本身是条件式的（等子进程 exit），
+    // 这里的上限只是环境故障判据，不是竞态阈值。
     const s = await fresh()
     await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
     await s.close()
@@ -1749,61 +2069,34 @@ describe('duckdb —— init 与关闭', () => {
     await s.close()
   })
 
-  it('读者撞锁：退避超限 → 包装 store_locked + hint（验收 35，注入假时钟；跨进程持真锁 + 按轮换全新路径重试 ≤5 轮）', { timeout: 120_000 }, async () => {
-    // ⚠️ 超时预算（120s 而不是默认 60s）：最坏路径是 5 轮 × (持锁者启动 5s + 落盘校验
-    // 10s) = 75s，已经**超过** 60s —— 高负载下（如 CI runner 或本机多任务）这条路一走到
-    // 第 2 轮就会先被用例超时杀掉，伪装成「锁竞态超预期」的假失败（2026-10-24 实测
-    // 一次无法复现的全量红）。120s = 最坏路径 75s × 2 余量，正常路径 20s 左右不受影响。
+  it('读者撞锁：退避超限 → 包装 store_locked + hint（验收 35，注入假时钟；跨进程持真锁 + 按轮换全新路径重试）', { timeout: LOCK_BUDGET_MS + 60_000 }, async () => {
+    // ⚠️ 超时预算（LOCK_BUDGET_MS + 60s）：跨进程锁用例每轮要 spawn 2–3 个**新进程**，
+    // 它们不吃 tests/setup-warm.ts 的进程内预热，各自付一次原生绑定冷启动（高负载实测
+    // 10–34s，极端 89.5s）。预算由 helpers/lock-holder.ts 的**单一下载截止时刻**统管：
+    // 每次等待只花剩余预算，耗尽就带着子进程原始输出报错，不把「机器忙」说成「竞态」。
     //
     // 回移 T7 方案（同文件写者用例同款，M3 修间歇红）：@duckdb/node-api 有
     // **进程内单例缓存** —— 测试进程打开过的库路径再开一律命中缓存、绕过文件锁，
     // 同进程 seed 再撞锁是间歇红根因。改为：
     // ① 持锁者直接对**全新路径**持锁（DuckDBInstance.create 会建文件，无需 seed）；
-    // ② 打印 'locked' 时锁可能尚未落盘 —— 用独立子进程校验 CONFLICT；
+    // ② 持锁者先跑一条语句再打标记 —— 语句执行成功即证明写事务已取得，文件锁已落盘
+    //    （实测对照：跑语句后 20/20 CONFLICT），再用独立子进程校验 CONFLICT 兜底；
     // ③ 极少数情况下校验 CONFLICT 后读者仍能打开（锁落盘竞态窗口）——每轮换
     //    全新路径重试，最多 5 轮。锁生效是平台保证，重试只对冲竞态窗口。
     // 被测语义不变（验收 35）：kind=store_locked、retryable=true、假时钟退避超限。
-    const { spawn } = await import('node:child_process')
-    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
-    const spawnHolder = async (dbPath: string) => {
-      const child = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(async ({ DuckDBInstance }) => {
-          const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
-          console.log('locked')
-          setInterval(() => {}, 1 << 30)
-          await new Promise(() => {})
-        })`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let o = ''
-      child.stdout?.on('data', (d) => { o += String(d) })
-      const ok = await new Promise<boolean>((resolve) => {
-        const iv = setInterval(() => { if (o.includes('locked')) { clearInterval(iv); resolve(true) } }, 100)
-        setTimeout(() => { clearInterval(iv); resolve(false) }, 5000)
-      })
-      if (!ok) { child.kill('SIGKILL'); throw new Error(`锁持有者未能启动：${o.slice(0, 200)}`) }
-      return child
-    }
-    // 独立子进程校验锁已真正落盘（绕开本进程实例缓存）：
-    const lockVerdict = async (dbPath: string): Promise<string> => {
-      const chk = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(({ DuckDBInstance }) =>
-          DuckDBInstance.create(${JSON.stringify(dbPath)}))
-          .then(() => console.log('OPENED'))
-          .catch(() => console.log('CONFLICT'))`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let co = ''
-      chk.stdout?.on('data', (d) => { co += String(d) })
-      return await new Promise<string>((resolve) => {
-        chk.on('close', () => resolve(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
-        setTimeout(() => { chk.kill('SIGKILL'); resolve('TIMEOUT') }, 10000)
-      })
-    }
+    const deadline = Date.now() + LOCK_BUDGET_MS
     let holder: import('node:child_process').ChildProcess | undefined
     try {
       let asserted = false
+      let roundsRun = 0
+      let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
+        roundsRun = round + 1
         const p = join(dir, `r-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
         if (holder) holder.kill('SIGKILL')
-        holder = await spawnHolder(p)
-        if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `r-holder-${round}`, deadline })
+        if (await lockVerdict(p, dir, deadline) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        lockConfirmed++
         let t = 0
         // ⚠️ 2026-10-31（B6-3）：这里**不能用** `expect(...).rejects` 包在 `catch { continue }` 里 ——
         // 那样「撞锁成功但断言写错」（kind 变了、hint 改了、假时钟没走）与「锁落盘竞态」
@@ -1833,62 +2126,43 @@ describe('duckdb —— init 与关闭', () => {
         }
         if (opened) continue   // 锁落盘竞态窗口（CONFLICT 后仍打开），换轮重来
       }
-      expect(asserted, '5 轮内未取得「锁生效且读者撞锁」——锁落盘竞态超预期').toBe(true)
+      // ⚠️ 归因要分两种：lockConfirmed == 0 说明**锁根本没生效**（夹具坏了/平台行为变了），
+      // 不是「竞态窗口」；lockConfirmed > 0 却每轮都 opened 才是那条竞态窗口。此前两者
+      // 共用一句「锁落盘竞态超预期」—— 变异实测（把持有者的实例提前关掉）会红成这句话，
+      // 把「锁根本没持住」说成平台竞态，归因是错的。
+      expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— 锁未生效（夹具或平台行为变了），不是竞态窗口').toBeGreaterThan(0)
+      expect(asserted, `未取得「锁生效且读者撞锁」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
       holder?.kill('SIGKILL')
     }
   })
 
-  it('写者撞锁：不重试、立即抛 store_locked（注入 sleep 证明未调用；跨进程持真锁 + 按轮换全新路径重试 ≤5 轮）', { timeout: 120_000 }, async () => {
+  it('写者撞锁：不重试、立即抛 store_locked（注入 sleep 证明未调用；跨进程持真锁 + 按轮换全新路径重试）', { timeout: LOCK_BUDGET_MS + 60_000 }, async () => {
+    // ⚠️ 超时预算与读者用例同因（LOCK_BUDGET_MS + 60s）：每轮两次子进程冷启动；
+    // 等待统管在 helpers/lock-holder.ts 的单一截止时刻上，耗尽就报「预算耗尽」。
+    //
     // ⚠️ 回移 T7 方案（tests/commands/store.test.ts 同款）：@duckdb/node-api 有
     // **进程内单例缓存** —— 测试进程打开过的库路径再开一律命中缓存、绕过文件锁，
     // 同进程 seed 再撞锁是间歇红根因。改为：
     // ① 持锁者直接对**全新路径**持锁（DuckDBInstance.create 会建文件，无需 seed）；
-    // ② 打印 'locked' 时锁可能尚未落盘 —— 用独立子进程校验 CONFLICT；
+    // ② 持锁者先跑一条语句再打标记（语句成功即证明写事务已取得、锁已落盘；实测 20/20
+    //    CONFLICT），再用独立子进程校验 CONFLICT 兜底；
     // ③ 极少数情况下校验 CONFLICT 后写者仍能打开（锁落盘竞态窗口）——每轮换
     //    全新路径重试，最多 5 轮。锁生效是平台保证，重试只对冲竞态窗口。
     // 被测语义不变：kind=store_locked、retryable=true、写者不退避（sleep 未调用）。
-    const { spawn } = await import('node:child_process')
-    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
-    const spawnHolder = async (dbPath: string) => {
-      const child = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(async ({ DuckDBInstance }) => {
-          const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
-          console.log('locked')
-          setInterval(() => {}, 1 << 30)
-          await new Promise(() => {})
-        })`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let o = ''
-      child.stdout?.on('data', (d) => { o += String(d) })
-      const ok = await new Promise<boolean>((resolve) => {
-        const iv = setInterval(() => { if (o.includes('locked')) { clearInterval(iv); resolve(true) } }, 100)
-        setTimeout(() => { clearInterval(iv); resolve(false) }, 5000)
-      })
-      if (!ok) { child.kill('SIGKILL'); throw new Error(`锁持有者未能启动：${o.slice(0, 200)}`) }
-      return child
-    }
-    // 独立子进程校验锁已真正落盘（绕开本进程实例缓存）：
-    const lockVerdict = async (dbPath: string): Promise<string> => {
-      const chk = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(({ DuckDBInstance }) =>
-          DuckDBInstance.create(${JSON.stringify(dbPath)}))
-          .then(() => console.log('OPENED'))
-          .catch(() => console.log('CONFLICT'))`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let co = ''
-      chk.stdout?.on('data', (d) => { co += String(d) })
-      return await new Promise<string>((resolve) => {
-        chk.on('close', () => resolve(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
-        setTimeout(() => { chk.kill('SIGKILL'); resolve('TIMEOUT') }, 10000)
-      })
-    }
+    const deadline = Date.now() + LOCK_BUDGET_MS
     let holder: import('node:child_process').ChildProcess | undefined
     try {
       let asserted = false
+      let roundsRun = 0
+      let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
+        roundsRun = round + 1
         const p = join(dir, `w-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
         if (holder) holder.kill('SIGKILL')
-        holder = await spawnHolder(p)
-        if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `w-holder-${round}`, deadline })
+        if (await lockVerdict(p, dir, deadline) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        lockConfirmed++
         const sleep = vi.fn(async () => {})
         // ⚠️ 2026-10-31（B6-3）：同上，不用 `rejects.toMatchObject` + 空 catch 的组合 ——
         // 断言失败与锁竞态会落进同一个 catch，红的时候归因指向平台竞态而非真错的断言。
@@ -1909,85 +2183,40 @@ describe('duckdb —— init 与关闭', () => {
         }
         if (opened) continue   // 锁落盘竞态窗口（CONFLICT 后仍打开），换轮重来
       }
-      expect(asserted, '5 轮内未取得「锁生效且写者撞锁」——锁落盘竞态超预期').toBe(true)
+      expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— 锁未生效（夹具或平台行为变了），不是竞态窗口').toBeGreaterThan(0)
+      expect(asserted, `未取得「锁生效且写者撞锁」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
       holder?.kill('SIGKILL')
     }
   })
 
-  it('只读持有者同样挡住写者 —— 报错不得把持有者说成「写进程」', { timeout: 180_000 }, async () => {
+  it('只读持有者同样挡住写者 —— 报错不得把持有者说成「写进程」', { timeout: LOCK_BUDGET_MS + 60_000 }, async () => {
     // 2026-11-05 审查实测：DuckDB 是「写者独占 / 读者共享」—— 一个以 READ_ONLY 打开的
     // 进程同样会让写者拿到 `Conflicting lock`。旧文案「数据库被写进程占用 / 另一个进程
     // 持有数据库写锁」把只读持有者说成写者，Agent 会去等一个并不存在的同步任务。
     //
     // ⚠️ 与同文件另外两条撞锁用例同款的三段式，缺一段就会间歇红：
     // ① 每轮换全新路径（@duckdb/node-api 进程内实例缓存会绕过文件锁）；
-    // ② 持有者打印 ready 后，用独立子进程校验 CONFLICT（锁可能尚未落盘）；
+    // ② 持有者跑一条语句后再打标记，用独立子进程校验 CONFLICT（锁可能尚未落盘）；
     // ③ 极少数情况下校验通过后写者仍能打开（锁落盘竞态窗口）→ 换轮重来。
-    const { spawn } = await import('node:child_process')
-    const { writeFileSync } = await import('node:fs')
-    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
-    // 只读实例要求文件已存在 → 先由**子进程**建一个合法的空 DuckDB 文件
-    // （种子放本进程会命中实例缓存，后续持有者/写者都绕开文件锁）。
-    const seed = async (dbPath: string, round: number) => {
-      const seedScript = join(dir, `ro-seed-${round}.mjs`)
-      writeFileSync(seedScript, `
-        const { DuckDBInstance } = await import(${JSON.stringify(pkgUrl.href)})
-        const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
-        inst.closeSync()
-      `)
-      await new Promise<void>((resolve, reject) => {
-        const ch = spawn(process.execPath, [seedScript], { stdio: ['ignore', 'ignore', 'pipe'] })
-        let e = ''
-        ch.stderr?.on('data', (d) => { e += String(d) })
-        ch.on('close', (code) => { code === 0 ? resolve() : reject(new Error(`种子失败：${e.slice(0, 300)}`)) })
-      })
-    }
-    // ⚠️ 子进程用**脚本文件**而非 `-e`：`-e` 里的动态 import 在部分 shell 引号组合下会
-    // 被截断（锁持有者静默不启动，用例只会红成「持有者未能启动」）。
-    const spawnRoHolder = async (dbPath: string, round: number) => {
-      const script = join(dir, `ro-holder-${round}.mjs`)
-      writeFileSync(script, `
-        const { DuckDBInstance } = await import(${JSON.stringify(pkgUrl.href)})
-        const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)}, { access_mode: 'READ_ONLY' })
-        const c = await inst.connect()
-        await c.run('SELECT 1')
-        console.log('ready')
-        setInterval(() => {}, 1 << 30)
-      `)
-      const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let o = ''
-      child.stdout?.on('data', (d) => { o += String(d) })
-      const ok = await new Promise<boolean>((resolve) => {
-        const iv = setInterval(() => { if (o.includes('ready')) { clearInterval(iv); resolve(true) } }, 100)
-        setTimeout(() => { clearInterval(iv); resolve(false) }, 30_000)
-      })
-      if (!ok) { child.kill('SIGKILL'); throw new Error(`只读持有者未能启动：${o.slice(0, 200)}`) }
-      return child
-    }
-    // 独立子进程校验锁已真正落盘（写者视角：能被打开 = 锁未生效）。
-    const lockVerdict = async (dbPath: string): Promise<string> => {
-      const chk = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(({ DuckDBInstance }) =>
-          DuckDBInstance.create(${JSON.stringify(dbPath)}))
-          .then(() => console.log('OPENED'))
-          .catch(() => console.log('CONFLICT'))`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let co = ''
-      chk.stdout?.on('data', (d) => { co += String(d) })
-      return await new Promise<string>((resolve) => {
-        chk.on('close', () => resolve(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
-        setTimeout(() => { chk.kill('SIGKILL'); resolve('TIMEOUT') }, 10000)
-      })
-    }
+    // ⚠️ 超时预算与另两条同因：每轮三个子进程（种子/持有者/校验）各付一次冷启动；
+    // 等待统管在 helpers/lock-holder.ts 的单一截止时刻上。
+    const deadline = Date.now() + LOCK_BUDGET_MS
     let holder: import('node:child_process').ChildProcess | undefined
     try {
       let asserted = false
+      let roundsRun = 0
+      let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
+        roundsRun = round + 1
         const p = join(dir, `ro-lock-${round}.db`)
         if (holder) holder.kill('SIGKILL')
-        await seed(p, round)
-        holder = await spawnRoHolder(p, round)
-        if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        // 只读实例要求文件已存在 → 先由**子进程**建一个合法的空 DuckDB 文件
+        // （种子放本进程会命中实例缓存，后续持有者/写者都绕开文件锁）。
+        await seedEmptyDb(p, dir, deadline)
+        holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `ro-holder-${round}`, accessMode: 'READ_ONLY', deadline })
+        if (await lockVerdict(p, dir, deadline) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        lockConfirmed++
         let opened = false
         try {
           await createDuckDbStore({ ...cfg, path: p }, 'rw', { sleep: async () => {} })
@@ -2010,7 +2239,8 @@ describe('duckdb —— init 与关闭', () => {
         }
         if (opened) continue   // 锁落盘竞态窗口，换轮重来
       }
-      expect(asserted, '5 轮内未取得「RO 持有者生效且写者撞锁」——锁落盘竞态超预期').toBe(true)
+      expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— RO 持有者的锁未生效，不是竞态窗口').toBeGreaterThan(0)
+      expect(asserted, `未取得「RO 持有者生效且写者撞锁」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
       holder?.kill('SIGKILL')
     }

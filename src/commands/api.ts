@@ -764,7 +764,7 @@ async function callOne(argv: string[]): Promise<number> {
       ...(r.notFound ? { not_found: true, warning: '接口返回成功但无数据' } : {}),
       ...(spec.note ? { note: spec.note } : {}),
       // ⚠️ `verified === false` 必须在**调用时**说，不能只写在 `api list` 里
-      // （2026-11-13 审计）：注册表 154 条里 73 条危险接口有 72 条未实测信封，
+      // （2026-11-13 审计）：注册表 154 条里 74 条危险接口有 73 条未实测信封，
       // 而 `verified` 此前只在 `api list` 输出、`callOne` 从不读 —— Agent 不先
       // 跑 `api list --all` 就完全不知道「这个接口的响应信封只是按文档推的」。
       // 后果具体：信封未实测时 `not_found` 判定与 `data` 语义可能不适用
