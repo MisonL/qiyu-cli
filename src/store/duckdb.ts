@@ -48,6 +48,13 @@ export interface DuckDbDeps {
    * 驱动卡在 ROLLBACK 上时，sync run / store init 会永久挂住，连「回滚未能确认」都说不出口。
    */
   rollbackCapMs?: number
+  /**
+   * 事务结束后按令牌键控的状态快照（**仅测试缝**）：`brokenTx` / `beganTx` / `txInFlight` /
+   * `txWrites` / `drainWaiters` 都是普通 Map/Set，键是令牌对象 —— 失败路径上漏删一项，
+   * 那个令牌与它携带的错误原因就被永久强引用（长跑进程里按失败次数无界增长）。
+   * 这条缝让「事务结束后一律为 0」可以被断言（Codex PR#81 第四十三轮 P2）。
+   */
+  txStateProbe?: (snapshot: Record<'brokenTx' | 'beganTx' | 'txInFlight' | 'txWrites' | 'drainWaiters', number>) => void
 }
 
 /** 依赖缺失 → store_not_initialized（按缺失 specifier 前缀二分 hint，spec §5.1）。 */
@@ -409,7 +416,15 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // ⚠️ 这里只可能中断到**本事务的**语句：事务开着期间，别的异步链的语句在
     // `assertTxOwnership` 就被拒、根本进不了驱动（`foreignInFlight` 必为 0）。
     try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 中断失败照旧走退役路径 */ }
-    return waitDrained(token, Date.now() + DRAIN_INTERRUPT_GRACE_MS)
+    if (await waitDrained(token, Date.now() + DRAIN_INTERRUPT_GRACE_MS)) return true
+    // ⚠️ **放弃前再中断一次**（CR 第四十三轮 major 的追问）：驱动在准备/初始化阶段会清掉
+    // 中断标志，一次 interrupt 可能落在「这条语句还没进入原生执行」的时刻 —— 之后它照样
+    // 开始跑，而我们这一侧已经给不出结论。此时已经退役令牌，剩余在途全是**本事务的**语句，
+    // 补一发中断没有归属风险，且子进程实测（2026-11-20）：interrupt 让卡住的语句以
+    // `INTERRUPT Error` 交回后，进程不再被原生线程占住、可正常退出（仅 close 则 15s 不退）。
+    // 不在这里再等：调用方已按「回滚未能确认」退役，结论不再依赖它是否真的停下。
+    try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 同上 */ }
+    return false
   }
   /**
    * 事务结束（提交 / 回滚 / 拒绝）时把令牌的 `ended` 置位。令牌是对象、由异步上下文持有，
@@ -463,6 +478,23 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   const refusals = new WeakMap<object, TxToken>()
   // ⚠️ 按**令牌**归属（CR 第三十八轮 major）：A 的拒绝对象被调用方接住、在 B 的回调里原样
   // 抛出时，只按身份匹配会让 B 跳过回滚 —— 而回滚已由 A 负责，B 的事务还开着。
+  /**
+   * 令牌生命周期的**唯一收口点**：事务结束（提交 / 拒绝 / 回调抛错 / 收尾失败）时把该令牌
+   * 从全部按令牌键控的集合里删掉。⚠️ 曾只在 `commitOrRefuse` 的成功/拒绝路径里删 —— 回调抛错
+   * 走 `rollbackInTx` 时 `brokenTx` / `beganTx` / 计数全都不删，令牌与错误原因被永久强引用
+   * （Codex PR#81 第四十三轮 P2；`txStateProbe` 的用例钉住「结束后一律为 0」）。
+   */
+  const releaseTokenState = (token: TxToken): void => {
+    brokenTx.delete(token)
+    beganTx.delete(token)
+    txInFlight.delete(token)
+    txWrites.delete(token)
+    drainWaiters.delete(token)
+    deps.txStateProbe?.({
+      brokenTx: brokenTx.size, beganTx: beganTx.size, txInFlight: txInFlight.size,
+      txWrites: txWrites.size, drainWaiters: drainWaiters.size,
+    })
+  }
   const isRefusal = (e: unknown, token: TxToken): boolean =>
     ((typeof e === 'object' && e !== null) || typeof e === 'function') && refusals.get(e as object) === token
   /**
@@ -527,7 +559,13 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         : '**回滚也未能确认**（连接可能已关闭、或还有语句未交回）：该连接已退役，'
           + '不要把该事务的任何写入当成已保存'))
     ;(err as { kind?: string }).kind = 'internal'
-    ;(err as { hint?: string }).hint = '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
+    // ⚠️ 恢复动作按**收尾状态**给（CR 第四十三轮 major）：这条拒绝不经过外层 catch 的
+    // `annotateUnconfirmedRollback`（身份集合让它跳过回滚），所以「回滚也未能确认、连接已退役」
+    // 的恢复动作必须在这里自己给 —— 否则 hint 只说「让操作串行」，而实例已经退役、照做也没用。
+    ;(err as { hint?: string }).hint = rolledBack
+      ? '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
+      : '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
+        + '；本次回滚也未能确认、该连接已退役 —— 请关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）再决定是否重放'
     // 回滚**已由这里负责**（唯一处理点，CR 第三十六轮 major）：外层 catch 见到这个拒绝就不再
     // 回滚第二次 —— 两次回滚里只要一次成功、另一次失败，上一行对「回滚是否确认」的说法就不可信。
     refusals.set(err, token)
@@ -1190,6 +1228,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         inTx = false
         txToken = undefined
         leaveWriteOp(op)
+        releaseTokenState(token)
       }
       return n
     },
@@ -1279,6 +1318,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       } finally {
         inTx = false
         txToken = undefined
+        releaseTokenState(token)
       }
     },
     async query(sql: string, params?: unknown[]): Promise<QueryResult> {

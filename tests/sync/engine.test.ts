@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { runTask } from '../../src/sync/engine.js'
-import { listGaps, readWatermark } from '../../src/sync/state.js'
+import { listGaps, listWatermarks, readWatermark } from '../../src/sync/state.js'
 import { RateGate } from '../../src/sync/rate-gate.js'
 import { shanghaiDayStart, shanghaiDayIso } from '../../src/sync/day.js'
 import type { SyncTask, RunCtx } from '../../src/sync/types.js'
@@ -919,6 +919,32 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     expect(e!.message, '主失败必须保留，不得被第二次尝试换掉').toMatch(/提交结果未知/)
     expect(retryWaits, '退役错误对两层重试判据都必须是终态 —— 一次重试等待都不许有').toBe(0)
     await store.close()
+  })
+
+  it('退役后写者锁不挡下一次 run：重新打开同一库、同一任务照常跑完并清锁（CR 第四十三轮 major 的追问）', async () => {
+    // CR 的追问：数据 COMMIT 成功但结果丢失时，`markPending` 盖下的写者锁留在库里；
+    // 操作员照 hint 重建实例、核对数据之后，这把锁会不会挡住下一次 run？
+    // 判据（真库实测）：锁只是 `sync_state` 上的两列，**没有任何读取点会据此拒绝** ——
+    // 新实例上的 run 照常进行并在结束时清章。若哪天加了「锁在就不跑」，这里会红。
+    const { store } = await storeWithCommitFailureAt(2)
+    const t = fakeTask({
+      id: 'lock.probe', table: 'tags',
+      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+    })
+    const first = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error)
+    expect(first, '前提：第一次 run 因提交结果未知而失败').not.toBeNull()
+    expect(first!.message).toMatch(/提交结果未知/)
+    await store.close()
+    // 新实例（模拟操作员的恢复动作）
+    const s2 = await createDuckDbStore(cfg, 'rw')
+    await s2.init()
+    // readWatermark 只投影水位列 —— 锁列要走 listWatermarks（status/verify 的同款视图）。
+    const before = await listWatermarks(s2)
+    expect(before.get('lock.probe')?.lockedBy, '前提：退役时锁确实留在库里').not.toBeNull()
+    const second = await runTask(t, ctx(s2))
+    expect(second.status, '锁不得挡住下一次 run').toBe('complete')
+    expect((await listWatermarks(s2)).get('lock.probe')?.lockedBy, '成功收尾必须清锁').toBeNull()
+    await s2.close()
   })
 
   it('rotated：同样交回主失败（第三入口，与 put 同一条 storeGapOrPrimary 路径）', async () => {
