@@ -290,14 +290,19 @@ async function waitForMarker(
       child.off('close', onClose); child.off('error', onError)
       resolve(v)
     }
+    // ⚠️ **进程已结束就不再是「就绪」**（CR 第四十四轮 major）：只按「输出里有 marker」判时，
+    // 一个打印了 `locked` 随后立刻退出的子进程会让我们返回一个**死 holder**，调用方以为锁还
+    // 持着。判据：marker 必须在**进程仍存活**时出现；已经 `exit`/`close`/原生失败的，一律未就绪。
+    const readyNow = (): boolean => run.exit === null && !run.closed && !run.failedNative
+      && stdoutHasMarkerLine(run.stdout, marker)
     // 轮询兜住「分块到达的 marker」与「error 已到但 close 未到」两种形态。
     const iv = setInterval(() => {
-      if (stdoutHasMarkerLine(run.stdout, marker)) finish(true)
+      if (readyNow()) finish(true)
       else if (run.closed || run.failedNative) finish(false)
     }, 50)
-    const onClose = (): void => finish(stdoutHasMarkerLine(run.stdout, marker))
+    const onClose = (): void => finish(false)
     const onError = (): void => { /* 记录在 run 里，由轮询收尾 */ }
-    const to = setTimeout(() => finish(stdoutHasMarkerLine(run.stdout, marker)), Math.max(budget, 0))
+    const to = setTimeout(() => finish(readyNow()), Math.max(budget, 0))
     child.on('close', onClose)
     child.on('error', onError)
   })

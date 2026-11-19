@@ -690,7 +690,13 @@ function staleExemptions(entries: Array<{ rel: string; sf: ts.SourceFile }>,
  */
 function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: string; testName?: string }> {
   const out: Array<{ line: number; why: string; testName?: string }> = []
-  const seen = new Set<number>()
+  /**
+   * 去重键是**外层登记调用节点**，不是行号（CR 第四十四轮 major）：`it.concurrent.each(表)(名, 体)`
+   * 的两层调用落在同一处、应只报一次；而**同一行里的两条独立登记**（`it.concurrent('J', …);
+   * it('N', { concurrent: true }, …)`）是两件事，按行去重会吞掉第二条 —— 若第一条恰好被白名单
+   * 豁免，第二条既不报违规、也不进过期检查（后者只数 `.concurrent` 那条）。
+   */
+  const seen = new Set<ts.Node>()
   /**
    * `.concurrent` 在哪一层调用上，注册实参就未必在同一层：`it.concurrent(名, 体)` 在自身，
    * 而链式登记 `it.concurrent.each(表)(名, 体)` 的用例名在外层调用的实参 0 —— 沿「被调用的
@@ -710,6 +716,23 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
     if (!ts.isCallExpression(top)) return undefined
     const first = top.arguments[0]
     return first === undefined ? undefined : staticKey(first)
+  }
+  /**
+   * 链式登记的最外层调用（与 `registeredName` 同一条爬升规则）：去重按它的**节点身份**。
+   * 表格层 `it.each([...])` 与登记层 `it.each([...])(名, 体)` 共享最外层节点，因此只报一次；
+   * 同一行里的另一条登记是另一个最外层节点，照常报。
+   */
+  const outermostRegistration = (call: ts.CallExpression): ts.Node => {
+    let e: ts.Node = call
+    for (;;) {
+      const p = e.parent
+      if (p === undefined) break
+      if (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isNonNullExpression(p)
+        || ts.isSatisfiesExpression(p) || ts.isTypeAssertionExpression(p)) { e = p; continue }
+      if (ts.isCallExpression(p) && p.expression === e) { e = p; continue }
+      break
+    }
+    return e
   }
   const isFn = (e: ts.Expression): boolean => {
     const u = unwrap(e)
@@ -741,13 +764,13 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
     if (c === undefined) continue
     const base = c.chain[0]!
     // 链式登记的两层调用（表格层 / 登记层）落在同一行，同一处违规只报一次
-    if (seen.has(lineOf(sf, call))) continue
+    if (seen.has(outermostRegistration(call))) continue
     if (REGISTRARS.has(base)) {
       const isAlias = c.chain.includes('concurrent')
         || c.chain.some((seg) => seg.toLowerCase() === 'concurrent')
       if (isAlias) {
         out.push({ line: lineOf(sf, call), why: `.concurrent 修饰链：${c.chain.join('.')}`, testName: registeredName(call) })
-        seen.add(lineOf(sf, call))
+        seen.add(outermostRegistration(call))
         continue
       }
       // ⚠️ 只有**选项位**才判：`it.skipIf(x)` / `it.each(cases)` 的实参是条件与表格，
@@ -803,7 +826,7 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       const expanded = expandList(call.arguments)
       if (expanded === undefined) {
         out.push({ line: lineOf(sf, call), why: `实参里有无法静态展开的 spread，选项位置不可静态确定` })
-        seen.add(lineOf(sf, call))
+        seen.add(outermostRegistration(call))
         continue
       }
       args = expanded.args
@@ -823,13 +846,13 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
             const inner = expandList(target.elements)
             if (inner === undefined) {
               out.push({ line: lineOf(sf, call), why: `.apply 的实参数组含无法静态展开的 spread 或空位，无法确定选项位置` })
-              seen.add(lineOf(sf, call))
+              seen.add(outermostRegistration(call))
               continue
             }
             args = inner.args
           } else {
             out.push({ line: lineOf(sf, call), why: `.apply 的实参数组是表达式 ${arg0 === undefined ? '（缺省）' : call.getText(sf)}，无法静态解析` })
-            seen.add(lineOf(sf, call))
+            seen.add(outermostRegistration(call))
             continue
           }
         }
@@ -907,7 +930,7 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
               ? `选项对象是标识符 ${r.node.text}，无法静态解析`
               : `选项位是表达式 ${r.text}，无法静态求值`,
           })
-          seen.add(lineOf(sf, call))
+          seen.add(outermostRegistration(call))
           continue
         }
         const u = r.node
@@ -937,11 +960,11 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
             // 确定串行（含 `concurrent: false` 与 `sequential: true` 的任意组合）
           } else if (C === true || S === false) {
             out.push({ line: lineOf(sf, call), why: '选项对象 concurrent 为真（原型链）' })
-            seen.add(lineOf(sf, call))
+            seen.add(outermostRegistration(call))
             continue
           } else {
             out.push({ line: lineOf(sf, call), why: '套件选项的原型链带开关，无法静态确定' })
-            seen.add(lineOf(sf, call))
+            seen.add(outermostRegistration(call))
             continue
           }
         }
@@ -960,12 +983,12 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         const concVal = props.get('concurrent')
         if (props.get('concurrent') !== undefined && boolLiteralValue(sf, props.get('concurrent')!) === true) {
           out.push({ line: lineOf(sf, call), why: '选项对象 concurrent 为真' })
-          seen.add(lineOf(sf, call))
+          seen.add(outermostRegistration(call))
           continue
         }
         if (props.get('concurrent') !== undefined && boolLiteralValue(sf, props.get('concurrent')!) === undefined) {
           out.push({ line: lineOf(sf, call), why: `选项对象的 concurrent 值 ${concVal!.getText(sf)} 无法静态求值` })
-          seen.add(lineOf(sf, call))
+          seen.add(outermostRegistration(call))
           continue
         }
         // `describe`/`suite` 上的 `sequential: false` 与 `concurrent: true` 等价
@@ -974,12 +997,12 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         const seqGet = accessorKeys.has('sequential')
         if (!seqGet && seqVal !== undefined && boolLiteralValue(sf, seqVal) === false) {
           out.push({ line: lineOf(sf, call), why: '套件选项 sequential 为假' })
-          seen.add(lineOf(sf, call))
+          seen.add(outermostRegistration(call))
           continue
         }
         if (SUITES.has(base) && (seqGet || (seqVal !== undefined && boolLiteralValue(sf, seqVal) === undefined))) {
           out.push({ line: lineOf(sf, call), why: `套件选项的 sequential 值 ${seqVal === undefined ? '访问器' : seqVal.getText(sf)} 无法静态求值` })
-          seen.add(lineOf(sf, call))
+          seen.add(outermostRegistration(call))
           continue
         }
         // ⚠️ 未知来源的键（`{ ...opts }` / `{ [key]: … }`）让「没声明并发」变得**看不出来** ——
@@ -990,7 +1013,7 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         // 会把它当 `'off'`，所以这里单独拦（Codex PR#81 第二十四轮 P2）。
         if (accessorKeys.has('concurrent')) {
           out.push({ line: lineOf(sf, call), why: '选项对象的 concurrent 来自访问器，值在运行时才知道' })
-          seen.add(lineOf(sf, call))
+          seen.add(outermostRegistration(call))
           continue
         }
         const concW = props.get('concurrent')
@@ -1001,7 +1024,7 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         const suiteExplicitSeq = seqVal !== undefined && boolLiteralValue(sf, seqVal) === true
         if (mayHaveUnknown && !explicitOff && !suiteExplicitSeq) {
           out.push({ line: lineOf(sf, call), why: '选项对象含未知来源的键（展开 / 动态键），无法确认未开启并发' })
-          seen.add(lineOf(sf, call))
+          seen.add(outermostRegistration(call))
         }
       }
     }
@@ -1559,6 +1582,11 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 内层调用（表格层）自己不含 concurrent，不会被单独判中；只穿一层时外层链为 undefined。
     expect(concHits(`${bt('it.skipIf(false).each([1])', '("case3", { con', 'current: true }, () => {})')}`),
       '条件基座 + each + 选项位并发').toEqual(['opt'])
+    // ⚠️ 去重键必须是**外层登记调用**，不是行号（CR 第四十四轮 major）：同一行里出现两条
+    // 独立登记时，按行去重会把第二条整个吞掉 —— 若第一条恰好是白名单里的豁免项，第二条
+    // 并发用例既不报违规、也不进白名单过期检查（它只数 `.concurrent` 那一条）。
+    expect(concHits(`${bt("it.concurrent('J', () => {}); it('N', { con", 'current: true }, () => {})')}`),
+      '同一行的两条独立登记都要报').toHaveLength(2)
     expect(concHits(`${bt("it('A', { con", 'current: true }, () => {})')}`)).toEqual(['opt'])
     expect(concHits(`${bt("it('B', { con", 'current: false }, () => {})')}`)).toEqual([])
     expect(concHits(`${bt("it('C', { 'con", "current': true }, () => {})")}`), '字符串键同属选项（Codex 第九轮）').toEqual(['opt'])

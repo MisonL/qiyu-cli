@@ -1821,6 +1821,48 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('事务回调里 close() 之后调用投影：必须是 usage「连接已关闭」，不是「事务已结束」（Codex PR#81 第四十三轮 P2）', { timeout: 90_000 }, async () => {
+    // 事故（探针 2026-11-20）：`close()` 会 `alsTx.disable()`，投影的 `assertProjection` 先看
+    // `alsTx.getStore()`，于是拿到 undefined → 抛「事务已经结束」（internal）。而同一次关闭下
+    // Store 自己的方法走 `execSql` 的 `closed` 检查 → `usage`「数据库连接已关闭」。
+    // 同一个坏状态两种分类，Agent 收到的退出码也不同（2 vs 1）。
+    const s = await fresh()
+    const seen: Record<string, string> = {}
+    const classify = async (k: string, f: () => Promise<unknown>): Promise<void> => {
+      try { await f(); seen[k] = 'ok' } catch (e) {
+        seen[k] = `${(e as { kind?: string }).kind}: ${(e as Error).message.slice(0, 8)}`
+      }
+    }
+    await s.transaction(async (t) => {
+      await s.close()
+      await classify('count', () => t.count('tags'))
+      await classify('upsert', () => t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }]))
+      await classify('delete', () => t.delete('tags', 'TRUE'))
+      await classify('tables', () => t.tables())
+    }).catch(() => {})
+    for (const [k, v] of Object.entries(seen)) {
+      expect(v, `投影方法 ${k} 在连接已关闭时必须与 Store 同一条分类`).toBe('usage: 数据库连接已关闭')
+    }
+    expect(Object.keys(seen), '前提：每个投影方法都试过').toHaveLength(4)
+  })
+
+  it('事务控制藏在 EXPLAIN ANALYZE 里同样拒收；普通 EXPLAIN ANALYZE SELECT 放行（CR 第四十四轮 major）', { timeout: 90_000 }, async () => {
+    // 事故（真驱动探针 2026-11-20）：`EXPLAIN ANALYZE COMMIT` 的外层语句类型是 EXPLAIN(4)，
+    // DuckDB 照常执行里层计划 —— 事务里写入 → 这条语句 → ROLLBACK 报 `no transaction is active`，
+    // 写入已经在库里（callback 随后抛错也撤不回）。旧判据只看外层类型，整条漏过。
+    const s = await fresh()
+    for (const sql of ['EXPLAIN ANALYZE COMMIT', 'EXPLAIN (ANALYZE) ROLLBACK', 'EXPLAIN ANALYZE BEGIN']) {
+      const err = await s.query(sql).then(() => null, (e: unknown) => e as Error & { kind?: string })
+      expect(err, `${sql} 必须被拒`).not.toBeNull()
+      expect(err!.kind, `${sql} 属用法错误`).toBe('usage')
+      expect(err!.message).toMatch(/事务控制/)
+    }
+    // 反例：不含事务关键字的解释语句照常可跑（否则这条守卫会把普通诊断也挡掉）
+    const ok = await s.query('EXPLAIN ANALYZE SELECT 1 AS v')
+    expect(ok.rows.length).toBeGreaterThan(0)
+    await s.close()
+  })
+
   it('提交被拒 + 回滚也未能确认 → 拒绝错误自己必须带「重建 → 核对 → 再重放」（CR 第四十三轮 major）', { timeout: 90_000 }, async () => {
     // 事故：`commitOrRefuse` 的拒绝走身份集合（`refusals`），外层 catch 不再回滚、也**不会**
     // 经过 `annotateUnconfirmedRollback` —— 于是「回滚也未能确认、连接已退役」这句在 message 里，

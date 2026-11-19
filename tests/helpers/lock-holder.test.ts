@@ -369,6 +369,28 @@ describe('锁夹具的子进程生命周期', () => {
     expectClean(child)
   })
 
+  it('holder：先打印 locked、随后立刻退出 → **不得**当成就绪（返回的是个死进程）（CR 第四十四轮 major）', async () => {
+    // 事故：`onClose` 与轮询都以「stdout 里有 marker」为准，不看进程是否已结束 —— 一个
+    // 打印了 `locked` 然后退出（例如语句成功、随后 setInterval 没挂住 / 句柄被关）的子进程
+    // 会让 spawnLockHolder 返回**已经死掉**的 holder，调用方以为锁还持着，继续校验与断言。
+    const running = observe(invoke('holder', BUDGET))
+    child.stdout?.emit('data', 'locked\n')
+    child.emit('exit', 0, null)
+    // ⚠️ 只 emit `exit`、**不** emit `close`：轮询自己必须拒绝，不能指望 close 回调兜底
+    // （否则判据仍然只有「输出里有 marker」，进程一死就返回死 holder）。
+    await vi.advanceTimersByTimeAsync(60)
+    expect(running.isSettled(), '不能把已退出的进程当作就绪返回').toBe(false)
+    // 失败收尾照旧等真实 close：业务预算（100ms）耗尽后进 settleFailure，再给 CLOSE_GRACE_MS 宽限。
+    await vi.advanceTimersByTimeAsync(6_000)
+    const result = await running.result
+    expect('error' in result ? 'error' : 'ok', '进程已退出就不存在「持有锁」这回事').toBe('error')
+    expect(String((result as { error?: Error }).error), '失败原因必须点名「就绪 / close 未确认」')
+      .toMatch(/未就绪|close/)
+    child.emit('close', 0, null)
+    await vi.advanceTimersByTimeAsync(0)
+    expectClean(child)
+  })
+
   it('seed：exit 0 之后等到 close 才成功', async () => {
     const running = observe(invoke('seed', 1_000_000))
     child.emit('exit', 0, null)

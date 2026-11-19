@@ -643,6 +643,13 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     if (poisoned !== undefined) throw poisonedError(poisoned)
     const ST = mod.StatementType ?? {}
     const TRANSACTION = typeof ST.TRANSACTION === 'number' ? ST.TRANSACTION : 10
+    // ⚠️ **可执行包装器**（CR 第四十四轮 major，真驱动探针 2026-11-20）：`EXPLAIN ANALYZE COMMIT`
+    // 的外层语句类型是 `EXPLAIN`(4)，DuckDB 照常执行里层计划 —— 探针实测「事务里写入 →
+    // `EXPLAIN ANALYZE COMMIT` → ROLLBACK 报 `no transaction is active`、写入已在库里」。
+    // 所以外层类型是 EXPLAIN **且原文含事务关键字**时一律拒：普通 `EXPLAIN ANALYZE SELECT 1`
+    // 不含事务关键字、照常放行；含关键字的解释语句本来就少，多拒一次只是换个更安全的失败。
+    // （`EXPLAIN (ANALYZE)` / `EXPLAIN (ANALYZE true)` 同一探针同样执行里层。）
+    const EXPLAIN = typeof ST.EXPLAIN === 'number' ? ST.EXPLAIN : 4
     let p: { statementType: number; destroySync?: () => void }
     try {
       p = await ex.prepare(0)
@@ -651,6 +658,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     }
     try {
       if (p.statementType === TRANSACTION) throw rawTxError()
+      if (p.statementType === EXPLAIN && TX_KEYWORD.test(sql)) throw rawTxError()
     } finally {
       // 预编译语句持有原生句柄：不释放会在长会话里累积（同 sandbox 的做法）。
       p.destroySync?.()
@@ -1293,7 +1301,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           // `const tx = await transaction(async (t) => t)` 把投影带出回调后，直接调用会变成
           // 一个 Store 别名（在 autocommit 里写），调用方却以为它还在事务里。每个方法入口
           // 都核对「当前异步上下文仍是本事务」。
+          // ⚠️ **关闭必须先于归属**（Codex PR#81 第四十三轮 P2，探针 2026-11-20）：`close()`
+          // 会 `alsTx.disable()`，`getStore()` 随即变成 undefined —— 只看令牌会把「连接已关」
+          // 误诊成「事务已结束」（internal），而 Store 自己的方法是 `usage`「数据库连接已关闭」。
+          // 同一个坏状态两种分类 = Agent 拿到两种退出码（1 vs 2）。
           const assertProjection = (): void => {
+            if (closed) throw usage('数据库连接已关闭')
             if (!inTx || alsTx.getStore() !== token) throw txEndedError()
           }
           // 方法一律 `async`：守卫的拒绝必须以 **rejected promise** 呈现（与类型契约一致），
