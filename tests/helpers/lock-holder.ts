@@ -30,6 +30,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { isLockError } from '../../src/store/retry.js'
 
 /** `@duckdb/node-api` 的 ESM 入口（子进程按绝对 URL import，不依赖 cwd）。 */
 export const PKG_URL = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
@@ -104,31 +105,53 @@ setInterval(() => {}, 1 << 30)`
 
 /**
  * 从**另一个进程**校验锁是否真的挡住打开（绕开本进程的实例缓存）。
- * `CONFLICT` = 被挡住（锁生效），`OPENED` = 能打开（锁未落盘/竞态窗口），`TIMEOUT` = 预算内无结论。
+ * `CONFLICT` = 被锁挡住（锁生效），`OPENED` = 能打开（锁未落盘/竞态窗口），`TIMEOUT` = 预算内无结论。
+ *
+ * ⚠️ **只有真正的锁报文才算 CONFLICT**（CodeRabbit 2026-11-19 major）：此前脚本是
+ * `main().catch(() => console.log('CONFLICT'))` —— 父目录不存在、`closeSync` 抛错等
+ * **夹具自身的失败**同样打 CONFLICT，于是撞锁用例会把「夹具坏了」当成「锁生效了」放行。
+ * 现在子进程把结果与**原始报文**一起交回，父进程用 `isLockError`（`src/store/retry.ts`
+ * 的唯一实现点，锚 DuckDB 的模板骨架）判定；非锁错误直接抛「校验进程失败」并带上报文。
  */
 export async function lockVerdict(
   dbPath: string, scriptDir: string, deadline: number,
 ): Promise<'CONFLICT' | 'OPENED' | 'TIMEOUT'> {
+  // 子进程跑不了 TS 判据（Node 20.12 无 type stripping），所以只交回事实、由父进程判。
   const chk = runScript(`const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
-async function main() {
+try {
   const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
   inst.closeSync()
-  console.log('OPENED')
-}
-main().catch(() => console.log('CONFLICT'))`, scriptDir, 'verdict')
+  console.log(JSON.stringify({ v: 'OPENED' }))
+} catch (e) {
+  console.log(JSON.stringify({ v: 'ERROR', msg: e instanceof Error ? e.message : String(e) }))
+}`, scriptDir, 'verdict')
   let co = ''
   chk.stdout?.on('data', (d) => { co += String(d) })
-  return await new Promise((resolve) => {
+  let errOut = ''
+  chk.stderr?.on('data', (d) => { errOut += String(d) })
+  const timedOut = await new Promise<boolean>((resolve) => {
     let done = false
-    const finish = (v: 'CONFLICT' | 'OPENED' | 'TIMEOUT') => {
-      if (done) return
-      done = true
-      clearTimeout(to)
-      resolve(v)
-    }
-    chk.on('close', () => finish(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
-    const to = setTimeout(() => { chk.kill('SIGKILL'); finish('TIMEOUT') }, Math.max(deadline - Date.now(), 0))
+    const finish = (v: boolean) => { if (done) return; done = true; clearTimeout(to); resolve(v) }
+    chk.on('close', () => finish(false))
+    chk.on('error', () => finish(false))
+    const to = setTimeout(() => { chk.kill('SIGKILL'); finish(true) }, Math.max(deadline - Date.now(), 0))
   })
+  if (timedOut) return 'TIMEOUT'
+  // 解析子进程交回的那一行 JSON（stdout 可能混入其它输出，取最后一个可解析的）。
+  const parsed = co.split('\n').reverse()
+    .map((l) => { try { return JSON.parse(l) as { v?: string; msg?: string } } catch { return null } })
+    .find((x) => x !== null && typeof x.v === 'string')
+  if (parsed === undefined || parsed === null) {
+    throw new Error(`锁校验进程未交回结论（退出后 stdout：${co.slice(0, 300) || '(空)'}；stderr：${errOut.slice(0, 300) || '(空)'}）`)
+  }
+  if (parsed.v === 'OPENED') return 'OPENED'
+  const msg = parsed.msg ?? ''
+  // ⚠️ 必须包成 Error 再交给 `isLockError`：它按 `e instanceof Error` 取 message，
+  // 传裸对象会 String() 成 `[object Object]`、永远判不出锁报文（实测踩过）。
+  if (isLockError(new Error(msg))) return 'CONFLICT'
+  // ⚠️ 夹具失败与「锁未生效」是两件事：这里必须响亮失败，不能返回 OPENED 让用例换轮重试、
+  //    最后报「锁落盘竞态超预期」—— 那会把「夹具坏了 / 库路径不可建」说成平台竞态。
+  throw new Error(`锁校验进程打开失败，且报错不是锁报文 —— 夹具或环境问题，不是锁竞态：${msg.slice(0, 400)}`)
 }
 
 /** RO 持有者要求文件已存在：由**子进程**建一个合法空库（父进程建会命中实例缓存）。 */
