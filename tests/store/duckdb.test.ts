@@ -1846,6 +1846,27 @@ describe('duckdb —— 事务', () => {
     expect(Object.keys(seen), '前提：每个投影方法都试过').toHaveLength(4)
   })
 
+  it('无事务关键字的多语句同样在派发前拒收（驱动会先执行第一条）（CR 第四十五轮 major）', { timeout: 90_000 }, async () => {
+    // 事故（真驱动探针 2026-11-20）：`INSERT INTO scratch VALUES (1); SELECT * FROM missing_table`
+    // 不含事务关键字 → 旧实现跳过解析、直接派发；驱动先执行 INSERT、再准备第二条时抛
+    // Catalog Error —— 调用方看到"失败"，行**已经在表里**（探针：scratch 1 行）。
+    const s = await fresh()
+    await s.query('CREATE TABLE scratch (x INTEGER)')
+    const err = await s.query('INSERT INTO scratch VALUES (1); SELECT * FROM missing_table')
+      .then(() => null, (e: unknown) => e as Error & { kind?: string })
+    expect(err, '多语句必须被拒').not.toBeNull()
+    expect(err!.kind, '多语句属用法错误').toBe('usage')
+    expect(err!.message).toMatch(/一次只接受一条语句/)
+    // ⚠️ 行数走 `query` 而不是 `count`：`count` 只认声明表（`assertTable`），scratch 是临时验证表。
+    const rows = async (): Promise<number> =>
+      Number((await s.query('SELECT count(*) AS n FROM scratch')).rows[0].n)
+    expect(await rows(), '第一条语句不得被先执行掉').toBe(0)
+    // 反例：单条带尾分号照常执行（初筛不能把合法的分号当多语句）
+    await s.query('INSERT INTO scratch VALUES (2);')
+    expect(await rows()).toBe(1)
+    await s.close()
+  })
+
   it('事务控制藏在 EXPLAIN ANALYZE 里同样拒收；普通 EXPLAIN ANALYZE SELECT 放行（CR 第四十四轮 major）', { timeout: 90_000 }, async () => {
     // 事故（真驱动探针 2026-11-20）：`EXPLAIN ANALYZE COMMIT` 的外层语句类型是 EXPLAIN(4)，
     // DuckDB 照常执行里层计划 —— 事务里写入 → 这条语句 → ROLLBACK 报 `no transaction is active`，
@@ -1963,6 +1984,53 @@ describe('duckdb —— 事务', () => {
     expect(txErr!.message, '不得再把原错误洗成「已回滚」').toMatch(/boom/)
     expect(txErr!.hint, '恢复动作：重建实例 + 核对后再决定是否重放').toMatch(/重建/)
     expect(txErr!.hint).toMatch(/重放|核对/)
+    await s.close()
+  })
+
+  it('回滚未能确认时**不得保留可重试标记**：retryable=false + code=store_retired（CR 第四十四轮 major）', { timeout: 90_000 }, async () => {
+    // 探针实测（2026-11-20）：回调抛的是 `kind:'store_locked'` / `retryable:true` 时，错误身份
+    // 保留 = 那个「可重试」标记原样出去；上层重试**同一实例**只会拿到 `store_retired`，
+    // 把这条带恢复动作的主失败整个换掉（与第四十一轮同一类事故）。
+    const real = await import('@duckdb/node-api')
+    let arm = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (arm && sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    arm = true
+    const boom = Object.assign(new Error('撞锁'), { kind: 'store_locked', retryable: true })
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw boom
+    }).then(() => null, (x: unknown) => x as Error & { retryable?: boolean; code?: string })
+    expect(e, '必须上抛').not.toBeNull()
+    expect(e!.message).toMatch(/回滚未能确认/)
+    expect(e!.retryable, '实例已退役 —— 同一实例上重试必然失败').toBe(false)
+    expect(e!.code, '与退役错误同一个稳定标记').toBe('store_retired')
     await s.close()
   })
 

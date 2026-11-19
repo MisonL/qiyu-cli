@@ -588,6 +588,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * （直连驱动探针 2026-11-19：`SELECT 1; END` 的 statementType 序列是 [1, 10]）。
    */
   const TX_KEYWORD = /(?:^|[^A-Za-z0-9_])(?:BEGIN|COMMIT|ROLLBACK|END|ABORT|START|TRANSACTION)(?:[^A-Za-z0-9_]|$)/i
+  /**
+   * 多语句的**文本初筛**（与 `TX_KEYWORD` 同一角色：只决定「要不要解析」，判据是解析结果
+   * 的语句数）。没有假阴性：多语句必然在末尾之前出现 `;`。假阳性（字符串 / 注释里的 `;`、
+   * 块末尾的分号）只多花一次解析 —— 单条带尾分号实测 `count === 1`，照常放行。
+   */
+  const mightBeMulti = (sql: string): boolean => sql.replace(/[\s;]+$/, '').includes(';')
   /** 原始事务控制的拒绝错误（`execSql` 与 `rejectRawTxControl` 共用一份文案）。 */
   const rawTxError = (): Error => {
     const err = new Error('事务控制语句不得经 `query` / 原始 SQL 下发 —— 它绕过事务归属与收尾判据'
@@ -695,7 +701,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // `prepared.run()` 之间的 await 是第二个窗口，用事务代号把它封住。
     // ⚠️ 解析判据的 await 也是同一个窗口（CR 第四十一轮）：所以在它之前取代号，解析之后再判。
     const epochBefore = txEpoch
-    if (!txControl && TX_KEYWORD.test(sql)) {
+    // ⚠️ **多语句必须独立于关键字初筛判**（CR 第四十五轮 major，真驱动探针 2026-11-20）：
+    // `INSERT INTO scratch VALUES (1); SELECT * FROM missing_table` 里没有事务关键字，旧实现
+    // 直接派发 —— 驱动先执行 INSERT、再准备第二条时报错，**行已经写进去了**。所以只要解析
+    // 可用就解析一次、按语句数判；`TX_KEYWORD` 仍决定要不要额外做事务控制判定。
+    const needsParse = !txControl && (TX_KEYWORD.test(sql) || mightBeMulti(sql))
+    if (needsParse) {
       // 解析同样占用连接（extract/prepare 走原生上下文）：按在途登记，BEGIN 准入才看得见它。
       // ⚠️ **归属先于登记**（CR 第四十二轮 major，实测复现）：判据必须是「当前链就是这条事务的
       // 所有者」，而不是实例级的「有活动事务」—— 事务开着时另一条链发来的解析若记在所有者账上，
@@ -963,6 +974,13 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     if (state !== 'unconfirmed' || !(e instanceof Error) || selfDiagnosed.has(e)) return e
     e.message = `${e.message} ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；`
       + '该连接已退役，本实例上的写入结果不可信'
+    // ⚠️ **本实例已退役，重试必然失败**（CR 第四十四轮 major，探针实测）：回调抛的是
+    // `kind:'store_locked'` / `retryable:true` 时，错误身份保留会让它原样带着「可重试」标记
+    // 出去 —— 上层重试同一实例只会得到 `store_retired`，把这条带恢复动作的主失败整个换掉。
+    // 所以统一打上稳定标记：`retryable=false` + `code:'store_retired'`（判据是「该实例上的
+    // 任何语句都会被拒」，与退役错误同一个 code）。
+    ;(e as { retryable?: boolean }).retryable = false
+    ;(e as { code?: string }).code = 'store_retired'
     const prev = (e as { hint?: string }).hint
     const add = '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）'
       + '再决定是否重放；本实例上的后续语句都会被拒'

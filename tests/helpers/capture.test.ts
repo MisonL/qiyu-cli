@@ -233,8 +233,19 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
   const aliasSources = (init: ts.Expression): string[] => {
     const found: string[] = []
     const walk = (e: ts.Expression): void => {
-      if (!refersToAlias(e)) return
       const u = unwrap(e)
+      // ⚠️ 数组 / 对象字面量里承载别名的元素（`const [a] = [opts]`）—— 必须先于
+      // `refersToAlias` 的闸门处理：字面量本身不是「引用」（复制表达式），但它**装着的**
+      // 元素可能是别名（CR 第四十五轮 major）。
+      if (ts.isArrayLiteralExpression(u)) { for (const el of u.elements) walk(el as ts.Expression); return }
+      if (ts.isObjectLiteralExpression(u)) {
+        for (const p2 of u.properties) {
+          if (ts.isPropertyAssignment(p2)) walk(p2.initializer)
+          else if (ts.isShorthandPropertyAssignment(p2)) walk(p2.name)
+        }
+        return
+      }
+      if (!refersToAlias(e)) return
       if (ts.isIdentifier(u)) { found.push(u.text); return }
       if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) return
       if (ts.isBinaryExpression(u)) {
@@ -283,6 +294,22 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
         if (aliasSources(init).some((s) => aliases.has(s)) && !aliases.has(n.name.text)) {
           aliases.add(n.name.text)
           changed = true
+        }
+      }
+      // ⚠️ **解构别名**（CR 第四十五轮 major）：`const [alias] = [opts]` / `const { a } = { a: opts }`
+      // 也建立了别名，随后 `alias.concurrent = true` 写穿 opts。旧收集只看 `Identifier` 的声明，
+      // 绑定模式整个跳过 —— 写穿被当成无关变量。
+      if (ts.isVariableDeclaration(n) && n.initializer !== undefined && !ts.isIdentifier(n.name)) {
+        // 初始化里引用了 opts/别名之一，且有**绑定元素**承接它 → 保守地把所有绑定名收进别名集
+        if (aliasSources(unwrap(n.initializer)).some((s2) => aliases.has(s2))) {
+          const bind = (b: ts.Node): void => {
+            if (ts.isBindingElement(b) && ts.isIdentifier(b.name) && !aliases.has(b.name.text)) {
+              aliases.add(b.name.text)
+              changed = true
+            }
+            ts.forEachChild(b, bind)
+          }
+          bind(n.name)
         }
       }
       // ⚠️ 别名不止经**声明初始化**建立：`let a; a = opts; a.concurrent = true` 同样写穿 opts
@@ -698,6 +725,27 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
    */
   const seen = new Set<ts.Node>()
   /**
+   * 命名导入别名 → 注册函数基名（CR 第四十五轮 major）：`import { it as check } from 'vitest'`
+   * 之后 `check('x', { concurrent: true }, fn)` 是**真登记**，而旧判据只看链首名字是否为
+   * `it`/`test`/… → 整条被当成无关调用。只认**从 vitest 导入**的名字（本地同名函数不是登记），
+   * 且只映射到注册表里的基名（`import { expect as e }` 之类不影响）。
+   */
+  const registrarAlias = new Map<string, string>()
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || st.importClause?.namedBindings === undefined) continue
+    const from = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : ''
+    if (from !== 'vitest') continue
+    const nb = st.importClause.namedBindings
+    if (!ts.isNamedImports(nb)) continue
+    for (const el of nb.elements) {
+      const imported = (el.propertyName ?? el.name).text
+      if (!REGISTRARS.has(imported)) continue
+      registrarAlias.set(el.name.text, imported)
+    }
+  }
+  /** 链首名字 → 注册函数基名（原名或经 vitest 命名导入的别名）。 */
+  const registrarBase = (name: string): string => registrarAlias.get(name) ?? name
+  /**
    * `.concurrent` 在哪一层调用上，注册实参就未必在同一层：`it.concurrent(名, 体)` 在自身，
    * 而链式登记 `it.concurrent.each(表)(名, 体)` 的用例名在外层调用的实参 0 —— 沿「被调用的
    * 表达式」往上爬到最外层，取它的实参 0。静态字符串才算名字（求不出就不豁免）。
@@ -762,7 +810,7 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
   for (const call of collectCalls(sf)) {
     const c = callChain(call)
     if (c === undefined) continue
-    const base = c.chain[0]!
+    const base = registrarBase(c.chain[0]!)
     // 链式登记的两层调用（表格层 / 登记层）落在同一行，同一处违规只报一次
     if (seen.has(outermostRegistration(call))) continue
     if (REGISTRARS.has(base)) {
@@ -1166,29 +1214,51 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
         }
         let callee = unwrap(inner.expression)
         let lastSeg = segOf(callee)
-        // ⚠️ 未知基座分支同样要先剥 `call`/`apply`（Codex PR#81 第二十五轮 P2，探针复现：
-        // `(pending ?? Promise.resolve()).then.call(pending, w)` 的末段是 `call`，不剥就看不见
-        // 它调的是 `then` —— 而这段尾巴照样在 hook 之后执行 `w`）。
-        if (lastSeg === 'call' || lastSeg === 'apply' || lastSeg === 'bind') {
-          // ⚠️ `bind` 同样要剥（Codex PR#81 第二十八轮 P2，Node 实测
-          // `(pending ?? P()).then.bind(pending)(w)` 在 hook 返回后才跑 `w`）—— 但只有**被绑定的
-          // 那个值又被调用**时才算：`x.then.bind(p)` 单独出现只是造了个绑定函数。
-          const wasBind = lastSeg === 'bind'
-          // `bind` 的返回值**又被调用**：本调用节点自己是某个 CallExpression 的被调方
-          // （形态 `Call(Call(Prop(Prop(基座,'then'),'bind'), 绑定实参), …)`）
-          // ⚠️ 包装（括号 / 断言）不影响语义：`((p ?? P()).then.bind(p))(w)` 也**被调用**了
-          // （Codex PR#81 第三十轮 P2，Node 实测 `w` 照样在 hook 之后跑）。
-          const boundThenCalled = wasBind && (() => {
-            let e: ts.Node = inner
-            while (e.parent !== undefined
-              && (ts.isParenthesizedExpression(e.parent) || ts.isAsExpression(e.parent) || ts.isNonNullExpression(e.parent)
-                || ts.isSatisfiesExpression(e.parent) || ts.isTypeAssertionExpression(e.parent))) e = e.parent
-            return e.parent !== undefined && ts.isCallExpression(e.parent) && e.parent.expression === e
-          })()
-          callee = unwrap((callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
-          lastSeg = segOf(callee)
-          // `x.then.bind(p)` 单独出现（没被调用）不是调度 —— 只有绑定值又被调用才算
-          if (wasBind && !boundThenCalled) continue
+        // ⚠️ 未知基座分支要**沿调用链往下剥**（Codex PR#81 第二十五/二十八/三十轮，CR 第四十五轮）：
+        //   · `.call` / `.apply` 是调用方式（`(p ?? P()).then.call(pending, w)`）；
+        //   · `.bind` 造出的绑定函数**又被调用**同样是调度（`…then.bind(p)(w)`、`…then.bind(p).call(null, w)`）。
+        // 旧实现按 if/else 只剥**一层**，`…bind(p).call(null, w)` 剥掉 `call` 后停在一个 CallExpression
+        // 上、既看不见 `bind` 也看不见 `then` —— 整条被静默放行。现在循环剥到不再是这两种形态，
+        // 并记下**是否真的出现过 bind**（没被调用的 `x.then.bind(p)` 单独出现只是造了个绑定函数）。
+        let sawBind = false
+        let strippedInvocation = false
+        for (;;) {
+          if (lastSeg === 'bind') {
+            // `.bind` 直接在末段：绑定函数**本节点**的父节点再调用它才算调度（下面统一判）。
+            sawBind = true
+            callee = unwrap((callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
+            lastSeg = segOf(callee)
+            continue
+          }
+          if (lastSeg !== undefined && (lastSeg === 'call' || lastSeg === 'apply')) {
+            strippedInvocation = true
+            callee = unwrap((callee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
+            lastSeg = segOf(callee)
+            continue
+          }
+          // `callee` 本身是调用结果：`…then.bind` 被调用 → 看见 bind；继续往被调方走。
+          if (ts.isCallExpression(callee)) {
+            const innerCallee = unwrap(callee.expression)
+            const seg = segOf(innerCallee)
+            if (seg === 'bind') sawBind = true
+            if (seg !== undefined && (seg === 'bind' || seg === 'call' || seg === 'apply')) {
+              callee = unwrap((innerCallee as ts.PropertyAccessExpression | ts.ElementAccessExpression).expression)
+              lastSeg = segOf(callee)
+              continue
+            }
+            lastSeg = seg
+            break
+          }
+          break
+        }
+        if (sawBind && !strippedInvocation) {
+          // 绑定函数的**结果**必须又被调用：本节点是 `…bind(p)` 那次调用，父节点再调用它才算。
+          let e: ts.Node = inner
+          while (e.parent !== undefined
+            && (ts.isParenthesizedExpression(e.parent) || ts.isAsExpression(e.parent) || ts.isNonNullExpression(e.parent)
+              || ts.isSatisfiesExpression(e.parent) || ts.isTypeAssertionExpression(e.parent))) e = e.parent
+          const invoked = e.parent !== undefined && ts.isCallExpression(e.parent) && e.parent.expression === e
+          if (!invoked) continue
         }
         // ⚠️ **被 await 的不算**：`await (pendingTail ?? …).catch(…)` 的尾巴当场收口，
         // 不会落进下一条用例（实测：db.test.ts 的 afterAll 清理正是这种写法，误报过）。
@@ -1520,6 +1590,13 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 旧实现不传，合法的绑定 hook 一律被判「未等待」）
     expect(hookHits(`${H}.bind(null)(async () => { await (pending ?? Promise.resolve()).then(w) })`),
       '绑定的 hook 自己 await 整条链').toEqual([])
+    // ⚠️ **bind 结果再经 `.call` / `.apply` 调用**（CR 第四十五轮 major）：
+    // `(p ?? Promise.resolve()).then.bind(p).call(null, w)` 同样在 hook 返回后跑 `w`。
+    expect(hookHits(`${H}(() => { (pending ?? Promise.resolve()).then.bind(pending).call(null, w) })`),
+      '未知基座 then 经 bind 再经 call').toEqual(['?.then('])
+    // 反例：只创建绑定函数、不调用（后面没有调用）不是调度
+    expect(hookHits(`${H}(() => { const bZ = (pending ?? Promise.resolve()).then.bind(pending) })`),
+      '只创建绑定函数').toEqual([])
     // 反例：绑定的 hook **只创建不调用** → 不是 hook，里面什么都不判
     expect(hookHits(`const hookZC = ${H}.bind(null, () => { ${ST}(w, 80) })`), '绑定但不调用的 hook 不扫描').toEqual([])
     // hook 体内的调度原语经 bind 后再经 call/apply 调用（Codex PR#81 第三十二轮 P2，探针复现）
@@ -1930,6 +2007,22 @@ it('Q34', oQ34, () => {})`),
     // 隔一层 `describe` 回调之后，`a` 只在作用域内部被声明，顶层扫描看不见它。
     expect(concHits(`const oQ5 = ${Zq}\ndescribe('g', () => { const aliasQ5 = oQ5\n  describe('h', () => { Object.assign(aliasQ5, { con${'current: true }'}) }) })\nit('Q5', oQ5, () => {})`),
       '作用域内的别名').toEqual(['unknown'])
+    // ⚠️ 原型分支里的**未知展开**必须传播（CR 第四十五轮 major）：`__proto__: { ...inherited }`
+    // 的继承键静态看不见（inherited 可能带 concurrent），旧实现丢掉了内层的 mayHaveUnknown。
+    expect(concHits(`const inheritedQ45 = { con${'current: true }'}\ndescribe('P45', { __proto__: { ...inheritedQ45 } }, () => {})`),
+      '原型分支里的未知展开 → 看不清').toEqual(['unknown'])
+    // 反例：已知自有键盖过继承值，照常判（不能被上面的传播误伤）
+    expect(concHits(`const inh45 = { con${'current: true }'}\ndescribe('P46', { __proto__: { ...inh45 }, con${'current: false }'}, () => {})`),
+      '自有键盖过原型').toEqual([])
+    // ⚠️ 命名导入别名（`import { it as check }`）同样是登记（CR 第四十五轮 major）
+    expect(concHits(`import { it as check45 } from ${JSON.stringify('vitest')}\ncheck45('X45', { con${'current: true }'}, () => {})`),
+      'vitest 命名导入别名').toEqual(['opt'])
+    // 反例：非 vitest 来源的同名函数不是登记
+    expect(concHits(`function localIt(n, o, f) { return [n, o, f] }\nlocalIt('Y45', { con${'current: true }'}, () => {})`),
+      '本地同名函数不是登记').toEqual([])
+    // ⚠️ 解构别名（`const [alias] = [opts]`）同样写穿（CR 第四十五轮 major）
+    expect(concHits(`const oD45 = ${Zq}\nconst [alias45] = [oD45]\nalias45['concurrent'] = true\nit('D45', oD45, () => {})`),
+      '数组解构别名写穿').toEqual(['unknown'])
     // 套件上显式 `sequential: true` 是串行收口（Codex 第二十五轮 P2）
     expect(concHits(`describe('Q9', { ...optsQ, se${'quential: true }, () => {})'}`),
       'sequential:true 收口未知展开').toEqual([])

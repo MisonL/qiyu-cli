@@ -283,7 +283,10 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
           // 直接被继承的键（如 `toString`）不是选项，不收。
           protoMap = new Map(inner.props)
           for (const [ik, iv] of inner.proto.own) if (!protoMap.has(ik)) protoMap.set(ik, iv)
-          protoUnresolved = inner.proto.unresolved
+          // ⚠️ 内层有**未知键**（`__proto__: { ...inherited }`）时，原型上可能带任何选项
+          // （CR 第四十五轮 major）：只取 `inner.proto.unresolved` 会丢掉 `mayHaveUnknown`，
+          // 套件守卫随即看到「原型上没有相关键」而放行。
+          protoUnresolved = inner.proto.unresolved || inner.mayHaveUnknown
         } else if (src.kind === ts.SyntaxKind.NullKeyword || ts.isNumericLiteral(src)
           || ts.isStringLiteral(src) || ts.isNoSubstitutionTemplateLiteral(src)) {
           // 原型设成常量：数字 / 字符串会被装箱，但原型上都没有可继承的选项键。
