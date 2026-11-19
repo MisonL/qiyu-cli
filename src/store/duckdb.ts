@@ -502,6 +502,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           + '不要按失败直接重试（可能重复写）；请用新的 Store 实例核对后再决定', { cause: e })
         ;(err as { kind?: string }).kind = 'internal'
         ;(err as { hint?: string }).hint = '关闭并重建 Store 实例，核对数据后决定是否重放'
+        // 这条错误已按成因给过恢复动作：外层 catch 的回滚收尾不得再补通用文案（两套指令打架）。
+        selfDiagnosed.add(err)
         throw err
       }
       beganTx.delete(token)
@@ -514,7 +516,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           ? `事务回调返回时仍有 ${ownPending} 条本事务的语句没有交回结果（是不是没有 await 它们？）`
           : `事务提交时仍有 ${foreignInFlight} 条其他异步链下发的语句没有交回结果，它执行期报错会把本事务标成 aborted`)
     // ⚠️ 顺序：先退役令牌（停掉后续下发），再等在途语句交回，最后才 ROLLBACK（`closeTx`）。
-    const rolledBack = await closeTx(token)
+    const closed = await closeTx(token)
+    const rolledBack = closed === 'confirmed'
     txInFlight.delete(token)
     txWrites.delete(token)
     const err = new Error(`事务未提交：${why} —— 该事务可能已被 DuckDB 标成 aborted，`
@@ -594,6 +597,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       ;(err as { hint?: string }).hint = '把多条语句拆成多次 query 调用；写入请放进 store.transaction() 的回调里'
       throw err
     }
+    // ⚠️ **解析结果在途期间连接可能已被关闭 / 退役**（CR 第四十二轮 major，真驱动探针
+    // 2026-11-20 复现）：`close()` 之后交回的解析句柄照旧能用，旧实现无条件 `prepare(0)`，
+    // 在**已关闭的连接**上又做了一次原生操作。这里不再碰原生上下文，归因交给 `execSql`
+    // 派发前的同源重判（与 `close()` 之后任何语句一样报「数据库连接已关闭」）。
+    if (closed) throw usage('数据库连接已关闭')
+    if (poisoned !== undefined) throw poisonedError(poisoned)
     const ST = mod.StatementType ?? {}
     const TRANSACTION = typeof ST.TRANSACTION === 'number' ? ST.TRANSACTION : 10
     let p: { statementType: number; destroySync?: () => void }
@@ -642,6 +651,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const epochBefore = txEpoch
     if (!txControl && TX_KEYWORD.test(sql)) {
       // 解析同样占用连接（extract/prepare 走原生上下文）：按在途登记，BEGIN 准入才看得见它。
+      // ⚠️ **归属先于登记**（CR 第四十二轮 major，实测复现）：判据必须是「当前链就是这条事务的
+      // 所有者」，而不是实例级的「有活动事务」—— 事务开着时另一条链发来的解析若记在所有者账上，
+      // 所有者回调此刻返回，`commitOrRefuse` 会看到 ownPending>0、拒绝提交并把连接退役。
+      // `assertTxOwnership()` 在这里同步判（同 `foreignInFlight` 的输入），外部链在解析前就被拒。
+      assertTxOwnership()
       const untrackParse = inTx && txToken !== undefined ? trackOwn(txToken) : trackForeign()
       try {
         await rejectRawTxControl(sql)
@@ -883,59 +897,107 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   }
 
   /**
-   * 在令牌上下文里收尾：退役令牌 → 等在途语句落定 → ROLLBACK。返回**是否确认回滚成功**。
+   * 事务收尾的**三态**（CR 第四十二轮 major）：`confirmed` = ROLLBACK 已确认，写入已撤；
+   * `unconfirmed` = 回滚可能没执行、事务也许还开着（连接已退役）；`none` = 本来就没什么可确认
+   * （BEGIN 未成功 / 连接已关 —— 后者实测未提交写入随连接丢弃）。
+   * ⚠️ 旧实现只有布尔，「未能确认」与「已确认」在两个事务处理器的 rethrow 上完全同形，
+   * `store init` 的用户因此分不出「迁移写入已撤」与「写入状态不可信」。
+   */
+  type TxClose = 'confirmed' | 'unconfirmed' | 'none'
+  /**
+   * 把「回滚未能确认」补进**交回给调用方的那个错误**（两个事务处理器的唯一落点）。
+   * 身份与 cause 不变（原错误原样透传是既有契约），只追加状态与恢复动作 ——
+   * 否则调用方的诊断与已确认回滚一字不差（CR 第四十二轮 major）。
+   * 边界如实记录：回调拒绝的不是 Error（字符串 / 对象）时无处挂 hint，原值原样交回；
+   * 「回滚未确认」这一事实此时仍由退役状态保证（本实例的后续语句全被拒）。
+   */
+  /** 自带成因级恢复动作的错误（COMMIT 结果未知）—— 不再追加通用回滚文案，免得两套指令打架。 */
+  const selfDiagnosed = new WeakSet<object>()
+  const annotateUnconfirmedRollback = <E>(e: E, state: TxClose): E => {
+    if (state !== 'unconfirmed' || !(e instanceof Error) || selfDiagnosed.has(e)) return e
+    e.message = `${e.message} ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；`
+      + '该连接已退役，本实例上的写入结果不可信'
+    const prev = (e as { hint?: string }).hint
+    const add = '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）'
+      + '再决定是否重放；本实例上的后续语句都会被拒'
+    ;(e as { hint?: string }).hint = prev === undefined ? add : `${prev} ${add}`
+    return e
+  }
+  /**
+   * 在令牌上下文里收尾：退役令牌 → 等在途语句落定 → ROLLBACK。返回收尾状态（三态，见
+   * `TxClose`）：`confirmed` 才会被 `commitOrRefuse` 说成「已整体回滚」；`unconfirmed` 由两个
+   * 事务处理器补进交回的错误（CR 第四十二轮 major：否则调用方拿到的诊断与已确认回滚一字不差）。
    * ⚠️ **关闭后不得进入上下文**（CodeRabbit PR#81 第十九轮 minor）：`close()` 已把 ALS
    * `disable()` 掉，而 `alsTx.run()` 会把它**重新启用**、失败路径又不再 disable ——
    * 「事务进行中被 close」每次都在攒一个启用态上下文。`execSql` 在这种情况下本来也必然抛
    * 「连接已关闭」，回滚必然失败，所以直接跳过。
    */
-  const rollbackInTx = async (token: TxToken): Promise<boolean> => {
+  const rollbackInTx = async (token: TxToken): Promise<TxClose> => {
     retire(token)
-    if (closed) return false
+    // 连接已关：未提交的写入随连接丢弃（真驱动探针 2026-11-20：关连接后重开，未提交行数 0），
+    // 事务状态不是「未知」，不需要向调用方补「回滚未确认」。
+    if (closed) return 'none'
     return alsTx.run(token, () => closeTx(token))
   }
   /**
    * `rollbackInTx` / `commitOrRefuse` 共用的事务收尾（只在令牌上下文里调用）。
-   * 返回「回滚是否确认」；无法确认时**退役连接**并**不发 ROLLBACK**（CR 第三十七轮 major #1/#4）：
+   * 返回收尾状态；无法确认时**退役连接**并**不发 ROLLBACK**（CR 第三十七轮 major #1/#4）：
    * 先 ROLLBACK 的话，驱动里还没执行完的语句会在事务结束后于 autocommit 里执行。
    */
-  const closeTx = async (token: TxToken): Promise<boolean> => {
+  const closeTx = async (token: TxToken): Promise<TxClose> => {
     retire(token)
-    if (closed) return false
+    if (closed) return 'none'
     if (!(await drainOwned(token))) {
       // 中断之后仍不交回：语句卡在不可中断的原生点上。此时连 close 都不能让进程退出
       //（实测：连接/实例都秒关，但原生线程仍被自身查询占住），所以退役文案要与这一事实一致。
       poison('事务内仍有语句没有交回结果（中断后仍未返回），无法确认它们不会在回滚之后落库')
-      return false
+      return 'unconfirmed'
     }
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      // 事务控制语句豁免「令牌已退役」检查，否则收尾自己的 ROLLBACK 也会被挡。
-      // ⚠️ **ROLLBACK 自身必须有界**（CR 第四十一轮 major）：drain 的截止时刻只覆盖在途语句；
-      // 驱动卡在 ROLLBACK 上时整条命令会永久挂住。超时按「未能确认」处理 —— **不**在这里
-      // interrupt（收尾的最坏路径是中断到别人正在跑的语句；退役 + 关闭连接已经足够，
-      // 而信号该在 drain 卡住时发，那里才是「语句还没交回」的判据）。
-      await Promise.race([
-        execSql('ROLLBACK', [], { txControl: true }),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`ROLLBACK 在 ${ROLLBACK_CAP_MS}ms 内未返回`)), ROLLBACK_CAP_MS)
-        }),
+    // 事务控制语句豁免「令牌已退役」检查，否则收尾自己的 ROLLBACK 也会被挡。
+    // ⚠️ **ROLLBACK 自身必须有界，且超时后必须 interrupt**（CR 第四十一轮 major 定有界、
+    // 第四十二轮补中断）。子进程实测（DuckDB 1.5.6-r.1，2026-11-20）：巨型语句占住原生线程、
+    // ROLLBACK 排在它后面时，到点只 close 掉连接与实例，**进程 15s 内不退出**（只能 SIGKILL，
+    // closeSync 不取消原生任务）；同一探针先 `interrupt()`，卡住的语句以 `INTERRUPT Error`
+    // 交回、排队的 ROLLBACK 随即执行成功、1.9s 内正常退出。所以：到点先 interrupt，
+    // 再给 `DRAIN_INTERRUPT_GRACE_MS` 等 ROLLBACK 落定；等不到才按「未能确认」退役。
+    let failed: unknown
+    const settled = execSql('ROLLBACK', [], { txControl: true })
+      .then(() => { /* 成功 */ }, (e: unknown) => { failed = e })
+    /** 等到 `settled` 或超时；返回是否已落定。 */
+    const awaitSettled = async (ms: number): Promise<boolean> => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const done = await Promise.race([
+        settled.then(() => true),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms) }),
       ])
+      if (timer !== undefined) clearTimeout(timer)
+      return done
+    }
+    try {
+      if (!(await awaitSettled(ROLLBACK_CAP_MS))) {
+        try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 中断失败照旧走退役路径 */ }
+        if (!(await awaitSettled(DRAIN_INTERRUPT_GRACE_MS))) {
+          // 中断之后仍不交回：卡在不可中断的原生点上（连 close 都不能让进程退出）。
+          poison(`ROLLBACK 在 ${ROLLBACK_CAP_MS}ms 内未返回，中断后 ${DRAIN_INTERRUPT_GRACE_MS}ms 内仍未交回：事务也许仍然开着`)
+          beganTx.delete(token)
+          return 'unconfirmed'
+        }
+      }
+      if (failed !== undefined) throw failed
       beganTx.delete(token)
-      return true
+      return 'confirmed'
     } catch (e) {
       // BEGIN 都没成功 → 本来就没有事务可回滚（可以是 BEGIN 被快照拒这类响亮失败），不是「状态未知」。
       // 挂住的那次 ROLLBACK 若**迟到成功**，事务其实已经收尾 —— 但本实例状态已经不可信
       //（退役由 poison 负责、连接即将关闭），不因迟到结果恢复可用性，保持「未能确认」。
       if (beganTx.has(token)) {
-        poison(e instanceof Error && /ROLLBACK 在 \d+ms 内未返回/.test(e.message)
-          ? `ROLLBACK 在 ${ROLLBACK_CAP_MS}ms 内未返回：事务也许仍然开着`
-          : 'ROLLBACK 未能确认：它可能根本没有执行，事务也许仍然开着')
+        poison('ROLLBACK 未能确认：它可能根本没有执行，事务也许仍然开着')
       }
+      // BEGIN 都没成功（`beganTx` 里没有令牌）：本来就没有事务可回滚，状态**不是**未知；
+      // 只有「BEGIN 曾成功 → ROLLBACK 没确认」才是「事务也许仍然开着」。
+      const unconfirmed = beganTx.has(token)
       beganTx.delete(token)
-      return false
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
+      return unconfirmed ? 'unconfirmed' : 'none'
     }
   }
 
@@ -1118,7 +1180,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         // ⚠️ 准入失败（还没碰过 BEGIN）不得回滚（CR 第三十九轮 major #1）：那条 ROLLBACK 会发到
         // 一条**别人的**事务上（手开事务）并拖慢拒绝。只有 BEGIN 已尝试过才进入回滚处理 ——
         // 「原生 BEGIN 成功了但结果交回被拒」的情形由 `beginAttempted` + `beganTx` 一起兜住。
-        if (!isRefusal(e, token) && beginAttempted) await rollbackInTx(token)
+        if (!isRefusal(e, token) && beginAttempted) {
+          // 回滚未能确认时必须带回状态（CR 第四十二轮 major）：rethrow 原错误，但让它自己说出
+          // 「写入状态不可信」。已确认回滚 / 无可回滚的路径一字不改。
+          throw annotateUnconfirmedRollback(e, await rollbackInTx(token))
+        }
         throw e
       } finally {
         inTx = false
@@ -1208,7 +1274,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         // ROLLBACK 也走 `execSql`：在令牌上下文里发，闸门才认得它属于本事务（若 BEGIN 都没
         // 成功，`safeRollback` 吞掉「没有事务」的次生错误）。⚠️ `commitOrRefuse` 抛出的拒绝
         // 已在身份集合里：回滚已由它负责，这里不再回滚第二次（CR 第三十六轮 major）。
-        if (!isRefusal(e, token)) await rollbackInTx(token)
+        if (!isRefusal(e, token)) throw annotateUnconfirmedRollback(e, await rollbackInTx(token))
         throw e
       } finally {
         inTx = false

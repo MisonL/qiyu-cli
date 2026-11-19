@@ -195,39 +195,28 @@ export function describeNonJson(httpStatus, contentType, text) {
   }
 }
 
-async function main() {
-  const casesPath = process.argv[2]
-  if (!casesPath) {
-    console.error('用法：node scripts/registry/sample.mjs <用例文件.json>（用例文件放 private/，不要提交）')
-    process.exit(2)
-  }
-  const creds = readCreds(process.env)
-  // 动态 import：dist 不存在时给出可执行的提示，而不是一个 MODULE_NOT_FOUND 栈。
-  let signedQuery
-  try {
-    ({ signedQuery } = await import('../../dist/core/sign.js'))
-  } catch {
-    console.error('找不到 dist/core/sign.js —— 先跑 `npm run build`（签名只有一个实现点，见本文件头注释①）')
-    process.exit(2)
-  }
-
-  const specs = Object.fromEntries(
-    JSON.parse(readFileSync(SPECS_PATH, 'utf8')).map((s) => [s.id, s]),
-  )
-  const cases = JSON.parse(readFileSync(resolve(casesPath), 'utf8'))
-
+/**
+ * 逐条分发的**唯一实现点**（main 只做 I/O 准备后调它）。
+ *
+ * ⚠️ 为什么拆成可注入参数的函数（CR 第四十二轮 major）：用例拿真实主循环来验
+ * 「被拒的接口一个请求都不发」。本地仿写一个 dispatch 只能证明 `assertSampleable`
+ * 本身会拒 —— 而生产路径是**这个循环里的顺序**：校验必须在 `fetchImpl` **之前**。
+ * 顺序一旦被改成先请求后校验，仿写用例照样绿，这里会红（fetchImpl 计数 1）。
+ * 依赖（凭据、签名、fetch、输出）全部由参数传入：测试不需要 dist、不联网、不打凭据。
+ */
+export async function runCases({ cases, specs, signedQuery, fetchImpl, log = console.log, now = Date.now }) {
   for (const { id, body } of cases) {
     const spec = specs[id]
     try {
       assertSampleable(spec, id)
     } catch (e) {
-      console.log(id, '=> 拒绝：', e.message)
+      log(id, '=> 拒绝：', e.message)
       continue
     }
     const bodyStr = body === undefined ? undefined : JSON.stringify(body)
-    const q = signedQuery(creds.appKey, creds.appSecret, bodyStr ?? '', Math.floor(Date.now() / 1000))
+    const q = signedQuery(spec, bodyStr, Math.floor(now() / 1000))
     try {
-      const res = await fetch(`${BASE}${spec.path}?${q}`, {
+      const res = await fetchImpl(`${BASE}${spec.path}?${q}`, {
         method: spec.method,
         headers: { 'Content-Type': 'application/json', 'Accept-Encoding': 'identity' },
         body: bodyStr,
@@ -239,14 +228,43 @@ async function main() {
         parsed = JSON.parse(text)
       } catch {
         // 非 JSON 响应：只报元数据，一个正文字符都不给（见 describeNonJson 的说明）
-        console.log(id, '=>', JSON.stringify(describeNonJson(res.status, res.headers.get('content-type'), text)))
+        log(id, '=>', JSON.stringify(describeNonJson(res.status, res.headers.get('content-type'), text)))
         continue
       }
-      console.log(id, '=>', JSON.stringify({ httpStatus: res.status, ...summarize(parsed) }))
+      log(id, '=>', JSON.stringify({ httpStatus: res.status, ...summarize(parsed) }))
     } catch (e) {
-      console.log(id, '=> 请求失败：', String(e).slice(0, 120))
+      log(id, '=> 请求失败：', String(e).slice(0, 120))
     }
   }
+}
+
+async function main() {
+  const casesPath = process.argv[2]
+  if (!casesPath) {
+    console.error('用法：node scripts/registry/sample.mjs <用例文件.json>（用例文件放 private/，不要提交）')
+    process.exit(2)
+  }
+  const creds = readCreds(process.env)
+  // 动态 import：dist 不存在时给出可执行的提示，而不是一个 MODULE_NOT_FOUND 栈。
+  let signMod
+  try {
+    signMod = await import('../../dist/core/sign.js')
+  } catch {
+    console.error('找不到 dist/core/sign.js —— 先跑 `npm run build`（签名只有一个实现点，见本文件头注释①）')
+    process.exit(2)
+  }
+
+  const specs = Object.fromEntries(
+    JSON.parse(readFileSync(SPECS_PATH, 'utf8')).map((s) => [s.id, s]),
+  )
+  const cases = JSON.parse(readFileSync(resolve(casesPath), 'utf8'))
+
+  await runCases({
+    cases,
+    specs,
+    signedQuery: (_spec, bodyStr, ts) => signMod.signedQuery(creds.appKey, creds.appSecret, bodyStr ?? '', ts),
+    fetchImpl: fetch,
+  })
 }
 
 // 只有直接执行时才跑 main（被 import 时不跑，测试才拿得到纯函数）

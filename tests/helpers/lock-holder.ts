@@ -263,7 +263,19 @@ function describeTerm(run: ScriptRun): string {
   return `请求 SIGKILL 后 ${CLOSE_GRACE_MS}ms 内未等到 close（kill 返回 ${kill.accepted}）；${tail}`
 }
 
-/** 等到子进程打印 `marker`，或它结束 / spawn 失败 / 预算耗尽。 */
+/**
+ * 就绪信号的判据：stdout 里出现**完整的一行** `marker`。
+ *
+ * ⚠️ 只看 stdout、且必须整行（CR 第四十二轮 major）：此前搜的是 stdout+stderr 合并串的
+ * **子串**，一条启动失败把 `locked` 带进 stderr（例如打不开 `/tmp/locked/q.db`）就会被
+ * 当成就绪 —— 用例随后拿一个从未拿到锁的 holder 当「锁已持有」，把夹具失败说成锁生效。
+ * 分块到达由调用方轮询累积的 stdout 自然兜住（`loc` + `ked\n` 两段仍拼得出整行）。
+ */
+function stdoutHasMarkerLine(stdout: string, marker: string): boolean {
+  return stdout.split('\n').some((l) => l.trim() === marker)
+}
+
+/** 等到子进程在 stdout 打出 `marker` 整行，或它结束 / spawn 失败 / 预算耗尽。 */
 async function waitForMarker(
   child: ChildProcess, marker: string, deadline: number, what: string,
 ): Promise<void> {
@@ -280,12 +292,12 @@ async function waitForMarker(
     }
     // 轮询兜住「分块到达的 marker」与「error 已到但 close 未到」两种形态。
     const iv = setInterval(() => {
-      if (run.out.includes(marker)) finish(true)
+      if (stdoutHasMarkerLine(run.stdout, marker)) finish(true)
       else if (run.closed || run.failedNative) finish(false)
     }, 50)
-    const onClose = (): void => finish(run.out.includes(marker))
+    const onClose = (): void => finish(stdoutHasMarkerLine(run.stdout, marker))
     const onError = (): void => { /* 记录在 run 里，由轮询收尾 */ }
-    const to = setTimeout(() => finish(run.out.includes(marker)), Math.max(budget, 0))
+    const to = setTimeout(() => finish(stdoutHasMarkerLine(run.stdout, marker)), Math.max(budget, 0))
     child.on('close', onClose)
     child.on('error', onError)
   })
@@ -304,6 +316,10 @@ async function waitForMarker(
   const why = run.failedNative
     ? '启动失败'
     : budget <= 0 ? `预算已耗尽（deadline 已过 ${-budget}ms）` : `在剩余预算 ${budget}ms 内未就绪`
+  // ⚠️ close 未确认时子进程**可能仍在运行**（SIGKILL 已发但 stdio 还被后代继承着）。
+  // 调用方必须让用例红、**不得**换轮重试或复用这个库路径 —— 目录随用例一起删掉是安全的
+  // （POSIX 上删掉仍被占用的文件不影响那个进程），但「以为进程没了」再复用路径就不是。
+  // 这句必须出现在失败文案里，否则读日志的人只会看到「未就绪」。
   const failure = run.finalFailure(`${what}${why}`)
   run.dispose()
   throw failure

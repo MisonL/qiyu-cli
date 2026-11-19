@@ -354,6 +354,21 @@ describe('锁夹具的子进程生命周期', () => {
     expectClean(child)
   })
 
+  it('holder：stderr 上出现含 "locked" 的报错路径 → **不得**当成就绪（只认 stdout 的完整一行）（CR 第四十二轮 major）', async () => {
+    // 事故：就绪探测搜的是 stdout+stderr 合并串。一条启动失败（例如打不开
+    // `/tmp/locked/q.db`）把 `locked` 带进 stderr，探测立刻返回一个**从未拿到锁**的
+    // holder —— 撞锁用例随后拿它当「锁已持有」，把夹具失败当成锁生效放行。
+    const running = observe(invoke('holder', BUDGET))
+    child.stderr?.emit('data', 'Error: 无法打开 /tmp/locked/q.db\n')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(running.isSettled(), 'stderr 里的路径不是就绪信号').toBe(false)
+    child.stdout?.emit('data', 'locked\n')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(running.isSettled(), 'stdout 的完整一行才是就绪信号').toBe(true)
+    expect(await running.result).toEqual({ value: child })
+    expectClean(child)
+  })
+
   it('seed：exit 0 之后等到 close 才成功', async () => {
     const running = observe(invoke('seed', 1_000_000))
     child.emit('exit', 0, null)

@@ -890,6 +890,34 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     expect(e!.message).not.toMatch(/Store 已退役/)
     expect(e!.hint, '恢复动作：核对后再决定是否重放').toMatch(/核对/)
     expect(e!.hint).toMatch(/重放/)
+    // ⚠️ 回滚收尾的补注**不得**嫁接到这条诊断上（CR 第四十二轮 major 的追问，真驱动探针
+    // 2026-11-20 实测过嫁接形态）：COMMIT 已下发、写入可能已落库，此时再说「回滚可能根本没
+    // 执行、写入结果不可信」只是把恢复动作稀释成两套互相打架的指令。核对→再决定重放才是
+    // 这条成因的指引，且它必须原样到达 Agent。
+    expect(e!.message, '不得追加通用回滚补注').not.toMatch(/回滚未能确认/)
+    expect(e!.hint, '不得追加通用回滚补注').not.toMatch(/写入结果不可信/)
+    await store.close()
+  })
+
+  it('退役/提交未知对两层重试判据都是终态：窗口事务只尝试一次（不重试、不被 store_retired 顶替）（CR 第四十二轮 major）', async () => {
+    // CR 的追问：`commitWindow` 走 `withStoreRetries`，rotated 路径又在外面套 `isTransient` ——
+    // 任一判据若把「退役」当可重试，第二次尝试会立刻撞上 `store_retired`，主失败里的恢复
+    // 指令被换成退役文案，诱导重复写。判据：真实退役错误对两层都是终态 ⇒ 事务只尝试一次。
+    // 计数用**真 store 的委托包装**（不是手写假 store）：退役行为仍由 duckdb.ts 产出。
+    const { store } = await storeWithCommitFailureAt(2)
+    // ⚠️ 判据取 `ctx.sleep`：`withRetries` 的**每次重试**都先等 `RETRY_DELAY_MS` 再跑第二次，
+    // 而退役之后的「gap 落库」事务是在 BEGIN 处被拒的收尾动作（不经过重试等待）。
+    // 数 transaction 调用会把它算进来，数回调执行次数又会在「第二次被 BEGIN 拒掉」时漏判。
+    let retryWaits = 0
+    const t = fakeTask({
+      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+    })
+    const e = await runTask(t, ctx(store, {
+      sleep: async () => { retryWaits++ },
+    })).then(() => null, (x: unknown) => x as Error)
+    expect(e, '必须上抛').not.toBeNull()
+    expect(e!.message, '主失败必须保留，不得被第二次尝试换掉').toMatch(/提交结果未知/)
+    expect(retryWaits, '退役错误对两层重试判据都必须是终态 —— 一次重试等待都不许有').toBe(0)
     await store.close()
   })
 

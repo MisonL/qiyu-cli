@@ -960,7 +960,9 @@ describe('duckdb —— 事务', () => {
         },
       },
     })
-    const s = await createDuckDbStore(cfg, 'rw', { importer, rollbackCapMs: 50 })
+    // 有界 = 预算 + 中断宽限（两条都注入到毫秒级；CR 第四十二轮在预算之后又加了中断宽限，
+    // 默认各 5s，这里不注入就会真等 5s、把「有界」测成「刚好卡线」）。
+    const s = await createDuckDbStore(cfg, 'rw', { importer, rollbackCapMs: 50, drainInterruptGraceMs: 50 })
     await s.init()
     const boom = new Error('boom')
     const started = Date.now()
@@ -968,12 +970,232 @@ describe('duckdb —— 事务', () => {
       await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
       throw boom
     }).then(() => null, (e: unknown) => e)
-    expect(txErr, '原始错误原样透传').toBe(boom)
-    expect(Date.now() - started, '收尾必须有界（不是无限等 ROLLBACK）').toBeLessThan(5_000)
+    expect(txErr, '原始错误原样透传（身份不变，回滚状态补在 message/hint 上）').toBe(boom)
+    expect(Date.now() - started, '收尾必须有界（不是无限等 ROLLBACK + 中断宽限）').toBeLessThan(5_000)
     const after = await s.count('tags').then(() => null, (e: unknown) => e as Error)
     expect(after, '回滚未能确认 → 连接退役').toMatchObject({ kind: 'internal' })
     expect((after as Error).message).toMatch(/退役|无法确认/)
     await s.close()
+  })
+
+  it('ROLLBACK 自身卡住 → 到点先 interrupt（否则原生线程占住、进程再也不退出），交回后回滚即为确认（CR 第四十二轮 major）', { timeout: 90_000 }, async () => {
+    // 子进程实测（DuckDB 1.5.6-r.1，2026-11-20）：巨型语句在原生执行、ROLLBACK 排在它后面；
+    // JS 计时器到点直接 close 掉连接与实例 → **进程 15s 内不退出**，只能 SIGKILL
+    // （closeSync 不取消原生任务）。超时后先 `interrupt()`，卡住的语句以 `INTERRUPT Error`
+    // 交回、排队的 ROLLBACK 随即执行成功，1.9s 内正常退出 —— 同一探针两分支对照。
+    const real = await import('@duckdb/node-api')
+    let interrupted = false
+    let hang = true
+    let releaseRollback!: () => void
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                interrupt: () => {
+                  interrupted = true
+                  // 真实驱动里 interrupt 让排队语句交回、ROLLBACK 随即执行成功 —— 这里复现同一顺序。
+                  if (hang) { hang = false; releaseRollback() }
+                },
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') {
+                    await new Promise<void>((r) => { releaseRollback = r })
+                    return cc.runAndReadAll(sql, params)
+                  }
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', {
+      importer, rollbackCapMs: 50, drainInterruptGraceMs: 300,
+    })
+    await s.init()
+    const boom = new Error('boom')
+    const txErr = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw boom
+    }).then(() => null, (e: unknown) => e as Error & { hint?: string })
+    expect(interrupted, 'ROLLBACK 超时后必须先 interrupt —— 不中断的原生线程会让进程无法退出').toBe(true)
+    expect(txErr, '原错误身份保留').toBe(boom)
+    expect(boom.message, '中断后 ROLLBACK 真的执行成功 → 回滚是**已确认**的，不得再加「未能确认」').not.toMatch(/回滚未能确认/)
+    expect(await s.count('tags'), '回滚已确认 → 连接仍可用（不退役）').toBe(0)
+    await s.close()
+  })
+
+  it('interrupt 之后 ROLLBACK 仍不交回 → 有界放弃、退役，并如实说「回滚未能确认」（CR 第四十二轮 major）', { timeout: 90_000 }, async () => {
+    const real = await import('@duckdb/node-api')
+    let interrupted = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                interrupt: () => { interrupted = true },
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') return new Promise(() => { /* 中断后仍不交回 */ })
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', {
+      importer, rollbackCapMs: 50, drainInterruptGraceMs: 100,
+    })
+    await s.init()
+    const boom = new Error('boom')
+    const started = Date.now()
+    const txErr = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw boom
+    }).then(() => null, (e: unknown) => e as Error & { hint?: string })
+    expect(interrupted, '中断是「不可中断原生点」判据的另一半：必须先试过').toBe(true)
+    expect(Date.now() - started, '中断宽限也必须是有界的').toBeLessThan(5_000)
+    expect(txErr!.message, '放弃之后必须说出来').toMatch(/回滚未能确认/)
+    const after = await s.count('tags').then(() => null, (e: unknown) => e as Error)
+    expect(after, '回滚未能确认 → 连接必须退役').toMatchObject({ kind: 'internal' })
+    await s.close()
+  })
+
+  it('外部链的含事务关键字 SQL 在事务期间 → 解析开始前就被拒，不得记在所有者账上（CR 第四十二轮 major）', { timeout: 90_000 }, async () => {
+    // 事故（真驱动探针 2026-11-20 复现）：事务已开、已写；外部链发一条**含事务关键字的查询**
+    // （`CASE WHEN true THEN 1 END` 会进解析判据）。旧实现在解析前按实例级 `inTx` 登记为
+    // `trackOwn(txToken)`，于是**外部链的解析被算成所有者的在途工作** —— 所有者回调此刻返回，
+    // `commitOrRefuse` 看到 ownPending>0，拒绝提交、回滚写入并退役连接（探针实测 tags=0）。
+    // 判据：归属必须**先于**解析判定与登记；外部链在解析前就被 `assertTxOwnership` 拒。
+    const real = await import('@duckdb/node-api')
+    let extractArmed = false
+    let parsedOutside = 0
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: async (sql: string) => {
+                  if (extractArmed) parsedOutside++
+                  return cc.extractStatements(sql)
+                },
+                runAndReadAll: (sql: string, params?: unknown[]) => cc.runAndReadAll(sql, params),
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    let wrote!: () => void
+    const writeDone = new Promise<void>((r) => { wrote = r })
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const txP = s.transaction(async (tx) => {
+      await tx.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      wrote()
+      await gate
+    }).then(() => 'committed', (e: unknown) => `rejected: ${(e as Error).message}`)
+    await writeDone
+    extractArmed = true
+    const outside = await s.query("SELECT CASE WHEN true THEN 1 END AS v")
+      .then(() => 'ok', (e: unknown) => `rejected: ${(e as { kind?: string }).kind}`)
+    expect(outside, '外部链必须在解析开始前就被拒（归属错误），而不是挂着等').toMatch(/^rejected: internal/)
+    expect(parsedOutside, '外部链的 SQL 不得进入解析 —— 否则它的在途会被记到所有者账上').toBe(0)
+    release()                     // 所有者回调在此时返回
+    expect(await txP, '所有者的事务不得被外部链拖垮').toBe('committed')
+    expect(await s.count('tags'), '所有者的写入必须落库').toBe(1)
+    await s.close()
+  })
+
+  it('解析结果在 close() 之后才交回 → 不得在已关闭连接上 prepare（CR 第四十二轮 major）', { timeout: 90_000 }, async () => {
+    // 事故（真驱动探针 2026-11-20 复现）：解析（extractStatements）在途时连接被关掉，
+    // 解析结果随后交回 —— 旧实现无条件 `prepare(0)`，在**已关闭的连接**上又做了一次原生操作
+    // （探针计数 0 → 1）。判据：连接已关 / 已退役时不得再碰原生上下文；归因交给
+    // execSql 的派发前重判（与 `close()` 之后任何语句一样报「数据库连接已关闭」）。
+    const real = await import('@duckdb/node-api')
+    let slow = false
+    let prepared = 0
+    let extracting!: () => void
+    const parseStarted = new Promise<void>((r) => { extracting = r })
+    let releaseParse!: () => void
+    const parseGate = new Promise<void>((r) => { releaseParse = r })
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as {
+                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
+                extractStatements: (x: string) => Promise<{ count: number; prepare: (i: number) => Promise<{ statementType: number; destroySync?: () => void }> }>
+                closeSync?: () => void
+              }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: async (sql: string) => {
+                  const ex = await cc.extractStatements(sql)
+                  if (slow) { slow = false; extracting(); await parseGate }
+                  return { count: ex.count, prepare: (i: number) => { prepared++; return ex.prepare(i) } }
+                },
+                runAndReadAll: (sql: string, params?: unknown[]) => cc.runAndReadAll(sql, params),
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    slow = true
+    const q = s.query("SELECT CASE WHEN true THEN 1 END AS v")
+      .then(() => 'ok', (e: unknown) => `rejected: ${(e as Error).message}`)
+    await parseStarted
+    await s.close()
+    releaseParse()
+    expect(await q, '已关闭连接上的查询必须报「数据库连接已关闭」').toMatch(/rejected: .*已关闭/)
+    expect(prepared, '连接已关 → 交回的解析结果不得再交给 prepare（不在原生上下文上做任何事）').toBe(0)
   })
 
   it('外部 delete 的第一条语句（count）报错也不得污掉所有者的事务（CodeRabbit PR#81 第十轮 major）', async () => {
@@ -1428,6 +1650,98 @@ describe('duckdb —— 事务', () => {
     // 守卫不粘滞：随后的事务照常可用
     await s.transaction(async (t) => { await t.upsert('tags', [{ id: '3', name: 'C', color: '#FFF' }]) })
     expect(await s.count('tags')).toBe(2)
+    await s.close()
+  })
+
+  it('回滚未能确认 → 交回的错误必须点明「回滚未确认」与恢复动作，同时保留原错误身份（CR 第四十二轮 major）', { timeout: 90_000 }, async () => {
+    // 事故（真驱动探针 2026-11-20 复现）：回调抛 boom、ROLLBACK 在执行前被拒 → closeTx 退役连接、
+    // 返回 false，而两个事务处理器都丢掉这个结果直接 rethrow boom —— 调用方拿到的诊断与
+    // 「已确认回滚」**一字不差**（message/hint/kind 全无差别），`store init` 的迁移失败因此
+    // 无法区分「写入已撤」与「写入状态不可信」。
+    // 判据：身份与 cause 不变（原错误原样透传仍是契约），但 message/hint 必须补上
+    // 「回滚未能确认」与「重建实例后再决定是否重放」。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const boom = new Error('boom')
+    const txErr = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw boom
+    }).then(() => null, (e: unknown) => e as Error & { hint?: string })
+    expect(txErr, '原错误身份必须保留（「原样透传」仍是契约）').toBe(boom)
+    expect(txErr!.message, '必须点明回滚未能确认').toMatch(/回滚未能确认/)
+    expect(txErr!.message, '不得再把原错误洗成「已回滚」').toMatch(/boom/)
+    expect(txErr!.hint, '恢复动作：重建实例 + 核对后再决定是否重放').toMatch(/重建/)
+    expect(txErr!.hint).toMatch(/重放|核对/)
+    await s.close()
+  })
+
+  it('自动事务（upsert）回滚未能确认 → 同样把状态带回调用方（第二处理器，CR 第四十二轮 major）', { timeout: 90_000 }, async () => {
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  // 注入：数据写入失败 → 自动事务进入回滚路径，而 ROLLBACK 本身也被拒
+                  if (armed && sql.startsWith('INSERT INTO "tags"')) throw new Error('注入：写入失败')
+                  if (armed && sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    armed = true
+    const err = await s.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+      .then(() => null, (e: unknown) => e as Error & { hint?: string })
+    expect(err, '写入失败必须上抛').not.toBeNull()
+    expect(err!.message, '自动事务的回滚同样未能确认，必须说出来').toMatch(/回滚未能确认/)
+    expect(err!.hint).toMatch(/重建/)
     await s.close()
   })
 

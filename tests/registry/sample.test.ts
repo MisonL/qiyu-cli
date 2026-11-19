@@ -16,7 +16,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   describeShape, describeNonJson, summarize, assertSampleable, readCreds,
-  READ_ONLY_IDS,
+  READ_ONLY_IDS, runCases,
 } from '../../scripts/registry/sample.mjs'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -178,6 +178,28 @@ describe('assertSampleable —— 拒采样写接口，判据取自注册表', (
     }
     expect(() => dispatch(mislabeled, 'robot.session.chat'), '白名单是唯一放行依据').toThrow(/未经确认只读/)
     expect(dispatched, '被拒的接口一个请求都不许发').toBe(0)
+  })
+
+  it('真实分发路径：注册表把写接口误标成 dangerous:false 时，**采样主循环**在 fetch 之前就拒绝（CR 第四十二轮 major）', async () => {
+    // ⚠️ 上一条只证明了 `assertSampleable` 会拒 —— 但生产里的分发是 `main()` 的循环，
+    // 这里的 `dispatch` 是本地仿写。本用例调用**采样器自己的循环**（`runCases`，main 的
+    // 唯一分发实现点），把 `fetch` 换成本地计数器：若循环把校验放在了 fetch 之后，
+    // 计数器就会变成 1（真实请求已经发出、生产数据已经改动）。
+    const specs = JSON.parse(read('src/core/registry/specs.json')) as Array<Record<string, unknown>>
+    const mislabeled = specs.filter((s) => s.id === 'robot.session.chat')
+      .map((s) => ({ ...s, dangerous: false }) as Record<string, unknown>)
+    expect(mislabeled, '前提：真实记录存在且被改回误标值').toHaveLength(1)
+    let fetched = 0
+    const lines: string[] = []
+    await runCases({
+      cases: [{ id: 'robot.session.chat', body: {} }],
+      specs: Object.fromEntries(mislabeled.map((s) => [String(s.id), s])),
+      signedQuery: () => 'q=stub',
+      fetchImpl: async () => { fetched++; return new Response('{}', { status: 200 }) },
+      log: (...parts: unknown[]) => { lines.push(parts.map(String).join(' ')) },
+    })
+    expect(fetched, '被拒的接口一个请求都不许发（校验必须在 fetch 之前）').toBe(0)
+    expect(lines.join('\n'), '拒绝理由必须点名白名单').toMatch(/未经确认只读/)
   })
 
   it('不在注册表里的 id 拒绝 —— 拼不出 path，也不该瞎猜', () => {
