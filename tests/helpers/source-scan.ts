@@ -246,22 +246,56 @@ export function objectPropsWithUnknown(obj: ts.ObjectLiteralExpression): {
    * （运行时才知道），与「来自未知展开」无法区分 —— 调用方需要分开报时看这里。
    */
   accessorKeys: Set<string>
+  /**
+   * **原型链来源**的键（非计算 `__proto__: v`，运行时设的是原型而不是自有键）。
+   * 值是对象字面量 → 按字面量递归；值是常量（null / 数字 / 字符串）→ 空映射；
+   * 值求不出（变量 / 调用 / 展开）→ `unresolved: true`，调用方按「看不清」处理。
+   * ⚠️ `own` 只收原型链上**没有**被自有键（含访问器）覆盖的键 —— 自有键优先。
+   */
+  proto: { own: Map<string, ts.Expression | undefined>; unresolved: boolean }
 } {
   return objectPropsInner(obj)
 }
 
-/** 递归返回「映射 + 是否可能含未知键（未知展开）+ 访问器键」，让不确定性传播到外层。 */
+/** 递归返回「映射 + 是否可能含未知键（未知展开）+ 访问器键 + 原型链来源」，让不确定性传播到外层。 */
 function objectPropsInner(obj: ts.ObjectLiteralExpression): {
   props: Map<string, ts.Expression | undefined>
   mayHaveUnknown: boolean
   accessorKeys: Set<string>
+  proto: { own: Map<string, ts.Expression | undefined>; unresolved: boolean }
 } {
   const out = new Map<string, ts.Expression | undefined>()
   const accessorKeys = new Set<string>()
   let mayHaveUnknown = false
+  // ⚠️ 非计算的 `__proto__: v` 是**设原型**的分支（字符串键同义），不是自有键；计算键
+  // `['__proto__']` 是普通自有键，走下面的正常路径。后写的 `__proto__` 覆盖先写的。
+  let protoMap = new Map<string, ts.Expression | undefined>()
+  let protoUnresolved = false
   for (const p of obj.properties) {
     if (ts.isPropertyAssignment(p)) {
       const k = staticPropKey(p.name, true)
+      // `__proto__` 的**非计算**键（标识符 / 字符串）是原型分支；计算键不是。
+      if (k === '__proto__' && !ts.isComputedPropertyName(p.name)) {
+        const src = unwrap(p.initializer)
+        if (ts.isObjectLiteralExpression(src)) {
+          const inner = objectPropsInner(src)
+          // 原型链上的键只保留内层**自有**的值；内层自己的 `__proto__` 继续沿链往下，
+          // 直接被继承的键（如 `toString`）不是选项，不收。
+          protoMap = new Map(inner.props)
+          for (const [ik, iv] of inner.proto.own) if (!protoMap.has(ik)) protoMap.set(ik, iv)
+          protoUnresolved = inner.proto.unresolved
+        } else if (src.kind === ts.SyntaxKind.NullKeyword || ts.isNumericLiteral(src)
+          || ts.isStringLiteral(src) || ts.isNoSubstitutionTemplateLiteral(src)) {
+          // 原型设成常量：数字 / 字符串会被装箱，但原型上都没有可继承的选项键。
+          protoMap = new Map()
+          protoUnresolved = false
+        } else {
+          // 变量 / 调用 / 展开：原型上有什么静态看不见
+          protoMap = new Map()
+          protoUnresolved = true
+        }
+        continue
+      }
       // 普通属性**后写覆盖**同名访问器：`{ ...{ get concurrent() { return true } }, concurrent: false }`
       // 实测按串行登记（Codex PR#81 第二十五轮 P2）—— 不清掉访问器标记，调用方会把合法串行
       // 报成「值运行时才知道」。
@@ -297,6 +331,8 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
         const inner = objectPropsInner(src)
         // 内层若含未知展开，它可能覆盖**外层**已有的键 —— 先清空再合并内层已知值。
         if (inner.mayHaveUnknown) { out.clear(); accessorKeys.clear() }
+        // ⚠️ 展开只复制**自有**键：内层的 `__proto__`（原型分支）不会成为外层的键，也不
+        // 影响外层已有的原型 —— 不合并、不清空 `protoMap`。
         // 后写的展开同样**覆盖**同名访问器：`{ ...{ get concurrent() {…} }, ...{ concurrent: false } }`
         // 内层是普通属性，外壳的访问器标记必须清掉（CodeRabbit PR#81 第二十六轮 minor）——
         // 否则调用方仍按「值运行时才知道」报未知，合法的串行样本被当成并发。
@@ -313,7 +349,9 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
       }
     }
   }
-  return { props: out, mayHaveUnknown, accessorKeys }
+  // 自有键（含访问器）盖过原型上的同名键 —— 只把没被盖住的留出来。
+  for (const k of out.keys()) protoMap.delete(k)
+  return { props: out, mayHaveUnknown, accessorKeys, proto: { own: protoMap, unresolved: protoUnresolved } }
 }
 
 /** 属性名 → 静态字符串键；动态键（变量 / 调用）返回 undefined。 */

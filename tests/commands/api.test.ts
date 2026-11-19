@@ -1180,6 +1180,29 @@ describe('api call —— 危险操作门禁', () => {
     vi.unstubAllEnvs()
   })
 
+  it('robot.session.chat + --yes + 对象形态 msg：真的发出、msg 原样进 body（CR 第四十一轮 major 的追问）', async () => {
+    // ⚠️ 上一条只证明「缺 --yes 被拦」。补这条的原因（CodeRabbit 第四十一轮）：`msg` 在
+    // 厂商文档里标成 string，而实测必须传**对象**（字符串会得到 14004 body内容json解析错误）。
+    // 对象值会走 `type_mismatch` 软告警 —— 校验在 `assertConfirmed` **之前**，所以要证的是
+    // 「软告警不拦请求、门禁放行后 msg 仍以对象形态发出」，而不是只看退出码。
+    vi.stubEnv('QIYU_APP_KEY', 'k')
+    vi.stubEnv('QIYU_APP_SECRET', 's')
+    const fetchSpy = vi.fn((_url: string | URL | Request, _init?: RequestInit) => Promise.resolve(
+      new Response(JSON.stringify({ code: 200, data: { sessionId: 'S1', answer: 'hi' } }),
+        { status: 200, headers: { 'content-type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchSpy)
+    const msg = { msgType: 'text', msgBody: { content: 'x' } }
+    const code = await apiCommand(['call', 'robot.session.chat', '--yes',
+      '--body', JSON.stringify({ uid: 'u1', msg })])
+    expect(code, '--yes 之后必须走正常成功路径（软告警不得拦请求）').toBe(0)
+    expect(fetchSpy, '恰好一个请求').toHaveBeenCalledTimes(1)
+    const sent = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body)
+    expect(sent.msg, 'msg 必须按对象发出（转成字符串会得到 14004）').toEqual(msg)
+    expect(JSON.parse(out).meta.endpoint).toBe('robot.session.chat')
+    vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
+  })
+
   it('robot.session.chat 也会被门禁拦下 —— 「非破坏性」不等于「不写」（2026-11-19 改判）', async () => {
     // ⚠️ 这条守的是一次真实的误分类：该接口在注册表里长期是 `dangerous:false`，
     // 而它的 note 自己写着「会话不存在时会自动创建真实会话」—— 调用一次就是一次

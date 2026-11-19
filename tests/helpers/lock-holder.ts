@@ -27,6 +27,16 @@
 //
 // ⚠️ 子进程一律用**脚本文件**而非 `-e`：`-e` 里的动态 import 依赖 shell 引号，历史上
 // 出现过被截断后静默不启动、只红成「未能启动」的形态。
+//
+// ⚠️ 生命周期约束（一切失败收尾的单一实现点）：
+//   · spawn 被 OS 拒绝时 Node 只发 `error`（实测 Node 24：`error` → `close(-2)`，**没有**
+//     `exit`），所以 `error` 必须有监听者，且必须原样交回调用方 —— 它是夹具/环境问题，
+//     不是锁竞态，不能落成未捕获异常，也不能换个错误顶替。
+//   · 预算耗尽时先 `kill('SIGKILL')`，再等**真实 `close`**（`exit` 只表示进程结束，
+//     stdio/文件句柄可能仍未放开）；调用方在 close 之前不得开始下一轮或删临时目录。
+//   · 等待 close 有界：先花剩余业务预算，再给 `CLOSE_GRACE_MS` 宽限；等不到就以
+//     `cause` 带上原始错误响亮失败 —— 既不无限挂住，也不把「清理未确认」说成正常结论。
+//   · `kill` 本身可能抛/触发 `error`（EPERM 等）：那也是原始失败，不得被吞成 TIMEOUT。
 import { spawn, type ChildProcess } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -42,6 +52,12 @@ export const PKG_URL = new URL('../../node_modules/@duckdb/node-api/lib/index.js
  */
 export const LOCK_BUDGET_MS = 300_000
 
+/**
+ * SIGKILL 之后等 `close` 的宽限。SIGKILL 不可被捕获，正常进程在毫秒级结束；等不到
+ * 只可能是 stdio 仍被后代继承或句柄被别处接管 —— 那种情况必须响亮失败而不是无限挂住。
+ */
+export const CLOSE_GRACE_MS = 5_000
+
 let seq = 0
 function runScript(script: string, scriptDir: string, name: string): ChildProcess {
   const path = join(scriptDir, `${name}-${++seq}.mjs`)
@@ -49,35 +65,248 @@ function runScript(script: string, scriptDir: string, name: string): ChildProces
   return spawn(process.execPath, [path], { stdio: ['ignore', 'pipe', 'pipe'] })
 }
 
-/** 等到子进程打印 `marker`，或它在就绪前退出 / 预算耗尽 —— 后两种带着原始输出报错。 */
+/**
+ * 一个脚本子进程的生命周期：收集输出、接住 `error` / `kill` 的原生错误、提供有界的
+ * 「等 close」与「请求终止并等 close」。
+ *
+ * ⚠️ `error` 监听**直到 close 都不摘**：spawn 被 OS 拒绝时它是唯一的失败信号，
+ * `kill` 失败时它也可能迟到 —— 摘早了就是未捕获异常，直接带走测试进程。
+ */
+class ScriptRun {
+  readonly child: ChildProcess
+  /** stdout + stderr 合并（`holder` 只需要原始输出）。 */
+  out = ''
+  /** 仅 stdout / 仅 stderr（`verdict`、`seed` 需要分开解析）。 */
+  stdout = ''
+  stderr = ''
+  /** 第一个原生错误（spawn 或 kill），原样保存、只认第一个。 */
+  nativeError: Error | undefined
+  /** spawn 是否根本没起来（`pid === undefined`）—— 还没启动的进程不该收到 SIGKILL。 */
+  neverSpawned = false
+  /** 已收到某个原生错误（结束原因不再是「预算耗尽」）。 */
+  get failedNative(): boolean { return this.nativeError !== undefined }
+  closed = false
+  exit: { code: number | null; signal: NodeJS.Signals | null } | null = null
+  private killed = false
+  private killAccepted = false
+  markKill(result: boolean): void { this.killed = true; this.killAccepted = result }
+  get killInfo(): { requested: boolean; accepted: boolean } {
+    return { requested: this.killed, accepted: this.killAccepted }
+  }
+  private closeWaiters: Array<() => void> = []
+  private errorWaiters: Array<() => void> = []
+  private spawnSentinel: ReturnType<typeof setTimeout> | undefined
+
+  constructor(child: ChildProcess) {
+    this.child = child
+    this.neverSpawned = child.pid === undefined
+    child.on('error', this.onError)
+    child.on('exit', this.onExit)
+    child.on('close', this.onClose)
+    child.stdout?.on('data', this.onData)
+    child.stderr?.on('data', this.onErrData)
+    if (this.neverSpawned) {
+      // pid 已确定是 undefined：spawn 已失败（或失败在即）。100ms 短哨兵只为等到零延迟的
+      // `error`；到点仍没有就自己记一条，避免未启动进程白等业务预算。
+      this.spawnSentinel = setTimeout(() => {
+        this.spawnSentinel = undefined
+        if (this.nativeError === undefined) {
+          this.nativeError = new Error('spawn 未启动（pid 未返回）且 100ms 内未收到 error 事件')
+        }
+        for (const w of this.errorWaiters.splice(0)) w()
+      }, 100)
+    }
+  }
+
+  private onData = (d: unknown): void => { this.out += String(d); this.stdout += String(d) }
+  private onErrData = (d: unknown): void => { this.out += String(d); this.stderr += String(d) }
+  private onError = (e: Error): void => {
+    this.nativeError ??= e
+    for (const w of this.errorWaiters.splice(0)) w()
+  }
+  private onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+    this.exit ??= { code, signal }
+  }
+  private onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
+    this.exit ??= { code, signal }
+    this.closed = true
+    for (const w of this.closeWaiters.splice(0)) w()
+    if (this.errorWaiters.length > 0 && this.nativeError !== undefined) {
+      for (const w of this.errorWaiters.splice(0)) w()
+    }
+  }
+
+  /** 未启动进程的终态：返回 `true` 表示 `nativeError` 已有值（真实 error 或 100ms 哨兵合成）。 */
+  async waitSpawnError(): Promise<boolean> {
+    if (this.nativeError === undefined && !this.closed) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          const i = this.errorWaiters.indexOf(waiter)
+          if (i >= 0) this.errorWaiters.splice(i, 1)
+          resolve()
+        }, 100)
+        const waiter = (): void => { clearTimeout(timer); resolve() }
+        this.errorWaiters.push(waiter)
+      })
+    }
+    return true
+  }
+
+  /**
+   * 等 `close`，最多 `budgetMs + CLOSE_GRACE_MS`：先给剩余业务预算（正常进程自己会退出），
+   * 到点请求 SIGKILL，再给一段宽限。返回 `true` 只表示**真的收到了 close**；
+   * 超时返回 `false`，由调用方带着 `finalFailure()` 响亮失败。
+   * ⚠️ 未启动的进程（`pid === undefined`）不会再有 close：它的结束信号是 `error`。
+   */
+  async waitClosed(budgetMs: number, opts: { killOnBudget?: boolean } = {}): Promise<boolean> {
+    if (this.neverSpawned) return this.waitSpawnError()
+    if (await this.waitOne(budgetMs)) return true
+    if (!(opts.killOnBudget ?? true)) return false
+    this.requestKill()
+    return this.waitOne(CLOSE_GRACE_MS)
+  }
+
+  /** 就绪前失败：立刻请求终止（若已启动），再等真实 close / 原生 error。 */
+  async settleFailure(): Promise<boolean> {
+    if (this.closed) return true
+    if (this.neverSpawned) return this.waitSpawnError()
+    this.requestKill()
+    return this.waitOne(CLOSE_GRACE_MS)
+  }
+
+  /** 等 `close`，最多 `budgetMs`；到点返回 `false`（不在内部请求终止）。 */
+  private waitOne(ms: number): Promise<boolean> {
+    if (this.closed) return Promise.resolve(true)
+    return new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const waiter = (): void => {
+        if (timer !== undefined) clearTimeout(timer)
+        resolve(this.closed)
+      }
+      this.closeWaiters.push(waiter)
+      timer = setTimeout(() => {
+        const i = this.closeWaiters.indexOf(waiter)
+        if (i >= 0) this.closeWaiters.splice(i, 1)
+        resolve(this.closed)
+      }, Math.max(ms, 0))
+    })
+  }
+
+  /**
+   * 请求 SIGKILL。⚠️ `kill` 会同步抛（EPERM 等）或触发 `error` 事件 —— 两种形态都是
+   * 原始失败，必须留在 `nativeError` 里，不能被后面的「结论」吞掉。
+   * 返回 kill 是否被受理；未启动的进程不发信号（没有可杀的 PID）。
+   */
+  requestKill(): boolean {
+    if (this.closed || this.neverSpawned) return false
+    if (this.killed) return this.killAccepted
+    let result = false
+    try {
+      result = this.child.kill('SIGKILL')
+    } catch (e) {
+      this.nativeError ??= e instanceof Error ? e : new Error(String(e))
+      result = false
+    }
+    // kill 期间同步触发过 error（EPERM 等）：信号没有生效。
+    this.markKill(result && this.nativeError === undefined)
+    return this.killAccepted
+  }
+
+  /**
+   * 失败收尾的统一描述：第一个原生错误优先原样返回（spawn/kill 的原始 cause 不丢），
+   * 否则带上「close 未确认 + kill 是否受理 + 原始输出」的合成错误。
+   */
+  finalFailure(summary: string): Error {
+    const detail = describeTerm(this)
+    // 没启动的进程永远不会有 close，原始 error 就是全部事实；已确认 close 后再出现的
+    // 原生错误（如 kill 事件晚到）原样交回，调用方拿到的仍是原始对象。
+    if (this.nativeError !== undefined && (this.closed || this.neverSpawned)) {
+      return this.nativeError
+    }
+    if (this.nativeError !== undefined) {
+      return new Error(`${this.nativeError.message} —— ${detail}`, { cause: this.nativeError })
+    }
+    return new Error(`${summary} —— ${detail}`)
+  }
+
+  /** 释放监听；已建立的监听在 dispose 之后不再影响断言。迟到的 `error` 仍需有人兜，
+   *  否则会在调用方已拿到结果之后冒成未捕获异常、带走测试进程。 */
+  dispose(): void {
+    if (this.spawnSentinel !== undefined) { clearTimeout(this.spawnSentinel); this.spawnSentinel = undefined }
+    this.child.off('exit', this.onExit)
+    this.child.stdout?.off('data', this.onData)
+    this.child.stderr?.off('data', this.onErrData)
+    this.child.off('close', this.onClose)
+    this.child.off('error', this.onError)
+    this.closeWaiters.splice(0)
+    this.errorWaiters.splice(0)
+    this.child.on('error', noopError)
+  }
+}
+function noopError(): void { /* 迟到的原生错误不再有归因价值；兜住不让它冒成未捕获异常。 */ }
+
+/**
+ * 终止结果的**唯一措辞点**：`kill` 是否被受理、`close` 是否到达是两件事，错误里必须分开，
+ * 否则「信号没送出去」会被说成「进程不肯退出」，归因就错了。
+ */
+function describeTerm(run: ScriptRun): string {
+  const kill = run.killInfo
+  const out = run.out.slice(0, 400) || '(空)'
+  const stderr = run.stderr.slice(0, 400) || '(空)'
+  const tail = `stdout：${out}；stderr：${stderr}`
+  if (run.closed) {
+    return kill.requested
+      ? `已请求 SIGKILL 并确认 close（kill 返回 ${kill.accepted}）；${tail}`
+      : `子进程自身已 close（未请求 SIGKILL）；${tail}`
+  }
+  if (!kill.requested) return `${CLOSE_GRACE_MS}ms 内未等到 close，且从未请求 SIGKILL；${tail}`
+  return `请求 SIGKILL 后 ${CLOSE_GRACE_MS}ms 内未等到 close（kill 返回 ${kill.accepted}）；${tail}`
+}
+
+/** 等到子进程打印 `marker`，或它结束 / spawn 失败 / 预算耗尽。 */
 async function waitForMarker(
   child: ChildProcess, marker: string, deadline: number, what: string,
 ): Promise<void> {
-  let out = ''
-  child.stdout?.on('data', (d) => { out += String(d) })
-  child.stderr?.on('data', (d) => { out += String(d) })
+  const run = new ScriptRun(child)
   const budget = deadline - Date.now()
   const ok = await new Promise<boolean>((resolve) => {
     let done = false
-    const finish = (v: boolean) => {
+    const finish = (v: boolean): void => {
       if (done) return
       done = true
-      clearInterval(iv); clearTimeout(to); child.off('exit', onExit)
+      clearInterval(iv); clearTimeout(to)
+      child.off('close', onClose); child.off('error', onError)
       resolve(v)
     }
-    const iv = setInterval(() => { if (out.includes(marker)) finish(true) }, 50)
-    // 子进程若先退出（绑定缺失、脚本语法错），立刻判失败 —— 不让用例白等满预算。
-    const onExit = () => finish(out.includes(marker))
-    const to = setTimeout(() => finish(out.includes(marker)), Math.max(budget, 0))
-    child.on('exit', onExit)
+    // 轮询兜住「分块到达的 marker」与「error 已到但 close 未到」两种形态。
+    const iv = setInterval(() => {
+      if (run.out.includes(marker)) finish(true)
+      else if (run.closed || run.failedNative) finish(false)
+    }, 50)
+    const onClose = (): void => finish(run.out.includes(marker))
+    const onError = (): void => { /* 记录在 run 里，由轮询收尾 */ }
+    const to = setTimeout(() => finish(run.out.includes(marker)), Math.max(budget, 0))
+    child.on('close', onClose)
+    child.on('error', onError)
   })
-  if (!ok) {
-    child.kill('SIGKILL')
-    const why = budget <= 0
-      ? `预算已耗尽（deadline 已过 ${-budget}ms）`
-      : `在剩余预算 ${budget}ms 内未就绪`
-    throw new Error(`${what}${why} —— 子进程输出：${out.slice(0, 400) || '(空)'}`)
+  if (ok) {
+    run.dispose()
+    return
   }
+  // 未启动的进程不会再有 close：它的终态是 `error`（给 100ms 短哨兵，不占业务预算）。
+  // 已启动的进程在预算耗尽时**立刻**请求 SIGKILL，再等真实 close（宽限有界）。
+  const closed = await run.settleFailure()
+  if (!closed) {
+    const failure = run.finalFailure(`${what}在剩余预算 ${Math.max(budget, 0)}ms 内未就绪`)
+    run.dispose()
+    throw failure
+  }
+  const why = run.failedNative
+    ? '启动失败'
+    : budget <= 0 ? `预算已耗尽（deadline 已过 ${-budget}ms）` : `在剩余预算 ${budget}ms 内未就绪`
+  const failure = run.finalFailure(`${what}${why}`)
+  run.dispose()
+  throw failure
 }
 
 /** 起一个跨进程持锁者（RW 独占锁 / RO 共享锁），就绪后才返回。 */
@@ -107,11 +336,10 @@ setInterval(() => {}, 1 << 30)`
  * 从**另一个进程**校验锁是否真的挡住打开（绕开本进程的实例缓存）。
  * `CONFLICT` = 被锁挡住（锁生效），`OPENED` = 能打开（锁未落盘/竞态窗口），`TIMEOUT` = 预算内无结论。
  *
- * ⚠️ **只有真正的锁报文才算 CONFLICT**（CodeRabbit 2026-11-19 major）：此前脚本是
- * `main().catch(() => console.log('CONFLICT'))` —— 父目录不存在、`closeSync` 抛错等
- * **夹具自身的失败**同样打 CONFLICT，于是撞锁用例会把「夹具坏了」当成「锁生效了」放行。
- * 现在子进程把结果与**原始报文**一起交回，父进程用 `isLockError`（`src/store/retry.ts`
- * 的唯一实现点，锚 DuckDB 的模板骨架）判定；非锁错误直接抛「校验进程失败」并带上报文。
+ * ⚠️ **只有真正的锁报文才算 CONFLICT**：子进程把结果与**原始报文**一起交回，父进程用
+ * `isLockError`（`src/store/retry.ts` 的唯一实现点，锚 DuckDB 的模板骨架）判定；
+ * 非锁错误、spawn 失败都直接抛出并带上原始信息，不伪装成 OPENED/TIMEOUT —— 否则撞锁用例
+ * 会把「夹具坏了」当成「锁生效了」放行，或把环境问题说成平台竞态。
  */
 export async function lockVerdict(
   dbPath: string, scriptDir: string, deadline: number,
@@ -125,18 +353,21 @@ try {
 } catch (e) {
   console.log(JSON.stringify({ v: 'ERROR', msg: e instanceof Error ? e.message : String(e) }))
 }`, scriptDir, 'verdict')
-  let co = ''
-  chk.stdout?.on('data', (d) => { co += String(d) })
-  let errOut = ''
-  chk.stderr?.on('data', (d) => { errOut += String(d) })
-  const timedOut = await new Promise<boolean>((resolve) => {
-    let done = false
-    const finish = (v: boolean) => { if (done) return; done = true; clearTimeout(to); resolve(v) }
-    chk.on('close', () => finish(false))
-    chk.on('error', () => finish(false))
-    const to = setTimeout(() => { chk.kill('SIGKILL'); finish(true) }, Math.max(deadline - Date.now(), 0))
-  })
+  const run = new ScriptRun(chk)
+  const closed = await run.waitClosed(deadline - Date.now())
+  const timedOut = run.killInfo.requested && run.closed
+  run.dispose()
+  // spawn/kill 失败没有正常结论：原样抛出，别让调用方拿到「未交回结论」这种二手归因。
+  if (run.nativeError !== undefined) throw run.nativeError
+  if (!closed) {
+    // close 未确认：不报 TIMEOUT —— 调用方会据此换轮/删目录，而进程可能还开着库文件。
+    const failure = run.finalFailure('锁校验进程在预算内未给出结论')
+    if (run.neverSpawned) throw failure
+    throw new Error(`锁校验进程在预算内未给出结论 —— 无法确认它已放开库文件，不报 TIMEOUT。${failure.message}`, { cause: failure })
+  }
   if (timedOut) return 'TIMEOUT'
+  const co = run.stdout
+  const errOut = run.stderr
   // 解析子进程交回的那一行 JSON（stdout 可能混入其它输出，取最后一个可解析的）。
   const parsed = co.split('\n').reverse()
     .map((l) => { try { return JSON.parse(l) as { v?: string; msg?: string } } catch { return null } })
@@ -159,16 +390,20 @@ export async function seedEmptyDb(dbPath: string, scriptDir: string, deadline: n
   const ch = runScript(`const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
 const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
 inst.closeSync()`, scriptDir, 'seed')
-  let e = ''
-  ch.stderr?.on('data', (d) => { e += String(d) })
-  await new Promise<void>((resolve, reject) => {
-    const to = setTimeout(() => {
-      ch.kill('SIGKILL')
-      reject(new Error(`种子进程在预算内未退出（deadline 已过）—— stderr：${e.slice(0, 300) || '(空)'}`))
-    }, Math.max(deadline - Date.now(), 0))
-    ch.on('close', (code) => {
-      clearTimeout(to)
-      code === 0 ? resolve() : reject(new Error(`种子失败：${e.slice(0, 300)}`))
-    })
-  })
+  const run = new ScriptRun(ch)
+  const closedInBudget = await run.waitClosed(deadline - Date.now())
+  if (!closedInBudget) {
+    const failure = run.finalFailure('种子进程在预算内未退出')
+    run.dispose()
+    if (run.nativeError !== undefined) throw failure
+    throw new Error(`种子进程在预算内未退出 —— 无法确认它已放开库文件。${failure.message}`, { cause: failure })
+  }
+  run.dispose()
+  if (run.nativeError !== undefined) throw run.nativeError
+  if (run.exit?.code !== 0) {
+    const how = run.exit?.signal !== null && run.exit?.signal !== undefined
+      ? `signal=${run.exit.signal}`
+      : `exit=${run.exit?.code ?? 'unknown'}`
+    throw new Error(`种子失败：${run.stderr.slice(0, 300)}（${how}）`)
+  }
 }

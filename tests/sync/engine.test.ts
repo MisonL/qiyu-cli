@@ -819,3 +819,106 @@ describe('整体早于接口下界的区间（CI 实测修正）', () => {
     await store.close()
   })
 })
+
+/**
+ * COMMIT 结果未知（CR 第四十一轮 major 的追问）：落库事务的提交结果无法确认时，Store 会
+ * **当场退役**；随后的 gap 落库与清锁都会撞上退役。若让这些次生失败照常上抛，用户看到的
+ * 是「Store 已退役：…请关闭该实例并重新创建」—— 把主失败里的恢复指令（写入可能已落库、
+ * 不要按失败直接重试、核对后再决定是否重放）整段换掉，恰好诱导重复写。
+ *
+ * ⚠️ 用**真驱动**注入（不是手写假 store）：退役是 `duckdb.ts` 的行为，只有真 Store 才会
+ * 在 COMMIT 交回被拒时打上 `store_retired`；手写假 store 会把这道判据测成永远不触发。
+ */
+describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案）', () => {
+  /** 关掉第 N 次 COMMIT 的结果交回（提交在驱动里已执行；N 从 init 之后的第一次提交数起）。 */
+  async function storeWithCommitFailureAt(n: number): Promise<{ store: Store; commits: () => number }> {
+    const real = await import('@duckdb/node-api')
+    let seen = 0
+    // ⚠️ init 的迁移自己就会提交很多次（每个迁移一个事务）—— 计数必须在 init **之后**开，
+    // 否则注入打中的是迁移的 COMMIT，Store 在 init 里就退役了。
+    let injectAt = 0
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as {
+                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
+                extractStatements: (x: string) => unknown
+                closeSync?: () => void
+              }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                // 原型方法不在自有属性里，Store 的事务控制判据要用它 —— 显式转发。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  const out = await cc.runAndReadAll(sql, params)
+                  if (sql === 'COMMIT' && injectAt !== 0 && ++seen === injectAt) {
+                    throw new Error('注入：COMMIT 已执行、结果交回失败')
+                  }
+                  return out
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+    seen = 0
+    injectAt = n
+    return { store, commits: () => seen }
+  }
+
+  it('windowed：交回原始失败（带「核对后再重放」），不是退役文案', async () => {
+    // markPending 的提交是第 1 次；数据窗的提交是第 2 次。
+    const { store } = await storeWithCommitFailureAt(2)
+    const t = fakeTask({
+      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+    })
+    const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+    expect(e, '提交结果未知必须上抛（不能当成 partial 成功）').not.toBeNull()
+    expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
+    expect(e!.message).not.toMatch(/Store 已退役/)
+    expect(e!.hint, '恢复动作：核对后再决定是否重放').toMatch(/核对/)
+    expect(e!.hint).toMatch(/重放/)
+    await store.close()
+  })
+
+  it('rotated：同样交回主失败（第三入口，与 put 同一条 storeGapOrPrimary 路径）', async () => {
+    const { runRotated } = await import('../../src/sync/engine.js')
+    const { store } = await storeWithCommitFailureAt(2)
+    const t = fakeTask({
+      reportDayRotation: true, maxWindowDays: 1,
+      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+    })
+    const e = await runRotated([t], ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+    expect(e, '轮转路径的提交结果未知同样上抛').not.toBeNull()
+    expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
+    expect(e!.message).not.toMatch(/Store 已退役/)
+    expect(e!.hint).toMatch(/核对/)
+    await store.close()
+  })
+
+  it('snapshot：同样交回主失败（gap / 清锁撞退役不得把它换掉）', async () => {
+    const { store } = await storeWithCommitFailureAt(2)
+    const t = fakeTask({
+      kind: 'snapshot', table: 'tags',
+      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+    })
+    const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+    expect(e, '快照写库的提交结果未知同样上抛').not.toBeNull()
+    expect(e!.message).toMatch(/提交结果未知/)
+    expect(e!.message).not.toMatch(/Store 已退役/)
+    expect(e!.hint).toMatch(/核对/)
+    await store.close()
+  })
+})

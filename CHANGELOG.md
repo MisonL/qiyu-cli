@@ -18,8 +18,11 @@
 ### 修复
 
 - **存储层事务安全**：归属闸门下沉到唯一的语句派发点；按令牌统计在途语句与未完成的写操作，
-  阻止提前 `COMMIT`；`query` 下发 `BEGIN` / `COMMIT` / `ROLLBACK` 一律拒收；`COMMIT` 结果
-  未知时报「可能已落库、不要直接重试」并退役连接；收尾超时先 `interrupt()` 再放弃。
+  阻止提前 `COMMIT`；`query` 下发事务控制（按 DuckDB 解析出的语句类型判定，含 `END` / `ABORT` /
+  `START` / 注释前缀 / 多语句）一律拒收；`COMMIT` 结果未知时报「可能已落库、不要直接重试」并
+  **当场退役**连接（重新创建后先核对数据再决定是否重放）；`ROLLBACK` 自身有界，收尾超时先
+  `interrupt()` 再放弃。`sync run` 遇到退役时交回原始失败与恢复动作，不再让「关闭重建」的
+  通用提示覆盖「核对后再重放」的指令。
 - `robot.session.chat` 改判 `dangerous: true`（它会自动创建真实会话），`--yes` 门禁生效。
 - 与声明表同名的 **view 不再被当作表执行**：`db tables` / `db describe` / `query --table` /
   `stats fields` / `sync verify` / `store status` 只认基表；「同名」按 DuckDB 规则大小写不敏感。

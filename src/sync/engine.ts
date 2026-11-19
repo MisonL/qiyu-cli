@@ -310,6 +310,32 @@ async function storeGap(ctx: RunCtx, task: SyncTask, w: Range,
 }
 
 /**
+ * Store 连接已退役（事务状态无法确认，存储层拒绝一切后续语句）—— 判据是存储层打的
+ * 稳定 `code`，不按报文文本匹配（文案随成因变化，code 不变）。
+ * ⚠️ 为什么引擎必须认它（CR 第四十一轮 major 的追问，真驱动注入实测）：落库事务的
+ * COMMIT 结果未知时 Store 当场退役；随后的 **gap 落库**与**清锁**都会撞上退役。
+ * 若让这两条次生失败照常上抛，用户看到的会是「Store 已退役，请关闭重建后再试」——
+ * 把原始失败里的「写入可能已落库，不要按失败直接重试（可能重复写），核对后再决定是否
+ * 重放」整段换掉，恰好诱导重复写。
+ */
+const isStoreRetired = (e: unknown): boolean =>
+  (e as { code?: string }).code === 'store_retired'
+
+/**
+ * 记本窗 gap；连接已退役时 gap 写不进去，**把本窗的原始失败原样交回**（它带着恢复指令）。
+ * 其它 error 照旧上抛 —— 那是 gap 真正的写入失败，不能吞。
+ */
+async function storeGapOrPrimary(ctx: RunCtx, task: SyncTask, w: Range,
+  reason: WindowGapReason, detail: string, gaps: GapInfo[], primary: unknown): Promise<void> {
+  try {
+    await storeGap(ctx, task, w, reason, detail, gaps)
+  } catch (e) {
+    if (isStoreRetired(e)) throw primary
+    throw e
+  }
+}
+
+/**
  * gapHint → sync_gaps.detail（C-8）：hint 带 `fixture`（会话导出的尾部标记行原文）时
  * 追加标注 —— 「为什么可疑」在 detail 正文、「可疑的那行原文」在其后，同一行可见。
  * 不带 fixture 的 hint（dim 的 staffIdList 形态漂移等）detail 原样落库，行为不变。
@@ -735,8 +761,8 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
         // 行数统计口径（brief 钉死用例）：mismatch 时 written 记「应写行数」（kept）——
         // 实际行已随事务回滚，计入的是本窗参与核对的落库意图行数。
         writtenTotal += kept.length
-        await storeGap(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
-          isMismatch ? (e as Error).message : writeFailedDetail(e, ctx), gaps)
+        await storeGapOrPrimary(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
+          isMismatch ? (e as Error).message : writeFailedDetail(e, ctx), gaps, e)
         continue
       }
       resolvedEndOut = watermarkMs
@@ -872,8 +898,8 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       }))
     } catch (e) {
       const isMismatch = (e as { code?: string }).code === 'count_mismatch'
-      await storeGap(ctx, task, resolvedRange, isMismatch ? 'count_mismatch' : 'write_failed',
-        isMismatch ? (e as Error).message : writeFailedDetail(e, ctx), gaps)
+      await storeGapOrPrimary(ctx, task, resolvedRange, isMismatch ? 'count_mismatch' : 'write_failed',
+        isMismatch ? (e as Error).message : writeFailedDetail(e, ctx), gaps, e)
       return snapshotResult(task, resolvedRange, gaps, fetchRes.rows.length, 0, 0, 1, 'failed')
     }
 
@@ -897,11 +923,20 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
  * 无行（如空范围空跑、或在 markPending 之前就抛错）时不动库 —— 不为清章凭空建一行。
  */
 async function releaseLock(ctx: RunCtx, task: SyncTask): Promise<void> {
-  const st: WatermarkState = await readWatermark(ctx.store, task.id)
-  if (st.watermark === null && st.rangeStatus === null && st.lastSyncedAt === null) return
-  await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
-    await clearLock(tx, task.id, st)
-  }))
+  try {
+    const st: WatermarkState = await readWatermark(ctx.store, task.id)
+    if (st.watermark === null && st.rangeStatus === null && st.lastSyncedAt === null) return
+    await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
+      await clearLock(tx, task.id, st)
+    }))
+  } catch (e) {
+    // 连接已退役：读水位与清锁都发不出去，这是主失败的**次生**结果 —— 而本函数在
+    // `finally` 里，上抛会把主失败整个换掉：退役文案只说「关闭重建」，恰好丢掉主失败里
+    // 「核对数据后再决定是否重放」的恢复指令（CR 第四十一轮 major 的追问）。
+    // 只吞退役这一类；其它错误照旧上抛（那是清锁自己的真失败）。
+    if (isStoreRetired(e)) return
+    throw e
+  }
 }
 
 /** snapshot 结果封装（windows.total 恒 1：快照是一次全量拉取，成功 1 / 失败 1）。 */
@@ -1130,8 +1165,8 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
           plan.contiguousBroken = true
           const isMismatch = (e as { code?: string }).code === 'count_mismatch'
           plan.written += kept.length
-          await storeGap(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
-            isMismatch ? (e as Error).message : writeFailedDetail(e, { storeLocation: ctx.storeLocation }), plan.gaps)
+          await storeGapOrPrimary(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
+            isMismatch ? (e as Error).message : writeFailedDetail(e, { storeLocation: ctx.storeLocation }), plan.gaps, e)
           continue
         }
         for (const h of (Array.isArray(fetchRes.gapHint) ? fetchRes.gapHint : [fetchRes.gapHint])) {

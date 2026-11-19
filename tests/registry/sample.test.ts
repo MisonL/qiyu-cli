@@ -162,6 +162,24 @@ describe('assertSampleable —— 拒采样写接口，判据取自注册表', (
     expect(() => assertSampleable(spec({ path: null }), 'wecom.robot.switch')).toThrow(/没有可用 path/)
   })
 
+  it('注册表把写接口误标成 dangerous:false 时**仍拒绝** —— 白名单是唯一放行依据（端到端，CR 第四十一轮 major 的追问）', () => {
+    // ⚠️ 前面几条用 `spec()` 合成体测「白名单默认拒绝」，但合成体与真实记录是两条路径。
+    // CodeRabbit 的追问是：删掉写行为黑名单之后，**显式点名**一个不在白名单、注册表又恰好
+    // 标成 `dangerous:false` 的真实写接口，会不会绕过白名单直接发请求？
+    // 判据必须在**分发之前**：`assertSampleable` 拒绝 ⇒ 循环里 `continue`，fetch 一次都不调。
+    // 这里用一个真实写接口的真实记录，把 dangerous 改回误标值，再走与 main 相同的调用序。
+    const mislabeled: Record<string, unknown> = { ...byId['robot.session.chat'], dangerous: false }
+    expect(mislabeled.callable, '前提：该接口本身可调用').toBe(true)
+    // 与 main 的分发序一致：先 assertSampleable，通过才 fetch。
+    let dispatched = 0
+    const dispatch = (sp: unknown, id: string): void => {
+      assertSampleable(sp as never, id)   // 抛 ⇒ 不 dispatch
+      dispatched++
+    }
+    expect(() => dispatch(mislabeled, 'robot.session.chat'), '白名单是唯一放行依据').toThrow(/未经确认只读/)
+    expect(dispatched, '被拒的接口一个请求都不许发').toBe(0)
+  })
+
   it('不在注册表里的 id 拒绝 —— 拼不出 path，也不该瞎猜', () => {
     expect(() => assertSampleable(undefined, 'no.such.id')).toThrow(/不在注册表/)
   })

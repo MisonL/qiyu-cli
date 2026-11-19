@@ -333,10 +333,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   sqls.push(sql)
                   if (!holdNext || !sql.includes('bad_cast_q38')) return cc.runAndReadAll(sql, params)
@@ -397,10 +401,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   sqls.push(sql)
                   if (!holdNext || !sql.includes('q38_ok')) return cc.runAndReadAll(sql, params)
@@ -458,10 +466,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   sqls.push(sql)
                   return cc.runAndReadAll(sql, params)
@@ -541,10 +553,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   sqls.push(sql)
                   if (!holdNext || !sql.startsWith('DELETE FROM "tags"')) return cc.runAndReadAll(sql, params)
@@ -763,6 +779,200 @@ describe('duckdb —— 事务', () => {
     // 托管事务本身照常可用
     await s.transaction(async (t) => { await t.upsert('tags', [{ id: '7', name: 'Y', color: '#222222' }]) })
     expect(await s.count('tags')).toBe(1)
+    await s.close()
+  })
+
+  it('事务控制按**解析出的语句类型**拒收：END / ABORT / START / 注释前缀 / 多语句（CR 第四十一轮 major）', async () => {
+    // 旧判据是文本前缀正则（`^\s*(?:BEGIN|COMMIT|ROLLBACK)`），而 DuckDB 把 END / START TRANSACTION /
+    // ABORT 都解析成事务控制（statementType = TRANSACTION）；注释前缀与多语句同样能绕过前缀匹配
+    // （实测：`SELECT 1; COMMIT` 会真的执行 COMMIT）。判据改为「交给 DuckDB 解析，逐条语句看类型」。
+    const s = await fresh()
+    for (const sql of ['END', 'ABORT', 'START TRANSACTION', '/*c*/ COMMIT', '--x\nROLLBACK', 'SELECT 1; END']) {
+      await expect(s.query(sql), `${JSON.stringify(sql)} 必须在派发前被拒`).rejects.toMatchObject({ kind: 'usage' })
+    }
+    // 合法形态仍放行：字符串里的同名文本不是语句，注释前缀的普通查询照常执行
+    expect((await s.query("SELECT 'END' AS v")).rows[0]).toEqual({ v: 'END' })
+    expect((await s.query('/*c*/ SELECT 1 AS n')).rows[0]).toEqual({ n: 1 })
+    // 托管回调里同样挡在派发前：END 不能在回调里提前提交，回调抛错后写入整体回滚
+    const err = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      await expect(s.query('END')).rejects.toMatchObject({ kind: 'usage' })
+      throw new Error('boom')
+    }).then(() => null, (e: unknown) => e)
+    expect((err as Error).message).toBe('boom')
+    expect(await s.count('tags'), '回调里的 END 不得提交任何东西').toBe(0)
+    await s.close()
+  })
+
+  it('COMMIT 结果未知 → Store **立即**永久退役，不依赖随后的 ROLLBACK 恰好失败（CR 第四十一轮 major）', { timeout: 90_000 }, async () => {
+    // 旧行为：COMMIT 被拒后只交回「结果未知」，退役与否取决于随后的 ROLLBACK 是否失败 ——
+    // 若 ROLLBACK 成功（COMMIT 根本没执行、事务还开着），归属被清掉后连接**继续可用**，
+    // 与错误文案「请用新的 Store 实例核对」自相矛盾。
+    const real = await import('@duckdb/node-api')
+    const sqls: string[] = []
+    let rejectCommit = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  sqls.push(sql)
+                  // 在**执行前**拒绝 COMMIT：事务仍开着，随后的 ROLLBACK 会成功
+                  if (sql === 'COMMIT' && rejectCommit) throw new Error('注入：COMMIT 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    rejectCommit = true
+    const txErr = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    }).then(() => null, (e: unknown) => e)
+    expect((txErr as Error).message, '必须点明结果未知').toMatch(/提交结果未知.*可能已经落库/)
+    const after = await s.count('tags').then(() => null, (e: unknown) => e as Error)
+    expect(after, '结果未知后同一实例必须永久退役（不等 ROLLBACK 的结果）').toMatchObject({ kind: 'internal' })
+    expect((after as Error).message).toMatch(/退役|无法确认/)
+    // ⚠️ 退役原因不同、恢复动作也不同（CR 第四十一轮 major 的 sync 侧追问）：同一条通用
+    // 退役 hint 会让人「关掉重建后直接重试」，而本成因下 COMMIT 已下发 —— 写入可能已落库，
+    // 直接重试就是重复写。通用的「未提交的写入不会落库」在这里恰恰是**假话**。
+    const retired = after as Error & { hint?: string; code?: string }
+    expect(retired.hint, '退役 hint 必须按成因给恢复动作').toMatch(/核对/)
+    expect(retired.hint).toMatch(/重放/)
+    expect(retired.hint, '不得声称未提交的写入不会落库').not.toMatch(/未提交的写入不会落库/)
+    // 编排层（sync）按稳定 code 判「该实例已不可用」，不按报文文本 —— 文案会随成因变。
+    expect(retired.code).toBe('store_retired')
+    expect(sqls.filter((q) => q === 'ROLLBACK').length, '收尾只做一次尽力回滚').toBeLessThanOrEqual(1)
+    await s.close()
+    const s2 = await createDuckDbStore(cfg, 'rw')
+    expect(await s2.count('tags'), 'COMMIT 未执行成功 → 写入不得落库').toBe(0)
+    await s2.close()
+  })
+
+  it('事务控制语句失败不探测连接（不发 SELECT 1）；活跃回调里的数据语句错误仍探测（CR 第四十一轮 major）', { timeout: 90_000 }, async () => {
+    // 判据只该问「这条数据语句是否把事务标成 aborted」。COMMIT/ROLLBACK 自身的失败另有处理
+    // （结果未知 / 退役），此时再发 SELECT 1 是在未知状态下多下发一条语句；连接已关或
+    // 事务已退役时同理。
+    const real = await import('@duckdb/node-api')
+    const sqls: string[] = []
+    let failCommit = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  sqls.push(sql)
+                  const out = await cc.runAndReadAll(sql, params)
+                  if (sql === 'COMMIT' && failCommit) {
+                    failCommit = false
+                    throw new Error('注入：COMMIT 结果交回时被拒绝')
+                  }
+                  return out
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    // 反向先做：活跃回调里的数据语句执行期报错 → 仍要问连接（法是 SELECT 1）
+    sqls.length = 0
+    await s.transaction(async () => {
+      await expect(s.query("SELECT CAST('x' AS INTEGER)")).rejects.toThrow()
+    }).then(() => null, (e: unknown) => e)
+    expect(sqls.filter((q) => q === 'SELECT 1').length, '数据语句错误必须探测').toBeGreaterThan(0)
+    // 正向：COMMIT 失败不再探测
+    sqls.length = 0
+    failCommit = true
+    await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '2', name: 'B', color: '#FFF' }])
+    }).then(() => null, (e: unknown) => e)
+    expect(sqls.filter((q) => q === 'SELECT 1'), '事务控制失败不得再下发探针').toEqual([])
+    await s.close()
+  })
+
+  it('ROLLBACK 永不返回 → 收尾在预算内放弃并退役，不得把命令挂死（CR 第四十一轮 major）', { timeout: 90_000 }, async () => {
+    // drain 的截止时刻只覆盖在途语句，不覆盖 ROLLBACK 自身；驱动卡在 ROLLBACK 上时
+    // sync run / store init 会永久挂住，连「回滚未能确认」都说不出口。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') return new Promise(() => { /* 永不 settle */ })
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer, rollbackCapMs: 50 })
+    await s.init()
+    const boom = new Error('boom')
+    const started = Date.now()
+    const txErr = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw boom
+    }).then(() => null, (e: unknown) => e)
+    expect(txErr, '原始错误原样透传').toBe(boom)
+    expect(Date.now() - started, '收尾必须有界（不是无限等 ROLLBACK）').toBeLessThan(5_000)
+    const after = await s.count('tags').then(() => null, (e: unknown) => e as Error)
+    expect(after, '回滚未能确认 → 连接退役').toMatchObject({ kind: 'internal' })
+    expect((after as Error).message).toMatch(/退役|无法确认/)
     await s.close()
   })
 
@@ -1018,10 +1228,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   if (sql === 'ROLLBACK' || sql === 'COMMIT') events.push(`${sql.toLowerCase()}-dispatched`)
                   if (!holdNext || !sql.startsWith('INSERT INTO "tags"')) return cc.runAndReadAll(sql, params)
@@ -1131,10 +1345,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   if (sql === 'ROLLBACK' || sql === 'COMMIT') events.push(`${sql.toLowerCase()}-dispatched`)
                   if (sql.startsWith('DELETE FROM "tags"')) events.push('delete-dispatched')
@@ -1230,10 +1448,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
                   return cc.runAndReadAll(sql, params)
@@ -1284,10 +1506,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   sqls.push(sql)
                   if (!holdNext || !sql.startsWith('DELETE FROM "tags"')) return cc.runAndReadAll(sql, params)
@@ -1378,10 +1604,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   if (!holdNext || !sql.includes('CREATE TABLE')) return cc.runAndReadAll(sql, params)
                   holdNext = false
@@ -1500,10 +1730,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   if (!holdNext || sql !== 'COMMIT') return cc.runAndReadAll(sql, params)
                   holdNext = false
@@ -1595,10 +1829,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
                   const out = await cc.runAndReadAll(sql, params)
@@ -1648,10 +1886,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   sqls.push(sql)
                   if (!holdNext || !sql.includes('q39_hold')) return cc.runAndReadAll(sql, params)
@@ -1706,10 +1948,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   if (fakeNext && sql.startsWith('INSERT INTO "tags"')) {
                     fakeNext = false
@@ -1755,10 +2001,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   const out = await cc.runAndReadAll(sql, params)
                   if (sql === 'COMMIT' && failCommit) {
@@ -1814,10 +2064,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 // 中断可由测试注入（原生连接上没有真正卡住的查询）
                 interrupt: () => {
                   interrupted = true
@@ -1902,10 +2156,14 @@ describe('duckdb —— 事务', () => {
             closeSync: () => ii.closeSync?.(),
             connect: async () => {
               const c = await ii.connect()
-              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; closeSync?: () => void }
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
               return {
                 ...(c as object),
                 closeSync: () => cc.closeSync?.(),
+                // ⚠️ 原型方法不在自有属性里：`...(c as object)` 展开拿不到，Store 的原始
+                // 事务控制判据要用它（CR 第四十一轮），这里显式转发 —— 不转发时 Store 会以
+                // internal 响亮失败，而不是静默跳过判据。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
                 interrupt: () => { interrupted = true },
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   sqls.push(sql)
