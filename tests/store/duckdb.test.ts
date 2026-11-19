@@ -2158,6 +2158,62 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('回调拒绝的不是 Error + 回滚未能确认 → 必须包一层带上退役状态与恢复动作；回滚已确认则原样交回（CR 第四十八轮 major）', { timeout: 90_000 }, async () => {
+    // 事故：回调 `throw 'task failed'`，ROLLBACK 也失败 —— 旧实现 `!(e instanceof Error)` 直接
+    // 原样交回字符串。调用方拿到的字符串与「已确认回滚」一字不差，没有任何地方说「这个实例
+    // 已退役、写入状态不可信」。非 Error 无处挂字段，只能包一层（原值进 cause）。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw 'task failed'
+    }).then(() => null, (x: unknown) => x as Error & { cause?: unknown; hint?: string; code?: string; kind?: string; retryable?: boolean })
+    expect(e, '字符串拒绝值不能原样交回（那与已确认回滚同形）').toBeInstanceOf(Error)
+    expect(e!.cause, '原拒绝值必须保留在 cause 上').toBe('task failed')
+    expect(e!.message, '原值要能被看见').toContain('task failed')
+    expect(e!.message, '回滚状态要说').toMatch(/回滚未能确认/)
+    expect(e!.kind, '无 kind 会被 thrownToExit 换成通用文案').toBe('internal')
+    expect(e!.code).toBe('store_retired')
+    expect(e!.retryable, '实例已退役 → 不可重试').toBe(false)
+    expect(e!.hint, '恢复动作：先核对、再决定是否重放').toMatch(/核对/)
+    expect(e!.hint).toMatch(/重放/)
+    await s.close()
+    // 反例：回滚已确认时不得改变拒绝值（身份契约只在这种情况下保住原值）
+    const ok = await fresh()
+    const raw = await ok.transaction(async () => {
+      throw 'task failed'
+    }).then(() => null, (x: unknown) => x)
+    expect(raw, '回滚已确认 → 原值原样交回').toBe('task failed')
+    await ok.close()
+  })
+
   it('默认退役 hint 不得声称「未提交的写入不会落库」（回滚未确认时该说法是假话）（Codex PR#81 第四十五轮 P2）', { timeout: 90_000 }, async () => {
     // 默认 hint 服务于「回滚未能确认」：那个状态的准确含义就是「落没落库无法确认」。
     // 照「未提交的写入不会落库」直接重放，可能重复写。

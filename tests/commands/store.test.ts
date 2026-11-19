@@ -764,6 +764,75 @@ describe('store 命令面与 help', () => {
     }
   })
 
+  it('迁移失败且回滚未能确认 → 命令出口必须保住「先核对、再决定是否重放」（CR 第四十八轮 major）', { timeout: 60000 }, async () => {
+    // 探针实测（2026-11-20）：迁移抛的是 plain Error（没有 kind），`annotateUnconfirmedRollback`
+    // 补了 code/hint 但没补 kind —— `thrownToExit` 走「无 kind」分支、用通用 hint 覆盖掉
+    // 「核对后再重放」，store init 的操作者只看到「执行期错误，换个库验证」。
+    // ⚠️ 必须用**全新路径**：已建到 LATEST_VERSION 的库没有待放迁移，`init` 直接成功。
+    const freshPath = join(dir, 'migrate-fail.db')
+    out = ''; err = ''
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    vi.resetModules()
+    vi.doMock('../../src/store/index.js', async (importOriginal) => {
+      const orig = await importOriginal<typeof import('../../src/store/index.js')>()
+      const { createDuckDbStore } = await import('../../src/store/duckdb.js')
+      return {
+        ...orig,
+        openStore: async (cfg: unknown, mode: unknown) => {
+          const s = await createDuckDbStore(cfg as never, mode as never, { importer: importer as never })
+          const origExec = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
+          vi.spyOn(s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }, 'execSql')
+            .mockImplementation(async (sql: string, p?: unknown[]) => {
+              // 迁移建表照常，版本行写不进去 → 事务回调抛 plain Error（无 kind）
+              if (sql.startsWith('INSERT INTO schema_version')) throw new Error('migration failed')
+              return origExec(sql, p)
+            })
+          return s
+        },
+      }
+    })
+    const { storeCommand: mockedCommand } = await import('../../src/commands/store.js')
+    try {
+      expect(await mockedCommand(['init', '--db', freshPath])).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind, '无 kind 会在命令出口被换成通用文案').toBe('internal')
+      // ⚠️ CLI 出口的 `code` 与 `kind` 同值（`thrownToExit` 的映射），`store_retired` 只由
+      // 编排层（sync 引擎直接消费 store 错误）识别 —— 这里不重复断言 code。
+      expect(e.message).toMatch(/回滚未能确认/)
+      expect(e.message).toMatch(/migration failed/)
+      expect(e.hint, '恢复动作必须保住「先核对数据、再决定是否重放」').toMatch(/核对/)
+      expect(e.hint).toMatch(/重放/)
+    } finally {
+      vi.doUnmock('../../src/store/index.js')
+    }
+  })
+
   // —— 权限错误（errno）分流：判据必须匹配**真实到达该函数的报文形态** ——
   // ⚠️ 2026-10-31 实测修缺陷：原判据是 `/^(EACCES|EPERM|EROFS)/`，按 Node `fs` 的报文
   // 前缀写成 —— 但 store 链路**零 `node:fs`**（lstat/stat/mkdir 的 errno 分流都在命令层

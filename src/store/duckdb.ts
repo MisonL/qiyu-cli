@@ -981,7 +981,22 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   /** 自带成因级恢复动作的错误（COMMIT 结果未知）—— 不再追加通用回滚文案，免得两套指令打架。 */
   const selfDiagnosed = new WeakSet<object>()
   const annotateUnconfirmedRollback = <E>(e: E, state: TxClose): E => {
-    if (state !== 'unconfirmed' || !(e instanceof Error) || selfDiagnosed.has(e)) return e
+    if (state !== 'unconfirmed') return e
+    // ⚠️ **非 Error 的拒绝值也要带上状态**（CR 第四十八轮 major）：回调 `throw 'task failed'`
+    // 时，调用方拿到的字符串与「已确认回滚」一字不差 —— 而这里实例已经退役、写入状态不可信。
+    // 包一层 Error 并保留原值在 `cause`（身份契约只覆盖 Error；非 Error 无处挂字段）。
+    if (!(e instanceof Error)) {
+      const wrapped = new Error(`事务失败（回调拒绝了一个非 Error 值：${String(e).slice(0, 120)}）`
+        + ' ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；'
+        + '该连接已退役，本实例上的写入结果不可信', { cause: e })
+      ;(wrapped as { kind?: string }).kind = 'internal'
+      ;(wrapped as { retryable?: boolean }).retryable = false
+      ;(wrapped as { code?: string }).code = 'store_retired'
+      ;(wrapped as { hint?: string }).hint = '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）'
+        + '再决定是否重放；本实例上的后续语句都会被拒'
+      return wrapped as unknown as E
+    }
+    if (selfDiagnosed.has(e)) return e
     const note = ' ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；'
       + '该连接已退役，本实例上的写入结果不可信'
     // ⚠️ **冻结 / 只读的错误对象不能再赋值**（CR 第四十六轮 major，探针 2026-11-20）：
@@ -996,6 +1011,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     try {
       const prev = (e as { hint?: string }).hint
       e.message = `${e.message}${note}`
+      // ⚠️ **无 kind 的错误必须补 `internal`**（CR 第四十八轮 major，探针实测）：`store init`
+      // 的迁移抛 plain Error 时，`thrownToExit` 走「无 kind」分支、把这条 hint 换成通用的
+      // 「执行期错误」—— 恢复动作（核对后再重放）在下游被丢掉。
+      ;(e as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
       ;(e as { retryable?: boolean }).retryable = false
       ;(e as { code?: string }).code = 'store_retired'
       ;(e as { hint?: string }).hint = prev === undefined ? hint : `${prev} ${hint}`
