@@ -1850,6 +1850,27 @@ describe('duckdb —— 事务', () => {
     expect(Object.keys(seen), '前提：每个投影方法都试过').toHaveLength(4)
   })
 
+  it('每条迁移 SQL 都必须只有一条语句 —— 否则新的多语句守卫会让 store init 回滚该迁移（CR 第四十六/四十七轮追问）', { timeout: 90_000 }, async () => {
+    // 多语句守卫现在与关键字初筛无关地对**每次** execSql 生效；迁移若在**一次** exec 调用里
+    // 塞两条 DDL，init 会把它拒掉、回滚、版本不推进（症状是「新库迁移到某一版就失败」）。
+    // 判据：逐条交给真实驱动的 extractStatements，语句数必须为 1。
+    const { MIGRATIONS } = await import('../../src/store/schema.js')
+    const real = await import('@duckdb/node-api')
+    const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<{ connect: () => Promise<{ extractStatements: (s: string) => Promise<{ count: number }>; run: (s: string) => Promise<unknown>; closeSync?: () => void }>; closeSync?: () => void }>)(join(dir, 'mig.db'))
+    const c = await inst.connect()
+    const bad: Array<{ version: number; count: number; sql: string }> = []
+    for (const m of MIGRATIONS) {
+      const sqls: string[] = []
+      await m.up(async (sql: string) => { sqls.push(sql); return undefined })
+      for (const sql of sqls) {
+        const ex = await c.extractStatements(sql)
+        if (ex.count !== 1) bad.push({ version: m.version, count: ex.count, sql: sql.slice(0, 80) })
+      }
+    }
+    c.closeSync?.(); inst.closeSync?.()
+    expect(bad, '迁移里的每个 exec 调用只能带一条语句（多语句请拆成多次 exec）').toEqual([])
+  })
+
   it('无事务关键字的多语句同样在派发前拒收（驱动会先执行第一条）（CR 第四十五轮 major）', { timeout: 90_000 }, async () => {
     // 事故（真驱动探针 2026-11-20）：`INSERT INTO scratch VALUES (1); SELECT * FROM missing_table`
     // 不含事务关键字 → 旧实现跳过解析、直接派发；驱动先执行 INSERT、再准备第二条时抛
@@ -2036,6 +2057,104 @@ describe('duckdb —— 事务', () => {
     expect(e!.hint, '恢复动作同样要给').toMatch(/核对/)
     expect(e!.code).toBe('store_retired')
     expect(e!.retryable, '实例已退役 → 不可重试').toBe(false)
+    await s.close()
+  })
+
+  it('提交被拒且收尾退役 → 拒绝错误自己带 code=store_retired；已确认回滚则不带（CR 第四十七轮 major）', { timeout: 90_000 }, async () => {
+    // `commitOrRefuse` 的拒绝走身份集合，顶层 catch 不做标注 —— 收尾退役时若不带稳定 code，
+    // 调用方拿不到「实例已退役」这个信号（编排层按 code 判，不按文案）。
+    const real = await import('@duckdb/node-api')
+    let armRolloackFailure = false
+    let hangInsert = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                interrupt: () => { /* 不可中断点 */ },
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (hangInsert && sql.startsWith('INSERT INTO "tags"')) await new Promise(() => {})
+                  if (armRolloackFailure && sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', {
+      importer, drainCapMs: 100, drainInterruptGraceMs: 100,
+    })
+    await s.init()
+    hangInsert = true
+    armRolloackFailure = true
+    const e = await s.transaction(async (t) => {
+      void t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }]).catch(() => {})
+    }).then(() => null, (x: unknown) => x as Error & { code?: string; hint?: string })
+    expect(e, '提交被拒必须上抛').not.toBeNull()
+    expect(e!.message).toMatch(/回滚也未能确认/)
+    expect(e!.code, '收尾退役 → 稳定标记').toBe('store_retired')
+    expect(e!.hint).toMatch(/核对/)
+    await s.close()
+  })
+
+  it('只有 code 只读（message 可写）同样不得丢主失败（CR 第四十七轮 major）', { timeout: 90_000 }, async () => {
+    // 部分只读：`message` 可写、`code` 只读 —— 第一步成功、第二步抛 TypeError，旧实现只在
+    // message 那一步兜底，异常照样换掉主失败。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const boom = new Error('write failed')
+    Object.defineProperty(boom, 'code', { value: 'E_READONLY', writable: false, configurable: false })
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw boom
+    }).then(() => null, (x: unknown) => x as Error & { cause?: unknown; hint?: string; code?: string; retryable?: boolean })
+    expect(e, '不得以 TypeError 呈现').toBeInstanceOf(Error)
+    expect(e!.constructor.name).toBe('Error')
+    expect(e!.cause, '原错误挂在 cause 上').toBe(boom)
+    expect(e!.message).toMatch(/write failed/)
+    expect(e!.message).toMatch(/回滚未能确认/)
+    expect(e!.code).toBe('store_retired')
+    expect(e!.retryable).toBe(false)
     await s.close()
   })
 

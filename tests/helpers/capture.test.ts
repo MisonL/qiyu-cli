@@ -844,12 +844,24 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       //   · **rest 参数名**（`...rest`）→ 转发边界：它是列表的结尾，rest 之前的显式实参位置固定、
       //     照常判；rest 之后还有显式实参 → 位置不可静态确定；
       //   · 其余（变量、函数调用、`[...rest]` 后再接东西）→ 整条实参表按「看不清」报，不许静默放行。
-      const restNames = new Set<string>()
-      const collectRest = (n: ts.Node): void => {
-        if (ts.isParameter(n) && n.dotDotDotToken !== undefined && ts.isIdentifier(n.name)) restNames.add(n.name.text)
-        ts.forEachChild(n, collectRest)
+      /**
+       * 名字是不是**当前调用所在作用域里**的 rest 参数（CR 第四十七轮 major）：
+       * 旧实现收「文件里任意函数声明过 `...rest`」，于是模块级 `const rest = [{ concurrent: true }, fn]`
+       * 配一个无关函数里的 `...rest` 就能让整条登记被当成转发边界放行。判据：从调用节点往上走，
+       * 遇到函数 → 它的参数里有同名 rest 才算；到文件顶层都没有 → 不是 rest。
+       */
+      const isRestParamInScope = (name: string): boolean => {
+        let n: ts.Node | undefined = call
+        while (n !== undefined) {
+          if (ts.isFunctionLike(n)) {
+            const has = (n as ts.SignatureDeclaration).parameters.some(
+              (p) => p.dotDotDotToken !== undefined && ts.isIdentifier(p.name) && p.name.text === name)
+            if (has) return true
+          }
+          n = n.parent
+        }
+        return false
       }
-      collectRest(sf)
       /** 列表的静态展开；`openTail` 表示结尾是 rest 展开（后面还可能再有实参）。求不出 → undefined。 */
       const expandList = (list: readonly ts.Expression[]): { args: ts.Expression[]; openTail: boolean } | undefined => {
         const flat: ts.Expression[] = []
@@ -859,7 +871,7 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
           if (openTail || ts.isOmittedExpression(el)) return undefined
           if (!ts.isSpreadElement(el)) { flat.push(el); continue }
           const src = unwrap(el.expression)
-          if (ts.isIdentifier(src) && restNames.has(src.text)) { openTail = true; continue }
+          if (ts.isIdentifier(src) && isRestParamInScope(src.text)) { openTail = true; continue }
           const arr = ts.isIdentifier(src)
             ? (() => { const init = staticBindingInitializer(sf, src.text); return init === undefined ? undefined : unwrap(init) })()
             : src
@@ -1120,9 +1132,28 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
         ? (unwrap(raw.expression) as ts.PropertyAccessExpression).name.text === 'bind'
         : staticKey((unwrap(raw.expression) as ts.ElementAccessExpression).argumentExpression) === 'bind')
   }
+  /**
+   * vitest 命名导入别名 → 原名（CR 第四十七轮 major）：`import { beforeEach as setup } from 'vitest'`
+   * 之后 `setup(() => { setTimeout(w, 80) })` 是**真 hook**，旧判据按字面名字认不出。
+   * 只认从 `vitest` 导入的（本地同名函数不算），且只映射 hook 名（其它导入不影响）。
+   */
+  const hookAlias = new Map<string, string>()
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || st.importClause?.namedBindings === undefined) continue
+    const from = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : ''
+    if (from !== 'vitest') continue
+    const nb = st.importClause.namedBindings
+    if (!ts.isNamedImports(nb)) continue
+    for (const el of nb.elements) {
+      const imported = (el.propertyName ?? el.name).text
+      if (HOOK_HOOKS.has(imported.toLowerCase())) hookAlias.set(el.name.text, imported)
+    }
+  }
   const isHookName = (chain: string[] | undefined, call?: ts.CallExpression): boolean => {
     if (chain === undefined) return false
     let c = chain
+    // 链首名字若是 vitest hook 的命名导入别名，先还原成原名再判
+    if (c.length > 0 && hookAlias.has(c[0]!)) c = [hookAlias.get(c[0]!)!, ...c.slice(1)]
     // `beforeEach.call(null, fn)` / `.apply(...)`：调用方式，末段剥掉
     if (c.length > 1 && (c[c.length - 1] === 'call' || c[c.length - 1] === 'apply')) c = c.slice(0, -1)
     // `beforeEach.bind(null)(fn)`（Codex PR#81 第二十七轮 P2，Node 实测照常登记 hook）：
@@ -2023,6 +2054,22 @@ it('Q34', oQ34, () => {})`),
     // ⚠️ 解构别名（`const [alias] = [opts]`）同样写穿（CR 第四十五轮 major）
     expect(concHits(`const oD45 = ${Zq}\nconst [alias45] = [oD45]\nalias45['concurrent'] = true\nit('D45', oD45, () => {})`),
       '数组解构别名写穿').toEqual(['unknown'])
+    // ⚠️ hook 的**命名导入别名**同样是 hook（CR 第四十七轮 major）
+    expect(hookHits(`import { before${'Each as setup47 } from '}${JSON.stringify('vitest')}\nsetup47(() => { ${ST}(w, 80) })`),
+      'vitest hook 命名导入别名').toEqual([`${ST}(`])
+    // 反例：本地同名函数不是 hook
+    expect(hookHits(`function setup47b(fn) { return fn }\nsetup47b(() => { ${ST}(w, 80) })`),
+      '本地同名函数不是 hook').toEqual([])
+    // ⚠️ rest 参数必须**在作用域里**（CR 第四十七轮 major）：模块级元组 + 无关函数里的 `...rest`
+    // 不能让登记被当成转发边界放行
+    // ⚠️ 结论是 `unknown` 而不是 `opt`：同名绑定出现两次（模块级元组 + 无关函数的 rest 参数），
+    // `staticBindingInitializer` 按保守侧作废旧值 —— 关键是**不得放行**（旧实现把整条登记当成
+    // 转发边界、返回空列表）。
+    expect(concHits(`const args47 = [{ con${'current: true }' }, () => {}]\nfunction unrelated47(...args47) { return args47 }\nit('R47', ...args47)`),
+      'rest 边界必须按作用域解析（看不清就不放行）').toEqual(['unknown'])
+    // 真正的转发 helper（本函数的 rest 参数）仍按边界放行
+    expect(concHits(`function fwd47(name, ...rest47) { return it(name, ...rest47) }\nfwd47('R48', () => {})`),
+      '本函数的 rest 参数是真边界').toEqual([])
     // 套件上显式 `sequential: true` 是串行收口（Codex 第二十五轮 P2）
     expect(concHits(`describe('Q9', { ...optsQ, se${'quential: true }, () => {})'}`),
       'sequential:true 收口未知展开').toEqual([])

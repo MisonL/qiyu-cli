@@ -573,6 +573,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       ? '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
       : '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
         + '；本次回滚也未能确认、该连接已退役 —— 请关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）再决定是否重放'
+    // ⚠️ 稳定标记（CR 第四十七轮 major）：这条拒绝不经过顶层 catch 的标注，编排层按 code 判
+    // 「实例已退役」—— 已确认回滚时实例仍可用，不带标记。
+    if (!rolledBack) (err as { code?: string }).code = 'store_retired'
     // 回滚**已由这里负责**（唯一处理点，CR 第三十六轮 major）：外层 catch 见到这个拒绝就不再
     // 回滚第二次 —— 两次回滚里只要一次成功、另一次失败，上一行对「回滚是否确认」的说法就不可信。
     refusals.set(err, token)
@@ -987,8 +990,16 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 新错误（`cause` 保留原对象），身份契约让位于「不能把主失败弄丢」。
     const hint = '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）'
       + '再决定是否重放；本实例上的后续语句都会被拒'
+    // ⚠️ **整个标注过程都可能失败**（CR 第四十七轮 major）：`message` 可写而 `code` 只读的
+    // 对象上，第一步成功、第二步抛 TypeError —— 同样把主失败弄丢。读写全部放进同一个 try，
+    // 任何一步失败都换成包层（`cause` 保留原对象）。
     try {
+      const prev = (e as { hint?: string }).hint
       e.message = `${e.message}${note}`
+      ;(e as { retryable?: boolean }).retryable = false
+      ;(e as { code?: string }).code = 'store_retired'
+      ;(e as { hint?: string }).hint = prev === undefined ? hint : `${prev} ${hint}`
+      return e
     } catch {
       const wrapped = new Error(`${e.message}${note}`, { cause: e })
       ;(wrapped as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
@@ -997,17 +1008,6 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       ;(wrapped as { hint?: string }).hint = hint
       return wrapped as unknown as E
     }
-    // ⚠️ **本实例已退役，重试必然失败**（CR 第四十四轮 major，探针实测）：回调抛的是
-    // `kind:'store_locked'` / `retryable:true` 时，错误身份保留会让它原样带着「可重试」标记
-    // 出去 —— 上层重试同一实例只会得到 `store_retired`，把这条带恢复动作的主失败整个换掉。
-    // 所以统一打上稳定标记：`retryable=false` + `code:'store_retired'`（判据是「该实例上的
-    // 任何语句都会被拒」，与退役错误同一个 code）。
-    // 可写对象（冻结对象在上面的 catch 里已整体换皮）：补稳定标记与恢复动作。
-    const prev = (e as { hint?: string }).hint
-    ;(e as { retryable?: boolean }).retryable = false
-    ;(e as { code?: string }).code = 'store_retired'
-    ;(e as { hint?: string }).hint = prev === undefined ? hint : `${prev} ${hint}`
-    return e
   }
   /**
    * 在令牌上下文里收尾：退役令牌 → 等在途语句落定 → ROLLBACK。返回收尾状态（三态，见

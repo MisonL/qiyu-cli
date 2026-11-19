@@ -382,14 +382,16 @@ try {
   const closed = await run.waitClosed(deadline - Date.now())
   const timedOut = run.killInfo.requested && run.closed
   run.dispose()
-  // spawn/kill 失败没有正常结论：原样抛出，别让调用方拿到「未交回结论」这种二手归因。
-  if (run.nativeError !== undefined) throw run.nativeError
   if (!closed) {
-    // close 未确认：不报 TIMEOUT —— 调用方会据此换轮/删目录，而进程可能还开着库文件。
+    // ⚠️ **close 未确认优先于原生错误**（CR 第四十七轮 major）：`kill()` 抛 EPERM 时
+    // `nativeError` 有值，但子进程可能**还开着库文件** —— 先原样抛原生错误会把这件事藏起来。
+    // 已启动的进程在这里一律交回「无法确认已放开库文件」，原生错误挂在 `cause` 上。
     const failure = run.finalFailure('锁校验进程在预算内未给出结论')
-    if (run.neverSpawned) throw failure
+    if (run.neverSpawned) throw run.nativeError ?? failure
     throw new Error(`锁校验进程在预算内未给出结论 —— 无法确认它已放开库文件，不报 TIMEOUT。${failure.message}`, { cause: failure })
   }
+  // close 已确认（或 spawn 没起来）：原生错误就是全部事实，原样抛出。
+  if (run.nativeError !== undefined) throw run.nativeError
   if (timedOut) return 'TIMEOUT'
   const co = run.stdout
   const errOut = run.stderr

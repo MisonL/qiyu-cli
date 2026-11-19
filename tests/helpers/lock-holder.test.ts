@@ -244,6 +244,23 @@ describe('锁夹具的子进程生命周期', () => {
     expectClean(child)
   })
 
+  it('verdict：kill 抛 EPERM 且没有 close → 必须说「无法确认已放开库文件」，EPERM 挂在 cause（CR 第四十七轮 major）', async () => {
+    // 旧实现先抛原生错误：调用方只看到 EPERM，不知道子进程可能还开着库文件 ——
+    // 换轮 / 删目录都可能与活着的进程撞上。
+    const original = Object.assign(new Error('kill EPERM'), { code: 'EPERM', syscall: 'kill' })
+    vi.mocked(child.kill).mockImplementation(() => { throw original })
+    swallowOn(child)
+    const running = observe(invoke('verdict', BUDGET))
+    await vi.advanceTimersByTimeAsync(BUDGET + 5_000)
+    expect(running.isSettled(), '宽限耗尽必须交回结论').toBe(true)
+    const err = (await running.result as { error?: Error & { cause?: unknown } }).error
+    expect(err, '必须是「close 未确认」的合成错误，不是裸 EPERM').toBeInstanceOf(Error)
+    expect(err!.message).toMatch(/无法确认|close/)
+    expect(err!.cause, '原生错误保留在 cause 上').toBeInstanceOf(Error)
+    expect((err!.cause as Error).message).toMatch(/EPERM/)
+    expectClean(child)
+  })
+
   it('holder：kill 未被受理且没有 close → 错误里 kill 与 close 分开说', async () => {
     vi.mocked(child.kill).mockReturnValue(false)
     const running = observe(invoke('holder', BUDGET))
