@@ -464,9 +464,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     ;(err as { kind?: string }).kind = 'internal'
     // 稳定判据（供编排层判断「该实例上任何语句都会被拒」）：文案随成因变化，code 不变。
     ;(err as { code?: string }).code = 'store_retired'
+    // ⚠️ 默认 hint **不得声称「未提交的写入不会落库」**（Codex PR#81 第四十五轮 P2）：这条
+    // 默认文案服务于「回滚未能确认」的成因，而那个状态的准确含义就是「落没落库无法确认」——
+    // 照默认文案直接重放可能重复写。恢复动作统一为「关闭 → 重建 → 核对 → 再决定」。
     ;(err as { hint?: string }).hint = p.hint
-      ?? 'close 该 Store 并重建实例；'
-        + '若进程随后仍不退出，说明那条语句卡在不可中断的原生点上，只能结束进程（未提交的写入不会落库）'
+      ?? 'close 该 Store 并重建实例，先核对数据（本事务的写入是否落库）再决定是否重放；'
+        + '若进程随后仍不退出，说明那条语句卡在不可中断的原生点上，只能结束进程'
     return err
   }
   /**
@@ -533,6 +536,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         const err = new Error('事务提交结果未知：COMMIT 已下发但未能确认结果 —— 本事务的写入**可能已经落库**，也可能没有。'
           + '不要按失败直接重试（可能重复写）；请用新的 Store 实例核对后再决定', { cause: e })
         ;(err as { kind?: string }).kind = 'internal'
+        // ⚠️ 稳定标记（Codex PR#81 第四十五轮 P2）：这条错误本身就让实例永久退役，而编排层
+        // （`storeGapOrPrimary` / `releaseLock`）按 `store_retired` 识别「该实例已不可用」——
+        // 少了它，主失败在 gap 落库/清锁路径上会被次生错误换掉。
+        ;(err as { code?: string }).code = 'store_retired'
         ;(err as { hint?: string }).hint = '关闭并重建 Store 实例，核对数据后决定是否重放'
         // 这条错误已按成因给过恢复动作：外层 catch 的回滚收尾不得再补通用文案（两套指令打架）。
         selfDiagnosed.add(err)
@@ -972,19 +979,34 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   const selfDiagnosed = new WeakSet<object>()
   const annotateUnconfirmedRollback = <E>(e: E, state: TxClose): E => {
     if (state !== 'unconfirmed' || !(e instanceof Error) || selfDiagnosed.has(e)) return e
-    e.message = `${e.message} ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；`
+    const note = ' ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；'
       + '该连接已退役，本实例上的写入结果不可信'
+    // ⚠️ **冻结 / 只读的错误对象不能再赋值**（CR 第四十六轮 major，探针 2026-11-20）：
+    // `Object.freeze(new Error(…))` 上写 `message` 会抛 TypeError —— 调用方拿到的既不是原错误、
+    // 也不是带恢复动作的诊断，而是 TypeError（原失败与回放指令一起丢光）。此时改为包一层
+    // 新错误（`cause` 保留原对象），身份契约让位于「不能把主失败弄丢」。
+    const hint = '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）'
+      + '再决定是否重放；本实例上的后续语句都会被拒'
+    try {
+      e.message = `${e.message}${note}`
+    } catch {
+      const wrapped = new Error(`${e.message}${note}`, { cause: e })
+      ;(wrapped as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
+      ;(wrapped as { retryable?: boolean }).retryable = false
+      ;(wrapped as { code?: string }).code = 'store_retired'
+      ;(wrapped as { hint?: string }).hint = hint
+      return wrapped as unknown as E
+    }
     // ⚠️ **本实例已退役，重试必然失败**（CR 第四十四轮 major，探针实测）：回调抛的是
     // `kind:'store_locked'` / `retryable:true` 时，错误身份保留会让它原样带着「可重试」标记
     // 出去 —— 上层重试同一实例只会得到 `store_retired`，把这条带恢复动作的主失败整个换掉。
     // 所以统一打上稳定标记：`retryable=false` + `code:'store_retired'`（判据是「该实例上的
     // 任何语句都会被拒」，与退役错误同一个 code）。
+    // 可写对象（冻结对象在上面的 catch 里已整体换皮）：补稳定标记与恢复动作。
+    const prev = (e as { hint?: string }).hint
     ;(e as { retryable?: boolean }).retryable = false
     ;(e as { code?: string }).code = 'store_retired'
-    const prev = (e as { hint?: string }).hint
-    const add = '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）'
-      + '再决定是否重放；本实例上的后续语句都会被拒'
-    ;(e as { hint?: string }).hint = prev === undefined ? add : `${prev} ${add}`
+    ;(e as { hint?: string }).hint = prev === undefined ? hint : `${prev} ${hint}`
     return e
   }
   /**

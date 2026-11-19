@@ -896,7 +896,13 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     // 这条成因的指引，且它必须原样到达 Agent。
     expect(e!.message, '不得追加通用回滚补注').not.toMatch(/回滚未能确认/)
     expect(e!.hint, '不得追加通用回滚补注').not.toMatch(/写入结果不可信/)
+    // ⚠️ **注入的确实是「数据窗」那次提交**（CR 第四十六轮 major 的追问）：重开库核对 ——
+    // 若第 2 次 COMMIT 其实是 markPending 那次，数据行不会在库里，这条用例就在拿错误的
+    // 提交位置冒充事故形态。
     await store.close()
+    const reopened = await createDuckDbStore(cfg, 'rw')
+    expect(await reopened.count('tags'), '数据窗的提交在驱动里已执行 → 行应已落库').toBe(1)
+    await reopened.close()
   })
 
   it('退役/提交未知对两层重试判据都是终态：窗口事务只尝试一次（不重试、不被 store_retired 顶替）（CR 第四十二轮 major）', async () => {

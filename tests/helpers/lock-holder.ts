@@ -325,7 +325,11 @@ async function waitForMarker(
   // 调用方必须让用例红、**不得**换轮重试或复用这个库路径 —— 目录随用例一起删掉是安全的
   // （POSIX 上删掉仍被占用的文件不影响那个进程），但「以为进程没了」再复用路径就不是。
   // 这句必须出现在失败文案里，否则读日志的人只会看到「未就绪」。
-  const failure = run.finalFailure(`${what}${why}`)
+  // ⚠️ **调用方拿不到句柄就失去了手动清理的途径**（CR 第四十六轮 major 的追问）：这里抛错时
+  // `spawnLockHolder` 不会返回 child，调用方只能靠这条文案里的 pid 去处理。所以 pid 与
+  // 「close 未确认」必须一起说 —— 只报「未就绪」等于把活着的进程藏起来。
+  const pid = child.pid
+  const failure = run.finalFailure(`${what}${why}${pid === undefined ? '' : `（子进程 pid ${pid}）`}`)
   run.dispose()
   throw failure
 }

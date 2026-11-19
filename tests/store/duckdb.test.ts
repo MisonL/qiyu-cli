@@ -849,6 +849,10 @@ describe('duckdb —— 事务', () => {
       await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
     }).then(() => null, (e: unknown) => e)
     expect((txErr as Error).message, '必须点明结果未知').toMatch(/提交结果未知.*可能已经落库/)
+    // ⚠️ **首次**退役错误自己也要带稳定标记（Codex PR#81 第四十五轮 P2）：编排层按
+    // `store_retired` 识别「该实例已不可用」，只有后续 `poisonedError` 带标记时，主失败在
+    // gap 落库 / 清锁路径上仍会被次生错误换掉。
+    expect((txErr as Error & { code?: string }).code, '首次退役错误同样带 store_retired').toBe('store_retired')
     const after = await s.count('tags').then(() => null, (e: unknown) => e as Error)
     expect(after, '结果未知后同一实例必须永久退役（不等 ROLLBACK 的结果）').toMatchObject({ kind: 'internal' })
     expect((after as Error).message).toMatch(/退役|无法确认/)
@@ -1984,6 +1988,99 @@ describe('duckdb —— 事务', () => {
     expect(txErr!.message, '不得再把原错误洗成「已回滚」').toMatch(/boom/)
     expect(txErr!.hint, '恢复动作：重建实例 + 核对后再决定是否重放').toMatch(/重建/)
     expect(txErr!.hint).toMatch(/重放|核对/)
+    await s.close()
+  })
+
+  it('冻结的错误对象同样不得丢主失败：回滚未确认时包一层并保留 cause（CR 第四十六轮 major）', { timeout: 90_000 }, async () => {
+    // 探针实测（2026-11-20）：`Object.freeze(new Error(…))` 上写 `message` 抛 TypeError ——
+    // 调用方拿到的既不是原错误、也不是带恢复动作的诊断，原失败与「核对后再重放」一起丢光。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const boom = Object.freeze(new Error('write failed'))
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw boom
+    }).then(() => null, (x: unknown) => x as Error & { cause?: unknown; hint?: string; code?: string; retryable?: boolean })
+    expect(e, '不得变成 TypeError').toBeInstanceOf(Error)
+    expect(e!.constructor.name, '抛出的是 Error，不是赋值失败产生的 TypeError').toBe('Error')
+    expect(e!.cause, '原错误必须挂在 cause 上').toBe(boom)
+    expect(e!.message, '原失败原文保留').toMatch(/write failed/)
+    expect(e!.message, '回滚状态同样要说').toMatch(/回滚未能确认/)
+    expect(e!.hint, '恢复动作同样要给').toMatch(/核对/)
+    expect(e!.code).toBe('store_retired')
+    expect(e!.retryable, '实例已退役 → 不可重试').toBe(false)
+    await s.close()
+  })
+
+  it('默认退役 hint 不得声称「未提交的写入不会落库」（回滚未确认时该说法是假话）（Codex PR#81 第四十五轮 P2）', { timeout: 90_000 }, async () => {
+    // 默认 hint 服务于「回滚未能确认」：那个状态的准确含义就是「落没落库无法确认」。
+    // 照「未提交的写入不会落库」直接重放，可能重复写。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw new Error('boom')
+    }).catch(() => {})
+    // 后续语句走**默认 hint**（成因无自定义 hint）
+    const after = await s.count('tags').then(() => null, (e: unknown) => e as Error & { hint?: string })
+    expect(after, '前提：实例已退役').not.toBeNull()
+    expect(after!.hint, '默认 hint 不得声称未提交写入不落库').not.toMatch(/未提交的写入不会落库/)
+    expect(after!.hint, '恢复动作：重建 + 核对后再决定').toMatch(/核对/)
+    expect(after!.hint).toMatch(/重放/)
     await s.close()
   })
 
