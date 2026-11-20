@@ -699,6 +699,9 @@ describe('store 命令面与 help', () => {
       let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
         roundsRun = round + 1
+        // ⚠️ **预算耗尽后不再换轮**（CR 第六十一轮追问）：deadline 已过去时，新一轮夹具
+        // 的就绪/close 等待全是负数预算，失败会被报成「未就绪」而不是「预算耗尽」。
+        if (Date.now() >= deadline) break
         const p = join(dir, `w-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
         if (holder) holder.kill('SIGKILL')
         holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `w-holder-${round}`, deadline })

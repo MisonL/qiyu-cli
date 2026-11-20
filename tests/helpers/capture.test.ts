@@ -1049,6 +1049,20 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
             // 上一条判断，否则 `(n as ts.Block).statements` 是 undefined、`.some` 直接抛。
             if ((n as ts.Block | ts.SourceFile | ts.ModuleBlock).statements.some(declares)) return false
           }
+          // ⚠️ **循环初始化里的声明同样遮蔽**（CR 第六十一轮 major）：`for (const args of …)` /
+          // `for (let args = …)` 的 `args` 是循环变量（每次迭代换个值），不是转发边界；
+          // 只查函数参数与块级语句表时整条循环初始化被跳过，一路找到外层同名 rest 就放行。
+          // （`for (x of …)` 的左侧也可以是已有标识符 —— 那同样是绑定/赋值目标，按遮蔽处理。）
+          if (ts.isForOfStatement(n) || ts.isForInStatement(n) || ts.isForStatement(n)) {
+            const bindsLoop = (b: ts.BindingName): boolean => ts.isIdentifier(b)
+              ? b.text === name
+              : b.elements.some((e) => !ts.isOmittedExpression(e) && bindsLoop(e.name))
+            const init = n.initializer
+            const declared = init !== undefined && (ts.isVariableDeclarationList(init)
+              ? init.declarations.some((d) => bindsLoop(d.name))
+              : ts.isIdentifier(init) && init.text === name)
+            if (declared) return false
+          }
           // ⚠️ catch 的**解构绑定**同样遮蔽（Codex 第五轮 P2）：`catch ({ args })` 里的 args 是
           // catch 绑定的值，展开的是它而不是外层的 `...args`。
           if (ts.isCatchClause(n) && n.variableDeclaration !== undefined) {
@@ -1589,20 +1603,50 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
         }
         return acc
       }
-      if (chain[chain.length - 1] === 'apply') {
-        const arr = unwrap(call.arguments[1] as ts.Expression | undefined ?? ({} as ts.Expression))
-        return ts.isArrayLiteralExpression(arr) ? expand(arr.elements) : []
+      /** bind 的预绑定实参：apply 形态里它是**数组**（apply 的实参列表），要摊平。 */
+      const flatArray = (list: readonly ts.Expression[]): ts.Expression[] => list.flatMap((arg) => {
+        const u = unwrap(arg)
+        return ts.isArrayLiteralExpression(u)
+          ? flatArray(u.elements as readonly ts.Expression[]) : [u]
+      })
+      const tailName = (e: ts.Expression): string | undefined => {
+        const u = unwrap(e)
+        return ts.isPropertyAccessExpression(u) ? u.name.text
+          : ts.isElementAccessExpression(u) ? staticKey(u.argumentExpression) : undefined
       }
-      // ⚠️ **bind 的预绑定实参**（CR 第五十九轮 major）：`beforeEach.bind(null, setup)()` 的
-      // 外层调用实参为空，setup 在被调方（`beforeEach.bind(null, setup)`）的实参里。
-      const callee = unwrap(call.expression)
-      if (ts.isCallExpression(callee)) {
-        const innerChain = callChain(callee)?.chain ?? []
-        if (innerChain[innerChain.length - 1] === 'bind') {
-          return [...expand(callee.arguments.slice(1)), ...expand(call.arguments)]
+      /** 一层调用自身的实参：`.call` 去掉 thisArg、`.apply` 取第二实参的数组。 */
+      const fromCall = (c: ts.CallExpression, name: string | undefined): ts.Expression[] => {
+        if (name === 'apply') {
+          const arr = unwrap(c.arguments[1] as ts.Expression | undefined ?? ({} as ts.Expression))
+          return ts.isArrayLiteralExpression(arr) ? expand(arr.elements) : []
         }
+        return expand(name === 'call' ? c.arguments.slice(1) : c.arguments)
       }
-      return expand(call.arguments)
+      // ⚠️ **逐层向被调方回溯**（CR 第六十一轮 major）：链里可能叠了 bind 与 call/apply
+      // （`beforeEach.call(null, setup)`、`beforeEach.bind(null, setup)()`、
+      // `beforeEach.bind(null, [setup]).apply(null)`）—— 每一层的 thisArg 都不是回调，
+      // 而 bind 的预绑定实参是回调。旧实现只认「链尾恰是 call/apply」或「被调方恰是 bind 调用」
+      // 的两种离散形态，叠起来就整条漏掉。
+      let current: ts.CallExpression = call
+      let acc = fromCall(current, chain[chain.length - 1] === 'bind'
+        ? undefined : chain[chain.length - 1])
+      for (;;) {
+        // 先剥 `….call` / `….apply` 这层属性访问，才到「调用 bind 结果」的 CallExpression。
+        let base: ts.Expression = unwrap(current.expression)
+        if (ts.isPropertyAccessExpression(base) || ts.isElementAccessExpression(base)) {
+          base = unwrap(base.expression)
+        }
+        if (!ts.isCallExpression(base)) break
+        const innerName = tailName(base.expression)
+        if (innerName === 'bind') {
+          acc = [...flatArray(base.arguments.slice(1)), ...acc]
+          break
+        }
+        if (innerName === undefined || (innerName !== 'call' && innerName !== 'apply')) break
+        acc = [...fromCall(base, innerName), ...acc]
+        current = base
+      }
+      return acc
     })()
     for (const arg of hookArgs) {
       const u = unwrap(arg)
@@ -2575,6 +2619,14 @@ it('Q34', oQ34, () => {})`),
     // ㉒ **bind 预绑定的回调被调用**（CR 第五十九轮 major）：`beforeEach.bind(null, setup)()`
     expect(hookHits(bt('function setupH94() { ', ST, '(w, 80) }\n', H, '.bind(null, setupH94)()')),
       'bind 预绑定的命名回调').toEqual([`${ST}(`])
+    // ㉕ **.call / .apply 触发 hook 时的预绑定回调**（CR 第六十一轮 major）：
+    // `beforeEach.bind(null, setup).call(null)` 与 `beforeEach.bind(null, [setup]).apply(null)` ——
+    // 外层调用是 call/apply，实参为空，setup 藏在**被调方**的 bind 实参里。旧归一化只看最外层
+    // `.apply` 的第二实参（空），命名回调一个都找不到。
+    expect(hookHits(bt('function setupH95() { ', ST, '(w, 80) }\n', H, '.bind(null, setupH95).call(null)')),
+      'bind 预绑定 + .call 的命名回调').toEqual([`${ST}(`])
+    expect(hookHits(bt('function setupH96() { ', ST, '(w, 80) }\n', H, '.bind(null, [setupH96]).apply(null)')),
+      'bind 预绑定 + .apply 的命名回调').toEqual([`${ST}(`])
     // ㉓ **套件体内声明的命名回调**（CR 第五十九轮 major）：`describe('g', register)` 里的
     //    register 自己声明并登记 setup —— 查找不能停在 register 这一层。
     expect(hookHits(bt('describe(\'g80\', register80)\nfunction register80() {\n  function setup80() { ', ST, '(w, 80) }\n  ', H, '(setup80)\n}')),
@@ -2602,6 +2654,18 @@ it('Q34', oQ34, () => {})`),
       '解构声明遮蔽外层 rest 名').toEqual(['unknown'])
     expect(concHits(`function sh53(...args53) {\n  {\n    const { args53 } = { args53: [{ con${'current: true }'}, () => {}] }\n    it('S53', ...args53)\n  }\n}`),
       '对象解构声明同样遮蔽').toEqual(['unknown'])
+    // ㉔ **循环绑定的变量同样遮蔽外层 rest 名**（CR 第六十一轮 major）：`for (const args of …)`
+    // 的 `args` 是循环变量（数组元素），不是转发边界；旧判据只查函数参数与块语句，循环初始化
+    // 里的声明整个看不见，一路溯到外层同名 rest 参数就当边界放行。
+    expect(concHits(`function sh54(...args54) {\n  for (const args54 of [[{ con${'current: true }'}, () => {}]]) {\n    it('S54', ...args54)\n  }\n}`),
+      'for-of 循环变量遮蔽外层 rest').toEqual(['unknown'])
+    expect(concHits(`function sh55(...args55) {\n  for (const args55 in { a: 1 }) {\n    it('S55', ...args55)\n  }\n}`),
+      'for-in 循环变量同样遮蔽').toEqual(['unknown'])
+    expect(concHits(`function sh56(...args56) {\n  for (let args56 = 0; args56 < 1; args56++) {\n    it('S56', ...args56)\n  }\n}`),
+      'for 初始化里的声明同样遮蔽').toEqual(['unknown'])
+    // 反例：循环没有占用那个名字时，真正的 rest 转发仍按边界放行
+    expect(concHits(`function fwd54(name, ...rest54) {\n  for (const i54 of [1]) { it(name, ...rest54) }\n}`),
+      '循环变量不相干时 rest 仍是边界').toEqual([])
     // ⑫ **条件表达式的分支里也要收别名**（Codex 第五轮 P2）：`const [a] = flag ? [opts] : [{}]`
     // 在 flag 为真时 a === opts。旧收集先用 refersToAlias 判整个条件表达式（字面量不是引用）
     // 就停了，分支里的 opts 整个漏掉。

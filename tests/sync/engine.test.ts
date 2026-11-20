@@ -1139,11 +1139,14 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
         fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
       })
       const e = await runTask(t, ctx(store, { sleep: async () => { retryWaits++ } }))
-        .then(() => null, (x: unknown) => x as Error & { kind?: string; code?: string; hint?: string })
+        .then(() => null, (x: unknown) => x as Error & { kind?: string; code?: string; hint?: string; retryable?: boolean })
       expect(e, '必须以错误收尾').not.toBeNull()
       expect(e!.message, '原始撞锁失败必须保留（不得被退役文案换掉）').toMatch(/注入：写入撞锁/)
       expect(e!.message, '回滚未确认的事实也要在').toMatch(/回滚未能确认/)
       expect(e!.code, '实例已退役').toBe('store_retired')
+      // ⚠️ 原错误带 `retryable:true`（撞锁可重试）；实例已退役后**必须改判为 false**（CR 第六十一轮
+      // 追问）：命令出口按 kind 分流时，可重试标记还在就是「把已退役的实例当普通撞锁」再试一次。
+      expect(e!.retryable, '退役后不得再说可重试').toBe(false)
       expect(retryWaits, '退役错误对两层重试都是终态 —— 一次重试等待都不许有').toBe(0)
       expect(insertCalls, '退役后不得再次碰同一实例').toBe(1)
       expect(rollbackCalls).toBeGreaterThanOrEqual(1)
@@ -1202,13 +1205,73 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
         fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
       })
       const e = await runRotated([t], ctx(store, { sleep: async () => { retryWaits++ } }))
-        .then(() => null, (x: unknown) => x as Error & { code?: string })
+        .then(() => null, (x: unknown) => x as Error & { code?: string; retryable?: boolean })
       expect(e, '必须以错误收尾').not.toBeNull()
       expect(e!.message, '原始撞锁失败必须保留（不得被退役文案换掉）').toMatch(/注入：写入撞锁/)
       expect(e!.message, '回滚未确认的事实也要在').toMatch(/回滚未能确认/)
       expect(e!.code, '实例已退役').toBe('store_retired')
+      expect(e!.retryable, '退役后不得再说可重试').toBe(false)
       expect(retryWaits, '旋转入口的退役错误同样是终态 —— 一次重试等待都不许有').toBe(0)
       expect(insertCalls, '退役后不得再次碰同一实例').toBe(1)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('配对核对不符 + 回滚未确认 → 主失败原文保留在包层、恢复动作不被命令出口换掉（CR 第六十一轮追问）', async () => {
+    // `commitWindow` 的 count_mismatch 是**无 kind** 的普通 Error。回滚未确认时补注会包一层；
+    // 若包层漏了 `kind`，命令出口 `thrownToExit` 会走「无 kind」分支、把 hint 换成通用
+    // 「执行期错误」文案 —— 「先核对再重放」整段丢失。判据：交回错误同时保留 mismatch 原文、
+    // 回滚未确认事实、kind=internal 与核对 hint，且窗口放弃（不重试）。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    let insertCalls = 0
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!armed) return cc.runAndReadAll(sql, params)
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  if (/^INSERT INTO\s+"?tags"?/.test(sql)) { insertCalls++; return cc.runAndReadAll(sql, params) }
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+    armed = true
+    try {
+      // apiCount=2、实际 1 行 → 写入数 1 ≠ 预期 2 → 事务里抛 count_mismatch。
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 2 }),
+      })
+      const e = await runTask(t, ctx(store, { sleep: async () => {} })).then(() => null,
+        (x: unknown) => x as Error & { kind?: string; hint?: string; code?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '配对核对原文必须保留').toMatch(/配对核对不符/)
+      expect(e!.message, '回滚未确认的事实也要在').toMatch(/回滚未能确认/)
+      expect(e!.kind, '无 kind 的主失败必须由包层补 internal（否则 hint 被命令出口换掉）').toBe('internal')
+      expect(e!.code, '实例已退役').toBe('store_retired')
+      expect(e!.hint, '恢复动作必须含核对').toMatch(/核对/)
+      expect(e!.hint, '恢复动作必须含重放').toMatch(/重放/)
+      expect(insertCalls, '退役后不得再碰同一实例').toBe(1)
     } finally {
       await store.close()
     }

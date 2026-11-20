@@ -1070,12 +1070,20 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     })()
     const prevKind = isErr
       ? ((): string | undefined => {
-          try { return (e as { kind?: string }).kind } catch { return undefined }
+          // ⚠️ 非字符串按缺失处理（CR 第六十一轮 major）：Symbol 等值落进模板拼接会抛
+          // TypeError，整段标注会被换成 TypeError；直接落进 kind 分流又会污染命令出口。
+          try {
+            const v = (e as { kind?: unknown }).kind
+            return typeof v === 'string' ? v : undefined
+          } catch { return undefined }
         })()
       : undefined
     const prevHint = isErr
       ? ((): string | undefined => {
-          try { return (e as { hint?: string }).hint } catch { return undefined }
+          try {
+            const v = (e as { hint?: unknown }).hint
+            return typeof v === 'string' ? v : undefined
+          } catch { return undefined }
         })()
       : undefined
     const wrapped = new Error(`${readable}${note}`, { cause: e })

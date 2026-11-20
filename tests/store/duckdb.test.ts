@@ -2336,6 +2336,13 @@ describe('duckdb —— 事务', () => {
     expect(e!.kind).toBe('internal')
     expect(e!.code).toBe('store_retired')
     await s.close()
+    // ⚠️ **未提交写入只能靠原生 close 丢弃**（CR 第六十一轮追问）：COMMIT 尚未在驱动里执行就
+    // 被拒，事务可能仍然开着；实例已退役，收尾的 ROLLBACK 也发不出去（poison 守卫）。这里
+    // 重开库核对 —— ACID 的兜底是连接关闭，错误文案说「可能已落库」指的是 COMMIT 真下发过的
+    // 形态，这两种说法不得互相矛盾。
+    const reopened = await createDuckDbStore(cfg, 'rw')
+    expect(await reopened.count('tags'), 'COMMIT 未执行就被拒 → close 后不得残留未提交写入').toBe(0)
+    await reopened.close()
   })
 
   it('ROLLBACK 以 undefined 被拒 → 不得当成「已确认回滚」（CR 第五十二轮 major）', { timeout: 90_000 }, async () => {
@@ -2716,6 +2723,57 @@ describe('duckdb —— 事务', () => {
     expect(String(e!.hint), '不得只剩「稍后重试」').not.toBe('请稍后重试')
     expect(e!.code).toBe('store_retired')
     expect(e!.cause, '原错误必须挂在 cause 上').toBe(weird)
+    await s.close()
+  })
+
+  it('hint / kind 不是字符串（Symbol 等）→ 包层按缺失处理，不得抛、不得带出去（CR 第六十一轮 major）', { timeout: 90_000 }, async () => {
+    // 形态：`hint` 的 getter 返回 `Symbol` —— 字符串模板拼接 Symbol 会抛 TypeError（`String(Symbol)`
+    // 不抛，但 `${sym}` 抛）。包层构造就此炸掉，调用方拿到的是 TypeError，主失败与
+    // 「重建 → 核对 → 再重放」全部丢光。非字符串的 `kind` 同理：它会原样落到命令出口的
+    // kind 分流上。判据：两者都按「缺失」处理（kind=internal、hint 只有通用恢复动作）。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const weird = new Error('原始失败')
+    Object.defineProperty(weird, 'hint', { configurable: true, get: () => Symbol('hint') })
+    Object.defineProperty(weird, 'kind', { configurable: true, get: () => Symbol('kind') })
+    const e = await s.transaction(async () => { throw weird })
+      .then(() => null, (x: unknown) => x as Error & { cause?: unknown; code?: string; hint?: string; kind?: string })
+    expect(e, '不得变成模板拼接抛出的 TypeError').toBeInstanceOf(Error)
+    expect(e!.constructor.name, '抛出的是 Error，不是拼接 Symbol 产生的 TypeError').toBe('Error')
+    expect(e!.cause, '原错误必须挂在 cause 上').toBe(weird)
+    expect(e!.message, '回滚状态必须说').toMatch(/回滚未能确认/)
+    expect(e!.message, '原失败原文保留').toMatch(/原始失败/)
+    expect(e!.kind, '非字符串 kind 按缺失处理').toBe('internal')
+    expect(e!.code).toBe('store_retired')
+    expect(e!.hint, '通用恢复动作必须在').toMatch(/核对/)
+    expect(String(e!.hint), 'Symbol 建议不得出现在 hint 里').not.toContain('Symbol')
     await s.close()
   })
 
@@ -4175,6 +4233,10 @@ describe('duckdb —— init 与关闭', () => {
       let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
         roundsRun = round + 1
+        // ⚠️ **预算耗尽后不再换轮**（CR 第六十一轮追问）：deadline 已过去时，新夹具的
+        // 就绪/close 等待全是负数预算，失败会被报成「未就绪」而不是「预算耗尽」。
+        // 显式停下，让末尾的 roundsRun / lockConfirmed 断言如实报告已跑的轮数。
+        if (Date.now() >= deadline) break
         const p = join(dir, `r-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
         if (holder) holder.kill('SIGKILL')
         holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `r-holder-${round}`, deadline })
@@ -4241,6 +4303,10 @@ describe('duckdb —— init 与关闭', () => {
       let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
         roundsRun = round + 1
+        // ⚠️ **预算耗尽后不再换轮**（CR 第六十一轮追问）：deadline 已过去时，新夹具的
+        // 就绪/close 等待全是负数预算，失败会被报成「未就绪」而不是「预算耗尽」。
+        // 显式停下，让末尾的 roundsRun / lockConfirmed 断言如实报告已跑的轮数。
+        if (Date.now() >= deadline) break
         const p = join(dir, `w-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
         if (holder) holder.kill('SIGKILL')
         holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `w-holder-${round}`, deadline })
@@ -4292,6 +4358,10 @@ describe('duckdb —— init 与关闭', () => {
       let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
         roundsRun = round + 1
+        // ⚠️ **预算耗尽后不再换轮**（CR 第六十一轮追问）：deadline 已过去时，新夹具的
+        // 就绪/close 等待全是负数预算，失败会被报成「未就绪」而不是「预算耗尽」。
+        // 显式停下，让末尾的 roundsRun / lockConfirmed 断言如实报告已跑的轮数。
+        if (Date.now() >= deadline) break
         const p = join(dir, `ro-lock-${round}.db`)
         if (holder) holder.kill('SIGKILL')
         // 只读实例要求文件已存在 → 先由**子进程**建一个合法的空 DuckDB 文件
