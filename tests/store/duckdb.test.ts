@@ -1918,9 +1918,18 @@ describe('duckdb —— 事务', () => {
       expect(err!.kind, `${sql} 属用法错误`).toBe('usage')
       expect(err!.message).toMatch(/事务控制/)
     }
-    // 反例：不含事务关键字的解释语句照常可跑（否则这条守卫会把普通诊断也挡掉）
+    // 反例①：不含事务关键字的解释语句照常可跑（否则这条守卫会把普通诊断也挡掉）
     const ok = await s.query('EXPLAIN ANALYZE SELECT 1 AS v')
     expect(ok.rows.length).toBeGreaterThan(0)
+    // 反例②：事务关键字只出现在**字符串字面量 / 注释**里（Codex PR#81 第五十二轮 P2）：
+    // 真驱动实测 `EXPLAIN ANALYZE SELECT 'COMMIT'` 只是普通解释语句，外层类型 EXPLAIN 但里层
+    // 并无事务控制。旧判据拿 TX_KEYWORD 匹配整条 SQL 原文 → 误拒合法诊断。
+    for (const sql of ["EXPLAIN ANALYZE SELECT 'COMMIT' AS v",
+      'EXPLAIN ANALYZE SELECT 1 AS v /* COMMIT */']) {
+      const res = await s.query(sql).then(() => null, (e: unknown) => e as Error)
+      expect(res, `${sql} 是普通解释语句，不得误拒`).toBeNull()
+      expect((res as unknown as { rows: unknown[] } | null)?.rows?.length ?? 1).toBeGreaterThan(0)
+    }
     await s.close()
   })
 
@@ -3735,6 +3744,58 @@ describe('duckdb —— 事务', () => {
     expect(after, '原生 BEGIN 已成功、回滚又未能确认 → 后续语句必须被拒（连接已退役）')
       .toMatchObject({ kind: 'internal' })
     expect((after as Error).message).toMatch(/退役|无法确认/)
+    await s.close()
+  })
+
+  it('BEGIN 在执行前就被驱动拒绝 → 交回原错误、实例不得退役（Codex PR#81 第五十四轮 P2）', { timeout: 90_000 }, async () => {
+    // 事故形态：`beganTx` 在发出 BEGIN **之前**登记（为了兜住「原生已成功、结果交回才拒」）。
+    // 若驱动的拒绝发生在原生执行之前（事务根本没有开过），随后 ROLLBACK 也失败时仍按
+    // 「回滚未确认」毒化整个实例 —— 原错误被换成「回滚未确认」，后续所有操作都被拒。
+    // 判据：事务真的没开过（探针两次 txid_current 不同值）→ 不毒化、原错误原样交回。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  // 枚举层拒绝：原生 BEGIN 一行都没执行。
+                  if (armed && sql === 'BEGIN') throw new Error('注入：BEGIN 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    armed = true
+    const boom = new Error('boom')
+    const txErr = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw boom
+    }).then(() => null, (e: unknown) => e as Error & { code?: string })
+    expect(txErr, '事务必须失败').not.toBeNull()
+    expect(txErr!.message, '原错误必须原样交回，不得被换成「回滚未确认」').toMatch(/BEGIN 在执行前被拒绝/)
+    expect(txErr!.message).not.toMatch(/回滚未能确认/)
+    expect(txErr!.code, '事务根本没开过 → 不得带退役标记').toBeUndefined()
+    armed = false
+    const n = await s.count('tags').then((v) => v, (e: unknown) => e as Error & { kind?: string })
+    expect(n, '实例不得退役：后续语句照常可用').toBe(0)
     await s.close()
   })
 

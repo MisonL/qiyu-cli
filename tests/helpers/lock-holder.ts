@@ -154,7 +154,12 @@ class ScriptRun {
         this.errorWaiters.push(waiter)
       })
     }
-    return true
+    // ⚠️ **error 不等于 stdio 已关**（CR 第六十二轮 major）：Node 在 spawn 失败后仍会发
+    // `close`（实测 error → close(-2)）；pid 缺失只说明没有可发信号的进程，不代表文件句柄
+    // 已经放开。等有界的 close，拿不到就如实返回 false —— 调用方按「清理未确认」处理，
+    // 不在这之前删目录 / 换轮。
+    if (this.closed) return true
+    return this.waitOne(CLOSE_GRACE_MS)
   }
 
   /**
@@ -225,9 +230,11 @@ class ScriptRun {
    */
   finalFailure(summary: string): Error {
     const detail = describeTerm(this)
-    // 没启动的进程永远不会有 close，原始 error 就是全部事实；已确认 close 后再出现的
-    // 原生错误（如 kill 事件晚到）原样交回，调用方拿到的仍是原始对象。
-    if (this.nativeError !== undefined && (this.closed || this.neverSpawned)) {
+    // 已确认 close（含未启动的进程收到 error 后的 close）→ 原始 error 就是全部事实，
+    // 原样交回，调用方拿到的仍是原始对象。
+    // ⚠️ **未启动不等于 stdio 已关**（CR 第六十二轮 major）：close 未确认时不能把原始错误
+    // 当成「清理已完成」的结论文案 —— 合成错误把 close 未确认说清楚，原始错误挂在 cause 上。
+    if (this.nativeError !== undefined && this.closed) {
       return this.nativeError
     }
     if (this.nativeError !== undefined) {
@@ -355,10 +362,21 @@ async function waitForMarker(
   throw failure
 }
 
+/**
+ * 预算已过期就**不写脚本、不 spawn**（CR 第六十二轮 major）：三个入口都会先起子进程，
+ * 负数预算下子进程照样先 create/modify 数据库，到点才被 kill —— 失败文案还会伪装成
+ * 「未就绪」。统一在入口判一次，响亮报「预算已耗尽」。
+ */
+function assertBudget(deadline: number, what: string): void {
+  if (Date.now() >= deadline) {
+    throw new Error(`${what}：预算已耗尽（deadline 已过 ${Date.now() - deadline}ms），不再起子进程`)
+  }
+}
 /** 起一个跨进程持锁者（RW 独占锁 / RO 共享锁），就绪后才返回。 */
 export async function spawnLockHolder(
   o: { dbPath: string; scriptDir: string; name?: string; accessMode?: 'READ_ONLY' | 'READ_WRITE'; deadline: number },
 ): Promise<ChildProcess> {
+  assertBudget(o.deadline, '锁持有者')
   const script = o.accessMode === 'READ_ONLY'
     ? `const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
 const inst = await DuckDBInstance.create(${JSON.stringify(o.dbPath)}, { access_mode: 'READ_ONLY' })
@@ -390,6 +408,7 @@ setInterval(() => {}, 1 << 30)`
 export async function lockVerdict(
   dbPath: string, scriptDir: string, deadline: number,
 ): Promise<'CONFLICT' | 'OPENED' | 'TIMEOUT'> {
+  assertBudget(deadline, '锁校验')
   // 子进程跑不了 TS 判据（Node 20.12 无 type stripping），所以只交回事实、由父进程判。
   const chk = runScript(`const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
 try {
@@ -410,7 +429,8 @@ try {
     // `nativeError` 有值，但子进程可能**还开着库文件** —— 先原样抛原生错误会把这件事藏起来。
     // 已启动的进程在这里一律交回「无法确认已放开库文件」，原生错误挂在 `cause` 上。
     const failure = run.finalFailure('锁校验进程在预算内未给出结论')
-    if (run.neverSpawned) throw run.nativeError ?? failure
+    // ⚠️ **未启动也不等于 stdio 已关**（CR 第六十二轮 major）：close 未确认时不能把原始
+    // spawn 错误当成「已收尾」交回 —— 合成文案说清 close 未确认，原始错误经 cause 保留。
     throw new Error(`锁校验进程在预算内未给出结论 —— 无法确认它已放开库文件，不报 TIMEOUT。${failure.message}`, { cause: failure })
   }
   // close 已确认（或 spawn 没起来）：原生错误就是全部事实，原样抛出。
@@ -437,6 +457,7 @@ try {
 
 /** RO 持有者要求文件已存在：由**子进程**建一个合法空库（父进程建会命中实例缓存）。 */
 export async function seedEmptyDb(dbPath: string, scriptDir: string, deadline: number): Promise<void> {
+  assertBudget(deadline, '种子进程')
   const ch = runScript(`const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
 const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
 inst.closeSync()`, scriptDir, 'seed')

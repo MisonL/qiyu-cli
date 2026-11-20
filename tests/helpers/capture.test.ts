@@ -427,6 +427,14 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
               if (!aliases.has(u.text)) { aliases.add(u.text); changed = true }
               return
             }
+            // ⚠️ **转存进容器的属性**（CR 第六十二轮 major）：`box.opts = opts` 之后
+            // `box.opts.concurrent = true` 写穿的仍是 opts。属性路径本身不能进别名集，但把
+            // **根标识符**（`box`）收进来后，任何经 `box.…` 的写入都按「可能是 opts」处理 ——
+            // 只多报（更保守），不会漏掉真写入。
+            if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
+              collectTarget(u.expression)
+              return
+            }
             if (ts.isArrayLiteralExpression(u)) {
               for (const el of u.elements) {
                 if (ts.isSpreadElement(el)) collectTarget(el.expression)
@@ -1533,12 +1541,9 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
   const reassignedNames = new Set<string>()
   {
     const collectAssign = (n: ts.Node): void => {
-      if (ts.isBinaryExpression(n)) {
-        const k = n.operatorToken.kind
-        if (k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment) {
-          // ⚠️ 解构赋值同样重绑定（Codex 第七轮 P2）：`[setup] = [() => …]` / `({ f: setup } = …)`
-          // 的左侧不是 Identifier，只认标识符会漏掉。
-          const collectAssignTarget = (e: ts.Expression): void => {
+      // ⚠️ 解构赋值同样重绑定（Codex 第七轮 P2）：`[setup] = [() => …]` / `({ f: setup } = …)`
+      // 的左侧不是 Identifier，只认标识符会漏掉。循环赋值（CR 第六十二轮）也用它。
+      const collectAssignTarget = (e: ts.Expression): void => {
             const u = unwrap(e)
             if (ts.isIdentifier(u)) { reassignedNames.add(u.text); return }
             if (ts.isArrayLiteralExpression(u)) {
@@ -1557,9 +1562,19 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
               return
             }
             if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.EqualsToken) collectAssignTarget(u.left)
-          }
-          collectAssignTarget(n.left)
-        }
+      }
+      if (ts.isBinaryExpression(n)) {
+        const k = n.operatorToken.kind
+        if (k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment) collectAssignTarget(n.left)
+      }
+      // ⚠️ **for...of / for...in 的左侧也是赋值目标**（CR 第六十二轮 major）：
+      // `for (setup of [() => setTimeout(...)]) {}` 每轮都换掉回调，不是声明、也不是 `=` 左侧。
+      // 只认普通赋值时守卫照旧下钻初始的空回调，真正的调度回调被漏掉。
+      // `for (const x of …)` 是声明（每次迭代新绑定），不算重新赋值 —— 只有`let` 的既有名字被
+      // 直接写成目标（或解构目标）才算。
+      if ((ts.isForOfStatement(n) || ts.isForInStatement(n)) && n.initializer !== undefined
+        && !ts.isVariableDeclarationList(n.initializer)) {
+        collectAssignTarget(n.initializer as ts.Expression)
       }
       ts.forEachChild(n, collectAssign)
     }
@@ -2642,6 +2657,18 @@ it('Q34', oQ34, () => {})`),
       expect(hits.length, '对象解构赋值后的回调必须报告').toBe(1)
       expect(hits[0]).toMatch(/重新赋值/)
     }
+    // ㉘ **循环赋值同样算重绑定**（CR 第六十二轮 major）：`for (setup of …)` / `for (setup in …)`
+    // 的左侧不是赋值表达式，旧收集只认 `=` / 解构赋值 —— 回调在登记前已被换掉却照旧下钻。
+    {
+      const hits = hookHits(bt('let setupH97 = () => {}\nfor (setupH97 of [() => { ', ST, '(w, 80) }]) {}\n', H, '(setupH97)'))
+      expect(hits.length, 'for-of 赋值目标必须报告').toBe(1)
+      expect(hits[0]).toMatch(/重新赋值/)
+    }
+    {
+      const hits = hookHits(bt('let setupH98 = () => {}\nfor (setupH98 in { a: 1 }) { ', ST, '(w, 80) }\n', H, '(setupH98)'))
+      expect(hits.length, 'for-in 赋值目标必须报告').toBe(1)
+      expect(hits[0]).toMatch(/重新赋值/)
+    }
     // 未被重新赋值的 let 仍可解析（不因噎废食）
     expect(hookHits(bt('let setupH88 = () => { ', ST, '(w, 80) }\n', H, '(setupH88)')),
       '未重新赋值的 let 照常下钻').toEqual([`${ST}(`])
@@ -2666,6 +2693,20 @@ it('Q34', oQ34, () => {})`),
     // 反例：循环没有占用那个名字时，真正的 rest 转发仍按边界放行
     expect(concHits(`function fwd54(name, ...rest54) {\n  for (const i54 of [1]) { it(name, ...rest54) }\n}`),
       '循环变量不相干时 rest 仍是边界').toEqual([])
+    // ㉖ **自有 `['__proto__']` 计算键**（CR 第六十二轮 major）：`{ ['__proto__']: … }` 是**普通自有
+    // 数据属性**，字面量里它不换原型；但 runner 合并选项若走 `Object.assign`，目标对象的
+    // `__proto__` setter 会把那个对象挂成原型 —— `options.concurrent` 从原型链读得到。
+    // 静态推导既不能当「串行」也不能当「并发」，按「看不清」报。
+    expect(concHits(`describe('P62', { ['__proto__']: { con${'current: true }'} }, () => {})`),
+      '计算键 __proto__ 在合并时可能换原型').toEqual(['unknown'])
+    // ㉗ **选项对象经属性赋值写入**（CR 第六十二轮 major）：`const o = {}; o.concurrent = true`
+    // 之后登记的选项值已经变了 —— 只认字面量初始化会把空对象当串行放行。
+    expect(concHits(`const oA62 = {}\noA62.concurrent = true\nit('A62', oA62, () => {})`),
+      '属性赋值写入选项对象').toEqual(['unknown'])
+    expect(concHits(`const oB62 = { con${'current: false }'}\noB62['concurrent'] = true\nit('B62', oB62, () => {})`),
+      '下标赋值同样写入').toEqual(['unknown'])
+    expect(concHits(`const oC62 = { con${'current: false }'}\nconst boxC62 = {}\nboxC62.opts = oC62\nboxC62.opts.concurrent = true\nit('C62', oC62, () => {})`),
+      '经容器属性转存后再写穿同一个对象').toEqual(['unknown'])
     // ⑫ **条件表达式的分支里也要收别名**（Codex 第五轮 P2）：`const [a] = flag ? [opts] : [{}]`
     // 在 flag 为真时 a === opts。旧收集先用 refersToAlias 判整个条件表达式（字面量不是引用）
     // 就停了，分支里的 opts 整个漏掉。
@@ -2879,7 +2920,11 @@ it('Q34', oQ34, () => {})`),
     const proto = (name: string, opts: string): string[] => concHits(`describe('${name}', ${opts}, () => {})`)
     expect(proto('PT1', '{ __proto__: { con' + 'current: true } }'), '字面量原型上的并发开关可静态确定').toEqual(['opt'])
     expect(proto('PT2', "{ '__proto__': { se" + 'quential: false } }'), '字符串键同样是原型开关').toEqual(['opt'])
-    expect(proto('PT3', "{ ['__proto__']: { con" + 'current: true } }'), '计算键是普通自有键，不是原型').toEqual([])
+    // ⚠️ 改判（CR 第六十二轮 major）：计算键 `['__proto__']` 在**字面量**里是普通自有键，但
+    // runner 用 `Object.assign({}, suiteOptions, options)` 合并选项时，目标对象的 proto setter
+    // 被触发 —— 这个对象成了合并结果的**原型**，`options.concurrent` 从它继承。PT3 旧断言
+    // （按自有键判串行）会把并发用例放行，现在按「看不清」报。
+    expect(proto('PT3', "{ ['__proto__']: { con" + 'current: true } }'), '计算键在合并时可能换原型').toEqual(['unknown'])
     expect(proto('PT4', '{ __proto__: null }'), '原型设成 null 没有继承来的键').toEqual([])
     expect(proto('PT5', '{ __proto__: { timed' + 'out: 1 } }'), '原型上没有开关相关的键').toEqual([])
     expect(concHits(`import { protoOptsPT6 } from './x'\ndescribe('PT6', { __proto__: protoOptsPT6 }, () => {})`),

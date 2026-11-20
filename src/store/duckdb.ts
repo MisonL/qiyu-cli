@@ -642,6 +642,52 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 块末尾的分号）只多花一次解析 —— 单条带尾分号实测 `count === 1`，照常放行。
    */
   const mightBeMulti = (sql: string): boolean => sql.replace(/[\s;]+$/, '').includes(';')
+  /**
+   * 把 SQL 里**不执行**的文本剥掉（字符串字面量 / 引号标识符 / 行注释 / 块注释 / dollar 引用），
+   * 只给「原文里有没有事务关键字」这类**初判**用（CR 第六十二轮 / Codex PR#81 第五十二轮 P2）。
+   * ⚠️ 它不是 SQL 解析器，边界如实记录：块注释按「到第一个星号加斜杠为止」处理
+   * （剥离只会更保守地停下，不会把关键字漏进结果）；`E'…'` 之类前缀照常按普通字面量剥。
+   */
+  const stripSqlLiterals = (sql: string): string => {
+    let out = ''
+    for (let i = 0; i < sql.length; i++) {
+      const ch = sql[i]
+      if (ch === '-' && sql[i + 1] === '-') {
+        while (i < sql.length && sql[i] !== '\n') i++
+        out += '\n'
+        continue
+      }
+      if (ch === '/' && sql[i + 1] === '*') {
+        i += 2
+        while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i++
+        i++
+        out += ' '
+        continue
+      }
+      if (ch === "'" || ch === '"') {
+        const q = ch
+        i++
+        while (i < sql.length) {
+          if (sql[i] === q) {
+            if (sql[i + 1] === q) { i += 2; continue }
+            break
+          }
+          i++
+        }
+        out += ' '
+        continue
+      }
+      if (ch === '$') {
+        const m = /^\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$/.exec(sql.slice(i))
+        if (m !== null) {
+          const end = sql.indexOf(m[0], i + m[0].length)
+          if (end !== -1) { i = end + m[0].length - 1; out += ' '; continue }
+        }
+      }
+      out += ch
+    }
+    return out
+  }
   /** 原始事务控制的拒绝错误（`execSql` 与 `rejectRawTxControl` 共用一份文案）。 */
   const rawTxError = (): Error => {
     const err = new Error('事务控制语句不得经 `query` / 原始 SQL 下发 —— 它绕过事务归属与收尾判据'
@@ -713,8 +759,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // ⚠️ **可执行包装器**（CR 第四十四轮 major，真驱动探针 2026-11-20）：`EXPLAIN ANALYZE COMMIT`
     // 的外层语句类型是 `EXPLAIN`(4)，DuckDB 照常执行里层计划 —— 探针实测「事务里写入 →
     // `EXPLAIN ANALYZE COMMIT` → ROLLBACK 报 `no transaction is active`、写入已在库里」。
-    // 所以外层类型是 EXPLAIN **且原文含事务关键字**时一律拒：普通 `EXPLAIN ANALYZE SELECT 1`
-    // 不含事务关键字、照常放行；含关键字的解释语句本来就少，多拒一次只是换个更安全的失败。
+    // 所以外层类型是 EXPLAIN 且（剥掉字面量/注释后）含事务关键字时拒。
+    // ⚠️ **只匹配 SQL 代码部分**（CR 第六十二轮 / Codex PR#81 第五十二轮 P2）：`EXPLAIN ANALYZE
+    // SELECT 'COMMIT'` 与注释里的 COMMIT 都是**不执行**的文本 —— 旧判据匹配整条原文，把合法
+    // 只读诊断误拒。字面量 / 引号标识符 / 行注释 / 块注释 / dollar 引用全部剥掉再匹配：事务
+    // 控制不可能藏在字面量里执行，剥离不会放宽判据。
     // （`EXPLAIN (ANALYZE)` / `EXPLAIN (ANALYZE true)` 同一探针同样执行里层。）
     const EXPLAIN = typeof ST.EXPLAIN === 'number' ? ST.EXPLAIN : 4
     let p: { statementType: number; destroySync?: () => void }
@@ -735,7 +784,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     }
     try {
       if (p.statementType === TRANSACTION) throw rawTxError()
-      if (p.statementType === EXPLAIN && TX_KEYWORD.test(sql)) throw rawTxError()
+      if (p.statementType === EXPLAIN && TX_KEYWORD.test(stripSqlLiterals(sql))) throw rawTxError()
     } finally {
       // 预编译语句持有原生句柄：不释放会在长会话里累积（同 sandbox 的做法）。
       p.destroySync?.()
@@ -1120,6 +1169,35 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 返回收尾状态；无法确认时**退役连接**并**不发 ROLLBACK**（CR 第三十七轮 major #1/#4）：
    * 先 ROLLBACK 的话，驱动里还没执行完的语句会在事务结束后于 autocommit 里执行。
    */
+  /**
+   * 连接上**此刻有没有活动事务**（BEGIN 收尾归因用，Codex PR#81 第五十四轮 P2）。
+   * 真驱动探针（2026-11-20）：autocommit 下每条语句各开一个隐式事务、`txid_current()`
+   * 逐次**递增**；显式事务内连续查询返回**同一值**。所以「两次查询同值 = 有活动事务」。
+   * 任何失败 / 超时 → `undefined`（调用方按「无法确认」处理，保守侧不变）。
+   * ⚠️ 只在 ROLLBACK 已被拒、需要判断「事务到底开没开」时调用 —— 正常路径一次都不发。
+   */
+  const probeActiveTransaction = async (): Promise<boolean | undefined> => {
+    const one = async (): Promise<string> => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('事务状态探针超时')), 50)
+      })
+      try {
+        const raw = c.runAndReadAll('SELECT txid_current() AS t') as unknown as Promise<{
+          getRowObjectsJson?: () => Array<Record<string, unknown>>
+        }>
+        const r = await Promise.race([raw, timeout])
+        return String(r.getRowObjectsJson?.()[0]?.t)
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+    }
+    try {
+      const a = await one()
+      const b = await one()
+      return a === b
+    } catch { return undefined }
+  }
   const closeTx = async (token: TxToken): Promise<TxClose> => {
     retire(token)
     if (closed) return 'none'
@@ -1174,12 +1252,20 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // BEGIN 都没成功 → 本来就没有事务可回滚（可以是 BEGIN 被快照拒这类响亮失败），不是「状态未知」。
       // 挂住的那次 ROLLBACK 若**迟到成功**，事务其实已经收尾 —— 但本实例状态已经不可信
       //（退役由 poison 负责、连接即将关闭），不因迟到结果恢复可用性，保持「未能确认」。
-      if (beganTx.has(token)) {
-        poison('ROLLBACK 未能确认：它可能根本没有执行，事务也许仍然开着')
+      // ⚠️ **「登记过」不等于「事务真的开过」**（Codex PR#81 第五十四轮 P2）：`beganTx` 在发出
+      // BEGIN 之前登记（为了兜住「原生已成功、结果交回才拒」），若驱动的拒绝发生在原生执行
+      // **之前**，事务根本没开过 —— 直接按「回滚未确认」毒化会把原错误换成退役文案，后续所有
+      // 操作都被拒。这里问一次连接（两次 `txid_current()` 同值才是有活动事务）：
+      // 确认没有 → 按「无可回滚」交回原错误；探针失败 / 有事务 → 保守毒化（与旧行为一致）。
+      let unconfirmed = beganTx.has(token)
+      if (unconfirmed) {
+        const active = await probeActiveTransaction()
+        if (active === false) {
+          unconfirmed = false
+        } else {
+          poison('ROLLBACK 未能确认：它可能根本没有执行，事务也许仍然开着')
+        }
       }
-      // BEGIN 都没成功（`beganTx` 里没有令牌）：本来就没有事务可回滚，状态**不是**未知；
-      // 只有「BEGIN 曾成功 → ROLLBACK 没确认」才是「事务也许仍然开着」。
-      const unconfirmed = beganTx.has(token)
       beganTx.delete(token)
       return unconfirmed ? 'unconfirmed' : 'none'
     }

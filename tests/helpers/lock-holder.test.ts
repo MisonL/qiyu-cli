@@ -6,7 +6,7 @@ import { accessSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
-import { lockVerdict, spawnLockHolder, seedEmptyDb, LOCK_BUDGET_MS, PKG_URL } from './lock-holder.js'
+import { lockVerdict, spawnLockHolder, seedEmptyDb, LOCK_BUDGET_MS, CLOSE_GRACE_MS, PKG_URL } from './lock-holder.js'
 
 // 只把 `spawn` 换成可预置替身的薄壳，其余 child_process 能力保持真实。
 vi.mock('node:child_process', async (importOriginal) => {
@@ -146,6 +146,17 @@ describe('锁夹具的子进程生命周期', () => {
     spawnMock.mockReturnValueOnce(child)
   })
 
+  it.each(fixtures)('%s：预算已耗尽 → 不 spawn、不写脚本，响亮报「预算已耗尽」（CR 第六十二轮 major）', async (fixture) => {
+    // 事故：deadline 已过去时三个入口仍会写脚本并起子进程（负数预算），子进程先去
+    // create/modify 数据库，到点才被 kill —— 失败文案还会伪装成「未就绪」。入口先判预算。
+    const running = observe(invoke(fixture, -1))   // 假时钟 now=0，deadline=-1 已过期
+    await vi.advanceTimersByTimeAsync(0)
+    expect(spawnMock, '预算耗尽不得再起子进程').not.toHaveBeenCalled()
+    expect(running.isSettled(), '预算耗尽必须立即交回，不留无界等待').toBe(true)
+    const result = await running.result
+    expect('error' in result ? String(result.error) : '', '必须点名预算已耗尽').toMatch(/预算已耗尽|预算过期|deadline/)
+  })
+
   it.each(fixtures)('%s：未启动进程的 spawn error 不裸抛，原错误原样交回', async (fixture) => {
     Object.assign(child, { pid: undefined })
     swallowOn(child)
@@ -153,9 +164,13 @@ describe('锁夹具的子进程生命周期', () => {
     const original = Object.assign(new Error('spawn … EACCES'), { code: 'EACCES', syscall: 'spawn …' })
     expect(() => child.emit('error', original), '没有 error 监听者 = 未捕获异常带走进程').not.toThrow()
     await vi.advanceTimersByTimeAsync(100)
-    expect(running.isSettled(), '未启动进程不会再有 close，error 就是终态').toBe(true)
+    // ⚠️ error 不等于 stdio 已关（CR 第六十二轮 major）：Node 在 spawn 失败后仍会发 close。
+    expect(running.isSettled(), 'close 未确认前不得交回（调用方可能已开始删目录）').toBe(false)
+    child.emit('close', -2, null)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(running.isSettled()).toBe(true)
     const result = await running.result
-    expect('error' in result ? result.error : undefined, '必须保留原始 spawn 错').toBe(original)
+    expect('error' in result ? result.error : undefined, 'close 已确认 → 保留原始 spawn 错').toBe(original)
     expect(child.kill, '没有 PID 不该发信号').not.toHaveBeenCalled()
     expectClean(child)
   })
@@ -168,11 +183,15 @@ describe('锁夹具的子进程生命周期', () => {
     expect(running.isSettled(), '哨兵未到前不得交回').toBe(false)
     await vi.advanceTimersByTimeAsync(1)
     for (let i = 0; i < 10 && !running.isSettled(); i++) await Promise.resolve()
-    expect(running.isSettled(), '哨兵到点必须交回，不留无界等待').toBe(true)
+    // ⚠️ 哨兵只负责把「没等到 error」记成原生错误；close 未确认仍守有界宽限（CR 第六十二轮 major）。
+    expect(running.isSettled(), '哨兵到点、close 未到 → 继续等有界宽限').toBe(false)
+    await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS)
+    expect(running.isSettled(), '宽限到点必须交回，不留无界等待').toBe(true)
     const result = await running.result
     const error = 'error' in result ? result.error : undefined
     expect(error).toBeInstanceOf(Error)
     expect(String(error), '必须点名「没等到 error 事件」，不能静默').toMatch(/未收到 error 事件/)
+    expect(String(error), '同时说清 close 未确认').toMatch(/close/)
     expectClean(child)
   })
 
@@ -363,18 +382,32 @@ describe('锁夹具的子进程生命周期', () => {
     expectClean(child)
   })
 
-  it.each(fixtures)('%s：spawn error 已到但 close 未到，在 100ms 哨兵内明确失败并保留 cause', async (fixture) => {
+  it.each(fixtures)('%s：spawn error 已到但 close 未到 → 有界等待后报「清理未确认」，原始错误挂 cause（CR 第六十二轮 major）', async (fixture) => {
     Object.assign(child, { pid: undefined })
     swallowOn(child)
     const running = observe(invoke(fixture, 1_000_000))
     const original = Object.assign(new Error('spawn … ENOENT'), { code: 'ENOENT' })
     child.emit('error', original)
     await vi.advanceTimersByTimeAsync(100)
-    expect(running.isSettled(), '未启动进程不白等业务预算').toBe(true)
+    expect(running.isSettled(), 'close 未到不得交回原始错误').toBe(false)
+    await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS)
+    expect(running.isSettled(), '宽限到点必须交回').toBe(true)
     const result = await running.result
     const error = 'error' in result ? result.error : undefined
-    expect(error).toBe(original)
-    expect(child.kill).not.toHaveBeenCalled()
+    // 未确认清理：不能把原始错误当「已收尾」交回（调用方会据此删目录），但原错误不丢。
+    expect(error, 'close 未确认 → 交回合成错误，不冒充原始错误').not.toBe(original)
+    // cause 链上必须找得到原始错误（各入口包层数不同：verdict 有一层夹具失败包层）。
+    const causeChainHas = (e: unknown, target: unknown): boolean => {
+      let x: unknown = e
+      for (let i = 0; i < 4 && x !== undefined && x !== null; i++) {
+        if (x === target) return true
+        x = (x as { cause?: unknown }).cause
+      }
+      return false
+    }
+    expect(causeChainHas((error as { cause?: unknown }).cause, original), '原始错误在 cause 链上').toBe(true)
+    expect(String(error), '必须说清 close 未确认').toMatch(/close/)
+    expect(child.kill, '没有 PID 不该发信号').not.toHaveBeenCalled()
     expectClean(child)
   })
 
@@ -421,6 +454,7 @@ describe('锁夹具的子进程生命周期', () => {
     const running = observe(invoke('verdict', 1_000_000))
     child.emit('error', Object.assign(new Error('spawn … EACCES'), { code: 'EACCES' }))
     await vi.advanceTimersByTimeAsync(100)
+    await vi.advanceTimersByTimeAsync(CLOSE_GRACE_MS)
     await running.result
     // 夹具必须把「调用方已拿到结果之后到达的原生错误」兜住，而不是让它抛穿测试进程。
     expect(() => child.emit('error', new Error('late error after settle'))).not.toThrow()
@@ -430,7 +464,10 @@ describe('锁夹具的子进程生命周期', () => {
   it('holder：deadline 已过时 marker 立即可见也不算就绪（CR 第五十四轮 major #7）', async () => {
     // 事故形态：截止定时器到点仍去读「此刻是否就绪」—— 在高负载下定时器本身会迟到，一条
     // **截止之后**才到达的 marker 因此被当成就绪。判据：就绪必须被观察到**在 deadline 之内**。
-    const running = observe(invoke('holder', -1))
+    // ⚠️ 预算在入口内（spawn 前）判（CR 第六十二轮 major）—— 这里让子进程**在预算内启动**，
+    // 再推进时间越过 deadline，迟到的 marker 仍然不算就绪。
+    const running = observe(invoke('holder', BUDGET))
+    await vi.advanceTimersByTimeAsync(BUDGET + 1)
     child.stdout?.emit('data', 'locked\n')
     await vi.advanceTimersByTimeAsync(0)
     expect(running.isSettled(), '失败收尾要等真实 close').toBe(false)

@@ -280,7 +280,14 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
     if (ts.isPropertyAssignment(p)) {
       const k = staticPropKey(p.name, true)
       // `__proto__` 的**非计算**键（标识符 / 字符串）是原型分支；计算键不是。
-      if (k === '__proto__' && !ts.isComputedPropertyName(p.name)) {
+      // ⚠️ **计算键 `['__proto__']` 是自有数据属性**（CR 第六十二轮 major）：它不是原型分支，
+      // 但 Vitest 把选项经 `Object.assign({}, suiteOptions, options)` 合并时，目标对象的 proto
+      // setter 会被触发 —— 这个键**换了目标的原型**，之后读 `options.concurrent` 就从它继承。
+      // 静态模型里既不能当普通自有键放过，也不能确定是并发：按「原型分支未解析」报「看不清」。
+      if (k === '__proto__') {
+        // 计算键的**值**也不是原型来源：合并时会触发 proto setter，但原型上有什么取决于
+        // 那个值 —— 静态上看不清，按 unresolved 报。
+        if (ts.isComputedPropertyName(p.name)) { protoMap = new Map(); protoUnresolved = true; continue }
         const src = unwrap(p.initializer)
         if (ts.isObjectLiteralExpression(src)) {
           const inner = objectPropsInner(src)
