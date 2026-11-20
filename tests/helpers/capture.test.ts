@@ -812,6 +812,19 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       registrarAlias.set(el.name.text, imported)
     }
   }
+  /**
+   * vitest 的**命名空间导入**（CR 第五十三轮 major #5）：`import * as vt from 'vitest'` 之后
+   * `vt.it.concurrent(…)` / `vt.describe('x', {concurrent:true}, …)` 都是真登记。链首是这些名字时
+   * 先剥掉那一段，与命名导入别名同一处归一。只认从 `vitest` 导入的命名空间。
+   */
+  const vitestNamespaces = new Set<string>()
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || st.importClause?.namedBindings === undefined) continue
+    const from = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : ''
+    if (from !== 'vitest') continue
+    const nb = st.importClause.namedBindings
+    if (ts.isNamespaceImport(nb)) vitestNamespaces.add(nb.name.text)
+  }
   /** 链首名字 → 注册函数基名（原名或经 vitest 命名导入的别名）。 */
   const registrarBase = (name: string): string => registrarAlias.get(name) ?? name
   /**
@@ -879,14 +892,16 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
   for (const call of collectCalls(sf)) {
     const c = callChain(call)
     if (c === undefined) continue
-    const base = registrarBase(c.chain[0]!)
+    // 命名空间前缀先剥掉：`vt.it.concurrent` 的链按 `it.concurrent` 判（报文也按归一后的链）
+    const chain = c.chain.length >= 2 && vitestNamespaces.has(c.chain[0]!) ? c.chain.slice(1) : c.chain
+    const base = registrarBase(chain[0]!)
     // 链式登记的两层调用（表格层 / 登记层）落在同一行，同一处违规只报一次
     if (seen.has(outermostRegistration(call))) continue
     if (REGISTRARS.has(base)) {
-      const isAlias = c.chain.includes('concurrent')
-        || c.chain.some((seg) => seg.toLowerCase() === 'concurrent')
+      const isAlias = chain.includes('concurrent')
+        || chain.some((seg) => seg.toLowerCase() === 'concurrent')
       if (isAlias) {
-        out.push({ line: lineOf(sf, call), why: `.concurrent 修饰链：${c.chain.join('.')}`, testName: registeredName(call) })
+        out.push({ line: lineOf(sf, call), why: `.concurrent 修饰链：${chain.join('.')}`, testName: registeredName(call) })
         seen.add(outermostRegistration(call))
         continue
       }
@@ -998,8 +1013,8 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         continue
       }
       args = expanded.args
-      const lastSeg = c.chain[c.chain.length - 1]
-      if (c.chain.length > 1 && (lastSeg === 'call' || lastSeg === 'apply')) {
+      const lastSeg = chain[chain.length - 1]
+      if (chain.length > 1 && (lastSeg === 'call' || lastSeg === 'apply')) {
         // ⚠️ `Function.prototype.apply(thisArg, argsArray)` 的**第一个实参是 thisArg** —— 之前这里
         // 把 `call.arguments[0]`（thisArg，实测是 `null`）当成实参数组，`it.apply(null, [...])`
         // 直接被判成「实参数组无法静态解析」（Codex PR#81 第二十五轮 P2 的修复本身没生效，
@@ -1845,6 +1860,16 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // `callChain` 返回 undefined，`.concurrent` 与选项位同时漏判 —— 守卫被"合法写法"绕过。
     expect(concHits(`${bt('it[', JSON.stringify('concurrent'), ']("x", () => {})')}`), '下标访问的并发修饰')
       .toEqual(['alias:it.concurrent'])
+    // vitest 的**命名空间导入**同样是登记（CR 第五十三轮 major #5）：`import * as vt from 'vitest'`
+    // 之后 `vt.it.concurrent(…)` / `vt.describe('x', { concurrent: true }, …)` 都是真登记。
+    const nsIt = `import * as vt60 from 'vitest'\n`
+    expect(concHits(`${nsIt}${bt('vt60.it.', 'concurrent("NS", () => {})')}`), '命名空间导入的并发修饰')
+      .toEqual(['alias:it.concurrent'])
+    expect(concHits(`${nsIt}${bt("vt60.describe('NS2', { con", 'current: true }, () => {})')}`), '命名空间导入的选项并发')
+      .toEqual(['opt'])
+    // 反例：别的模块的命名空间同名成员不是登记
+    expect(concHits(`${bt('import * as vt61 from ', JSON.stringify('./my-helpers'))}\n${bt('vt61.it.', 'concurrent("NS3", () => {})')}`),
+      '非 vitest 命名空间不算登记').toEqual([])
     expect(concHits(`${bt('it[', JSON.stringify('skipIf'), '](false).concurrent(' , '"q2", () => {})')}`),
       '下标基座 + 点号修饰').toEqual(['alias:it.skipIf.concurrent'])
     // 叠加修饰（CodeRabbit PR#81 第十三轮）：条件基座 + concurrent + each。

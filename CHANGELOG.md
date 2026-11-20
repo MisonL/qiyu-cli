@@ -96,6 +96,8 @@
 - 迁移形态判据认**命名空间导入**（`import * as cap from './capture.js'; cap.captureSinks(…)`）；
   并发豁免同时排除**参数化登记**（`it.concurrent.each(…)`）。锁夹具：`close` 未确认的失败文案带
   子进程 pid，`afterEach` 逐个收尾（一个失败不再中断其余）。
+- 并发判据认 vitest 的**命名空间导入登记**（`import * as vt from 'vitest'; vt.it.concurrent(…)` /
+  `vt.describe('x', { concurrent: true }, …)`）。
 
 
 ## [0.2.2] - 2026-11-12
