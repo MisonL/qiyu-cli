@@ -758,7 +758,9 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
         if ((e as { kind?: string }).kind === 'rate_limit_local') {
           failed++
           contiguousBroken = true
-          await storeGap(ctx, task, w, 'rate_limit_local', (e as Error).message, gaps)
+          // ⚠️ **次生的退役错误不得顶掉这里的原始失败**（CR 第六十三轮 major）：限频
+          // 预算耗尽本身带恢复指令；补记缺口的事务若首次让实例退役，两条事实合并交回。
+          await storeGapOrPrimary(ctx, task, w, 'rate_limit_local', (e as Error).message, gaps, e)
           continue
         }
         throw e
@@ -771,7 +773,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       } catch (e) {
         failed++
         contiguousBroken = true
-        await storeGap(ctx, task, w, fetchGapReason(e), fetchGapDetail(e), gaps)
+        await storeGapOrPrimary(ctx, task, w, fetchGapReason(e), fetchGapDetail(e), gaps, e)
         continue
       }
 
@@ -893,7 +895,7 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
         }))
         await releaseLock(ctx, task)
       }
-      await storeGap(ctx, task, resolvedRange, 'rate_limit_local', (e as Error).message, gaps)
+      await storeGapOrPrimary(ctx, task, resolvedRange, 'rate_limit_local', (e as Error).message, gaps, e)
       return snapshotResult(task, resolvedRange, gaps, 0, 0, 0, 1, 'failed')
     }
     throw e
@@ -911,7 +913,7 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
     try {
       fetchRes = await withRetries(ctx, () => fetchWithFakeEmptyRetry(task, ref, ctx), isTransient)
     } catch (e) {
-      await storeGap(ctx, task, resolvedRange, fetchGapReason(e), fetchGapDetail(e), gaps)
+      await storeGapOrPrimary(ctx, task, resolvedRange, fetchGapReason(e), fetchGapDetail(e), gaps, e)
       return snapshotResult(task, resolvedRange, gaps, 0, 0, 0, 1, 'failed')
     }
 
@@ -1171,7 +1173,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
           if ((e as { kind?: string }).kind === 'rate_limit_local') {
             plan.failed++
             plan.contiguousBroken = true
-            await storeGap(ctx, task, w, 'rate_limit_local', (e as Error).message, plan.gaps)
+            await storeGapOrPrimary(ctx, task, w, 'rate_limit_local', (e as Error).message, plan.gaps, e)
             continue
           }
           throw e
@@ -1184,7 +1186,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
         } catch (e) {
           plan.failed++
           plan.contiguousBroken = true
-          await storeGap(ctx, task, w, fetchGapReason(e), fetchGapDetail(e), plan.gaps)
+          await storeGapOrPrimary(ctx, task, w, fetchGapReason(e), fetchGapDetail(e), plan.gaps, e)
           continue
         }
 

@@ -1177,6 +1177,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * ⚠️ 只在 ROLLBACK 已被拒、需要判断「事务到底开没开」时调用 —— 正常路径一次都不发。
    */
   const probeActiveTransaction = async (): Promise<boolean | undefined> => {
+    // ⚠️ **退役连接上一条语句都不许发**（CR 第六十三轮 major）：`closeTx` 在这里绕过了
+    // execSql 的退役守卫，若连接已退役（poison），探针就是「退役后仍做原生操作」。
+    // 退役状态下的答案已由 poison 决定，保守侧 = 按「未能确认」处理。
+    if (poisoned !== undefined) return undefined
     const one = async (): Promise<string> => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const timeout = new Promise<never>((_, reject) => {
@@ -1199,7 +1203,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       const a = await one()
       const b = await one()
       return a === b
-    } catch { return undefined }
+    } catch {
+      // ⚠️ 超时 / 失败时把执行中的原生查询中断掉（CR 第六十三轮 major）：close 不会取消
+      // 原生任务，挂住的 SELECT 会把进程留在后台。目的只是解卡，不改变归因。
+      try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 中断失败照旧走保守侧 */ }
+      return undefined
+    }
   }
   const closeTx = async (token: TxToken): Promise<TxClose> => {
     retire(token)
@@ -1407,6 +1416,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 分类是 `usage`（Codex PR#81 第二十五轮 P3，实测：`count` 走 `execSql` 报 usage，
       // `upsert`/`delete` 报 internal —— 同一个 Store 上两种说法）。
       if (closed) throw usage('数据库连接已关闭')
+      // ⚠️ 退役连接不接受新工作（CR 第六十三轮 major）：自动事务的 BEGIN 同样不发。
+      if (poisoned !== undefined) throw poisonedError(poisoned)
       rejectEndedContext()
       // ⚠️ `inTx` 的语义是「本实例上有事务开着」，不等于「调用者在那个事务里」——
       // 归属必须由 `assertTxOwnership` 判（历史审查 PR#4 复核）。
@@ -1474,6 +1485,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 强引用它），而这条失败路径不会再 disable —— 迟到的 `transaction()` 每次都在攒一个
       // 启用态上下文。`upsert()` 本来就是这么防的，这里对齐。
       if (closed) throw usage('数据库连接已关闭')
+      // ⚠️ **退役连接不接受新事务**（CR 第六十三轮 major）：连 BEGIN 都不发 —— 否则失败
+      // 路径的回滚收尾会把原错误换成「回滚未确认」，并在退役连接上再做原生探测。
+      if (poisoned !== undefined) throw poisonedError(poisoned)
       rejectEndedContext()
       // ⚠️ 用异步上下文区分两种「事务已开」（CodeRabbit PR#81 第十七轮 minor，实测复现）：
       //   · 调用方**就在所有者上下文里**（`fn` 里的 `tx.transaction`，令牌一致）→ 真嵌套，usage；

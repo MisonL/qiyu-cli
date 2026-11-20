@@ -280,14 +280,15 @@ function objectPropsInner(obj: ts.ObjectLiteralExpression): {
     if (ts.isPropertyAssignment(p)) {
       const k = staticPropKey(p.name, true)
       // `__proto__` 的**非计算**键（标识符 / 字符串）是原型分支；计算键不是。
-      // ⚠️ **计算键 `['__proto__']` 是自有数据属性**（CR 第六十二轮 major）：它不是原型分支，
-      // 但 Vitest 把选项经 `Object.assign({}, suiteOptions, options)` 合并时，目标对象的 proto
-      // setter 会被触发 —— 这个键**换了目标的原型**，之后读 `options.concurrent` 就从它继承。
-      // 静态模型里既不能当普通自有键放过，也不能确定是并发：按「原型分支未解析」报「看不清」。
+      // ⚠️ **计算键 `['__proto__']` 是普通自有数据属性**（CR 第六十三轮 major，真 runner 探针
+      // 修正第六十二轮的「合并换原型」结论）：2.1.9 的套件标志在 `Object.assign` 合并**之前**
+      // 从原对象读（`@vitest/runner/dist/index.js:551-552`），合并后 `concurrent`/`sequential`
+      // 又被规范成自有布尔（`:558-559`、测试收尾 `:451-452`），压过 Object.assign 换原型带来的
+      // 继承。探针（vitest 2.1.9，`--maxWorkers=1 --no-file-parallelism`，并发峰值）：describe
+      // 计算键 → 子用例串行（peak 1）；带选项套件里 it 计算键 → 串行；顶层 it 计算键 → 串行；
+      // 对照 describe 非计算 `__proto__` → 子用例并发（peak 2）。所以按普通自有键收进模型。
       if (k === '__proto__') {
-        // 计算键的**值**也不是原型来源：合并时会触发 proto setter，但原型上有什么取决于
-        // 那个值 —— 静态上看不清，按 unresolved 报。
-        if (ts.isComputedPropertyName(p.name)) { protoMap = new Map(); protoUnresolved = true; continue }
+        if (ts.isComputedPropertyName(p.name)) { out.set('__proto__', p.initializer); continue }
         const src = unwrap(p.initializer)
         if (ts.isObjectLiteralExpression(src)) {
           const inner = objectPropsInner(src)

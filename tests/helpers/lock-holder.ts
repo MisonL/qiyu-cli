@@ -290,7 +290,11 @@ function describeTerm(run: ScriptRun): string {
  * 分块到达由调用方轮询累积的 stdout 自然兜住（`loc` + `ked\n` 两段仍拼得出整行）。
  */
 function stdoutHasMarkerLine(stdout: string, marker: string): boolean {
-  return stdout.split('\n').some((l) => l.trim() === marker)
+  const lines = stdout.split('\n')
+  // ⚠️ **最后一段没有换行收尾 —— 它可能只是半行**（CR 第六十三轮 major）：stdout 先到
+  // `locked`、随后到 `-failed\n` 时，把半行当整行就会把启动失败当成「锁已持有」。
+  lines.pop()
+  return lines.some((l) => l.trim() === marker)
 }
 
 /** 等到子进程在 stdout 打出 `marker` 整行，或它结束 / spawn 失败 / 预算耗尽。 */

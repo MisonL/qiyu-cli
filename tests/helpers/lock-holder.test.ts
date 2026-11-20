@@ -520,6 +520,21 @@ describe('锁夹具的子进程生命周期', () => {
     expectClean(child)
   })
 
+  it('holder：没有换行收尾的 "locked" 不算就绪（半行可能接着变成 locked-failed）（CR 第六十三轮 major）', async () => {
+    // 事故：`split('\n')` 的最后一段是没有换行收尾的半行。stdout 先发 `locked`、稍后发
+    // `-failed\n` 时，第一块就被 `trim() === marker` 当成完整一行 —— 用例拿一个启动失败、
+    // 从未拿到锁的 holder 当「锁已持有」。判据：只认换行收尾的整行。
+    const running = observe(invoke('holder', BUDGET))
+    child.stdout?.emit('data', 'locked')
+    await vi.advanceTimersByTimeAsync(60)
+    expect(running.isSettled(), '未换行收尾的半行不得当成就绪').toBe(false)
+    child.stdout?.emit('data', '\n')
+    await vi.advanceTimersByTimeAsync(60)
+    expect(running.isSettled(), '换行补上后才是完整一行').toBe(true)
+    expect(await running.result).toEqual({ value: child })
+    expectClean(child)
+  })
+
   it('holder：stderr 上出现含 "locked" 的报错路径 → **不得**当成就绪（只认 stdout 的完整一行）（CR 第四十二轮 major）', async () => {
     // 事故：就绪探测搜的是 stdout+stderr 合并串。一条启动失败（例如打不开
     // `/tmp/locked/q.db`）把 `locked` 带进 stderr，探测立刻返回一个**从未拿到锁**的

@@ -390,10 +390,17 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
         }
       }
       // ⚠️ **for...of 的元素也是别名来源**（Codex 第五轮 P2）：`for (const item of [opts])`
-      // 里 item 就是 opts（数组字面量的元素身份不变）。遍历**数组本身**（`of opts`）时元素身份
-      // 未知 —— 保守不认（记录边界：那只多报不了，只会漏掉「元素恰好是 opts」的形态）。
+      // 里 item 就是 opts（数组字面量的元素身份不变）。⚠️ 迭代对象也可以是**本文件里唯一静态
+      // 绑定的名字**（`const list = [opts]; for (const item of list)`，CR 第六十三轮 major）
+      // —— 只认循环位置的数组字面量时整条漏掉，随后 `item.concurrent = true` 被当成无关
+      // 变量、按旧值放行。遍历**数组本身**（`of opts`）时元素身份未知 —— 保守不认（记录边界：
+      // 那只多报不了，只会漏掉「元素恰好是 opts」的形态）。
       if (ts.isForOfStatement(n) && ts.isVariableDeclarationList(n.initializer)) {
-        const src = unwrap(n.expression)
+        let src = unwrap(n.expression)
+        if (ts.isIdentifier(src)) {
+          const init = staticBindingInitializer(sf, src.text)
+          if (init !== undefined) src = unwrap(init)
+        }
         if (ts.isArrayLiteralExpression(src)
           && aliasSources(src).some((s2) => aliases.has(s2))) {
           const bindLoop = (b: ts.Node): void => {
@@ -655,7 +662,23 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
  * 找不到、绑到别的东西或**写过**它 → undefined。
  * ⚠️ 判据是"被写过就作废"，与写法无关 —— 见 `isMutated`。
  */
+/**
+ * ⚠️ **重入守卫**（CR 第六十三轮 major）：`isMutated` 的别名收集会为「循环遍历的名字」解析
+ * 初始化器 —— 而本函数末尾又调 `isMutated(sf, name)`，同一个名字递归回来会无限下潜
+ * （`const list = [opts]` + `for (const item of list)` 实测 RangeError: Maximum call stack
+ * size exceeded）。重入时静态求值不可信 → undefined（保守侧：只多报「看不清」，不会放行）。
+ */
+const resolvingNames = new WeakMap<ts.SourceFile, Set<string>>()
 function staticBindingInitializer(sf: ts.SourceFile, name: string): ts.Expression | undefined {
+  let active = resolvingNames.get(sf)
+  if (active?.has(name)) return undefined
+  if (active === undefined) { active = new Set<string>(); resolvingNames.set(sf, active) }
+  active.add(name)
+  try {
+    return staticBindingInitializerUnchecked(sf, name)
+  } finally { active.delete(name) }
+}
+function staticBindingInitializerUnchecked(sf: ts.SourceFile, name: string): ts.Expression | undefined {
   let found: ts.Expression | undefined
   let shadowed = false
   // ⚠️ 同名声明必须**全文件唯一**（Codex PR#81 第二十五轮 P2「按初始化位置求值」，探针复现：
@@ -1034,29 +1057,33 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
           // 块级 / 文件级语句表里同名声明（只收 `const` / `let` / `var` / 函数 / 类；
           // 解构（`const { args } = …`）同样遮蔽，但那份保守侧已在 `staticBindingInitializer` 里，
           // 这里只判标识符名字 —— 漏掉解构只会让判据更保守，不会放行）
-          if (ts.isBlock(n) || ts.isSourceFile(n) || ts.isModuleBlock(n)) {
-            const declares = (st: ts.Statement): boolean => {
-              // ⚠️ 语句层看到的是 `VariableStatement`，声明本身在 `declarationList` 里 —— 只看
-              // `VariableDeclaration` 会漏掉全部 `const` / `let` / `var`（第一版就漏了，样本仍绿）。
-              if (ts.isVariableStatement(st)) {
-                // ⚠️ **绑定模式里的同名绑定同样遮蔽**（CR 第五十轮 major）：
-                // `const { args } = { args: [...] }` / `const [args] = [...]` 声明的 `args`
-                // 就是接下来展开的那个值；只认 Identifier 名字时整条跳过，判据继续上溯到外层
-                // `...args` 并当成转发边界放行 —— 真正登记的并发选项因此被静默丢掉。
-                const binds = (b: ts.BindingName): boolean => ts.isIdentifier(b)
-                  ? b.text === name
-                  : b.elements.some((e) => !ts.isOmittedExpression(e) && binds(e.name))
-                return st.declarationList.declarations.some((d) => d.name !== undefined && binds(d.name))
-              }
-              if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st))
-                && st.name !== undefined && st.name.text === name) return true
-              return false
+          const declares = (st: ts.Statement): boolean => {
+            // ⚠️ 语句层看到的是 `VariableStatement`，声明本身在 `declarationList` 里 —— 只看
+            // `VariableDeclaration` 会漏掉全部 `const` / `let` / `var`（第一版就漏了，样本仍绿）。
+            if (ts.isVariableStatement(st)) {
+              // ⚠️ **绑定模式里的同名绑定同样遮蔽**（CR 第五十轮 major）：
+              // `const { args } = { args: [...] }` / `const [args] = [...]` 声明的 `args`
+              // 就是接下来展开的那个值；只认 Identifier 名字时整条跳过，判据继续上溯到外层
+              // `...args` 并当成转发边界放行 —— 真正登记的并发选项因此被静默丢掉。
+              const binds = (b: ts.BindingName): boolean => ts.isIdentifier(b)
+                ? b.text === name
+                : b.elements.some((e) => !ts.isOmittedExpression(e) && binds(e.name))
+              return st.declarationList.declarations.some((d) => d.name !== undefined && binds(d.name))
             }
+            if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st))
+              && st.name !== undefined && st.name.text === name) return true
+            return false
+          }
+          if (ts.isBlock(n) || ts.isSourceFile(n) || ts.isModuleBlock(n)) {
             // 只看这一层的**直接**声明（嵌套块的声明由它自己那层判）。
             // ⚠️ `switch` 的 `case` 块没有 `statements`（只有 `clauses`）—— 不把 CaseBlock 收进
             // 上一条判断，否则 `(n as ts.Block).statements` 是 undefined、`.some` 直接抛。
             if ((n as ts.Block | ts.SourceFile | ts.ModuleBlock).statements.some(declares)) return false
           }
+          // ⚠️ **`switch` 的 `case` / `default` 子句同样是一层作用域**（CR 第六十三轮 major）：
+          // CaseBlock 只有 `clauses`，只查 Block 时整层被跳过 —— `case 1: const args = [...]`
+          // 的声明看不见，判据一路溯到外层同名 `...args` 并当成转发边界放行。
+          if (ts.isCaseBlock(n) && n.clauses.some((cl) => cl.statements.some(declares))) return false
           // ⚠️ **循环初始化里的声明同样遮蔽**（CR 第六十一轮 major）：`for (const args of …)` /
           // `for (let args = …)` 的 `args` 是循环变量（每次迭代换个值），不是转发边界；
           // 只查函数参数与块级语句表时整条循环初始化被跳过，一路找到外层同名 rest 就放行。
@@ -2690,6 +2717,16 @@ it('Q34', oQ34, () => {})`),
       'for-in 循环变量同样遮蔽').toEqual(['unknown'])
     expect(concHits(`function sh56(...args56) {\n  for (let args56 = 0; args56 < 1; args56++) {\n    it('S56', ...args56)\n  }\n}`),
       'for 初始化里的声明同样遮蔽').toEqual(['unknown'])
+    // ㉕ **`case` 子句里的同名声明同样遮蔽**（CR 第六十三轮 major）：`switch` 的 CaseBlock
+    // 没有 `statements`（只有 `clauses`），作用域 walk 整层跳过 —— `case 1: const args = [...]`
+    // 里展开的是那个数组，旧判据一路溯到外层同名 rest 参数就当转发边界放行。
+    expect(concHits(`function sh57(...args57) {\n  switch (k57) {\n    case 1:\n      const args57 = [{ con${'current: true }'}, () => {}]\n      it('S57', ...args57)\n      break\n  }\n}`),
+      'case 子句里同名声明遮蔽外层 rest').toEqual(['unknown'])
+    expect(concHits(`function sh58(...args58) {\n  switch (k58) {\n    default:\n      const args58 = [{ con${'current: true }'}, () => {}]\n      it('S58', ...args58)\n  }\n}`),
+      'default 子句里同名声明同样遮蔽').toEqual(['unknown'])
+    // 反例：case 里的声明与 rest 不同名 → 仍按边界放行
+    expect(concHits(`function fwd57(name, ...rest57) {\n  switch (k57) { case 1: { const other57 = 1; it(name, ...rest57) } }\n}`),
+      'case 无关声明不放宽').toEqual([])
     // 反例：循环没有占用那个名字时，真正的 rest 转发仍按边界放行
     expect(concHits(`function fwd54(name, ...rest54) {\n  for (const i54 of [1]) { it(name, ...rest54) }\n}`),
       '循环变量不相干时 rest 仍是边界').toEqual([])
@@ -2698,7 +2735,7 @@ it('Q34', oQ34, () => {})`),
     // `__proto__` setter 会把那个对象挂成原型 —— `options.concurrent` 从原型链读得到。
     // 静态推导既不能当「串行」也不能当「并发」，按「看不清」报。
     expect(concHits(`describe('P62', { ['__proto__']: { con${'current: true }'} }, () => {})`),
-      '计算键 __proto__ 在合并时可能换原型').toEqual(['unknown'])
+      '计算键 __proto__ 只是自有数据属性，不换原型').toEqual([])
     // ㉗ **选项对象经属性赋值写入**（CR 第六十二轮 major）：`const o = {}; o.concurrent = true`
     // 之后登记的选项值已经变了 —— 只认字面量初始化会把空对象当串行放行。
     expect(concHits(`const oA62 = {}\noA62.concurrent = true\nit('A62', oA62, () => {})`),
@@ -2739,6 +2776,14 @@ it('Q34', oQ34, () => {})`),
     // 反例：循环只读 → 不改变选项，仍按原值判
     expect(concHits(`const oF61 = { con${'current: false }'}\nfor (const itemF61 of [oF61]) { console.log(itemF61) }\nit('F61', oF61, () => {})`),
       '只读循环不建立写穿').toEqual([])
+    // ⚠️ **迭代对象是名前绑定的数组**（CR 第六十三轮 major）：`const list = [opts]; for (const
+    // item of list)` 的元素仍是 opts。只认循环位置的数组字面量时 `item` 不进别名集，
+    // 随后的 `item.concurrent = true` 写穿被当成无关变量、按旧值放行。
+    expect(concHits(`const oF62 = { con${'current: false }'}\nconst listF62 = [oF62]\nfor (const itemF62 of listF62) { itemF62.concurrent = true }\nit('F62', oF62, () => {})`),
+      '遍历名前绑定的数组同样带出元素别名').toEqual(['unknown'])
+    // 反例：遍历绑定的数组但不写 → 仍按原值判
+    expect(concHits(`const oF63 = { con${'current: false }'}\nconst listF63 = [oF63]\nfor (const itemF63 of listF63) { console.log(itemF63) }\nit('F63', oF63, () => {})`),
+      '只读遍历绑定的数组不放宽').toEqual([])
     // ⑲ **完整属性链**（Codex 第七轮 P2）：`box.nested.opts` 的基座是属性访问，只追一层会漏。
     expect(concHits(`const oP72 = { con${'current: false }'}\nconst boxP72 = { nested: { opts: oP72 } }\nconst aliasP72 = boxP72.nested.opts\naliasP72.concurrent = true\nit('P72', oP72, () => {})`),
       '两层容器属性链仍指向同一对象').toEqual(['unknown'])
@@ -2920,11 +2965,14 @@ it('Q34', oQ34, () => {})`),
     const proto = (name: string, opts: string): string[] => concHits(`describe('${name}', ${opts}, () => {})`)
     expect(proto('PT1', '{ __proto__: { con' + 'current: true } }'), '字面量原型上的并发开关可静态确定').toEqual(['opt'])
     expect(proto('PT2', "{ '__proto__': { se" + 'quential: false } }'), '字符串键同样是原型开关').toEqual(['opt'])
-    // ⚠️ 改判（CR 第六十二轮 major）：计算键 `['__proto__']` 在**字面量**里是普通自有键，但
-    // runner 用 `Object.assign({}, suiteOptions, options)` 合并选项时，目标对象的 proto setter
-    // 被触发 —— 这个对象成了合并结果的**原型**，`options.concurrent` 从它继承。PT3 旧断言
-    // （按自有键判串行）会把并发用例放行，现在按「看不清」报。
-    expect(proto('PT3', "{ ['__proto__']: { con" + 'current: true } }'), '计算键在合并时可能换原型').toEqual(['unknown'])
+    // ⚠️ **再改判（CR 第六十三轮 major，真 runner 探针修正第六十二轮结论）**：计算键
+    // `['__proto__']` 是字面量的**自有数据属性**，2.1.9 里它不会让套件或用例并发 —— 套件标志
+    // 在合并**之前**从原对象读（`@vitest/runner/dist/index.js:551-552`），合并后
+    // `concurrent`/`sequential` 又被规范成自有布尔（`:558-559`、测试收尾 `:451-452`）压过原型
+    // 继承。探针（vitest 2.1.9，`--maxWorkers=1 --no-file-parallelism`，并发峰值）：describe
+    // 计算键 → 子用例串行（peak 1）；带选项套件里 it 计算键 → 串行；顶层 it 计算键 → 串行；
+    // 对照 describe 非计算 `__proto__` → 子用例并发（peak 2）。计算键按普通自有键放过。
+    expect(proto('PT3', "{ ['__proto__']: { con" + 'current: true } }'), '计算键只是自有数据属性，不改原型').toEqual([])
     expect(proto('PT4', '{ __proto__: null }'), '原型设成 null 没有继承来的键').toEqual([])
     expect(proto('PT5', '{ __proto__: { timed' + 'out: 1 } }'), '原型上没有开关相关的键').toEqual([])
     expect(concHits(`import { protoOptsPT6 } from './x'\ndescribe('PT6', { __proto__: protoOptsPT6 }, () => {})`),

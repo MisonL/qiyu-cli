@@ -838,6 +838,32 @@ describe('store 命令面与 help', () => {
     }
   })
 
+  it('命令出口：退役包装保留原 kind（store_locked）→ retryable:false 且「核对后再重放」hint 原样到达（CR 第六十三轮 major）', async () => {
+    // 引擎层用例只断言到 `runTask` 交回的错误为止。CR 的追问：这条错误到达命令出口
+    // （`thrownToExit`，`store status` 族与 `sync run` 共用）之后，输出会不会又变回
+    // 「撞锁可重试」的通用形态、把核对与重放的指引丢掉？
+    // 形态出处：`duckdb.ts` 的 `annotateUnconfirmedRollback` —— 回滚未确认的撞锁失败
+    // **保留原 kind**（`store_locked`）、`retryable` 置 false、`code` 打 `store_retired`、
+    // hint 换成「先核对再决定是否重放」。这里按该形态构造并钉住出口渲染。
+    const { thrownToExit } = await import('../../src/commands/store.js')
+    const retired = Object.assign(
+      new Error('Store 已退役：撞锁重试超过上限 ——（事务收尾）回滚未能确认：该事务也许仍然开着'),
+      {
+        kind: 'store_locked',
+        retryable: false,
+        code: 'store_retired',
+        hint: '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）再决定是否重放；本实例上的后续语句都会被拒',
+      },
+    )
+    expect(thrownToExit(retired), '退役 = 业务失败，不是可重试的环境故障').toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind, '原 kind 透传（引擎层的重试分流靠它）').toBe('store_locked')
+    expect(e.retryable, '退役实例绝不可重试 —— 重试只会撞上同一个退役错误').toBe(false)
+    expect(e.hint, '恢复动作必须保住「先核对、再决定是否重放」').toMatch(/核对/)
+    expect(e.hint).toMatch(/重放/)
+    expect(e.hint, '不得退回普通撞锁的「稍后重试」指引').not.toMatch(/稍后重试/)
+  })
+
   // —— 权限错误（errno）分流：判据必须匹配**真实到达该函数的报文形态** ——
   // ⚠️ 2026-10-31 实测修缺陷：原判据是 `/^(EACCES|EPERM|EROFS)/`，按 Node `fs` 的报文
   // 前缀写成 —— 但 store 链路**零 `node:fs`**（lstat/stat/mkdir 的 errno 分流都在命令层

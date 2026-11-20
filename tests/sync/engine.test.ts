@@ -1218,6 +1218,25 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     }
   })
 
+  it('取数失败 + 补记缺口的提交结果丢失 → 取数原始失败不得被退役文案顶掉（CR 第六十三轮 major）', async () => {
+    // 事故：fetch 失败 → `storeGap` 补记缺口；缺口事务的 COMMIT 结果丢失让实例**首次**退役。
+    // 旧实现状态的处理只覆盖「落库/清锁」两条路径，三条 fetch 处理器的 storeGap 是裸调用 ——
+    // 次生的退役错误把「取数失败」连同它的恢复指令换掉。
+    // 提交次数：markPending #1；缺口事务的 COMMIT 是 #2。
+    const { store } = await storeWithCommitFailureAt(2)
+    try {
+      const t = fakeTask({ fetch: async () => { throw new Error('注入：取数失败') } })
+      const e = await runTask(t, ctx(store, { sleep: async () => {} })).then(() => null,
+        (x: unknown) => x as Error & { code?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '取数原始失败必须保留').toMatch(/注入：取数失败/)
+      expect(e!.message, '缺口事务退役的事实也要在').toMatch(/补记缺口时实例退役|退役/)
+      expect(e!.code, '编排层要能识别退役').toBe('store_retired')
+    } finally {
+      await store.close()
+    }
+  })
+
   it('配对核对不符 + 回滚未确认 → 主失败原文保留在包层、恢复动作不被命令出口换掉（CR 第六十一轮追问）', async () => {
     // `commitWindow` 的 count_mismatch 是**无 kind** 的普通 Error。回滚未确认时补注会包一层；
     // 若包层漏了 `kind`，命令出口 `thrownToExit` 会走「无 kind」分支、把 hint 换成通用
