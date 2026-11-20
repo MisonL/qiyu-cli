@@ -425,8 +425,21 @@ inst.closeSync()`, scriptDir, 'seed')
     if (run.nativeError !== undefined) throw failure
     throw new Error(`种子进程在预算内未退出 —— 无法确认它已放开库文件。${failure.message}`, { cause: failure })
   }
+  // ⚠️ **预算过期后的 close 不是完成**（CR 第五十轮 major）：`waitClosed` 到点会请求 SIGKILL，
+  // 宽限里进程照样 close；若 `kill()` 未被受理（返回 false）而种子自己以 0 退出，旧实现直接
+  // 返回成功 —— 但「按时建好空库」已经无法成立，那是清理的结果。判据放在 exit 码之前：
+  // 只要本夹具**请求过终止**，就说明它没在预算内退出，exit 是什么都不足以证明按时完成。
+  // （真按时退出（exit 0 且 close 早于预算）不会请求终止，见 `waitClosed`。）
+  // ⚠️ 原生错误（kill 的 EPERM 等）是**原始失败**，优先原样交回 —— 不能让合成报文顶掉它
+  // （既有用例断言身份：`toBe(原生错误)`）。
+  // ⚠️ dispose **必须先于任何 throw**（既有用例的 `expectClean` 断言监听器全清）。
   run.dispose()
   if (run.nativeError !== undefined) throw run.nativeError
+  if (run.killInfo.requested) {
+    const how = run.exit?.signal != null ? `signal=${run.exit.signal}` : `exit=${run.exit?.code ?? 'unknown'}`
+    throw new Error(`种子进程未在预算内退出（预算到期时已请求终止）—— 随后的 ${how} 只是清理结果，`
+      + '不能证明空库已按时建好；RO 夹具依赖该库，换更大的 deadline 或排查环境负载')
+  }
   if (run.exit?.code !== 0) {
     const how = run.exit?.signal !== null && run.exit?.signal !== undefined
       ? `signal=${run.exit.signal}`

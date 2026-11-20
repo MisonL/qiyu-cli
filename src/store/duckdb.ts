@@ -980,13 +980,24 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    */
   /** 自带成因级恢复动作的错误（COMMIT 结果未知）—— 不再追加通用回滚文案，免得两套指令打架。 */
   const selfDiagnosed = new WeakSet<object>()
+  // ⚠️ **拒绝值连文本都可能转不出来**（CR 第五十轮 major，探针 2026-11-20）：
+  // `String(Object.create(null))` 抛 `TypeError: Cannot convert object to primitive value`
+  // （无原型对象没有 `Symbol.toPrimitive`/`toString`/`valueOf`）。若在拼 message 时直接 `String(e)`，
+  // 补话动作本身炸掉 —— 调用方拿到的是那个 TypeError，原拒绝值与「先核对再重放」一起丢光。
+  const safeText = (v: unknown, max: number): string => {
+    try {
+      return String(v).slice(0, max)
+    } catch {
+      return `（无法转成文本的拒绝值，typeof=${typeof v}）`
+    }
+  }
   const annotateUnconfirmedRollback = <E>(e: E, state: TxClose): E => {
     if (state !== 'unconfirmed') return e
     // ⚠️ **非 Error 的拒绝值也要带上状态**（CR 第四十八轮 major）：回调 `throw 'task failed'`
     // 时，调用方拿到的字符串与「已确认回滚」一字不差 —— 而这里实例已经退役、写入状态不可信。
     // 包一层 Error 并保留原值在 `cause`（身份契约只覆盖 Error；非 Error 无处挂字段）。
     if (!(e instanceof Error)) {
-      const wrapped = new Error(`事务失败（回调拒绝了一个非 Error 值：${String(e).slice(0, 120)}）`
+      const wrapped = new Error(`事务失败（回调拒绝了一个非 Error 值：${safeText(e, 120)}）`
         + ' ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；'
         + '该连接已退役，本实例上的写入结果不可信', { cause: e })
       ;(wrapped as { kind?: string }).kind = 'internal'

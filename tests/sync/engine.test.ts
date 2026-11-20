@@ -879,17 +879,24 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
   }
 
   it('windowed：交回原始失败（带「核对后再重放」），不是退役文案', async () => {
+    // kind 断言见用例中部：命令出口靠它透传 hint
     // markPending 的提交是第 1 次；数据窗的提交是第 2 次。
     const { store } = await storeWithCommitFailureAt(2)
     const t = fakeTask({
       fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
     })
-    const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+    const e = await runTask(t, ctx(store)).then(() => null,
+      (x: unknown) => x as Error & { hint?: string; kind?: string })
     expect(e, '提交结果未知必须上抛（不能当成 partial 成功）').not.toBeNull()
     expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
     expect(e!.message).not.toMatch(/Store 已退役/)
     expect(e!.hint, '恢复动作：核对后再决定是否重放').toMatch(/核对/)
     expect(e!.hint).toMatch(/重放/)
+    // ⚠️ **kind 必须在场**（CR 第五十轮 major #3 的收口）：命令出口 `thrownToExit` 只在
+    // `err.kind` 存在时透传 `err.hint`，否则换成通用「执行期错误」文案 —— hint 在 engine 层
+    // 保住了、到了命令边界照样可能被换掉。命令出口是同一个函数（`sync-run.ts` 与 `store.ts`
+    // 共用 `thrownToExit`），这里钉住进入出口的形状，两个命令族同时被守住。
+    expect(e!.kind, '无 kind 的错误在命令出口会被换成通用 hint —— 必须带 kind 出门').toBe('internal')
     // ⚠️ 回滚收尾的补注**不得**嫁接到这条诊断上（CR 第四十二轮 major 的追问，真驱动探针
     // 2026-11-20 实测过嫁接形态）：COMMIT 已下发、写入可能已落库，此时再说「回滚可能根本没
     // 执行、写入结果不可信」只是把恢复动作稀释成两套互相打架的指令。核对→再决定重放才是

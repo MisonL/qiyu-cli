@@ -320,12 +320,38 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       // （CodeRabbit PR#81 第二十六轮 minor，序列可复现）。只跟声明初始值时这个序列完全逃过
       // 写入判据 —— `a` 从未进入别名集，就被当成无关变量。与「建立别名不算写入」同一个口径：
       // 这句赋值本身不计为写入，只把 `a` 收进别名集。
-      if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
-        && ts.isIdentifier(n.left)) {
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const init = unwrap(n.right)
-        if (aliasSources(init).some((s) => aliases.has(s)) && !aliases.has(n.left.text)) {
-          aliases.add(n.left.text)
-          changed = true
+        if (aliasSources(init).some((s) => aliases.has(s))) {
+          // ⚠️ **左侧可以是解构模式**（CR 第五十轮 major，探针可复现）：`let a; [a] = [opts]` /
+          // `({ x: a } = { x: opts })` 之后 `a.concurrent = true` 写穿的仍是 opts。旧判据只认
+          // 左侧是 Identifier 的赋值 —— 数组 / 对象字面量形态整个跳过，`a` 从不进入别名集。
+          // 目标收集按**赋值目标**遍历：标识符 / 展开 / 嵌套模式 / 默认值（`a = d` 的左侧才是目标）。
+          const collectTarget = (e: ts.Expression): void => {
+            const u = unwrap(e)
+            if (ts.isIdentifier(u)) {
+              if (!aliases.has(u.text)) { aliases.add(u.text); changed = true }
+              return
+            }
+            if (ts.isArrayLiteralExpression(u)) {
+              for (const el of u.elements) {
+                if (ts.isSpreadElement(el)) collectTarget(el.expression)
+                else if (!ts.isOmittedExpression(el)) collectTarget(el as ts.Expression)
+              }
+              return
+            }
+            if (ts.isObjectLiteralExpression(u)) {
+              for (const p2 of u.properties) {
+                if (ts.isPropertyAssignment(p2)) collectTarget(p2.initializer)
+                else if (ts.isShorthandPropertyAssignment(p2)) collectTarget(p2.name)
+                else if (ts.isSpreadAssignment(p2)) collectTarget(p2.expression)
+              }
+              return
+            }
+            // 解构默认值 `[a = fallback] = …`：绑定名在等号左侧
+            if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.EqualsToken) collectTarget(u.left)
+          }
+          collectTarget(n.left)
         }
       }
       ts.forEachChild(n, collect)
@@ -876,7 +902,14 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
               // ⚠️ 语句层看到的是 `VariableStatement`，声明本身在 `declarationList` 里 —— 只看
               // `VariableDeclaration` 会漏掉全部 `const` / `let` / `var`（第一版就漏了，样本仍绿）。
               if (ts.isVariableStatement(st)) {
-                return st.declarationList.declarations.some((d) => ts.isIdentifier(d.name) && d.name.text === name)
+                // ⚠️ **绑定模式里的同名绑定同样遮蔽**（CR 第五十轮 major）：
+                // `const { args } = { args: [...] }` / `const [args] = [...]` 声明的 `args`
+                // 就是接下来展开的那个值；只认 Identifier 名字时整条跳过，判据继续上溯到外层
+                // `...args` 并当成转发边界放行 —— 真正登记的并发选项因此被静默丢掉。
+                const binds = (b: ts.BindingName): boolean => ts.isIdentifier(b)
+                  ? b.text === name
+                  : b.elements.some((e) => !ts.isOmittedExpression(e) && binds(e.name))
+                return st.declarationList.declarations.some((d) => d.name !== undefined && binds(d.name))
               }
               if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st))
                 && st.name !== undefined && st.name.text === name) return true
@@ -1186,6 +1219,33 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       if (HOOK_HOOKS.has(imported.toLowerCase())) hookAlias.set(el.name.text, imported)
     }
   }
+  let schedulerNamespace: string | undefined
+  /**
+   * 调度原语经**模块导入**改名（CR 第五十轮 major）：`import { setTimeout as later } from 'node:timers'`
+   * 运行时就是同一个函数；旧判据只还原 `vitest` 的 hook 别名，timer 模块的别名整个漏掉（被测文件
+   * 一改名就从守卫底下溜走）。与 `hookAlias` 同一收集手法：只认能从这四个模块写法导入的名字
+   * （`timers` / `node:timers` / `timers/promises` / `node:timers/promises`）；别的模块的同名导出
+   * 不是调度原语，不在本判据内（自检留了反例）。
+   */
+  const schedulerAlias = new Map<string, string>()
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || st.importClause?.namedBindings === undefined) continue
+    const from = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : ''
+    // 四个可导入调度原语的模块写法（`node:timers/promises` 的 `setTimeout` 返回 Promise，
+    // 但**按字面名调用本来就会被本判据报** —— 改名形态必须同口径，否则改名即绕过）
+    if (!/^(node:)?timers(\/promises)?$/.test(from)) continue
+    const nb = st.importClause.namedBindings
+    if (ts.isNamedImports(nb)) {
+      for (const el of nb.elements) {
+        const imported = (el.propertyName ?? el.name).text
+        if (HOOK_FORBIDDEN.has(imported)) schedulerAlias.set(el.name.text, imported)
+      }
+    } else if (ts.isNamespaceImport(nb)) {
+      // 命名空间导入 `import * as tmr from 'node:timers'`：`tmr.setTimeout(…)` 是调度，但基座名
+      // 是 `tmr`、不是 `globalThis` —— 记下来，判据匹配时剥掉这一段基座（见下方 `unhost`）。
+      schedulerNamespace = nb.name.text
+    }
+  }
   const isHookName = (chain: string[] | undefined, call?: ts.CallExpression): boolean => {
     if (chain === undefined) return false
     let c = chain
@@ -1360,11 +1420,20 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       // 不去重会把同一处报两次。判据：当前调用节点的被调方是不是**另一个调用**。
       if (innerName.length > 1 && innerName[innerName.length - 1] === 'bind'
         && ts.isCallExpression(unwrap(inner.expression))) innerName.pop()
+      // 调度原语的**模块导入别名**还原成原名（CR 第五十轮 major）：链首是命名导入别名时换回
+      // 原语名；命名空间导入（`import * as tmr from 'node:timers'`）时剥掉基座那一段。
+      // ⚠️ 命名空间导入的还原必须在**剥 call/apply/bind** 之后做：`tmr.setTimeout.call(null, …)`
+      // 剥完是 `tmr.setTimeout`，按「首段是命名空间」剥掉基座才剩 `setTimeout` —— 放在剥之前
+      // 只会看到 `tmr.setTimeout.call`、判据落空（CR 第五十轮 sample 形态）。
+      const resolved = innerName.length > 0 && schedulerAlias.has(innerName[0]!)
+        ? [schedulerAlias.get(innerName[0]!)!, ...innerName.slice(1)]
+        : innerName
       // `setTimeout(…)` 与 `globalThis.setTimeout(…)` 都是调度；反射（`globalThis['set'+'Timeout']`）
       // 与转调 helper 内部排调度仍看不出来（见上方边界注释）。
-      const bare = innerName.length === 2 && GLOBAL_HOSTS.has(innerName[0]!)
-        ? [innerName[1]!]
-        : innerName
+      const unhost = resolved.length >= 2 && resolved[0] === schedulerNamespace ? resolved.slice(1) : resolved
+      const bare = unhost.length === 2 && GLOBAL_HOSTS.has(unhost[0]!)
+        ? [unhost[1]!]
+        : unhost
       const forbidden = bare.length === 1 && HOOK_FORBIDDEN.has(bare[0]!)
         // `process.nextTick(…)`：宿主是 `process`，原语是 `nextTick`
         || (bare.length === 2 && bare[0] === 'process' && bare[1] === 'nextTick')
@@ -1374,7 +1443,7 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
         // 判据按「末段是这三个名字」写，宁可多报也不漏（判据的边界写在 `HOOK_FORBIDDEN` 注释里）。
         || (bare.length >= 2 && ['then', 'catch', 'finally'].includes(bare[bare.length - 1]!))
       if (!forbidden) continue
-      out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${innerName.join('.')}(」` })
+      out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${unhost.join('.')}(」` })
     }
   }
   return out
@@ -1741,6 +1810,11 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(concHits(`${bt("it('C3', { [('con", "current')]: true }, () => {})")}`), '计算键 + 括号').toEqual(['opt'])
     expect(concHits(`${bt("it('C4', { ['con", "current' as const]: true }, () => {})")}`), '计算键 + 断言').toEqual(['opt'])
     expect(concHits(`${bt("describe('G3', { [('se", "quential')]: false }, () => {})")}`), '套件计算键 + 括号').toEqual(['opt'])
+    // 计算键是**逗号表达式**（CR 第五十轮 major）：`[('con', 'current')]` 求值是 `'current'`，
+    // 选项对象里没有 concurrent 键 → 确定是串行，不是「看不清」。旧判据剥完括号仍停在
+    // BinaryExpression 上、报 unknown —— 保守方向没错，但这个形态**能**静态求出。
+    expect(concHits(`${bt("it('C5', { [('con', 'current')]: true }, () => {})")}`), '逗号表达式键取最右').toEqual([])
+    expect(concHits(`${bt("it('C6', { [('x', 'con", "current')]: true }, () => {})")}`), '逗号表达式键取最右（命中并发）').toEqual(['opt'])
     // 括号 / 断言包装不改变语义（Codex PR#81 第十轮）
     expect(concHits(`${bt("it('C2', { con", 'current: (true) }, () => {})')}`), '括号包装').toEqual(['opt'])
     // `sequential: false` 在套件上等价并发；`it` 上的同名键不算（不是套件选项）
@@ -2137,6 +2211,30 @@ it('Q34', oQ34, () => {})`),
     //    → **串行**。旧判据先看 concurrent、直接报违规（合法串行套件被判红）。
     expect(concHits(`describe('T50', { con${'current: true, sequential: true }'}, () => {})`),
       'sequential:true 压过 concurrent:true（Vitest 解析为串行）').toEqual([])
+    // ④ 别名经**解构赋值**建立（CR 第五十轮 major）：`let a; [a] = [opts]` 之后写 `a.concurrent`
+    //    写穿的是 opts。旧收集只认「声明初始化」与「左侧是 Identifier」的赋值 —— 左侧是数组 /
+    //    对象字面量的解构赋值整个跳过，`a` 从未进入别名集，守卫把被改成并发的选项当串行放行。
+    expect(concHits(`const oD50 = { con${'current: false }'}\nlet aD50\n;[aD50] = [oD50]\naD50.concurrent = true\nit('D50', oD50, () => {})`),
+      '数组解构赋值同样建立别名').toEqual(['unknown'])
+    expect(concHits(`const oD51 = { con${'current: false }'}\nlet aD51\n;({ x: aD51 } = { x: oD51 })\naD51.concurrent = true\nit('D51', oD51, () => {})`),
+      '对象解构赋值同样建立别名').toEqual(['unknown'])
+    // ⑤ 调度原语经**模块导入**改名（CR 第五十轮 major）：`import { setTimeout as later } from 'node:timers'`
+    //    运行时就是同一个函数；旧判据只把 `vitest` 的 hook 导入还原成原名，timer 模块的别名整个漏掉。
+    expect(hookHits(bt("import { ", ST, " as later52 } from 'node:timers'\n", H, '(() => { later52(w, 80) })')),
+      'timer 模块的命名导入别名同样是调度').toEqual([`${ST}(`])
+    expect(hookHits(bt("import * as tmr53 from 'node:timers'\n", H, '(() => { tmr53.', ST, '(w, 80) })')),
+      'timer 模块的命名空间导入同样是调度').toEqual([`${ST}(`])
+    expect(hookHits(bt("import * as tmr55 from 'node:timers'\n", H, '(() => { tmr55.', ST, '.call(null, w, 80) })')),
+      '命名空间导入 + .call 同样是调度').toEqual([`${ST}(`])
+    // 反例：别的模块的同名导出不归本判据（名字只是恰好叫 setTimeout）
+    expect(hookHits(bt("import { ", ST, " as later54 } from './my-helpers'\n", H, '(() => { later54(w, 80) })')),
+      '非 timer 模块的同名导入不算调度').toEqual([])
+    // ⑥ 解构**声明**与 rest 参数同名同样遮蔽（CR 第五十轮 major）：`const [args] = [[…]]`
+    //    展开的是那个数组，不是转发边界 —— 旧 `declares` 只认 Identifier 名字，绑定模式漏掉。
+    expect(concHits(`function sh52(...args52) {\n  {\n    const [args52] = [[{ con${'current: true }'}, () => {}]]\n    it('S52', ...args52)\n  }\n}`),
+      '解构声明遮蔽外层 rest 名').toEqual(['unknown'])
+    expect(concHits(`function sh53(...args53) {\n  {\n    const { args53 } = { args53: [{ con${'current: true }'}, () => {}] }\n    it('S53', ...args53)\n  }\n}`),
+      '对象解构声明同样遮蔽').toEqual(['unknown'])
     // 访问器被后写的数据属性覆盖 → 值确定（Codex 第二十五轮 P2）
     const g = bt('get con', 'current() { return true }')
     expect(concHits(bt("it('QA', { ...{ ", g, ' }, con', 'current: false }, () => {})')),

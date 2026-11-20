@@ -176,6 +176,26 @@ describe('锁夹具的子进程生命周期', () => {
     expectClean(child)
   })
 
+  it('seed：预算耗尽后才 close（即便 exit 0）不算成功 —— 那次 close 是清理的结果，不是按时完成', async () => {
+    // CR 第五十轮 major：`waitClosed` 在预算到点后请求 kill、再等宽限；若 kill 未被受理
+    // （返回 false）而进程随后自己以 0 退出，旧实现返回成功 —— 但「按时建好库」这件事
+    // 已经无法成立，调用方拿到的成功是**预算过期后的清理结果**，不是种子完成。
+    vi.mocked(child.kill).mockReturnValue(false)
+    const running = observe(invoke('seed', BUDGET))
+    await vi.advanceTimersByTimeAsync(BUDGET)
+    expect(running.isSettled(), '预算刚到时还没 close，不能提前交结论').toBe(false)
+    child.emit('close', 0, null)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(running.isSettled()).toBe(true)
+    const result = await running.result
+    expect('error' in result, 'exit 0 不得把过期的种子变成成功').toBe(true)
+    if ('error' in result) {
+      expect((result.error as Error).message, '必须点名预算').toMatch(/预算/)
+      expect((result.error as Error).message, '必须说清 exit 0 不足以证明按时完成').toMatch(/exit|退出/)
+    }
+    expectClean(child)
+  })
+
   it.each(fixtures)('%s：kill 返回 false 但随后 close，仍以真实 close 为准', async (fixture) => {
     vi.mocked(child.kill).mockReturnValue(false)
     const running = observe(invoke(fixture, BUDGET))

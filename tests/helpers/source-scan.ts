@@ -363,7 +363,12 @@ function staticPropKey(name: ts.PropertyName, allowComputed: boolean): string | 
   if (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text
   if (allowComputed && ts.isComputedPropertyName(name)) {
     // 键表达式可能是括号 / 断言包装后的字面量（`{ [('concurrent')]: true }`，Codex PR#81 第十二轮）
-    const e = unwrap(name.expression)
+    let e = unwrap(name.expression)
+    // ⚠️ **逗号表达式交出最右操作数**（CR 第五十轮 major）：`{ [('a', 'concurrent')]: true }`
+    // 求值就是 `'concurrent'`。剥完括号仍停在 BinaryExpression 上会让它落进「动态键」——
+    // 保守方向没错，但这个形态**能**静态求出，报 unknown 是漏判。只认字面量最右值，
+    // 最右是变量 / 调用仍按动态键返回 undefined。
+    while (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.CommaToken) e = unwrap(e.right)
     if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e) || ts.isNumericLiteral(e)) {
       return e.text
     }

@@ -2223,6 +2223,54 @@ describe('duckdb —— 事务', () => {
     await ok.close()
   })
 
+  it('回调拒绝的值连文本都转不出（Object.create(null)）+ 回滚未确认 → 不得让转换动作换掉主失败（CR 第五十轮 major）', { timeout: 90_000 }, async () => {
+    // 探针实测（2026-11-20）：`String(Object.create(null))` 抛 `TypeError: Cannot convert object
+    // to primitive value` —— 包层在构造 message 时自己炸掉，调用方拿到的是那个 TypeError，
+    // 原拒绝值与「先核对再重放」一起丢光。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const weird = Object.create(null) as object
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw weird
+    }).then(() => null, (x: unknown) => x as Error & { cause?: unknown; hint?: string; code?: string; kind?: string })
+    expect(e, '不得以 TypeError 呈现').toBeInstanceOf(Error)
+    expect(e!.constructor.name, '补话动作不得造出新的主失败').toBe('Error')
+    expect(e!.cause, '原拒绝值必须挂在 cause 上').toBe(weird)
+    expect(e!.message, '回滚状态要说').toMatch(/回滚未能确认/)
+    expect(e!.kind).toBe('internal')
+    expect(e!.code).toBe('store_retired')
+    expect(e!.hint, '恢复动作照旧要给').toMatch(/核对/)
+    await s.close()
+  })
+
   it('默认退役 hint 不得声称「未提交的写入不会落库」（回滚未确认时该说法是假话）（Codex PR#81 第四十五轮 P2）', { timeout: 90_000 }, async () => {
     // 默认 hint 服务于「回滚未能确认」：那个状态的准确含义就是「落没落库无法确认」。
     // 照「未提交的写入不会落库」直接重放，可能重复写。
