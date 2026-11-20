@@ -928,6 +928,18 @@ describe('api call —— B 块（body 校验）', () => {
     vi.unstubAllGlobals()
   })
 
+  it('危险接口 --no-validate + 无 --yes → 仍是 4 confirm_required、fetch 零调用', async () => {
+    // --no-validate 只关 body 校验，**不得**连带跳确认门禁（CR 第五十八轮的追问）。
+    const fetchSpy = vi.fn(); vi.stubGlobal('fetch', fetchSpy)
+    vi.stubEnv('QIYU_APP_KEY', ''); vi.stubEnv('QIYU_APP_SECRET', '')
+    const code = await apiCommand(['call', 'robot.session.chat', '--no-validate', '--body', '{}'])
+    expect(code, '仍必须退出 4').toBe(4)
+    const e = JSON.parse(out).error
+    expect(e.kind).toBe('needs_confirmation')
+    expect(fetchSpy, '不得发起请求').not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
   it('验收 5：search 带 bogus → 0，warning 含「已发出」「不要重发」', async () => {
     vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))

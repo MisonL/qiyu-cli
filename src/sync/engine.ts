@@ -298,7 +298,16 @@ async function withRetries<T>(ctx: RunCtx, op: () => Promise<T>,
  * 于是引擎重试真正覆盖的是 core 无法归类/无法重试的那一类：撞锁（store_locked）
  * 与任务层显式标注 retryable 的瞬时错误。
  */
+/**
+ * 实例已退役（稳定 `code`）—— **两层重试判据的最高优先终止条件**（Codex 第七轮 P2，真驱动
+ * 注入实测）：回滚未确认的撞锁失败会保留原 `kind`（`store_locked`）并打上
+ * `code=store_retired`；若只按 kind 判「撞锁可重试」，就会再碰**已退役的同一实例** ——
+ * 第二次尝试撞上「Store 已退役」，把主失败与「先核对再重放」整段换掉。
+ */
+const isRetiredFailure = (e: unknown): boolean => (e as { code?: string }).code === 'store_retired'
+
 function isTransient(e: unknown): boolean {
+  if (isRetiredFailure(e)) return false
   const err = e as { kind?: string; retryable?: boolean }
   if (err.kind === 'store_locked') return true
   if (err.kind === 'rate_limit' || err.kind === 'network') return false
@@ -307,7 +316,8 @@ function isTransient(e: unknown): boolean {
 
 /** store 事务的撞锁重试（B 中-4，spec §6.3：C1 写者无内置重试，重试调度归 D 层）。 */
 const storeRetryable = (e: unknown): boolean =>
-  (e as { kind?: string }).kind === 'store_locked' || isLockError(e)
+  !isRetiredFailure(e)
+  && ((e as { kind?: string }).kind === 'store_locked' || isLockError(e))
 
 const withStoreRetries = <T>(ctx: RunCtx, op: () => Promise<T>): Promise<T> =>
   withRetries(ctx, op, storeRetryable)

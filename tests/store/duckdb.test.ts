@@ -2602,6 +2602,118 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('hint 是「读得到旧值、写不进去」的访问器 → 包层必须给出核对动作（CR 第五十八轮 major）', { timeout: 90_000 }, async () => {
+    // 形态：`hint` getter 返回「请稍后重试」、setter 空实现 —— 赋值不抛也不生效；只回读 code
+    // 会漏掉这一条，调用方拿到的仍是「稍后重试」而回滚状态不可信。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const weird = new Error('原始失败')
+    Object.defineProperty(weird, 'hint', {
+      configurable: true,
+      get: () => '请稍后重试',
+      set: () => { /* 静默丢弃 */ },
+    })
+    const e = await s.transaction(async () => { throw weird })
+      .then(() => null, (x: unknown) => x as Error & { cause?: unknown; code?: string; hint?: string })
+    expect(e!.hint, '核对动作必须真的到达调用方').toMatch(/核对/)
+    expect(String(e!.hint), '不得只剩「稍后重试」').not.toBe('请稍后重试')
+    expect(e!.code).toBe('store_retired')
+    expect(e!.cause, '原错误必须挂在 cause 上').toBe(weird)
+    await s.close()
+  })
+
+  it('kind 是「读回 undefined、写不进去」的访问器 → 包层必须补 internal（CR 第五十八轮 major）', { timeout: 90_000 }, async () => {
+    // 形态：`kind` getter 恒为 undefined、setter 空实现 —— 标注「成功」但 kind 从未落盘；
+    // `store init` 的命令出口按「无 kind」把 hint 换成通用文案，恢复动作丢失。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const weird = new Error('原始失败')
+    Object.defineProperty(weird, 'kind', {
+      configurable: true,
+      get: () => undefined,
+      set: () => { /* 静默丢弃 */ },
+    })
+    const e = await s.transaction(async () => { throw weird })
+      .then(() => null, (x: unknown) => x as Error & { cause?: unknown; kind?: string; code?: string; hint?: string })
+    expect(e!.kind, '命令出口按 kind 透传 hint —— 必须真的读得到').toBe('internal')
+    expect(e!.hint).toMatch(/核对/)
+    expect(e!.code).toBe('store_retired')
+    expect(e!.cause).toBe(weird)
+    await s.close()
+  })
+
+  it('整批解析失败时派发也不会执行前半段（extract 放行的实测边界）（CR 第五十八轮 major）', { timeout: 90_000 }, async () => {
+    // 追问：extractStatements 第一次拒绝、同一连接下一次能解析时，放行会不会让派发
+    // 先执行前半段？真驱动实测（2026-11-20）：批次里任一语句语法错时 extract 与
+    // runAndReadAll 交回**同一个** Parser Error，前半段 INSERT 一行都没落（count 不变）。
+    // 这里用真库把「放行 ≠ 执行」钉住。
+    const s = await createDuckDbStore(cfg, 'rw')
+    try {
+      await s.init()
+      const e = await s.query(`INSERT INTO "tags" VALUES ('1','A','#FFF'); SELEC 1`)
+        .then(() => null, (x: unknown) => x as Error)
+      expect(e, '解析失败必须原样失败').not.toBeNull()
+      expect(e!.message).toMatch(/Parser Error|syntax error|语法/)
+      expect(await s.count('tags'), '前半段 INSERT 不得执行').toBe(0)
+    } finally {
+      await s.close()
+    }
+  })
+
   it('回调抛出已撤销的 Proxy + 回滚未确认 → 原值仍挂在 cause，恢复动作照常给出（CR 第五十六轮 major）', { timeout: 90_000 }, async () => {
     // `e instanceof Error` 在已撤销的 Proxy 上会抛 TypeError（HasInstance 走 [[GetPrototypeOf]]）——
     // 错误路径上的类型判据自己成了新的主失败，原拒绝值与「先核对再重放」一起丢光。

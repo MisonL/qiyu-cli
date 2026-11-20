@@ -298,8 +298,16 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       // const alias = box.opts` 里 alias === opts（box 的初始化已把 opts 收进别名集）。静态上
       // 求不出「那个属性装的是不是 opts 本身」，按基座身份保守收（多报只会让判据更严）。
       if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
-        const base = unwrap(u.expression)
-        if (ts.isIdentifier(base) && aliases.has(base.text)) found.push(base.text)
+        // 沿**完整属性链**找根（Codex 第七轮 P2）：`box.nested.opts` 的基座是属性访问，
+        // 只看一层会漏掉 `box` 这个已登记别名。
+        const rootAlias = (x: ts.Expression): string | undefined => {
+          const b = unwrap(x)
+          if (ts.isIdentifier(b)) return aliases.has(b.text) ? b.text : undefined
+          if (ts.isPropertyAccessExpression(b) || ts.isElementAccessExpression(b)) return rootAlias(b.expression)
+          return undefined
+        }
+        const root = rootAlias(u.expression)
+        if (root !== undefined) found.push(root)
         return
       }
       if (ts.isBinaryExpression(u)) {
@@ -1208,7 +1216,12 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
           const C = tri('concurrent')
           const S = tri('sequential')
           if (C === false || S === true) {
-            // 确定串行（含 `concurrent: false` 与 `sequential: true` 的任意组合）
+            // 确定串行（含 `concurrent: false` 与 `sequential: true` 的任意组合）。
+            // ⚠️ **必须在这里收口**（Codex 第七轮 P2）：合并后已确定串行时，后面按自有属性
+            // 判 `{ __proto__: { sequential: true }, concurrent: true }` 会把合法的串行套件
+            // 报成并发（Vitest 实测该组合串行）。原实现想「再走一遍自有键判据」，与合并语义打架。
+            seen.add(outermostRegistration(call))
+            continue
           } else if (C === true || S === false) {
             out.push({ line: lineOf(sf, call), why: '选项对象 concurrent 为真（原型链）' })
             seen.add(outermostRegistration(call))
@@ -1434,7 +1447,14 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
    * 边界（沿用既有口径）：`await ignore(x.then(w))` 只等 `ignore` 的返回值，**不穿透调用实参** ——
    * 途中遇到「e 是某个调用的实参」即判 false。
    */
+  /**
+   * 已解析出的**命名回调**节点（Codex 第七轮 P2）：`async function setup() { await
+   * Promise.resolve().then(w) }` 里 inner 的 await 属于 setup，而 setup 的父节点是源文件、
+   * 不是 hook 调用 —— 只认「语法上直接是 hook 实参」会把已等待的链误报成调度。
+   */
+  const namedHookCallbacks = new WeakSet<ts.Node>()
   const isHookCallback = (fn: ts.Node): boolean => {
+    if (namedHookCallbacks.has(fn)) return true
     let e: ts.Node = fn
     for (;;) {
       const p = e.parent
@@ -1494,8 +1514,29 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       if (ts.isBinaryExpression(n)) {
         const k = n.operatorToken.kind
         if (k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment) {
-          const left = unwrap(n.left)
-          if (ts.isIdentifier(left)) reassignedNames.add(left.text)
+          // ⚠️ 解构赋值同样重绑定（Codex 第七轮 P2）：`[setup] = [() => …]` / `({ f: setup } = …)`
+          // 的左侧不是 Identifier，只认标识符会漏掉。
+          const collectAssignTarget = (e: ts.Expression): void => {
+            const u = unwrap(e)
+            if (ts.isIdentifier(u)) { reassignedNames.add(u.text); return }
+            if (ts.isArrayLiteralExpression(u)) {
+              for (const el of u.elements) {
+                if (ts.isSpreadElement(el)) collectAssignTarget(el.expression)
+                else if (!ts.isOmittedExpression(el)) collectAssignTarget(el as ts.Expression)
+              }
+              return
+            }
+            if (ts.isObjectLiteralExpression(u)) {
+              for (const p2 of u.properties) {
+                if (ts.isPropertyAssignment(p2)) collectAssignTarget(p2.initializer)
+                else if (ts.isShorthandPropertyAssignment(p2)) collectAssignTarget(p2.name)
+                else if (ts.isSpreadAssignment(p2)) collectAssignTarget(p2.expression)
+              }
+              return
+            }
+            if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.EqualsToken) collectAssignTarget(u.left)
+          }
+          collectAssignTarget(n.left)
         }
       }
       ts.forEachChild(n, collectAssign)
@@ -1522,7 +1563,30 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
     if (!isHookName(callChain(call)?.chain, call)) continue
     // 命名的回调（标识符实参）在同文件里能唯一解析时，把它的函数体一起扫。
     const roots: ts.Node[] = [call]
-    for (const arg of call.arguments) {
+    // ⚠️ **还原 call/apply 与静态展开后的实参**（Codex 第七轮 P2）：`beforeEach.apply(null,
+    // [setup])` 与 `beforeEach(...[setup])` 的命名回调不在 `call.arguments` 的字面位置上。
+    const hookArgs: ts.Expression[] = (() => {
+      const chain = callChain(call)?.chain ?? []
+      const expand = (list: readonly ts.Expression[]): ts.Expression[] => {
+        const acc: ts.Expression[] = []
+        for (const el of list) {
+          const u = unwrap(el)
+          if (ts.isSpreadElement(u)) {
+            const inner = unwrap(u.expression)
+            if (ts.isArrayLiteralExpression(inner)) acc.push(...expand(inner.elements))
+            continue
+          }
+          if (!ts.isOmittedExpression(u)) acc.push(u as ts.Expression)
+        }
+        return acc
+      }
+      if (chain[chain.length - 1] === 'apply') {
+        const arr = unwrap(call.arguments[1] as ts.Expression | undefined ?? ({} as ts.Expression))
+        return ts.isArrayLiteralExpression(arr) ? expand(arr.elements) : []
+      }
+      return expand(call.arguments)
+    })()
+    for (const arg of hookArgs) {
       const u = unwrap(arg)
       if (!ts.isIdentifier(u)) continue
       if (reassignedNames.has(u.text)) {
@@ -1532,7 +1596,7 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
         continue
       }
       const fn = sameFileFunction(u.text)
-      if (fn !== undefined) roots.push(fn)
+      if (fn !== undefined) { namedHookCallbacks.add(fn); roots.push(fn) }
     }
     for (const root of roots) for (const inner of collectCalls(root)) {
       // ⚠️ 用 `callChain` 而不是 `calleeChain`：`Promise.resolve().then(…)` 的被调对象基座是
@@ -2475,12 +2539,31 @@ it('Q34', oQ34, () => {})`),
     // 反例：同文件里定义了、但没交给 hook —— 不报
     expect(hookHits(bt('function notSetupH85() { ', ST, '(w, 80) }\n', H, '(() => {})')),
       '没被登记的函数不扫').toEqual([])
+    // ⑲ 命名回调里被 hook 真正 await 的链不算调度（Codex 第七轮 P2）：只认语法实参会误报。
+    expect(hookHits(bt('async function setupH89() { await Promise.resolve().then(() => { w() }) }\n', H, '(setupH89)')),
+      '命名回调里的 await 已收口').toEqual([])
+    // ⑳ apply 的数组实参与静态展开都要还原（Codex 第七轮 P2）
+    expect(hookHits(bt('function setupH90() { ', ST, '(w, 80) }\n', H, '.apply(null, [setupH90])')),
+      'apply 数组实参里的命名回调').toEqual([`${ST}(`])
+    expect(hookHits(bt('function setupH91() { ', ST, '(w, 80) }\n', H, '(...[setupH91])')),
+      '静态展开里的命名回调').toEqual([`${ST}(`])
     // ⑱ **登记前被重新赋值**（CR 第五十七轮 major）：`let setup = () => {}` 之后换成调度回调 ——
     //    只走原始空箭头会把尾巴漏掉。无法静态确认时响亮报告（不是静默放过）。
     {
       const hits = hookHits(bt('let setupH87 = () => {}\nsetupH87 = () => { ', ST, '(w, 80) }\n', H, '(setupH87)'))
       expect(hits.length, '被重新赋值的回调必须报告一次').toBe(1)
       expect(hits[0], '点名「重新赋值」').toMatch(/重新赋值/)
+    }
+    // ㉑ 解构赋值同样算重绑定（Codex 第七轮 P2）
+    {
+      const hits = hookHits(bt('let setupH92 = () => {}\n;[setupH92] = [() => { ', ST, '(w, 80) }]\n', H, '(setupH92)'))
+      expect(hits.length, '解构赋值后的回调必须报告').toBe(1)
+      expect(hits[0]).toMatch(/重新赋值/)
+    }
+    {
+      const hits = hookHits(bt('let setupH93 = () => {}\n;({ f: setupH93 } = { f: () => { ', ST, '(w, 80) } })\n', H, '(setupH93)'))
+      expect(hits.length, '对象解构赋值后的回调必须报告').toBe(1)
+      expect(hits[0]).toMatch(/重新赋值/)
     }
     // 未被重新赋值的 let 仍可解析（不因噎废食）
     expect(hookHits(bt('let setupH88 = () => { ', ST, '(w, 80) }\n', H, '(setupH88)')),
@@ -2526,6 +2609,12 @@ it('Q34', oQ34, () => {})`),
     // 反例：循环只读 → 不改变选项，仍按原值判
     expect(concHits(`const oF61 = { con${'current: false }'}\nfor (const itemF61 of [oF61]) { console.log(itemF61) }\nit('F61', oF61, () => {})`),
       '只读循环不建立写穿').toEqual([])
+    // ⑲ **完整属性链**（Codex 第七轮 P2）：`box.nested.opts` 的基座是属性访问，只追一层会漏。
+    expect(concHits(`const oP72 = { con${'current: false }'}\nconst boxP72 = { nested: { opts: oP72 } }\nconst aliasP72 = boxP72.nested.opts\naliasP72.concurrent = true\nit('P72', oP72, () => {})`),
+      '两层容器属性链仍指向同一对象').toEqual(['unknown'])
+    // ⑳ **原型已确定串行时不再按自有并发判**（Codex 第七轮 P2）：Vitest 实测该组合串行。
+    expect(concHits(`describe('X77', { __proto__: { se${'quential: true }'}, concurrent: true }, () => {})`),
+      '合并后已确定串行 → 不得再报自有 concurrent').toEqual([])
     // ⑰ **经容器属性读出的对象还是同一个身份**（CR 第五十七轮 major）：`const box = { opts:
     //    oP70 }; const alias = box.opts` 里 alias === oP70。
     expect(concHits(`const oP70 = { con${'current: false }'}\nconst boxP70 = { opts: oP70 }\nconst aliasP70 = boxP70.opts\naliasP70.concurrent = true\nit('P70', oP70, () => {})`),

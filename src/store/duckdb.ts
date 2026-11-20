@@ -1054,25 +1054,33 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 任何一步失败都换成包层（`cause` 保留原对象）。
     try {
       const prev = (e as { hint?: string }).hint
+      // 原 kind 先读出来（读也可能抛 → 进 catch 走包层）。
+      const prevKind = (e as { kind?: string }).kind
+      const expectedKind = prevKind ?? 'internal'
+      const expectedHint = prev === undefined
+        ? hint
+        : `${hint}；原错误的建议（核对之后才可执行）：${prev}`
       e.message = `${e.message}${note}`
       // ⚠️ **无 kind 的错误必须补 `internal`**（CR 第四十八轮 major，探针实测）：`store init`
       // 的迁移抛 plain Error 时，`thrownToExit` 走「无 kind」分支、把这条 hint 换成通用的
       // 「执行期错误」—— 恢复动作（核对后再重放）在下游被丢掉。
-      ;(e as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
+      ;(e as { kind?: string }).kind = expectedKind
       ;(e as { retryable?: boolean }).retryable = false
       ;(e as { code?: string }).code = 'store_retired'
-      // ⚠️ **「写进去了」不等于「读得到」**（CR 第五十七轮 major）：`code` 可以有 getter +
-      // 空 setter —— 赋值不抛、也没写进去；直接返回会让调用方读不到退役信号。赋值后回读
-      // 验证，不符就走下面同一个包层（原对象挂 cause）。
+      // ⚠️ **「写进去了」不等于「读得到」**（CR 第五十七/五十八轮 major）：这些字段可以是
+      // getter + 空 setter —— 赋值不抛、也没写进去。**三个关键字段逐项回读**：任一不符就走
+      // 下面同一个包层（原对象挂 cause），否则调用方按 `code`/`kind`/`hint` 分流的判据
+      // 会整套落空（看不到退役信号、命令出口把核对动作换成通用文案、或只剩「稍后重试」）。
       // ⚠️ 原 hint 与「先核对」冲突时**核对必须在前**（CR 第五十七轮 major）：两条一起交给
       // Agent 时，先出现的「稍后重试」会被照做，而写入状态此时不可信 —— 原建议标注为
       // 「核对之后才可执行」。回滚已确认的路径一字不动（本函数只在 unconfirmed 进来）。
-      ;(e as { hint?: string }).hint = prev === undefined
-        ? hint
-        : `${hint}；原错误的建议（核对之后才可执行）：${prev}`
-      let tagged: string | undefined
-      tagged = (e as { code?: string }).code
-      if (tagged !== 'store_retired') throw new Error('store_retired 标记未能落盘')
+      ;(e as { hint?: string }).hint = expectedHint
+      const taggedCode: unknown = (e as { code?: string }).code
+      const taggedKind: unknown = (e as { kind?: string }).kind
+      const taggedHint: unknown = (e as { hint?: string }).hint
+      if (taggedCode !== 'store_retired' || taggedKind !== expectedKind || taggedHint !== expectedHint) {
+        throw new Error('回溯状态未能完整落盘（code / kind / hint 写入被静默丢弃）')
+      }
       return e
     } catch {
       // ⚠️ **包层本身必须构造得出来**（CR 第五十二轮 major）：`message` 可能是抛异常的访问器 ——
