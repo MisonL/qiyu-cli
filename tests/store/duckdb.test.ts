@@ -2223,6 +2223,144 @@ describe('duckdb —— 事务', () => {
     await ok.close()
   })
 
+  it('COMMIT 以非 Error 值被拒（null）→ 仍按「提交结果未知」交回（CR 第五十二轮 major）', { timeout: 90_000 }, async () => {
+    // 探针形态：驱动把 COMMIT 以 `null` 拒绝时，旧实现读 `(e as {kind}).kind` 直接 TypeError，
+    // 「提交结果未知 / 不要重试」整段被一个 TypeError 换掉。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (armed && sql === 'COMMIT') throw null
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    armed = true
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    }).then(() => null, (x: unknown) => x as Error & { kind?: string; code?: string })
+    expect(e, '必须交回 Error，不得是 TypeError').toBeInstanceOf(Error)
+    expect(e!.constructor.name).toBe('Error')
+    expect(e!.message).toMatch(/提交结果未知/)
+    expect(e!.kind).toBe('internal')
+    expect(e!.code).toBe('store_retired')
+    await s.close()
+  })
+
+  it('ROLLBACK 以 undefined 被拒 → 不得当成「已确认回滚」（CR 第五十二轮 major）', { timeout: 90_000 }, async () => {
+    // 探针形态：`promise.then(ok, e => { failed = e })` + `if (failed !== undefined) throw failed`
+    // —— 拒绝值恰好是 `undefined` 时被当成「ROLLBACK 成功」，于是回滚未确认的事务被说成「已整体回滚」。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (armed && sql === 'ROLLBACK') throw undefined
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    armed = true
+    const original = new Error('boom')
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      throw original
+    }).then(() => null, (x: unknown) => x as Error & { hint?: string })
+    expect(e).toBeInstanceOf(Error)
+    expect(e!.message, 'ROLLBACK 拒绝（哪怕拒绝值是 undefined）就说明收尾未确认').toMatch(/回滚未能确认/)
+    expect(e!.hint).toMatch(/核对/)
+    await s.close()
+  })
+
+  it('错误对象的 message 读取本身会抛 → 补话包层必须能构造出来（CR 第五十二轮 major）', { timeout: 90_000 }, async () => {
+    // 探针形态：`message` 是抛异常的访问器 —— 第一段 try 的赋值失败后，catch 里再读
+    // `e.message` 拼包层又会抛，调用方拿到的是那个 TypeError，原值与恢复动作一起丢光。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const weird = new Error('原始失败')
+    let reads = 0
+    Object.defineProperty(weird, 'message', {
+      configurable: true,
+      get() { reads++; throw new Error('getter 也不许炸掉包层') },
+      set() { throw new Error('setter 抛') },
+    })
+    const e = await s.transaction(async () => { throw weird })
+      .then(() => null, (x: unknown) => x as Error & { cause?: unknown; hint?: string })
+    expect(e, '必须是可读的 Error，不得是 read 时的 TypeError').toBeInstanceOf(Error)
+    expect(e!.cause, '原对象必须挂在 cause 上').toBe(weird)
+    expect(e!.message).toMatch(/回滚未能确认/)
+    expect(reads, '读取次数不设上限，但必须能安全兜底').toBeGreaterThan(0)
+    await s.close()
+  })
+
   it('回调拒绝的值连文本都转不出（Object.create(null)）+ 回滚未确认 → 不得让转换动作换掉主失败（CR 第五十轮 major）', { timeout: 90_000 }, async () => {
     // 探针实测（2026-11-20）：`String(Object.create(null))` 抛 `TypeError: Cannot convert object
     // to primitive value` —— 包层在构造 message 时自己炸掉，调用方拿到的是那个 TypeError，

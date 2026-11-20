@@ -314,7 +314,11 @@ async function waitForMarker(
   // 已启动的进程在预算耗尽时**立刻**请求 SIGKILL，再等真实 close（宽限有界）。
   const closed = await run.settleFailure()
   if (!closed) {
-    const failure = run.finalFailure(`${what}在剩余预算 ${Math.max(budget, 0)}ms 内未就绪`)
+    // ⚠️ **close 未确认时 pid 必须一起说**（CR 第五十二轮 major #13）：这条路径同样不返回
+    // child，调用方只能靠文案里的 pid 去处理那个可能仍活着的进程。
+    const pid = child.pid
+    const failure = run.finalFailure(`${what}在剩余预算 ${Math.max(budget, 0)}ms 内未就绪`
+      + `${pid === undefined ? '' : `（子进程 pid ${pid}）`}`)
     run.dispose()
     throw failure
   }

@@ -1011,6 +1011,8 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     expect(e!.message, '原始窗口失败必须保留').toMatch(/注入：窗口写入失败/)
     expect(e!.message, '补记缺口的提交未知 / 退役事实不得被吞').toMatch(/缺口|退役/)
     expect(e!.code, '实例已退役：编排层据此识别').toBe('store_retired')
+    // kind 也必须在场：命令出口 `thrownToExit` 只在 `err.kind` 存在时透传 hint（CR 第五十二轮 #15）
+    expect(e!.kind, '命令出口靠 kind 透传 hint').toBe('internal')
     expect(e!.hint, '恢复动作仍要给出').toMatch(/核对/)
     await store.close()
   })

@@ -524,7 +524,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         await execSql('COMMIT', [], { txControl: true })
       } catch (e) {
         // 连接已关闭（usage）→ COMMIT 根本没下发，不存在「结果未知」；原错误照常交回。
-        if ((e as { kind?: string }).kind === 'usage') throw e
+        // ⚠️ **拒绝值可能不是对象**（CR 第五十二轮 major）：驱动以 `null` / `undefined` 拒绝时
+        // 读 `.kind` 会抛 TypeError，把「提交结果未知」整段换掉 —— 先确认是对象再读。
+        if (e !== null && typeof e === 'object' && (e as { kind?: string }).kind === 'usage') throw e
         // ⚠️ **COMMIT 结果未知**（CR 第三十九轮 major #5）：COMMIT 已下发、结果没能确认 ——
         // 写入可能已经落库，也可能没有。不能只说「失败」：按失败重试可能重复写。
         // ⚠️ **本实例当场永久退役**（CR 第四十一轮 major）：不能把「还能不能用」寄望于随后
@@ -1031,7 +1033,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       ;(e as { hint?: string }).hint = prev === undefined ? hint : `${prev} ${hint}`
       return e
     } catch {
-      const wrapped = new Error(`${e.message}${note}`, { cause: e })
+      // ⚠️ **包层本身必须构造得出来**（CR 第五十二轮 major）：`message` 可能是抛异常的访问器 ——
+      // 第一段 try 正是因此失败，catch 里再读 `e.message` 会第二次抛、把原值换成 TypeError。
+      const readable = ((): string => {
+        try { return String((e as { message?: unknown }).message) } catch { return '(无法读取的错误消息)' }
+      })()
+      const wrapped = new Error(`${readable}${note}`, { cause: e })
       ;(wrapped as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
       ;(wrapped as { retryable?: boolean }).retryable = false
       ;(wrapped as { code?: string }).code = 'store_retired'
@@ -1077,8 +1084,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 交回、排队的 ROLLBACK 随即执行成功、1.9s 内正常退出。所以：到点先 interrupt，
     // 再给 `DRAIN_INTERRUPT_GRACE_MS` 等 ROLLBACK 落定；等不到才按「未能确认」退役。
     let failed: unknown
+    // ⚠️ **不能用「failed !== undefined」判是否被拒**（CR 第五十二轮 major）：拒绝值恰好是
+    // `undefined` 时会把「ROLLBACK 被拒」当成「成功」，于是回滚未确认的事务被说成「已整体回滚」。
+    let rejected = false
     const settled = execSql('ROLLBACK', [], { txControl: true })
-      .then(() => { /* 成功 */ }, (e: unknown) => { failed = e })
+      .then(() => { /* 成功 */ }, (e: unknown) => { failed = e; rejected = true })
     /** 等到 `settled` 或超时；返回是否已落定。 */
     const awaitSettled = async (ms: number): Promise<boolean> => {
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -1099,7 +1109,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           return 'unconfirmed'
         }
       }
-      if (failed !== undefined) throw failed
+      if (rejected) throw failed
       beganTx.delete(token)
       return 'confirmed'
     } catch (e) {

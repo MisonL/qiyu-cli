@@ -170,17 +170,26 @@ function isMigratedFile(sf: ts.SourceFile): boolean {
   // `installSinks`。只认字面名会把这种文件整份漏掉（并发与 hook 两路共用本判据）。
   // 边界（如实记录）：跨模块 re-export、命名空间导入（`cap.captureSinks(…)`）与反射不追。
   const names = new Set(['captureSinks'])
+  // ⚠️ **命名空间导入**同样算迁移形态（CR 第五十二轮 major #11）：`import * as cap from './capture.js'`
+  // 之后 `cap.captureSinks(…)` 是同一个函数 —— 只认命名导入会把整份文件判成非迁移，
+  // 并发与 hook 两路细判全部跳过。这里记下命名空间名，调用链的首段命中它且第二段是
+  // `captureSinks` 即算。
+  const namespaces = new Set<string>()
   for (const st of sf.statements) {
     if (!ts.isImportDeclaration(st)) continue
     const bindings = st.importClause?.namedBindings
-    if (bindings === undefined || !ts.isNamedImports(bindings)) continue
+    if (bindings === undefined) continue
+    if (ts.isNamespaceImport(bindings)) { namespaces.add(bindings.name.text); continue }
+    if (!ts.isNamedImports(bindings)) continue
     for (const el of bindings.elements) {
       if (el.propertyName?.text === 'captureSinks') names.add(el.name.text)
     }
   }
   return collectCalls(sf).some((c) => {
-    const head = callChain(c)?.chain[0]
-    return head !== undefined && names.has(head)
+    const chain = callChain(c)?.chain
+    if (chain === undefined || chain.length === 0) return false
+    if (names.has(chain[0]!)) return true
+    return chain.length >= 2 && namespaces.has(chain[0]!) && chain[1] === 'captureSinks'
   })
 }
 
@@ -722,8 +731,11 @@ function scanEntries(entries: Array<{ rel: string; sf: ts.SourceFile }>,
     const exemptableForm = (why: string): boolean => {
       const prefix = '.concurrent 修饰链：'
       if (!why.startsWith(prefix)) return false
-      const base = why.slice(prefix.length).split('.')[0]!
-      return REGISTRARS.has(base) && !SUITES.has(base)
+      const segs = why.slice(prefix.length).split('.')
+      const base = segs[0]!
+      // 只认**单条**测试登记（`it.concurrent`）；参数化（`.each` / `.for`）按同一标题展开成多条
+      // 用例，不是清单里那一条证据（CR 第五十二轮 major #10）。套件级同样不可豁免。
+      return REGISTRARS.has(base) && !SUITES.has(base) && segs.length === 2 && segs[1] === 'concurrent'
     }
     for (const v of concurrentViolations(sf)) {
       // 豁免只按**用例名**精确匹配一条测试登记的 `.concurrent`；其它形态与没有静态用例名的违规永不豁免
@@ -2369,6 +2381,16 @@ it('Q34', oQ34, () => {})`),
     expect(hookSchedulingViolations(aliasHookSf), '别名导入的文件仍要进入 hook 细判').toHaveLength(1)
     expect(isMigrated(bt('const installSinks = (f: () => void) => f\ninstallSinks(() => {})')),
       '没从 capture 助手导入的同名局部函数不算迁移').toBe(false)
+    // ⚠️ **命名空间导入同样是迁移形态**（CR 第五十二轮 major #11）：`import * as cap from './capture.js'`
+    // 之后 `cap.captureSinks(…)` 是同一个函数。旧判据只看命名导入，整份文件被当成非迁移 ——
+    // 并发与 hook 两路细判全跳过。
+    const nsImport = bt('import * as capNS59 from ', JSON.stringify('./capture.js'),
+      '\ncapNS59.capture', 'Sinks(() => {})')
+    expect(isMigrated(nsImport), '命名空间导入同样是迁移形态').toBe(true)
+    const nsSf = parseTs(`${nsImport}\nit('NS1', { con${'current: true }'}, () => {})`)
+    expect(scanEntries([{ rel: 'ns-import.ts', sf: nsSf }], {}), '命名空间导入的文件仍要进入并发细判').toHaveLength(1)
+    expect(hookSchedulingViolations(parseTs(`${nsImport}\n${H}(() => { ${ST}(w, 1) })`)),
+      '命名空间导入的文件仍要进入 hook 细判').toHaveLength(1)
 
     // —— 白名单精确到登记：只豁免清单里的那条用例名，同一文件里再来一条仍要报 ——
     const J_TITLE = 'J：it.concurrent 的体留下 60ms 尾巴'
@@ -2391,6 +2413,10 @@ it('Q34', oQ34, () => {})`),
     expect(scanEntries([{ rel: 'synthetic-exempt.ts', sf: parseTs(migratedSrc(
       bt("it(", JSON.stringify(J_TITLE), ', { con', 'current: true }, () => {})'))) }], exemptOne),
       '选项形式的并发不得被同名用例豁免').toHaveLength(1)
+    // 参数化登记（`it.concurrent.each(表)`）按同一标题展开成多条用例，不是清单里那一条证据
+    expect(scanEntries([{ rel: 'synthetic-exempt.ts', sf: parseTs(migratedSrc(
+      bt('it.con', 'current.each([1])(' , JSON.stringify(J_TITLE), ', () => {})'))) }], exemptOne),
+      '参数化并发登记不得被同名豁免').toHaveLength(1)
     expect(staleExemptions([{ rel: 'synthetic-exempt.ts', sf: parseTs(migratedSrc(concReg(J_TITLE))) }], exemptOne),
       '登记仍在时不得报过期').toEqual([])
     // 成员资格：文件形态对、但**不在扫描结果里**（不再迁移 / 不存在）同样是过期

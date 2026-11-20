@@ -32,11 +32,23 @@ beforeEach(() => {
     return child
   })
 })
+/**
+ * 逐个收尾、**全部试过**再抛第一个错误（CR 第五十二轮 major #12）：`await closeRealChild` 抛错
+ * （5000ms 内未确认 close）时，裸循环会中断、后面那些子进程漏掉，可能拖住进程退出。
+ */
+async function closeAll<T>(runs: readonly T[], closeOne: (r: T) => Promise<void>): Promise<unknown[]> {
+  const errs: unknown[] = []
+  for (const run of runs) {
+    try { await closeOne(run) } catch (e) { errs.push(e) }
+  }
+  return errs
+}
 afterEach(async () => {
   if (vi.isFakeTimers()) vi.clearAllTimers()
   vi.useRealTimers()
-  for (const run of realChildren) await closeRealChild(run)
+  const cleanupErrors = await closeAll(realChildren, closeRealChild)
   rmSync(dir, { recursive: true, force: true })
+  if (cleanupErrors.length > 0) throw cleanupErrors[0]
 })
 
 async function closeRealChild(run: RealChild): Promise<void> {
@@ -95,6 +107,17 @@ function swallowOn(child: ChildProcess): void {
 }
 
 describe('锁夹具的子进程生命周期', () => {
+  it('closeAll：一个子进程收尾抛错不得中断其余子进程的收尾', async () => {
+    const seen: string[] = []
+    const errs = await closeAll(['a', 'b', 'c'] as const, async (r) => {
+      seen.push(r)
+      if (r === 'a') throw new Error('a 收尾失败')
+      return
+    })
+    expect(seen, '每个子进程都要尝试').toEqual(['a', 'b', 'c'])
+    expect(errs, '错误交回调用方，不在这里吞').toHaveLength(1)
+  })
+
   let child: ChildProcess
   beforeEach(() => {
     vi.useFakeTimers({ now: 0 })
@@ -240,6 +263,9 @@ describe('锁夹具的子进程生命周期', () => {
     expect(error.error).toBeInstanceOf(Error)
     expect(String(error.error)).toMatch(/close/)
     expect(String(error.error)).toContain('kill 返回 true')
+    // ⚠️ **close 未确认时调用方拿不到句柄**：pid 必须在文案里（CR 第五十二轮 major #13）——
+    // 只报「未就绪 / close 缺失」等于把可能仍活着的进程藏起来。
+    expect(String(error.error), 'close 未确认必须点名 pid').toMatch(/pid 1234/)
     expectClean(child)
   })
 
