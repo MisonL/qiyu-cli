@@ -148,8 +148,12 @@ const GLOBAL_HOSTS = new Set(['globalThis', 'global', 'window', 'self'])
 /**
  * 写入 API 的**方法名**（静态尾段的判据，也是 `writesThroughCallee` 里链名判据的唯一出处 ——
  * 链名与尾段两条判据都从这里取名字，新增一个写入 API 只改这里）。
+ * ⚠️ `setPrototypeOf` 也算写入（Codex 第五十轮 P2）：Vitest 的套件读的是合并后对象的
+ * `options.concurrent`，原型链上的开关同样生效（见下面 `__proto__` 那段），而
+ * `Object.setPrototypeOf(opts, { concurrent: true })` 把整个原型换掉 —— 名单里没有它时
+ * 对象仍被当成 `{}`，静默放行。`Reflect.setPrototypeOf` 同一判据。
  */
-const WRITE_TAILS = new Set(['assign', 'set', 'defineProperty', 'defineProperties'])
+const WRITE_TAILS = new Set(['assign', 'set', 'defineProperty', 'defineProperties', 'setPrototypeOf'])
 /**
  * 调用方式方法名（`.call` / `.apply` / `.bind`）。`writesThroughCallee` 的静态尾段沿它们往里找
  * 真正的链尾：`(w ?? Reflect).set.call(…)` 的尾段先是 `call`，剥一层才是 `set`。
@@ -851,13 +855,40 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
        * 遇到函数 → 它的参数里有同名 rest 才算；到文件顶层都没有 → 不是 rest。
        */
       const isRestParamInScope = (name: string): boolean => {
-        let n: ts.Node | undefined = call
+        // ⚠️ **更近的局部绑定会遮蔽外层的 rest 参数**（Codex 第五十轮 P2）：
+        // `function f(...args) { { const args = [{ concurrent: true }, fn]; it('x', ...args) } }`
+        // 里展开的是**那个数组**，不是转发边界。旧实现沿着祖先链一路找到外层 `...args` 就放行。
+        // 判据：从调用往上走，**先**撞到同名绑定的那一层说了算 —— 同名参数（非 rest）或
+        // 所在块里的同名声明都算遮蔽；一路走到顶层都没撞到同名绑定，才算外层的 rest 参数。
+        let n: ts.Node | undefined = call.parent
         while (n !== undefined) {
           if (ts.isFunctionLike(n)) {
-            const has = (n as ts.SignatureDeclaration).parameters.some(
-              (p) => p.dotDotDotToken !== undefined && ts.isIdentifier(p.name) && p.name.text === name)
-            if (has) return true
+            const same = (n as ts.SignatureDeclaration).parameters.filter(
+              (p) => ts.isIdentifier(p.name) && p.name.text === name)
+            // 同名参数存在：rest 就是边界，普通参数就不是（也不许再往上看外层同名 rest）
+            if (same.length > 0) return same.some((p) => p.dotDotDotToken !== undefined)
           }
+          // 块级 / 文件级语句表里同名声明（只收 `const` / `let` / `var` / 函数 / 类；
+          // 解构（`const { args } = …`）同样遮蔽，但那份保守侧已在 `staticBindingInitializer` 里，
+          // 这里只判标识符名字 —— 漏掉解构只会让判据更保守，不会放行）
+          if (ts.isBlock(n) || ts.isSourceFile(n) || ts.isModuleBlock(n)) {
+            const declares = (st: ts.Statement): boolean => {
+              // ⚠️ 语句层看到的是 `VariableStatement`，声明本身在 `declarationList` 里 —— 只看
+              // `VariableDeclaration` 会漏掉全部 `const` / `let` / `var`（第一版就漏了，样本仍绿）。
+              if (ts.isVariableStatement(st)) {
+                return st.declarationList.declarations.some((d) => ts.isIdentifier(d.name) && d.name.text === name)
+              }
+              if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st))
+                && st.name !== undefined && st.name.text === name) return true
+              return false
+            }
+            // 只看这一层的**直接**声明（嵌套块的声明由它自己那层判）。
+            // ⚠️ `switch` 的 `case` 块没有 `statements`（只有 `clauses`）—— 不把 CaseBlock 收进
+            // 上一条判断，否则 `(n as ts.Block).statements` 是 undefined、`.some` 直接抛。
+            if ((n as ts.Block | ts.SourceFile | ts.ModuleBlock).statements.some(declares)) return false
+          }
+          if (ts.isCatchClause(n) && n.variableDeclaration !== undefined
+            && ts.isIdentifier(n.variableDeclaration.name) && n.variableDeclaration.name.text === name) return false
           n = n.parent
         }
         return false
@@ -1041,7 +1072,13 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         // 三态求值：`true` 为真、`false` 为假、`undefined` 求不出（**不许放行**）。
         // ⚠️ 必须把「求不出」和「为假」分开 —— 两态会把 `{ concurrent: cond }` 当串行放行。
         const concVal = props.get('concurrent')
-        if (props.get('concurrent') !== undefined && boolLiteralValue(sf, props.get('concurrent')!) === true) {
+        // ⚠️ **套件上同时写 `concurrent: true` 与 `sequential: true` 时 Vitest 解析为串行**
+        // （Codex 第五十轮 P2；`createSuite` 的两段：`isConcurrent && !isSequential`）。
+        // 旧判据先报 concurrent:true，把合法串行套件判红 —— 冲突时让 sequential 先说话。
+        const seqOverridesConcurrent = SUITES.has(base) && props.get('sequential') !== undefined
+          && boolLiteralValue(sf, props.get('sequential')!) === true && !accessorKeys.has('sequential')
+        if (!seqOverridesConcurrent && props.get('concurrent') !== undefined
+          && boolLiteralValue(sf, props.get('concurrent')!) === true) {
           out.push({ line: lineOf(sf, call), why: '选项对象 concurrent 为真' })
           seen.add(outermostRegistration(call))
           continue
@@ -1474,17 +1511,19 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       // ⚠️ 白名单不得变成"永久豁免"：条目必须仍是真的豁免对象（文件存在、确实用了
       // `.concurrent`，且**登记的用例名与豁免清单逐一对得上**——多一个或少一个都算清单过期：
       // 少一个说明文件里新增了没被登记的并发用例，将来它被静默放行；多一个说明证据已删）。
-      for (const [rel, entry] of Object.entries(CONCURRENT_EXEMPT)) {
+      for (const rel of Object.keys(CONCURRENT_EXEMPT)) {
         expect(rel, 'CONCURRENT_EXEMPT 的键必须是 / 分隔（与上面的归一化一致）').not.toContain('\\')
         const p = join(SRC_TESTS, rel)
         expect(existsSync(p), `CONCURRENT_EXEMPT 里的 ${rel} 不存在（清单过期）`).toBe(true)
         const sfExempt = parsedOf(p)
         expect(sfExempt, `CONCURRENT_EXEMPT 里的 ${rel} 读不到`).toBeDefined()
-        const actuallyConcurrent = concurrentTestNames(sfExempt!)
-        expect(staleExemptions([{ rel, sf: sfExempt! }], CONCURRENT_EXEMPT),
-          `${rel} 的 .concurrent 用例与豁免清单不一致，请同步 CONCURRENT_EXEMPT`).toEqual([])
-        expect(actuallyConcurrent.length, `${rel} 的豁免必须仍对应一条真实并发用例`).toBeGreaterThan(0)
+        expect(concurrentTestNames(sfExempt!).length, `${rel} 的豁免必须仍对应一条真实并发用例`).toBeGreaterThan(0)
       }
+      // ⚠️ **成员资格同样要查**（Codex 第五十轮 P2）：旧调用把豁免文件自己包成 entries 传入，
+      // `found === undefined` 那条「不再是被扫描的迁移形态文件」永远走不到 —— 文件停用
+      // `captureSinks` 后豁免会一直成立。这里传**真实扫描结果**，两条判据一起生效。
+      expect(staleExemptions(migratedFiles(), CONCURRENT_EXEMPT),
+        '豁免清单过期：文件 / 用例名 / 迁移形态任一与实际不符，请同步 CONCURRENT_EXEMPT').toEqual([])
     })
 
   it('用了 captureSinks 的文件，四类 hook 体里不得出现调度原语（含 beforeAll / 嵌套 afterAll）',
@@ -1815,7 +1854,11 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 数字实参是**超时**不是选项（`@vitest/runner` 的 `parseArguments`：number → `{ timeout }`）
     expect(concHits(`it('T1', async () => {}, 40_000)\nconst oth = { con${'current: false }'}`),
       '数字超时不算选项（文件里别处有 concurrent 才走细判）').toEqual([])
-    expect(concHits(`it('T2', { con${'current: true }, () => {}, 40000)'}`), '超时与选项共存').toEqual(['opt'])
+    // ⚠️ 旧样本写成 4 个实参（`it(名, 选项, 执行体, 40000)`）—— Vitest 2.1.9 的登记函数签名是
+    // `(name, optionsOrFn, optionsOrTest)`，第 4 个实参被**静默忽略**，样本自称的「超时与选项共存」
+    // 并不成立（CR 第四十九轮 major 的追问；它同时声称两处样本有多余引号，实测模板求值后 0 解析诊断）。
+    // 改成受支持的形态：选项在**第 3 位**、超时是选项里的 `timeout` 键。
+    expect(concHits(`it('T2', () => {}, { con${'current: true, timeout: 40_000 }'})`), '选项在第 3 位（含 timeout 键）').toEqual(['opt'])
     // 写入 API 的名字链 / 调用方式都要还原（Codex 第二十五轮 P2）
     // ⚠️ **样本里被赋值的必须是对象字面量本身、不是 JSON 文本**：`JSON.stringify({concurrent:false})`
     // 的产物键带引号（`{"concurrent":false}`），后面的 `{ concurrent: true }` 是**不带引号**的键；
@@ -2073,6 +2116,27 @@ it('Q34', oQ34, () => {})`),
     // 套件上显式 `sequential: true` 是串行收口（Codex 第二十五轮 P2）
     expect(concHits(`describe('Q9', { ...optsQ, se${'quential: true }, () => {})'}`),
       'sequential:true 收口未知展开').toEqual([])
+    // —— 第五十轮 Codex 报出的三处守卫缺口（每条都是「判据看不见 → 静默放行」）——
+    // ① `Object.setPrototypeOf(opts, { concurrent: true })` 换掉原型：Vitest 的套件读的是
+    //    合并后对象的 `options.concurrent`（原型链上的值同样生效，见上方 `__proto__` 那段），
+    //    而写入 API 名单里没有 `setPrototypeOf` → 对象仍被当成 `{}`、静默放行。
+    expect(concHits(`const oP50 = {}\nObject.setPrototypeOf(oP50, { con${'current: true }'})\ndescribe('P50', oP50, () => {})`),
+      'setPrototypeOf 换原型同样是写入').toEqual(['unknown'])
+    expect(concHits(`const oR50 = {}\nReflect.setPrototypeOf(oR50, { con${'current: true }'})\ndescribe('R50', oR50, () => {})`),
+      'Reflect.setPrototypeOf 同属写入 API').toEqual(['unknown'])
+    // ② 块作用域里声明了与**外层 rest 参数同名**的局部绑定：展开的不再是 rest 边界，
+    //    而是那个数组 —— 旧判据沿祖先链找到外层 `...args` 就当转发边界放行。
+    expect(concHits(`function sh50(...args50) {\n  {\n    const args50 = [{ con${'current: true }'}, () => {}]\n    it('S50', ...args50)\n  }\n}`),
+      '被局部遮蔽的 rest 名不是转发边界').toEqual(['unknown'])
+    // 只在**更近的函数签名**里遮蔽：外层 `...args51`、内层普通参数 `args51` —— 展开的是内层
+    // 那个普通参数（一个真数组，不是转发边界），不许顺着祖先链认成外层的 rest。
+    expect(concHits(`function outer51(...args51) {\n  function inner51(args51: unknown[]) {\n    it('S51', ...args51)\n  }\n}`),
+      '更近的同名普通参数遮蔽外层 rest').toEqual(['unknown'])
+    // ③ 套件同时写 `concurrent: true` 与 `sequential: true`：Vitest 的
+    //    `isConcurrentSpecified / isSequentialSpecified` 两段化简后 `options.concurrent = isConcurrent && !isSequential`
+    //    → **串行**。旧判据先看 concurrent、直接报违规（合法串行套件被判红）。
+    expect(concHits(`describe('T50', { con${'current: true, sequential: true }'}, () => {})`),
+      'sequential:true 压过 concurrent:true（Vitest 解析为串行）').toEqual([])
     // 访问器被后写的数据属性覆盖 → 值确定（Codex 第二十五轮 P2）
     const g = bt('get con', 'current() { return true }')
     expect(concHits(bt("it('QA', { ...{ ", g, ' }, con', 'current: false }, () => {})')),
@@ -2147,6 +2211,10 @@ it('Q34', oQ34, () => {})`),
       exemptOne), '登记过期必须被发现').toHaveLength(1)
     expect(staleExemptions([{ rel: 'synthetic-exempt.ts', sf: parseTs(migratedSrc(concReg(J_TITLE))) }], exemptOne),
       '登记仍在时不得报过期').toEqual([])
+    // 成员资格：文件形态对、但**不在扫描结果里**（不再迁移 / 不存在）同样是过期
+    expect(staleExemptions([], exemptOne), '豁免文件不在扫描集里 → 过期').toHaveLength(1)
+    // 反例：文件在扫描集里但已不用 captureSinks（不是迁移形态）→ 由调用方先过滤，这里不重复判；
+    // 经过 migratedFiles 的真实调用点（仓扫用例）同时覆盖这一档。
 
     // —— 4/5：rest 展开与 call/apply 归一化 ——
     // rest 展开是**转发边界**，但边界只覆盖展开本身：rest **之前**的显式实参位置固定，照常判；

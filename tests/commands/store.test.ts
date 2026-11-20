@@ -699,7 +699,7 @@ describe('store 命令面与 help', () => {
       let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
         roundsRun = round + 1
-        const p = dbPath()   // 每轮换全新路径（避开本进程实例缓存）
+        const p = join(dir, `w-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
         if (holder) holder.kill('SIGKILL')
         holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `w-holder-${round}`, deadline })
         if (await lockVerdict(p, dir, deadline) !== 'CONFLICT') continue   // 锁未落盘，换轮
@@ -817,8 +817,10 @@ describe('store 命令面与 help', () => {
         },
       }
     })
-    const { storeCommand: mockedCommand } = await import('../../src/commands/store.js')
     try {
+      // ⚠️ 动态导入放进受保护区（Codex 第五十轮 P3）：它在 `try` 之外失败时 `doUnmock` 不会执行，
+      // 模块 mock 会污染后续用例。
+      const { storeCommand: mockedCommand } = await import('../../src/commands/store.js')
       expect(await mockedCommand(['init', '--db', freshPath])).toBe(1)
       const e = JSON.parse(out).error
       expect(e.kind, '无 kind 会在命令出口被换成通用文案').toBe('internal')

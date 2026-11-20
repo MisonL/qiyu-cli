@@ -1707,12 +1707,16 @@ describe('duckdb —— 事务', () => {
       brokenTx: 0, beganTx: 0, txInFlight: 0, txWrites: 0, drainWaiters: 0,
     })
     // ③ 回调抛错、回滚未能确认（含 beginTx 与 brokenTx 两条记号）
+    // ⚠️ **必须先记下快照数、断言它涨了**（Codex 第五十轮 P3）：若这条路径没调 `txStateProbe`，
+    // `snapshots.at(-1)` 仍是上一段的零值、断言会在没走到该路径的情况下通过。
+    const before3 = snapshots.length
     armRollbackFailure = true
     await s.transaction(async (t) => {
       await t.upsert('tags', [{ id: '3', name: 'C', color: '#FFF' }])
       throw new Error('boom2')
     }).catch(() => {})
     armRollbackFailure = false
+    expect(snapshots.length, '回滚未能确认这条路必须自己交出一份快照').toBeGreaterThan(before3)
     expect(snapshots.at(-1), '回滚未能确认后同样不得留令牌（连接已退役，令牌也不该被引用）').toEqual({
       brokenTx: 0, beganTx: 0, txInFlight: 0, txWrites: 0, drainWaiters: 0,
     })
@@ -2008,7 +2012,12 @@ describe('duckdb —— 事务', () => {
     expect(txErr!.message, '必须点明回滚未能确认').toMatch(/回滚未能确认/)
     expect(txErr!.message, '不得再把原错误洗成「已回滚」').toMatch(/boom/)
     expect(txErr!.hint, '恢复动作：重建实例 + 核对后再决定是否重放').toMatch(/重建/)
-    expect(txErr!.hint).toMatch(/重放|核对/)
+    // ⚠️ **两项都要**（Codex 第五十轮 P2）：「重放」与「核对」是两件事 —— 旧断言是
+    // `/重放|核对/`（或），只教重放、不先核对的回归照样通过。而且顺序也是语义：
+    // 「先核对数据是否落库」必须在「再决定是否重放」之前。
+    expect(txErr!.hint, '必须要求先核对').toMatch(/核对/)
+    expect(txErr!.hint, '必须点名重放').toMatch(/重放/)
+    expect(txErr!.hint!.indexOf('核对'), '核对必须先于重放').toBeLessThan(txErr!.hint!.indexOf('重放'))
     await s.close()
   })
 
