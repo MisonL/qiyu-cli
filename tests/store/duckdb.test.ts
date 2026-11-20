@@ -2714,6 +2714,107 @@ describe('duckdb —— 事务', () => {
     }
   })
 
+  it('retryable 是「读回 true、写不进去」的访问器 → 包层必须交回 retryable=false（CR 第五十九轮 major）', { timeout: 90_000 }, async () => {
+    // 形态：`retryable` getter 恒为 true、setter 空实现 —— 标注「成功」但调用方仍读到 true；
+    // 命令出口会同时给出「可重试」和「先核对再重放」两条互相矛盾的指令。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const weird = new Error('原始失败')
+    Object.defineProperty(weird, 'retryable', {
+      configurable: true,
+      get: () => true,
+      set: () => { /* 静默丢弃 */ },
+    })
+    const e = await s.transaction(async () => { throw weird })
+      .then(() => null, (x: unknown) => x as Error & { cause?: unknown; retryable?: boolean; code?: string; hint?: string })
+    expect(e!.retryable, '「先核对再重放」与「可重试」不能同时成立').toBe(false)
+    expect(e!.code).toBe('store_retired')
+    expect(e!.hint).toMatch(/核对/)
+    expect(e!.cause, '原错误必须挂在 cause 上').toBe(weird)
+    await s.close()
+  })
+
+  it('首次解析异步失败、随后可解析 → 多语句仍必须被拒（不得放行给驱动逐条执行）（CR 第五十九轮 major）', { timeout: 90_000 }, async () => {
+    // 真驱动探针 2026-11-20：extractStatements 第一次异步拒绝、放宽后放行时，驱动在派发里
+    // **再次解析**并依次执行 —— `CREATE TABLE probeA; CREATE TABLE probeB` 两张表都建出来了。
+    // 拿不到语句数就不能证明只有一条，因此解析失败必须失败即拒。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    let failedOnce = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => Promise<unknown>; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: async (sql: string) => {
+                  if (armed && !failedOnce && sql.includes(';')) {
+                    failedOnce = true
+                    throw new Error('注入：首次解析异步失败')
+                  }
+                  return cc.extractStatements(sql)
+                },
+                runAndReadAll: (sql: string, p?: unknown[]) => cc.runAndReadAll(sql, p),
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    armed = true
+    try {
+      const e = await s.query('CREATE TABLE probeA(a INT); CREATE TABLE probeB(a INT)')
+        .then(() => null, (x: unknown) => x as Error & { cause?: unknown; kind?: string })
+      expect(e, '解析失败必须拒绝派发').not.toBeNull()
+      expect(e!.message, '点名「无法解析语句数」').toMatch(/无法解析/)
+      expect(String(e!.cause), '原生解析错误挂在 cause').toMatch(/首次解析异步失败/)
+      const names = (await s.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='main' AND table_name IN ('probeA','probeB')"))
+        .rows.map((r) => String(r.table_name))
+      expect(names, '两条 CREATE 一条都不得执行').toEqual([])
+    } finally {
+      await s.close()
+    }
+  })
+
   it('回调抛出已撤销的 Proxy + 回滚未确认 → 原值仍挂在 cause，恢复动作照常给出（CR 第五十六轮 major）', { timeout: 90_000 }, async () => {
     // `e instanceof Error` 在已撤销的 Proxy 上会抛 TypeError（HasInstance 走 [[GetPrototypeOf]]）——
     // 错误路径上的类型判据自己成了新的主失败，原拒绝值与「先核对再重放」一起丢光。

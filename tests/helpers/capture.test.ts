@@ -1220,6 +1220,14 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
             // ⚠️ **必须在这里收口**（Codex 第七轮 P2）：合并后已确定串行时，后面按自有属性
             // 判 `{ __proto__: { sequential: true }, concurrent: true }` 会把合法的串行套件
             // 报成并发（Vitest 实测该组合串行）。原实现想「再走一遍自有键判据」，与合并语义打架。
+            // ⚠️ **但未知自有键可能覆盖继承来的声明**（CR 第五十九轮 major）：`{ __proto__:
+            // { sequential: true }, ...opts }` 而 opts 里有 `sequential: false` 时 Vitest 实际
+            // 按并发跑 —— 继承来的真值不能当成确定串行。
+            if (mayHaveUnknown) {
+              out.push({ line: lineOf(sf, call), why: '套件选项的原型链带开关，但存在可能覆盖它的未知自有键，无法静态确定' })
+              seen.add(outermostRegistration(call))
+              continue
+            }
             seen.add(outermostRegistration(call))
             continue
           } else if (C === true || S === false) {
@@ -1546,12 +1554,13 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
   const sameFileFunction = (name: string): ts.FunctionLikeDeclaration | undefined => {
     const hits: ts.FunctionLikeDeclaration[] = []
     const visit = (n: ts.Node): void => {
-      if (ts.isFunctionDeclaration(n)) { if (n.name?.text === name) hits.push(n); return }
+      // ⚠️ **嵌套在别的函数体里的声明同样要找到**（CR 第五十九轮 major）：`describe('g', register)`
+      // 里 register 自己声明并登记 setup —— 命中即收，未命中要继续往下走，不能停在 register 这层。
+      if (ts.isFunctionDeclaration(n) && n.name?.text === name) { hits.push(n); return }
       if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name
         && n.initializer !== undefined) {
         const init = unwrap(n.initializer)
-        if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) hits.push(init)
-        return
+        if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) { hits.push(init); return }
       }
       ts.forEachChild(n, visit)
     }
@@ -1583,6 +1592,15 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       if (chain[chain.length - 1] === 'apply') {
         const arr = unwrap(call.arguments[1] as ts.Expression | undefined ?? ({} as ts.Expression))
         return ts.isArrayLiteralExpression(arr) ? expand(arr.elements) : []
+      }
+      // ⚠️ **bind 的预绑定实参**（CR 第五十九轮 major）：`beforeEach.bind(null, setup)()` 的
+      // 外层调用实参为空，setup 在被调方（`beforeEach.bind(null, setup)`）的实参里。
+      const callee = unwrap(call.expression)
+      if (ts.isCallExpression(callee)) {
+        const innerChain = callChain(callee)?.chain ?? []
+        if (innerChain[innerChain.length - 1] === 'bind') {
+          return [...expand(callee.arguments.slice(1)), ...expand(call.arguments)]
+        }
       }
       return expand(call.arguments)
     })()
@@ -2554,6 +2572,13 @@ it('Q34', oQ34, () => {})`),
       expect(hits.length, '被重新赋值的回调必须报告一次').toBe(1)
       expect(hits[0], '点名「重新赋值」').toMatch(/重新赋值/)
     }
+    // ㉒ **bind 预绑定的回调被调用**（CR 第五十九轮 major）：`beforeEach.bind(null, setup)()`
+    expect(hookHits(bt('function setupH94() { ', ST, '(w, 80) }\n', H, '.bind(null, setupH94)()')),
+      'bind 预绑定的命名回调').toEqual([`${ST}(`])
+    // ㉓ **套件体内声明的命名回调**（CR 第五十九轮 major）：`describe('g', register)` 里的
+    //    register 自己声明并登记 setup —— 查找不能停在 register 这一层。
+    expect(hookHits(bt('describe(\'g80\', register80)\nfunction register80() {\n  function setup80() { ', ST, '(w, 80) }\n  ', H, '(setup80)\n}')),
+      '套件体内声明的命名回调').toEqual([`${ST}(`])
     // ㉑ 解构赋值同样算重绑定（Codex 第七轮 P2）
     {
       const hits = hookHits(bt('let setupH92 = () => {}\n;[setupH92] = [() => { ', ST, '(w, 80) }]\n', H, '(setupH92)'))
@@ -2612,6 +2637,11 @@ it('Q34', oQ34, () => {})`),
     // ⑲ **完整属性链**（Codex 第七轮 P2）：`box.nested.opts` 的基座是属性访问，只追一层会漏。
     expect(concHits(`const oP72 = { con${'current: false }'}\nconst boxP72 = { nested: { opts: oP72 } }\nconst aliasP72 = boxP72.nested.opts\naliasP72.concurrent = true\nit('P72', oP72, () => {})`),
       '两层容器属性链仍指向同一对象').toEqual(['unknown'])
+    // ㉔ **未知自有键可能覆盖原型上的串行声明**（CR 第五十九轮 major）：`{ __proto__: { sequential:
+    // true }, ...opts }` 而 opts 里有 `sequential: false` —— Vitest 实际按并发跑；继承来的真值
+    // 不能当成确定串行。
+    expect(concHits(`const optsP73 = { se${'quential: false }'}\ndescribe('X73', { __proto__: { se${'quential: true }'}, ...optsP73 }, () => {})`),
+      '未知自有键可能覆盖继承串行 → 不得放行').toEqual(['unknown'])
     // ⑳ **原型已确定串行时不再按自有并发判**（Codex 第七轮 P2）：Vitest 实测该组合串行。
     expect(concHits(`describe('X77', { __proto__: { se${'quential: true }'}, concurrent: true }, () => {})`),
       '合并后已确定串行 → 不得再报自有 concurrent').toEqual([])

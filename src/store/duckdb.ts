@@ -676,8 +676,21 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 既往一致的原文与 kind（`extractStatements` 对同类错误与 `runAndReadAll` 同源，但
     // abort 探针、错误映射等逻辑都在派发路径上）。事务控制语句一定能被解析，所以
     // 「解析失败 → 放行」不会漏掉任何真实的事务控制形态。
-    const ex = await c.extractStatements(sql).catch(() => undefined)
-    if (ex === undefined) return
+    let parseFailure: unknown
+    const ex = await c.extractStatements(sql).catch((e: unknown) => { parseFailure = e; return undefined })
+    if (ex === undefined) {
+      // ⚠️ **解析失败不得放行**（CR 第五十九轮 major，真驱动探针 2026-11-20）：驱动在派发时
+      // 会**再次解析**并依次执行各语句 —— 实测「首次 extractStatements 异步拒绝、随后放行」
+      // 时，`CREATE TABLE probeA(…); CREATE TABLE probeB(…)` 两条都真的执行了。拿不到语句数
+      // 就无法证明只有一条，只能拒绝；原生解析错误挂在 `cause`（措辞用 safeValueText，
+      // 访问器/无原型对象不得把诊断换掉）。
+      const err = new Error(`无法解析 SQL 的语句数（${safeValueText(parseFailure, 160)}）——`
+        + '为安全起见拒绝派发：多语句会被驱动逐条执行，事务控制或写入可能夹在其中')
+      ;(err as { kind?: string }).kind = 'internal'
+      ;(err as { hint?: string }).hint = '把多条语句拆成多次 query 调用；写入请放进 store.transaction() 的回调里'
+      ;(err as { cause?: unknown }).cause = parseFailure
+      throw err
+    }
     // ⚠️ 多语句**先拒**（CR 第四十一轮 major）：`SELECT 1; COMMIT` 实测就是把两条语句
     // 依次执行。检查顺序刻意在 prepare 之前 —— prepare 会因缺表/绑定失败提前 return，
     // 若把多语句判定放在其后，「第一条绑不上、第二条是 COMMIT」的形态会漏过这道守卫
@@ -1078,7 +1091,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       const taggedCode: unknown = (e as { code?: string }).code
       const taggedKind: unknown = (e as { kind?: string }).kind
       const taggedHint: unknown = (e as { hint?: string }).hint
-      if (taggedCode !== 'store_retired' || taggedKind !== expectedKind || taggedHint !== expectedHint) {
+      // ⚠️ `retryable` 同样回读（CR 第五十九轮 major）：空 setter 上赋值不生效时，调用方会同时
+      // 读到「可重试」与「先核对再重放」两条互相矛盾的指令。
+      const taggedRetryable: unknown = (e as { retryable?: boolean }).retryable
+      if (taggedCode !== 'store_retired' || taggedKind !== expectedKind || taggedHint !== expectedHint
+        || taggedRetryable !== false) {
         throw new Error('回溯状态未能完整落盘（code / kind / hint 写入被静默丢弃）')
       }
       return e
