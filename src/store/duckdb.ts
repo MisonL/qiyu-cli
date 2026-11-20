@@ -1186,6 +1186,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         const raw = c.runAndReadAll('SELECT txid_current() AS t') as unknown as Promise<{
           getRowObjectsJson?: () => Array<Record<string, unknown>>
         }>
+        // 超时后探针仍可能迟到拒绝（中断 / 连接收尾）—— 先挂一个空的 catch，避免它冒成
+        // 未处理的 rejection 带走进程。
+        void raw.catch(() => { /* 归因价值已由探针的 undefined 承担 */ })
         const r = await Promise.race([raw, timeout])
         return String(r.getRowObjectsJson?.()[0]?.t)
       } finally {
