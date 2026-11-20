@@ -92,7 +92,12 @@ export function unwrap(node: ts.Expression): ts.Expression {
 
 /** 字面量下标访问的键（`obj['f']` / ``obj[`f`]`` 与 `obj.f` 同义）；非静态键返回 undefined。 */
 export function staticKey(node: ts.Expression): string | undefined {
-  const k = unwrap(node)
+  // ⚠️ **逗号表达式交出最右操作数**（CR 第五十一轮 major）：`it[(0, 'concurrent')](…)` 与
+  // `process.stderr[(0, 'write')](…)` 求值就是最右那个字面量。声明侧（`staticPropKey` 的
+  // 计算键）已按同一规则解析 —— 接入键不认时 `calleeChain` 返回 undefined、整条调用被跳过，
+  // 同一个形态在两侧结论相反。最右不是字面量仍返回 undefined（反射边界不变）。
+  let k = unwrap(node)
+  while (ts.isBinaryExpression(k) && k.operatorToken.kind === ts.SyntaxKind.CommaToken) k = unwrap(k.right)
   if (ts.isStringLiteral(k) || ts.isNoSubstitutionTemplateLiteral(k)) return k.text
   return undefined
 }

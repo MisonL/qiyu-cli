@@ -289,6 +289,17 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
     if (ts.isConditionalExpression(u)) return refersToAlias(u.whenTrue) || refersToAlias(u.whenFalse)
     return false
   }
+  /** 绑定模式里各 BindingElement 的**默认值**表达式（`const [a = opts]` 的 `opts`）。 */
+  const collectDefaults = (b: ts.BindingName): ts.Expression[] => {
+    if (ts.isIdentifier(b)) return []
+    const out: ts.Expression[] = []
+    for (const el of b.elements) {
+      if (ts.isOmittedExpression(el)) continue
+      if (el.initializer !== undefined) out.push(el.initializer)
+      out.push(...collectDefaults(el.name))
+    }
+    return out
+  }
   // 别名收集（在 `refersToAlias` / `aliasSources` 定义之后跑 —— 它们按名字引用）
   for (let changed = true; changed;) {
     changed = false
@@ -304,8 +315,12 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       // 也建立了别名，随后 `alias.concurrent = true` 写穿 opts。旧收集只看 `Identifier` 的声明，
       // 绑定模式整个跳过 —— 写穿被当成无关变量。
       if (ts.isVariableDeclaration(n) && n.initializer !== undefined && !ts.isIdentifier(n.name)) {
-        // 初始化里引用了 opts/别名之一，且有**绑定元素**承接它 → 保守地把所有绑定名收进别名集
-        if (aliasSources(unwrap(n.initializer)).some((s2) => aliases.has(s2))) {
+        // 初始化里引用了 opts/别名之一，或有**绑定元素的默认值**引用它（`const [a = opts] = []`，
+        // CR 第五十一轮 major）→ 保守地把所有绑定名收进别名集。默认值只在元素缺失时生效，
+        // 但它同样可能把别名交出去 —— 收进来只让判据更保守。
+        const bindsAlias = aliasSources(unwrap(n.initializer)).some((s2) => aliases.has(s2))
+          || collectDefaults(n.name).some((d) => aliasSources(unwrap(d)).some((s2) => aliases.has(s2)))
+        if (bindsAlias) {
           const bind = (b: ts.Node): void => {
             if (ts.isBindingElement(b) && ts.isIdentifier(b.name) && !aliases.has(b.name.text)) {
               aliases.add(b.name.text)
@@ -698,9 +713,21 @@ function scanEntries(entries: Array<{ rel: string; sf: ts.SourceFile }>,
   for (const { rel, sf } of entries) {
     if (!isMigratedFile(sf)) continue
     const allowed = new Set(exempt[rel]?.concurrentNames ?? [])
+    /**
+     * 只有**测试登记**（`it` / `test`）的 `.concurrent` 修饰链才可被按名豁免（CR 第五十一轮 major）：
+     * `describe.concurrent('同名标题')` 是套件级并发、选项形式的 `{ concurrent: true }` 是另一种
+     * 登记形态 —— 都不是清单里那条「`it.concurrent` 的体留下尾巴」的证据。旧实现只按用例名匹配，
+     * 换成套件 / 选项形态顶掉同名用例就能整条豁免，文件里的用例照样并发跑。
+     */
+    const exemptableForm = (why: string): boolean => {
+      const prefix = '.concurrent 修饰链：'
+      if (!why.startsWith(prefix)) return false
+      const base = why.slice(prefix.length).split('.')[0]!
+      return REGISTRARS.has(base) && !SUITES.has(base)
+    }
     for (const v of concurrentViolations(sf)) {
-      // 豁免只按**用例名**精确匹配一条登记；没有静态用例名的违规永远不被豁免
-      if (v.testName !== undefined && allowed.has(v.testName)) continue
+      // 豁免只按**用例名**精确匹配一条测试登记的 `.concurrent`；其它形态与没有静态用例名的违规永不豁免
+      if (v.testName !== undefined && allowed.has(v.testName) && exemptableForm(v.why)) continue
       hits.push(`${rel}:${v.line}（${v.why}）`)
     }
   }
@@ -889,8 +916,13 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
         let n: ts.Node | undefined = call.parent
         while (n !== undefined) {
           if (ts.isFunctionLike(n)) {
-            const same = (n as ts.SignatureDeclaration).parameters.filter(
-              (p) => ts.isIdentifier(p.name) && p.name.text === name)
+            // ⚠️ **绑定模式参数同样遮蔽**（CR 第五十一轮 major）：`function inner({ args })` 里的
+            // `args` 是内层参数（解构出来的值），展开的是它而不是外层的 `...args` —— 只认
+            // Identifier 参数名时整条跳过，判据继续上溯并当成转发边界放行。
+            const binds = (b: ts.BindingName): boolean => ts.isIdentifier(b)
+              ? b.text === name
+              : b.elements.some((e) => !ts.isOmittedExpression(e) && binds(e.name))
+            const same = (n as ts.SignatureDeclaration).parameters.filter((p) => binds(p.name))
             // 同名参数存在：rest 就是边界，普通参数就不是（也不许再往上看外层同名 rest）
             if (same.length > 0) return same.some((p) => p.dotDotDotToken !== undefined)
           }
@@ -1219,7 +1251,12 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       if (HOOK_HOOKS.has(imported.toLowerCase())) hookAlias.set(el.name.text, imported)
     }
   }
-  let schedulerNamespace: string | undefined
+  /** 全部 timer 模块的命名空间导入名（可同时导入 `node:timers` 与 `node:timers/promises` ——
+   *  只记最后一个会让经第一个发起的调度整个漏掉，CR 第五十一轮 major）。 */
+  const schedulerNamespaces = new Set<string>()
+  /** vitest 的命名空间导入名（`import * as vt from 'vitest'` → `vt.beforeEach(…)` 是真 hook，
+   *  CR 第五十一轮 major）。 */
+  const vitestNamespaces = new Set<string>()
   /**
    * 调度原语经**模块导入**改名（CR 第五十轮 major）：`import { setTimeout as later } from 'node:timers'`
    * 运行时就是同一个函数；旧判据只还原 `vitest` 的 hook 别名，timer 模块的别名整个漏掉（被测文件
@@ -1243,12 +1280,23 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
     } else if (ts.isNamespaceImport(nb)) {
       // 命名空间导入 `import * as tmr from 'node:timers'`：`tmr.setTimeout(…)` 是调度，但基座名
       // 是 `tmr`、不是 `globalThis` —— 记下来，判据匹配时剥掉这一段基座（见下方 `unhost`）。
-      schedulerNamespace = nb.name.text
+      schedulerNamespaces.add(nb.name.text)
     }
+  }
+  // vitest 的命名空间导入：与 `hookAlias` 同一收集手法，只认从 `vitest` 导入的
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || st.importClause?.namedBindings === undefined) continue
+    const from = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : ''
+    if (from !== 'vitest') continue
+    const nb = st.importClause.namedBindings
+    if (ts.isNamespaceImport(nb)) vitestNamespaces.add(nb.name.text)
   }
   const isHookName = (chain: string[] | undefined, call?: ts.CallExpression): boolean => {
     if (chain === undefined) return false
     let c = chain
+    // `import * as vt from 'vitest'; vt.beforeEach(…)` 同样是 hook 登记（CR 第五十一轮 major）：
+    // 链首是 vitest 命名空间导入时剥掉那一段。只认从 `vitest` 导入的名字。
+    if (c.length >= 2 && vitestNamespaces.has(c[0]!)) c = c.slice(1)
     // 链首名字若是 vitest hook 的命名导入别名，先还原成原名再判
     if (c.length > 0 && hookAlias.has(c[0]!)) c = [hookAlias.get(c[0]!)!, ...c.slice(1)]
     // `beforeEach.call(null, fn)` / `.apply(...)`：调用方式，末段剥掉
@@ -1430,7 +1478,7 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
         : innerName
       // `setTimeout(…)` 与 `globalThis.setTimeout(…)` 都是调度；反射（`globalThis['set'+'Timeout']`）
       // 与转调 helper 内部排调度仍看不出来（见上方边界注释）。
-      const unhost = resolved.length >= 2 && resolved[0] === schedulerNamespace ? resolved.slice(1) : resolved
+      const unhost = resolved.length >= 2 && schedulerNamespaces.has(resolved[0]!) ? resolved.slice(1) : resolved
       const bare = unhost.length === 2 && GLOBAL_HOSTS.has(unhost[0]!)
         ? [unhost[1]!]
         : unhost
@@ -1815,6 +1863,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // BinaryExpression 上、报 unknown —— 保守方向没错，但这个形态**能**静态求出。
     expect(concHits(`${bt("it('C5', { [('con', 'current')]: true }, () => {})")}`), '逗号表达式键取最右').toEqual([])
     expect(concHits(`${bt("it('C6', { [('x', 'con", "current')]: true }, () => {})")}`), '逗号表达式键取最右（命中并发）').toEqual(['opt'])
+    // 接入键（`it[(0, 'concurrent')]`）同样要按逗号表达式取最右（CR 第五十一轮 major）：
+    // 声明侧（选项对象的计算键）与本处必须同一条解析，否则「合法写法」绕过整条链扫描。
+    expect(concHits(`${bt('it[(0, ', JSON.stringify('concurrent'), ')]("C7", () => {})')}`), '逗号表达式接入键').toEqual(['alias:it.concurrent'])
     // 括号 / 断言包装不改变语义（Codex PR#81 第十轮）
     expect(concHits(`${bt("it('C2', { con", 'current: (true) }, () => {})')}`), '括号包装').toEqual(['opt'])
     // `sequential: false` 在套件上等价并发；`it` 上的同名键不算（不是套件选项）
@@ -2235,6 +2286,30 @@ it('Q34', oQ34, () => {})`),
       '解构声明遮蔽外层 rest 名').toEqual(['unknown'])
     expect(concHits(`function sh53(...args53) {\n  {\n    const { args53 } = { args53: [{ con${'current: true }'}, () => {}] }\n    it('S53', ...args53)\n  }\n}`),
       '对象解构声明同样遮蔽').toEqual(['unknown'])
+    // ⑦ 别名来自**解构默认值**（CR 第五十一轮 major）：`const [a = opts] = []` 的默认值
+    //    把 a 绑到 opts；初始化 `[]` 本身不含别名，旧收集整个跳过，随后写 `a.concurrent`
+    //    写穿 opts 却被当成无关变量。
+    expect(concHits(`const oG50 = { con${'current: false }'}\nconst [aG50 = oG50] = []\naG50.concurrent = true\nit('G50', oG50, () => {})`),
+      '解构默认值同样建立别名').toEqual(['unknown'])
+    // 反例：默认值引用的是**别的**对象 → 不建立指向 opts 的别名（初始化也没引用 opts）
+    expect(concHits(`const oG51 = { con${'current: false }'}\nconst otherG51 = {}\nconst [aG51 = otherG51] = []\naG51.concurrent = true\nit('G51', oG51, () => {})`),
+      '默认值不引用 opts → 不算别名').toEqual([])
+    // ⑧ **多个** timer 命名空间导入都要认（CR 第五十一轮 major）：旧实现只记最后一个，
+    //    经第一个命名空间发起的调度整个漏掉。
+    expect(concHits(`function unused() {}`), '占位（保持样本间互不影响）').toEqual([])
+    expect(hookHits(bt("import * as t1_56 from 'node:timers'\nimport * as t2_56 from 'node:timers/promises'\n", H, '(() => { t1_56.', ST, '(w, 80) })')),
+      '两个 timer 命名空间都保留').toEqual([`${ST}(`])
+    // ⑨ vitest 的**命名空间导入**同样是 hook 登记（CR 第五十一轮 major）：
+    //    `import * as vt from 'vitest'; vt.beforeEach(…)`。
+    expect(hookHits(bt("import * as vt57 from 'vitest'\nvt57.", H, '(() => { ', ST, '(w, 80) })')),
+      'vitest 命名空间导入的 hook').toEqual([`${ST}(`])
+    // 反例：别的模块的命名空间同名成员不是 hook
+    expect(hookHits(bt("import * as other58 from './my-helpers'\nother58.", H, '(() => { ', ST, '(w, 80) })')),
+      '非 vitest 命名空间的同名成员不算 hook').toEqual([])
+    // ⑩ 更近的**解构参数**同样遮蔽外层 rest（CR 第五十一轮 major）：`function inner({ args })`
+    //    里的 args 是内层参数，展开的是它，不是外层的 `...args`。
+    expect(concHits(`function outer54(...args54) {\n  function inner54({ args54 }: { args54: unknown[] }) {\n    it('S54', ...args54)\n  }\n}`),
+      '解构参数遮蔽外层 rest').toEqual(['unknown'])
     // 访问器被后写的数据属性覆盖 → 值确定（Codex 第二十五轮 P2）
     const g = bt('get con', 'current() { return true }')
     expect(concHits(bt("it('QA', { ...{ ", g, ' }, con', 'current: false }, () => {})')),
@@ -2307,6 +2382,15 @@ it('Q34', oQ34, () => {})`),
     '同文件里的第二条 concurrent 必须仍报').toHaveLength(1)
     expect(staleExemptions([{ rel: 'synthetic-exempt.ts', sf: parseTs(migratedSrc(concReg('K：改名后的用例'))) }],
       exemptOne), '登记过期必须被发现').toHaveLength(1)
+    // ⚠️ **豁免只覆盖「测试登记」的 `.concurrent` 那一条形态**（CR 第五十一轮 major）：
+    // 用 `describe.concurrent`（套件）或选项形式顶掉同名用例时，旧实现按标题把整条登记一并
+    // 豁免 —— 文件里多条用例仍会并发跑。豁免的语义是「这条证据」，不是「这个名字」。
+    expect(scanEntries([{ rel: 'synthetic-exempt.ts', sf: parseTs(migratedSrc(
+      bt('describe.con', 'current(', JSON.stringify(J_TITLE), ', () => {})'))) }], exemptOne),
+      '套件级 concurrent 不得被同名用例豁免').toHaveLength(1)
+    expect(scanEntries([{ rel: 'synthetic-exempt.ts', sf: parseTs(migratedSrc(
+      bt("it(", JSON.stringify(J_TITLE), ', { con', 'current: true }, () => {})'))) }], exemptOne),
+      '选项形式的并发不得被同名用例豁免').toHaveLength(1)
     expect(staleExemptions([{ rel: 'synthetic-exempt.ts', sf: parseTs(migratedSrc(concReg(J_TITLE))) }], exemptOne),
       '登记仍在时不得报过期').toEqual([])
     // 成员资格：文件形态对、但**不在扫描结果里**（不再迁移 / 不存在）同样是过期

@@ -330,8 +330,25 @@ async function storeGapOrPrimary(ctx: RunCtx, task: SyncTask, w: Range,
   try {
     await storeGap(ctx, task, w, reason, detail, gaps)
   } catch (e) {
-    if (isStoreRetired(e)) throw primary
-    throw e
+    if (!isStoreRetired(e)) throw e
+    // 主失败本身已让实例退役（它先退役、gap 写是次生）→ 原样交回主失败（它带着恢复指令）。
+    if (isStoreRetired(primary)) throw primary
+    // ⚠️ 否则是**补记缺口这次事务首次**让实例退役（COMMIT 结果未知，CR 第五十一轮 major #2）：
+    // 两条事实都必须交回 —— 只留主失败会静默丢掉「缺口记录可能没落库、实例已退役、后续窗口
+    // 写不进」；只留退役文案又丢掉主失败。合并成一条，`code`/`kind` 让编排层识别退役。
+    const primaryMsg = primary instanceof Error ? primary.message : String(primary)
+    const wrapped = new Error(`${primaryMsg} —— 补记缺口时实例退役（COMMIT 已下发但结果未确认：`
+      + '缺口记录可能没落库，后续窗口无法写入）', { cause: primary })
+    ;(wrapped as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
+    ;(wrapped as { retryable?: boolean }).retryable = false
+    ;(wrapped as { code?: string }).code = 'store_retired'
+    const eh = (e as { hint?: string }).hint
+    const ph = (primary as { hint?: string }).hint
+    const hints = [eh, ph].filter((h): h is string => typeof h === 'string')
+    ;(wrapped as { hint?: string }).hint = hints.length > 0
+      ? hints.join('；')
+      : '关闭并重建 Store 实例，先核对数据（本窗写入是否落库）再决定是否重放；后续窗口需要重跑'
+    throw wrapped
   }
 }
 
@@ -923,20 +940,22 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
  * 无行（如空范围空跑、或在 markPending 之前就抛错）时不动库 —— 不为清章凭空建一行。
  */
 async function releaseLock(ctx: RunCtx, task: SyncTask): Promise<void> {
+  // ⚠️ **读水位失败**才可能是主失败的次生结果（CR 第四十一轮 major；第五十一轮 major #5
+  // 细化）：本函数在 `finally` 里，若实例在进入这里**之前**就已退役，读水位的 store_retired
+  // 纯属次生 —— 吞掉，才能保住主失败里「核对数据后再决定是否重放」的恢复指令。
+  let st: WatermarkState
   try {
-    const st: WatermarkState = await readWatermark(ctx.store, task.id)
-    if (st.watermark === null && st.rangeStatus === null && st.lastSyncedAt === null) return
-    await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
-      await clearLock(tx, task.id, st)
-    }))
+    st = await readWatermark(ctx.store, task.id)
   } catch (e) {
-    // 连接已退役：读水位与清锁都发不出去，这是主失败的**次生**结果 —— 而本函数在
-    // `finally` 里，上抛会把主失败整个换掉：退役文案只说「关闭重建」，恰好丢掉主失败里
-    // 「核对数据后再决定是否重放」的恢复指令（CR 第四十一轮 major 的追问）。
-    // 只吞退役这一类；其它错误照旧上抛（那是清锁自己的真失败）。
     if (isStoreRetired(e)) return
     throw e
   }
+  // 读水位成功说明实例此前可用 —— 随后清锁事务里的 store_retired 是本函数**首次**让实例退役
+  //（COMMIT 结果未知），不是次生结果：必须上抛，否则本次 run 被报成 complete、写者锁可能没清。
+  if (st.watermark === null && st.rangeStatus === null && st.lastSyncedAt === null) return
+  await withStoreRetries(ctx, () => ctx.store.transaction(async (tx) => {
+    await clearLock(tx, task.id, st)
+  }))
 }
 
 /** snapshot 结果封装（windows.total 恒 1：快照是一次全量拉取，成功 1 / 失败 1）。 */

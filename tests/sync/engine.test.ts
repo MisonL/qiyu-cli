@@ -831,7 +831,8 @@ describe('整体早于接口下界的区间（CI 实测修正）', () => {
  */
 describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案）', () => {
   /** 关掉第 N 次 COMMIT 的结果交回（提交在驱动里已执行；N 从 init 之后的第一次提交数起）。 */
-  async function storeWithCommitFailureAt(n: number): Promise<{ store: Store; commits: () => number }> {
+  async function storeWithCommitFailureAt(n: number,
+    failWrite?: (sql: string) => boolean): Promise<{ store: Store; commits: () => number }> {
     const real = await import('@duckdb/node-api')
     let seen = 0
     // ⚠️ init 的迁移自己就会提交很多次（每个迁移一个事务）—— 计数必须在 init **之后**开，
@@ -859,6 +860,10 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
                 // 原型方法不在自有属性里，Store 的事务控制判据要用它 —— 显式转发。
                 extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  // 普通写入失败注入（与 COMMIT 回执注入可叠加：#2 的「窗口写失败 + 缺口提交未知」）
+                  if (failWrite !== undefined && sql !== 'COMMIT' && failWrite(sql)) {
+                    throw new Error('注入：窗口写入失败')
+                  }
                   const out = await cc.runAndReadAll(sql, params)
                   if (sql === 'COMMIT' && injectAt !== 0 && ++seen === injectAt) {
                     throw new Error('注入：COMMIT 已执行、结果交回失败')
@@ -972,6 +977,41 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
     expect(e!.message).not.toMatch(/Store 已退役/)
     expect(e!.hint).toMatch(/核对/)
+    await store.close()
+  })
+
+  it('windowed：数据窗已提交、清锁事务丢掉 COMMIT 回执 → 不得报 complete（CR 第五十一轮 major #5）', async () => {
+    // 成功路径的提交次数：#1 markPending、#2 数据窗、#3 清锁（releaseLock 的 clearLock 事务）。
+    // 清锁事务丢掉回执 = 它自己的 COMMIT 结果未知、当场退役 —— 这不是任何主失败的次生结果，
+    // 旧实现按「次生」吞掉并返回 complete：实例已退役、写者锁可能没清，却被报成全部成功。
+    const { store } = await storeWithCommitFailureAt(3)
+    const t = fakeTask({
+      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+    })
+    const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+    expect(e, '清锁事务的提交结果未知必须上抛，不能当 complete').not.toBeNull()
+    expect(e!.message).toMatch(/提交结果未知/)
+    expect(e!.hint, '恢复动作：先核对再决定是否重放').toMatch(/核对/)
+    await store.close()
+  })
+
+  it('windowed：窗口写普通失败 + 补记缺口的事务丢掉 COMMIT 回执 → 退役事实不得被吞（CR 第五十一轮 major #2）', async () => {
+    // 场景：窗口写入抛普通错误（回滚已确认、实例还活着），随后补记缺口的事务丢了 COMMIT 回执
+    //（**首次**让实例退役）。旧实现 `storeGapOrPrimary` 见 store_retired 就无条件交回 primary，
+    // 把「缺口记录可能没落库、实例已退役、后续窗口写不进」整段丢掉。
+    // 提交次数：markPending #1；窗口事务在 INSERT 处抛错、回滚不发 COMMIT；缺口事务的 COMMIT 是 #2。
+    const { store } = await storeWithCommitFailureAt(2,
+      (sql) => /INSERT INTO\s+"?tags"?/.test(sql))
+    const t = fakeTask({
+      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+    })
+    const e = await runTask(t, ctx(store)).then(() => null,
+      (x: unknown) => x as Error & { hint?: string; kind?: string; code?: string })
+    expect(e, '必须以错误收尾').not.toBeNull()
+    expect(e!.message, '原始窗口失败必须保留').toMatch(/注入：窗口写入失败/)
+    expect(e!.message, '补记缺口的提交未知 / 退役事实不得被吞').toMatch(/缺口|退役/)
+    expect(e!.code, '实例已退役：编排层据此识别').toBe('store_retired')
+    expect(e!.hint, '恢复动作仍要给出').toMatch(/核对/)
     await store.close()
   })
 
