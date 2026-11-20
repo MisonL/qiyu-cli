@@ -1152,6 +1152,68 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     }
   })
 
+  it('rotated：撞锁失败 + 回滚未确认 → 外层 isTransient 不得重试已退役的实例（CR 第六十轮 major）', async () => {
+    // 判据同 runTask 那条，但入口是 `runRotated`：它的 `commitWindow` 外面套的是**外层**
+    // `withRetries(…, isTransient)`。若 `isTransient` 只看 kind=store_locked，会再对已退役的
+    // 同一实例发起第二次尝试，主失败被「Store 已退役」换掉。两个入口各有一条回归，判据改名
+    // 或只改一处时两边都能红。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    let insertCalls = 0
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!armed) return cc.runAndReadAll(sql, params)
+                  if (/^INSERT INTO\s+"?tags"?/.test(sql)) {
+                    insertCalls++
+                    throw Object.assign(new Error('注入：写入撞锁'), { kind: 'store_locked', retryable: true })
+                  }
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+    armed = true
+    try {
+      const { runRotated } = await import('../../src/sync/engine.js')
+      let retryWaits = 0
+      const t = fakeTask({
+        reportDayRotation: true, maxWindowDays: 1,
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runRotated([t], ctx(store, { sleep: async () => { retryWaits++ } }))
+        .then(() => null, (x: unknown) => x as Error & { code?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '原始撞锁失败必须保留（不得被退役文案换掉）').toMatch(/注入：写入撞锁/)
+      expect(e!.message, '回滚未确认的事实也要在').toMatch(/回滚未能确认/)
+      expect(e!.code, '实例已退役').toBe('store_retired')
+      expect(retryWaits, '旋转入口的退役错误同样是终态 —— 一次重试等待都不许有').toBe(0)
+      expect(insertCalls, '退役后不得再次碰同一实例').toBe(1)
+    } finally {
+      await store.close()
+    }
+  })
+
   it('windowed：窗口写普通失败 + 补记缺口的事务丢掉 COMMIT 回执 → 退役事实不得被吞（CR 第五十一轮 major #2）', async () => {
     // 场景：窗口写入抛普通错误（回滚已确认、实例还活着），随后补记缺口的事务丢了 COMMIT 回执
     //（**首次**让实例退役）。旧实现 `storeGapOrPrimary` 见 store_retired 就无条件交回 primary，

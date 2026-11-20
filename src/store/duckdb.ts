@@ -720,8 +720,18 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     let p: { statementType: number; destroySync?: () => void }
     try {
       p = await ex.prepare(0)
-    } catch {
-      return   // 解析层就报错（Catalog/Binder）：交给派发路径给出与既往一致的归因
+    } catch (prepareFailure) {
+      // ⚠️ **类型无法判定时不得放行**（CR 第六十轮 major）：旧实现 `return` 装作分类成功，
+      // 驱动在派发里**再次解析并执行** —— 此时语句类型（TRANSACTION / EXPLAIN / 普通）
+      // 完全未知，无法证明它不含事务控制。代价如实记录：带事务关键字/多语句嫌疑、又恰好
+      // 绑不上表的 SQL（如 `SELECT … FROM missing -- END`）会从「表不存在」变成这条内部错误，
+      // 原生错误挂在 `cause` 上；不触发解析的普通 SQL 不受影响。
+      const err = new Error(`无法判定语句类型（${safeValueText(prepareFailure, 160)}）——`
+        + '为安全起见拒绝派发：拿不到语句类型就无法证明它不含事务控制语句')
+      ;(err as { kind?: string }).kind = 'internal'
+      ;(err as { hint?: string }).hint = '把多条语句拆成多次 query 调用；写入请放进 store.transaction() 的回调里'
+      ;(err as { cause?: unknown }).cause = prepareFailure
+      throw err
     }
     try {
       if (p.statementType === TRANSACTION) throw rawTxError()
@@ -1029,94 +1039,57 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    */
   type TxClose = 'confirmed' | 'unconfirmed' | 'none'
   /**
-   * 把「回滚未能确认」补进**交回给调用方的那个错误**（两个事务处理器的唯一落点）。
-   * 身份与 cause 不变（原错误原样透传是既有契约），只追加状态与恢复动作 ——
+   * 把「回滚未能确认」补进**交回给调用方的诊断**（两个事务处理器的唯一落点）。
    * 否则调用方的诊断与已确认回滚一字不差（CR 第四十二轮 major）。
-   * 边界如实记录：回调拒绝的不是 Error（字符串 / 对象）时无处挂 hint，原值原样交回；
-   * 「回滚未确认」这一事实此时仍由退役状态保证（本实例的后续语句全被拒）。
+   * ⚠️ **不再就地改写调用方的错误对象**（CR 第六十轮 major）：回滚状态是**这次事务尝试**的属性，
+   * 不是错误对象的属性 —— 同一个 Error 可能被回调跨 Store / 跨事务复用，在 A（回滚未确认、实例
+   * 退役）上补的 `code: 'store_retired'` 与「本实例已退役」文案会跟着对象出现在 B（回滚已确认、
+   * 实例仍可用）的诊断里，全是假话。现在**一律包一层**：原错误挂 `cause`（身份契约由 cause 承接），
+   * 状态字段只写在我们自己新建的普通 Error 上 —— 也顺带绕开了冻结 / getter+空 setter / revoked
+   * Proxy 这些「写外部对象会炸或静默丢」的陷阱（round 46–59 的加固因此变成结构性保证）。
    */
-  /** 自带成因级恢复动作的错误（COMMIT 结果未知）—— 不再追加通用回滚文案，免得两套指令打架。 */
+  /** 自带成因级恢复动作的错误（COMMIT 结果未知，本地新建）—— 不再追加通用回滚文案，免得两套指令打架。 */
   const selfDiagnosed = new WeakSet<object>()
   const annotateUnconfirmedRollback = <E>(e: E, state: TxClose): E => {
     if (state !== 'unconfirmed') return e
-    // ⚠️ **非 Error 的拒绝值也要带上状态**（CR 第四十八轮 major）：回调 `throw 'task failed'`
-    // 时，调用方拿到的字符串与「已确认回滚」一字不差 —— 而这里实例已经退役、写入状态不可信。
-    // 包一层 Error 并保留原值在 `cause`（身份契约只覆盖 Error；非 Error 无处挂字段）。
-    if (!isErrorValue(e)) {
-      const wrapped = new Error(`事务失败（回调拒绝了一个非 Error 值：${safeValueText(e, 120)}）`
-        + ' ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；'
-        + '该连接已退役，本实例上的写入结果不可信', { cause: e })
-      ;(wrapped as { kind?: string }).kind = 'internal'
-      ;(wrapped as { retryable?: boolean }).retryable = false
-      ;(wrapped as { code?: string }).code = 'store_retired'
-      ;(wrapped as { hint?: string }).hint = '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）'
-        + '再决定是否重放；本实例上的后续语句都会被拒'
-      return wrapped as unknown as E
-    }
-    if (selfDiagnosed.has(e)) return e
+    // COMMIT 结果未知的错误是本地新建的对象，不存在跨实例复用；它已按成因给过恢复动作。
+    if (isErrorValue(e) && selfDiagnosed.has(e)) return e
     const note = ' ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；'
       + '该连接已退役，本实例上的写入结果不可信'
-    // ⚠️ **冻结 / 只读的错误对象不能再赋值**（CR 第四十六轮 major，探针 2026-11-20）：
-    // `Object.freeze(new Error(…))` 上写 `message` 会抛 TypeError —— 调用方拿到的既不是原错误、
-    // 也不是带恢复动作的诊断，而是 TypeError（原失败与回放指令一起丢光）。此时改为包一层
-    // 新错误（`cause` 保留原对象），身份契约让位于「不能把主失败弄丢」。
     const hint = '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）'
       + '再决定是否重放；本实例上的后续语句都会被拒'
-    // ⚠️ **整个标注过程都可能失败**（CR 第四十七轮 major）：`message` 可写而 `code` 只读的
-    // 对象上，第一步成功、第二步抛 TypeError —— 同样把主失败弄丢。读写全部放进同一个 try，
-    // 任何一步失败都换成包层（`cause` 保留原对象）。
-    try {
-      const prev = (e as { hint?: string }).hint
-      // 原 kind 先读出来（读也可能抛 → 进 catch 走包层）。
-      const prevKind = (e as { kind?: string }).kind
-      const expectedKind = prevKind ?? 'internal'
-      const expectedHint = prev === undefined
-        ? hint
-        : `${hint}；原错误的建议（核对之后才可执行）：${prev}`
-      e.message = `${e.message}${note}`
-      // ⚠️ **无 kind 的错误必须补 `internal`**（CR 第四十八轮 major，探针实测）：`store init`
-      // 的迁移抛 plain Error 时，`thrownToExit` 走「无 kind」分支、把这条 hint 换成通用的
-      // 「执行期错误」—— 恢复动作（核对后再重放）在下游被丢掉。
-      ;(e as { kind?: string }).kind = expectedKind
-      ;(e as { retryable?: boolean }).retryable = false
-      ;(e as { code?: string }).code = 'store_retired'
-      // ⚠️ **「写进去了」不等于「读得到」**（CR 第五十七/五十八轮 major）：这些字段可以是
-      // getter + 空 setter —— 赋值不抛、也没写进去。**三个关键字段逐项回读**：任一不符就走
-      // 下面同一个包层（原对象挂 cause），否则调用方按 `code`/`kind`/`hint` 分流的判据
-      // 会整套落空（看不到退役信号、命令出口把核对动作换成通用文案、或只剩「稍后重试」）。
-      // ⚠️ 原 hint 与「先核对」冲突时**核对必须在前**（CR 第五十七轮 major）：两条一起交给
-      // Agent 时，先出现的「稍后重试」会被照做，而写入状态此时不可信 —— 原建议标注为
-      // 「核对之后才可执行」。回滚已确认的路径一字不动（本函数只在 unconfirmed 进来）。
-      ;(e as { hint?: string }).hint = expectedHint
-      const taggedCode: unknown = (e as { code?: string }).code
-      const taggedKind: unknown = (e as { kind?: string }).kind
-      const taggedHint: unknown = (e as { hint?: string }).hint
-      // ⚠️ `retryable` 同样回读（CR 第五十九轮 major）：空 setter 上赋值不生效时，调用方会同时
-      // 读到「可重试」与「先核对再重放」两条互相矛盾的指令。
-      const taggedRetryable: unknown = (e as { retryable?: boolean }).retryable
-      if (taggedCode !== 'store_retired' || taggedKind !== expectedKind || taggedHint !== expectedHint
-        || taggedRetryable !== false) {
-        throw new Error('回溯状态未能完整落盘（code / kind / hint 写入被静默丢弃）')
-      }
-      return e
-    } catch {
-      // ⚠️ **包层本身必须构造得出来**（CR 第五十二轮 major）：`message` 可能是抛异常的访问器 ——
-      // 第一段 try 正是因此失败，catch 里再读 `e.message` 会第二次抛、把原值换成 TypeError。
-      const readable = ((): string => {
-        try { return String((e as { message?: unknown }).message) } catch { return '(无法读取的错误消息)' }
-      })()
-      const wrapped = new Error(`${readable}${note}`, { cause: e })
-      // ⚠️ **catch 里再读 kind 也可能抛**（CR 第五十四轮 major）：访问器/proxy 上读写都会炸，
-      // 读失败只能按「无 kind」补 internal。
-      const readableKind = ((): string | undefined => {
-        try { return (e as { kind?: string }).kind } catch { return undefined }
-      })()
-      ;(wrapped as { kind?: string }).kind = readableKind ?? 'internal'
-      ;(wrapped as { retryable?: boolean }).retryable = false
-      ;(wrapped as { code?: string }).code = 'store_retired'
-      ;(wrapped as { hint?: string }).hint = hint
-      return wrapped as unknown as E
-    }
+    // 原 message / kind / hint 的读取都可能抛（访问器 / revoked Proxy）：一律读不到就退化。
+    const isErr = isErrorValue(e)
+    const readable = ((): string => {
+      try {
+        if (isErr) return String((e as { message?: unknown }).message)
+        // 非 Error 的拒绝值（字符串 / 对象）也要带上状态（CR 第四十八轮 major）：调用方拿到的
+        // 不能与「已确认回滚」一字不差；原值挂在 cause 上。
+        return `事务失败（回调拒绝了一个非 Error 值：${safeValueText(e, 120)}）`
+      } catch { return '(无法读取的错误消息)' }
+    })()
+    const prevKind = isErr
+      ? ((): string | undefined => {
+          try { return (e as { kind?: string }).kind } catch { return undefined }
+        })()
+      : undefined
+    const prevHint = isErr
+      ? ((): string | undefined => {
+          try { return (e as { hint?: string }).hint } catch { return undefined }
+        })()
+      : undefined
+    const wrapped = new Error(`${readable}${note}`, { cause: e })
+    // 无 kind 的错误必须补 `internal`（CR 第四十八轮 major）：`store init` 的迁移抛 plain Error 时，
+    // `thrownToExit` 走「无 kind」分支、把这条 hint 换成通用的「执行期错误」。
+    ;(wrapped as { kind?: string }).kind = prevKind ?? 'internal'
+    ;(wrapped as { retryable?: boolean }).retryable = false
+    ;(wrapped as { code?: string }).code = 'store_retired'
+    // 原 hint 与「先核对」冲突时**核对必须在前**（CR 第五十七轮 major）：两条一起交给 Agent 时，
+    // 先出现的「稍后重试」会被照做，而写入状态此时不可信 —— 原建议标注为「核对之后才可执行」。
+    ;(wrapped as { hint?: string }).hint = prevHint === undefined
+      ? hint
+      : `${hint}；原错误的建议（核对之后才可执行）：${prevHint}`
+    return wrapped as unknown as E
   }
   /**
    * 在令牌上下文里收尾：退役令牌 → 等在途语句落定 → ROLLBACK。返回收尾状态（三态，见
@@ -1175,6 +1148,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       if (!(await awaitSettled(ROLLBACK_CAP_MS))) {
         try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 中断失败照旧走退役路径 */ }
         if (!(await awaitSettled(DRAIN_INTERRUPT_GRACE_MS))) {
+          // ⚠️ **放弃前再补一发中断**（CR 第六十轮 major）：驱动把 ROLLBACK 拆成「准备」与
+          // 「执行」两段，第一次 interrupt 若落在准备阶段之前，会被随后的准备清掉 —— 之后它
+          // 照样进入原生执行，而我们这边已经放弃并退役（连 close 都解不了卡）。此时已经不再
+          // 等它交回（结论已经是「未能确认」），补发的目的只是别把原生线程留在里面。
+          try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 同上 */ }
           // 中断之后仍不交回：卡在不可中断的原生点上（连 close 都不能让进程退出）。
           poison(`ROLLBACK 在 ${ROLLBACK_CAP_MS}ms 内未返回，中断后 ${DRAIN_INTERRUPT_GRACE_MS}ms 内仍未交回：事务也许仍然开着`)
           beganTx.delete(token)
