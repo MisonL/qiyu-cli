@@ -57,10 +57,18 @@ export interface DuckDbDeps {
   txStateProbe?: (snapshot: Record<'brokenTx' | 'beganTx' | 'txInFlight' | 'txWrites' | 'drainWaiters', number>) => void
 }
 
+/**
+ * `e instanceof Error` 的安全形态（CR 第五十六轮 major）：**已撤销的 Proxy** 上 `instanceof`
+ * 会抛 TypeError（HasInstance 走 [[GetPrototypeOf]]）—— 错误路径上的类型判据不得自己成为新的
+ * 主失败。撤销后的 Proxy 一律当「非 Error」，原值仍挂在 `cause`。
+ */
+function isErrorValue(e: unknown): e is Error {
+  try { return e instanceof Error } catch { return false }
+}
 /** 依赖缺失 → store_not_initialized（按缺失 specifier 前缀二分 hint，spec §5.1）。 */
 function depError(e: unknown): Error {
   const mn = isModuleNotFound(e)
-  const err = new Error(`无法加载 DuckDB 依赖：${e instanceof Error ? e.message : String(e)}`)
+  const err = new Error(`无法加载 DuckDB 依赖：${isErrorValue(e) ? e.message : safeValueText(e, 400)}`)
   ;(err as { kind?: string }).kind = 'store_not_initialized'
   ;(err as { hint?: string }).hint = mn && mn.missing.startsWith('@duckdb/node-bindings')
     ? '当前平台无 DuckDB 预编译包（无 node-gyp 回退）。请在受支持的平台上安装 @duckdb/node-api@1.5.6-r.1'
@@ -83,7 +91,7 @@ function safeValueText(v: unknown, max: number): string {
  */
 function safeMessageText(v: unknown, max: number): string {
   try {
-    return String(v instanceof Error ? v.message : v).slice(0, max)
+    return String(isErrorValue(v) ? v.message : v).slice(0, max)
   } catch {
     return `（无法转成文本的拒绝值，typeof=${typeof v}）`
   }
@@ -1021,7 +1029,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // ⚠️ **非 Error 的拒绝值也要带上状态**（CR 第四十八轮 major）：回调 `throw 'task failed'`
     // 时，调用方拿到的字符串与「已确认回滚」一字不差 —— 而这里实例已经退役、写入状态不可信。
     // 包一层 Error 并保留原值在 `cause`（身份契约只覆盖 Error；非 Error 无处挂字段）。
-    if (!(e instanceof Error)) {
+    if (!isErrorValue(e)) {
       const wrapped = new Error(`事务失败（回调拒绝了一个非 Error 值：${safeValueText(e, 120)}）`
         + ' ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；'
         + '该连接已退役，本实例上的写入结果不可信', { cause: e })

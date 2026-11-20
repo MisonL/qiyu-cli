@@ -2511,6 +2511,51 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('回调抛出已撤销的 Proxy + 回滚未确认 → 原值仍挂在 cause，恢复动作照常给出（CR 第五十六轮 major）', { timeout: 90_000 }, async () => {
+    // `e instanceof Error` 在已撤销的 Proxy 上会抛 TypeError（HasInstance 走 [[GetPrototypeOf]]）——
+    // 错误路径上的类型判据自己成了新的主失败，原拒绝值与「先核对再重放」一起丢光。
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    const rev = Proxy.revocable({}, {})
+    const proxy = rev.proxy
+    rev.revoke()
+    const e = await s.transaction(async () => { throw proxy })
+      .then(() => null, (x: unknown) => x as Error & { cause?: unknown; code?: string; hint?: string })
+    expect(e, '必须是可读的 Error，不得是 instanceof 抛出的 TypeError').toBeInstanceOf(Error)
+    expect(e!.cause, '原拒绝值必须挂在 cause 上').toBe(proxy)
+    expect(e!.message, '必须带回退役状态与恢复动作').toMatch(/回滚未能确认/)
+    expect(e!.code, '实例已退役').toBe('store_retired')
+    expect(e!.hint).toMatch(/核对/)
+    await s.close()
+  })
+
   it('错误对象的 message 读取本身会抛 → 补话包层必须能构造出来（CR 第五十二轮 major）', { timeout: 90_000 }, async () => {
     // 探针形态：`message` 是抛异常的访问器 —— 第一段 try 的赋值失败后，catch 里再读
     // `e.message` 拼包层又会抛，调用方拿到的是那个 TypeError，原值与恢复动作一起丢光。
