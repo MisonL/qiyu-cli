@@ -1061,7 +1061,18 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       ;(e as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
       ;(e as { retryable?: boolean }).retryable = false
       ;(e as { code?: string }).code = 'store_retired'
-      ;(e as { hint?: string }).hint = prev === undefined ? hint : `${prev} ${hint}`
+      // ⚠️ **「写进去了」不等于「读得到」**（CR 第五十七轮 major）：`code` 可以有 getter +
+      // 空 setter —— 赋值不抛、也没写进去；直接返回会让调用方读不到退役信号。赋值后回读
+      // 验证，不符就走下面同一个包层（原对象挂 cause）。
+      // ⚠️ 原 hint 与「先核对」冲突时**核对必须在前**（CR 第五十七轮 major）：两条一起交给
+      // Agent 时，先出现的「稍后重试」会被照做，而写入状态此时不可信 —— 原建议标注为
+      // 「核对之后才可执行」。回滚已确认的路径一字不动（本函数只在 unconfirmed 进来）。
+      ;(e as { hint?: string }).hint = prev === undefined
+        ? hint
+        : `${hint}；原错误的建议（核对之后才可执行）：${prev}`
+      let tagged: string | undefined
+      tagged = (e as { code?: string }).code
+      if (tagged !== 'store_retired') throw new Error('store_retired 标记未能落盘')
       return e
     } catch {
       // ⚠️ **包层本身必须构造得出来**（CR 第五十二轮 major）：`message` 可能是抛异常的访问器 ——

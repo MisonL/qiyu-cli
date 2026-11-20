@@ -294,7 +294,14 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       }
       if (!refersToAlias(e)) return
       if (ts.isIdentifier(u)) { found.push(u.text); return }
-      if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) return
+      // ⚠️ **经容器属性读出的值可能是同一对象**（CR 第五十七轮 major）：`const box = { opts };
+      // const alias = box.opts` 里 alias === opts（box 的初始化已把 opts 收进别名集）。静态上
+      // 求不出「那个属性装的是不是 opts 本身」，按基座身份保守收（多报只会让判据更严）。
+      if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
+        const base = unwrap(u.expression)
+        if (ts.isIdentifier(base) && aliases.has(base.text)) found.push(base.text)
+        return
+      }
       if (ts.isBinaryExpression(u)) {
         const k = u.operatorToken.kind
         if (k === ts.SyntaxKind.CommaToken) { walk(u.right); return }
@@ -1476,6 +1483,25 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
    * 登记子树只有标识符，setup 体内的调度原语看不见。只在定义唯一时下钻 —— 同名多处
    * （遮蔽/重名）无法静态断言是哪一份，保持「看不见就不报」的保守口径（边界如实记录）。
    */
+  /**
+   * 文件内被**重新赋值**过的名字（CR 第五十七轮 major）：`let setup = () => {}; setup = () => {
+   * setTimeout(...) }; beforeEach(setup)` —— 只走原始空箭头会把尾巴漏掉。命中即报告
+   * 「无法静态确认其调度」（不静默放过，也不猜是哪一份）。
+   */
+  const reassignedNames = new Set<string>()
+  {
+    const collectAssign = (n: ts.Node): void => {
+      if (ts.isBinaryExpression(n)) {
+        const k = n.operatorToken.kind
+        if (k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment) {
+          const left = unwrap(n.left)
+          if (ts.isIdentifier(left)) reassignedNames.add(left.text)
+        }
+      }
+      ts.forEachChild(n, collectAssign)
+    }
+    collectAssign(sf)
+  }
   const sameFileFunction = (name: string): ts.FunctionLikeDeclaration | undefined => {
     const hits: ts.FunctionLikeDeclaration[] = []
     const visit = (n: ts.Node): void => {
@@ -1499,6 +1525,12 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
     for (const arg of call.arguments) {
       const u = unwrap(arg)
       if (!ts.isIdentifier(u)) continue
+      if (reassignedNames.has(u.text)) {
+        const reason = `hook 回调 ${u.text} 在文件内被重新赋值，无法静态确认其调度`
+        const key = `${lineOf(sf, u)}:${reason}`
+        if (!outSeen.has(key)) { outSeen.add(key); out.push({ line: lineOf(sf, u), why: reason }) }
+        continue
+      }
       const fn = sameFileFunction(u.text)
       if (fn !== undefined) roots.push(fn)
     }
@@ -2443,6 +2475,16 @@ it('Q34', oQ34, () => {})`),
     // 反例：同文件里定义了、但没交给 hook —— 不报
     expect(hookHits(bt('function notSetupH85() { ', ST, '(w, 80) }\n', H, '(() => {})')),
       '没被登记的函数不扫').toEqual([])
+    // ⑱ **登记前被重新赋值**（CR 第五十七轮 major）：`let setup = () => {}` 之后换成调度回调 ——
+    //    只走原始空箭头会把尾巴漏掉。无法静态确认时响亮报告（不是静默放过）。
+    {
+      const hits = hookHits(bt('let setupH87 = () => {}\nsetupH87 = () => { ', ST, '(w, 80) }\n', H, '(setupH87)'))
+      expect(hits.length, '被重新赋值的回调必须报告一次').toBe(1)
+      expect(hits[0], '点名「重新赋值」').toMatch(/重新赋值/)
+    }
+    // 未被重新赋值的 let 仍可解析（不因噎废食）
+    expect(hookHits(bt('let setupH88 = () => { ', ST, '(w, 80) }\n', H, '(setupH88)')),
+      '未重新赋值的 let 照常下钻').toEqual([`${ST}(`])
     // 边界如实记录：同名多处时无法静态断言是哪一份，保持「看不见就不报」
     expect(hookHits(bt('function setupH86() { ', ST, '(w, 80) }\nfunction setupH86() {}\n', H, '(setupH86)')),
       '同名多处无法静态断言 → 保守不报（已记录边界）').toEqual([])
@@ -2484,6 +2526,13 @@ it('Q34', oQ34, () => {})`),
     // 反例：循环只读 → 不改变选项，仍按原值判
     expect(concHits(`const oF61 = { con${'current: false }'}\nfor (const itemF61 of [oF61]) { console.log(itemF61) }\nit('F61', oF61, () => {})`),
       '只读循环不建立写穿').toEqual([])
+    // ⑰ **经容器属性读出的对象还是同一个身份**（CR 第五十七轮 major）：`const box = { opts:
+    //    oP70 }; const alias = box.opts` 里 alias === oP70。
+    expect(concHits(`const oP70 = { con${'current: false }'}\nconst boxP70 = { opts: oP70 }\nconst aliasP70 = boxP70.opts\naliasP70.concurrent = true\nit('P70', oP70, () => {})`),
+      '经容器属性读出的对象仍是别名').toEqual(['unknown'])
+    // 反例：容器本身不是选项别名 → 属性读出不建立联系
+    expect(concHits(`const oP71 = { con${'current: false }'}\nconst boxP71 = { other: 1 }\nconst aliasP71 = boxP71.other\naliasP71.concurrent = true\nit('P71', oP71, () => {})`),
+      '无关容器的属性不是别名').toEqual([])
     // 边界如实记录：遍历的是**数组本身**（`of oF62`），元素身份未知 —— 保守不认
     expect(concHits(`const oF62 = { con${'current: false }'}\nfor (const itemF62 of oF62) { itemF62.concurrent = true }\nit('F62', oF62, () => {})`),
       '遍历数组本身时元素身份未知 → 保守不报（已记录边界）').toEqual([])
