@@ -124,13 +124,26 @@ function resolveRangeStart(task: SyncTask, ctx: RunCtx, state: WatermarkState,
 }
 
 /**
+ * 任意拒绝值 → 文本；**转换本身抛**（`Object.create(null)` 没有 `Symbol.toPrimitive`）时交回
+ * 占位说明（CR 第五十四轮 store 侧同一形态的引擎收口）。错误路径上的「值转文本」不得自己
+ * 成为新的主失败 —— 否则本次运行连 partial / gap 都报不出来。
+ */
+function textOf(e: unknown): string {
+  try {
+    return e instanceof Error ? e.message : String(e)
+  } catch {
+    return `（无法转成文本的拒绝值，typeof=${typeof e}）`
+  }
+}
+
+/**
  * gap detail 的中文包装（C 低-2）：gap 要进 stdout 与持久层（sync_gaps），
  * 而失败原因可能是任意来源 —— `fetch failed`、DuckDB 的英文原文、上游报文片段。
  * 沿 store 层 thrownToExit 的形态：中文前缀说明「这是什么失败」，底层原文照附。
  * ⚠️ 引擎自己抛的中文结论（配对核对/本地限频）不包装 —— 再套一层只会变噪音。
  */
 function failDetail(label: string, e: unknown): string {
-  const raw = e instanceof Error ? e.message : String(e)
+  const raw = textOf(e)
   return `${label}（底层：${raw}）`
 }
 
@@ -145,7 +158,7 @@ function fetchGapReason(e: unknown): 'fetch_failed' | 'rate_limit_local' {
 
 function fetchGapDetail(e: unknown): string {
   return fetchGapReason(e) === 'rate_limit_local'
-    ? (e instanceof Error ? e.message : String(e))
+    ? textOf(e)
     : failDetail('取数失败', e)
 }
 
@@ -167,7 +180,7 @@ function isNotAnTableError(raw: string): boolean {
  * 不回显 DuckDB 原文里被操作的对象名（那是用户自己的表名，不是故障点；原文对 Agent 无益）。
  */
 function writeFailedDetail(e: unknown, ctx: { storeLocation?: { db: string; profileFlag?: string } }): string {
-  const raw = e instanceof Error ? e.message : String(e)
+  const raw = textOf(e)
   if (!isNotAnTableError(raw)) return failDetail('落库失败', e)
   const loc = ctx.storeLocation
   const rebuild = loc === undefined
@@ -336,9 +349,12 @@ async function storeGapOrPrimary(ctx: RunCtx, task: SyncTask, w: Range,
     // ⚠️ 否则是**补记缺口这次事务首次**让实例退役（COMMIT 结果未知，CR 第五十一轮 major #2）：
     // 两条事实都必须交回 —— 只留主失败会静默丢掉「缺口记录可能没落库、实例已退役、后续窗口
     // 写不进」；只留退役文案又丢掉主失败。合并成一条，`code`/`kind` 让编排层识别退役。
-    const primaryMsg = primary instanceof Error ? primary.message : String(primary)
-    const wrapped = new Error(`${primaryMsg} —— 补记缺口时实例退役（COMMIT 已下发但结果未确认：`
-      + '缺口记录可能没落库，后续窗口无法写入）', { cause: primary })
+    const primaryMsg = textOf(primary)
+    // ⚠️ **不得断言 COMMIT 已下发**（Codex 第五轮 P1，隔离探针实测）：补记缺口的事务也可能
+    // 在 INSERT 阶段就失败、ROLLBACK 又未确认（SQL 序列里根本没有 COMMIT）—— 摘要必须用
+    // 那条错误**自己的**成因（提交结果未知 / 回滚未能确认），否则恢复动作被误导。
+    const gapMsg = textOf(e)
+    const wrapped = new Error(`${primaryMsg} —— 补记缺口时实例退役（${gapMsg}）`, { cause: primary })
     ;(wrapped as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
     ;(wrapped as { retryable?: boolean }).retryable = false
     ;(wrapped as { code?: string }).code = 'store_retired'

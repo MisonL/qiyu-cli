@@ -68,6 +68,15 @@ function depError(e: unknown): Error {
   return err
 }
 
+/** 把任意拒绝值转成**截断的**文本；转换本身抛（无原型对象等）时交回占位说明。
+ *  错误路径上的所有「值转文本」都走它 —— 补话/诊断不得自己成为新的主失败。 */
+function safeValueText(v: unknown, max: number): string {
+  try {
+    return String(v).slice(0, max)
+  } catch {
+    return `（无法转成文本的拒绝值，typeof=${typeof v}）`
+  }
+}
 /** usage 错误（退出码 2）：带 kind 供命令层经 thrownToExit 归 usageFail 双通道。 */
 function usage(msg: string): Error {
   const e = new Error(msg)
@@ -389,7 +398,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   /** 等待计数归零；超过 deadline 返回 false。 */
   const waitDrained = async (token: TxToken, deadline: number): Promise<boolean> => {
     while ((txInFlight.get(token) ?? 0) > 0) {
-      const left = deadline - Date.now()
+      // ⚠️ **用单调时钟**（CR 第五十四轮 major）：`Date.now()` 会被系统时钟调整（NTP 步进）
+      // 往回/往前跳，让 5s 的收尾预算提前或延后；`performance.now()` 单调，只随真实流逝走。
+      const left = deadline - performance.now()
       if (left <= 0) return false
       await new Promise<void>((resolve) => {
         const waiters = drainWaiters.get(token) ?? []
@@ -411,12 +422,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     return true
   }
   const drainOwned = async (token: TxToken): Promise<boolean> => {
-    if (await waitDrained(token, Date.now() + DRAIN_CAP_MS)) return true
+    if (await waitDrained(token, performance.now() + DRAIN_CAP_MS)) return true
     // 语句在原生执行里卡着：中断是唯一不靠 kill 的出路（见上方实测）。
     // ⚠️ 这里只可能中断到**本事务的**语句：事务开着期间，别的异步链的语句在
     // `assertTxOwnership` 就被拒、根本进不了驱动（`foreignInFlight` 必为 0）。
     try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 中断失败照旧走退役路径 */ }
-    if (await waitDrained(token, Date.now() + DRAIN_INTERRUPT_GRACE_MS)) return true
+    if (await waitDrained(token, performance.now() + DRAIN_INTERRUPT_GRACE_MS)) return true
     // ⚠️ **放弃前再中断一次**（CR 第四十三轮 major 的追问）：驱动在准备/初始化阶段会清掉
     // 中断标志，一次 interrupt 可能落在「这条语句还没进入原生执行」的时刻 —— 之后它照样
     // 开始跑，而我们这一侧已经给不出结论。此时已经退役令牌，剩余在途全是**本事务的**语句，
@@ -779,10 +790,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       if (!txControl && !closed && poisoned === undefined
         && inTx && txToken !== undefined && ctxToken === txToken && await txInvalidated()) {
         brokenTx.set(txToken, `本事务内的一条语句执行期报错，DuckDB 已把整条事务标成 aborted`
-          + `（驱动原文：${(e instanceof Error ? e.message : String(e)).slice(0, 160)}）`)
+          + `（驱动原文：${e instanceof Error ? safeValueText(e.message, 160) : safeValueText(e, 160)}）`)
       }
       if (txEpoch !== epochBefore && txToken !== undefined) {
-        brokenTx.set(txToken, `外部语句执行期报错，且期间另一条链开启了事务（驱动原文：${(e instanceof Error ? e.message : String(e)).slice(0, 160)}）`)
+        brokenTx.set(txToken, '外部语句执行期报错，且期间另一条链开启了事务'
+          + `（驱动原文：${e instanceof Error ? safeValueText(e.message, 160) : safeValueText(e, 160)}）`)
       }
       if (txEpoch !== epochBefore) {
         throw epochChangedError(e)
@@ -982,24 +994,13 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    */
   /** 自带成因级恢复动作的错误（COMMIT 结果未知）—— 不再追加通用回滚文案，免得两套指令打架。 */
   const selfDiagnosed = new WeakSet<object>()
-  // ⚠️ **拒绝值连文本都可能转不出来**（CR 第五十轮 major，探针 2026-11-20）：
-  // `String(Object.create(null))` 抛 `TypeError: Cannot convert object to primitive value`
-  // （无原型对象没有 `Symbol.toPrimitive`/`toString`/`valueOf`）。若在拼 message 时直接 `String(e)`，
-  // 补话动作本身炸掉 —— 调用方拿到的是那个 TypeError，原拒绝值与「先核对再重放」一起丢光。
-  const safeText = (v: unknown, max: number): string => {
-    try {
-      return String(v).slice(0, max)
-    } catch {
-      return `（无法转成文本的拒绝值，typeof=${typeof v}）`
-    }
-  }
   const annotateUnconfirmedRollback = <E>(e: E, state: TxClose): E => {
     if (state !== 'unconfirmed') return e
     // ⚠️ **非 Error 的拒绝值也要带上状态**（CR 第四十八轮 major）：回调 `throw 'task failed'`
     // 时，调用方拿到的字符串与「已确认回滚」一字不差 —— 而这里实例已经退役、写入状态不可信。
     // 包一层 Error 并保留原值在 `cause`（身份契约只覆盖 Error；非 Error 无处挂字段）。
     if (!(e instanceof Error)) {
-      const wrapped = new Error(`事务失败（回调拒绝了一个非 Error 值：${safeText(e, 120)}）`
+      const wrapped = new Error(`事务失败（回调拒绝了一个非 Error 值：${safeValueText(e, 120)}）`
         + ' ——（事务收尾）回滚未能确认：ROLLBACK 可能根本没有执行，该事务也许仍然开着；'
         + '该连接已退役，本实例上的写入结果不可信', { cause: e })
       ;(wrapped as { kind?: string }).kind = 'internal'
@@ -1039,7 +1040,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         try { return String((e as { message?: unknown }).message) } catch { return '(无法读取的错误消息)' }
       })()
       const wrapped = new Error(`${readable}${note}`, { cause: e })
-      ;(wrapped as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
+      // ⚠️ **catch 里再读 kind 也可能抛**（CR 第五十四轮 major）：访问器/proxy 上读写都会炸，
+      // 读失败只能按「无 kind」补 internal。
+      const readableKind = ((): string | undefined => {
+        try { return (e as { kind?: string }).kind } catch { return undefined }
+      })()
+      ;(wrapped as { kind?: string }).kind = readableKind ?? 'internal'
       ;(wrapped as { retryable?: boolean }).retryable = false
       ;(wrapped as { code?: string }).code = 'store_retired'
       ;(wrapped as { hint?: string }).hint = hint

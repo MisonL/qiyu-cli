@@ -590,6 +590,22 @@ describe('失败窗有界重试（B 中-3）', () => {
     await store.close()
   })
 
+  it('fetch 抛出的拒绝值连文本都转不出 → 仍按 fetch_failed 记 gap，转换异常不得顶掉本次运行', async () => {
+    // 同类缺陷的引擎侧（CR 第五十四轮 store 修的同一个形态）：`e instanceof Error ? e.message
+    // : String(e)` 在 `Object.create(null)` 上会抛 TypeError —— 错误路径的转换自己成了新的
+    // 主失败，本次运行连 partial 都报不出来。引擎的五处转文本必须与 store 同口径。
+    const store = await fresh()
+    try {
+      const t = fakeTask({ fetch: async () => { throw Object.create(null) } })
+      const r = await runTask(t, ctx(store, { sleep: async () => {} }))
+      expect(r.status).toBe('partial')
+      expect(r.gaps.map((g) => g.reason)).toEqual(['fetch_failed'])
+      expect(r.gaps[0]!.detail, '失败说明要有占位文本，而不是抛出去').toMatch(/无法转成文本/)
+    } finally {
+      await store.close()
+    }
+  })
+
   it('限频（kind=rate_limit）也不进引擎重试预算（callPaced 自己的等待预算管冷却）', async () => {
     const store = await fresh()
     let calls = 0
@@ -887,31 +903,34 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     // kind 断言见用例中部：命令出口靠它透传 hint
     // markPending 的提交是第 1 次；数据窗的提交是第 2 次。
     const { store } = await storeWithCommitFailureAt(2)
-    const t = fakeTask({
-      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
-    })
-    const e = await runTask(t, ctx(store)).then(() => null,
-      (x: unknown) => x as Error & { hint?: string; kind?: string })
-    expect(e, '提交结果未知必须上抛（不能当成 partial 成功）').not.toBeNull()
-    expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
-    expect(e!.message).not.toMatch(/Store 已退役/)
-    expect(e!.hint, '恢复动作：核对后再决定是否重放').toMatch(/核对/)
-    expect(e!.hint).toMatch(/重放/)
-    // ⚠️ **kind 必须在场**（CR 第五十轮 major #3 的收口）：命令出口 `thrownToExit` 只在
-    // `err.kind` 存在时透传 `err.hint`，否则换成通用「执行期错误」文案 —— hint 在 engine 层
-    // 保住了、到了命令边界照样可能被换掉。命令出口是同一个函数（`sync-run.ts` 与 `store.ts`
-    // 共用 `thrownToExit`），这里钉住进入出口的形状，两个命令族同时被守住。
-    expect(e!.kind, '无 kind 的错误在命令出口会被换成通用 hint —— 必须带 kind 出门').toBe('internal')
-    // ⚠️ 回滚收尾的补注**不得**嫁接到这条诊断上（CR 第四十二轮 major 的追问，真驱动探针
-    // 2026-11-20 实测过嫁接形态）：COMMIT 已下发、写入可能已落库，此时再说「回滚可能根本没
-    // 执行、写入结果不可信」只是把恢复动作稀释成两套互相打架的指令。核对→再决定重放才是
-    // 这条成因的指引，且它必须原样到达 Agent。
-    expect(e!.message, '不得追加通用回滚补注').not.toMatch(/回滚未能确认/)
-    expect(e!.hint, '不得追加通用回滚补注').not.toMatch(/写入结果不可信/)
-    // ⚠️ **注入的确实是「数据窗」那次提交**（CR 第四十六轮 major 的追问）：重开库核对 ——
-    // 若第 2 次 COMMIT 其实是 markPending 那次，数据行不会在库里，这条用例就在拿错误的
-    // 提交位置冒充事故形态。
-    await store.close()
+    try {
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null,
+        (x: unknown) => x as Error & { hint?: string; kind?: string })
+      expect(e, '提交结果未知必须上抛（不能当成 partial 成功）').not.toBeNull()
+      expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
+      expect(e!.message).not.toMatch(/Store 已退役/)
+      expect(e!.hint, '恢复动作：核对后再决定是否重放').toMatch(/核对/)
+      expect(e!.hint).toMatch(/重放/)
+      // ⚠️ **kind 必须在场**（CR 第五十轮 major #3 的收口）：命令出口 `thrownToExit` 只在
+      // `err.kind` 存在时透传 `err.hint`，否则换成通用「执行期错误」文案 —— hint 在 engine 层
+      // 保住了、到了命令边界照样可能被换掉。命令出口是同一个函数（`sync-run.ts` 与 `store.ts`
+      // 共用 `thrownToExit`），这里钉住进入出口的形状，两个命令族同时被守住。
+      expect(e!.kind, '无 kind 的错误在命令出口会被换成通用 hint —— 必须带 kind 出门').toBe('internal')
+      // ⚠️ 回滚收尾的补注**不得**嫁接到这条诊断上（CR 第四十二轮 major 的追问，真驱动探针
+      // 2026-11-20 实测过嫁接形态）：COMMIT 已下发、写入可能已落库，此时再说「回滚可能根本没
+      // 执行、写入结果不可信」只是把恢复动作稀释成两套互相打架的指令。核对→再决定重放才是
+      // 这条成因的指引，且它必须原样到达 Agent。
+      expect(e!.message, '不得追加通用回滚补注').not.toMatch(/回滚未能确认/)
+      expect(e!.hint, '不得追加通用回滚补注').not.toMatch(/写入结果不可信/)
+      // ⚠️ **注入的确实是「数据窗」那次提交**（CR 第四十六轮 major 的追问）：重开库核对 ——
+      // 若第 2 次 COMMIT 其实是 markPending 那次，数据行不会在库里，这条用例就在拿错误的
+      // 提交位置冒充事故形态。
+    } finally {
+      await store.close()
+    }
     const reopened = await createDuckDbStore(cfg, 'rw')
     expect(await reopened.count('tags'), '数据窗的提交在驱动里已执行 → 行应已落库').toBe(1)
     await reopened.close()
@@ -923,20 +942,23 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     // 指令被换成退役文案，诱导重复写。判据：真实退役错误对两层都是终态 ⇒ 事务只尝试一次。
     // 计数用**真 store 的委托包装**（不是手写假 store）：退役行为仍由 duckdb.ts 产出。
     const { store } = await storeWithCommitFailureAt(2)
-    // ⚠️ 判据取 `ctx.sleep`：`withRetries` 的**每次重试**都先等 `RETRY_DELAY_MS` 再跑第二次，
-    // 而退役之后的「gap 落库」事务是在 BEGIN 处被拒的收尾动作（不经过重试等待）。
-    // 数 transaction 调用会把它算进来，数回调执行次数又会在「第二次被 BEGIN 拒掉」时漏判。
-    let retryWaits = 0
-    const t = fakeTask({
-      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
-    })
-    const e = await runTask(t, ctx(store, {
-      sleep: async () => { retryWaits++ },
-    })).then(() => null, (x: unknown) => x as Error)
-    expect(e, '必须上抛').not.toBeNull()
-    expect(e!.message, '主失败必须保留，不得被第二次尝试换掉').toMatch(/提交结果未知/)
-    expect(retryWaits, '退役错误对两层重试判据都必须是终态 —— 一次重试等待都不许有').toBe(0)
-    await store.close()
+    try {
+      // ⚠️ 判据取 `ctx.sleep`：`withRetries` 的**每次重试**都先等 `RETRY_DELAY_MS` 再跑第二次，
+      // 而退役之后的「gap 落库」事务是在 BEGIN 处被拒的收尾动作（不经过重试等待）。
+      // 数 transaction 调用会把它算进来，数回调执行次数又会在「第二次被 BEGIN 拒掉」时漏判。
+      let retryWaits = 0
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store, {
+        sleep: async () => { retryWaits++ },
+      })).then(() => null, (x: unknown) => x as Error)
+      expect(e, '必须上抛').not.toBeNull()
+      expect(e!.message, '主失败必须保留，不得被第二次尝试换掉').toMatch(/提交结果未知/)
+      expect(retryWaits, '退役错误对两层重试判据都必须是终态 —— 一次重试等待都不许有').toBe(0)
+    } finally {
+      await store.close()
+    }
   })
 
   it('退役后写者锁不挡下一次 run：重新打开同一库、同一任务照常跑完并清锁（CR 第四十三轮 major 的追问）', async () => {
@@ -945,39 +967,52 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     // 判据（真库实测）：锁只是 `sync_state` 上的两列，**没有任何读取点会据此拒绝** ——
     // 新实例上的 run 照常进行并在结束时清章。若哪天加了「锁在就不跑」，这里会红。
     const { store } = await storeWithCommitFailureAt(2)
-    const t = fakeTask({
-      id: 'lock.probe', table: 'tags',
-      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
-    })
-    const first = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error)
-    expect(first, '前提：第一次 run 因提交结果未知而失败').not.toBeNull()
-    expect(first!.message).toMatch(/提交结果未知/)
-    await store.close()
-    // 新实例（模拟操作员的恢复动作）
-    const s2 = await createDuckDbStore(cfg, 'rw')
-    await s2.init()
-    // readWatermark 只投影水位列 —— 锁列要走 listWatermarks（status/verify 的同款视图）。
-    const before = await listWatermarks(s2)
-    expect(before.get('lock.probe')?.lockedBy, '前提：退役时锁确实留在库里').not.toBeNull()
-    const second = await runTask(t, ctx(s2))
-    expect(second.status, '锁不得挡住下一次 run').toBe('complete')
-    expect((await listWatermarks(s2)).get('lock.probe')?.lockedBy, '成功收尾必须清锁').toBeNull()
-    await s2.close()
+    try {
+      const t = fakeTask({
+        id: 'lock.probe', table: 'tags',
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const first = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error)
+      expect(first, '前提：第一次 run 因提交结果未知而失败').not.toBeNull()
+      expect(first!.message).toMatch(/提交结果未知/)
+      // 新实例（模拟操作员的恢复动作）。退役实例拒绝一切语句，必须先关掉再开。
+      await store.close()
+      const s2 = await createDuckDbStore(cfg, 'rw')
+      try {
+        await s2.init()
+        // readWatermark 只投影水位列 —— 锁列要走 listWatermarks（status/verify 的同款视图）。
+        const before = (await listWatermarks(s2)).get('lock.probe')
+        // ⚠️ **先断言记录在场**（Codex 第七轮 P2）：`before.get(…)?.lockedBy` 在记录缺失时是
+        // undefined，而 `not.toBeNull()` 对 undefined 照样通过 —— 前提句会退化成永远成立的空话。
+        expect(before, '前提：水位记录必须存在（否则「锁留在库里」无从谈起）').toBeDefined()
+        expect(typeof before!.lockedBy, '前提：退役时锁确实留在库里').toBe('string')
+        const second = await runTask(t, ctx(s2))
+        expect(second.status, '锁不得挡住下一次 run').toBe('complete')
+        expect((await listWatermarks(s2)).get('lock.probe')?.lockedBy, '成功收尾必须清锁').toBeNull()
+      } finally {
+        await s2.close()
+      }
+    } finally {
+      await store.close()
+    }
   })
 
   it('rotated：同样交回主失败（第三入口，与 put 同一条 storeGapOrPrimary 路径）', async () => {
     const { runRotated } = await import('../../src/sync/engine.js')
     const { store } = await storeWithCommitFailureAt(2)
-    const t = fakeTask({
-      reportDayRotation: true, maxWindowDays: 1,
-      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
-    })
-    const e = await runRotated([t], ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
-    expect(e, '轮转路径的提交结果未知同样上抛').not.toBeNull()
-    expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
-    expect(e!.message).not.toMatch(/Store 已退役/)
-    expect(e!.hint).toMatch(/核对/)
-    await store.close()
+    try {
+      const t = fakeTask({
+        reportDayRotation: true, maxWindowDays: 1,
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runRotated([t], ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+      expect(e, '轮转路径的提交结果未知同样上抛').not.toBeNull()
+      expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
+      expect(e!.message).not.toMatch(/Store 已退役/)
+      expect(e!.hint).toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
   })
 
   it('windowed：数据窗已提交、清锁事务丢掉 COMMIT 回执 → 不得报 complete（CR 第五十一轮 major #5）', async () => {
@@ -985,14 +1020,72 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     // 清锁事务丢掉回执 = 它自己的 COMMIT 结果未知、当场退役 —— 这不是任何主失败的次生结果，
     // 旧实现按「次生」吞掉并返回 complete：实例已退役、写者锁可能没清，却被报成全部成功。
     const { store } = await storeWithCommitFailureAt(3)
-    const t = fakeTask({
-      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+    try {
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+      expect(e, '清锁事务的提交结果未知必须上抛，不能当 complete').not.toBeNull()
+      expect(e!.message).toMatch(/提交结果未知/)
+      expect(e!.hint, '恢复动作：先核对再决定是否重放').toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('gap 事务在 INSERT 阶段失败且 ROLLBACK 未确认 → 摘要不得说「COMMIT 已下发」（Codex 第五轮 P1）', async () => {
+    // 隔离探针：SQL 序列只有 BEGIN → INSERT sync_gaps → ROLLBACK，根本没有 COMMIT；若摘要仍写
+    // 「COMMIT 已下发」就会把恢复动作指到不存在的提交上。摘要必须用 gap 错误自己的成因。
+    const real = await import('@duckdb/node-api')
+    // ⚠️ 窗口事务的回滚必须**成功**（否则 primary 自己就带退役标记、走不到 gap 分支）：
+    // 只有第二次 ROLLBACK（补记缺口那次）被拒。
+    let rollbacks = 0
+    // 注入只在本用例的 runTask 阶段生效：init 的迁移里也有 `INSERT INTO "sync_gaps_v10"`
+    let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!armed) return cc.runAndReadAll(sql, params)
+                  if (sql === 'ROLLBACK' && ++rollbacks >= 2) throw new Error('注入：ROLLBACK 被拒')
+                  if (/INSERT INTO\s+"?(tags|sync_gaps)"?\s*\(/.test(sql)) throw new Error('注入：写入失败')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
     })
-    const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
-    expect(e, '清锁事务的提交结果未知必须上抛，不能当 complete').not.toBeNull()
-    expect(e!.message).toMatch(/提交结果未知/)
-    expect(e!.hint, '恢复动作：先核对再决定是否重放').toMatch(/核对/)
-    await store.close()
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+    armed = true
+    try {
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null,
+        (x: unknown) => x as Error & { hint?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '真实成因是回滚未确认').toMatch(/回滚未能确认/)
+      expect(e!.message, '不得声称 COMMIT 已下发').not.toMatch(/COMMIT 已下发/)
+      expect(e!.hint).toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
   })
 
   it('windowed：窗口写普通失败 + 补记缺口的事务丢掉 COMMIT 回执 → 退役事实不得被吞（CR 第五十一轮 major #2）', async () => {
@@ -1002,32 +1095,38 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     // 提交次数：markPending #1；窗口事务在 INSERT 处抛错、回滚不发 COMMIT；缺口事务的 COMMIT 是 #2。
     const { store } = await storeWithCommitFailureAt(2,
       (sql) => /INSERT INTO\s+"?tags"?/.test(sql))
-    const t = fakeTask({
-      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
-    })
-    const e = await runTask(t, ctx(store)).then(() => null,
-      (x: unknown) => x as Error & { hint?: string; kind?: string; code?: string })
-    expect(e, '必须以错误收尾').not.toBeNull()
-    expect(e!.message, '原始窗口失败必须保留').toMatch(/注入：窗口写入失败/)
-    expect(e!.message, '补记缺口的提交未知 / 退役事实不得被吞').toMatch(/缺口|退役/)
-    expect(e!.code, '实例已退役：编排层据此识别').toBe('store_retired')
-    // kind 也必须在场：命令出口 `thrownToExit` 只在 `err.kind` 存在时透传 hint（CR 第五十二轮 #15）
-    expect(e!.kind, '命令出口靠 kind 透传 hint').toBe('internal')
-    expect(e!.hint, '恢复动作仍要给出').toMatch(/核对/)
-    await store.close()
+    try {
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null,
+        (x: unknown) => x as Error & { hint?: string; kind?: string; code?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '原始窗口失败必须保留').toMatch(/注入：窗口写入失败/)
+      expect(e!.message, '补记缺口的提交未知 / 退役事实不得被吞').toMatch(/缺口|退役/)
+      expect(e!.code, '实例已退役：编排层据此识别').toBe('store_retired')
+      // kind 也必须在场：命令出口 `thrownToExit` 只在 `err.kind` 存在时透传 hint（CR 第五十二轮 #15）
+      expect(e!.kind, '命令出口靠 kind 透传 hint').toBe('internal')
+      expect(e!.hint, '恢复动作仍要给出').toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
   })
 
   it('snapshot：同样交回主失败（gap / 清锁撞退役不得把它换掉）', async () => {
     const { store } = await storeWithCommitFailureAt(2)
-    const t = fakeTask({
-      kind: 'snapshot', table: 'tags',
-      fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
-    })
-    const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
-    expect(e, '快照写库的提交结果未知同样上抛').not.toBeNull()
-    expect(e!.message).toMatch(/提交结果未知/)
-    expect(e!.message).not.toMatch(/Store 已退役/)
-    expect(e!.hint).toMatch(/核对/)
-    await store.close()
+    try {
+      const t = fakeTask({
+        kind: 'snapshot', table: 'tags',
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+      expect(e, '快照写库的提交结果未知同样上抛').not.toBeNull()
+      expect(e!.message).toMatch(/提交结果未知/)
+      expect(e!.message).not.toMatch(/Store 已退役/)
+      expect(e!.hint).toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
   })
 })

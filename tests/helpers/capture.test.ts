@@ -153,7 +153,9 @@ const GLOBAL_HOSTS = new Set(['globalThis', 'global', 'window', 'self'])
  * `Object.setPrototypeOf(opts, { concurrent: true })` 把整个原型换掉 —— 名单里没有它时
  * 对象仍被当成 `{}`，静默放行。`Reflect.setPrototypeOf` 同一判据。
  */
-const WRITE_TAILS = new Set(['assign', 'set', 'defineProperty', 'defineProperties', 'setPrototypeOf'])
+const WRITE_TAILS = new Set(['assign', 'set', 'defineProperty', 'defineProperties', 'setPrototypeOf',
+  // 删除属性同样让静态选项值失效（Codex 第五轮 P2）：删掉 `sequential: true` 后套件按并发跑
+  'deleteProperty'])
 /**
  * 调用方式方法名（`.call` / `.apply` / `.bind`）。`writesThroughCallee` 的静态尾段沿它们往里找
  * 真正的链尾：`(w ?? Reflect).set.call(…)` 的尾段先是 `call`，剥一层才是 `set`。
@@ -250,13 +252,45 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       // ⚠️ 数组 / 对象字面量里承载别名的元素（`const [a] = [opts]`）—— 必须先于
       // `refersToAlias` 的闸门处理：字面量本身不是「引用」（复制表达式），但它**装着的**
       // 元素可能是别名（CR 第四十五轮 major）。
-      if (ts.isArrayLiteralExpression(u)) { for (const el of u.elements) walk(el as ts.Expression); return }
+      if (ts.isArrayLiteralExpression(u)) {
+        for (const el of u.elements) {
+          // ⚠️ **展开字面量只复制外层容器、元素身份不变**（CR 第五十四轮 major #6）：
+          // `[...[opts]]` 的第 0 个元素就是 opts（`const [a] = [...[opts]]` 之后 a === opts）。
+          // 展开**标识符**（`[...opts]`）则是复制数组 —— 元素是 opts 的元素，不是 opts 本身。
+          if (ts.isSpreadElement(el)) {
+            const inner = unwrap(el.expression)
+            if (ts.isArrayLiteralExpression(inner)) for (const e2 of inner.elements) walk(e2 as ts.Expression)
+            continue
+          }
+          if (!ts.isOmittedExpression(el)) walk(el as ts.Expression)
+        }
+        return
+      }
       if (ts.isObjectLiteralExpression(u)) {
         for (const p2 of u.properties) {
           if (ts.isPropertyAssignment(p2)) walk(p2.initializer)
           else if (ts.isShorthandPropertyAssignment(p2)) walk(p2.name)
+          // 同一身份规则：`{...{ a: opts }}` 的 a 仍是 opts；`{...opts}` 是复制
+          else if (ts.isSpreadAssignment(p2)) {
+            const inner = unwrap(p2.expression)
+            if (ts.isObjectLiteralExpression(inner)) {
+              for (const q of inner.properties) {
+                if (ts.isPropertyAssignment(q)) walk(q.initializer)
+                else if (ts.isShorthandPropertyAssignment(q)) walk(q.name)
+              }
+            }
+          }
         }
         return
+      }
+      // ⚠️ **值选择表达式先分叉**（Codex 第五轮 P2）：`flag ? [opts] : [{}]` 的分支仍是容器
+      // 表达式，先用 `refersToAlias` 闸门会被整体判成「不是引用」而停住。
+      if (ts.isConditionalExpression(u)) { walk(u.whenTrue); walk(u.whenFalse); return }
+      if (ts.isBinaryExpression(u)) {
+        const k = u.operatorToken.kind
+        if (k === ts.SyntaxKind.CommaToken) { walk(u.right); return }
+        if (k === ts.SyntaxKind.QuestionQuestionToken || k === ts.SyntaxKind.BarBarToken
+          || k === ts.SyntaxKind.AmpersandAmpersandToken) { walk(u.left); walk(u.right); return }
       }
       if (!refersToAlias(e)) return
       if (ts.isIdentifier(u)) { found.push(u.text); return }
@@ -979,8 +1013,14 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
             // 上一条判断，否则 `(n as ts.Block).statements` 是 undefined、`.some` 直接抛。
             if ((n as ts.Block | ts.SourceFile | ts.ModuleBlock).statements.some(declares)) return false
           }
-          if (ts.isCatchClause(n) && n.variableDeclaration !== undefined
-            && ts.isIdentifier(n.variableDeclaration.name) && n.variableDeclaration.name.text === name) return false
+          // ⚠️ catch 的**解构绑定**同样遮蔽（Codex 第五轮 P2）：`catch ({ args })` 里的 args 是
+          // catch 绑定的值，展开的是它而不是外层的 `...args`。
+          if (ts.isCatchClause(n) && n.variableDeclaration !== undefined) {
+            const binds2 = (b: ts.BindingName): boolean => ts.isIdentifier(b)
+              ? b.text === name
+              : b.elements.some((e) => !ts.isOmittedExpression(e) && binds2(e.name))
+            if (binds2(n.variableDeclaration.name)) return false
+          }
           n = n.parent
         }
         return false
@@ -1181,15 +1221,22 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
           continue
         }
         // `describe`/`suite` 上的 `sequential: false` 与 `concurrent: true` 等价
-        const seqVal = SUITES.has(base) ? props.get('sequential') : undefined
+        // ⚠️ 但**显式 `concurrent: false` 压过它**（Codex 第五轮 P2，runner 源码与探针实测：
+        // `isSequentialSpecified` 含 `options.concurrent === false` → `isConcurrent && !isSequential`
+        // 为假）。旧判据见 sequential:false 就报并发 —— 合法串行套件被判红。
+        const concExplicitFalse = SUITES.has(base) && !accessorKeys.has('concurrent')
+          && props.get('concurrent') !== undefined
+          && boolLiteralValue(sf, props.get('concurrent')!) === false
+        const seqVal = SUITES.has(base) && !concExplicitFalse ? props.get('sequential') : undefined
         // 访问器声明的键：值是读的时候才求得的，`props.get` 是 undefined —— 不能当成「没写」
         const seqGet = accessorKeys.has('sequential')
-        if (!seqGet && seqVal !== undefined && boolLiteralValue(sf, seqVal) === false) {
+        if (!concExplicitFalse && !seqGet && seqVal !== undefined && boolLiteralValue(sf, seqVal) === false) {
           out.push({ line: lineOf(sf, call), why: '套件选项 sequential 为假' })
           seen.add(outermostRegistration(call))
           continue
         }
-        if (SUITES.has(base) && (seqGet || (seqVal !== undefined && boolLiteralValue(sf, seqVal) === undefined))) {
+        if (!concExplicitFalse && SUITES.has(base)
+          && (seqGet || (seqVal !== undefined && boolLiteralValue(sf, seqVal) === undefined))) {
           out.push({ line: lineOf(sf, call), why: `套件选项的 sequential 值 ${seqVal === undefined ? '访问器' : seqVal.getText(sf)} 无法静态求值` })
           seen.add(outermostRegistration(call))
           continue
@@ -1293,11 +1340,14 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
    */
   const schedulerAlias = new Map<string, string>()
   for (const st of sf.statements) {
-    if (!ts.isImportDeclaration(st) || st.importClause?.namedBindings === undefined) continue
+    if (!ts.isImportDeclaration(st) || st.importClause === undefined) continue
     const from = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : ''
     // 四个可导入调度原语的模块写法（`node:timers/promises` 的 `setTimeout` 返回 Promise，
     // 但**按字面名调用本来就会被本判据报** —— 改名形态必须同口径，否则改名即绕过）
     if (!/^(node:)?timers(\/promises)?$/.test(from)) continue
+    // 默认导入拿到的是同一组函数（`import tmr from 'node:timers'`，CR 第五十四轮 major #11）
+    if (st.importClause.name !== undefined) schedulerNamespaces.add(st.importClause.name.text)
+    if (st.importClause.namedBindings === undefined) continue
     const nb = st.importClause.namedBindings
     if (ts.isNamedImports(nb)) {
       for (const el of nb.elements) {
@@ -1509,15 +1559,18 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       const bare = unhost.length === 2 && GLOBAL_HOSTS.has(unhost[0]!)
         ? [unhost[1]!]
         : unhost
+      const thenLike = bare.length >= 2 && ['then', 'catch', 'finally'].includes(bare[bare.length - 1]!)
       const forbidden = bare.length === 1 && HOOK_FORBIDDEN.has(bare[0]!)
         // `process.nextTick(…)`：宿主是 `process`，原语是 `nextTick`
         || (bare.length === 2 && bare[0] === 'process' && bare[1] === 'nextTick')
         // `.then/.catch/.finally(…)`：**不限于**基座是 `Promise`（CodeRabbit PR#81 第二十二轮 minor）：
-        // `slowOp().then(w)`、`somePromise.finally(w)` 同样排微任务；只认 `Promise` 基座时它们
-        // 全漏。代价是 `await x.then(…)` 也会被报 —— 那同样是"在 hook 里留下 Promise 回调"，
-        // 判据按「末段是这三个名字」写，宁可多报也不漏（判据的边界写在 `HOOK_FORBIDDEN` 注释里）。
-        || (bare.length >= 2 && ['then', 'catch', 'finally'].includes(bare[bare.length - 1]!))
+        // `slowOp().then(w)`、`somePromise.finally(w)` 同样排微任务；只认 `Promise` 基座时它们全漏。
+        || thenLike
       if (!forbidden) continue
+      // ⚠️ **两条链形态同一策略**（CR 第五十四轮 major #8）：未知基座分支早就豁免「被 hook 直接
+      // await 的 then/catch/finally」（当场收口、尾巴不会落进下一条用例），已知名字链此前照报 ——
+      // 同一个写法在两个分支两种结论。这里对齐：只对微任务链形态生效，setTimeout 等原语不在内。
+      if (thenLike && isAwaited(inner)) continue
       out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${unhost.join('.')}(」` })
     }
   }
@@ -1744,6 +1797,13 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 不限于 `Promise` 基座（CodeRabbit PR#81 第二十二轮 minor）：任何链末段的 then/catch/finally
     expect(hookHits(`${H}(() => { slowOp().then(w) })`), '任意 Promise 链的 then').toEqual(['slowOp.then('])
     expect(hookHits(`${H}(() => { somePromise.finally(w) })`), '任意链的 finally').toEqual(['somePromise.finally('])
+    // ⚠️ **同一策略覆盖两条链形态**（CR 第五十四轮 major #8）：未知基座分支早就把「被 hook
+    // 直接 await 的 then/catch/finally」豁免，已知名字链却照报 —— `await pending.then(w)`
+    // 是当场收口的合法写法，两种链不能给相反结论。
+    expect(hookHits(`${H}(async () => { await pending.then(w) })`), '已知名字链被 await → 不收尾才算违规')
+      .toEqual([])
+    expect(hookHits(`${H}(async () => { await pending.catch(w); })`), '已知名字链 await catch').toEqual([])
+    expect(hookHits(`${H}(() => { pending.then(w) })`), '未 await 的已知名字链照报').toEqual(['pending.then('])
     expect(hookHits(`${H}(() => { x.catch(w) })`), '任意链的 catch').toEqual(['x.catch('])
     // 反例：名字里只是恰好含 then 前缀的不是
     expect(hookHits(`${H}(() => { thenable(w) })`), 'thenable 不是 .then').toEqual([])
@@ -2317,12 +2377,41 @@ it('Q34', oQ34, () => {})`),
     // 反例：别的模块的同名导出不归本判据（名字只是恰好叫 setTimeout）
     expect(hookHits(bt("import { ", ST, " as later54 } from './my-helpers'\n", H, '(() => { later54(w, 80) })')),
       '非 timer 模块的同名导入不算调度').toEqual([])
+    // 默认导入 timer 模块（CR 第五十四轮 major #11）：`import tmr63 from 'node:timers'` 拿到的是
+    // 同一组函数（默认导出即命名空间）。
+    expect(hookHits(bt("import tmr63 from 'node:timers'\n", H, '(() => { tmr63.', ST, '(w, 80) })')),
+      '默认导入的 timer 模块同样是调度').toEqual([`${ST}(`])
     // ⑥ 解构**声明**与 rest 参数同名同样遮蔽（CR 第五十轮 major）：`const [args] = [[…]]`
     //    展开的是那个数组，不是转发边界 —— 旧 `declares` 只认 Identifier 名字，绑定模式漏掉。
     expect(concHits(`function sh52(...args52) {\n  {\n    const [args52] = [[{ con${'current: true }'}, () => {}]]\n    it('S52', ...args52)\n  }\n}`),
       '解构声明遮蔽外层 rest 名').toEqual(['unknown'])
     expect(concHits(`function sh53(...args53) {\n  {\n    const { args53 } = { args53: [{ con${'current: true }'}, () => {}] }\n    it('S53', ...args53)\n  }\n}`),
       '对象解构声明同样遮蔽').toEqual(['unknown'])
+    // ⑫ **条件表达式的分支里也要收别名**（Codex 第五轮 P2）：`const [a] = flag ? [opts] : [{}]`
+    // 在 flag 为真时 a === opts。旧收集先用 refersToAlias 判整个条件表达式（字面量不是引用）
+    // 就停了，分支里的 opts 整个漏掉。
+    expect(concHits(`const flag70 = true\nconst o70 = { con${'current: false }'}\nconst [a70] = flag70 ? [o70] : [{}]\na70.concurrent = true\nit('S70', o70, () => {})`),
+      '条件表达式分支里的别名').toEqual(['unknown'])
+    // ⑬ **删除属性也算写入**（Codex 第五轮 P2）：`Reflect.deleteProperty(opts, 'sequential')`
+    // 之后套件按 concurrent:true 跑；写入名单没有 deleteProperty 时旧值被继续相信（报串行）。
+    expect(concHits(`const o71 = { con${'current: true, sequential: true }'}\nReflect.deleteProperty(o71, 'sequential')\ndescribe('D71', o71, () => {})`),
+      'Reflect.deleteProperty 使静态选项失效').toEqual(['unknown'])
+    // ⑭ **catch 的解构绑定同样遮蔽**（Codex 第五轮 P2）：同 identifier-only 漏判
+    expect(concHits(`function f72(...args72) {\n  try { throw 1 } catch ({ args72 }) {\n    it('S72', ...args72)\n  }\n}`),
+      'catch 解构绑定遮蔽外层 rest').toEqual(['unknown'])
+    // ⑮ **concurrent:false 压过 sequential:false**（Codex 第五轮 P2，runner 源码实测该组合串行）：
+    // `isSequentialSpecified` 含 `options.concurrent === false` → 最终并发为假。
+    expect(concHits(`describe('D73', { con${'current: false, sequential: false }, () => {})'}`),
+      '显式 concurrent:false 是串行').toEqual([])
+    expect(concHits(`describe('D74', { se${'quential: false }, () => {})'}`), '单独 sequential:false 仍是并发').toEqual(['opt'])
+    // ⑪ **数组展开会复制外层数组、但元素身份不变**（CR 第五十四轮 major #6）：
+    //    `const [a] = [...[opts]]` 里的 a 就是 opts。旧收集遇到 SpreadElement 直接停，
+    //    随后 `a.concurrent = true` 写穿 opts 却被当成无关变量。
+    expect(concHits(`const oS60 = { con${'current: false }'}\nconst [aS60] = [...[oS60]]\naS60.concurrent = true\nit('S60', oS60, () => {})`),
+      '数组展开里的对象字面量仍是别名').toEqual(['unknown'])
+    // 反例：展开的是**标识符**（`[...opts]`）→ 复制数组、元素不是 opts 本身
+    expect(concHits(`const oS61 = { con${'current: false }'}\nconst [aS61] = [...oS61]\naS61.concurrent = true\nit('S61', oS61, () => {})`),
+      '展开标识符是复制，不是别名').toEqual([])
     // ⑦ 别名来自**解构默认值**（CR 第五十一轮 major）：`const [a = opts] = []` 的默认值
     //    把 a 绑到 opts；初始化 `[]` 本身不含别名，旧收集整个跳过，随后写 `a.concurrent`
     //    写穿 opts 却被当成无关变量。

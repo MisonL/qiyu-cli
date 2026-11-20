@@ -43,12 +43,26 @@ async function closeAll<T>(runs: readonly T[], closeOne: (r: T) => Promise<void>
   }
   return errs
 }
+/**
+ * afterEach 的收尾决定（CR 第五十四轮 major #13）：只有**全部子进程 close 都已确认**才删夹具
+ * 目录 —— close 未确认说明那个进程可能仍占着库文件，删掉目录就把排查证据一起丢了。
+ */
+function finishFixtureCleanup(fixtureDir: string,
+  errors: readonly unknown[]): { removeDir: boolean; failure?: Error } {
+  if (errors.length === 0) return { removeDir: true }
+  return {
+    removeDir: false,
+    failure: new Error(`子进程收尾未确认 close（可能仍活着），保留夹具目录 ${fixtureDir}：${String(errors[0])}`,
+      { cause: errors[0] }),
+  }
+}
 afterEach(async () => {
   if (vi.isFakeTimers()) vi.clearAllTimers()
   vi.useRealTimers()
   const cleanupErrors = await closeAll(realChildren, closeRealChild)
-  rmSync(dir, { recursive: true, force: true })
-  if (cleanupErrors.length > 0) throw cleanupErrors[0]
+  const plan = finishFixtureCleanup(dir, cleanupErrors)
+  if (plan.removeDir) rmSync(dir, { recursive: true, force: true })
+  if (plan.failure !== undefined) throw plan.failure
 })
 
 async function closeRealChild(run: RealChild): Promise<void> {
@@ -107,6 +121,13 @@ function swallowOn(child: ChildProcess): void {
 }
 
 describe('锁夹具的子进程生命周期', () => {
+  it('finishFixtureCleanup：close 未确认时保留目录并交回带路径的失败', () => {
+    const kept = finishFixtureCleanup('/tmp/fixture-x', [new Error('5000ms 内未确认 close')])
+    expect(kept.removeDir, 'close 未确认不得删目录（可能仍被占用）').toBe(false)
+    expect(String(kept.failure), '失败文案要带目录路径供排查').toContain('/tmp/fixture-x')
+    expect(finishFixtureCleanup('/tmp/fixture-y', []), '全部确认 close 才删').toEqual({ removeDir: true })
+  })
+
   it('closeAll：一个子进程收尾抛错不得中断其余子进程的收尾', async () => {
     const seen: string[] = []
     const errs = await closeAll(['a', 'b', 'c'] as const, async (r) => {
@@ -287,6 +308,8 @@ describe('锁夹具的子进程生命周期', () => {
     expect(error.error, 'close 未确认时 verdict 不得报 TIMEOUT').toBeInstanceOf(Error)
     expect(String(error.error)).toMatch(/close/)
     expect(String(error.error)).toContain('kill 返回 true')
+    // 调用方拿不到句柄 → 可能仍活着的进程只能靠文案里的 pid 处理（CR 第五十四轮 major #9）
+    expect(String(error.error), 'close 未确认必须点名 pid').toMatch(/pid 1234/)
     expectClean(child)
   })
 
@@ -401,6 +424,20 @@ describe('锁夹具的子进程生命周期', () => {
     await running.result
     // 夹具必须把「调用方已拿到结果之后到达的原生错误」兜住，而不是让它抛穿测试进程。
     expect(() => child.emit('error', new Error('late error after settle'))).not.toThrow()
+    expectClean(child)
+  })
+
+  it('holder：deadline 已过时 marker 立即可见也不算就绪（CR 第五十四轮 major #7）', async () => {
+    // 事故形态：截止定时器到点仍去读「此刻是否就绪」—— 在高负载下定时器本身会迟到，一条
+    // **截止之后**才到达的 marker 因此被当成就绪。判据：就绪必须被观察到**在 deadline 之内**。
+    const running = observe(invoke('holder', -1))
+    child.stdout?.emit('data', 'locked\n')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(running.isSettled(), '失败收尾要等真实 close').toBe(false)
+    child.emit('close', 0, null)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(running.isSettled()).toBe(true)
+    expect('error' in await running.result, '过期后的就绪不算就绪').toBe(true)
     expectClean(child)
   })
 

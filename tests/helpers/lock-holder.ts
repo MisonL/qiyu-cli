@@ -253,14 +253,18 @@ function describeTerm(run: ScriptRun): string {
   const kill = run.killInfo
   const out = run.out.slice(0, 400) || '(空)'
   const stderr = run.stderr.slice(0, 400) || '(空)'
+  // ⚠️ **pid 放在唯一措辞点**（CR 第五十四轮 major #9）：终止失败时调用方拿不到句柄，可能仍
+  // 活着的进程只能靠文案里的 pid 处理 —— 每条失败描述都带它，避免某个调用点漏写。
+  const pid = run.child.pid
+  const pidNote = pid === undefined ? '' : `（子进程 pid ${pid}）`
   const tail = `stdout：${out}；stderr：${stderr}`
   if (run.closed) {
     return kill.requested
-      ? `已请求 SIGKILL 并确认 close（kill 返回 ${kill.accepted}）；${tail}`
-      : `子进程自身已 close（未请求 SIGKILL）；${tail}`
+      ? `已请求 SIGKILL 并确认 close（kill 返回 ${kill.accepted}）${pidNote}；${tail}`
+      : `子进程自身已 close（未请求 SIGKILL）${pidNote}；${tail}`
   }
-  if (!kill.requested) return `${CLOSE_GRACE_MS}ms 内未等到 close，且从未请求 SIGKILL；${tail}`
-  return `请求 SIGKILL 后 ${CLOSE_GRACE_MS}ms 内未等到 close（kill 返回 ${kill.accepted}）；${tail}`
+  if (!kill.requested) return `${CLOSE_GRACE_MS}ms 内未等到 close，且从未请求 SIGKILL${pidNote}；${tail}`
+  return `请求 SIGKILL 后 ${CLOSE_GRACE_MS}ms 内未等到 close（kill 返回 ${kill.accepted}）${pidNote}；${tail}`
 }
 
 /**
@@ -281,6 +285,14 @@ async function waitForMarker(
 ): Promise<void> {
   const run = new ScriptRun(child)
   const budget = deadline - Date.now()
+  // ⚠️ **就绪必须发生在 deadline 之内**（CR 第五十四轮 major #7）：截止定时器到点后仍去读
+  // 「此刻是否就绪」时，高负载下定时器本身会迟到，一条**截止之后**才到的 marker 就被当成就绪。
+  // 记录 marker 首次被观察到的时刻（data 事件即时更新），判定以它为准。
+  let markerSeenAt: number | undefined
+  const onMarkerData = (): void => {
+    if (markerSeenAt === undefined && stdoutHasMarkerLine(run.stdout, marker)) markerSeenAt = Date.now()
+  }
+  child.stdout?.on('data', onMarkerData)
   const ok = await new Promise<boolean>((resolve) => {
     let done = false
     const finish = (v: boolean): void => {
@@ -288,13 +300,14 @@ async function waitForMarker(
       done = true
       clearInterval(iv); clearTimeout(to)
       child.off('close', onClose); child.off('error', onError)
+      child.stdout?.off('data', onMarkerData)
       resolve(v)
     }
     // ⚠️ **进程已结束就不再是「就绪」**（CR 第四十四轮 major）：只按「输出里有 marker」判时，
     // 一个打印了 `locked` 随后立刻退出的子进程会让我们返回一个**死 holder**，调用方以为锁还
     // 持着。判据：marker 必须在**进程仍存活**时出现；已经 `exit`/`close`/原生失败的，一律未就绪。
     const readyNow = (): boolean => run.exit === null && !run.closed && !run.failedNative
-      && stdoutHasMarkerLine(run.stdout, marker)
+      && markerSeenAt !== undefined && markerSeenAt <= deadline
     // 轮询兜住「分块到达的 marker」与「error 已到但 close 未到」两种形态。
     const iv = setInterval(() => {
       if (readyNow()) finish(true)
@@ -316,9 +329,7 @@ async function waitForMarker(
   if (!closed) {
     // ⚠️ **close 未确认时 pid 必须一起说**（CR 第五十二轮 major #13）：这条路径同样不返回
     // child，调用方只能靠文案里的 pid 去处理那个可能仍活着的进程。
-    const pid = child.pid
-    const failure = run.finalFailure(`${what}在剩余预算 ${Math.max(budget, 0)}ms 内未就绪`
-      + `${pid === undefined ? '' : `（子进程 pid ${pid}）`}`)
+    const failure = run.finalFailure(`${what}在剩余预算 ${Math.max(budget, 0)}ms 内未就绪`)
     run.dispose()
     throw failure
   }
@@ -332,8 +343,7 @@ async function waitForMarker(
   // ⚠️ **调用方拿不到句柄就失去了手动清理的途径**（CR 第四十六轮 major 的追问）：这里抛错时
   // `spawnLockHolder` 不会返回 child，调用方只能靠这条文案里的 pid 去处理。所以 pid 与
   // 「close 未确认」必须一起说 —— 只报「未就绪」等于把活着的进程藏起来。
-  const pid = child.pid
-  const failure = run.finalFailure(`${what}${why}${pid === undefined ? '' : `（子进程 pid ${pid}）`}`)
+  const failure = run.finalFailure(`${what}${why}`)
   run.dispose()
   throw failure
 }

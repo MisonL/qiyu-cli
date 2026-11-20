@@ -31,8 +31,6 @@ vi.setConfig({ testTimeout: 15_000, hookTimeout: 60_000 })
 let dir = ''
 let out = ''
 let err = ''
-/** 「夹具隔离」用例留下的延迟操作 —— `afterAll` 清理前把它抽干（见那里的注释）。 */
-let pendingTail: Promise<void> | undefined
 /** 模板库：`beforeAll` 建好（跑完全部迁移）后只读，`beforeEach` 从它复制。 */
 const templatePath = (): string => join(dir, 'template.duckdb')
 let testSeq = 0
@@ -106,10 +104,6 @@ afterAll(async () => {
   // 不是测试结论，所以降级成 stderr 提示。实测已确认 `beforeAll` 抛错时 `afterAll`
   // **仍会执行**（临时用例：beforeAll 抛错 → 打印 `afterAll 执行了`），所以"setup 失败
   // 就没人清理"的说法不成立；剩下的只是句柄时序。
-  // ⚠️ 清理前先把「夹具隔离」留下的那条尾巴**抽干**（CodeRabbit PR#81）：用 `-t` 只跑
-  // 前一条时，尾巴在 `afterAll` 删目录之后才开库 → 目录已不在，它的 rejection 也无人接，
-  // 变成 unhandled rejection。抽干后顺序确定：尾巴先跑完，再删目录。
-  await (pendingTail ?? Promise.resolve()).catch(() => { /* 尾巴失败是它自己的事，不掩盖清理 */ })
   try { rmSync(dir, { recursive: true, force: true }) } catch (e) {
     process.stderr.write(`[db.test] 临时目录清理失败（可安全忽略，路径：${dir}）：`
       + `${e instanceof Error ? e.message : String(e)}\n`)
@@ -913,74 +907,61 @@ describe('db describe', () => {
 })
 
 describe('夹具隔离（历史审查 PR#72 收口）', () => {
-  let prevDbPath = ''
-  /** 上一条用例那条"尾巴"的完成信号 —— 必须**等它真的落定**，不能靠猜时长。 */
-  let tailDone: Promise<void> = Promise.resolve()
-  /** 上一条用例的延迟回调里**再次**调 `dbPath()` 得到的值（验证路径绑在异步上下文里）。 */
-  let pathSeenByTail = ''
-
-  itBound('【前一条】把本条库改坏，并留一条 80ms 后才执行的"尾巴"', async () => {
-    prevDbPath = dbPath()
-    const s = await createDuckDbStore(
-      { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
-    try { await s.query('DROP TABLE "sessions"') } finally { await s.close() }
-    // 模拟"用例超时后仍在跑的异步操作"：它落到的是**本条自己的**库文件。
-    // ⚠️ 不能只 `void` 掉（CodeRabbit PR#81 major）：本机慢一点时 150ms 不够等它开库 +
-    // DROP 完成，断言会跑在删除之前 → 偶发假绿；而它的 rejection 也没人接。
-    // 现在留下 completion promise，由下一条 `await`。
-    pendingTail = tailDone = new Promise<void>((resolve, reject) => {
-      setTimeout(() => {
-        void (async () => {
-          try {
-            // ⚠️ 先等**下一条夹具真的生效**再取路径（CR 第三十六轮 major）：只靠 80ms 时长，
-            // 机器慢时定时器可能在下一条 `beforeEach` 之前就烧掉 —— 那时全局 `currentDb` 还是
-            // 本条路径，「ALS 失效」的回归照样绿（假绿）。判据改成「全局已换到下一条」。
-            for (const deadline = Date.now() + 10_000; currentDb === prevDbPath && Date.now() < deadline;) {
-              await new Promise((r) => setTimeout(r, 10))
-            }
-            // 这里再调一次 `dbPath()`：它模拟"超时用例恢复后重新取路径"。绑在异步上下文里
-            // 时它仍返回**本条**路径；若改成读全局，这里会拿到下一条的路径（变异可红）。
-            pathSeenByTail = dbPath()
-            // 写也用**回调自己解析的路径**（不是 `prevDbPath`）：ALS 失效时它落到下一条夹具，
-            // 断言「本条 25 张表完好」当场变红（CR 第三十六轮 major）。
-            const t = await createDuckDbStore(
-              { backend: 'duckdb', path: pathSeenByTail, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
-            try { await t.query('DROP TABLE "tickets"') } finally { await t.close() }
-            resolve()
-          } catch (e) { reject(e) }
-        })()
-      }, 80)
-    })
-  })
-
-  itBound('【本条】库仍是完整的 25 张表 —— 上一条的破坏与尾巴都碰不到它', async () => {
-    // ⚠️ 前置状态缺了就**显式失败**（Codex PR#81 第四轮 P2）：这条用例靠上一条设
-    // `prevDbPath` / `tailDone` / `pathSeenByTail`。用 `-t` 只筛这一条时它们都是初始值，
-    // 断言会全部空转却显示 passed（实测 `1 passed, 26 skipped` 什么都没验证）。
-    expect(prevDbPath, '此用例必须与【前一条】一起跑（`-t 夹具隔离` 或整文件）；'
-      + '单独筛它时前置状态不存在，会假绿').not.toBe('')
-    // 等上一条那条尾巴**真的完成**（它在别处写，写坏了也不影响这里）
-    const early = await dbCommand(['tables', '--db', dbPath()])
-    expect(early, '尾巴落地前本条就该是好的').toBe(0)
-    out = ''      // captureSinks 是**追加**语义：同一条用例里跑第二条命令前必须清缓冲
-    await tailDone
-    // ⚠️ 判定顺序：先看**数据**再看路径 —— 若只断言"路径不同"，把夹具改回单库时
-    // 第一条就红，看不出"尾巴真的写坏了本条"这个更有说服力的形态（变异验证过）。
-    expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
-    expect((data().tables as TableOut[]).map((t) => t.name), '上一条删掉的表不得消失').toHaveLength(25)
-    expect(dbPath(), '每条用例必须拿到自己的库文件').not.toBe(prevDbPath)
-    expect(pathSeenByTail, '上一条的延迟续执行必须仍读到它自己那条路径（不得读到本条的）')
-      .toBe(prevDbPath)
-    // 反过来确认"上一条真的把破坏留下了"—— 否则本条通过也可能只是因为它没动手
-    const broken = await createDuckDbStore(
-      { backend: 'duckdb', path: prevDbPath, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+  itBound('前一条的延迟续执行只碰它自己的库文件，碰不到后一条的夹具', async () => {
+    // ⚠️ **单条自包含**（Codex 第七轮 P2）：旧形态拆成两条、靠模块状态与真实执行顺序串起来，
+    // 用 `-t` 只筛后一条时前置状态不存在、断言全部空转（实测「1 passed」什么都没验证）。
+    // 现在两条「用例」都在本条里用 `alsDb.run` 上下文**显式造出**，不依赖 vitest 的顺序与超时。
+    const ownDb = currentDb
+    const firstDb = join(dir, 'iso-first.duckdb')
+    const secondDb = join(dir, 'iso-second.duckdb')
+    copyFileSync(templatePath(), firstDb)
+    copyFileSync(templatePath(), secondDb)
+    let pathSeenByTail = ''
+    let tail!: Promise<void>
     try {
-      const names = (await broken.query(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"))
-        .rows.map((r) => String(r.table_name))
-      expect(names, '上一条的库里确实少了 sessions/tickets（证明破坏真的发生了）')
-        .not.toContain('sessions')
-      expect(names).not.toContain('tickets')
-    } finally { await broken.close() }
+      // —— 前一条用例：在它自己的异步上下文里改坏自己的库，并留一条「超时后恢复」的续执行 ——
+      await alsDb.run(firstDb, async () => {
+        const s = await createDuckDbStore(
+          { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+        try { await s.query('DROP TABLE "sessions"') } finally { await s.close() }
+        // 定时器在**当前 ALS 上下文里**创建 → 恢复时仍带着前一条的路径（与真实超时用例同形）。
+        tail = (async () => {
+          await new Promise<void>((r) => { setTimeout(r, 30) })
+          // 「恢复后重新取路径」：模拟超时用例继续执行时的 `dbPath()` 调用。
+          pathSeenByTail = dbPath()
+          // 写也用回调自己解析的路径：ALS 失效时它落到后一条夹具，下面的 25 表断言当场变红。
+          const t = await createDuckDbStore(
+            { backend: 'duckdb', path: pathSeenByTail, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+          try { await t.query('DROP TABLE "tickets"') } finally { await t.close() }
+        })()
+      })
+      // —— 后一条用例的 beforeEach：全局已切到新夹具（模板复制）——
+      currentDb = secondDb
+      const early = await dbCommand(['tables', '--db', secondDb])
+      expect(early, '尾巴落地前后一条都该是好的').toBe(0)
+      out = ''   // captureSinks 是**追加**语义：同一条用例里跑第二条命令前必须清缓冲
+      await tail
+      expect(await dbCommand(['tables', '--db', secondDb])).toBe(0)
+      expect((data().tables as TableOut[]).map((t) => t.name), '上一条删掉的表不得消失').toHaveLength(25)
+      // ⚠️ 判据绑的是**回调自己解析的路径**：把 `dbPath()` 改回读全局（去掉 ALS）时这条变红，
+      // 后一条夹具的 tickets 也会被删掉（下一句变红）—— 两条一起证明隔离真的成立。
+      expect(pathSeenByTail, '延迟续执行必须仍读到它自己那条路径（不得读到后一条的）').toBe(firstDb)
+      // 反过来确认「前一条真的把破坏留下了」—— 否则本条通过也可能只是因为它没动手。
+      const broken = await createDuckDbStore(
+        { backend: 'duckdb', path: firstDb, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+      try {
+        const names = (await broken.query(
+          "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"))
+          .rows.map((r) => String(r.table_name))
+        expect(names, '前一条的库里确实少了 sessions/tickets（证明破坏真的发生了）')
+          .not.toContain('sessions')
+        expect(names).not.toContain('tickets')
+      } finally { await broken.close() }
+    } finally {
+      // 断言中途失败也必须把尾巴抽干（否则 cleanup 删目录后它才开库 → unhandled rejection）。
+      // 尾巴可能还没被创建（前一条的建库就抛了）—— 不能让 finally 自己再抛一次掩盖原始失败。
+      await (tail ?? Promise.resolve()).catch(() => { /* 尾巴失败是它自己的事，原始断言错误优先 */ })
+      currentDb = ownDb
+    }
   })
 })
