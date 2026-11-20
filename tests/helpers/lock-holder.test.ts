@@ -441,6 +441,35 @@ describe('锁夹具的子进程生命周期', () => {
     expectClean(child)
   })
 
+  it('seed：close 在 deadline 之后才被看到（过期定时器还没跑）也不算按时完成（CR 第五十五轮 major）', async () => {
+    // 事故形态：截止定时器在高负载下迟到；close 事件先被处理，`waitOne` 以「已 close」直接
+    // 返回 true —— 从未请求过终止，种子以 exit 0 被当成「按时建好」。判据必须比较**看到 close
+    // 的时刻**与 deadline，而不是只问「最终是否 close」。
+    vi.mocked(child.kill).mockReturnValue(false)
+    const running = observe(invoke('seed', BUDGET))
+    vi.setSystemTime(BUDGET + 1)      // 时钟越过 deadline，但定时器回调尚未运行
+    child.emit('close', 0, null)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(running.isSettled(), '迟到 close 也必须交回结论').toBe(true)
+    const result = await running.result
+    expect('error' in result, 'exit 0 + 迟到 close 不得算按时完成').toBe(true)
+    if ('error' in result) {
+      expect((result.error as Error).message, '点名「预算之外才 close」').toMatch(/预算/)
+    }
+    expectClean(child)
+  })
+
+  it('verdict：close 迟到于 deadline → 按 TIMEOUT，不报 OPENED（CR 第五十五轮 major）', async () => {
+    const running = observe(invoke('verdict', BUDGET))
+    child.stdout?.emit('data', JSON.stringify({ v: 'OPENED' }) + '\n')
+    vi.setSystemTime(BUDGET + 1)
+    child.emit('close', 0, null)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(running.isSettled()).toBe(true)
+    expect(await running.result, '过期后才 close 的结论不是按时完成').toEqual({ value: 'TIMEOUT' })
+    expectClean(child)
+  })
+
   it('holder：分块到达的 marker 就绪后交回仍存活的 child', async () => {
     const running = observe(invoke('holder', 1_000_000))
     child.stdout?.emit('data', 'loc')

@@ -87,6 +87,8 @@ class ScriptRun {
   get failedNative(): boolean { return this.nativeError !== undefined }
   closed = false
   exit: { code: number | null; signal: NodeJS.Signals | null } | null = null
+  /** 观察到 `close` 的时刻：调用方拿它跟 deadline 比「是否按时结束」（见 `waitClosed` 注释）。 */
+  closedAt: number | undefined
   private killed = false
   private killAccepted = false
   markKill(result: boolean): void { this.killed = true; this.killAccepted = result }
@@ -130,6 +132,9 @@ class ScriptRun {
   private onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
     this.exit ??= { code, signal }
     this.closed = true
+    // ⚠️ 「最终 close 了」与「按时 close 了」是两件事（CR 第五十五轮 major）：高负载下截止
+    // 定时器可能迟到，close 事件先被处理 —— 只看布尔会把过期后的清理结果当成按时完成。
+    this.closedAt = Date.now()
     for (const w of this.closeWaiters.splice(0)) w()
     if (this.errorWaiters.length > 0 && this.nativeError !== undefined) {
       for (const w of this.errorWaiters.splice(0)) w()
@@ -155,6 +160,8 @@ class ScriptRun {
   /**
    * 等 `close`，最多 `budgetMs + CLOSE_GRACE_MS`：先给剩余业务预算（正常进程自己会退出），
    * 到点请求 SIGKILL，再给一段宽限。返回 `true` 只表示**真的收到了 close**；
+   * ⚠️ 是否**按时**结束要看 `closedAt`（CR 第五十五轮 major）：迟到到达的 close 同样返回
+   * `true`，但 `closedAt > deadline` —— 调用方据此把「过期清理」与「按时完成」分开。
    * 超时返回 `false`，由调用方带着 `finalFailure()` 响亮失败。
    * ⚠️ 未启动的进程（`pid === undefined`）不会再有 close：它的结束信号是 `error`。
    */
@@ -394,6 +401,8 @@ try {
 }`, scriptDir, 'verdict')
   const run = new ScriptRun(chk)
   const closed = await run.waitClosed(deadline - Date.now())
+  // ⚠️ 迟到 close（截止定时器没来得及跑、close 先交付）同样不是「按时给出结论」（CR 第五十五轮 major）。
+  const closedLate = run.closedAt !== undefined && run.closedAt > deadline
   const timedOut = run.killInfo.requested && run.closed
   run.dispose()
   if (!closed) {
@@ -406,7 +415,7 @@ try {
   }
   // close 已确认（或 spawn 没起来）：原生错误就是全部事实，原样抛出。
   if (run.nativeError !== undefined) throw run.nativeError
-  if (timedOut) return 'TIMEOUT'
+  if (timedOut || closedLate) return 'TIMEOUT'
   const co = run.stdout
   const errOut = run.stderr
   // 解析子进程交回的那一行 JSON（stdout 可能混入其它输出，取最后一个可解析的）。
@@ -433,11 +442,17 @@ const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
 inst.closeSync()`, scriptDir, 'seed')
   const run = new ScriptRun(ch)
   const closedInBudget = await run.waitClosed(deadline - Date.now())
-  if (!closedInBudget) {
+  // ⚠️ **close 迟到于 deadline 也不算按时完成**（CR 第五十五轮 major）：截止定时器可能迟到，
+  // close 事件先被交付 —— 此时从未请求过终止，但「按时建好空库」已经不成立。
+  const closedLate = run.closedAt !== undefined && run.closedAt > deadline
+  if (!closedInBudget || closedLate) {
     const failure = run.finalFailure('种子进程在预算内未退出')
     run.dispose()
     if (run.nativeError !== undefined) throw failure
-    throw new Error(`种子进程在预算内未退出 —— 无法确认它已放开库文件。${failure.message}`, { cause: failure })
+    const how = closedLate
+      ? `它在预算之外才 close（观察到于 deadline 后 ${run.closedAt! - deadline}ms），不能证明空库按时建好`
+      : '无法确认它已放开库文件'
+    throw new Error(`种子进程在预算内未退出 —— ${how}。${failure.message}`, { cause: failure })
   }
   // ⚠️ **预算过期后的 close 不是完成**（CR 第五十轮 major）：`waitClosed` 到点会请求 SIGKILL，
   // 宽限里进程照样 close；若 `kill()` 未被受理（返回 false）而种子自己以 0 退出，旧实现直接

@@ -77,6 +77,22 @@ function safeValueText(v: unknown, max: number): string {
     return `（无法转成文本的拒绝值，typeof=${typeof v}）`
   }
 }
+/**
+ * 拒绝值 → 截断文本，**先安全地取 message**：`message` 是抛异常的访问器时，`String(e)` 之前
+ * 的求值不能发生在 try 外面（CR 第五十五轮 major：求值一抛，状态标记就落不下去）。
+ */
+function safeMessageText(v: unknown, max: number): string {
+  try {
+    return String(v instanceof Error ? v.message : v).slice(0, max)
+  } catch {
+    return `（无法转成文本的拒绝值，typeof=${typeof v}）`
+  }
+}
+/**
+ * 派发前被**本地关闭判据**拒绝的 usage 错误（身份集合）。COMMIT 的归因据此区分「根本没下发」
+ * 与「驱动拒绝」—— 不读拒绝值的 `kind`（访问器可抛，驱动对象也可能伪造该字段，CR 第五十五轮 major）。
+ */
+const closedBeforeDispatch = new WeakSet<object>()
 /** usage 错误（退出码 2）：带 kind 供命令层经 thrownToExit 归 usageFail 双通道。 */
 function usage(msg: string): Error {
   const e = new Error(msg)
@@ -534,10 +550,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       try {
         await execSql('COMMIT', [], { txControl: true })
       } catch (e) {
-        // 连接已关闭（usage）→ COMMIT 根本没下发，不存在「结果未知」；原错误照常交回。
-        // ⚠️ **拒绝值可能不是对象**（CR 第五十二轮 major）：驱动以 `null` / `undefined` 拒绝时
-        // 读 `.kind` 会抛 TypeError，把「提交结果未知」整段换掉 —— 先确认是对象再读。
-        if (e !== null && typeof e === 'object' && (e as { kind?: string }).kind === 'usage') throw e
+        // 连接已关闭（execSql 派发前的本地守卫）→ COMMIT 根本没下发，不存在「结果未知」；
+        // 原错误照常交回。⚠️ 判据用**身份集合**而不是读 `.kind`（CR 第五十五轮 major）：
+        // 拒绝值的 `kind` 可能是抛异常的访问器（读一下就换成 TypeError），也可能是驱动对象
+        // 伪造的同名字段（会把「可能已落库」的提交当成没下发）。
+        if (e !== null && typeof e === 'object' && closedBeforeDispatch.has(e)) throw e
         // ⚠️ **COMMIT 结果未知**（CR 第三十九轮 major #5）：COMMIT 已下发、结果没能确认 ——
         // 写入可能已经落库，也可能没有。不能只说「失败」：按失败重试可能重复写。
         // ⚠️ **本实例当场永久退役**（CR 第四十一轮 major）：不能把「还能不能用」寄望于随后
@@ -704,7 +721,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   }
   const execSql = async (sql: string, params: unknown[] = [], opts?: { txControl?: boolean }): Promise<unknown> => {
     const txControl = opts?.txControl === true
-    if (closed) throw usage('数据库连接已关闭')
+    if (closed) {
+      // 身份登记：COMMIT 的 catch 靠它识别「本地没下发」（不读拒绝值的 kind）。
+      const e = usage('数据库连接已关闭')
+      closedBeforeDispatch.add(e)
+      throw e
+    }
     // 连接已退役：事务状态无法确认，一条语句都不许再发（CR 第三十七轮 major #4）。
     if (poisoned !== undefined) throw poisonedError(poisoned)
     // ⚠️ **原始事务控制一律拒绝**（CR 第三十九轮 major #4，第四十一轮改为按**解析出的语句
@@ -790,11 +812,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       if (!txControl && !closed && poisoned === undefined
         && inTx && txToken !== undefined && ctxToken === txToken && await txInvalidated()) {
         brokenTx.set(txToken, `本事务内的一条语句执行期报错，DuckDB 已把整条事务标成 aborted`
-          + `（驱动原文：${e instanceof Error ? safeValueText(e.message, 160) : safeValueText(e, 160)}）`)
+          + `（驱动原文：${safeMessageText(e, 160)}）`)
       }
       if (txEpoch !== epochBefore && txToken !== undefined) {
         brokenTx.set(txToken, '外部语句执行期报错，且期间另一条链开启了事务'
-          + `（驱动原文：${e instanceof Error ? safeValueText(e.message, 160) : safeValueText(e, 160)}）`)
+          + `（驱动原文：${safeMessageText(e, 160)}）`)
       }
       if (txEpoch !== epochBefore) {
         throw epochChangedError(e)

@@ -374,7 +374,28 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
           bind(n.name)
         }
       }
-      // ⚠️ 别名不止经**声明初始化**建立：`let a; a = opts; a.concurrent = true` 同样写穿 opts
+      // ⚠️ **for...of 的元素也是别名来源**（Codex 第五轮 P2）：`for (const item of [opts])`
+      // 里 item 就是 opts（数组字面量的元素身份不变）。遍历**数组本身**（`of opts`）时元素身份
+      // 未知 —— 保守不认（记录边界：那只多报不了，只会漏掉「元素恰好是 opts」的形态）。
+      if (ts.isForOfStatement(n) && ts.isVariableDeclarationList(n.initializer)) {
+        const src = unwrap(n.expression)
+        if (ts.isArrayLiteralExpression(src)
+          && aliasSources(src).some((s2) => aliases.has(s2))) {
+          const bindLoop = (b: ts.Node): void => {
+            if (ts.isBindingElement(b) && ts.isIdentifier(b.name) && !aliases.has(b.name.text)) {
+              aliases.add(b.name.text)
+              changed = true
+            }
+            ts.forEachChild(b, bindLoop)
+          }
+          for (const d of n.initializer.declarations) {
+            if (ts.isIdentifier(d.name)) {
+              if (!aliases.has(d.name.text)) { aliases.add(d.name.text); changed = true }
+            } else bindLoop(d.name)
+          }
+        }
+      }
+      // ⚠️ 别名不止经**声明初始化**建立：`let a; a = opts; a.concurrent = true` 同样写穿 opts      // ⚠️ 别名不止经**声明初始化**建立：`let a; a = opts; a.concurrent = true` 同样写穿 opts
       // （CodeRabbit PR#81 第二十六轮 minor，序列可复现）。只跟声明初始值时这个序列完全逃过
       // 写入判据 —— `a` 从未进入别名集，就被当成无关变量。与「建立别名不算写入」同一个口径：
       // 这句赋值本身不计为写入，只把 `a` 收进别名集。
@@ -1450,9 +1471,38 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       return false
     }
   }
+  /**
+   * 同文件里**唯一**的同名函数声明 / 常量函数（Codex 第五轮 P2）：`beforeEach(setup)` 的
+   * 登记子树只有标识符，setup 体内的调度原语看不见。只在定义唯一时下钻 —— 同名多处
+   * （遮蔽/重名）无法静态断言是哪一份，保持「看不见就不报」的保守口径（边界如实记录）。
+   */
+  const sameFileFunction = (name: string): ts.FunctionLikeDeclaration | undefined => {
+    const hits: ts.FunctionLikeDeclaration[] = []
+    const visit = (n: ts.Node): void => {
+      if (ts.isFunctionDeclaration(n)) { if (n.name?.text === name) hits.push(n); return }
+      if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name
+        && n.initializer !== undefined) {
+        const init = unwrap(n.initializer)
+        if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) hits.push(init)
+        return
+      }
+      ts.forEachChild(n, visit)
+    }
+    visit(sf)
+    return hits.length === 1 ? hits[0] : undefined
+  }
+  const outSeen = new Set<string>()
   for (const call of collectCalls(sf)) {
     if (!isHookName(callChain(call)?.chain, call)) continue
-    for (const inner of collectCalls(call)) {
+    // 命名的回调（标识符实参）在同文件里能唯一解析时，把它的函数体一起扫。
+    const roots: ts.Node[] = [call]
+    for (const arg of call.arguments) {
+      const u = unwrap(arg)
+      if (!ts.isIdentifier(u)) continue
+      const fn = sameFileFunction(u.text)
+      if (fn !== undefined) roots.push(fn)
+    }
+    for (const root of roots) for (const inner of collectCalls(root)) {
       // ⚠️ 用 `callChain` 而不是 `calleeChain`：`Promise.resolve().then(…)` 的被调对象基座是
       // **调用**，`calleeChain` 对它返回 undefined（Codex PR#81 第二十轮 P2，探针复现）。
       const innerName = callChain(inner)?.chain
@@ -1571,7 +1621,10 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       // await 的 then/catch/finally」（当场收口、尾巴不会落进下一条用例），已知名字链此前照报 ——
       // 同一个写法在两个分支两种结论。这里对齐：只对微任务链形态生效，setTimeout 等原语不在内。
       if (thenLike && isAwaited(inner)) continue
-      out.push({ line: lineOf(sf, inner), why: `hook 体里出现「${unhost.join('.')}(」` })
+      const reason = `hook 体里出现「${unhost.join('.')}(」`
+      // 同一命名回调被多个 hook 登记时只报一次（行号 + 说明去重）。
+      const key = `${lineOf(sf, inner)}:${reason}`
+      if (!outSeen.has(key)) { outSeen.add(key); out.push({ line: lineOf(sf, inner), why: reason }) }
     }
   }
   return out
@@ -2381,6 +2434,18 @@ it('Q34', oQ34, () => {})`),
     // 同一组函数（默认导出即命名空间）。
     expect(hookHits(bt("import tmr63 from 'node:timers'\n", H, '(() => { tmr63.', ST, '(w, 80) })')),
       '默认导入的 timer 模块同样是调度').toEqual([`${ST}(`])
+    // ⑰ **命名的 hook 回调**（Codex 第五轮 P2）：`beforeEach(setup)` 的登记子树只有标识符，
+    //    setup 体内的调度原语要下钻到同文件里唯一的函数定义才看得见。
+    expect(hookHits(bt('function setupH83() { ', ST, '(w, 80) }\n', H, '(setupH83)')),
+      '同文件唯一函数声明作为 hook 回调也要下钻').toEqual([`${ST}(`])
+    expect(hookHits(bt('const setupH84 = () => { ', ST, '(w, 80) }\n', H, '(setupH84)')),
+      '常量箭头函数作为 hook 回调同样下钻').toEqual([`${ST}(`])
+    // 反例：同文件里定义了、但没交给 hook —— 不报
+    expect(hookHits(bt('function notSetupH85() { ', ST, '(w, 80) }\n', H, '(() => {})')),
+      '没被登记的函数不扫').toEqual([])
+    // 边界如实记录：同名多处时无法静态断言是哪一份，保持「看不见就不报」
+    expect(hookHits(bt('function setupH86() { ', ST, '(w, 80) }\nfunction setupH86() {}\n', H, '(setupH86)')),
+      '同名多处无法静态断言 → 保守不报（已记录边界）').toEqual([])
     // ⑥ 解构**声明**与 rest 参数同名同样遮蔽（CR 第五十轮 major）：`const [args] = [[…]]`
     //    展开的是那个数组，不是转发边界 —— 旧 `declares` 只认 Identifier 名字，绑定模式漏掉。
     expect(concHits(`function sh52(...args52) {\n  {\n    const [args52] = [[{ con${'current: true }'}, () => {}]]\n    it('S52', ...args52)\n  }\n}`),
@@ -2412,6 +2477,16 @@ it('Q34', oQ34, () => {})`),
     // 反例：展开的是**标识符**（`[...opts]`）→ 复制数组、元素不是 opts 本身
     expect(concHits(`const oS61 = { con${'current: false }'}\nconst [aS61] = [...oS61]\naS61.concurrent = true\nit('S61', oS61, () => {})`),
       '展开标识符是复制，不是别名').toEqual([])
+    // ⑯ **for...of 的元素别名**（Codex 第五轮 P2）：`for (const item of [opts])` 里 item 就是
+    //    opts —— 元素身份不变，随后 `item.concurrent = true` 写穿 opts。
+    expect(concHits(`const oF60 = { con${'current: false }'}\nfor (const itemF60 of [oF60]) { itemF60.concurrent = true }\nit('F60', oF60, () => {})`),
+      'for...of 字面量元素里的别名').toEqual(['unknown'])
+    // 反例：循环只读 → 不改变选项，仍按原值判
+    expect(concHits(`const oF61 = { con${'current: false }'}\nfor (const itemF61 of [oF61]) { console.log(itemF61) }\nit('F61', oF61, () => {})`),
+      '只读循环不建立写穿').toEqual([])
+    // 边界如实记录：遍历的是**数组本身**（`of oF62`），元素身份未知 —— 保守不认
+    expect(concHits(`const oF62 = { con${'current: false }'}\nfor (const itemF62 of oF62) { itemF62.concurrent = true }\nit('F62', oF62, () => {})`),
+      '遍历数组本身时元素身份未知 → 保守不报（已记录边界）').toEqual([])
     // ⑦ 别名来自**解构默认值**（CR 第五十一轮 major）：`const [a = opts] = []` 的默认值
     //    把 a 绑到 opts；初始化 `[]` 本身不含别名，旧收集整个跳过，随后写 `a.concurrent`
     //    写穿 opts 却被当成无关变量。

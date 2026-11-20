@@ -911,6 +911,23 @@ describe('api call —— B 块（body 校验）', () => {
     vi.unstubAllGlobals()
   })
 
+  it('危险接口 robot.session.chat + 合法 body 但无 --yes → 4 confirm_required，且未碰凭证与网络', async () => {
+    // CR 第五十五轮的追问：registry 把 robot.session.chat 改判 dangerous:true 之后，显式调用
+    // 是否真的在**凭证解析与 transport 之前**被拦下？门禁是参数/确认问题 —— 它必须先于环境
+    // 错误（缺凭证）报出，否则 Agent 会先去配 QIYU_APP_KEY 再撞上这道墙。
+    const fetchSpy = vi.fn(); vi.stubGlobal('fetch', fetchSpy)
+    // 故意不提供任何凭证：走到 resolveCredentialsUsingFile 的话会报 auth_missing。
+    vi.stubEnv('QIYU_APP_KEY', ''); vi.stubEnv('QIYU_APP_SECRET', '')
+    const code = await apiCommand(['call', 'robot.session.chat', '--body', '{"uid":"u1","msg":"hi"}'])
+    expect(code, '危险接口未确认必须退出 4').toBe(4)
+    const e = JSON.parse(out).error
+    expect(e.kind, '必须是「需要确认」而不是 auth/usage').toBe('needs_confirmation')
+    expect(e.code).toBe('confirm_required')
+    expect(String(e.hint), 'hint 必须要求人类确认、不得自动加 --yes').toMatch(/人类/)
+    expect(fetchSpy, '门禁之前不得发起任何请求').not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
   it('验收 5：search 带 bogus → 0，warning 含「已发出」「不要重发」', async () => {
     vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ code: 200, data: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))))

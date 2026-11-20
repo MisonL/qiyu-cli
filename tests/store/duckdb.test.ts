@@ -2405,6 +2405,112 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('COMMIT 拒绝对象的 kind 访问器会抛 → 仍必须按「提交结果未知」退役（CR 第五十五轮 major）', { timeout: 90_000 }, async () => {
+    // 探针形态：驱动 COMMIT 已执行、结果交回前拒绝，拒绝对象带有抛异常的 `kind` 访问器。
+    // 旧实现先读 `.kind === 'usage'` —— 读取本身抛 TypeError，把「提交结果未知」换掉、
+    // 也不退役实例（写入可能已落库，后续语句却还能下发）。
+    const real = await import('@duckdb/node-api')
+    const weird = {
+      message: '注入：COMMIT 结果丢失',
+      get kind(): string { throw new Error('kind 读取炸了') },
+    }
+    // 注入只在本用例的 transaction 阶段生效：init 的迁移也在自动事务里 COMMIT。
+    let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (armed && sql === 'COMMIT') {
+                    await cc.runAndReadAll(sql, params)
+                    throw weird
+                  }
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    armed = true
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+    }).then(() => null, (x: unknown) => x as Error & { cause?: unknown; code?: string; hint?: string })
+    expect(e, '必须以错误收尾').not.toBeNull()
+    expect(e!.message, 'kind 访问器不得顶掉「提交结果未知」').toMatch(/提交结果未知/)
+    expect(e!.cause, '原拒绝对象必须挂在 cause 上').toBe(weird)
+    expect(e!.code, '结果未知 = 实例当场退役').toBe('store_retired')
+    expect(e!.hint).toMatch(/核对/)
+    // 退役是事实：后续语句一律被拒（不是「还能用」）
+    await s.query('SELECT 1').then(() => { throw new Error('退役后仍能下发语句') },
+      (x: unknown) => x as Error)
+    await s.close()
+  })
+
+  it('驱动错误的 message 是抛异常的访问器 → brokenTx 仍必须落标记（不得静默提交）（CR 第五十五轮 major）', { timeout: 90_000 }, async () => {
+    // 探针形态：INSERT 的拒绝是 Error，但 `message` 是抛异常的访问器。旧实现先求
+    // `e.message` 再交给 safeValueText —— 求值这一步就抛，`brokenTx.set` 从未执行；
+    // 回调吞掉失败后 COMMIT 照常下发，而 DuckDB 已把事务标成 aborted（写入被静默丢弃）。
+    const real = await import('@duckdb/node-api')
+    const weird = new Error('原始失败')
+    Object.defineProperty(weird, 'message', {
+      configurable: true,
+      get() { throw new Error('message 读取炸了') },
+    })
+    let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (armed && (sql.startsWith('INSERT INTO') || sql === 'SELECT 1')) throw weird
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    armed = true
+    const out = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }]).catch(() => {})
+    }).then(() => 'committed' as const, (e: unknown) => ({ rejected: e as Error }))
+    expect(out, '事务已被废 → COMMIT 必须被拒，不能报成功').toHaveProperty('rejected')
+    expect((out as { rejected: Error }).rejected.message, '点名事务已被标成 aborted')
+      .toMatch(/aborted|事务未提交/)
+    await s.close()
+  })
+
   it('错误对象的 message 读取本身会抛 → 补话包层必须能构造出来（CR 第五十二轮 major）', { timeout: 90_000 }, async () => {
     // 探针形态：`message` 是抛异常的访问器 —— 第一段 try 的赋值失败后，catch 里再读
     // `e.message` 拼包层又会抛，调用方拿到的是那个 TypeError，原值与恢复动作一起丢光。
