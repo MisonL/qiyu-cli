@@ -861,7 +861,11 @@ describe('query --sql · 参数与错误分派（spec §十一）', () => {
     expect(String(e.hint), '不得再引导向 store init（对非 DuckDB 文件是死路）').not.toContain('store init')
   })
 
-  it('文件已损坏（截断 / 页校验和不对）→ 同一份「已损坏」hint，且不把损坏说成「不是 DuckDB 文件」', { timeout: 60_000 }, async () => {
+  it('文件已损坏（截断 / 页校验和不对）→ 同一份「已损坏」hint，且不把损坏说成「不是 DuckDB 文件」', { timeout: 180_000 }, async () => {
+    // ⚠️ 预算 180s（原 60s）与 store.test.ts 同因：`makeCorruptDb` 每种损坏都要 spawn
+    // 一个新 node 进程建真库（本进程建库会命中实例缓存、损坏不可见），新进程各付一次
+    // 原生绑定冷启动（高负载实测 10–34s/次），本用例循环两种损坏。60s 会假红成
+    // 「损坏成因归错了」；判据（kind/hint 逐字）本身不变。
     // 2026-11-05：损坏是第三种成因 —— 此前落进 sandbox 的兜底「请确认文件存在且由本 CLI
     // 创建（store init）」，而对损坏文件原地跑 store init 同样打不开。
     const { makeCorruptDb } = await import('../fixtures/corrupt-db.js')
@@ -1239,7 +1243,10 @@ describe('query --table · 成功路径（spec §六/§十）', () => {
     expect((meta().mask_warnings as string[]).some((x) => /extra_col/.test(x))).toBe(true)
   })
 
-  it('目录里的对象多于沙箱默认 1000 行时照样认得存在的表（CodeRabbit + Codex PR#78 实测）', async () => {
+  // ⚠️ 显式放宽到 120s（2026-11-16 实测）：本用例要真造 1100+ 张表，本机负载 800+ 时
+  // 30s 默认超时必爆（CI 与本机低负载下 ~20s）。这是"造大夹具"的固有代价，不是回归。
+  it('目录里的对象多于沙箱默认 1000 行时照样认得存在的表（CodeRabbit + Codex PR#78 实测）',
+    { timeout: 120_000 }, async () => {
     // `OBJECT_KINDS_SQL` 是全目录扫描；`SandboxSession.run` 缺省 `limit: 1000`，一个 1100+ 对象的
     // 库会把它截断、`truncated: true`，排在截断之后的声明表就被误报成「缺表」（修复前实测）。
     // ⚠️ 必须**真的**造出 1100+ 对象（Codex PR#78 第二轮 P2）：只 seed 25 张声明表时目录

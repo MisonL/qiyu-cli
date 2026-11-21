@@ -333,9 +333,9 @@
     "envelope": "A",
     "verified": true
   },
-  "robot.session.chat": {
-    "dangerous": false,
-    "note": "成功路径未实测（2026-10-30）：`msg` 传字符串返回 `{code:14004, message:\"body内容json解析错误\"}` —— 必须传**对象** `{\"msgType\":\"text\",\"msgBody\":{\"content\":\"…\"}}`（此前已实测记录；厂商文档把 msg 标成 type:string，是错的）。⚠️ 该接口**不是只读**：会话不存在时会**自动创建真实会话**并返回 sessionId，成功采样会向生产机器人写入会话数据（且未命中 FAQ 时 sessionId 会轮换）—— 故未继续采样。dangerous:false 只表示非破坏性，不代表无副作用。"
+    "robot.session.chat": {
+    "dangerous": true,
+    "note": "成功路径未实测（2026-10-30）：`msg` 传字符串返回 `{code:14004, message:\"body内容json解析错误\"}` —— 必须传**对象** `{\"msgType\":\"text\",\"msgBody\":{\"content\":\"…\"}}`（此前已实测记录；厂商文档把 msg 标成 type:string，是错的）。⚠️ 该接口**不是只读**：会话不存在时会**自动创建真实会话**并返回 sessionId，成功调用会向生产机器人写入会话数据（且未命中 FAQ 时 sessionId 会轮换）—— 故未继续采样。**2026-11-19 改判 `dangerous: false → true`**：此前登记为 false 并附注「只表示非破坏性、不代表无副作用」，但 §5.2 对 `dangerous` 的定义是「**写**/破坏性操作 → 需要 --yes」—— 它会写（自动建会话），且同族的 `robot.session.create` 就是 true。误分类的代价是一次不动声色的生产写入被门禁放行，因此按定义收口，`--yes` 门禁自此生效。"
   },
   "robot.session.commonQuestions": {
     "dangerous": false,

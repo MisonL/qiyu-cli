@@ -4,7 +4,8 @@
 // ⚠️ fixtures 全合成：13800001111 是明显的测试号码，不使用任何真实企业数据。
 import { describe, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest'
 import { it, captureSinks } from '../helpers/capture.js'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { copyFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { dbCommand } from '../../src/commands/db.js'
@@ -12,7 +13,6 @@ import { missingTableCauses } from '../../src/query/errors.js'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { shellArg } from '../../src/core/shell.js'
 import { TABLES, MIGRATIONS } from '../../src/store/schema.js'
-import { OBJECT_KINDS_SQL } from '../../src/commands/store-precheck.js'
 import type { Store } from '../../src/store/types.js'
 
 // DuckDB 冷启动偶发 >5s（与 tests/commands/sync.test.ts 同款放宽）。
@@ -20,60 +20,76 @@ import type { Store } from '../../src/store/types.js'
 // （本机负载高时实测 10–34s），vitest 默认 10s 会先把它判超时。
 vi.setConfig({ testTimeout: 15_000, hookTimeout: 60_000 })
 
-// ⚠️ **整个文件只用一个库文件**（2026-11-13 性能改造）。原先是 `beforeEach` 里
-// `mkdtemp` 新目录、每条用例各建一个库 —— 而 `@duckdb/node-api` 的实例缓存**按路径**
-// 生效（`tests/fixtures/corrupt-db.ts` 记着这条），换路径就等于每次都付一次
-// 「打开 + 25 张表迁移」。实测（本机负载 88）：新建库 ~500–800ms/条，
-// 同路径「DROP 全部表 + 重新迁移」~140ms/条，冷启动只付一次。
-// 语义不变：每条用例开始前库都被重置成「刚 init 完」的状态（见 `resetDb()`），
-// 包括会篡改 schema 的用例（删表、删列）—— 它们留下的破坏也一并清掉。
-//
-// ⚠️ **已知边界**（2026-11-14，历史审查 PR#72 复核）：单库路径换来的是「一条用例超时后，
-// 它仍在跑的异步操作会与下一条的 `resetDb()`（DROP + 迁移）交错」。vitest 不会取消已超时
-// 用例的执行，而本文件不为此设防 —— 代价是偶发的、报错点可能落在**下一条**用例上。
-// 不改成「每条用例独立路径」是因为那要重新付冷启动与迁移的全价（见上段实测）。
+// ⚠️ **每条用例一个库文件，从"热模板"复制**（2026-11-15，历史审查 PR#72 收口）。
+// 演进史：① `beforeEach` 里 `mkdtemp` 新目录各建库 → 每条都付「打开 + 25 表迁移」
+// （本机负载 88 实测 ~500–800ms/条）；② 全文件单库 + 每条 `DROP 全部表 + 重新迁移`
+// （~140ms/条），代价是**已知边界**：用例超时后它仍在跑的异步操作会与下一条的
+// `resetDb()` 交错（vitest 不取消已超时用例的执行），破坏可能落到**下一条**头上；
+// ③ 现在：`beforeAll` 建一次模板库（冷启动 + 迁移只付一次），`beforeEach` 把模板
+// **复制**成本条的 `q-<n>.duckdb`（复制 ~ms 级，不跑迁移、不重开冷启动）。
+// 于是"上一条的尾巴写坏了下一条的夹具"这条路**不存在**了：尾巴写的是它自己那个文件。
 let dir = ''
 let out = ''
 let err = ''
-const dbPath = (): string => join(dir, 'q.db')
+/** 模板库：`beforeAll` 建好（跑完全部迁移）后只读，`beforeEach` 从它复制。 */
+const templatePath = (): string => join(dir, 'template.duckdb')
+let testSeq = 0
+/**
+ * 用例 → 它自己那条库文件的路径。
+ *
+ * ⚠️ 必须绑在**用例的异步上下文**里，不能"每次调用读全局当前序号"（CodeRabbit + Codex
+ * PR#81 major，Codex 真库探针复现）：上一条用例超时后 vitest **不会取消**它的执行，
+ * 它恢复后若再调一次 `dbPath()`，读到的是**下一条**的序号 —— 于是它打开的 `q-2.duckdb`
+ * 正是下一条的夹具，文件级隔离当场失效（探针：旧续执行删掉了下一条的 tickets）。
+ * 绑进 ALS 后，恢复的旧用例读到的仍是**它自己**那条路径。
+ * `currentDb` 只给 hook（不在用例上下文里）用。
+ */
+const alsDb = new AsyncLocalStorage<string>()
+let currentDb = ''
+const dbPath = (): string => alsDb.getStore() ?? currentDb
 
 /**
- * 把库恢复成「刚 store init 完」：删掉全部表（含用例中途建的 `rogue_table`）再迁移。
+ * 注册用例并把**本条路径**绑进它的异步上下文（见 `alsDb` 的注释）。
+ * ⚠️ 用它替代裸 `it`：`it(name, body)` 的 body 在 `alsDb.run(currentDb, …)` 里执行，
+ * 后续 `await` 链（含定时器回调）都带着同一条路径。
+ */
+const itBound: typeof it = ((name: unknown, ...rest: unknown[]) => {
+  // ⚠️ 包**第一个函数实参**，不能假定"执行体在最后一位"（CodeRabbit PR#81）：
+  // vitest 还有 `it(名, 执行体, 超时)` 重载，那时最后一位是数字，按 last 取会拿不到执行体、
+  // 于是它**不套 ALS 绑定** —— 超时用例恢复后又读到下一条的库路径。
+  const at = rest.findIndex((x) => typeof x === 'function')
+  if (at >= 0) {
+    const fn = rest[at] as (...a: unknown[]) => unknown
+    rest[at] = (...a: unknown[]) => alsDb.run(currentDb, () => fn(...a))
+  }
+  return (it as unknown as (...x: unknown[]) => unknown)(name, ...rest)
+}) as typeof it
+
+/**
+ * 把本条的库恢复成「刚 store init 完」：从模板复制覆盖。
  *
- * ⚠️ **只给真正用库的用例调用**，不放进 `beforeEach`（2026-11-13 实测）：本文件有
- * 三条用例根本不碰 `q.db`（两条「库不存在 / 空库 / 他人库」用的是各自的路径，
- * 一条是纯参数错误），给它们也重置一遍等于凭空加 3×140ms。放进 `beforeEach`
- * 首次实测反而比改造前更慢（10.3s → 13.5s）。
+ * ⚠️ 保留这个函数名是因为它被 26 处调用（每条用例开头「重置夹具」的语义没变），
+ * 但实现从「DROP 全部表 + 重新迁移」换成了**整文件复制** —— 幂等、便宜，
+ * 且不会与任何仍在跑的旧操作共享同一个文件。
  */
 async function resetDb(): Promise<void> {
-  const s = await createDuckDbStore(
-    { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
-  try {
-    // 表名用 `query()` + `information_schema` 取（`tableNames()` 只列声明过的表，
-    // 而「多一张表」那条用例会建 `rogue_table`，它也必须被清掉）。
-    const names = (await s.query(
-      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'`))
-      .rows.map((r) => String(r.table_name))
-    // ⚠️ 同一名字可能是 view（本文件有「声明表被换成同名 view」的用例）：`DROP TABLE` 对
-    // view 报 `Catalog Error: Existing object tags is of type View`，于是破坏会**留到下一条
-    // 用例**（单库路径的已知边界，见文件头）。先按非基表删，再兜底按表删。
-    const kinds = new Map((await s.query(OBJECT_KINDS_SQL)).rows.map((r) => [String(r.table_name), String(r.table_type)]))
-    for (const n of names) {
-      if (kinds.get(n) !== 'BASE TABLE') await s.query(`DROP VIEW IF EXISTS "${n}" CASCADE`)
-      await s.query(`DROP TABLE IF EXISTS "${n}" CASCADE`)
-    }
-    await s.init()
-  } finally {
-    await s.close()
-  }
+  copyFileSync(templatePath(), dbPath())
 }
+
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-db-'))
-  // 冷启动只付一次：`beforeAll` 里先建好库，后续每条用例的 `resetDb()` 走同路径快路径。
-  await resetDb()
+  // 冷启动与迁移只付一次：建**模板库**（25 张表全建好），之后每条用例复制它。
+  const s = await createDuckDbStore(
+    { backend: 'duckdb', path: templatePath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+  try { await s.init() } finally { await s.close() }
 })
-beforeEach(async () => {
+beforeEach(() => {
+  testSeq += 1
+  currentDb = join(dir, `q-${testSeq}.duckdb`)
+  // 每条用例拿到**自己的库文件**：上一条用例超时后仍在跑的异步写，写的是它自己那个
+  // 文件，碰不到本条的夹具（PR#72 的原始顾虑就此消失，不再是"已知边界"）。
+  copyFileSync(templatePath(), currentDb)
   out = ''; err = ''
   captureSinks((s) => { out += s }, (s) => { err += s })
   vi.stubEnv('HOME', dir)   // 隔离真实 ~（配置文件与默认库路径都走 HOME）
@@ -82,7 +98,17 @@ beforeEach(async () => {
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs()
 })
-afterAll(() => { rmSync(dir, { recursive: true, force: true }) })
+afterAll(async () => {
+  // ⚠️ 清理**不得让本文件失败**，但也不能静默（历史审查 PR#73）：Windows 上 DuckDB 的
+  // `closeSync()` 未及时释放句柄时，`rmSync` 会 EBUSY/EPERM —— 那是临时目录残留，
+  // 不是测试结论，所以降级成 stderr 提示。实测已确认 `beforeAll` 抛错时 `afterAll`
+  // **仍会执行**（临时用例：beforeAll 抛错 → 打印 `afterAll 执行了`），所以"setup 失败
+  // 就没人清理"的说法不成立；剩下的只是句柄时序。
+  try { rmSync(dir, { recursive: true, force: true }) } catch (e) {
+    process.stderr.write(`[db.test] 临时目录清理失败（可安全忽略，路径：${dir}）：`
+      + `${e instanceof Error ? e.message : String(e)}\n`)
+  }
+})
 
 const data = (): Record<string, unknown> => JSON.parse(out).data
 const meta = (): Record<string, unknown> => JSON.parse(out).meta
@@ -134,7 +160,7 @@ async function seed(): Promise<void> {
 }
 
 describe('db tables', () => {
-  it('db tables 输出 25 表 + 行数 + 粒度 + PII 列 + notice', async () => {
+  itBound('db tables 输出 25 表 + 行数 + 粒度 + PII 列 + notice', async () => {
     await resetDb()
     await seed()
     expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
@@ -170,7 +196,7 @@ describe('db tables', () => {
     expect(m.warnings).toEqual([])
   })
 
-  it('time_range 按 timeColumn 计算；sessions 的 epoch-ms 转上海 ISO；无时间列 → null', async () => {
+  itBound('time_range 按 timeColumn 计算；sessions 的 epoch-ms 转上海 ISO；无时间列 → null', async () => {
     await resetDb()
     await seed()
     expect(await dbCommand(['tables', '--db', dbPath()])).toBe(0)
@@ -192,7 +218,7 @@ describe('db tables', () => {
     expect(byName.get('staff')!.time_range).toBeNull()
   })
 
-  it('声明与实况不一致（删一张表 / 多一张表）→ meta.warnings 点名，rows 不编造', async () => {
+  itBound('声明与实况不一致（删一张表 / 多一张表）→ meta.warnings 点名，rows 不编造', async () => {
     await resetDb()
     const s = await fresh()
     try {
@@ -237,7 +263,7 @@ describe('db tables', () => {
     expect(text).not.toMatch(/需重建库或重新同步/)   // 重新同步单独无法重建被删表
   })
 
-  it('声明的表被换成同名 view → db tables 不执行它、照常成功并点名（与 store status 同口径）', async () => {
+  itBound('声明的表被换成同名 view → db tables 不执行它、照常成功并点名（与 store status 同口径）', async () => {
     // 2026-11-14（PR #74 合并后自查）：`information_schema` 把 view 也算作表，`db tables`
     // 对声明名做 `SELECT COUNT(*) FROM "<name>"` 时会把 view 本体当查询执行 —— view 的底表
     // 被删/不可读时整条命令报 `query_error` 退出 2，而 `store status` 早已改成「只数基表、
@@ -265,7 +291,7 @@ describe('db tables', () => {
     expect(text).toContain('tags')
   })
 
-  it('同名 view 只差大小写（"TAGS"）也必须被认出、不得被执行（Codex PR#76）', async () => {
+  itBound('同名 view 只差大小写（"TAGS"）也必须被认出、不得被执行（Codex PR#76）', async () => {
     // DuckDB 标识符大小写不敏感：`"TAGS"` 会被 `"tags"` 解析到，元数据里的名字保留 `TAGS`。
     await resetDb()
     await seed()
@@ -286,7 +312,7 @@ describe('db tables', () => {
     expect((meta().warnings as string[]).join('\n')).toContain('TAGS')
   })
 
-  it('非基表的列不得冒充基表的列集：与声明不同的 view 列只算它自己的（2026-11-15）', async () => {
+  itBound('非基表的列不得冒充基表的列集：与声明不同的 view 列只算它自己的（2026-11-15）', async () => {
     // 2026-11-15：`columnsOf` 按名字取全库列集，同名 view 的列会被当成「该表实际的列」——
     // 列名一致时让「缺列」warning 静默；不一致时则凭空造出「多列/少列」漂移，两边都是
     // 对一个**根本没被计数**的对象做列核对。列核对的来源只能是基表。
@@ -312,7 +338,7 @@ describe('db tables', () => {
     expect(text, 'view 的列不得被当成 tickets 的列去造漂移').not.toMatch(/表 tickets 实际/)
   })
 
-  it('声明的时间列被删 → db tables 仍成功，该表 time_range 为 null + warning（不硬失败）', async () => {
+  itBound('声明的时间列被删 → db tables 仍成功，该表 time_range 为 null + warning（不硬失败）', async () => {
     await resetDb()
     await seed()
     const s = await createDuckDbStore(
@@ -337,7 +363,7 @@ describe('db tables', () => {
     expect(text).toMatch(/startTime/)
   })
 
-  it('时间列的脏值不进 time_range，且逐表给 warning（正确性 P1）', async () => {
+  itBound('时间列的脏值不进 time_range，且逐表给 warning（正确性 P1）', async () => {
     await resetDb()
     await seed()
     const s = await createDuckDbStore(
@@ -376,7 +402,7 @@ describe('db tables', () => {
     } finally { rmSync(clean, { recursive: true, force: true }) }
   })
 
-  it('形态判据两端锚定：尾部垃圾与纯日期也算脏值，不进 time_range（CodeRabbit 终审 minor）', async () => {
+  itBound('形态判据两端锚定：尾部垃圾与纯日期也算脏值，不进 time_range（CodeRabbit 终审 minor）', async () => {
     await resetDb()
     await seed()
     const s = await createDuckDbStore(
@@ -398,7 +424,7 @@ describe('db tables', () => {
       .toMatch(/时间列 stat_date 有 2 个值不符合约定形态/)
   })
 
-  it('epoch-ms 列的非数字值是脏值，必须计数并警告（CodeRabbit 复审：SQL 三值逻辑回归）', async () => {
+  itBound('epoch-ms 列的非数字值是脏值，必须计数并警告（CodeRabbit 复审：SQL 三值逻辑回归）', async () => {
     await resetDb()
     await seed()
     const s = await createDuckDbStore(
@@ -417,7 +443,7 @@ describe('db tables', () => {
       .toMatch(/时间列 startTime 有 2 个值不符合约定形态/)
   })
 
-  it('db describe 的时间范围同样排除脏值并逐列警告（正确性 P1）', async () => {
+  itBound('db describe 的时间范围同样排除脏值并逐列警告（正确性 P1）', async () => {
     await resetDb()
     await seed()
     const s = await createDuckDbStore(
@@ -436,7 +462,7 @@ describe('db tables', () => {
     expect((meta().warnings as string[]).join('\n')).toMatch(/时间列 hour_ts 有 1 个值不符合约定形态/)
   })
 
-  it('db tables 也核对列集：多列/少列进 warnings（审查 I-3，README 承诺不静默）', async () => {
+  itBound('db tables 也核对列集：多列/少列进 warnings（审查 I-3，README 承诺不静默）', async () => {
     await resetDb()
     await seed()
     const s = await createDuckDbStore(
@@ -460,7 +486,7 @@ describe('db tables', () => {
     expect(sessions.pii_columns).not.toContain('rogue_col')
   })
 
-  it('未知参数 / --pretty / 值位缺失 → usage 退出码 2；--help → 0', async () => {
+  itBound('未知参数 / --pretty / 值位缺失 → usage 退出码 2；--help → 0', async () => {
     expect(await dbCommand(['tables', '--db', dbPath(), '--bogus'])).toBe(2)
     expect(errorOf().kind).toBe('usage')
     expect(err.length).toBeGreaterThan(0)          // usageFail 双通道：stderr 文本
@@ -501,7 +527,7 @@ describe('db tables', () => {
     }
   })
 
-  it('库不存在 → store_not_initialized + hint 指 store init', async () => {
+  itBound('库不存在 → store_not_initialized + hint 指 store init', async () => {
     expect(await dbCommand(['tables', '--db', join(dir, 'missing.db')])).toBe(1)
     let e = errorOf()
     expect(e.kind).toBe('store_not_initialized')
@@ -558,7 +584,7 @@ const SESSIONS_PII = ['payload', 'userPhone', 'userName', 'userEmail',
 const sessionsDef = (): (typeof TABLES)[number] => TABLES.find((t) => t.name === 'sessions')!
 
 describe('db describe', () => {
-  it('同名 view（底表已删）→ 不执行它、退出 0、只出声明元数据并点名（与 db tables 同口径）', async () => {
+  itBound('同名 view（底表已删）→ 不执行它、退出 0、只出声明元数据并点名（与 db tables 同口径）', async () => {
     // 2026-11-15：此前 describe 只看表名在不在，`COUNT(*)` 执行 view → Catalog Error →
     // 退出 2，报文还把 view 定义里的底表名说成「表不存在」。
     await resetDb()
@@ -586,7 +612,7 @@ describe('db describe', () => {
     expect(JSON.parse(out).error, '不得回显 view 定义里的底表名').toBeUndefined()
   })
 
-  it('db describe sessions：7 键逐列 + sensitive/observed_enum/时间列/row_count/PII 列', async () => {
+  itBound('db describe sessions：7 键逐列 + sensitive/observed_enum/时间列/row_count/PII 列', async () => {
     await resetDb()
     await seed()
     expect(await dbCommand(['describe', 'sessions', '--db', dbPath()])).toBe(0)
@@ -633,7 +659,7 @@ describe('db describe', () => {
     expect(meta().warnings).toEqual([])
   })
 
-  it('无时间列 → time_column/time_range 均 null；meta 恒有 notice / warnings / field_notes', async () => {
+  itBound('无时间列 → time_column/time_range 均 null；meta 恒有 notice / warnings / field_notes', async () => {
     await resetDb()
     await seed()
     expect(await dbCommand(['describe', 'schema_version', '--db', dbPath()])).toBe(0)
@@ -651,7 +677,7 @@ describe('db describe', () => {
     expect(m.warnings).toEqual([])
   })
 
-  it('未知表 → usage 2 + 候选（sessons → sessions）；缺表名 / 多余位置参数 → usage 2', async () => {
+  itBound('未知表 → usage 2 + 候选（sessons → sessions）；缺表名 / 多余位置参数 → usage 2', async () => {
     await resetDb()
     await seed()
     // 拼错一个字符 → 候选来自 TABLES（不裸透 DuckDB 英文）。
@@ -699,7 +725,7 @@ describe('db describe', () => {
     expect(out.startsWith('{\n  "ok": true,'), 'db describe --pretty 必须缩进').toBe(true)
   })
 
-  it('实际列集与 TABLES 不一致 → meta.warnings 点名多列/少列；列清单仍以声明为权威', async () => {
+  itBound('实际列集与 TABLES 不一致 → meta.warnings 点名多列/少列；列清单仍以声明为权威', async () => {
     await resetDb()
     const s = await fresh()
     try {
@@ -720,7 +746,7 @@ describe('db describe', () => {
     expect((data() as DescribeOut).columns.map((c) => c.name)).toContain('userCrmInfo')
   })
 
-  it('R5：声明有但库中无 → 仍输出声明元数据（row_count/time_range null）+ warning，退出码 0', async () => {
+  itBound('R5：声明有但库中无 → 仍输出声明元数据（row_count/time_range null）+ warning，退出码 0', async () => {
     await resetDb()
     const s = await fresh()
     try {
@@ -758,7 +784,7 @@ describe('db describe', () => {
     expect(meta().notice).toBe('本数据库包含客户 PII；不要将其写入日志或对外报表')
   })
 
-  it('声明的时间列被删 → 退出码 0、time_range null、row_count 照常、warnings 点名该列', async () => {
+  itBound('声明的时间列被删 → 退出码 0、time_range null、row_count 照常、warnings 点名该列', async () => {
     await resetDb()
     await seed()
     const s = await createDuckDbStore(
@@ -788,7 +814,7 @@ describe('db describe', () => {
     expect(text).toMatch(/startTime/)
   })
 
-  it('time_range 覆盖 iso-day 与 iso-instant 两种 kind', async () => {
+  itBound('time_range 覆盖 iso-day 与 iso-instant 两种 kind', async () => {
     await resetDb()
     await seed()
     // iso-day（daily_overview.stat_date）
@@ -807,7 +833,7 @@ describe('db describe', () => {
       { min: '2026-09-15T09:00:00+08:00', max: '2026-09-16T09:00:00+08:00' })
   })
 
-  it('iso-instant 按解析时刻取极值，不按字典序（CodeRabbit 终审 minor）', async () => {
+  itBound('iso-instant 按解析时刻取极值，不按字典序（CodeRabbit 终审 minor）', async () => {
     await resetDb()
     await seed()
     const s = await createDuckDbStore(
@@ -836,7 +862,7 @@ describe('db describe', () => {
     expect((meta().warnings as string[]).join('\n')).not.toMatch(/不符合约定形态/)
   })
 
-  it('库不存在 / 空库 / 他人库 → store_not_initialized，hint 指 store init 或换 --db', async () => {
+  itBound('库不存在 / 空库 / 他人库 → store_not_initialized，hint 指 store init 或换 --db', async () => {
     expect(await dbCommand(['describe', 'sessions', '--db', join(dir, 'missing.db')])).toBe(1)
     let e = errorOf()
     expect(e.kind).toBe('store_not_initialized')
@@ -873,9 +899,69 @@ describe('db describe', () => {
     expect(e.hint).toMatch(/换 --db 路径/)
   })
 
-  it('--help 不接受额外参数（describe --help --bogus → usage 2）', async () => {
+  itBound('--help 不接受额外参数（describe --help --bogus → usage 2）', async () => {
     expect(await dbCommand(['describe', '--help', '--bogus'])).toBe(2)
     expect(err).toMatch(/未知参数/)
     expect(errorOf().kind).toBe('usage')
+  })
+})
+
+describe('夹具隔离（历史审查 PR#72 收口）', () => {
+  itBound('前一条的延迟续执行只碰它自己的库文件，碰不到后一条的夹具', async () => {
+    // ⚠️ **单条自包含**（Codex 第七轮 P2）：旧形态拆成两条、靠模块状态与真实执行顺序串起来，
+    // 用 `-t` 只筛后一条时前置状态不存在、断言全部空转（实测「1 passed」什么都没验证）。
+    // 现在两条「用例」都在本条里用 `alsDb.run` 上下文**显式造出**，不依赖 vitest 的顺序与超时。
+    const ownDb = currentDb
+    const firstDb = join(dir, 'iso-first.duckdb')
+    const secondDb = join(dir, 'iso-second.duckdb')
+    copyFileSync(templatePath(), firstDb)
+    copyFileSync(templatePath(), secondDb)
+    let pathSeenByTail = ''
+    let tail!: Promise<void>
+    try {
+      // —— 前一条用例：在它自己的异步上下文里改坏自己的库，并留一条「超时后恢复」的续执行 ——
+      await alsDb.run(firstDb, async () => {
+        const s = await createDuckDbStore(
+          { backend: 'duckdb', path: dbPath(), readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+        try { await s.query('DROP TABLE "sessions"') } finally { await s.close() }
+        // 定时器在**当前 ALS 上下文里**创建 → 恢复时仍带着前一条的路径（与真实超时用例同形）。
+        tail = (async () => {
+          await new Promise<void>((r) => { setTimeout(r, 30) })
+          // 「恢复后重新取路径」：模拟超时用例继续执行时的 `dbPath()` 调用。
+          pathSeenByTail = dbPath()
+          // 写也用回调自己解析的路径：ALS 失效时它落到后一条夹具，下面的 25 表断言当场变红。
+          const t = await createDuckDbStore(
+            { backend: 'duckdb', path: pathSeenByTail, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+          try { await t.query('DROP TABLE "tickets"') } finally { await t.close() }
+        })()
+      })
+      // —— 后一条用例的 beforeEach：全局已切到新夹具（模板复制）——
+      currentDb = secondDb
+      const early = await dbCommand(['tables', '--db', secondDb])
+      expect(early, '尾巴落地前后一条都该是好的').toBe(0)
+      out = ''   // captureSinks 是**追加**语义：同一条用例里跑第二条命令前必须清缓冲
+      await tail
+      expect(await dbCommand(['tables', '--db', secondDb])).toBe(0)
+      expect((data().tables as TableOut[]).map((t) => t.name), '上一条删掉的表不得消失').toHaveLength(25)
+      // ⚠️ 判据绑的是**回调自己解析的路径**：把 `dbPath()` 改回读全局（去掉 ALS）时这条变红，
+      // 后一条夹具的 tickets 也会被删掉（下一句变红）—— 两条一起证明隔离真的成立。
+      expect(pathSeenByTail, '延迟续执行必须仍读到它自己那条路径（不得读到后一条的）').toBe(firstDb)
+      // 反过来确认「前一条真的把破坏留下了」—— 否则本条通过也可能只是因为它没动手。
+      const broken = await createDuckDbStore(
+        { backend: 'duckdb', path: firstDb, readOnlyRetryMs: 30000, batchSize: 1000 }, 'rw')
+      try {
+        const names = (await broken.query(
+          "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"))
+          .rows.map((r) => String(r.table_name))
+        expect(names, '前一条的库里确实少了 sessions/tickets（证明破坏真的发生了）')
+          .not.toContain('sessions')
+        expect(names).not.toContain('tickets')
+      } finally { await broken.close() }
+    } finally {
+      // 断言中途失败也必须把尾巴抽干（否则 cleanup 删目录后它才开库 → unhandled rejection）。
+      // 尾巴可能还没被创建（前一条的建库就抛了）—— 不能让 finally 自己再抛一次掩盖原始失败。
+      await (tail ?? Promise.resolve()).catch(() => { /* 尾巴失败是它自己的事，原始断言错误优先 */ })
+      currentDb = ownDb
+    }
   })
 })

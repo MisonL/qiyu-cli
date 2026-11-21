@@ -8,11 +8,11 @@
 // 子 vitest 文件（A 留尾巴、B 验证没收到），因为 vitest 会在测试文件之间重载本助手模块，
 // 世代状态必须挂在 `globalThis` 上才跨得过去。
 //
-// ⚠️ 已知边界（CodeRabbit 2026-11-14 major 的实测裁决）：**hook 里的延迟写入没有世代**
-// （`beforeEach`/`afterEach` 不在执行体的 `alsGen.run` 里），会被当成「当前世代」接收 ——
-// 实测 A 的 `beforeEach` 里 80ms 后落地的尾巴进了 B 的 `out`。本文件的守卫**选不出来**
-// （加一条也是绿），所以没有假装有守卫；要覆盖它得给 27 个文件的 hook 也套世代，超出范围。
-// 已逐文件 grep：现有用例的 hook 里没有延迟输出。
+// ⚠️ hook 里的延迟写入本来没有世代（`beforeEach`/`afterEach` 不在执行体的 `alsGen.run` 里），
+// 实测 A 的 `beforeEach` 里 80ms 后落地的尾巴会进 B 的 `out`。**这条边界 2026-11-16 改由
+// 静态守卫关闭**（Sourcery PR#72 + PR#81 五轮收敛）：`capture.test.ts` 禁止用了
+// `captureSinks` 的文件在四类 hook 体里出现调度原语（定时器 / 微任务）—— 所以本文件
+// （以及全仓）的 hook 只做同步事，延迟写入一律写在用例体里（用例体有世代，尾巴会被丢弃）。
 import { describe, expect, beforeEach, vi } from 'vitest'
 import { it, captureSinks, startCapture } from './capture.js'
 

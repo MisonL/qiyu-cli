@@ -7,348 +7,335 @@
 
 ## [0.2.3] - 2026-11-14
 
-> **材料已备，未 tag、未 npm publish，待授权。** tag / publish 完成后再把本行改成发布事实
-> （参照 0.2.2 段的写法：tag 指向的提交、npm 沙箱安装实测结果），并把文末
-> `[0.2.3]` 的基址从 `compare/v0.2.2...HEAD` 换成 `compare/v0.2.2...v0.2.3`（与既往发版一致）。
+> **材料已备，未 tag、未 npm publish，待授权。** tag / publish 完成后本行改为发布事实，
+> 并把文末 `[0.2.3]` 的基址从 `compare/v0.2.2...HEAD` 换成 `compare/v0.2.2...v0.2.3`。
 
 ### 新增
 
-- **`api call` 调用未实测信封的接口时，成功与错误信封都如实声明 `unverified_endpoint: true`**：
-  注册表 154 条里 73 条危险接口有 72 条从未观测过响应信封（`verified:false`、`envelope:null`），
-  但 `verified` 此前**只在 `api list` 输出**、`callOne` 从不读它 —— Agent 不先跑
-  `api list --all` 就完全不知道「这次的 `not_found` 判定、`data` 解包与错误分类只是按文档推的」。
-  后果不是抽象的：200 响应里没有载荷键时，信封未实测的接口不判 `not_found` ——
-  「空 `data` 是什么意思」没人观测过，`envelope.ts` 记着 `deleteKnowledges` 的空数组
-  其实是「全部删成功」，按读接口判据会被报成「什么都没删」。图例逐字写明这个边界，
-  以及仍会置位的那个例外（`message` 能解析成 JSON 且为空，同时带 `warning`）。
-  现在**所有错误出口也带**（Codex 2026-11-13 P2：只在成功路径声明、而图例明说错误分类也
-  只有文档依据，等于自相矛盾）：业务错误、`needs_confirmation`、用法错误的 `error` 里都有
-  `unverified_endpoint` 与 `endpoint`，**包括 `byId()` 之前就返回的那几条**（如 `--body`
-  不是合法 JSON，CodeRabbit 2026-11-13 minor）。
-  错误路径与成功路径口径不同：**已定位的接口在错误信封里显式给 `true | false`**
-  （成功路径仍只在未实测时输出，避免对所有人变成噪音），Agent 不必去猜「键不出现」的意思。
-  `api call` 的所有用法错误出口（重复 `--body`、未知参数、位置参数、`--body` 缺值/非法 JSON、
-  凭证缺失）都经同一个 `failCall()` 带上它。
-  实现时抓到并修掉一个**语义反转**：`fail()` 里曾把 `verified` 直接赋给 `unverified_endpoint`，
-  于是已实测接口输出 `true`、未实测输出 `false`，与成功路径正好相反 —— 由新加的
-  双向用例当场发现。
-  图例同步收窄两处原本说过头的话：不再暗示「键不出现 = 该接口实测过」（未知 id 时同样不出现），
-  也不再写「一律不判 not_found」（宽松分支仍会置位）。
-  判据收敛为单一实现点 `unverifiedOf(spec)`，只在未实测时输出（已实测的接口不带，避免噪音）；
-  守卫覆盖两个方向（`ticket.finish` 未实测必须带、`export.session` 实测必须不带）
-  与三条错误出口，变异（删实现 / 改无条件 / 逐个拆出口）均实测变红。
-
-### 文档
-
-- **README 可读性重构**：`## 当前状态` 只讲交付情况（skill 图例 / body 校验 / 输出格式 /
-  `api list` 形态搬进 `## 输出契约`）；`status` / `range_status` 两张表的长说明移到表下；
-  `## 配置凭证` 拆成四节并把权限规则重写成「一条判据 + 三档成因表 + 例外」。事实与守卫短语
-  零变更（逐关键词核对过），全文无超过 300 字符的行。
+- `api call` 调用未实测信封的接口时，成功与业务错误信封都带 `unverified_endpoint`，标明
+  `not_found` 判定、`data` 解包与错误分类只有文档依据（74 条危险接口中 73 条未观测过响应）。
 
 ### 修复
 
-- **目录查询显式放大上限、截断即拒**（2026-11-15，CodeRabbit + Codex PR#78）：`OBJECT_KINDS_SQL`
-  是全目录扫描，而查询沙箱缺省只回 1000 行 —— 对象多于此的库里，排在截断之后的声明表会被误报成
-  「缺表」（Codex 实测：1100 张无关表 + 目标表 → `query --table` 报 `store_not_initialized`）。
-  沙箱路径的目录读取收敛到 `catalogRows()`：显式 `limit: 10000`（`run` 的上限），仍截断则报
-  `internal` 而不是把截断页当完整目录。经 `openGuardedSession` 的那次存在性预检
-  （`db tables` / `db describe` / `query` / `stats fields` 共用）原先是裸 `session.run()`，
-  同样受 1000 行上限约束，已一并收编（Codex PR#78 第二轮 P1）。
-- **限频闸门只看「本次真正要调用」的端点**（2026-11-15，Sourcery PR#58 复核）：fetch 前按
-  `gateEndpoints` 全部声明键预检，会把本次根本不调用的端点冷却也算成失败 —— 实测
-  `ticket.template.fields` 冷却 + 模板列表为空时，`dim.ticket_template_fields` 一发请求都不发
-  就被记成 `failed` + `rate_limit_local`，空快照本该删掉的旧字段行继续留着。现在引擎只预检
-  主端点（常见成因仍在发请求前失败），次要端点由 `callPaced` 在**调用前**有界等待/拦截；
-  被冷却端点拦下时记 `rate_limit_local` 而不是 `fetch_failed`。
-- **`sync run` 的 `write_failed` 点名「不是基表」并给出重建动作**（2026-11-15）：落库目标被同名
-  view 取代时，DuckDB 只回 `Catalog Error: … is not an table`，此前 gap 的 `detail` 只包成
-  「落库失败（底层：…）」—— Agent 会反复重跑必然失败的同步。现在明确说「本 CLI 的声明表在库里不是
-  基表（view 等，写入被库拒绝）」并给出与 `sync verify` 同款的「备份 → 换新路径 `store init` →
-  `sync run`」恢复动作（带本次档名、占位符附替换契约、不指回出问题的文件）；普通落库失败文案不变。
-- **`query --table` / `stats fields` 遇同名 view 不再执行它**（2026-11-15）：此前两者只查表名在不在，
-  一条底表已删的 view 会被执行，报「列 stat_date 在库中不存在」/「列 payload 不存在」，把 view 定义里的
-  对象说成漂移。现在报 `store_not_initialized`「同名对象不是基表（view 等），本命令未执行它」，并给出
-  「备份后换新路径重建库 + `sync run`」的恢复动作（`<新路径>` 占位符附带替换契约）。
-- **`db describe` 遇同名 view 不再执行它**（2026-11-15）：此前只看表名在不在，一条底表已删的
-  view 会让 `COUNT(*)` 执行它 → Catalog Error → 整条命令退出 2，报文还把 view 定义里的底表名
-  说成「表不存在」。现在与 `db tables` / `store status` / `sync verify` 同口径：只出声明元数据
-  （`row_count` / `time_range` 为 null），在 `meta.warnings` 点名「不是基表」。
-  同时修掉 `db tables` 的一处同类缺陷：同名 view 的列此前被当成「该表实际的列」做漂移比对
-  —— 列名恰好相同时让「缺列」warning 静默、不相同时凭空造出「多列/少列」；列核对的来源现在
-  只取基表。
+- **存储层事务安全**：归属闸门下沉到唯一的语句派发点（原始 SQL 的解析判据同样先判归属，
+  外部链的解析不再被记到事务所有者的账上）；按令牌统计在途语句与未完成的写操作，阻止提前
+  `COMMIT`；`query` 下发事务控制（按 DuckDB 解析出的语句类型判定，含 `END` / `ABORT` /
+  `START` / 注释前缀 / 多语句 / **`EXPLAIN ANALYZE` 里层**）一律拒收，多语句现在与关键字初筛
+  **无关地**先解析（`A; B` 的第一条会被驱动先执行掉），解析结果在 `close()` 之后才交回时不再
+  在已关闭连接上预编译；`COMMIT` 结果未知时报「可能已落库、不要直接重试」并**当场退役**连接（重新创建后
+  先核对数据再决定是否重放）；`ROLLBACK` 自身有界，收尾超时先 `interrupt()` 再放弃
+  （不中断会让原生线程占住、进程再也退不出）。`sync run` 遇到退役时交回原始失败与恢复动作，
+  不再让「关闭重建」的通用提示覆盖「核对后再重放」的指令，也不会因为重试把主失败换成退役文案。
+- 提交被拒、收尾又退役时，那条拒绝错误也带 `code: store_retired`（编排层按它识别实例不可用）。
+- **主失败在任何形态下都不丢**：回调抛出的错误即使被冻结（只读）也能带上「回滚未能确认」与
+  「重建 → 核对 → 再重放」（包一层并保留 `cause`，不再变成赋值失败的 TypeError）；退役后的
+  默认提示也不再声称「未提交的写入不会落库」（该状态的准确含义就是无法确认）。
+- 回调拒绝的值**连文本都转不出**（如 `Object.create(null)`，`String()` 自身会抛）时，回滚未确认的
+  补注不再让那个转换动作换掉主失败：原值仍挂在 `cause`，「重建 → 核对 → 再重放」与
+  `store_retired` 状态照常交回。
+- `sync run` 不再在**清锁事务**丢失 COMMIT 回执时谎报 `complete`（此前把它当「次生失败」吞掉，
+  而实例已退役、写者锁可能仍留着）：读水位成功说明实例此前可用，此后清锁事务的首次退役属本次
+  运行自己的失败，按「提交结果未知」交回并要求先核对。
+- 补记同步缺口的事务自身丢失 COMMIT 回执（首次让实例退役）时，交回的错误同时保留原始窗口失败与
+  「缺口记录可能没落库、后续窗口写不进」，不再无条件用原始失败顶掉这条退役事实。
+- 驱动把 `COMMIT` 以**非 Error 值**（如 `null`）拒绝时，仍按「提交结果未知、可能已落库、不要直接
+  重试」交回（此前读 `.kind` 会抛 `TypeError`，把整段恢复指令换掉）。
+- `ROLLBACK` 的拒绝值恰好是 `undefined` 时不再被当成「已整体回滚」：收尾状态按显式的拒绝标志判，
+  回滚未确认的事务照常补「事务也许仍然开着、实例已退役」与「先核对再重放」。
+- 错误对象的 `message` 是抛异常的访问器时，补话包层仍能构造出来（原对象挂在 `cause`），
+  不再让读取消息的二次异常顶掉主失败。
+- 错误对象的 `kind` 若是抛异常的访问器，补话包层仍能构造出来（按「无 kind」补 `internal`、
+  原对象挂在 `cause`）—— 此前第二次读取会把原失败换成 `TypeError`。
+- **退役是两层重试判据的最高优先终止条件**：回滚未确认的撞锁失败会保留 `kind: store_locked`
+  并打上 `code: store_retired`；此前 `sync run` 只按 kind 判「撞锁可重试」，会再碰已退役的实例、
+  把主失败换成「Store 已退役」。现在 `isTransient` 与 `storeRetryable` 先看退役标记。
+- **退役连接上一条语句都不再发出**：事务与自动事务的入口直接拒绝（此前会先发 `BEGIN`，
+  失败路径再把原错误换成「回滚未确认」）；回滚收尾的事务状态探针在退役状态下直接给出保守
+  答案，`COMMIT` 结果未知后的收尾路径也不再在已退役连接上查询 `txid_current()`。探针超时 /
+  失败后补发 `interrupt()` —— 关闭连接不会取消原生任务，挂住的状态查询会把进程留在后台。
+- `sync run` 的取数失败在补记缺口时撞上实例退役，交回的错误保留**原始取数失败**与「先核对
+  再重放」，不再被「缺口记录未落库」的退役文案顶掉（六处补记缺口的调用点统一走主失败优先
+  的合并规则）。
+- **事务失效性探针有界**：语句执行期报错后问连接「事务是否已废」（`SELECT 1`）的那次探测
+  直接走原生连接、此前没有超时 —— 原生线程被上一条失败语句占住时，这条拒绝永远交不回调用方，
+  回滚收尾（连同 `ROLLBACK` 自己的有界预算）根本没机会开始，整个事务 API 挂死。现在探针
+  50ms 有界、超时补发中断，并按「无法证明事务未失效」的保守侧处理（只影响是否拒绝提交，
+  不换掉交回的原错误）。
+- **无法解析语句数时拒绝派发**：`extractStatements` 失败曾被当成「放行、让驱动给原文」——
+  真驱动探针实测：首次解析异步失败、随后放行时，`CREATE TABLE a; CREATE TABLE b` 两条都被
+  驱动逐条执行。现在解析失败即拒（原生错误挂 `cause`）。语句类型判定（`prepare`）失败同样即拒：
+  拿不到类型就无法证明这条语句不含事务控制，旧实现会把它当成「分类成功」放行给驱动。
+- **`ROLLBACK` 放弃前补发一次中断**：驱动把 ROLLBACK 拆成准备与执行两段，第一次 `interrupt()`
+  可能落在进入原生执行之前、被随后的准备阶段清掉 —— 只发一次在慢准备下等于没中断，原生线程
+  会把进程占死。放弃前再补一发（与在途数据语句的收尾同款）。
+- 错误对象的 `hint` / `kind` 不是字符串（例如 `Symbol`）时按「缺失」处理：「回滚未能确认」的
+  包层不再因为模板拼接 `Symbol` 抛 TypeError 而丢掉主失败与恢复动作。
+- **`EXPLAIN` 里的字面量不再误拒 **：`EXPLAIN ANALYZE SELECT 'COMMIT'` 与注释里的关键字不
+ 执行，旧判据匹配整条原文、把合法只读诊断报成 usage；现在先剥掉字符串 / 引号标识符 /
+ 行注释 / 块注释 / dollar 引用再匹配（事务控制不可能藏在字面量里执行，判据不放宽）。
+- **`BEGIN` 在执行前就被拒时不再退役整个实例 **：`beganTx` 在发出 BEGIN 之前登记（兜住
+ 「原生已成功、结果交回才拒」），驱动的拒绝若发生在原生执行之前，事务根本没开过 ——
+ 现在收尾时问一次连接（两次 `txid_current()` 同值才是有活动事务），确认没开 → 按
+ 「无可回滚」交回原错误、实例继续可用；探针失败 / 有事务 → 保守退役（行为不变）。
+- 回归钉住：`COMMIT` 在执行前就被拒（事务可能仍开着、实例已退役）时，未提交写入随连接关闭
+ 丢弃 —— 重开库核对为零行，与「可能已落库」的措辞不矛盾。
+- **「回滚未能确认」的状态不再写进调用方的错误对象 **：回滚状态属于这次事务尝试，不属于那个
+ `Error` —— 同一个 `Error` 被回调跨 Store / 跨事务复用时，A 的 `code: store_retired` 与
+ 「本实例已退役」会被 B（回滚已确认、实例仍可用）原样继承。现在一律包一层：原错误挂在
+ `cause`，`code` / `kind` / `hint` / `retryable` 只写在新对象上；原错误自带的重试建议仍排在
+ 「先核对」之后。冻结对象、getter + 空 setter、`revoked Proxy` 这些「写外部对象会炸或静默丢」
+ 的形态因此结构性消失。
+- 回调抛出的拒绝值是 ** 已撤销的 Proxy** 时（`instanceof` 在它上面会抛 TypeError），「回滚未能确认」
+ 的包层仍能构造：原值挂在 `cause`，`store_retired` 与「先核对再重放」照常交回。
+- `COMMIT` 的归因不再读拒绝值上的 `kind`（访问器可抛、驱动对象也能伪造同名字段）：本地派发前
+ 的关闭守卫用身份集合登记，驱动拒绝一律按「提交结果未知」退役。
+- 语句失败后探测到事务已废时，即使驱动的 `message` 是抛异常的访问器，aborted 标记也照常落下
+ —— 回调吞掉失败后不会再出现「COMMIT 报成功、写入被静默丢弃」。
+- 驱动错误 ** 连文本都转不出 **（如 `Object.create(null)`）时，事务仍被标记为 aborted：状态标记
+ 先于措辞，拼接文案的异常不再让一次已中止的事务被当成成功提交；`sync run` 的取数 / 落库 / gap
+ 五处失败说明同样改走安全转换 —— 上游抛出的拒绝值转不出文本时仍照常记 `fetch_failed` gap，
+ 不再让 `TypeError` 顶掉整次运行。
+- 事务收尾的等待预算改用单调时钟，系统时钟被 NTP 步进时不再把 5 秒预算拉长或缩短。
+- `sync run` 补记缺口的事务 ** 首次 ** 退役时，摘要改用那条错误自己的成因（可能是「回滚未能确认」，
+ 而不是「COMMIT 已下发」）—— 恢复动作不再指向一次并不存在的提交。
+- **「回滚未能确认」不再与「已整体回滚」同形 **：事务回调失败且 `ROLLBACK` 未能确认时，交回的
+ 诊断（包层，原错误在 `cause`）在 message / hint 上补「回滚可能没执行、写入状态不可信」与
+ 「重建实例 → 核对 → 再决定是否重放」；自动事务与显式事务两条路径一致，提交被拒的那条拒绝
+ 错误同样自带该恢复动作。回调拒绝的不是 `Error`（字符串等）时也一样：包一层并保留 `cause`，
+ 不再把原值与「已确认回滚」混成同一种交回；`store init` 的迁移抛出无 `kind` 的普通错误时，
+ 该恢复动作也不会在命令出口被通用文案覆盖。弃等在途语句前会补发一次 `interrupt()`（一次中断可能落在语句真正
+ 开始执行之前），长跑进程里事务结束后的令牌状态也会被清空（此前失败路径会累积）。
+- 事务回调里 `close()` 之后调用事务对象的方法，报「数据库连接已关闭」（`usage`），与 Store
+ 自身方法同一分类（此前报「事务已结束」，两种退出码）。
+- ** 事务失效性探针超时后不再与回滚赛跑 **：探针（`SELECT 1`）超时并补发中断后，再有界等它
+ 交回；仍未交回时按「连接可能仍被它占用、`ROLLBACK` 无法安全发出」交回「回滚未能确认」并
+ 跳过 `ROLLBACK` —— 不再把「回滚根本没轮到」误报成「回滚失败」后错误退役。
+- 事务状态探针在 ** 每次 ** 原生 `txid_current()` 派发前复核连接状态：`close()` / 退役落在两次
+ 探针之间时，不再向已关闭的连接发探测语句（此前第二次探针的报错会被当成事务状态结论）。
+- `sync run` 的失败判据对 ** 任意拒绝值 ** 安全：`code` / `kind` / `hint` / `retryable` 统一经
+ 安全读取，`null` 或访问器抛异常的拒绝值不再让判据自己抛 `TypeError`、顶掉原始失败与恢复
+ 指令（此前 `releaseLock` 读 `code`、限频分派读 `kind` 都会踩到）。
+- `robot.session.chat` 改判 `dangerous: true`（它会自动创建真实会话），`--yes` 门禁生效。
+- 与声明表同名的 **view 不再被当作表执行 **：`db tables` / `db describe` / `query --table` /
+ `stats fields` / `sync verify` / `store status` 只认基表；「同名」按 DuckDB 规则大小写不敏感。
+- 目录查询显式放大行上限、截断即报错，不再把截断页当完整目录（对象多于 1000 个时曾误报缺表）。
+- 限频闸门只预检本次真正调用的端点，空快照不再被记为失败。
+- `sync run` 落库目标不是基表时点名成因，并给出「备份 → 换新路径重建 → 重新同步」的恢复动作。
+- `--since` 带相对时长时，区间终点不再取决于解析耗时（同一条命令的窗口数不再随机器快慢漂移）。
+- `npm ci` 不再打印 `Cannot find module .../dist/postinstall.js` 堆栈；`postinstall` 照常按文件路径执行。
+- 历史 PR 审查收口：查询 / 存储 / 元数据、同步与调度、注册表与图例、skill / 凭证 / CLI 输出的
+ 数十处契约问题修正（陈旧文案、错误归因、跨命令口径分叉），逐条经复现与回归验证。
+- **`EXPLAIN` 里的 `CASE … END` 不再被误当成事务控制**：事务控制的初判先剥掉成对的
+ `CASE…END`（从最内层剥、可嵌套，有界迭代到不动点）再匹配关键字 ——旧判据把 `END` 当
+ `COMMIT` 的同类，`EXPLAIN ANALYZE SELECT CASE WHEN … THEN … END` 这类合法只读诊断被误拒。
+未加引号的标识符 `case` 只会让初判**放行**，真正的事务控制仍由 `prepare` 的语句类型兜底
+ （`EXPLAIN ANALYZE COMMIT` 照常拒）。
+- **解析 / 预编译期就废掉的事务，回调吞掉错误后也不得报成功**：DuckDB 在 `prepare` 期做
+常量折叠与 table-function 参数求值，`range(CAST('x' AS BIGINT))` 的 Conversion Error
+在**派发之前**就把整条事务标成 aborted；旧实现把这次拒绝当普通失败交回，回调吞掉后
+ `COMMIT` 被驱动静默改成 `ROLLBACK`，写入丢失。现在分类失败时在事务所有者的在途登记内
+问一次连接（`usage` 拒绝不问），探针确认已失效才打 `brokenTx` 记号；交回的仍是
+ **原始解析错误**。
+- **事务失效探针「超时那一刻在途」≠「收尾时仍占用连接」**：探针 50ms 超时之后、回调返回
+之前自己交回的形态，旧判据只看 `stuck` 会为一个已经结束的探针跳过 ROLLBACK 并错误退役。
+现在额外记「原始 promise 已落定」，收尾只对**收尾此刻仍未交回**的探针跳过 ROLLBACK。
 
-- **历史 PR 审查意见的逐条复核与收口（2026-11-14）**：把 73 个已合并 PR 的 128 条审查线程
-  （40 条未标记解决）+ 审查正文逐条拿到当前代码上核实，**只修仍然成立的**：
-  · **`store` 连接封锁外部访问**：DuckDB 默认 `enable_external_access=true`，而此前只有查询
-    沙箱设过这一项 —— 打开来源不明的库时，同名的 `tags` view 会作为 `COUNT(*)` 的本体以用户
-    权限读外部文件（实测）。现在建连即设 `false`；`store status` 只数**基表**，同名 view 进
-    warnings（「库有漂移只警告不失败」仍是承诺）；基表的 COUNT 失败**不**降级 —— view 已在
-    计数前按类型排除，走到 COUNT 的都是基表，数不出来就是真错，按 spec §8.2 报 internal / 退出码 1
-    （Codex 2026-11-14 P1：曾把它降级成 warning + 退出码 0，Agent 会以为拿到的是完整的 tables）；
-  · **他人库指纹**：`store init` 不再「有个能读的 `schema_version` 就当自己的库」——
-    只认三种「本 CLI 不可能产出」的形态（`schema_version` 缺 `version` 列 / 声明表存在但
-    `schema_version` 零记录 / 版本号高于最新迁移 / `schema_version` 不是基表而是 view）即拒绝
-    （同名异形表此前会被 `IF NOT EXISTS` 静默沿用；view 那条同时保证**不求值**它）；「声明表带声明外的列」**不**拒（schema 漂移按既有契约只警告，
-    首版把它也判成他人库，全量回归当场误伤用户改过的库）；`schema_version` 是 view 时
-    连 `MAX(version)` 都不求值（否则 view 本体被当成查询执行）；
-  · **只有主键列的表 upsert**：`schema_version` 的 `DO UPDATE SET` 空子句此前是
-    `Parser Error`，改为 `DO NOTHING`；返回值同时改为「前后行数差」，冲突行一行没写就不再
-    报成写了 1 行（`Store.upsert` 的契约原文是「实际写入行数」，Codex 2026-11-14 P2）；
-  · **配置顶层不是对象**：`42` / `null` 此前被静默当成空配置回落默认库（`null` 还变成
-    「用法错误」退出码 2），现在明确拒绝；
-  · **网络重试不再绕过本地限频预算**：令牌只在进入重试循环前取一次，一次逻辑调用能发 3 个
-    请求（`limit:1` 的接口）—— 收敛成唯一出口 `acquireToken()`，每次出站都过它；
-    14003 重签不在其列（那是未执行的鉴权重试）；
-  · **只读库打开有界**：打开调用一直不返回（网络盘 / 卡住的锁等待）时截止时间此前永远到不了，
-    `store status` 会无限挂住 —— `retryWithBackoff` 增加单次尝试上限，**两条只读入口都传**
-    （`store` 与 `query` 沙箱；此前只改了一半，`qiyu query` / `db tables` / `stats` 仍会无限挂），
-    超时与撞锁同归 `store_locked`；被放弃的尝试只在本次重试落定后交回清理（复用同一 promise
-    时不会把已返回的连接关掉，同一连接也只关一次），单次尝试上限再被剩余总预算夹住，
-    不会在 30s 预算里等到近 60s；预算耗尽后（`sleep` 比 `intervalMs` 长得多、时钟被推过
-    deadline）不再发起新的打开；建连后加固 `SET` 失败时连接与实例一起关（只关实例会泄漏锁持有者）；
-    超时计时器**不 unref**（尝试本身不持有活跃句柄时，
-    unref 计时器会让 Node 直接退出、超时永远报不出来），清理回调抛错也只吞不崩；
-  · **`sync status` 等子命令的重复取值参数**：静默覆盖前一个值，而 `store` / `query` /
-    `sync run` 都拒绝 —— 统一报用法错误；
-  · `auth` / `api` 的 `--help` 错误码清单补上真实会出现的 `config_invalid`。
+- **事务控制改回词法判据，分类不再预编译**（Codex第十四轮 P2）：旧实现为取 `statementType`
+对触发初筛的 SQL调 `prepare(0)`，而 DuckDB在 prepare期就会求值 table function参数 ——
+真驱动探针实测 `SELECT * FROM range(nextval('s'))`在分类路径上序列前进两格（结果2行、
+下一次 nextval=3；基线是1行/2），自动提交下还会以内部断言「read-only but has made
+ changes」失败、把合法查询变成 internal错误。判据改为「剥掉字面量/注释后的句首词法」
+ （`BEGIN|COMMIT|ROLLBACK|END|ABORT|START TRANSACTION`，真驱动枚举过全部 type=10写法，
+不含 `PREPARE TRANSACTION`），`EXPLAIN`包装剥掉后判里层；分类不再碰连接。
+由此 `EXPLAIN ANALYZE SELECT 1 AS start`等合法别名不再被误拒（旧判据在包装里搜关键字）。
+**根因还有一层**：`execSql`一直把默认参数 `[]`传给驱动，而空数组是 truthy ——驱动据此走
+`runUntilLast`（extract + prepare + bind）路径，**每条无参语句都被预编译**。现在无参语句
+不再传数组（驱动走原生一次性查询，语义相同、不预编译）。
+- **失效探针未交回时拒绝新语句**（Codex第十四轮 P2）：探针超时且中断后仍未交回，连接
+仍被它占着；回调 catch掉原错误再 `await count()/query()`时，新语句排在后面永不交回，
+回调与回滚收尾一起挂死。现在 `execSql`在派发前同步判「最近一次探针未交回」并拒绝
+（txControl由 `closeTx`自行处理），让回调可以返回、由收尾退役实例。
+- **收尾三态的 `none`与 `unconfirmed`不再混说**（Codex第十四轮 P2）：ROLLBACK真的执行、
+只是回执被拒，活动事务探针确认连接上已无事务时 `closeTx`返回 `none`（实例未退役）；
+旧拒绝文案把所有非 `confirmed`都写成「该连接已退役」并打 `store_retired`，而同一实例
+随后还能成功查询。现在只有 `unconfirmed`才退役；`none`的文案与 hint如实说「连接上
+已无活动事务、实例仍可用，但写入是否落库无法从本连接确认」。
+- **事务失效探针各记各的账**（CR第六十七轮 major）：同一事务里两条在途语句先后失败会各自起一次
+探针；「已交回」原用一个共享布尔，旧探针交回会把**仍挂住的新探针**记成已结束 →收尾发出
+ ROLLBACK、排在挂住的探针后面超时，把「探针挂住」误报成「回滚未确认」。现在按代次锁存：
+只有**最近一次**探针的交回/超时能改状态；用例（两条失败语句 +显式闸门）与变异（退回共享布尔）均已验证。
+- **嵌套块注释按 DuckDB 规则完整剥离**（Codex 第十五轮 P2）：DuckDB 的块注释可以嵌套（真驱动
+  探针 2026-11-21：`/* outer /* inner */ COMMIT */ SELECT 1` 返回 `{v:1}`）；第六十七轮引入的
+  词法判据在「到第一个星号加斜杠为止」的剥离器上会把内层之后的 `COMMIT */ SELECT` 当成代码，
+  把合法查询误拒成 `usage`。现在按深度消费到配平的星号加斜杠，嵌套注释里的 `COMMIT` /分号
+  不再影响事务控制与多语句两条判据。
 
-- **`sync verify` 不再把同名 view 当表计数**（2026-11-14，同轮自查第三处入口）：上面两条
-  修的是「列清单」，`sync verify` 还会对任务表做 `COUNT(*)` —— 一条与声明表同名的 view 会让
-  verify 整条落 `internal`（实测报文还把 view 定义里的底表名说成存储损坏、建议「备份重建」）。
-  现在先按对象类型过滤：非基表不计行数（`local_rows: null`）、快照任务也不为它发上游请求，
-  `drift` 新增 `not_base_table`（README 图例与 `field_notes` 同步），`detail` 给出确认对象类型
-  与「换新路径重建库再 `sync run`」的完整命令。未修的边界：`sync run` 写同名 view 仍报
-  `write_failed`（写入本就无法成功；实测 detail 里只有底层 DuckDB 原文
-  `Catalog Error: tags is not an table`，不点名「不是基表」）。
+### 文档
 
-- **「同名」按 DuckDB 的标识符规则比对（大小写不敏感）**（2026-11-14，Codex PR#76）：DuckDB
-  的标识符大小写不敏感 —— 一条 `"TAGS"` view 会被 `"tags"` 解析到并执行，而元数据里的名字
-  保留 `TAGS`，此前的精确比较会漏掉它、继续执行 view 本体。判据收敛到
-  `src/store/object-kinds.ts`（唯一实现点，`store/` 不得 import `commands/`），
-  `store status` / `store init` / `db tables` / `sync verify`，以及 `store init` 的他人库指纹
-  （`"SCHEMA_VERSION"` view）、`schemaVersionMissing` 的存在性判据（大写表名同样算存在）
-  一律走它（`"TAGS"` 与 `"tags"` 视为同名）。只折叠 ASCII 字母：`"ticKets"`（U+212A）与
-  `"tickets"` 在 DuckDB 里是两个对象，用 `toLowerCase()` 会误折叠成同一个名字。
-  同轮（Codex PR#76 第三轮）补齐两处**同一规则没跟上的下游**：`SCHEMA_VERSION_COLUMNS_SQL`
-  显式按小写名过滤，`"SCHEMA_VERSION"` 库查不到列 → 被误报「缺少 version 列」（实际列为空），
-  现在交给 DuckDB 解析器（目录表上不区分大小写）；`store init` 指纹里的列清单按精确表名取键，
-  同款误报，现已按 ASCII 折叠取键。`sync verify` 对「本地对象不是基表」的快照任务**不再**因
-  缺凭证报 `auth_missing` —— 那条路径根本不取上游，「缺凭证」是环境问题、会盖住本地可诊断的
-  `not_base_table` drift；所有选中的快照任务本地都不是基表时才放行结果。
-  再一轮（Codex PR#76 第四轮）把同一条规则贯通到**清单与漂移比对**：`store.tables()` 现在返回
-  声明的名字（`"SCHEMA_VERSION"` → `schema_version`，未声明对象原样返回），`tableByName` 与
-  「声明有而库中无 / 库中有而声明无」两侧都按同一规则匹配 —— 此前完整库被改名成大写
-  `schema_version` 时，`store status` 会在 `count` 上抛 usage（退出码 2），并把它同时报成
-  「声明有而库中无」与「库中有而声明无」、附「重建库」建议。
-
-- **`db tables` / `store init` 与 `store status` 同口径：只认基表**（2026-11-14，PR #74 合并后自查）：
-  上一轮只改了 `store status`，而同一份库里另外两条命令仍把 `information_schema` 里的 view
-  当自己的表 —— `db tables` 会对声明名 `SELECT COUNT(*)`、把同名 view 的本体当查询执行
-  （实测：view 底表被删 → `query_error`、退出码 2），`store init` 的成功输出则把一条 view
-  列进 `tables` 清单。现在三处都只列/只数基表，非基表进 `meta.warnings`（`nonBaseTablesWarning`
-  唯一渲染点），README 承诺的「两边数量应当一致」才成立。测试夹具的 `resetDb()` 同步改成
-  「先按非基表 `DROP VIEW`，再 `DROP TABLE`」（view 残留会污染下一条用例）。
-
-- **`--since` 带相对时长时，区间终点不再取决于解析耗时**：`--since 1d` 的终点原本取自
-  `parseTimeArg` 内部的时钟，随后「未给 `--until`」又调了一次时钟 —— 两次 `Date.now()`
-  之间只要过去 ≥1ms，区间就从「1 天」变成「1 天 + ε」，`sliceByMaxWindow(…, 6, 1)`
-  于是切出**第二窗**（起点 = 终点−1 天，几乎与首窗重合）。它被合并窗机制计入 `contained`，
-  而覆盖窗失败时按 `skipped` 结算 —— 同一个 `sync run`，同一份凭证，`windows.total` 会是
-  1 或 2、`skipped` 会是 0 或 1，全看这两次读钟之间隔了几毫秒。
-  2026-11-11 CI 的 Node 24 job 因此拿到 `total: 2`（Node 20.12 / 22 与本机都是 1 ——
-  日志只证明它们没触发；推断是两次读钟落在同一毫秒，未做逐 job 的计时埋点）。
-  现在区间合成的整段只读一次时钟：`--full`、`parseTimeArg`、以及「缺 `--until` 时的终点」
-  共用同一个时刻，区间长度恰为用户要的时长，窗数不再随机器快慢漂移。
-  由同一时刻派生的提示（非日界 `--until` + 日对齐任务）也复用这个时刻做**复解析** ——
-  同一个 `--until` 必须解析出同一个边界，否则提示描述的日期与实际区间不同。
-  ⚠️ 但两条**预测引擎钳制**的提示（请求区间早于接口下界、末端上限）仍**当场读钟**：
-  引擎按任务执行时刻的 `nowOf(ctx)` 计算 `windowStartFloorDays` / `windowEndLimit`，
-  整轮同步跨过上海午夜时，用早先采样的时刻会把「午夜后就能拉到」误报成「永远拉不到」
-  （Codex 2026-11-12 P2）。读得越晚越接近引擎的判据；这一点是**近似**而非保证，
-  且没有测试覆盖（`runSyncRun` 的时钟没有注入缝，跨午夜无法确定性构造）。
-
-- **`npm ci` 不再打印 `Cannot find module .../dist/postinstall.js` 的堆栈**：
-  npm 的 `postinstall` 在 `prepare`（= `npm run build`）**之前**执行，而本仓库自己就是
-  那个包——于是在 `dist/` 尚未生成时，`node dist/postinstall.js || exit 0` 每次都先吐一段
-  MODULE_NOT_FOUND 再被 `|| exit 0` 吞掉（CI 三个 Node 版本 job 各一次，用户看到的是
-  「装依赖时报错了」）。
-  脚本改为**保留路径式真实入口、只在外层加存在性探测**：
-  `node -e "const f=require('node:fs'),c=require('node:child_process'),p='dist/postinstall.js';if(f.existsSync(p))try{c.execFileSync(process.execPath,[p],{stdio:'inherit'})}catch{}" || exit 0`。
-  ⚠️ 我们试过另一种写法（`node -e "existsSync(…)&&import('./dist/postinstall.js')"`），
-  **它能消噪声，但静默关掉了功能**：`node -e` 下 `process.argv[1]` 是 `undefined`，
-  `dist/postinstall.js` 的入口守卫 `isEntry()` 恒假 —— 文件被载入了，`mainEntry` 却一个
-  字节都不执行（实测：`~/.agents/skills/qiyu` 不产生；CodeRabbit 与 Codex 两路审查各自
-  独立发现）。所以载入必须**经文件路径**走 `execFileSync(process.execPath, [p])`，让
-  `isEntry()` 成立、真正的安装逻辑照常执行。
-  四组实测：`dist/` 在 → 正常安装（SKILL.md 落盘）；`dist/` 缺 → 静默退出 0、无噪声；
-  文件在但抛错 → 内层 `try/catch` + 外层 `|| exit 0` 双兜底仍 0（不阻断安装）；
-  `~` 下无任何 Agent 目录 → 只提示不建链（原「绝不越权写 home」语义不变）。
-  缺 `dist/` 的根因是 `postinstall` 在 `prepare`（= build）**之前**执行，本仓库自身即包；
-  这条 `postinstall` 只在全局安装真实触发（`npm_config_global` 判据在文件内部）。
+- README 可读性重构：当前状态、输出契约、配置凭证分节，事实与承诺不变。
+- `2026-10-10-请求构建与body校验` spec 补历史状态注：`--pretty` 与 `auth login` 均已实现。
 
 ### 测试
 
-- **审查意见复核带出的守卫收紧**（2026-11-14）：`sync-enums` 的任务层 `reason` 扫描从
-  「至少 N 处」改为**逐文件**断言（一个文件整段漏扫不再能被别处的命中凑数），并显式拒绝
-  模板串/计算值形态；`gate-keys` 的夹具改为按 endpoint 给出「让循环转起来」的最小数据
-  （此前一律回 `'[]'`，`ticket.log` / `ticket.template.fields` 从未被真实调用 → 覆盖断言
-  空真），并补上「每个任务至少一次真实调用」下限与「声明键没被观测」白名单；`query` 的
-  只读形态用例从「只看退出码」改为断言**真实列与行**；时区用例的 `Promise.all` 改为顺序跑
-  （`inZone` 改的是进程级 `TZ`，并发会让三个模块都在最后一个时区下初始化）；
-  `db.test.ts` 如实记录「单库路径 + 超时后残留操作交错」这一已知边界。
+- 并发静态守卫补：循环初始化里的同名绑定同样遮蔽外层 rest 参数（`for (const args of …)`），
+  hook 登记经 `.call` / `.apply` 触发时的 bind 预绑定回调（实参为数组的 apply 形态同样摊平）。
+- 并发静态守卫再补：计算键 `['__proto__']` 按**自有数据属性**收进模型（真 runner 探针
+  ——vitest 2.1.9，并发峰值——确认 describe / it 三种形态下计算键都不换原型、子用例串行；
+  非计算的 `__proto__:` 才是原型来源，对照 peak 2）；循环赋值目标（`for (setup of …)` 同样算
+  重绑定）；转存进容器的选项（`box.opts = opts` 之后经 `box.opts` 写穿同一对象）。
+- 撞锁用例的换轮循环在预算耗尽后显式停下；锁夹具三个入口在预算已过期时**不写脚本、不 spawn**
+  （此前负数预算下照样起子进程、到点才 kill，失败被报成「未就绪」）。
+- 锁夹具的 spawn 失败也等有界的 `close`：`error` 事件不等于 stdio 已关（Node 之后仍会发
+  close），未确认时交回「清理未确认」并把原始错误挂在 `cause` 上，不再让调用方提前删目录。
+- 新增 `tests/helpers/capture.ts`，按用例隔离 stdout/stderr 捕获，27 个测试文件迁移；
+  并发与 hook 延迟写入两类边界改由 AST 静态守卫关闭。
+- 每个 worker 进程只付一次 DuckDB 冷启动（`tests/setup-warm.ts`），预热失败降级、预算可配。
+- 跨进程锁夹具收敛为 `tests/helpers/lock-holder.ts`：等待改为贯穿用例的截止时刻，校验只把
+  真正的锁报文判为 `CONFLICT`；高负载下的假失败与超时一并修正。就绪信号只认 stdout 的
+  **换行收尾**的完整一行（stderr 里含库路径的启动报错、先到 `locked` 半行再到 `-failed\n`
+  的失败形态，都不再被当成「已拿到锁」）。
+- 采样器把逐条分发抽成可注入依赖的 `runCases`，「被拒的接口一个请求都不发」改由**真实主循环**
+  验证（校验必须是 `fetch` 之前的步骤）。
+- 并发静态守卫补：`switch` 的 `case` / `default` 子句里的同名声明同样遮蔽外层 rest 参数；
+  迭代对象是**名前绑定的数组**（`const list = [opts]; for (const item of list)`）时照常追踪
+  元素别名（初始化器解析加重入守卫，同一名字递归回来时保守放弃、不再栈溢出）。
+- 闸门用例的断言失败路径同样收尾：`finally` 里释放全部闸门、收回已启动的操作、关闭 Store
+  后才把断言失败交回 —— 此前挂起的原生语句会把用例拖到超时并污染后续用例。
+- `prepare` 失败用例钉住「确实走到类型判定」的前提并断言后续目录查询不被同一注入波及；
+  退役包装经命令出口 `thrownToExit` 渲染出 `retryable: false` + 「核对后再重放」hint 的完整
+  输出（引擎层断言到 Agent 之间的最后一段出口不再无人看守）；重型查询的中断用例先等查询
+  真正进入原生执行再返回（慢机上截止可能早于派发、中断会被驱动初始化清掉）。
+- 并发静态守卫补：命名 hook 回调按**登记所在作用域**解析（兄弟套件各声明一次同名 `setup`
+  时不再两份都不扫；同层重复声明按运行时语义取最后一次）；`for (item of [opts])` 这类
+  **既有变量目标**同样带出元素别名，而裸标识符目标只算重新绑定、不算写入（只读循环不再被
+  误判成「值已变」）；测试注册器的**本地别名**（`const check = it`）同样按登记处理；
+  `isMutated` 的结果按 (文件, 名字) 缓存，多个互不相关的循环源不再各自重跑全文件扫描。
+- captureSinks 的配置面守卫：仓库配置文件 / package 脚本 / 分片器不得启用
+  `sequence.concurrent`（全局并发下写入无法归属；正则本身带双向自检）。已声明边界：调用方
+  在命令行额外加 `--sequence.concurrent` 仍绕开静态扫描，使用该旗标时不得依赖 captureSinks。
+- 事务里程碑等待（`awaitMilestone`）在事务先失败/结束时立刻交回原始错误（此前裸等就绪信号，
+  回调在里程碑前抛错时只能等 90s 超时）；原生中断用例里事务内 `count` 的结局按调度接受
+  「先跑完 / 被中断 / 事务结束后才交回」三种确定形态；两段闸门用例的失败收尾改为**反复放闸**
+  直到全部操作落定（第二道闸门在第一道释放后才创建，放一遍会漏）；`SELECT 1` 失效探针挂住
+  的用例以「60s 超时」作 RED 证据（修复后毫秒级返回）。
+- 并发静态守卫补：`beforeEach.bind(null, setup)()` 的预绑定实参、套件体内声明的命名回调、
+  `{ __proto__: { sequential: true }, ...opts }` 的未知自有键可能覆盖继承声明（不再误判串行）；
+  完整属性链别名（`box.nested.opts`）、已解析命名回调的 hook 身份（被 await 的链
+  不再误报）、`apply`/静态展开的实参还原、原型已确定串行时收口（不再把合法串行套件报成并发）、
+  解构赋值左侧的重绑定目标；经容器属性读出的对象身份（`const box = { opts }; box.opts`）与「登记前被
+  重新赋值的 hook 回调」（无法静态确认时响亮报告，不静默放过）；同文件唯一命名回调下钻。
+- 并发静态守卫补：同文件唯一命名回调（`beforeEach(setup)` 下钻 setup 的函数体）、`for...of`
+  字面量元素建立的别名（`for (const item of [opts])`）；条件表达式分支里的别名、数组展开（`[...[opts]]` 容器复制但元素身份不变，
 
-- **`command-legends-reverse` 的 `sync verify` 不再真打外网**（2026-11-14，CI `test (22)` 连续
-  两次红）：该文件的 `beforeEach` 把凭证存根成 `k-test`/`s-test`，而 `sync verify` 不传任务时
-  会选中全部快照任务、逐条请求 `qiyukf.com` 核对行数 —— 用例耗时取决于跑 CI 那一刻的外网状况
-  （同一份断言实测 20.6s 与 40s 超时两种）。现在给这条用例打桩 fetch（只换「上游返回什么」），
-  并断言桩**真的被调用**（否则桩是死的、图例对 `expected_from_api` 的覆盖会静默退化成 null）。
-- **新增 `tests/helpers/capture.ts`：按用例隔离 stdout/stderr 捕获**（CodeRabbit 2026-11-13 major）。
-  27 个测试文件用模块级 `let out` + `beforeEach` 重置的模式挡得住「上一条的输出漏进下一条」
-  的**状态**，挡不住**写入方**：上一条超时后，它已发出、尚未 resolve 的异步调用会在下一条
-  开始之后才写 stdout（实测 `out="FRESHTAIL"`、`writes=2`）。归属按 `AsyncLocalStorage`
-  记录的**发起者**判，而不是按「此刻挂着的 spy」判 —— 延迟回调往往在运行时才查
-  `process.stdout.write`，那时挂着的是下一条用例的 spy。守卫含一条「尾巴在中间隔着的
-  用例期间落地」的用例与一条「用户 `restoreAllMocks` 之后仍能捕获」的用例，每条都自包含
-  （可 `-t` 单独选跑）；变异（改用「当前活动捕获」/ 安装桩退回布尔量）均实测变红。
-  另修两处实测问题：用户的 `afterEach(restoreAllMocks)` 之后助手会重装（原先一个
-  `installed` 布尔量会让它跳过安装、写入绕过缓冲）；文件结束时由顶层 `afterAll` 恢复 spy
-  （vitest 2.1.9 默认不跨用例恢复，不恢复会把下一个测试文件的写入记进最后一个缓冲）。
-  ⚠️ 实测：`afterAll` 里的断言在 vitest 2.1.9 只打印错误、**退出码仍为 0（用例算通过）**，
-  所以这类断言不能当守卫用 —— 改为在最后一条用例里测判据本身。
-  替身同时按 Node stream 契约把 `write(chunk, cb)` / `write(chunk, enc, cb)` 的回调调掉
-  （CodeRabbit 2026-11-13 major）：不调的话等待写入完成的用例只能超时。变异验证：
-  去掉回调 → 用例超时变红。
-  实测记录：vitest 2.1.9 默认 `restoreMocks:false`，跨用例不会自动恢复 spy。
+  `[...opts]` 才是复制）、`Reflect.deleteProperty` 也算写入、catch 的解构绑定同样遮蔽 rest、
+  timer 模块的默认导入；套件同写 `concurrent: false` 与 `sequential: false` 按串行判（不再误报并发）。
+- 锁夹具：`close` 的**到达时刻**与 deadline 分开比（截止定时器迟到、close 先交付时，seed 不再
+  把 exit 0 当按时完成、verdict 不报 OPENED 而报 TIMEOUT）；就绪信号必须被观察到在 `deadline`
+  之内（截止后才出现的 marker 不算）、失败描述统一带子进程 pid、子进程 close 未确认时保留夹具
+  目录；「夹具隔离」回归改为单条自包含用例，
 
-- **27 个测试文件迁移到 `captureSinks()`，模块级 `let out` 不再自己装 spy**。
-  每个文件只改三行：`it` 从 `vitest` 改为从 `./helpers/capture.js` 导入（包装版给每条用例
-  打上**世代号**）、`describe/it/expect` 其余照旧、`beforeEach` 里的两行
-  `vi.spyOn(process.stdout/stderr, 'write')` 换成一行 `captureSinks(…)`。归属按
-  `AsyncLocalStorage` 记录的**世代号**判：上一条用例的延迟尾巴属于旧世代，**一律丢弃**，
-  不会进下一条的 `out`。两个入口（`captureSinks()` 世代形态 / `startCapture()` 句柄形态）
-  共用同一份 spy 安装，避免两套实现各自漂移。
-  ⚠️ 边界：迁移形态的 sink 写的是**模块级** `out`，`it.concurrent` 的两条用例本就在写同一个
-  变量，任何归属都无法隔离它们；hook（`beforeEach`/`afterEach`）里的延迟写入也没有世代。
-  要并发隔离就用句柄形态（`startCapture()` + `cap.run()`）。
-  ⚠️ 迁移中实测到的坑：**不能**用「`process.stdout.write === activeSpy` 就跳过重装」做幂等 —
-  `vi.restoreAllMocks()` 还原到的是**上一层 spy**（正是本助手自己装的那个），身份判据成立
-  但写入落在旧闭包的 `sinks` 里，`out` 恒空（`cli.test.ts` 当场 11 条失败）。现在每次
-  `captureSinks()` 无条件重装。
-  变异验证三处：「世代判据恒真」→ 尾巴用例红（`expected 'BTAIL' to be 'B'`）；
-  「不调 write 完成回调」→ 回调用例超时红；「加回身份判据」→ `cli.test.ts` 11 条红。
-  ⚠️ 包装版 `it` 必须把 vitest 的别名形态全部挂上（`each` / `skip` / `skipIf` / `runIf` /
-  `only` / `todo` / `concurrent` / `fails`）：它们是登记函数的**属性**，裸箭头函数上没有。
-  首轮迁移漏了这一层，全量报两个「失败文件」，真实情况是 `config-insecure.test.ts`（`it.each`）
-  与 `auth.test.ts`（`it.skipIf`）在**收集阶段**就 `TypeError`、一条用例都没跑 ——
-  「失败文件数」在小全量里读不出严重性。别名实现只有一个实现点，两种形态共用：
-  直接登记（`it.skip(名, 体)`）与柯里化修饰（`it.each(表格)(名, 体)`）。
-  守卫用 `it.each` / `it.runIf(false)` / `it.skipIf(true)` / `it.todo` / `it.fails` 各跑一次
-  （条件必须真的决定成败，否则「条件被当成用例名丢掉」这条错法测不出来）；
-  变异：丢表格行转发 → `it.each` 两行红；别名不展开 → each 与两条条件用例红；
-  去掉 `skipIf` 别名 → 整个文件 `TypeError` 红。
-  ⚠️ 别名的**两类别名形态**必须分开处理（CodeRabbit 2026-11-14 major，探针实测确认）：
-  `skip` / `only` / `fails` / `concurrent` / `todo` 是**直接登记** —— 调用即把用例登记掉、
-  返回值 `undefined`，「拿返回值再包执行体」永远包不到，执行体跑在无世代上下文里；
-  `each` / `skipIf` / `runIf` 才是柯里化修饰。按键名分两组，不按首参类型猜（实测是等价变异）。
-  另修 options-first 重载 `it(名, 选项, 体)`（同轮 major）：只认第二实参时选项对象被当成执行体。
-  守卫让这两条的**尾巴真的落地**（`it.fails` / `it.concurrent` / options-first 各留 60ms
-  尾巴，下一条断言没收到）；变异：直接别名裸登记 → 两条尾巴用例红；去掉 options-first
-  分支 → 对应用例红。
-
-- **捕获助手第二轮审查的两条收口**（CodeRabbit 2026-11-14）：① `it(名, undefined, 体)`
-  也是 options-first 重载，选项位置为 `undefined` 时不能被当成「第二实参不是对象」拒绝；
-  ② 陈旧世代的写入在**句柄形态**下曾照样追加进最新句柄的 `fallback`，污染 `cap.out` /
-  `cap.writes` —— 现在 `cap.run()` 的显式归属优先，没有归属时才过世代判据。
-  两条都有尾巴落地的守卫，变异（不认 `undefined` / fallback 不过判据）各自变红。
-
-- **`tests/setup-warm.ts` 的预热失败只降级、不拖垮测试**（Codex 2026-11-14 P2）。
-  `@duckdb/node-api` 是 `optionalDependencies`，缺原生 binding 时 `setupFiles` 里的顶层
-  await 会抛 —— 那会让**所有**测试文件连收集都进不去，包括不碰数据库的、以及「缺依赖时
-  给安装指引」的那几条。现在预热失败只往 stderr 打一行降级说明，测试回到「谁先用谁付
-  冷启动」（慢一点，不是错）。
-  守卫**真跑一个子 vitest**（`NODE_OPTIONS=--import` 注入一个让预热抛错的全局量），
-  断言不碰数据库的用例仍然通过；变异（catch 里重抛）→ 子 vitest 失败、守卫红。
-  ⚠️ 子用例文件必须落在仓库 `tests/` 下：放在 /tmp 会因 `include` 过滤报
-  「No test files found」，退出码同为 1，看着像守卫通过。
-  子 vitest 用 `spawnSync` 的 `timeout` + `SIGKILL` 兜时间（同步等待打不断用例超时，
-  CodeRabbit 2026-11-14 major），失败诊断里带 `r.error`。
-  预热体抽成可导出的 `warmDuckDb()`，**临时目录创建也在降级范围里**（同轮 major：
-  `mkdtempSync` 失败原来绕过 catch）。这条单测直接调预热体 —— 走子 vitest 分不清是预热
-  还是 vitest 自身起不来（`TMPDIR` 指向文件时 vitest 在收集阶段就死）。变异：把
-  `mkdtempSync` 移出 try → 该用例红。
-  预热**有界**（Sourcery 2026-11-14）：setupFiles 在收集之前执行，原生绑定卡住时用例自身的
-  超时都还没生效 —— 整个 worker 挂死。现在 `Promise.race` 一个 `QIYU_WARM_TIMEOUT_MS`
-  （默认 120s）预算，超时按降级处理。⚠️ 这个定时器**不能** `unref()`：卡住的那一步若没有
-  别的 handle，事件循环里只剩它，unref 后直接「无活可做」退出，race 既不 resolve 也不
-  reject（实测：注入永不 resolve 的 await 后用例直接 60s 超时）。
-  预热体不再自己写 stderr，失败作为返回值交给 setup 入口（本文件被 setupFiles 加载时
-  `warmDuckDb` 的导入会先跑一遍预热，自己写 stderr 会让每次跑测试都多一行告警）。
-  `init()` 失败也会关库（不把文件句柄带进后续测试文件）；清理目录同样 best-effort。
-  ⚠️ Windows 上 Node 的 `os.tmpdir()` 读 `TEMP`/`TMP` 而不是 `TMPDIR`，守卫三个一起设。
-
-- **包装版 `it` 补上 vitest 的 `sequential` 与 `for`**（CodeRabbit 2026-11-14 major）。
-  不装的话调用点在**收集阶段** `TypeError`、整文件 0 条；而 `for` 与 `each` 同类（柯里化，
-  返回登记函数）—— 当成直接登记会丢表格行，执行体拿到上一层的函数、报
-  `function is not iterable`（实测）。
-  ⚠️ `it.extend` **刻意不装**：vitest 会解析执行体的源码文本校验 fixture 写法，而包装恰好
-  把执行体换成 `(...a) => f(...a)`，报 `The first argument inside a fixture must use object
-  destructuring pattern … Instead, received "..a"`。在包装下它用不了，不装反而给出更清楚的
-  `it.extend is not a function`。
-
-- **预热失败的注入改成固定模式**（Codex 2026-11-14 P2）：探针缝原先用
-  `new Function(环境变量里的代码)` —— 等于把「测试收集前以当前进程权限执行任意 JS」的能力
-  交给一个环境变量。现在只认 `throw` / `hang` 两个字面量。
-
-- **捕获助手的跨文件归属**（CodeRabbit 2026-11-14 major）：实测在 vitest 2.1.9 默认 isolation
-  下**不可达** —— 每个测试文件一个独立环境：`globalThis` 不共享（A 写的东西 B 读不到）、模块
-  重载、A 留的定时器随环境销毁。曾试着把世代状态挂到 `globalThis` 上共享，实测**跨不过去**，
-  已回退。⚠️ 这条**没有守卫**：执行顺序可以强制（临时 config + 升序 sequencer 已验证 A → B），
-  但即便顺序对了 B 也拿不到 A 的 Promise，「跨文件尾巴」构造不出来 —— 写守卫只能是假绿
-  （试过一条，钉上「B 必须拿到 A 的尾巴」后立刻红）。若将来改成单环境（`isolate: false`，
-  那也正是让预热能跨文件共享的配置），这条要重新评估。
-
-- **预热的超时边界如实收窄**（CodeRabbit 2026-11-14 major）：`Promise.race` 的预算只管
-  「一直不返回的 await」。原生绑定若**同步**卡住 JS 线程，同线程的定时器根本排不上队
-  （实测 400ms 忙等让 100ms 定时器一次没触发），进程内任何超时都拦不住 —— vitest 自己的
-  `testTimeout` 同样拦不住。把预热挪进子进程试过，**没有收益**（子进程暖的是它自己进程的原生
-  模块，worker 仍要自己加载；且 Node 自带 strip-types 解析不了源码里的 `.js` 说明符，要额外
-  引入 tsx 依赖），已回退并把这条边界写进文件头，**不放假守卫**。
-
-- **测试进程内只付一次 DuckDB 冷启动费（`tests/setup-warm.ts` + `setupFiles`）。**
-  实测：进程内**首次** `DuckDBInstance.create` 在空载时 438ms、本机高负载时 19–34s
-  （原生扩展加载 + 首次 mmap），之后同路径重开约 22ms。原先每个真库测试文件的首条用例
-  都要承担这段，`hookTimeout`/`testTimeout` 在这台机器上会直接超时。
-  现在 `setupFiles` 在**每个 worker 进程**开跑前建一个临时库、`init()`、关掉，用
-  `process` 级布尔量保证只做一次（`setupFiles` 在被测模块之前执行，且 worker 进程内跨
-  测试文件共享）。`globalSetup` 不行 —— 实测是**另一个进程**（探测 pid 45930 vs 51568），
-  预热的 native module 到不了 worker。子进程预热与模板库拷贝两条路也实测无效，理由见
-  `HANDOFF.md` §审计③。
-  收益：`tests/commands/db.test.ts` 从「首条用例常超时」变为稳定通过（A/B 各 2 轮：
-  改前 2/2 有首条超时失败，改后 2/2 全绿）；全量 2576 条在 load 511 下全绿。
-
-- **预热预算的环境变量做校验**（2026-11-14 独立审计）：`QIYU_WARM_TIMEOUT_MS` 原先直接
-  `Number()`。`'30s'` / 拼错的值是 `NaN`，而 Node 把 `NaN`/`Infinity` 当 **1ms**（`Infinity`
-  还会打 `TimeoutOverflowWarning`）—— 预热必然「超时」降级，每条告警都成噪音；过大的值会把
-  测试收集拖上十分钟。现在非法值退回默认 120s、过大值夹到 600s（`parseBudget`，有守卫）。
-
-- **测试注释与安全修复对齐**（同轮审计）：`tests/setup-warm.test.ts` 文件头还写着「由
-  `setup-warm.ts` 按该变量 `new Function` 求值」——那是已被 Codex P2 否决并改掉的旧方案，
-  留着会被下一个人照着恢复、等于把任意 JS 执行权交回给环境变量。已改成现状并显式禁止回退。
-
-- **`tests/commands/db.test.ts` 全文件共用一个库路径，逐条 `resetDb()` 复置。**
-  同一文件里原先每条用例各建一个新路径的库（新路径 = 110ms 创建 + 75ms `init`，且绕不过
-  首次冷启动），现改为 `beforeAll` 建一次目录、每条用例开头 `DROP TABLE` 全部业务表再
-  `init()`。**只在真的用库的 18 条用例里调 `resetDb()`，不是 `beforeEach` 全量** ——
-  实测放 `beforeEach` 反而更慢（10.3s → 13.5s）。`hookTimeout` 提到 60s（首次 `beforeAll`
-  仍可能撞上冷启动）；两条互不相干的用例原先共用 `alien.db` 会串，改为各自独立路径。
-
-- **钉住「上一条用例的 ticking 时钟不得泄漏」的清理契约**（CodeRabbit 2026-11-12 第三轮 major）：
-  新增回归用例会让 `Date.now` 每读一次 +1ms，若清理失效，后续用例会拿到停在 2026-11-11 的
-  假时钟、失败变成顺序相关。核实本文件 `afterEach` 的 `vi.restoreAllMocks()` 已覆盖该恢复
-  （CodeRabbit 的结论是**假阳性**），但把这个不变量钉成守卫：`Date.now()` 必须明显远离上一条
-  用例的 tick 原点。变异验证：删掉那句恢复 → 守卫红且实测时钟停在 `tickOrigin+9`；恢复 → 绿。
+  故障注入用例的 Store 收尾放进 `try/finally`（断言失败也不泄漏实例）。
+- 并发静态守卫补三处看不见的形态：`Object.setPrototypeOf` / `Reflect.setPrototypeOf` 换原型同样是
+  写入（原型链上的 `concurrent` 对套件生效）；被更近局部绑定（块级声明 / 更近同名参数）遮蔽的
+  rest 展开不再当转发边界；套件同写 `concurrent: true` 与 `sequential: true` 时按 Vitest 的解析
+  判串行（此前把合法串行套件判红）。豁免清单改为对真实扫描结果校验成员资格。
+- 并发静态守卫再补四种看不见的形态：**解构赋值**建立的别名（`[a] = [opts]` 之后写 `a`）、
+  计算键是**逗号表达式**（`[('x', 'concurrent')]` 取最右值）、调度原语经 **timer 模块导入改名**
+  （`import { setTimeout as later } from 'node:timers'`，含命名空间导入与 `.call`）、以及
+  **解构声明**与 rest 参数同名时的遮蔽（`const { args } = …`）。锁夹具不再把「预算到期后才
+  close」的种子当成功（exit 0 只是清理结果）；`kill` 的原生错误仍是第一优先。
+- 并发静态守卫继续补形态：**解构默认值**里的别名（`const [a = opts] = []`）、同时存在的**多个**
+  timer 命名空间导入、vitest 的**命名空间导入** hook（`import * as vt from 'vitest'; vt.beforeEach(…)`）、
+  更近的**解构参数**遮蔽外层 rest、以及**接入键**的逗号表达式（`it[(0, 'concurrent')](…)`）与声明侧
+  同一条解析；并发豁免只对**测试登记**的 `.concurrent` 生效（换成 `describe.concurrent` 或选项形态
+  顶掉同名用例不再被豁免）。
+- 迁移形态判据认**命名空间导入**（`import * as cap from './capture.js'; cap.captureSinks(…)`）；
+  并发豁免同时排除**参数化登记**（`it.concurrent.each(…)`）。锁夹具：`close` 未确认的失败文案带
+  子进程 pid，`afterEach` 逐个收尾（一个失败不再中断其余）。
+- 并发判据认 vitest 的**命名空间导入登记**（`import * as vt from 'vitest'; vt.it.concurrent(…)` /
+  `vt.describe('x', { concurrent: true }, …)`）。
+- 跨进程锁校验只接受**正常退出**的结论：校验器写出 `OPENED` / `CONFLICT` 后因信号（OOM /
+  外部 kill）或非零退出而死时，残留 JSON 不再被采信；「没有结论」优先交回，点名退出状态与
+  stdout/stderr（信号终止与非零退出两形态各有用例；删掉闸门即红）。锁校验脚本在写入落盘后
+  **再复核一次预算**：截止在写脚本期间耗尽时不再起子进程。
+- 引擎失败判据的拒绝值形态两路钉住（`null` 与 `kind` 访问器抛异常）：交回值必须是**同一引用**。
+  变异验证：`safeCodeOf` 退回裸读只红 `null`、去掉安全读取的 try 只红 getter，两者互不代偿。
+- 并发静态守卫补：`sequence.concurrent` 的配置面按**值**判（`--sequence.concurrent=false` 是显式
+  关闭，引号包裹的键名一样启用）；命名 hook 回调的**本地别名**（`const init = setup`）沿不可变
+  初始化器追踪；`for (opts of […])` 改写被登记绑定本身才算写入（按收集前快照判，只读循环的
+  新变量目标不再被误判）；`isMutated` 只缓存最外层求值结果（嵌套求值在别名扩张窗口里的半途
+  结论不落缓存 —— 该深度判据无独立可观测用例，如实按结构性防护记录）。
+- 迁移形态判据认**本地别名**（`const install = captureSinks`，含命名空间别名，沿已知初始化器
+追到不动点）；hook 的**常量元组展开**（`beforeEach(...hooks)`）照常下钻，解析不出的展开
+ （参数 / 非字面量）**响亮报告**而不是当成「没有实参」；hook 回调的别名链**无法静态确认**
+ （重赋值后 / 参数形参 / 非函数初始化）同样报告（Codex 第十三轮 P2）；使用点上**参数绑定
+遮蔽**同名执行体时按未知选项判（`it('x', body)` 的形参运行时可能是 `{concurrent: true}`）；
+同一段文本里**每一处** `--sequence.concurrent` 旗标都要看（`=false` 后面再启用不再被
+第一处遮住）。
+- 纯文本扫描器在函数边界只跟随**会被交出的值**（表达式体 / `return` 表达式 / 被 `return`
+的变量初始化器 / 构造器 `this.x =` 字段）：立即执行的块体箭头里只用于变量声明、且从不
+返回的 `new Error` 不再被当成可见（判据用原始 `new` 节点，不用正在跨越边界的子节点）。
+- 持锁者收尾统一走 `terminateHolder`：监听先挂再 `SIGKILL`，有界等待 `close`（stdio 与库
+句柄真放开后才交回）；宽限内没有 `close` 或 `kill` 自身抛错都**响亮失败**（后者原错误
+挂 `cause`），不再把「清理未确认」说成正常收尾。
+- 变异记录（每条新增守卫删掉 / 改坏即红）：删本地别名决议 → 别名用例红；不展开常量元组 →
+元组用例红；不报告无法解析的展开 → 对应用例红；去掉参数遮蔽判据 → 遮蔽用例红；`matchAll`
+退回单次 `exec` → 多处旗标用例红；别名链 `null` 不报告 → 别名链用例红；删构造器 `this`
+交出判据 → 匿名类样本红；删 `flowsToReturn` 闸门 → 变量声明丢弃样本红；`terminateHolder`
+不等 `close` → 宽限用例红（promise resolved）；`stripCaseEnds` 退化为不剥离 → `EXPLAIN`
+ CASE 用例红；预编译期探针不记账 → 提交误报成功；收尾只看 `stuck` → 探针已交回用例红。
+ `initCache` 移除后无任何用例变红（纯性能缓存，等价变异，如实记录）。
+- 分类判据回归（Codex第十四轮）：带注释/字符串关键字的 `range(nextval('s'))`只求值一次
+（基线语义：1行、下次取值2；旧分类路径实测2行/3，自动提交下还会内部断言失败）；
+`EXPLAIN ANALYZE SELECT 1 AS start`、`(ANALYZE) … AS "transaction"`不再被误拒；
+`EXPLAIN ANALYZE COMMIT` / `(ANALYZE) ROLLBACK`仍按词法判据拒收（判据自检：真驱动枚举了
+全部 type=10写法）。
+-未决探针拒绝：回调 catch掉原错误再 `count()`时必须得到明确拒绝且该语句一条都不派发，
+整条 `transaction()`在8s内交回（不再挂死）。
+-收尾三态：ROLLBACK回执丢失但活动事务探针确认已无事务时，拒绝错误不带 `store_retired`、
+文案不说「已退役」、hint不含「重建」，同一实例随后查询照常成功。
+-Codex第十四轮六条修复逐一变异：词法判据关闭 →`END`拒收用例红；`EXPLAIN`包装不剥 →
+`EXPLAIN ANALYZE COMMIT`用例红；未决探针闸门关闭 →新拒绝用例红；退役判据退回
+`!rolledBack` → `none`用例红；解析后重判删除 → close窗口用例红（改由驱动报
+「connection disconnected」）；空参数照旧传 `[]` → `range(nextval)`回归红（DuckDB内部
+断言）。六条全部恢复字节一致。
+-删除「类型无法判定（prepare被拒）」用例：分类不再 `prepare`，该前提与判据一起消失；
+「解析失败不得放行」（extract失败）用例保留。
+-静态守卫补五种此前看不见的形态（CR第六十七轮 major）：并发登记器的**本地别名保留修饰链**
+ （`const check = it.concurrent; check(…)`，含命名空间导入与传递闭包）；hook的
+ **`.apply`命名元组**（`const args = [setup] as const; beforeEach.apply(null, args)`），
+解析不出即响亮报告；`sequence`经**本地常量绑定**进配置（`defineConfig({ test: { sequence } })`）
+按 AST求值，求不出按违规处理；**互不相关的多个 for-of源**不再互相拖累 ——原先
+ `isMutated → staticBindingInitializer → isMutated`的互相递归在12个独立循环下**实测卡死**
+ （同步守卫 >300s），循环源解析改用不递归的声明前段后回到毫秒级，并留12循环回归。
+-持锁者收尾：`terminateHolder`认「spawn侧登记的 close」（测试在等校验进程时持锁者可能早已
+结束，事件不重放），`kill()`抛错或子进程报原生 `error`时仍**有界等 close**并把原始错误
+带出（close到了也不吞）、宽限内等不到时在文案与 `cause`里点名真正成因；清理未确认时
+ **保留夹具目录**（不在可能仍开着的库文件上删除）。状态标记监听与等待监听分离，`expectClean`
+仍对后者零容忍。
+-闸门用例：迁移探针用例改**显式闸门**（定时器只证明已派发，不能证明已交回）；两条 count
+闸门用例的失败路径统一 `finally`放闸、收回 delete并关闭 Store；真原生重查询在**派发之前**
+就失败时立刻交回（不再裸等就绪信号到90s超时）；包装夹具显式转发 `extractStatements`；
+ `COMMIT结果未知`夹具的写失败注入在 `init`之后才武装，第三次提交用「提交前最后一条写
+语句」证明来自清锁事务（sync_state），排除把数据窗提交误当成清锁提交。
+-变异记录：并发别名/apply元组/apply无法解析/sequence绑定/探针代次/`terminateHolder`四种
+行为逐一删改 →对应用例各红，恢复字节一致；`initCache`为纯性能缓存（等价变异），循环源
+递归的 RED证据是12循环回归用例在修复前 >300s超时。
 
 
+- 锁夹具的「marker 就绪 → 锁对另一进程可见」按 helper 文档的竞态窗口处理（CI Node 22 job 实测
+  两种模式各偶发一次 OPENED；本机含 CPU 压力无法复现、根因未定位）：新增有界等待
+  `conflictWithin`（默认 5s 窗口、200ms 复查），窗口耗尽仍是 OPENED 照常判红；「锁晚到」用例
+  用闸门把拿锁时机变成确定性的（marker 已到、锁未落盘时首查必为 OPENED，开闸后窗口内落到
+  CONFLICT）；机制层用例用可注入读源钉住「窗口内继续等」「耗尽不得改写 OPENED」「TIMEOUT 不重试」。
+- 端到端用例标题改用 `%s`（vitest 2.1.9 不替换 `$0`，此前 CI 失败时分不清是 READ_WRITE 还是
+  READ_ONLY）。
+- `terminateHolder` 在「kill 接受信号、失败只经原生 `error` 事件到达、随后宽限内 close」时，
+  清理已确认后仍把原始错误交回（此前只检查同步抛出的 kill 错误，会把「信号没送达」吞成成功；
+  Codex 第十五轮 P2）。
+- 变异记录（第六十八轮）：去掉嵌套深度 → 嵌套注释用例红；`terminateHolder` 退回只看同步 kill
+  错误 → error→close 用例红；`conflictWithin` 单次化 / 耗尽改写 OPENED / holder 永不拿锁 → 机制与
+  端到端用例各红；全部恢复字节一致。
 ## [0.2.2] - 2026-11-12
 
 > tag `v0.2.2` 指向 main `2354cdf`（GitHub / GitLab 双远端），已 publish 到 npm；

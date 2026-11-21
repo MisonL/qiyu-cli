@@ -249,7 +249,7 @@ describe('注册表', () => {
       .toMatch(/鉴权方式从未实测/)
   })
 
-  it('dangerous 的七个 id 逐个钉住 —— 门禁挂在这个字段上', () => {
+  it('dangerous 的 id 逐个钉住 —— 门禁挂在这个字段上', () => {
     // ⚠️ 这条此前写作「每条记录都显式给出 dangerous」，遍历 `allEndpoints()`
     // 断言 `typeof e.dangerous === 'boolean'` —— 那是**恒真**的：`loadSpecs`
     // 缺该键即抛（`typeof o.dangerous !== 'boolean'`），所以能进注册表的记录
@@ -312,6 +312,9 @@ describe('注册表', () => {
       'push.msg.text',
       'robot.evaluation.comment',
       'robot.session.assist',
+      // 2026-11-19 由 false 改判为 true：它会自动建会话（写），此前按
+      // 「非破坏性」误分类，导致一次生产写入被 `--yes` 门禁放行。
+      'robot.session.chat',
       'robot.session.close',
       'robot.session.create',
       'robot.session.evaluation',
