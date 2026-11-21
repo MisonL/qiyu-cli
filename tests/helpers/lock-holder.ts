@@ -59,9 +59,14 @@ export const LOCK_BUDGET_MS = 300_000
 export const CLOSE_GRACE_MS = 5_000
 
 let seq = 0
-function runScript(script: string, scriptDir: string, name: string): ChildProcess {
+function runScript(script: string, scriptDir: string, name: string, deadline: number): ChildProcess {
+  assertBudget(deadline, `${name}：脚本写入`)
   const path = join(scriptDir, `${name}-${++seq}.mjs`)
   writeFileSync(path, script)
+  // ⚠️ **写完脚本、spawn 之前再复核一次截止**（CR 第六十五轮 major）：`writeFileSync` 在高
+  // 负载磁盘上可能吃掉整个预算，若只在入口查一次，子进程会在截止之后才起来、可能先动到库
+  // 文件，超时清理时它已在跑。入口检查保留（迟到的请求不写脚本），这里是第二道。
+  assertBudget(deadline, `${name}：准备起子进程`)
   return spawn(process.execPath, [path], { stdio: ['ignore', 'pipe', 'pipe'] })
 }
 
@@ -395,7 +400,7 @@ const c = await inst.connect()
 await c.run('CREATE TABLE IF NOT EXISTS lock_probe (x INTEGER)')
 console.log('locked')
 setInterval(() => {}, 1 << 30)`
-  const child = runScript(script, o.scriptDir, o.name ?? 'holder')
+  const child = runScript(script, o.scriptDir, o.name ?? 'holder', o.deadline)
   await waitForMarker(child, 'locked', o.deadline, '锁持有者')
   return child
 }
@@ -421,7 +426,7 @@ try {
   console.log(JSON.stringify({ v: 'OPENED' }))
 } catch (e) {
   console.log(JSON.stringify({ v: 'ERROR', msg: e instanceof Error ? e.message : String(e) }))
-}`, scriptDir, 'verdict')
+}`, scriptDir, 'verdict', deadline)
   const run = new ScriptRun(chk)
   const closed = await run.waitClosed(deadline - Date.now())
   // ⚠️ 迟到 close（截止定时器没来得及跑、close 先交付）同样不是「按时给出结论」（CR 第五十五轮 major）。
@@ -446,8 +451,20 @@ try {
   const parsed = co.split('\n').reverse()
     .map((l) => { try { return JSON.parse(l) as { v?: string; msg?: string } } catch { return null } })
     .find((x) => x !== null && typeof x.v === 'string')
+  const how = run.exit === null
+    ? '未观察到 exit'
+    : run.exit.signal != null ? `signal=${run.exit.signal}` : `exit=${run.exit.code}`
+  // ⚠️ **没有结论优先**（既有用例实测）：非零退出 + 无 JSON 时，最有用的是点名 stdout/stderr
+  // 与退出状态；先跑下面的 exit 闸门只会把「为什么没结论」换成一句泛泛的「未正常结束」。
   if (parsed === undefined || parsed === null) {
-    throw new Error(`锁校验进程未交回结论（退出后 stdout：${co.slice(0, 300) || '(空)'}；stderr：${errOut.slice(0, 300) || '(空)'}）`)
+    throw new Error(`锁校验进程未交回结论（${how}；退出后 stdout：${co.slice(0, 300) || '(空)'}；stderr：${errOut.slice(0, 300) || '(空)'}）`)
+  }
+  // ⚠️ **校验器必须正常退出才接受它的结论**（CR 第六十五轮 major）：`close` 只证明 stdio
+  // 关掉了，不证明它跑完。写了结论后因信号（OOM / 外部 kill）而死时，那条 JSON 只是残留输出 ——
+  // 接受 CONFLICT 会让用例基于一个失败的校验器通过。超时路径已在上面提前返回（那是清理，
+  // 不是结论）；到这里仍非 exit 0 / 带信号 → 结论不可信，响亮失败。
+  if (run.exit === null || run.exit.code !== 0 || run.exit.signal !== null) {
+    throw new Error(`锁校验进程未正常结束（${how}）—— 它的输出不能当成 CONFLICT / OPENED 结论`)
   }
   if (parsed.v === 'OPENED') return 'OPENED'
   const msg = parsed.msg ?? ''
@@ -464,7 +481,7 @@ export async function seedEmptyDb(dbPath: string, scriptDir: string, deadline: n
   assertBudget(deadline, '种子进程')
   const ch = runScript(`const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
 const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
-inst.closeSync()`, scriptDir, 'seed')
+inst.closeSync()`, scriptDir, 'seed', deadline)
   const run = new ScriptRun(ch)
   const closedInBudget = await run.waitClosed(deadline - Date.now())
   // ⚠️ **close 迟到于 deadline 也不算按时完成**（CR 第五十五轮 major）：截止定时器可能迟到，

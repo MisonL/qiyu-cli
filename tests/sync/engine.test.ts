@@ -936,6 +936,30 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     await reopened.close()
   })
 
+  it.each([
+    { label: 'null', make: (): unknown => null },
+    {
+      label: 'kind 访问器抛异常的对象',
+      make: (): unknown => Object.defineProperty({}, 'kind', {
+        get() { throw new Error('注入：拒绝值的 kind 访问器') },
+      }),
+    },
+  ])('拒绝值是 $label 时退役/限频判据不得抛 TypeError 顶掉原失败（Codex 第十二轮 P2）', { timeout: 90_000 }, async ({ make }) => {
+    // 事故形态：`Store.query` 以 `null` 拒绝时，`acquireGated` / `runSnapshot` 的限频判据
+    // `(e as { kind }).kind` 直接 TypeError（实测 `Cannot read properties of null (reading 'kind')`）
+    // —— 错误路径上的判据成了新的主失败，原始拒绝值与恢复指令一起丢光。判据必须安全读取：
+    // null / 非对象 / 访问器抛异常 → 一律「不匹配」，拒绝值原样交回。
+    // ⚠️ 只需 Store 边界桩：这条路径上被真实执行的判据是 `withStoreRetries` → `acquireGated`
+    // → `runSnapshot` 的限频分派（`acquire` 读到拒绝就到此为止）；真库只会把冷启动负载
+    // 噪声（实测 90 s 超时）带进来，判据并没有被多覆盖一行。
+    const thrown = make()
+    const fake = { query: async () => { throw thrown } } as unknown as Store
+    const out = await runTask(fakeTask({ kind: 'snapshot' }), ctx(fake))
+      .then(() => ({ resolved: true as const }), (x: unknown) => ({ rejected: true as const, value: x }))
+    expect(out, '必须交回拒绝结果').toHaveProperty('rejected')
+    expect((out as { value: unknown }).value, '原拒绝值必须原样交回（同一引用），不得换成 TypeError').toBe(thrown)
+  })
+
   it('退役/提交未知对两层重试判据都是终态：窗口事务只尝试一次（不重试、不被 store_retired 顶替）（CR 第四十二轮 major）', async () => {
     // CR 的追问：`commitWindow` 走 `withStoreRetries`，rotated 路径又在外面套 `isTransient` ——
     // 任一判据若把「退役」当可重试，第二次尝试会立刻撞上 `store_retired`，主失败里的恢复

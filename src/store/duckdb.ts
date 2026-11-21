@@ -483,6 +483,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * autocommit 里执行）、拒绝一切后续语句；事务由 `close()` 关闭连接时隐式结束。
    */
   let poisoned: { reason: string; hint?: string } | undefined
+  // 事务失效性探针超时、中断后仍未交回 —— closeTx 据此跳过 ROLLBACK（Codex 第十二轮 P2）。
+  let nativeProbeStuck = false
   /**
    * `hint` 只在成因的恢复动作与通用说法**不同**时才给（CR 第四十一轮 major）：COMMIT
    * 结果未知时写入可能已落库，「关掉重建后直接重试」就是重复写，通用的
@@ -633,13 +635,26 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error('事务失效性探针超时')), 50)
     })
+    let raw: Promise<unknown> | undefined
     try {
-      const raw = c.runAndReadAll('SELECT 1', []) as unknown as Promise<unknown>
+      // 同一次派发前的复核（关闭 / 退役后这条探针不回交任何有意义的答案，直接按保守侧处理）。
+      if (closed || poisoned !== undefined) return true
+      raw = c.runAndReadAll('SELECT 1', []) as unknown as Promise<unknown>
       void raw.catch(() => { /* 归因价值由探针结果承担，避免迟到拒绝冒成 unhandled */ })
       await Promise.race([raw, timeout])
+      nativeProbeStuck = false
       return false
     } catch {
       try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 中断失败照旧按已失效处理 */ }
+      // ⚠️ **超时后还要知道探针有没有真的交回**（Codex 第十二轮 P2）：`Promise.race` 只结束
+      // 等待、不取消底层查询。若它仍在占用单连接，随后 closeTx 发出的 ROLLBACK 只会排在它
+      // 后面超时 —— 被误判成「回滚未确认」并退役实例，而归因是错的（ROLLBACK 根本没轮到）。
+      // 有界等它交回；仍未交回 → 记账，让 closeTx 跳过 ROLLBACK、按「收尾无法确认」处理。
+      const settled = raw === undefined ? true : await Promise.race([
+        raw.then(() => true, () => true),
+        new Promise<boolean>((resolve) => { setTimeout(() => resolve(false), 100) }),
+      ])
+      nativeProbeStuck = !settled
       return true
     } finally {
       if (timer !== undefined) clearTimeout(timer)
@@ -1201,6 +1216,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // 退役状态下的答案已由 poison 决定，保守侧 = 按「未能确认」处理。
     if (poisoned !== undefined) return undefined
     const one = async (): Promise<string> => {
+      // ⚠️ **每次原生调用前复核连接状态**（CR 第六十五轮 major）：close() 可能落在两次探针
+      // 之间（第一次 txid_current 在途时关连接），随后第二次仍在已关闭的连接上发语句；
+      // 反过来 close 也可能落在 ROLLBACK 在途期间，让第一次探针在关闭之后才发。关闭 / 退役
+      // 时静态求值不可信 → 抛给下面的保守侧（返回 undefined）。
+      if (closed) throw new Error('连接已关闭，事务状态探针不派发')
+      if (poisoned !== undefined) throw new Error('Store 已退役，事务状态探针不派发')
       let timer: ReturnType<typeof setTimeout> | undefined
       const timeout = new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error('事务状态探针超时')), 50)
@@ -1236,6 +1257,14 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 中断之后仍不交回：语句卡在不可中断的原生点上。此时连 close 都不能让进程退出
       //（实测：连接/实例都秒关，但原生线程仍被自身查询占住），所以退役文案要与这一事实一致。
       poison('事务内仍有语句没有交回结果（中断后仍未返回），无法确认它们不会在回滚之后落库')
+      return 'unconfirmed'
+    }
+    // ⚠️ **探针可能仍占着连接**（Codex 第十二轮 P2）：事务失效性探针超时后已无法确认它是否
+    // 停止；此时发 ROLLBACK 只会排在它后面、超时后被误判成「回滚未确认」，而真实成因是连接
+    // 仍被探针占用。直接按「收尾无法确认」退役，把成因写进文案，不发 ROLLBACK。
+    if (nativeProbeStuck) {
+      poison('事务状态探针中断后仍未交回：连接可能仍被它占用，ROLLBACK 无法安全发出')
+      beganTx.delete(token)
       return 'unconfirmed'
     }
     // 事务控制语句豁免「令牌已退役」检查，否则收尾自己的 ROLLBACK 也会被挡。

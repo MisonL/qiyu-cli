@@ -2553,7 +2553,7 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
-  it('事务失效探针（SELECT 1）挂住 → 必须有界，拒绝照常交回、回滚收尾照常开始（CR 第六十四轮 major）', { timeout: 60_000 }, async () => {
+  it('事务失效探针（SELECT 1）挂住 → 必须有界，拒绝照常交回、回滚收尾照常开始（CR 第六十四轮 major）', { timeout: 90_000 }, async () => {
     // 事故形态：事务内一条语句执行期报错后，`execSql` 的 catch 会先问连接「事务是否已废」
     // （`SELECT 1`）。该探针直接走原生连接、没有超时 —— 原生线程卡住时这条拒绝**永远交不回**
     // 回调，回滚收尾（以及 ROLLBACK 自己的有界预算）根本没机会开始，整个 `transaction()`
@@ -2561,6 +2561,7 @@ describe('duckdb —— 事务', () => {
     // 原失败照常交回。
     const real = await import('@duckdb/node-api')
     let armed = false
+    const sqls: string[] = []
     const importer = async (): Promise<unknown> => ({
       ...real,
       DuckDBInstance: {
@@ -2578,8 +2579,10 @@ describe('duckdb —— 事务', () => {
                 closeSync: () => cc.closeSync?.(),
                 extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (armed) sqls.push(sql)
                   if (!armed) return cc.runAndReadAll(sql, params)
-                  if (sql === 'SELECT 1') return new Promise(() => { /* 永不交回：原生线程被占住 */ })
+                  // SELECT 1 永不交回；中断在这里不生效（模拟卡在不可取消的原生点）
+                  if (sql === 'SELECT 1') return new Promise(() => {})
                   if (sql.startsWith('INSERT INTO')) throw new Error('注入：执行期失败')
                   return cc.runAndReadAll(sql, params)
                 },
@@ -2594,9 +2597,15 @@ describe('duckdb —— 事务', () => {
     armed = true
     const e = await s.transaction(async (t) => {
       await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
-    }).then(() => null, (x: unknown) => x as Error)
+    }).then(() => null, (x: unknown) => x as Error & { hint?: string; code?: string })
     expect(e, '探针挂住不得让事务永远不交回').not.toBeNull()
     expect(e!.message, '原失败照常交回（探针只影响归因，不换掉它）').toMatch(/注入：执行期失败/)
+    // ⚠️ **探针未交回时不得发 ROLLBACK**（Codex 第十二轮 P2）：它会排在仍占着连接的探针后面
+    // 超时，把「探针挂住」误报成「回滚未确认」。收尾按「无法确认」退役，成因写进文案。
+    expect(sqls.filter((q) => q === 'ROLLBACK'), '探针未交回 → 一条 ROLLBACK 都不发').toEqual([])
+    expect(e!.message, '收尾状态如实说「无法确认」').toMatch(/回滚未能确认|无法确认/)
+    expect(e!.hint, '恢复动作：重建 → 核对 → 再重放').toMatch(/核对/)
+    expect(e!.code).toBe('store_retired')
     await s.close()
   })
 

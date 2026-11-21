@@ -622,6 +622,22 @@ describe('锁夹具的子进程生命周期', () => {
     expectClean(child)
   })
 
+  it.each([
+    { label: '信号终止（OOM / 外部 kill 形态）', exit: null as null | number, signal: 'SIGKILL' as NodeJS.Signals, want: /未正常结束.*signal=SIGKILL/ },
+    { label: '非零退出', exit: 1 as null | number, signal: null as null | NodeJS.Signals, want: /未正常结束.*exit=1/ },
+  ])('verdict：$label 时写了结论也不得接受那条 JSON', async ({ exit, signal, want }) => {
+    // CR 第六十五轮 major：close 只证明 stdio 关了，不证明校验器跑完。结论行先落 stdout、
+    // 进程随后被信号杀死时，接受 OPENED/CONFLICT 会让用例基于一个失败的校验器通过。
+    const running = observe(invoke('verdict', 1_000_000))
+    child.stdout?.emit('data', `${JSON.stringify({ v: 'OPENED' })}\n`)
+    child.emit('close', exit, signal)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(running.isSettled()).toBe(true)
+    const result = await running.result
+    expect(String('error' in result ? result.error : '')).toMatch(want)
+    expectClean(child)
+  })
+
   it('verdict：没有 JSON 结论时点名 stdout/stderr，不吞成竞态', async () => {
     const running = observe(invoke('verdict', 1_000_000))
     child.stdout?.emit('data', '不是 JSON')
@@ -630,7 +646,8 @@ describe('锁夹具的子进程生命周期', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(running.isSettled()).toBe(true)
     const result = await running.result
-    expect(String('error' in result ? result.error : '')).toMatch(/未交回结论.*不是 JSON.*脚本加载失败/)
+    // 无结论优先于 exit 闸门：退出状态也要点名（非零退出本身解释不了「为什么没结论」）。
+    expect(String('error' in result ? result.error : '')).toMatch(/未交回结论.*exit=1.*不是 JSON.*脚本加载失败/)
     expectClean(child)
   })
 })

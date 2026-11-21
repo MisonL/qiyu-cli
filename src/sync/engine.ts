@@ -153,7 +153,7 @@ function failDetail(label: string, e: unknown): string {
  * 限频，不是取数失败 —— 记成 fetch_failed 会让 Agent 去查接口形态而不是等冷却。
  */
 function fetchGapReason(e: unknown): 'fetch_failed' | 'rate_limit_local' {
-  return (e as { kind?: string }).kind === 'rate_limit_local' ? 'rate_limit_local' : 'fetch_failed'
+  return safeKindOf(e) === 'rate_limit_local' ? 'rate_limit_local' : 'fetch_failed'
 }
 
 function fetchGapDetail(e: unknown): string {
@@ -304,20 +304,48 @@ async function withRetries<T>(ctx: RunCtx, op: () => Promise<T>,
  * `code=store_retired`；若只按 kind 判「撞锁可重试」，就会再碰**已退役的同一实例** ——
  * 第二次尝试撞上「Store 已退役」，把主失败与「先核对再重放」整段换掉。
  */
-const isRetiredFailure = (e: unknown): boolean => (e as { code?: string }).code === 'store_retired'
+/**
+ * 安全读取拒绝值上的字符串字段（**唯一实现点**，CR 第六十五轮 / Codex 第十二轮 P2）：
+ * 拒绝值可能是 `null` / `undefined`（读属性直接 TypeError），也可能是 getter 抛异常的对象 ——
+ * 错误路径上的判据自己成了新的主失败，就会把原始错误整段换掉。读不出来一律按「不匹配」。
+ * ⚠️ 不只是 `code`：`kind` / `hint` / `retryable` 同样被判据读，一律经这里
+ *（实测事故：`query` 以 `null` 拒绝时 `fetchGapReason` 的 `(e as {kind}).kind` 抛
+ * `Cannot read properties of null (reading 'kind')`，原始拒绝值整段丢失）。
+ */
+const safeStringField = (e: unknown, field: 'code' | 'kind' | 'hint'): string | undefined => {
+  if (e === null || (typeof e !== 'object' && typeof e !== 'function')) return undefined
+  try {
+    const v = (e as Record<string, unknown>)[field]
+    return typeof v === 'string' ? v : undefined
+  } catch {
+    return undefined
+  }
+}
+const safeBoolField = (e: unknown, field: 'retryable'): boolean | undefined => {
+  if (e === null || (typeof e !== 'object' && typeof e !== 'function')) return undefined
+  try {
+    const v = (e as Record<string, unknown>)[field]
+    return typeof v === 'boolean' ? v : undefined
+  } catch {
+    return undefined
+  }
+}
+const safeCodeOf = (e: unknown): string | undefined => safeStringField(e, 'code')
+const safeKindOf = (e: unknown): string | undefined => safeStringField(e, 'kind')
+const isRetiredFailure = (e: unknown): boolean => safeCodeOf(e) === 'store_retired'
 
 function isTransient(e: unknown): boolean {
   if (isRetiredFailure(e)) return false
-  const err = e as { kind?: string; retryable?: boolean }
-  if (err.kind === 'store_locked') return true
-  if (err.kind === 'rate_limit' || err.kind === 'network') return false
-  return err.retryable === true
+  const kind = safeKindOf(e)
+  if (kind === 'store_locked') return true
+  if (kind === 'rate_limit' || kind === 'network') return false
+  return safeBoolField(e, 'retryable') === true
 }
 
 /** store 事务的撞锁重试（B 中-4，spec §6.3：C1 写者无内置重试，重试调度归 D 层）。 */
 const storeRetryable = (e: unknown): boolean =>
   !isRetiredFailure(e)
-  && ((e as { kind?: string }).kind === 'store_locked' || isLockError(e))
+  && (safeKindOf(e) === 'store_locked' || isLockError(e))
 
 const withStoreRetries = <T>(ctx: RunCtx, op: () => Promise<T>): Promise<T> =>
   withRetries(ctx, op, storeRetryable)
@@ -341,8 +369,7 @@ async function storeGap(ctx: RunCtx, task: SyncTask, w: Range,
  * 把原始失败里的「写入可能已落库，不要按失败直接重试（可能重复写），核对后再决定是否
  * 重放」整段换掉，恰好诱导重复写。
  */
-const isStoreRetired = (e: unknown): boolean =>
-  (e as { code?: string }).code === 'store_retired'
+const isStoreRetired = (e: unknown): boolean => safeCodeOf(e) === 'store_retired'
 
 /**
  * 记本窗 gap；连接已退役时 gap 写不进去，**把本窗的原始失败原样交回**（它带着恢复指令）。
@@ -365,11 +392,11 @@ async function storeGapOrPrimary(ctx: RunCtx, task: SyncTask, w: Range,
     // 那条错误**自己的**成因（提交结果未知 / 回滚未能确认），否则恢复动作被误导。
     const gapMsg = textOf(e)
     const wrapped = new Error(`${primaryMsg} —— 补记缺口时实例退役（${gapMsg}）`, { cause: primary })
-    ;(wrapped as { kind?: string }).kind = (e as { kind?: string }).kind ?? 'internal'
+    ;(wrapped as { kind?: string }).kind = safeKindOf(e) ?? 'internal'
     ;(wrapped as { retryable?: boolean }).retryable = false
     ;(wrapped as { code?: string }).code = 'store_retired'
-    const eh = (e as { hint?: string }).hint
-    const ph = (primary as { hint?: string }).hint
+    const eh = safeStringField(e, 'hint')
+    const ph = safeStringField(primary, 'hint')
     const hints = [eh, ph].filter((h): h is string => typeof h === 'string')
     ;(wrapped as { hint?: string }).hint = hints.length > 0
       ? hints.join('；')
@@ -421,7 +448,7 @@ async function acquireGated(ctx: RunCtx, task: SyncTask): Promise<void> {
       await withStoreRetries(ctx, () => ctx.gate.acquire(key))
       return
     } catch (e) {
-      if ((e as { kind?: string }).kind !== 'rate_limit_local' || waits >= GATE_WAIT_BUDGET) throw e
+      if (safeKindOf(e) !== 'rate_limit_local' || waits >= GATE_WAIT_BUDGET) throw e
       const wait = clampGateWait((e as { retryAfter?: number }).retryAfter ?? 0) || GATE_WAIT_FALLBACK_MS
       await engineSleep(ctx, wait)
     }
@@ -755,7 +782,7 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       try {
         await acquireGated(ctx, task)
       } catch (e) {
-        if ((e as { kind?: string }).kind === 'rate_limit_local') {
+        if (safeKindOf(e) === 'rate_limit_local') {
           failed++
           contiguousBroken = true
           // ⚠️ **次生的退役错误不得顶掉这里的原始失败**（CR 第六十三轮 major）：限频
@@ -802,12 +829,12 @@ async function runWindowed(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
       } catch (e) {
         failed++
         contiguousBroken = true
-        const isMismatch = (e as { code?: string }).code === 'count_mismatch'
+        const isMismatch = safeCodeOf(e) === 'count_mismatch'
         // 行数统计口径（brief 钉死用例）：mismatch 时 written 记「应写行数」（kept）——
         // 实际行已随事务回滚，计入的是本窗参与核对的落库意图行数。
         writtenTotal += kept.length
         await storeGapOrPrimary(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
-          isMismatch ? (e as Error).message : writeFailedDetail(e, ctx), gaps, e)
+          isMismatch ? textOf(e) : writeFailedDetail(e, ctx), gaps, e)
         continue
       }
       resolvedEndOut = watermarkMs
@@ -884,7 +911,7 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
   try {
     await acquireGated(ctx, task)
   } catch (e) {
-    if ((e as { kind?: string }).kind === 'rate_limit_local') {
+    if (safeKindOf(e) === 'rate_limit_local') {
       // 快照也要留下可查的状态行（E 中-1）：门都没进就放弃时，若库里连一行都没有，
       // 建一行 pending（盖章后立即清章）——「这个任务本轮被本地冷却拦下了」必须可查，
       // 而不是 status 里什么都看不到。
@@ -942,9 +969,9 @@ async function runSnapshot(task: SyncTask, ctx: RunCtx): Promise<TaskRunResult> 
         return n
       }))
     } catch (e) {
-      const isMismatch = (e as { code?: string }).code === 'count_mismatch'
+      const isMismatch = safeCodeOf(e) === 'count_mismatch'
       await storeGapOrPrimary(ctx, task, resolvedRange, isMismatch ? 'count_mismatch' : 'write_failed',
-        isMismatch ? (e as Error).message : writeFailedDetail(e, ctx), gaps, e)
+        isMismatch ? textOf(e) : writeFailedDetail(e, ctx), gaps, e)
       return snapshotResult(task, resolvedRange, gaps, fetchRes.rows.length, 0, 0, 1, 'failed')
     }
 
@@ -1170,7 +1197,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
         try {
           await acquireGated(ctx, task)
         } catch (e) {
-          if ((e as { kind?: string }).kind === 'rate_limit_local') {
+          if (safeKindOf(e) === 'rate_limit_local') {
             plan.failed++
             plan.contiguousBroken = true
             await storeGapOrPrimary(ctx, task, w, 'rate_limit_local', (e as Error).message, plan.gaps, e)
@@ -1210,7 +1237,7 @@ export async function runRotated(tasks: SyncTask[], ctx: RunCtx): Promise<TaskRu
         } catch (e) {
           plan.failed++
           plan.contiguousBroken = true
-          const isMismatch = (e as { code?: string }).code === 'count_mismatch'
+          const isMismatch = safeCodeOf(e) === 'count_mismatch'
           plan.written += kept.length
           await storeGapOrPrimary(ctx, task, w, isMismatch ? 'count_mismatch' : 'write_failed',
             isMismatch ? (e as Error).message : writeFailedDetail(e, { storeLocation: ctx.storeLocation }), plan.gaps, e)

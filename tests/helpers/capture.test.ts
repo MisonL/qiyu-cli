@@ -239,14 +239,24 @@ function functionBinding(sf: ts.SourceFile, name: string): boolean {
  * 按 (文件, 名字) 缓存结果即可；重入由 `staticBindingInitializer` 的同名守卫先挡住，不会缓存半成品。
  */
 const mutatedCache = new WeakMap<ts.SourceFile, Map<string, boolean>>()
+let isMutatedDepth = 0
 function isMutated(sf: ts.SourceFile, name: string): boolean {
   let cache = mutatedCache.get(sf)
   if (cache === undefined) { cache = new Map(); mutatedCache.set(sf, cache) }
   const cached = cache.get(name)
   if (cached !== undefined) return cached
-  const result = isMutatedUnchecked(sf, name)
-  cache.set(name, result)
-  return result
+  isMutatedDepth++
+  try {
+    const result = isMutatedUnchecked(sf, name)
+    // ⚠️ **只缓存最外层求值**（CR 第六十五轮 major）：嵌套调用（外层解析循环源时顺带解析
+    // 另一个名字）在**外层别名状态仍在扩张**的窗口里扫全文，看不全「经外层循环别名写穿」的
+    // 形态；把这种半途结果缓存下来，后续独立求值会拿到过时的 false。嵌套结果只服务当次外层
+    // 计算，不落缓存。
+    if (isMutatedDepth === 1) cache.set(name, result)
+    return result
+  } finally {
+    isMutatedDepth--
+  }
 }
 function isMutatedUnchecked(sf: ts.SourceFile, name: string): boolean {
   // ⚠️ **别名也算目标**：`const t2 = opts; Object.assign(t2, {…})` 改的仍是 opts
@@ -256,6 +266,9 @@ function isMutatedUnchecked(sf: ts.SourceFile, name: string): boolean {
   // 代价如实记录：不同作用域里的同名局部变量会被并成一个名字 —— 这只会让判据更保守（多报
   // 「看不清」），不会把真写入漏掉。
   const aliases = new Set<string>([name])
+  // ⚠️ **收集前的快照**（CR 第六十五轮 major）：别名收集会把 `for (item of [opts])` 的 item
+  // 也收进集合 —— 写入判据若按收集后的集合看，只读循环的 item 会被当成「被登记对象本身」。
+  const aliasesBefore = new Set(aliases)
   /**
    * 初始化表达式里哪些标识符可能是**同一个对象**（别名候选）。与 `refersToAlias` 共用同一条
    * 值选择语义（?? / || / && / 三元 收全部操作数，逗号只收最右），只是这里收标识符名。
@@ -663,9 +676,11 @@ function isMutatedUnchecked(sf: ts.SourceFile, name: string): boolean {
       if (ts.isVariableDeclarationList(init)) {
         // `for (const { concurrent } of …)` 会重新绑定局部名，但不是写 opts —— 不算
       } else if (ts.isIdentifier(init)) {
-        // ⚠️ **裸标识符目标只是重新绑定，不是写入**（CR 第六十四轮 major）：`for (item of [opts])`
-        // 每轮把元素赋给 item，opts 本身一个字节都没变。旧判据把「目标是别名」当写入 —— 而
-        // 别名收集现在会把这种循环目标收进别名集，只读循环也会被误判成「值已变」。
+        // ⚠️ **裸标识符目标按「原本是否就是被登记对象/别名」判**（CR 第六十四/六十五轮）：
+        //   · `for (item of [opts])` —— item 只是新变量，opts 一个字节没变（别名收集也会把
+        //     item 收进集合，所以不能按「现在是不是别名」判，要看**收集前**的快照）；
+        //   · `for (opts of [{…}])` —— 被登记的那个绑定本身被改写，登记读到的是新值，是真写入。
+        if (aliasesBefore.has(init.text)) hit = true
       } else if (ts.isPropertyAccessExpression(init) || ts.isElementAccessExpression(init)) {
         // `for (opts.concurrent of [true])` 每一轮都给 opts 的**属性**赋值 → 是真写入
         if (refersToAlias(init)) hit = true
@@ -1662,7 +1677,19 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
    * （函数声明 / const 箭头函数 / 函数表达式）；最近的同名绑定不是函数 → 无法静态确认，
    * 返回 null（不再退回整份文件查重，那会把别的作用域的函数当成这个回调）。
    */
-  const functionInScope = (name: string, from: ts.Node): ts.FunctionLikeDeclaration | null | undefined => {
+  const functionInScope = (name: string, from: ts.Node, depth = 0, seen?: Set<string>): ts.FunctionLikeDeclaration | null | undefined => {
+    const trail = seen ?? new Set<string>()
+    // ⚠️ **回调的本地别名**（CR 第六十五轮 major）：`const init = setup; beforeEach(init)` 登记的
+    // 是同一个回调。沿**不可变的本地初始化器**跟到函数字面量；重赋值 / 环 / 超过深度 →
+    // 无法静态确认（null），不退回整份文件查重。
+    if (depth > 8 || trail.has(name)) return null
+    trail.add(name)
+    const followAlias = (init: ts.Expression, at: ts.Node): ts.FunctionLikeDeclaration | null | undefined => {
+      const u = unwrap(init)
+      if (!ts.isIdentifier(u)) return null
+      if (reassignedNames.has(u.text)) return null
+      return functionInScope(u.text, at, depth + 1, trail)
+    }
     let n: ts.Node | undefined = from.parent
     while (n !== undefined) {
       if (ts.isFunctionLike(n)) {
@@ -1687,7 +1714,10 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
               sawName = true
               const init = d.initializer === undefined ? undefined : unwrap(d.initializer)
               if (init !== undefined && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) lastFn = init
-              else lastFn = undefined
+              else if (init !== undefined && ts.isIdentifier(init)) {
+                const aliased = followAlias(d.initializer!, d)
+                lastFn = aliased === undefined || aliased === null ? undefined : aliased
+              } else lastFn = undefined
             }
           }
         }
@@ -1983,12 +2013,29 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
    */
   it('仓库配置与脚本不得启用 sequence.concurrent（全局并发下 captureSinks 的写入无法归属）',
     () => {
-      const enables = (txt: string): boolean =>
-        /sequence\s*[.:]\s*concurrent|--sequence\.concurrent|sequence\s*:\s*\{[^}]*concurrent\s*:\s*true/.test(txt)
+      // ⚠️ **按值判，不按拼写判**（CR 第六十五轮 major）：`--sequence.concurrent=false` 是显式
+      // 关闭；带引号的键名（`{ 'sequence': { 'concurrent': true } }`）一样能启用。
+      // 配置面：sequence 下的 concurrent 为 true/1（键名可带引号、可点号或对象形式）。
+      const enables = (txt: string): boolean => {
+        const key = `['"]?concurrent['"]?`
+        const flag = /--sequence\.concurrent(?:=([^\s"']+))?/.exec(txt)
+        if (flag !== null) {
+          const v = flag[1]
+          if (v === undefined || /^(true|1)$/i.test(v)) return true
+        }
+        const seqObj = /['"]?sequence['"]?\s*[:.]\s*\{[^}]*?['"]?concurrent['"]?\s*:\s*(true|1)\b/.test(txt)
+        const seqDot = new RegExp(`['"]?sequence['"]?\\s*[.:]\\s*${key}\\s*[:=]\\s*(true|1)\\b`).test(txt)
+        return seqObj || seqDot
+      }
       // 双向自检：三种真实启用形态必红；无关文本放过（只测正则本身，不拿真配置做变异 ——
       // 改 config 再跑测试会让本次运行真的变成并发，触发历史上的内存事故）。
       expect(enables('export default { test: { sequence: { concurrent: true } } }'), '配置对象形态').toBe(true)
       expect(enables('vitest run --sequence.concurrent'), 'CLI 旗标形态').toBe(true)
+      // ⚠️ **按值判，不按拼写判**（CR 第六十五轮 major）：`=false` 是显式关闭；带引号的键名
+      // 一样能启用。
+      expect(enables('vitest run --sequence.concurrent=false'), 'CLI 显式关闭').toBe(false)
+      expect(enables("{ 'sequence': { 'concurrent': true } }"), '引号包裹的配置键').toBe(true)
+      expect(enables("{ 'sequence': { 'concurrent': false } }"), '引号包裹的显式关闭').toBe(false)
       expect(enables('sequence.concurrent: true'), '点号形态').toBe(true)
       expect(enables('export default { test: { maxWorkers: 1 } }'), '无关配置').toBe(false)
       const files = ['vitest.config.ts', 'vitest.config.mts', 'vitest.workspace.ts',
@@ -2187,6 +2234,10 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     // 同名 `setup` 时，整份文件查重看到两处声明、两个都不扫 —— 其中一处排了调度就整条漏掉。
     expect(hookHits(`describe('SD1', () => {\n  const setupA = () => { ${ST}(w, 80) }\n  beforeEach(setupA)\n})\ndescribe('SD2', () => {\n  const setupA = () => { console.log('ok') }\n  beforeEach(setupA)\n})`),
       '兄弟套件里同名回调按各自的作用域解析').toEqual([`${ST}(`])
+    // ⚠️ **回调的本地别名**（CR 第六十五轮 major）：`const init = setup; beforeEach(init)` 登记的
+    // 是同一个回调 —— 只看标识符的初始化器是函数时，别名整条漏扫。
+    expect(hookHits(`const setupS = () => { ${ST}(w, 80) }\nconst initS = setupS\n${H}(initS)`),
+      '本地别名的回调照常下钻').toEqual([`${ST}(`])
     // 反例：名字里只是恰好含 then 前缀的不是
     expect(hookHits(`${H}(() => { thenable(w) })`), 'thenable 不是 .then').toEqual([])
     // hook 登记本身经 `.call`（Codex PR#81 第二十四轮 P2）
@@ -2919,6 +2970,10 @@ it('Q34', oQ34, () => {})`),
       '既有变量的 for-of 目标同样带出元素别名').toEqual(['unknown'])
     expect(concHits(`const oF65 = { con${'current: false }'}\nlet itemF65\nfor (itemF65 of [oF65]) { console.log(itemF65) }\nit('F65', oF65, () => {})`),
       '只读遍历既有目标不放宽').toEqual([])
+    // ⚠️ **循环重赋的就是被登记的那个绑定**（CR 第六十五轮 major）：`for (opts of [...])` 之后
+    // 再登记，Vitest 读到的是循环写入的新值 —— 裸标识符「只算重绑定」在这里恰恰**改变了值**。
+    expect(concHits(`let oR66 = { con${'current: false }'}\nfor (oR66 of [{ con${'current: true }'}]) {}\nit('R66', oR66, () => {})`),
+      '循环重赋原绑定 → 登记读到新值').toEqual(['unknown'])
     // ⑲ **完整属性链**（Codex 第七轮 P2）：`box.nested.opts` 的基座是属性访问，只追一层会漏。
     expect(concHits(`const oP72 = { con${'current: false }'}\nconst boxP72 = { nested: { opts: oP72 } }\nconst aliasP72 = boxP72.nested.opts\naliasP72.concurrent = true\nit('P72', oP72, () => {})`),
       '两层容器属性链仍指向同一对象').toEqual(['unknown'])
