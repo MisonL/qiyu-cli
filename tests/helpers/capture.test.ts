@@ -232,7 +232,23 @@ function functionBinding(sf: ts.SourceFile, name: string): boolean {
  * `name` 都算（Codex PR#81 第二十五轮 P2，探针复现：`Object.assign(opts, …)` 与
  * `opts['concurrent'] = …` 旧判据都不认，守卫把已被改成并发的选项当成串行放行）。
  */
+/**
+ * 「name 有没有被写过」的结果缓存（CR 第六十四轮 major）：判据本身是对整份文件的一次遍历，
+ * 而 `staticBindingInitializer` 会为每个循环源 / 别名解析各查一次 —— 多个互不相关的 for-of
+ * 循环时，每次解析都重跑全文件扫描（含嵌套的 isMutated）。文件内容在单次守卫运行内不变，
+ * 按 (文件, 名字) 缓存结果即可；重入由 `staticBindingInitializer` 的同名守卫先挡住，不会缓存半成品。
+ */
+const mutatedCache = new WeakMap<ts.SourceFile, Map<string, boolean>>()
 function isMutated(sf: ts.SourceFile, name: string): boolean {
+  let cache = mutatedCache.get(sf)
+  if (cache === undefined) { cache = new Map(); mutatedCache.set(sf, cache) }
+  const cached = cache.get(name)
+  if (cached !== undefined) return cached
+  const result = isMutatedUnchecked(sf, name)
+  cache.set(name, result)
+  return result
+}
+function isMutatedUnchecked(sf: ts.SourceFile, name: string): boolean {
   // ⚠️ **别名也算目标**：`const t2 = opts; Object.assign(t2, {…})` 改的仍是 opts
   // （Codex PR#81 第二十五轮 P2 的同族形态，探针复现过旧判据放行）。先收集以 name 初始化的
   // 别名（可传递），再按「目标里出现 name 或任一别名」判。
@@ -389,13 +405,50 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
           bind(n.name)
         }
       }
+      /**
+       * 赋值目标收集（**唯一实现点**，普通赋值与 for-of 目标共用）：标识符 → 收进别名集；
+       * 属性 / 下标 → 沿根收集（`box.opts = opts` 之后 `box.…` 的写入都按「可能是 opts」处理）；
+       * 数组 / 对象字面量模式 → 递归；解构默认值 `a = d` 只收左侧。
+       */
+      const collectTarget = (e: ts.Expression): void => {
+        const u = unwrap(e)
+        if (ts.isIdentifier(u)) {
+          if (!aliases.has(u.text)) { aliases.add(u.text); changed = true }
+          return
+        }
+        // ⚠️ **转存进容器的属性**（CR 第六十二轮 major）：属性路径本身不能进别名集，但把
+        // **根标识符**（`box`）收进来后，任何经 `box.…` 的写入都按「可能是 opts」处理 ——
+        // 只多报（更保守），不会漏掉真写入。
+        if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
+          collectTarget(u.expression)
+          return
+        }
+        if (ts.isArrayLiteralExpression(u)) {
+          for (const el of u.elements) {
+            if (ts.isSpreadElement(el)) collectTarget(el.expression)
+            else if (!ts.isOmittedExpression(el)) collectTarget(el as ts.Expression)
+          }
+          return
+        }
+        if (ts.isObjectLiteralExpression(u)) {
+          for (const p2 of u.properties) {
+            if (ts.isPropertyAssignment(p2)) collectTarget(p2.initializer)
+            else if (ts.isShorthandPropertyAssignment(p2)) collectTarget(p2.name)
+            else if (ts.isSpreadAssignment(p2)) collectTarget(p2.expression)
+          }
+          return
+        }
+        // 解构默认值 `[a = fallback] = …`：绑定名在等号左侧
+        if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.EqualsToken) collectTarget(u.left)
+      }
       // ⚠️ **for...of 的元素也是别名来源**（Codex 第五轮 P2）：`for (const item of [opts])`
       // 里 item 就是 opts（数组字面量的元素身份不变）。⚠️ 迭代对象也可以是**本文件里唯一静态
       // 绑定的名字**（`const list = [opts]; for (const item of list)`，CR 第六十三轮 major）
       // —— 只认循环位置的数组字面量时整条漏掉，随后 `item.concurrent = true` 被当成无关
-      // 变量、按旧值放行。遍历**数组本身**（`of opts`）时元素身份未知 —— 保守不认（记录边界：
-      // 那只多报不了，只会漏掉「元素恰好是 opts」的形态）。
-      if (ts.isForOfStatement(n) && ts.isVariableDeclarationList(n.initializer)) {
+      // 变量、按旧值放行。⚠️ 目标也可以是**既有变量**（`for (item of [opts])`，CR 第六十四轮
+      // major）：每轮把元素赋给 item，同样建立别名。遍历**数组本身**（`of opts`）时元素身份
+      // 未知 —— 保守不认（记录边界：那只多报不了，只会漏掉「元素恰好是 opts」的形态）。
+      if (ts.isForOfStatement(n) && n.initializer !== undefined) {
         let src = unwrap(n.expression)
         if (ts.isIdentifier(src)) {
           const init = staticBindingInitializer(sf, src.text)
@@ -403,17 +456,21 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
         }
         if (ts.isArrayLiteralExpression(src)
           && aliasSources(src).some((s2) => aliases.has(s2))) {
-          const bindLoop = (b: ts.Node): void => {
-            if (ts.isBindingElement(b) && ts.isIdentifier(b.name) && !aliases.has(b.name.text)) {
-              aliases.add(b.name.text)
-              changed = true
+          if (ts.isVariableDeclarationList(n.initializer)) {
+            const bindLoop = (b: ts.Node): void => {
+              if (ts.isBindingElement(b) && ts.isIdentifier(b.name) && !aliases.has(b.name.text)) {
+                aliases.add(b.name.text)
+                changed = true
+              }
+              ts.forEachChild(b, bindLoop)
             }
-            ts.forEachChild(b, bindLoop)
-          }
-          for (const d of n.initializer.declarations) {
-            if (ts.isIdentifier(d.name)) {
-              if (!aliases.has(d.name.text)) { aliases.add(d.name.text); changed = true }
-            } else bindLoop(d.name)
+            for (const d of n.initializer.declarations) {
+              if (ts.isIdentifier(d.name)) {
+                if (!aliases.has(d.name.text)) { aliases.add(d.name.text); changed = true }
+              } else bindLoop(d.name)
+            }
+          } else {
+            collectTarget(n.initializer as ts.Expression)
           }
         }
       }
@@ -428,38 +485,6 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
           // `({ x: a } = { x: opts })` 之后 `a.concurrent = true` 写穿的仍是 opts。旧判据只认
           // 左侧是 Identifier 的赋值 —— 数组 / 对象字面量形态整个跳过，`a` 从不进入别名集。
           // 目标收集按**赋值目标**遍历：标识符 / 展开 / 嵌套模式 / 默认值（`a = d` 的左侧才是目标）。
-          const collectTarget = (e: ts.Expression): void => {
-            const u = unwrap(e)
-            if (ts.isIdentifier(u)) {
-              if (!aliases.has(u.text)) { aliases.add(u.text); changed = true }
-              return
-            }
-            // ⚠️ **转存进容器的属性**（CR 第六十二轮 major）：`box.opts = opts` 之后
-            // `box.opts.concurrent = true` 写穿的仍是 opts。属性路径本身不能进别名集，但把
-            // **根标识符**（`box`）收进来后，任何经 `box.…` 的写入都按「可能是 opts」处理 ——
-            // 只多报（更保守），不会漏掉真写入。
-            if (ts.isPropertyAccessExpression(u) || ts.isElementAccessExpression(u)) {
-              collectTarget(u.expression)
-              return
-            }
-            if (ts.isArrayLiteralExpression(u)) {
-              for (const el of u.elements) {
-                if (ts.isSpreadElement(el)) collectTarget(el.expression)
-                else if (!ts.isOmittedExpression(el)) collectTarget(el as ts.Expression)
-              }
-              return
-            }
-            if (ts.isObjectLiteralExpression(u)) {
-              for (const p2 of u.properties) {
-                if (ts.isPropertyAssignment(p2)) collectTarget(p2.initializer)
-                else if (ts.isShorthandPropertyAssignment(p2)) collectTarget(p2.name)
-                else if (ts.isSpreadAssignment(p2)) collectTarget(p2.expression)
-              }
-              return
-            }
-            // 解构默认值 `[a = fallback] = …`：绑定名在等号左侧
-            if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.EqualsToken) collectTarget(u.left)
-          }
           collectTarget(n.left)
         }
       }
@@ -637,7 +662,12 @@ function isMutated(sf: ts.SourceFile, name: string): boolean {
       const init = n.initializer
       if (ts.isVariableDeclarationList(init)) {
         // `for (const { concurrent } of …)` 会重新绑定局部名，但不是写 opts —— 不算
-      } else if (ts.isIdentifier(init) || ts.isPropertyAccessExpression(init) || ts.isElementAccessExpression(init)) {
+      } else if (ts.isIdentifier(init)) {
+        // ⚠️ **裸标识符目标只是重新绑定，不是写入**（CR 第六十四轮 major）：`for (item of [opts])`
+        // 每轮把元素赋给 item，opts 本身一个字节都没变。旧判据把「目标是别名」当写入 —— 而
+        // 别名收集现在会把这种循环目标收进别名集，只读循环也会被误判成「值已变」。
+      } else if (ts.isPropertyAccessExpression(init) || ts.isElementAccessExpression(init)) {
+        // `for (opts.concurrent of [true])` 每一轮都给 opts 的**属性**赋值 → 是真写入
         if (refersToAlias(init)) hit = true
       } else if (destructuresAlias(init)) hit = true
     }
@@ -925,6 +955,25 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
     if (from !== 'vitest') continue
     const nb = st.importClause.namedBindings
     if (ts.isNamespaceImport(nb)) vitestNamespaces.add(nb.name.text)
+  }
+  /**
+   * ⚠️ **本地别名同样是登记**（CR 第六十四轮 major）：`const check = it; check(名, {…}, 体)`
+   * 在运行时就是 `it`。只认导入别名时整条被当成无关调用，选项里的并发开关被静默放行。
+   * 与作用域判据同一口径：只认**顶层唯一**的 `const X = <注册器名>`，传递闭包展开。
+   * 边界：若 `it` 本身被本地同名函数遮蔽，这里仍按注册器处理 —— 更保守（只会多报）。
+   */
+  for (let changed = true; changed;) {
+    changed = false
+    for (const st of sf.statements) {
+      if (!ts.isVariableStatement(st)) continue
+      for (const d of st.declarationList.declarations) {
+        if (!ts.isIdentifier(d.name) || registrarAlias.has(d.name.text) || d.initializer === undefined) continue
+        const init = unwrap(d.initializer)
+        if (!ts.isIdentifier(init)) continue
+        const base = registrarAlias.get(init.text) ?? (REGISTRARS.has(init.text) ? init.text : undefined)
+        if (base !== undefined) { registrarAlias.set(d.name.text, base); changed = true }
+      }
+    }
   }
   /** 链首名字 → 注册函数基名（原名或经 vitest 命名导入的别名）。 */
   const registrarBase = (name: string): string => registrarAlias.get(name) ?? name
@@ -1607,6 +1656,48 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
     }
     collectAssign(sf)
   }
+  /**
+   * 从登记调用往上找**最近的同名绑定**（CR 第六十四轮 major）：兄弟套件各声明一次同名回调时，
+   * 整份文件查重看到两处声明、两个都不扫 —— 其中一处排了调度就整条漏掉。判据：最近作用域说了算
+   * （函数声明 / const 箭头函数 / 函数表达式）；最近的同名绑定不是函数 → 无法静态确认，
+   * 返回 null（不再退回整份文件查重，那会把别的作用域的函数当成这个回调）。
+   */
+  const functionInScope = (name: string, from: ts.Node): ts.FunctionLikeDeclaration | null | undefined => {
+    let n: ts.Node | undefined = from.parent
+    while (n !== undefined) {
+      if (ts.isFunctionLike(n)) {
+        const binds = (n as ts.SignatureDeclaration).parameters
+          .some((p) => ts.isIdentifier(p.name) && p.name.text === name)
+        if (binds) return null
+      }
+      const stmts: readonly ts.Statement[] | undefined = ts.isBlock(n) || ts.isSourceFile(n) || ts.isModuleBlock(n)
+        ? (n as ts.Block | ts.SourceFile | ts.ModuleBlock).statements
+        : ts.isCaseBlock(n) ? n.clauses.flatMap((cl) => [...cl.statements]) : undefined
+      if (stmts !== undefined) {
+        // ⚠️ **同层重复声明按运行时语义取最后一个**：`function setup(){}; function setup(){}`
+        // 在 JS 里最后一次声明生效（hoisting 覆盖）。取第一个会扫到已被覆盖的那份 ——
+        // 既漏掉真正会执行的回调，也把「同名多处」样本（期望不报）变成误报。
+        let sawName = false
+        let lastFn: ts.FunctionLikeDeclaration | undefined
+        for (const st of stmts) {
+          if (ts.isFunctionDeclaration(st) && st.name?.text === name) { sawName = true; lastFn = st }
+          if (ts.isVariableStatement(st)) {
+            for (const d of st.declarationList.declarations) {
+              if (!ts.isIdentifier(d.name) || d.name.text !== name) continue
+              sawName = true
+              const init = d.initializer === undefined ? undefined : unwrap(d.initializer)
+              if (init !== undefined && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) lastFn = init
+              else lastFn = undefined
+            }
+          }
+        }
+        if (lastFn !== undefined) return lastFn
+        if (sawName) return null
+      }
+      n = n.parent
+    }
+    return undefined
+  }
   const sameFileFunction = (name: string): ts.FunctionLikeDeclaration | undefined => {
     const hits: ts.FunctionLikeDeclaration[] = []
     const visit = (n: ts.Node): void => {
@@ -1699,7 +1790,10 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
         if (!outSeen.has(key)) { outSeen.add(key); out.push({ line: lineOf(sf, u), why: reason }) }
         continue
       }
-      const fn = sameFileFunction(u.text)
+      // ⚠️ **就地作用域优先**（CR 第六十四轮 major）：同名回调在兄弟套件里各声明一次时，
+      // 整份文件查重会放弃；先按「最近的同名绑定」解析，找不到才退回整份文件唯一解析。
+      const scopedFn = functionInScope(u.text, call)
+      const fn = scopedFn === null ? undefined : (scopedFn ?? sameFileFunction(u.text))
       if (fn !== undefined) { namedHookCallbacks.add(fn); roots.push(fn) }
     }
     for (const root of roots) for (const inner of collectCalls(root)) {
@@ -1845,6 +1939,7 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
  */
 describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#72）', () => {
   const SRC_TESTS = fileURLToPath(new URL('../', import.meta.url))
+  const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url))
 
   /** 递归取测试文件（跳过 fixtures）。 */
   function testFiles(dir: string, out: string[] = []): string[] {
@@ -1878,6 +1973,36 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     parsed.set(f, sf)
     return sf
   }
+
+  /**
+   * ⚠️ **`sequence.concurrent` 不得被仓库配置启用**（CR 第六十四轮 major）：captureSinks 的写入
+   * 归属依赖「同一时刻只有一条用例在写模块级变量」；全局并发序列会让**普通** `it(...)` 也并发，
+   * 而登记里没有任何标志可被静态扫描看见 —— 那是机制层无法覆盖的配置面。这里钉住仓内
+   * （配置文件 / package 脚本 / 分片器）不启用它。已声明边界：调用方在命令行额外加
+   * `--sequence.concurrent` 仍会绕开本守卫（静态扫描不可见），使用该旗标时禁止依赖 captureSinks。
+   */
+  it('仓库配置与脚本不得启用 sequence.concurrent（全局并发下 captureSinks 的写入无法归属）',
+    () => {
+      const enables = (txt: string): boolean =>
+        /sequence\s*[.:]\s*concurrent|--sequence\.concurrent|sequence\s*:\s*\{[^}]*concurrent\s*:\s*true/.test(txt)
+      // 双向自检：三种真实启用形态必红；无关文本放过（只测正则本身，不拿真配置做变异 ——
+      // 改 config 再跑测试会让本次运行真的变成并发，触发历史上的内存事故）。
+      expect(enables('export default { test: { sequence: { concurrent: true } } }'), '配置对象形态').toBe(true)
+      expect(enables('vitest run --sequence.concurrent'), 'CLI 旗标形态').toBe(true)
+      expect(enables('sequence.concurrent: true'), '点号形态').toBe(true)
+      expect(enables('export default { test: { maxWorkers: 1 } }'), '无关配置').toBe(false)
+      const files = ['vitest.config.ts', 'vitest.config.mts', 'vitest.workspace.ts',
+        'package.json', 'scripts/test-shards.mjs', 'scripts/test-shards.test.ts']
+      const offenders: string[] = []
+      for (const rel of files) {
+        const txt = (() => {
+          try { return readFileSync(join(REPO_ROOT, rel), 'utf8') } catch { return undefined }
+        })()
+        if (txt === undefined) continue
+        if (enables(txt)) offenders.push(rel)
+      }
+      expect(offenders, 'captureSinks 的归属前提是全局串行；要并发请改用 startCapture() 句柄形态').toEqual([])
+    })
 
   /** 迁移形态文件的相对路径清单（白名单键的归一化与 Windows 分隔符一致）。 */
   function migratedFiles(): Array<{ rel: string; sf: ts.SourceFile }> {
@@ -2058,6 +2183,10 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
     expect(hookHits(`${H}(async () => { await pending.catch(w); })`), '已知名字链 await catch').toEqual([])
     expect(hookHits(`${H}(() => { pending.then(w) })`), '未 await 的已知名字链照报').toEqual(['pending.then('])
     expect(hookHits(`${H}(() => { x.catch(w) })`), '任意链的 catch').toEqual(['x.catch('])
+    // ⚠️ **命名回调按登记所在作用域解析**（CR 第六十四轮 major）：两个兄弟套件各声明一次
+    // 同名 `setup` 时，整份文件查重看到两处声明、两个都不扫 —— 其中一处排了调度就整条漏掉。
+    expect(hookHits(`describe('SD1', () => {\n  const setupA = () => { ${ST}(w, 80) }\n  beforeEach(setupA)\n})\ndescribe('SD2', () => {\n  const setupA = () => { console.log('ok') }\n  beforeEach(setupA)\n})`),
+      '兄弟套件里同名回调按各自的作用域解析').toEqual([`${ST}(`])
     // 反例：名字里只是恰好含 then 前缀的不是
     expect(hookHits(`${H}(() => { thenable(w) })`), 'thenable 不是 .then').toEqual([])
     // hook 登记本身经 `.call`（Codex PR#81 第二十四轮 P2）
@@ -2784,6 +2913,12 @@ it('Q34', oQ34, () => {})`),
     // 反例：遍历绑定的数组但不写 → 仍按原值判
     expect(concHits(`const oF63 = { con${'current: false }'}\nconst listF63 = [oF63]\nfor (const itemF63 of listF63) { console.log(itemF63) }\nit('F63', oF63, () => {})`),
       '只读遍历绑定的数组不放宽').toEqual([])
+    // ⚠️ **既有变量做 for-of 目标**（CR 第六十四轮 major）：`for (item of [opts])` 每轮把
+    // 元素赋给 item —— 收集器只跟声明目标时，随后的 `item.concurrent = true` 被当成无关变量。
+    expect(concHits(`const oF64 = { con${'current: false }'}\nlet itemF64\nfor (itemF64 of [oF64]) { itemF64.concurrent = true }\nit('F64', oF64, () => {})`),
+      '既有变量的 for-of 目标同样带出元素别名').toEqual(['unknown'])
+    expect(concHits(`const oF65 = { con${'current: false }'}\nlet itemF65\nfor (itemF65 of [oF65]) { console.log(itemF65) }\nit('F65', oF65, () => {})`),
+      '只读遍历既有目标不放宽').toEqual([])
     // ⑲ **完整属性链**（Codex 第七轮 P2）：`box.nested.opts` 的基座是属性访问，只追一层会漏。
     expect(concHits(`const oP72 = { con${'current: false }'}\nconst boxP72 = { nested: { opts: oP72 } }\nconst aliasP72 = boxP72.nested.opts\naliasP72.concurrent = true\nit('P72', oP72, () => {})`),
       '两层容器属性链仍指向同一对象').toEqual(['unknown'])
@@ -2955,6 +3090,12 @@ it('Q34', oQ34, () => {})`),
     expect(concHits(bt("it.call(...[null, 'RP8', { con", 'current: true }, () => {}] as const)')),
       '.call 的实参整体经展开').toEqual(['opt'])
     expect(concHits(bt("it.call(...[null, 'RP9', () => {}] as const)")), '.call 展开的合法串行登记').toEqual([])
+    // ⚠️ **注册器的本地别名**（CR 第六十四轮 major）：`const check = it; check(…)` 是真登记，
+    // 只认导入别名时整条被当成无关调用、选项里的并发开关被静默放行。
+    expect(concHits(`const check = it\ncheck('AL1', { con${'current: true }'}, () => {})`),
+      '测试注册器的本地别名同样是登记').toEqual(['opt'])
+    expect(concHits(`const check = helper\ncheck('AL2', { con${'current: true }'}, () => {})`),
+      '绑定到非测试函数的名字不是登记').toEqual([])
     expect(concHits(bt("it.apply(...[null, ['RP10', { con", 'current: true }, () => {}]] as const)')),
       '.apply 的两个实参整体经展开').toEqual(['opt'])
 

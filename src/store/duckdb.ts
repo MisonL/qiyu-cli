@@ -624,7 +624,26 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
    * 直接走原生连接、不经 `execSql`：不登记在途、不做归属判定，也绝不递归。
    */
   const txInvalidated = async (): Promise<boolean> => {
-    try { await c.runAndReadAll('SELECT 1', []); return false } catch { return true }
+    // ⚠️ **必须有界**（CR 第六十四轮 major）：这条探针直接走原生连接，若原生线程被上一条
+    // 失败语句占住，`SELECT 1` 永不交回 —— 而它是在 `execSql` 的 catch 里 await 的，拒绝也
+    // 就永远到不了调用方，回滚收尾（连同 ROLLBACK 自己的有界预算）根本没机会开始。
+    // 超时与探针报错同一保守侧：无法证明事务未失效 → 按「已失效」处理（只影响是否拒绝提交，
+    // 不换掉交回的错误）。超时后补发 interrupt，别把原生线程留在里面。
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('事务失效性探针超时')), 50)
+    })
+    try {
+      const raw = c.runAndReadAll('SELECT 1', []) as unknown as Promise<unknown>
+      void raw.catch(() => { /* 归因价值由探针结果承担，避免迟到拒绝冒成 unhandled */ })
+      await Promise.race([raw, timeout])
+      return false
+    } catch {
+      try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 中断失败照旧按已失效处理 */ }
+      return true
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
   /**
    * 事务关键字的**文本初筛**：只决定「要不要交给 DuckDB 解析」，本身不是判据。
