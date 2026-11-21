@@ -7,7 +7,7 @@ import { createDuckDbStore } from '../../src/store/duckdb.js'
 import type { DuckDbDeps } from '../../src/store/duckdb.js'
 import { TABLES } from '../../src/store/schema.js'
 import type { Store, StoreConfig, QueryResult } from '../../src/store/types.js'
-import { spawnLockHolder, lockVerdict, seedEmptyDb, LOCK_BUDGET_MS } from '../helpers/lock-holder.js'
+import { spawnLockHolder, lockVerdict, seedEmptyDb, terminateHolder, LOCK_BUDGET_MS } from '../helpers/lock-holder.js'
 
 // L1 对冲：本文件全部用例走真库（DuckDB 冷启动偶发 >5s），统一放宽到 15s。
 vi.setConfig({ testTimeout: 15_000 })
@@ -1197,16 +1197,27 @@ describe('duckdb —— 事务', () => {
       wrote()
       await gate
     }).then(() => 'committed', (e: unknown) => `rejected: ${(e as Error).message}`)
-    await writeDone
-    extractArmed = true
-    const outside = await s.query("SELECT CASE WHEN true THEN 1 END AS v")
-      .then(() => 'ok', (e: unknown) => `rejected: ${(e as { kind?: string }).kind}`)
-    expect(outside, '外部链必须在解析开始前就被拒（归属错误），而不是挂着等').toMatch(/^rejected: internal/)
-    expect(parsedOutside, '外部链的 SQL 不得进入解析 —— 否则它的在途会被记到所有者账上').toBe(0)
-    release()                     // 所有者回调在此时返回
-    expect(await txP, '所有者的事务不得被外部链拖垮').toBe('committed')
-    expect(await s.count('tags'), '所有者的写入必须落库').toBe(1)
-    await s.close()
+    // ⚠️ **先等「写成功」与「事务已结束」竞速**（CR 第六十六轮 major）：回调在 `wrote()` 之前
+    // 就失败时，裸等 milestone 只能等 90s 超时；把事务的结局一起看，立刻点名成因。
+    const pre = await Promise.race([
+      writeDone.then(() => 'ready' as const),
+      txP.then((s) => ({ settled: s } as const)),
+    ])
+    if (typeof pre === 'object') throw new Error(`前提不成立：事务在写成功之前就结束了（${pre.settled}）`)
+    try {
+      extractArmed = true
+      const outside = await s.query("SELECT CASE WHEN true THEN 1 END AS v")
+        .then(() => 'ok', (e: unknown) => `rejected: ${(e as { kind?: string }).kind}`)
+      expect(outside, '外部链必须在解析开始前就被拒（归属错误），而不是挂着等').toMatch(/^rejected: internal/)
+      expect(parsedOutside, '外部链的 SQL 不得进入解析 —— 否则它的在途会被记到所有者账上').toBe(0)
+      release()                     // 所有者回调在此时返回
+      expect(await txP, '所有者的事务不得被外部链拖垮').toBe('committed')
+      expect(await s.count('tags'), '所有者的写入必须落库').toBe(1)
+    } finally {
+      // ⚠️ 断言失败也要放闸 / 收回事务 / 关库（CR 第六十六轮 major）：否则挂住的
+      // 回调把用例拖到超时，并让实例泄漏到后续用例。
+      await releaseAll([release], [txP], () => s.close())
+    }
   })
 
   it('解析结果在 close() 之后才交回 → 不得在已关闭连接上 prepare（CR 第四十二轮 major）', { timeout: 90_000 }, async () => {
@@ -1286,16 +1297,19 @@ describe('duckdb —— 事务', () => {
       await gate
     }).then(() => 'committed', (e: unknown) => `rejected: ${(e as Error).message}`)
     await awaitMilestone(txReady, txP, '所有者写成功的里程碑')
-    // 外部 delete 打到那张一执行就报错的 view 上
-    const outside = await s.delete('robot_summary', 'TRUE')
-      .then(() => 'ok', (e: unknown) => e)
-    expect(outside, '外部 delete 必须在发出任何语句前被拒（kind:internal），'
-      + '否则它的 count 会执行并污掉所有者的事务').toMatchObject({ kind: 'internal' })
-    release()
-    expect(await txP).toBe('committed')
-    const ids = (await s.query('SELECT id FROM tags')).rows.map((r) => String(r.id))
-    expect(ids, '所有者 COMMIT 报成功但写入被静默丢弃 —— 正是本用例要挡的形态').toEqual(['9'])
-    await s.close()
+    try {
+      // 外部 delete 打到那张一执行就报错的 view 上
+      const outside = await s.delete('robot_summary', 'TRUE')
+        .then(() => 'ok', (e: unknown) => e)
+      expect(outside, '外部 delete 必须在发出任何语句前被拒（kind:internal），'
+        + '否则它的 count 会执行并污掉所有者的事务').toMatchObject({ kind: 'internal' })
+      release()
+      expect(await txP).toBe('committed')
+      const ids = (await s.query('SELECT id FROM tags')).rows.map((r) => String(r.id))
+      expect(ids, '所有者 COMMIT 报成功但写入被静默丢弃 —— 正是本用例要挡的形态').toEqual(['9'])
+    } finally {
+      await releaseAll([release], [txP], () => s.close())
+    }
   })
 
   it('delete 的 count 在 await 期间，事务同样不得开启 —— count 的错误只属于 delete 自己（CR 第三十七轮 major，改写自 PR#81 第十六轮）', async () => {
@@ -1396,18 +1410,26 @@ describe('duckdb —— 事务', () => {
         return orig(sql, p)
       }
     const up = s.upsert('tags', [{ id: '1', name: 'A', color: '#FF0000' }])
-    await inInsert                          // 自动事务已 BEGIN 并卡在 INSERT
-    const txErr = await s.transaction(async () => { throw new Error('不该到这里') })
-      .then(() => null, (e: unknown) => e)
-    expect(txErr, '并发显式事务必须被拒成 internal（不是 usage 嵌套）').toMatchObject({ kind: 'internal' })
-    // 此刻闭包层只应看到自动事务的那条 BEGIN（INSERT 还挂在闸门前）；被拒的显式事务
-    // 一条都不发 —— 这条断言在闭包层，实例属性 spy 看不到 BEGIN（探针证实过）。
-    expect(sqls, '被拒的显式事务不得发出 BEGIN（闭包层观察）').toEqual(['BEGIN'])
-    releaseInsert()
-    expect(await up).toBe(1)
-    expect(sqls, '自动事务完整序列：BEGIN → INSERT → COMMIT').toEqual(['BEGIN', 'INSERT', 'COMMIT'])
-    await s.close()
-    await raw.close()
+    // ⚠️ 先等「已进入 INSERT」与「upsert 已结束」竞速（CR 第六十六轮 major）：upsert 在到达
+    // INSERT 之前就失败时，裸等里程碑只能等 90s 超时。把结局一起看，立刻点名成因。
+    const pre = await Promise.race([
+      inInsert.then(() => 'ready' as const),
+      up.then((n) => ({ done: n } as const), (e: unknown) => ({ err: e as Error } as const)),
+    ])
+    if (typeof pre === 'object') throw new Error(`前提不成立：upsert 在进入 INSERT 之前就结束了（${JSON.stringify(pre)}）`)
+    try {
+      const txErr = await s.transaction(async () => { throw new Error('不该到这里') })
+        .then(() => null, (e: unknown) => e)
+      expect(txErr, '并发显式事务必须被拒成 internal（不是 usage 嵌套）').toMatchObject({ kind: 'internal' })
+      // 此刻闭包层只应看到自动事务的那条 BEGIN（INSERT 还挂在闸门前）；被拒的显式事务
+      // 一条都不发 —— 这条断言在闭包层，实例属性 spy 看不到 BEGIN（探针证实过）。
+      expect(sqls, '被拒的显式事务不得发出 BEGIN（闭包层观察）').toEqual(['BEGIN'])
+      releaseInsert()
+      expect(await up).toBe(1)
+      expect(sqls, '自动事务完整序列：BEGIN → INSERT → COMMIT').toEqual(['BEGIN', 'INSERT', 'COMMIT'])
+    } finally {
+      await releaseAll([releaseInsert], [up], async () => { await s.close(); await raw.close() })
+    }
   })
 
   it('显式事务开着时，另一条链的 transaction() 报 internal（不是 usage 嵌套），读语句也不得落进去（CodeRabbit PR#81 第十七轮 minor）', async () => {
@@ -1426,23 +1448,26 @@ describe('duckdb —— 事务', () => {
       await gate
     })
     await awaitMilestone(txReady, tx, '事务开起来的里程碑')
-    const race = await s.transaction(async () => 'x').then(() => null, (e: unknown) => e)
-    expect(race, '竞争方的显式事务必须报 internal（串行化），不能报成 usage 嵌套').toMatchObject({ kind: 'internal' })
-    expect((race as { hint?: string }).hint, 'internal 必须带串行化提示').toMatch(/串行/)
-    const read = await s.count('tags').then(() => null, (e: unknown) => e)
-    expect(read, '竞争方的读同样必须被拒成 internal').toMatchObject({ kind: 'internal' })
-    expect((read as Error).message, '文案必须对读成立 —— 不能只说"写操作"，否则只读调用方会被引到错误成因上')
-      // ⚠️ 锚在**被改动的那句**（"又发起了 X"）上，不能只匹配 /读/：消息后半句本来就解释
-      // 了读的后果，只匹配 /读/ 的话把首句改回"写操作"变异也照样绿（实测存活过一轮）。
-      .toMatch(/又发起了语句/)
-    expect((read as { hint?: string }).hint).toMatch(/query/)
-    release()
-    await tx
-    // 所有者上下文里的真嵌套仍是 usage（这条不能跟着变成 internal）
-    await expect(s.transaction(async (t) => {
-      await (t as unknown as { transaction: (f: unknown) => Promise<unknown> }).transaction(async () => {})
-    })).rejects.toMatchObject({ kind: 'usage' })
-    await s.close()
+    try {
+      const race = await s.transaction(async () => 'x').then(() => null, (e: unknown) => e)
+      expect(race, '竞争方的显式事务必须报 internal（串行化），不能报成 usage 嵌套').toMatchObject({ kind: 'internal' })
+      expect((race as { hint?: string }).hint, 'internal 必须带串行化提示').toMatch(/串行/)
+      const read = await s.count('tags').then(() => null, (e: unknown) => e)
+      expect(read, '竞争方的读同样必须被拒成 internal').toMatchObject({ kind: 'internal' })
+      expect((read as Error).message, '文案必须对读成立 —— 不能只说"写操作"，否则只读调用方会被引到错误成因上')
+        // ⚠️ 锚在**被改动的那句**（"又发起了 X"）上，不能只匹配 /读/：消息后半句本来就解释
+        // 了读的后果，只匹配 /读/ 的话把首句改回"写操作"变异也照样绿（实测存活过一轮）。
+        .toMatch(/又发起了语句/)
+      expect((read as { hint?: string }).hint).toMatch(/query/)
+      release()
+      await tx
+      // 所有者上下文里的真嵌套仍是 usage（这条不能跟着变成 internal）
+      await expect(s.transaction(async (t) => {
+        await (t as unknown as { transaction: (f: unknown) => Promise<unknown> }).transaction(async () => {})
+      })).rejects.toMatchObject({ kind: 'usage' })
+    } finally {
+      await releaseAll([release], [tx], () => s.close())
+    }
   })
 
   it('tx 内嵌套 transaction() → usage', async () => {
@@ -1984,7 +2009,11 @@ describe('duckdb —— 事务', () => {
     // 真驱动实测 `EXPLAIN ANALYZE SELECT 'COMMIT'` 只是普通解释语句，外层类型 EXPLAIN 但里层
     // 并无事务控制。旧判据拿 TX_KEYWORD 匹配整条 SQL 原文 → 误拒合法诊断。
     for (const sql of ["EXPLAIN ANALYZE SELECT 'COMMIT' AS v",
-      'EXPLAIN ANALYZE SELECT 1 AS v /* COMMIT */']) {
+      'EXPLAIN ANALYZE SELECT 1 AS v /* COMMIT */',
+      // ⚠️ 反例③（Codex 第十三轮 P2）：`END` 也是 CASE 的结束关键字，`CASE … END` 的
+      // 合法只读诊断不得被当成事务控制拒掉（可嵌套、可带 ELSE）。
+      'EXPLAIN ANALYZE SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END AS v',
+      'EXPLAIN ANALYZE SELECT CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 2 ELSE 0 END ELSE 0 END AS v']) {
       const res = await s.query(sql).then(() => null, (e: unknown) => e as Error)
       expect(res, `${sql} 是普通解释语句，不得误拒`).toBeNull()
       expect((res as unknown as { rows: unknown[] } | null)?.rows?.length ?? 1).toBeGreaterThan(0)
@@ -2606,6 +2635,90 @@ describe('duckdb —— 事务', () => {
     expect(e!.message, '收尾状态如实说「无法确认」').toMatch(/回滚未能确认|无法确认/)
     expect(e!.hint, '恢复动作：重建 → 核对 → 再重放').toMatch(/核对/)
     expect(e!.code).toBe('store_retired')
+    await s.close()
+  })
+
+  it('探针超时后才交回、回调仍活着 → 收尾仍须发 ROLLBACK（CR 第六十六轮 major）', { timeout: 90_000 }, async () => {
+    // 事故形态：探针的 50ms 等待 + 100ms 宽限都没等到它交回（nativeProbeStuck=true），
+    // 但它在回调返回**之前**自己交回了 —— 连接已不被占用，为它跳过 ROLLBACK 会把一个
+    // 可正常收尾的事务错误退役。判据以**收尾时刻**为准。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    const sqls: string[] = []
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as {
+                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
+                extractStatements: (x: string) => unknown
+                interrupt?: () => void
+                closeSync?: () => void
+              }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                interrupt: () => cc.interrupt?.(),
+                runAndReadAll: (sql: string, params?: unknown[]) => {
+                  if (armed) sqls.push(sql)
+                  if (!armed) return cc.runAndReadAll(sql, params)
+                  // 探针在 180ms 后交回：超过 50ms 超时 + 100ms 宽限，但在回调返回之前。
+                  if (sql === 'SELECT 1') {
+                    return new Promise((resolve, reject) => {
+                      setTimeout(() => { cc.runAndReadAll(sql, params).then(resolve, reject) }, 180)
+                    })
+                  }
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const s = await createDuckDbStore(cfg, 'rw', { importer })
+    await s.init()
+    armed = true
+    const e = await s.transaction(async (t) => {
+      await t.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      // 自身语句执行期报错 → 触发失效性探针（延迟 180ms 交回）。
+      await s.query("SELECT CAST('not-a-number' AS BIGINT) AS n").catch(() => {})
+      // 探针在 150ms 判「仍未交回」，在 180ms 自己交回；回调活到 250ms。
+      await new Promise<void>((r) => setTimeout(r, 120))
+    }).then(() => null, (x: unknown) => x as Error & { code?: string; hint?: string })
+    expect(e, '事务必须被拒，不得报成功').not.toBeNull()
+    expect(e!.message, '按「事务可能已废」拒绝提交').toMatch(/事务未提交|aborted/)
+    expect(e!.message, '探针已交回 → 回滚可以确认').toMatch(/已整体回滚/)
+    expect(e!.code, '回滚已确认时实例不退役').toBeUndefined()
+    expect(sqls.filter((q) => q === 'ROLLBACK'), '探针已交回 → 必须真的发 ROLLBACK').not.toEqual([])
+    // 实例仍可用：清锁之类的后续语句照常执行。
+    expect((await s.query('SELECT 1 AS ok')).rows[0]).toEqual({ ok: 1 })
+    await s.close()
+  })
+
+  it('解析/预编译期就让事务失效（Conversion Error）→ 回调吞掉后仍不得报成功（CR 第六十六轮 major）', { timeout: 90_000 }, async () => {
+    // 事故形态：分类器为判定语句类型会 `prepare`，而 DuckDB 在 prepare 期就求值 table function
+    // 参数 —— `range(CAST('not-a-number' AS BIGINT))` 抛 Conversion Error，事务已被标成
+    // aborted。旧实现把这条失败当普通拒绝交回、释放在途计数；回调吞掉后 commitOrRefuse 只
+    // 看到计数归零 → COMMIT 被 DuckDB 静默改成 ROLLBACK，写入丢失而 API 报成功。
+    const s = await fresh()
+    const e = await s.transaction(async () => {
+      await s.upsert('tags', [{ id: '1', name: 'A', color: '#FFF' }])
+      // 注释里的 END 让它进入分类路径；求值失败发生在 prepare 期。
+      await s.query("SELECT * FROM range(CAST('not-a-number' AS BIGINT)) -- END").catch(() => {})
+    }).then(() => null, (x: unknown) => x as Error & { code?: string; message?: string })
+    expect(e, '解析期已废掉事务 → 提交必须被拒，不能报成功').not.toBeNull()
+    expect(e!.message, '点名事务可能已被标成 aborted').toMatch(/事务未提交|aborted/)
+    expect(e!.code, '回滚已确认时实例不退役').toBeUndefined()
+    expect(await s.count('tags'), '回滚已确认 → 写入不落库').toBe(0)
     await s.close()
   })
 
@@ -3670,11 +3783,31 @@ describe('duckdb —— 事务', () => {
     const s = await createDuckDbStore(cfg, 'rw', { importer })
     holdNext = true
     const initP = s.init()
-    for (const deadline = Date.now() + 10_000; executeGate === undefined && Date.now() < deadline;) {
-      await new Promise((r) => setTimeout(r, 10))
-    }
+    // ⚠️ **init 可能在闸门出现之前就失败**（CR 第六十六轮 major）：裸轮询会空转 10s，而
+    // initP 的拒绝在这段窗口里没有任何监听者，Node 可能先报 unhandled rejection。把
+    // 「闸门就绪」与「init 已结束」一起竞速 —— init 先失败就立刻把它抛给下面的收尾。
+ // ⚠️ **init可能在闸门出现之前就失败**（CR第六十六轮 major）：裸轮询会空转10s，而
+ // initP的拒绝在这段窗口里没有任何监听者，Node可能先报 unhandled rejection。这里先挂
+ //拒绝监听：init先失败就立刻停止轮询并把原始拒绝向上交回；闸门先出现则照常继续。
+ let gateStop = false
+ let gateWaiterReject: (e: unknown) => void = () => {}
+ const gateWait = new Promise<{ p: Promise<void> | undefined }>((resolve, reject) => {
+ gateWaiterReject = reject
+ const deadline = Date.now() +10_000
+ const poll = (): void => {
+ if (gateStop) return
+ if (Date.now() >= deadline) { resolve({ p: undefined }); return }
+ // ⚠️用对象包住：`resolve`会把 thenable**当作要等待的值**（adopt）——直接 resolve(闸门 promise)
+ //会等迁移释放闸门，而死锁到本用例超时（实测：race版挂90s的根因）。
+ if (executeGate !== undefined) { resolve({ p: executeGate }); return }
+ setTimeout(poll,10)
+ }
+ poll()
+ })
+ void initP.catch((e: unknown) => { gateStop = true; gateWaiterReject(e) })
+ const ready = { gate: (await gateWait).p }
     try {
-      expect(executeGate, '前提：迁移的第一条 DDL 已下发、停在执行闸门上').toBeDefined()
+      expect('gate' in ready ? ready.gate : undefined, '前提：迁移的第一条 DDL 已下发、停在执行闸门上').toBeDefined()
       // 迁移事务此刻开着 —— 另一条链的 transaction() 必须在入口被拒（不得发 BEGIN）
       const txErr = await s.transaction(async () => { /* 不该进来 */ })
         .then(() => null, (e: unknown) => e as Error)
@@ -4297,9 +4430,14 @@ describe('duckdb —— 事务', () => {
     // ⚠️ 宽限必须明显短于这条查询的自然耗时（本机实测 ~6s）：否则「不中断、光等」也能通过，
     // 用例就区分不出 interrupt 有没有发（第三十九轮变异 M5 实测：宽限 10s 时该变异存活）。
     const real = await import('@duckdb/node-api')
-    // ⚠️ **观测原生派发与中断的先后**（CR 第六十三轮 major）：慢机上 200ms 截止可能在重查询
-    // 真正进入原生执行之前就到点 —— 中断落在驱动的初始化/准备阶段会被随后清掉，用例结论
-    // 随机器负载漂移。回调里等「已派发」再返回，并记录两者顺序钉住前提。
+    // ⚠️ **观测派发与中断的先后**（CR 第六十三轮 major / 第六十六轮 major 收窄）：
+    // 这里的 `heavy-dispatched` 是**包装层入口**——它只证明语句已交给驱动，**不**证明
+    // DuckDB 原生线程已开始执行（驱动内部还有排队/准备）。所以它只当「语句确实发出去了」
+    // 的前提，不拿来断言「中断发生在原生执行之后」。
+    // 真正的判据是**结果**：这条 2e10 行计数在 200ms 预算内不可能跑完；若中断被随后的
+    // 准备阶段清掉、语句一直在原生里跑，`heavyOut` 就不会以 `INTERRUPT` 交回（用例会
+    // 超时而不是假绿）。边界如实记录：极端负载下原生启动晚于 200ms 时，本用例会以超时
+    // 失败 —— 那是时序保证，不是「中断逻辑错误」。
     let heavyEnteredResolve: () => void = () => {}
     const heavyEntered = new Promise<void>((resolve) => { heavyEnteredResolve = resolve })
     const events: string[] = []
@@ -4357,7 +4495,9 @@ describe('duckdb —— 事务', () => {
       // 等重查询真正进入原生执行再返回 —— 否则截止可能早于派发，中断被驱动初始化清掉
       await heavyEntered
     }).then(() => null, (e: unknown) => e as Error)
-    expect(events[0], '前提：中断必须发生在重查询已进入原生执行之后').toBe('heavy-dispatched')
+    expect(events, '前提：重查询已交给驱动').toContain('heavy-dispatched')
+    expect(events.indexOf('heavy-dispatched'), '前提：中断在语句交给驱动之后发出')
+      .toBeLessThan(events.indexOf('interrupt'))
     expect(events, '前提：确有中断发出').toContain('interrupt')
     expect(txErr, '未交回的语句不得被当成已提交').not.toBeNull()
     expect((txErr as Error).message, '中断让它交回，回滚因此可确认').toMatch(/已整体回滚/)
@@ -4636,7 +4776,7 @@ describe('duckdb —— init 与关闭', () => {
       expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— 锁未生效（夹具或平台行为变了），不是竞态窗口').toBeGreaterThan(0)
       expect(asserted, `未取得「锁生效且读者撞锁」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
-      holder?.kill('SIGKILL')
+      await terminateHolder(holder)
     }
   })
 
@@ -4693,7 +4833,7 @@ describe('duckdb —— init 与关闭', () => {
       expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— 锁未生效（夹具或平台行为变了），不是竞态窗口').toBeGreaterThan(0)
       expect(asserted, `未取得「锁生效且写者撞锁」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
-      holder?.kill('SIGKILL')
+      await terminateHolder(holder)
     }
   })
 
@@ -4753,7 +4893,7 @@ describe('duckdb —— init 与关闭', () => {
       expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— RO 持有者的锁未生效，不是竞态窗口').toBeGreaterThan(0)
       expect(asserted, `未取得「RO 持有者生效且写者撞锁」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
-      holder?.kill('SIGKILL')
+      await terminateHolder(holder)
     }
   })
 

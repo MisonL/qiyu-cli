@@ -518,3 +518,31 @@ inst.closeSync()`, scriptDir, 'seed', deadline)
     throw new Error(`种子失败：${run.stderr.slice(0, 300)}（${how}）`)
   }
 }
+/**
+ *结束跨进程持锁者并**确认它已 close**（CR第六十六轮 major）：`kill()`只发信号 —— stdio
+ *与库文件句柄可能仍未放开，调用方在 close之前删夹具目录 /复用同一路径，会把「清理未确认」
+ *说成正常收尾（Windows上还会直接删不掉）。有界等待；等不到就响亮失败。
+ * ⚠️只用于**当前仍在运行的**持锁者（每轮换路径的旧持有者由轮次循环自行 kill）。
+ */
+export async function terminateHolder(child: ChildProcess | undefined,
+ graceMs: number = CLOSE_GRACE_MS): Promise<void> {
+ if (child === undefined) return
+ let timer: ReturnType<typeof setTimeout> | undefined
+ const closed = new Promise<boolean>((resolve) => {
+ const done = (): void => {
+ if (timer !== undefined) clearTimeout(timer)
+ resolve(true)
+ }
+ child.once('close', done)
+ timer = setTimeout(() => { child.off('close', done); resolve(false) }, graceMs)
+ })
+ //监听先挂、再发信号：kill与 close之间没有窗口。
+ try {
+ child.kill('SIGKILL')
+ } catch (e) {
+ throw new Error(`终止持锁者失败（它可能仍占着库文件）：${(e as Error).message}`, { cause: e })
+ }
+ if (!(await closed)) {
+ throw new Error('持锁者未在宽限内 close ——它可能仍占着库文件，不得删除夹具目录或复用同一路径')
+ }
+}

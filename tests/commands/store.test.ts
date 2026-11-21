@@ -9,7 +9,7 @@ import { storeCommand } from '../../src/commands/store.js'
 import { dbCommand } from '../../src/commands/db.js'
 import { syncCommand } from '../../src/commands/sync.js'
 import { TABLES } from '../../src/store/schema.js'
-import { spawnLockHolder, lockVerdict, LOCK_BUDGET_MS } from '../helpers/lock-holder.js'
+import { spawnLockHolder, lockVerdict, terminateHolder, LOCK_BUDGET_MS } from '../helpers/lock-holder.js'
 
 let dir = '', out = '', err = ''
 const dbPath = (): string => join(dir, 'q.db')
@@ -722,7 +722,7 @@ describe('store 命令面与 help', () => {
       expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— 锁未生效（夹具或平台行为变了），不是竞态窗口').toBeGreaterThan(0)
       expect(asserted, `未取得「锁生效且 init 撞锁返回 1」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
-      holder?.kill('SIGKILL')
+      await terminateHolder(holder)
     }
   })
 

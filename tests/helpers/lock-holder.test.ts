@@ -6,7 +6,7 @@ import { accessSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
-import { lockVerdict, spawnLockHolder, seedEmptyDb, LOCK_BUDGET_MS, CLOSE_GRACE_MS, PKG_URL } from './lock-holder.js'
+import { lockVerdict, spawnLockHolder, seedEmptyDb, terminateHolder, LOCK_BUDGET_MS, CLOSE_GRACE_MS, PKG_URL } from './lock-holder.js'
 
 // 只把 `spawn` 换成可预置替身的薄壳，其余 child_process 能力保持真实。
 vi.mock('node:child_process', async (importOriginal) => {
@@ -650,6 +650,29 @@ describe('锁夹具的子进程生命周期', () => {
     expect(String('error' in result ? result.error : '')).toMatch(/未交回结论.*exit=1.*不是 JSON.*脚本加载失败/)
     expectClean(child)
   })
+})
+
+describe('terminateHolder（持锁者收尾必须确认 close）', () => {
+ it('kill之后等到 close才算收尾', async () => {
+ const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter
+ ;(ch as unknown as { kill: () => boolean }).kill = () => {
+ setTimeout(() => ch.emit('close', null, 'SIGKILL'),5)
+ return true
+ }
+ await terminateHolder(ch,200)
+ })
+
+ it('宽限内没有 close →响亮失败（不得把清理未确认说成正常收尾）', async () => {
+ const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter
+ ;(ch as unknown as { kill: () => boolean }).kill = () => true
+ await expect(terminateHolder(ch,50)).rejects.toThrow(/未在宽限内 close/)
+ })
+
+ it('kill自身抛错 →原样带出', async () => {
+ const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter
+ ;(ch as unknown as { kill: () => boolean }).kill = () => { throw new Error('EPERM:注入') }
+ await expect(terminateHolder(ch,50)).rejects.toThrow(/EPERM:注入/)
+ })
 })
 
 describe('真实子进程端到端', () => {

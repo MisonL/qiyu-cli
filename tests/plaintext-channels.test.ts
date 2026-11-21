@@ -206,6 +206,49 @@ const THROW_ERROR: Rule = {
       || ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)
       || ts.isConstructorDeclaration(n)
     /**
+     * 函数边界处**只跟随会被交出的值**（CR 第六十六轮 major）：
+     * `throw (() => { const debug = new Error('**debug**'); return new Error('clean') })()` 里
+     * 变量声明的结果既不返回也不抛出，外层即使被调也抛不到它。判据：节点必须在
+     * 表达式体箭头的 body 里，或在某个 `return` 的表达式里，或是被 `return` 的那个变量的
+     * 初始化器。边界（如实记录）：`const e = new Error(…); e = other; return e` 这类重赋值
+     * 不追 —— 会多报（更保守），不会漏。
+     */
+    const flowsToReturn = (fn: ts.FunctionLikeDeclaration, node: ts.Node): boolean => {
+      const body = fn.body
+      if (body === undefined) return false
+      if (!ts.isBlock(body)) return containsNode(body, node)
+      const names = new Set<string>()
+      // ⚠️ **构造器里写 `this.e = <n>`也是交出**（既有匿名类样本：
+      // `new (class { constructor() { this.e = new Error(…) } })().e` ——字段随即被读）。
+      let viaThis = false
+      for (let x: ts.Node | undefined = node; x !== undefined && x !== fn; x = x.parent) {
+        const p = x.parent
+        if (p !== undefined && ts.isVariableDeclaration(p) && ts.isIdentifier(p.name)
+          && p.initializer !== undefined && containsNode(p.initializer, node)) names.add(p.name.text)
+        if (p !== undefined && ts.isBinaryExpression(p)
+          && p.operatorToken.kind === ts.SyntaxKind.EqualsToken
+          && containsNode(p.right, node)) {
+          const left = unwrap(p.left)
+          if (ts.isPropertyAccessExpression(left)
+          && left.expression.kind === ts.SyntaxKind.ThisKeyword) viaThis = true
+        }
+      }
+      if (viaThis) return true
+      let out = false
+      const walk = (x: ts.Node): void => {
+        if (out || (x !== body && ts.isFunctionLike(x))) return
+        if (ts.isReturnStatement(x) && x.expression !== undefined) {
+          const e = x.expression
+          if (containsNode(e, node)) { out = true; return }
+          const u = unwrap(e)
+          if (ts.isIdentifier(u) && names.has(u.text)) { out = true; return }
+        }
+        ts.forEachChild(x, walk)
+      }
+      walk(body)
+      return out
+    }
+    /**
      * 这个函数节点是否**立即执行**（`(() => …)()` / `(function () {…})()`）。
      * ⚠️ 括号也是包装：`(() => …)()` 里箭头的父节点是 `ParenthesizedExpression`，
      * 只比一层父节点会把 IIFE 误判成"没被调用"（探针实测：父=ArrowFunction 的父是括号）。
@@ -506,6 +549,13 @@ const THROW_ERROR: Rule = {
         const isBoundary = isFnBoundary(p) || ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p)
           || ts.isConstructorDeclaration(p)
         if (isBoundary && !isImmediatelyInvoked(p) && !isExecutedAccessor(p)) { blocked = true; break }
+ // ⚠️ **被立即调用的边界也只跟随「交出的值」**（CR第六十六轮 major）：
+ // `(() => { const debug = new Error('**debug**'); return new Error('clean') })()`里
+ //变量声明的结果既不返回也不抛出 ——外层执行它也不会抛它。只有落在 return表达式 /
+ //表达式体箭头 body /被 return的变量初始化器里，才继续往上判。
+ // ⚠️ 判据用**原始 new 节点**（n），不是正在跨越边界的子节点（`up` 在块体函数处是
+ // Block 本身，拿它去比 return 表达式永远为假）。
+        if (isFnBoundary(p) && !flowsToReturn(p as ts.FunctionLikeDeclaration, n)) { blocked = true; break }
         // ⚠️ 走到**函数边界**时，内层函数字面量就是 `up`。内层处在边界的**尾位置**（表达式体箭头本身 /
         // 块体最后一条 `return <n>`）时，它只是被**返回**，外层被调用也不执行它：
         // `({ make: () => function () { return new Error('**X**') } }).make()`（CodeRabbit PR#81 第三十一轮
@@ -655,6 +705,11 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       "throw (() => { new Error('**被丢弃**'); return new Error('clean') })()",
       // 括号包装的丢弃同样不算（CR 第三十四轮 minor）
       "throw (() => { (new Error('**括号包裹被丢弃**')); return new Error('clean') })()",
+      // CR 第六十六轮 major：块体箭头里 `new Error` 只用于变量声明、且变量从不 return → 不交出
+      "throw (() => { const debug66 = new Error('**变量声明丢弃**'); return new Error('clean') })()",
+      // 正向：变量被 return、以及 if 分支里的 return 都真交出（同一判据不能只看表达式体箭头）
+      "throw (() => { const e66 = new Error('**变量后返回**'); return e66 })()",
+      "throw (() => { if (1) return new Error('**条件返回**') })()",
       // 逗号表达式里非最右操作数被丢弃（CR 第三十五轮 minor）：抛的是 clean
       "throw (new Error('**逗号丢弃**'), new Error('clean'))",
       "throw ((() => new Error('**非空断言**'))!)()",
@@ -749,6 +804,7 @@ describe('纯文本通道（stderr 与 help）不得出现 Markdown 标记 —�
       ['**只调外层B**', false], ['**getter 只读**', false], ['**展开里的方法**', false], ['**展开里的箭头**', false],
       ['**展开里的函数表达式**', false], ['**属性箭头未调用**', false], ['**方法引用**', false], ['**unused**', false],
       ['**call 链内层**', false], ['**被丢弃**', false], ['**括号包裹被丢弃**', false],
+ ['**变量声明丢弃**', false], ['**变量后返回**', true], ['**条件返回**', true],
       ['**逗号丢弃**', false],
       ['const e = new Error', false],
     ]

@@ -187,6 +187,26 @@ function isMigratedFile(sf: ts.SourceFile): boolean {
       if (el.propertyName?.text === 'captureSinks') names.add(el.name.text)
     }
   }
+  // ⚠️ **本文件的本地别名**（CR 第六十六轮 major）：`const install = captureSinks` 之后只调
+  // `install(…)` 也是迁移形态。只认导入名会把整份文件判成非迁移，并发与 hook 两路细判全部
+  // 跳过。沿**已知名字的初始化器**追到不动点（含 `ns.captureSinks`），深度有界；重赋值 /
+  // 看不懂的形态不追 —— 边界与导入别名一致（只影响覆盖面，不新增误报）。
+  for (let round = 0; round < 8; round++) {
+    let grew = false
+    const visitAlias = (n: ts.Node): void => {
+      if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer !== undefined
+        && !names.has(n.name.text)) {
+        const init = unwrap(n.initializer)
+        const viaIdent = ts.isIdentifier(init) && names.has(init.text)
+        const viaNs = ts.isPropertyAccessExpression(init) && ts.isIdentifier(init.expression)
+          && namespaces.has(init.expression.text) && init.name.text === 'captureSinks'
+        if (viaIdent || viaNs) { names.add(n.name.text); grew = true }
+      }
+      ts.forEachChild(n, visitAlias)
+    }
+    visitAlias(sf)
+    if (!grew) break
+  }
   return collectCalls(sf).some((c) => {
     const chain = callChain(c)?.chain
     if (chain === undefined || chain.length === 0) return false
@@ -714,14 +734,33 @@ function isMutatedUnchecked(sf: ts.SourceFile, name: string): boolean {
  * size exceeded）。重入时静态求值不可信 → undefined（保守侧：只多报「看不清」，不会放行）。
  */
 const resolvingNames = new WeakMap<ts.SourceFile, Set<string>>()
+/**
+ * `staticBindingInitializer` 的结果缓存（CR 第六十六轮 major：性能）：多个互不相关的
+ * for-of 源会让每个源各自重跑「全文件唯一声明 + 写入判据」的整份扫描，文件大时是
+ * 排列级的重复工作。只缓存**最外层**求值（`resolveDepth === 1` 且不在 `isMutated` 扫描
+ * 过程中，`isMutatedDepth === 0`）—— 嵌套在别名扩张窗口里的半途结果不落缓存，与
+ * `isMutated` 的深度判据同一理由。AST 在单次守卫运行内不变，缓存安全。
+ */
+const initCache = new WeakMap<ts.SourceFile, Map<string, ts.Expression | undefined>>()
+let resolveDepth = 0
 function staticBindingInitializer(sf: ts.SourceFile, name: string): ts.Expression | undefined {
   let active = resolvingNames.get(sf)
   if (active?.has(name)) return undefined
+  let cache = initCache.get(sf)
+  if (cache === undefined) { cache = new Map(); initCache.set(sf, cache) }
+  if (cache.has(name)) return cache.get(name)
   if (active === undefined) { active = new Set<string>(); resolvingNames.set(sf, active) }
   active.add(name)
+  resolveDepth++
+  const outermost = resolveDepth === 1 && isMutatedDepth === 0
   try {
-    return staticBindingInitializerUnchecked(sf, name)
-  } finally { active.delete(name) }
+    const out = staticBindingInitializerUnchecked(sf, name)
+    if (outermost) cache.set(name, out)
+    return out
+  } finally {
+    resolveDepth--
+    active.delete(name)
+  }
 }
 function staticBindingInitializerUnchecked(sf: ts.SourceFile, name: string): ts.Expression | undefined {
   let found: ts.Expression | undefined
@@ -1029,10 +1068,25 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
     }
     return e
   }
-  const isFn = (e: ts.Expression): boolean => {
+  /**
+   * `name` 在**使用点**是否是最近的参数绑定（CR 第六十六轮 major）：`function run(body) {
+   * it('x', body) }` 里 body 的运行时值是调用方给的（可能是 `{concurrent:true}`），整份
+   * 文件里的同名函数声明 / 常量只是**另一个**绑定 —— 把它当执行体就会跳过选项判据。
+   * 最近的参数绑定说话：判「不是可确认的执行体」，交给未知分支响亮报告。
+   */
+  const boundAsParameter = (at: ts.Node, name: string): boolean => {
+    let n: ts.Node | undefined = at.parent
+    while (n !== undefined) {
+      if (ts.isFunctionLike(n)
+        && (n as ts.SignatureDeclaration).parameters.some((p) => ts.isIdentifier(p.name) && p.name.text === name)) return true
+      n = n.parent
+    }
+    return false
+  }
+  const isFn = (e: ts.Expression, at: ts.Node): boolean => {
     const u = unwrap(e)
     return ts.isArrowFunction(u) || ts.isFunctionExpression(u)
-      || (ts.isIdentifier(u) && functionBinding(sf, u.text))
+      || (ts.isIdentifier(u) && !boundAsParameter(at, u.text) && functionBinding(sf, u.text))
   }
   /** 选项对象的形状，或"求不出"的成因（报违规时的文案要用）。 */
   type Resolved =
@@ -1292,7 +1346,7 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
       const optionArgs = thirdResolvesToObject
         ? [rest[1]!]
         : lastIsNumber && rest.length === 1 ? []
-          : rest.length > 0 && isFn(rest[0]!) ? rest.slice(1) : rest.slice(0, 1)
+          : rest.length > 0 && isFn(rest[0]!, call) ? rest.slice(1) : rest.slice(0, 1)
       for (const a of optionArgs) {
         const r = resolveOptions(a)
         if (r.kind !== 'obj') {
@@ -1760,6 +1814,17 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
           if (ts.isSpreadElement(u)) {
             const inner = unwrap(u.expression)
             if (ts.isArrayLiteralExpression(inner)) acc.push(...expand(inner.elements))
+            // ⚠️ **常量元组的展开**（CR 第六十六轮 major）：`const hooks = [setup] as const;
+            // beforeEach(...hooks)` 把同一批回调摊给 hook。`...hooks` 的操作数只有
+            // 标识符 —— 旧实现直接丢弃，setup 体内的调度原语从守卫眼前消失。先追
+            // `staticBindingInitializer` 拿到这个不可变数组，再逐元素展开（与循环别名
+            // 同一来源）。解析不出来（别名 / 重赋值 / 参数）就把它原样交给回调循环，
+            // 由「绑定无法确认 → 响亮报告」兜住，不静默吞掉。
+            else if (ts.isIdentifier(inner)) {
+              const init = staticBindingInitializer(sf, inner.text)
+              if (init !== undefined && ts.isArrayLiteralExpression(init)) acc.push(...expand(init.elements))
+              else acc.push(u as ts.Expression)
+            } else acc.push(u as ts.Expression)
             continue
           }
           if (!ts.isOmittedExpression(u)) acc.push(u as ts.Expression)
@@ -1813,6 +1878,14 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
     })()
     for (const arg of hookArgs) {
       const u = unwrap(arg)
+      // ⚠️ **展开不出来就要报告**（CR 第六十六轮 major）：可能是参数 / 重赋值 / 非字面量
+      // 数组 —— 里面也许就藏着带调度原语的回调，不能当「没有实参」放行。
+      if (ts.isSpreadElement(u)) {
+        const reason = 'hook 实参里的展开无法静态解析为常量元组，无法证明其中没有回调'
+        const key = `${lineOf(sf, u)}:${reason}`
+        if (!outSeen.has(key)) { outSeen.add(key); out.push({ line: lineOf(sf, u), why: reason }) }
+        continue
+      }
       if (!ts.isIdentifier(u)) continue
       if (reassignedNames.has(u.text)) {
         const reason = `hook 回调 ${u.text} 在文件内被重新赋值，无法静态确认其调度`
@@ -1823,7 +1896,17 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       // ⚠️ **就地作用域优先**（CR 第六十四轮 major）：同名回调在兄弟套件里各声明一次时，
       // 整份文件查重会放弃；先按「最近的同名绑定」解析，找不到才退回整份文件唯一解析。
       const scopedFn = functionInScope(u.text, call)
-      const fn = scopedFn === null ? undefined : (scopedFn ?? sameFileFunction(u.text))
+      // ⚠️ **「绑定存在但解析不出」不得静默跳过**（Codex 第十三轮 P2）：别名链里出现被
+      // 重新赋值的变量 / 参数 / 非函数初始化时，functionInScope 返回 null —— 旧实现把它当
+      // 「没有回调」放行，而实际登记的可能是带定时器的回调（`let setup = …; setup = () => {
+      // setTimeout(…) }; const init = setup; beforeEach(init)`）。看不见就响亮报告，不猜。
+      if (scopedFn === null) {
+        const reason = `hook 回调 ${u.text} 的绑定无法静态确认（重赋值后的别名 / 参数 / 非函数初始化），无法证明其调度`
+        const key = `${lineOf(sf, u)}:${reason}`
+        if (!outSeen.has(key)) { outSeen.add(key); out.push({ line: lineOf(sf, u), why: reason }) }
+        continue
+      }
+      const fn = scopedFn ?? sameFileFunction(u.text)
       if (fn !== undefined) { namedHookCallbacks.add(fn); roots.push(fn) }
     }
     for (const root of roots) for (const inner of collectCalls(root)) {
@@ -1971,6 +2054,16 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
   const SRC_TESTS = fileURLToPath(new URL('../', import.meta.url))
   const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url))
 
+  it('迁移形态判据认本地别名（`const install = captureSinks`）（CR 第六十六轮 major）', () => {
+    // 只认导入名时，整份文件被判成「非迁移」，并发与 hook 两路细判全部跳过。
+    expect(isMigratedFile(parseTs("import { captureSinks } from './capture.js'\nconst install = captureSinks\ninstall()")),
+      '命名导入的本地别名').toBe(true)
+    expect(isMigratedFile(parseTs("import * as cap from './capture.js'\nconst install = cap.captureSinks\ninstall()")),
+      '命名空间导入的本地别名').toBe(true)
+    expect(isMigratedFile(parseTs("const install = captureSinks\n// install() 只在注释里")),
+      '只被提及、没有被调用').toBe(false)
+  })
+
   /** 递归取测试文件（跳过 fixtures）。 */
   function testFiles(dir: string, out: string[] = []): string[] {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -2018,8 +2111,9 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       // 配置面：sequence 下的 concurrent 为 true/1（键名可带引号、可点号或对象形式）。
       const enables = (txt: string): boolean => {
         const key = `['"]?concurrent['"]?`
-        const flag = /--sequence\.concurrent(?:=([^\s"']+))?/.exec(txt)
-        if (flag !== null) {
+        // ⚠️ **每一处旗标都要看**（CR 第六十六轮 major）：一段文本里可能先有 `=false`、
+        // 后面再有一处启用（同一条 shell 串起多个脚本）。`.exec` 只看第一处会漏掉后者。
+        for (const flag of txt.matchAll(/--sequence\.concurrent(?:=([^\s"']+))?/g)) {
           const v = flag[1]
           if (v === undefined || /^(true|1)$/i.test(v)) return true
         }
@@ -2034,6 +2128,8 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       // ⚠️ **按值判，不按拼写判**（CR 第六十五轮 major）：`=false` 是显式关闭；带引号的键名
       // 一样能启用。
       expect(enables('vitest run --sequence.concurrent=false'), 'CLI 显式关闭').toBe(false)
+      expect(enables('a --sequence.concurrent=false && b --sequence.concurrent'),
+        '先关闭后启用：第二处旗标不得被第一处遮住').toBe(true)
       expect(enables("{ 'sequence': { 'concurrent': true } }"), '引号包裹的配置键').toBe(true)
       expect(enables("{ 'sequence': { 'concurrent': false } }"), '引号包裹的显式关闭').toBe(false)
       expect(enables('sequence.concurrent: true'), '点号形态').toBe(true)
@@ -2876,6 +2972,44 @@ it('Q34', oQ34, () => {})`),
       expect(hits.length, 'for-in 赋值目标必须报告').toBe(1)
       expect(hits[0]).toMatch(/重新赋值/)
     }
+    // ㉖ **别名链指向被重赋值的回调**（Codex 第十三轮 P2）：`let setup = () => {}; setup = () =>
+    // { setTimeout(…) }; const init = setup; beforeEach(init)` —— functionInScope 沿别名遇到
+    // 重赋值只能返回 null（不知道最终指向哪份），旧实现把它当「没有回调」静默放行。
+    {
+      const hits = hookHits(bt('let setupH99 = () => {}\nsetupH99 = () => { ', ST, '(w, 80) }\nconst initH99 = setupH99\n', H, '(initH99)'))
+      expect(hits.length, '重赋值来源的别名必须报告').toBe(1)
+      expect(hits[0]).toMatch(/无法静态确认/)
+    }
+    // ㉗ **参数形式的回调**：`function register(handler) { beforeEach(handler) }` 里登记的
+    // 实参运行时才知道 —— 同样必须报告「无法静态确认」，不得默认无调度。
+    {
+      const hits = hookHits(bt('function regH99(handlerH99) { ', H, '(handlerH99) }'))
+      expect(hits.length, '参数形式的回调必须报告未知').toBe(1)
+      expect(hits[0]).toMatch(/无法静态确认/)
+    }
+    // ㉙ **常量元组的展开**（CR 第六十六轮 major）：`const hooks = [setup] as const;
+    // beforeEach(...hooks)` 登记的仍是 setup；展开操作数只有标识符，旧实现整个丢弃。
+    expect(hookHits(bt('function setupT99() { ', ST, '(w, 80) }\nconst hooksT99 = [setupT99] as const\n', H, '(...hooksT99)')),
+      '常量元组展开的命名回调').toEqual([`${ST}(`])
+    // 解析不出的展开（参数 / 非字面量）→ 响亮报告，不得当成「没有实参」。
+    {
+      const hits = hookHits(bt('declare const argsT99: unknown[]\n', H, '(...argsT99)'))
+      expect(hits.length, '无法解析的展开必须报告').toBe(1)
+      expect(hits[0]).toMatch(/展开无法静态解析/)
+    }
+    // ㉚ **使用点的参数绑定遮蔽同名函数**（CR 第六十六轮 major）：`const body = () => {}`
+    // 在外层，但 `it('x', body)` 的 body 是**最近的参数** —— 运行时值可能是 `{concurrent:true}`，
+    // 把它当执行体会整个跳过选项判据。判据按使用点解析，最近的参数绑定说了算。
+    expect(concHits(bt('const bodyT99 = () => {}\nfunction runT99(bodyT99) { it(\'xT99\', bodyT99) }')),
+      '参数绑定遮蔽外层函数 → 未知选项').toEqual(['unknown'])
+    // 正向：没有参数遮蔽时，具名执行体照旧不误报。
+    expect(concHits(bt('const bodyT98 = () => {}\nit(\'xT98\', bodyT98)')),
+      '具名执行体（无遮蔽）不误报').toEqual([])
+    // ㉛ **多个互不相关的常量数组**（CR 第六十六轮 major：性能 + 正确性）：每个 for-of 源都会
+    // 触发一次静态解析；多个源不得互相拖累，也不得因此漏掉 hook 体里的调度原语。
+    expect(hookHits(bt('const arrA99 = [() => {}]\nconst arrB99 = [() => {}]\n'
+      + 'for (const itemA99 of arrA99) {}\nfor (const itemB99 of arrB99) {}\n',
+    H, '(() => { ', ST, '(w, 80) })')), '多个互不相关的循环源').toEqual([`${ST}(`])
     // 未被重新赋值的 let 仍可解析（不因噎废食）
     expect(hookHits(bt('let setupH88 = () => { ', ST, '(w, 80) }\n', H, '(setupH88)')),
       '未重新赋值的 let 照常下钻').toEqual([`${ST}(`])

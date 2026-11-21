@@ -86,6 +86,19 @@ function safeValueText(v: unknown, max: number): string {
   }
 }
 /**
+ * 安全读取拒绝值上的 `kind`（CR 第六十六轮 major 的反向判据）：拒绝值可能是 `null` /
+ * 无原型对象 / 访问器抛异常的对象 —— 判据自己抛错就会把原始失败换掉。读不出来一律 undefined。
+ */
+function safeKindOf(v: unknown): string | undefined {
+  if (v === null || (typeof v !== 'object' && typeof v !== 'function')) return undefined
+  try {
+    const k = (v as { kind?: unknown }).kind
+    return typeof k === 'string' ? k : undefined
+  } catch {
+    return undefined
+  }
+}
+/**
  * 拒绝值 → 截断文本，**先安全地取 message**：`message` 是抛异常的访问器时，`String(e)` 之前
  * 的求值不能发生在 try 外面（CR 第五十五轮 major：求值一抛，状态标记就落不下去）。
  */
@@ -485,6 +498,10 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   let poisoned: { reason: string; hint?: string } | undefined
   // 事务失效性探针超时、中断后仍未交回 —— closeTx 据此跳过 ROLLBACK（Codex 第十二轮 P2）。
   let nativeProbeStuck = false
+  // ⚠️ **「超时那一刻在途」≠「收尾时仍占用连接」**（CR 第六十六轮 major）：探针可能在我们
+  // 放弃等待之后、回调返回之前自己交回 —— 只看 stuck 会为了一个已经结束的探针跳过 ROLLBACK
+  // 并错误退役。记账以**收尾时刻**为准：原始 promise 一落定就把这里翻成 true。
+  let nativeProbeSettled = true
   /**
    * `hint` 只在成因的恢复动作与通用说法**不同**时才给（CR 第四十一轮 major）：COMMIT
    * 结果未知时写入可能已落库，「关掉重建后直接重试」就是重复写，通用的
@@ -640,6 +657,8 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       // 同一次派发前的复核（关闭 / 退役后这条探针不回交任何有意义的答案，直接按保守侧处理）。
       if (closed || poisoned !== undefined) return true
       raw = c.runAndReadAll('SELECT 1', []) as unknown as Promise<unknown>
+      nativeProbeSettled = false
+      raw.then(() => { nativeProbeSettled = true }, () => { nativeProbeSettled = true })
       void raw.catch(() => { /* 归因价值由探针结果承担，避免迟到拒绝冒成 unhandled */ })
       await Promise.race([raw, timeout])
       nativeProbeStuck = false
@@ -721,6 +740,26 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       out += ch
     }
     return out
+  }
+  /**
+   * 去掉 `CASE … END` 结构（EXPLAIN 的事务控制初判用，Codex 第十三轮 P2）：
+   * `EXPLAIN ANALYZE SELECT CASE WHEN … THEN … END` 是合法只读诊断，而 `END` 恰好也是
+   * `TX_KEYWORD` 的一员 —— 旧判据把它误判成事务控制并拒绝。字面量 / 注释先由
+   * `stripSqlLiterals` 剥掉，再按「最近的 CASE…END 配对」删除（可嵌套，有界迭代到不动点）。
+   * 边界：未加引号的标识符 `case` 会被一并剥掉 —— 那只可能让初判**放行**，而真正的事务控制
+   * 语句类型仍由 `prepare` 的 statementType 兜底（`EXPLAIN ANALYZE COMMIT` 照常拒）。
+   */
+  const stripCaseEnds = (s: string): string => {
+    let t = s
+    // 从**最内层**开始剥：非贪婪 `CASE…END` 会先配上最近的 END，嵌套 CASE 的内层先消失，
+    // 外层的 END 才轮得到；从外往里剥「第一个 CASE + 第一个 END」会把内层 END 当外层配对，
+    // 留下一个孤立的 END（实测 `CASE WHEN … THEN CASE WHEN … END ELSE … END` 仍被误判）。
+    for (let i = 0; i < 64; i++) {
+      const n = t.replace(/\bCASE\b((?:(?!\bCASE\b)[\s\S])*?)\bEND\b/i, ' ')
+      if (n === t) return t
+      t = n
+    }
+    return t
   }
   /** 原始事务控制的拒绝错误（`execSql` 与 `rejectRawTxControl` 共用一份文案）。 */
   const rawTxError = (): Error => {
@@ -818,7 +857,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     }
     try {
       if (p.statementType === TRANSACTION) throw rawTxError()
-      if (p.statementType === EXPLAIN && TX_KEYWORD.test(stripSqlLiterals(sql))) throw rawTxError()
+      if (p.statementType === EXPLAIN && TX_KEYWORD.test(stripCaseEnds(stripSqlLiterals(sql)))) throw rawTxError()
     } finally {
       // 预编译语句持有原生句柄：不释放会在长会话里累积（同 sandbox 的做法）。
       p.destroySync?.()
@@ -875,6 +914,22 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       const untrackParse = inTx && txToken !== undefined ? trackOwn(txToken) : trackForeign()
       try {
         await rejectRawTxControl(sql)
+      } catch (e) {
+        // ⚠️ **解析 / 预编译也会绑定并求值**（CR 第六十六轮 major，DuckDB 在 prepare 期做
+        // constant folding 与 table-function 参数求值）：`SELECT * FROM range(CAST('x' AS
+        // BIGINT)) -- END` 会因注释进入分类，Conversion Error 在**派发之前**就把事务标成
+        // aborted —— 旧实现直接把它当普通拒绝交回，回调吞掉后 `commitOrRefuse` 只看到在途
+        // 归零，COMMIT 被 DuckDB 静默改成 ROLLBACK，写入丢失。
+        // 拒绝照旧是**原始解析错误**（不换掉）；只在事务所有者的计数登记内问一次连接，
+        // 探针说已失效才打 brokenTx 记号。local usage（事务控制语句）与派发前被拒的形态
+        // 没动过连接状态，不问。
+        if (!txControl && !closed && poisoned === undefined
+          && inTx && txToken !== undefined && ctxToken === txToken
+          && safeKindOf(e) !== 'usage' && await txInvalidated()) {
+          brokenTx.set(txToken, '事务内的 SQL 在解析/预编译期就让 DuckDB 把整条事务标成 aborted'
+            + `（驱动原文：${safeMessageText(e, 160)}）`)
+        }
+        throw e
       } finally {
         untrackParse()
       }
@@ -1262,7 +1317,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     // ⚠️ **探针可能仍占着连接**（Codex 第十二轮 P2）：事务失效性探针超时后已无法确认它是否
     // 停止；此时发 ROLLBACK 只会排在它后面、超时后被误判成「回滚未确认」，而真实成因是连接
     // 仍被探针占用。直接按「收尾无法确认」退役，把成因写进文案，不发 ROLLBACK。
-    if (nativeProbeStuck) {
+    // ⚠️ 判据是「**收尾此刻**探针仍没交回」（CR 第六十六轮 major）：超时那一刻在途、但随后
+    // 自己交回的探针已经不占连接，为它跳过 ROLLBACK 会把可正常收尾的事务错误退役。
+    if (nativeProbeStuck && !nativeProbeSettled) {
       poison('事务状态探针中断后仍未交回：连接可能仍被它占用，ROLLBACK 无法安全发出')
       beganTx.delete(token)
       return 'unconfirmed'
