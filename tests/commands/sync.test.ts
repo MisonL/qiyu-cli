@@ -493,7 +493,10 @@ describe('sync run —— store 与凭证前置检查', () => {
     expect(e.hint).not.toMatch(/请先运行/)
   })
 
-  it('store 已损坏（截断）→ 1 + store_not_initialized，hint 保留「已损坏 / 先备份再重建」（不得退回「请先运行 store init」）', { timeout: 60_000 }, async () => {
+  it('store 已损坏（截断）→ 1 + store_not_initialized，hint 保留「已损坏 / 先备份再重建」（不得退回「请先运行 store init」）', { timeout: 180_000 }, async () => {
+    // ⚠️ 预算 180s（原 60s）与 store/query 同因：`makeCorruptDb` 要在新 node 进程里建真库
+    // （本进程建库会命中实例缓存、损坏不可见），新进程不吃 setup-warm 的预热，要付一次
+    // 原生绑定冷启动（高负载实测 10–34s）。60s 会把「机器忙」报成「成因归错了」。
     // 2026-11-05：损坏是第三种打开失败成因，sync-run 的出口必须与 store/query 同一份
     // 文案 —— 否则同一个损坏文件在三个命令上给三种说法，且「跑 store init」对它无效。
     const { makeCorruptDb } = await import('../fixtures/corrupt-db.js')

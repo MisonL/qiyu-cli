@@ -440,7 +440,10 @@ describe('openGuardedSession 的存在性预检同样走 catalogRows（截断不
     }
   }
 
-  it('目录超过上限 → 三条命令都报 internal 且点名截断（不在截断页上判定）', async () => {
+  // ⚠️ 显式放宽到 120s（2026-11-16 实测）：本用例要真造 CATALOG_ROW_LIMIT+100 张表，
+  // 本机负载 800+ 时 30s 默认超时必爆。造大夹具的固有代价，不是回归。
+  it('目录超过上限 → 三条命令都报 internal 且点名截断（不在截断页上判定）',
+    { timeout: 120_000 }, async () => {
     const db = join(dir, 'big.duckdb')
     await buildBigStore(db)
     // 夹具自证（CodeRabbit PR#78 第三轮 major）：库已正规初始化（`init()` 跑完迁移），

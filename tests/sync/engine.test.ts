@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDuckDbStore } from '../../src/store/duckdb.js'
 import { runTask } from '../../src/sync/engine.js'
-import { listGaps, readWatermark } from '../../src/sync/state.js'
+import { listGaps, listWatermarks, readWatermark } from '../../src/sync/state.js'
 import { RateGate } from '../../src/sync/rate-gate.js'
 import { shanghaiDayStart, shanghaiDayIso } from '../../src/sync/day.js'
 import type { SyncTask, RunCtx } from '../../src/sync/types.js'
@@ -590,6 +590,22 @@ describe('失败窗有界重试（B 中-3）', () => {
     await store.close()
   })
 
+  it('fetch 抛出的拒绝值连文本都转不出 → 仍按 fetch_failed 记 gap，转换异常不得顶掉本次运行', async () => {
+    // 同类缺陷的引擎侧（CR 第五十四轮 store 修的同一个形态）：`e instanceof Error ? e.message
+    // : String(e)` 在 `Object.create(null)` 上会抛 TypeError —— 错误路径的转换自己成了新的
+    // 主失败，本次运行连 partial 都报不出来。引擎的五处转文本必须与 store 同口径。
+    const store = await fresh()
+    try {
+      const t = fakeTask({ fetch: async () => { throw Object.create(null) } })
+      const r = await runTask(t, ctx(store, { sleep: async () => {} }))
+      expect(r.status).toBe('partial')
+      expect(r.gaps.map((g) => g.reason)).toEqual(['fetch_failed'])
+      expect(r.gaps[0]!.detail, '失败说明要有占位文本，而不是抛出去').toMatch(/无法转成文本/)
+    } finally {
+      await store.close()
+    }
+  })
+
   it('限频（kind=rate_limit）也不进引擎重试预算（callPaced 自己的等待预算管冷却）', async () => {
     const store = await fresh()
     let calls = 0
@@ -817,5 +833,546 @@ describe('整体早于接口下界的区间（CI 实测修正）', () => {
     expect(r.windows.total).toBe(1)
     expect(r.status).toBe('complete')
     await store.close()
+  })
+})
+
+/**
+ * COMMIT 结果未知（CR 第四十一轮 major 的追问）：落库事务的提交结果无法确认时，Store 会
+ * **当场退役**；随后的 gap 落库与清锁都会撞上退役。若让这些次生失败照常上抛，用户看到的
+ * 是「Store 已退役：…请关闭该实例并重新创建」—— 把主失败里的恢复指令（写入可能已落库、
+ * 不要按失败直接重试、核对后再决定是否重放）整段换掉，恰好诱导重复写。
+ *
+ * ⚠️ 用**真驱动**注入（不是手写假 store）：退役是 `duckdb.ts` 的行为，只有真 Store 才会
+ * 在 COMMIT 交回被拒时打上 `store_retired`；手写假 store 会把这道判据测成永远不触发。
+ */
+describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案）', () => {
+  /** 关掉第 N 次 COMMIT 的结果交回（提交在驱动里已执行；N 从 init 之后的第一次提交数起）。 */
+  async function storeWithCommitFailureAt(n: number,
+    failWrite?: (sql: string) => boolean): Promise<{ store: Store; commits: () => number; commitLog: Array<{ lastMutating: string }> }> {
+    const real = await import('@duckdb/node-api')
+    let seen = 0
+    // ⚠️ init 的迁移自己就会提交很多次（每个迁移一个事务）—— 计数必须在 init **之后**开，
+    // 否则注入打中的是迁移的 COMMIT，Store 在 init 里就退役了。
+    let injectAt = 0
+ // ⚠️记录每次注入 COMMIT之前最后一条写语句（CR第六十七轮 major：只按序号断言时，
+ //数据窗的提交结果未知会满足同一组断言 ——必须能证明第3次提交来自清锁事务）。
+ let lastMutating = ''
+ const commitLog: Array<{ lastMutating: string }> = []
+ // ⚠️写失败注入在 init之后才武装：迁移里也可能出现写语句，武装过早会在建库阶段就炸。
+ let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as {
+                runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>
+                extractStatements: (x: string) => unknown
+                closeSync?: () => void
+              }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                // 原型方法不在自有属性里，Store 的事务控制判据要用它 —— 显式转发。
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  // 普通写入失败注入（与 COMMIT 回执注入可叠加：#2 的「窗口写失败 + 缺口提交未知」）
+                  if (armed && failWrite !== undefined && sql !== 'COMMIT' && failWrite(sql)) {
+                    throw new Error('注入：窗口写入失败')
+                  }
+                  //记录本次提交之前的最后一条写语句（INSERT/UPDATE/DELETE），用于证明注入打中的是哪个事务。
+                  if (sql !== 'COMMIT' && /^(INSERT|UPDATE|DELETE)/i.test(sql.trim())) lastMutating = sql
+                  const out = await cc.runAndReadAll(sql, params)
+                  if (sql === 'COMMIT' && injectAt !== 0 && seen + 1 === injectAt) commitLog.push({ lastMutating })
+                  if (sql === 'COMMIT' && injectAt !== 0 && ++seen === injectAt) {
+                    throw new Error('注入：COMMIT 已执行、结果交回失败')
+                  }
+                  return out
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+ armed = true
+    seen = 0
+    injectAt = n
+    return { store, commits: () => seen, commitLog }
+  }
+
+  it('windowed：交回原始失败（带「核对后再重放」），不是退役文案', async () => {
+    // kind 断言见用例中部：命令出口靠它透传 hint
+    // markPending 的提交是第 1 次；数据窗的提交是第 2 次。
+    const { store } = await storeWithCommitFailureAt(2)
+    try {
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null,
+        (x: unknown) => x as Error & { hint?: string; kind?: string })
+      expect(e, '提交结果未知必须上抛（不能当成 partial 成功）').not.toBeNull()
+      expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
+      expect(e!.message).not.toMatch(/Store 已退役/)
+      expect(e!.hint, '恢复动作：核对后再决定是否重放').toMatch(/核对/)
+      expect(e!.hint).toMatch(/重放/)
+      // ⚠️ **kind 必须在场**（CR 第五十轮 major #3 的收口）：命令出口 `thrownToExit` 只在
+      // `err.kind` 存在时透传 `err.hint`，否则换成通用「执行期错误」文案 —— hint 在 engine 层
+      // 保住了、到了命令边界照样可能被换掉。命令出口是同一个函数（`sync-run.ts` 与 `store.ts`
+      // 共用 `thrownToExit`），这里钉住进入出口的形状，两个命令族同时被守住。
+      expect(e!.kind, '无 kind 的错误在命令出口会被换成通用 hint —— 必须带 kind 出门').toBe('internal')
+      // ⚠️ 回滚收尾的补注**不得**嫁接到这条诊断上（CR 第四十二轮 major 的追问，真驱动探针
+      // 2026-11-20 实测过嫁接形态）：COMMIT 已下发、写入可能已落库，此时再说「回滚可能根本没
+      // 执行、写入结果不可信」只是把恢复动作稀释成两套互相打架的指令。核对→再决定重放才是
+      // 这条成因的指引，且它必须原样到达 Agent。
+      expect(e!.message, '不得追加通用回滚补注').not.toMatch(/回滚未能确认/)
+      expect(e!.hint, '不得追加通用回滚补注').not.toMatch(/写入结果不可信/)
+      // ⚠️ **注入的确实是「数据窗」那次提交**（CR 第四十六轮 major 的追问）：重开库核对 ——
+      // 若第 2 次 COMMIT 其实是 markPending 那次，数据行不会在库里，这条用例就在拿错误的
+      // 提交位置冒充事故形态。
+    } finally {
+      await store.close()
+    }
+    const reopened = await createDuckDbStore(cfg, 'rw')
+    expect(await reopened.count('tags'), '数据窗的提交在驱动里已执行 → 行应已落库').toBe(1)
+    await reopened.close()
+  })
+
+  it.each([
+    { label: 'null', make: (): unknown => null },
+    {
+      label: 'kind 访问器抛异常的对象',
+      make: (): unknown => Object.defineProperty({}, 'kind', {
+        get() { throw new Error('注入：拒绝值的 kind 访问器') },
+      }),
+    },
+  ])('拒绝值是 $label 时退役/限频判据不得抛 TypeError 顶掉原失败（Codex 第十二轮 P2）', { timeout: 90_000 }, async ({ make }) => {
+    // 事故形态：`Store.query` 以 `null` 拒绝时，`acquireGated` / `runSnapshot` 的限频判据
+    // `(e as { kind }).kind` 直接 TypeError（实测 `Cannot read properties of null (reading 'kind')`）
+    // —— 错误路径上的判据成了新的主失败，原始拒绝值与恢复指令一起丢光。判据必须安全读取：
+    // null / 非对象 / 访问器抛异常 → 一律「不匹配」，拒绝值原样交回。
+    // ⚠️ 只需 Store 边界桩：这条路径上被真实执行的判据是 `withStoreRetries` → `acquireGated`
+    // → `runSnapshot` 的限频分派（`acquire` 读到拒绝就到此为止）；真库只会把冷启动负载
+    // 噪声（实测 90 s 超时）带进来，判据并没有被多覆盖一行。
+    const thrown = make()
+    const fake = { query: async () => { throw thrown } } as unknown as Store
+    const out = await runTask(fakeTask({ kind: 'snapshot' }), ctx(fake))
+      .then(() => ({ resolved: true as const }), (x: unknown) => ({ rejected: true as const, value: x }))
+    expect(out, '必须交回拒绝结果').toHaveProperty('rejected')
+    expect((out as { value: unknown }).value, '原拒绝值必须原样交回（同一引用），不得换成 TypeError').toBe(thrown)
+  })
+
+  it('退役/提交未知对两层重试判据都是终态：窗口事务只尝试一次（不重试、不被 store_retired 顶替）（CR 第四十二轮 major）', async () => {
+    // CR 的追问：`commitWindow` 走 `withStoreRetries`，rotated 路径又在外面套 `isTransient` ——
+    // 任一判据若把「退役」当可重试，第二次尝试会立刻撞上 `store_retired`，主失败里的恢复
+    // 指令被换成退役文案，诱导重复写。判据：真实退役错误对两层都是终态 ⇒ 事务只尝试一次。
+    // 计数用**真 store 的委托包装**（不是手写假 store）：退役行为仍由 duckdb.ts 产出。
+    const { store } = await storeWithCommitFailureAt(2)
+    try {
+      // ⚠️ 判据取 `ctx.sleep`：`withRetries` 的**每次重试**都先等 `RETRY_DELAY_MS` 再跑第二次，
+      // 而退役之后的「gap 落库」事务是在 BEGIN 处被拒的收尾动作（不经过重试等待）。
+      // 数 transaction 调用会把它算进来，数回调执行次数又会在「第二次被 BEGIN 拒掉」时漏判。
+      let retryWaits = 0
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store, {
+        sleep: async () => { retryWaits++ },
+      })).then(() => null, (x: unknown) => x as Error)
+      expect(e, '必须上抛').not.toBeNull()
+      expect(e!.message, '主失败必须保留，不得被第二次尝试换掉').toMatch(/提交结果未知/)
+      expect(retryWaits, '退役错误对两层重试判据都必须是终态 —— 一次重试等待都不许有').toBe(0)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('退役后写者锁不挡下一次 run：重新打开同一库、同一任务照常跑完并清锁（CR 第四十三轮 major 的追问）', async () => {
+    // CR 的追问：数据 COMMIT 成功但结果丢失时，`markPending` 盖下的写者锁留在库里；
+    // 操作员照 hint 重建实例、核对数据之后，这把锁会不会挡住下一次 run？
+    // 判据（真库实测）：锁只是 `sync_state` 上的两列，**没有任何读取点会据此拒绝** ——
+    // 新实例上的 run 照常进行并在结束时清章。若哪天加了「锁在就不跑」，这里会红。
+    const { store } = await storeWithCommitFailureAt(2)
+    try {
+      const t = fakeTask({
+        id: 'lock.probe', table: 'tags',
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const first = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error)
+      expect(first, '前提：第一次 run 因提交结果未知而失败').not.toBeNull()
+      expect(first!.message).toMatch(/提交结果未知/)
+      // 新实例（模拟操作员的恢复动作）。退役实例拒绝一切语句，必须先关掉再开。
+      await store.close()
+      const s2 = await createDuckDbStore(cfg, 'rw')
+      try {
+        await s2.init()
+        // readWatermark 只投影水位列 —— 锁列要走 listWatermarks（status/verify 的同款视图）。
+        const before = (await listWatermarks(s2)).get('lock.probe')
+        // ⚠️ **先断言记录在场**（Codex 第七轮 P2）：`before.get(…)?.lockedBy` 在记录缺失时是
+        // undefined，而 `not.toBeNull()` 对 undefined 照样通过 —— 前提句会退化成永远成立的空话。
+        expect(before, '前提：水位记录必须存在（否则「锁留在库里」无从谈起）').toBeDefined()
+        expect(typeof before!.lockedBy, '前提：退役时锁确实留在库里').toBe('string')
+        const second = await runTask(t, ctx(s2))
+        expect(second.status, '锁不得挡住下一次 run').toBe('complete')
+        expect((await listWatermarks(s2)).get('lock.probe')?.lockedBy, '成功收尾必须清锁').toBeNull()
+      } finally {
+        await s2.close()
+      }
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('rotated：同样交回主失败（第三入口，与 put 同一条 storeGapOrPrimary 路径）', async () => {
+    const { runRotated } = await import('../../src/sync/engine.js')
+    const { store } = await storeWithCommitFailureAt(2)
+    try {
+      const t = fakeTask({
+        reportDayRotation: true, maxWindowDays: 1,
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runRotated([t], ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+      expect(e, '轮转路径的提交结果未知同样上抛').not.toBeNull()
+      expect(e!.message, '必须是主失败，不是退役文案').toMatch(/提交结果未知/)
+      expect(e!.message).not.toMatch(/Store 已退役/)
+      expect(e!.hint).toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('windowed：数据窗已提交、清锁事务丢掉 COMMIT 回执 → 不得报 complete（CR 第五十一轮 major #5）', async () => {
+    // 成功路径的提交次数：#1 markPending、#2 数据窗、#3 清锁（releaseLock 的 clearLock 事务）。
+    // 清锁事务丢掉回执 = 它自己的 COMMIT 结果未知、当场退役 —— 这不是任何主失败的次生结果，
+    // 旧实现按「次生」吞掉并返回 complete：实例已退役、写者锁可能没清，却被报成全部成功。
+    const { store, commitLog } = await storeWithCommitFailureAt(3)
+    try {
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+      expect(e, '清锁事务的提交结果未知必须上抛，不能当 complete').not.toBeNull()
+      expect(e!.message).toMatch(/提交结果未知/)
+      expect(e!.hint, '恢复动作：先核对再决定是否重放').toMatch(/核对/)
+    expect(commitLog[0], '注入必须打中第3次提交（清锁事务）').toBeDefined()
+    expect(commitLog[0]!.lastMutating, '清锁事务最后写的是 sync_state ——不是数据窗的 tags')
+     .toMatch(/sync_state/)
+    expect(commitLog[0]!.lastMutating, '排除把数据窗提交误当成清锁提交').not.toMatch(/tags/)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('gap 事务在 INSERT 阶段失败且 ROLLBACK 未确认 → 摘要不得说「COMMIT 已下发」（Codex 第五轮 P1）', async () => {
+    // 隔离探针：SQL 序列只有 BEGIN → INSERT sync_gaps → ROLLBACK，根本没有 COMMIT；若摘要仍写
+    // 「COMMIT 已下发」就会把恢复动作指到不存在的提交上。摘要必须用 gap 错误自己的成因。
+    const real = await import('@duckdb/node-api')
+    // ⚠️ 窗口事务的回滚必须**成功**（否则 primary 自己就带退役标记、走不到 gap 分支）：
+    // 只有第二次 ROLLBACK（补记缺口那次）被拒。
+    let rollbacks = 0
+    // 注入只在本用例的 runTask 阶段生效：init 的迁移里也有 `INSERT INTO "sync_gaps_v10"`
+    let armed = false
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!armed) return cc.runAndReadAll(sql, params)
+                  if (sql === 'ROLLBACK' && ++rollbacks >= 2) throw new Error('注入：ROLLBACK 被拒')
+                  if (/INSERT INTO\s+"?(tags|sync_gaps)"?\s*\(/.test(sql)) throw new Error('注入：写入失败')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+    armed = true
+    try {
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null,
+        (x: unknown) => x as Error & { hint?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '真实成因是回滚未确认').toMatch(/回滚未能确认/)
+      expect(e!.message, '不得声称 COMMIT 已下发').not.toMatch(/COMMIT 已下发/)
+      expect(e!.hint).toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('撞锁失败 + 回滚未确认 → 两层重试都不得再碰已退役的实例（Codex 第七轮 P2）', async () => {
+    // 事故形态（Codex 真驱动注入实测）：事务里抛 `kind:'store_locked'`、ROLLBACK 又未确认 ——
+    // 补注保留原 kind 并打上 `code=store_retired`。两层重试只按 kind 判「撞锁可重试」，
+    // 于是又对**已退役的同一实例**发起第二次尝试：主失败被「Store 已退役」换掉，恢复指令丢失。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    let insertCalls = 0
+    let rollbackCalls = 0
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!armed) return cc.runAndReadAll(sql, params)
+                  if (/^INSERT INTO\s+"?tags"?/.test(sql)) {
+                    insertCalls++
+                    throw Object.assign(new Error('注入：写入撞锁'), { kind: 'store_locked', retryable: true })
+                  }
+                  if (sql === 'ROLLBACK') {
+                    rollbackCalls++
+                    throw new Error('注入：ROLLBACK 被拒')
+                  }
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+    armed = true
+    try {
+      let retryWaits = 0
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store, { sleep: async () => { retryWaits++ } }))
+        .then(() => null, (x: unknown) => x as Error & { kind?: string; code?: string; hint?: string; retryable?: boolean })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '原始撞锁失败必须保留（不得被退役文案换掉）').toMatch(/注入：写入撞锁/)
+      expect(e!.message, '回滚未确认的事实也要在').toMatch(/回滚未能确认/)
+      expect(e!.code, '实例已退役').toBe('store_retired')
+      // ⚠️ 原错误带 `retryable:true`（撞锁可重试）；实例已退役后**必须改判为 false**（CR 第六十一轮
+      // 追问）：命令出口按 kind 分流时，可重试标记还在就是「把已退役的实例当普通撞锁」再试一次。
+      expect(e!.retryable, '退役后不得再说可重试').toBe(false)
+      expect(retryWaits, '退役错误对两层重试都是终态 —— 一次重试等待都不许有').toBe(0)
+      expect(insertCalls, '退役后不得再次碰同一实例').toBe(1)
+      expect(rollbackCalls).toBeGreaterThanOrEqual(1)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('rotated：撞锁失败 + 回滚未确认 → 外层 isTransient 不得重试已退役的实例（CR 第六十轮 major）', async () => {
+    // 判据同 runTask 那条，但入口是 `runRotated`：它的 `commitWindow` 外面套的是**外层**
+    // `withRetries(…, isTransient)`。若 `isTransient` 只看 kind=store_locked，会再对已退役的
+    // 同一实例发起第二次尝试，主失败被「Store 已退役」换掉。两个入口各有一条回归，判据改名
+    // 或只改一处时两边都能红。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    let insertCalls = 0
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!armed) return cc.runAndReadAll(sql, params)
+                  if (/^INSERT INTO\s+"?tags"?/.test(sql)) {
+                    insertCalls++
+                    throw Object.assign(new Error('注入：写入撞锁'), { kind: 'store_locked', retryable: true })
+                  }
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+    armed = true
+    try {
+      const { runRotated } = await import('../../src/sync/engine.js')
+      let retryWaits = 0
+      const t = fakeTask({
+        reportDayRotation: true, maxWindowDays: 1,
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runRotated([t], ctx(store, { sleep: async () => { retryWaits++ } }))
+        .then(() => null, (x: unknown) => x as Error & { code?: string; retryable?: boolean })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '原始撞锁失败必须保留（不得被退役文案换掉）').toMatch(/注入：写入撞锁/)
+      expect(e!.message, '回滚未确认的事实也要在').toMatch(/回滚未能确认/)
+      expect(e!.code, '实例已退役').toBe('store_retired')
+      expect(e!.retryable, '退役后不得再说可重试').toBe(false)
+      expect(retryWaits, '旋转入口的退役错误同样是终态 —— 一次重试等待都不许有').toBe(0)
+      expect(insertCalls, '退役后不得再次碰同一实例').toBe(1)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('取数失败 + 补记缺口的提交结果丢失 → 取数原始失败不得被退役文案顶掉（CR 第六十三轮 major）', async () => {
+    // 事故：fetch 失败 → `storeGap` 补记缺口；缺口事务的 COMMIT 结果丢失让实例**首次**退役。
+    // 旧实现状态的处理只覆盖「落库/清锁」两条路径，三条 fetch 处理器的 storeGap 是裸调用 ——
+    // 次生的退役错误把「取数失败」连同它的恢复指令换掉。
+    // 提交次数：markPending #1；缺口事务的 COMMIT 是 #2。
+    const { store } = await storeWithCommitFailureAt(2)
+    try {
+      const t = fakeTask({ fetch: async () => { throw new Error('注入：取数失败') } })
+      const e = await runTask(t, ctx(store, { sleep: async () => {} })).then(() => null,
+        (x: unknown) => x as Error & { code?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '取数原始失败必须保留').toMatch(/注入：取数失败/)
+      expect(e!.message, '缺口事务退役的事实也要在').toMatch(/补记缺口时实例退役|退役/)
+      expect(e!.code, '编排层要能识别退役').toBe('store_retired')
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('配对核对不符 + 回滚未确认 → 主失败原文保留在包层、恢复动作不被命令出口换掉（CR 第六十一轮追问）', async () => {
+    // `commitWindow` 的 count_mismatch 是**无 kind** 的普通 Error。回滚未确认时补注会包一层；
+    // 若包层漏了 `kind`，命令出口 `thrownToExit` 会走「无 kind」分支、把 hint 换成通用
+    // 「执行期错误」文案 —— 「先核对再重放」整段丢失。判据：交回错误同时保留 mismatch 原文、
+    // 回滚未确认事实、kind=internal 与核对 hint，且窗口放弃（不重试）。
+    const real = await import('@duckdb/node-api')
+    let armed = false
+    let insertCalls = 0
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (!armed) return cc.runAndReadAll(sql, params)
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 被拒')
+                  if (/^INSERT INTO\s+"?tags"?/.test(sql)) { insertCalls++; return cc.runAndReadAll(sql, params) }
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    const store = await createDuckDbStore(cfg, 'rw', { importer })
+    await store.init()
+    armed = true
+    try {
+      // apiCount=2、实际 1 行 → 写入数 1 ≠ 预期 2 → 事务里抛 count_mismatch。
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 2 }),
+      })
+      const e = await runTask(t, ctx(store, { sleep: async () => {} })).then(() => null,
+        (x: unknown) => x as Error & { kind?: string; hint?: string; code?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '配对核对原文必须保留').toMatch(/配对核对不符/)
+      expect(e!.message, '回滚未确认的事实也要在').toMatch(/回滚未能确认/)
+      expect(e!.kind, '无 kind 的主失败必须由包层补 internal（否则 hint 被命令出口换掉）').toBe('internal')
+      expect(e!.code, '实例已退役').toBe('store_retired')
+      expect(e!.hint, '恢复动作必须含核对').toMatch(/核对/)
+      expect(e!.hint, '恢复动作必须含重放').toMatch(/重放/)
+      expect(insertCalls, '退役后不得再碰同一实例').toBe(1)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('windowed：窗口写普通失败 + 补记缺口的事务丢掉 COMMIT 回执 → 退役事实不得被吞（CR 第五十一轮 major #2）', async () => {
+    // 场景：窗口写入抛普通错误（回滚已确认、实例还活着），随后补记缺口的事务丢了 COMMIT 回执
+    //（**首次**让实例退役）。旧实现 `storeGapOrPrimary` 见 store_retired 就无条件交回 primary，
+    // 把「缺口记录可能没落库、实例已退役、后续窗口写不进」整段丢掉。
+    // 提交次数：markPending #1；窗口事务在 INSERT 处抛错、回滚不发 COMMIT；缺口事务的 COMMIT 是 #2。
+    const { store } = await storeWithCommitFailureAt(2,
+      (sql) => /INSERT INTO\s+"?tags"?/.test(sql))
+    try {
+      const t = fakeTask({
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null,
+        (x: unknown) => x as Error & { hint?: string; kind?: string; code?: string })
+      expect(e, '必须以错误收尾').not.toBeNull()
+      expect(e!.message, '原始窗口失败必须保留').toMatch(/注入：窗口写入失败/)
+      expect(e!.message, '补记缺口的提交未知 / 退役事实不得被吞').toMatch(/缺口|退役/)
+      expect(e!.code, '实例已退役：编排层据此识别').toBe('store_retired')
+      // kind 也必须在场：命令出口 `thrownToExit` 只在 `err.kind` 存在时透传 hint（CR 第五十二轮 #15）
+      expect(e!.kind, '命令出口靠 kind 透传 hint').toBe('internal')
+      expect(e!.hint, '恢复动作仍要给出').toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it('snapshot：同样交回主失败（gap / 清锁撞退役不得把它换掉）', async () => {
+    const { store } = await storeWithCommitFailureAt(2)
+    try {
+      const t = fakeTask({
+        kind: 'snapshot', table: 'tags',
+        fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
+      })
+      const e = await runTask(t, ctx(store)).then(() => null, (x: unknown) => x as Error & { hint?: string })
+      expect(e, '快照写库的提交结果未知同样上抛').not.toBeNull()
+      expect(e!.message).toMatch(/提交结果未知/)
+      expect(e!.message).not.toMatch(/Store 已退役/)
+      expect(e!.hint).toMatch(/核对/)
+    } finally {
+      await store.close()
+    }
   })
 })

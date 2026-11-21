@@ -9,8 +9,16 @@ import { storeCommand } from '../../src/commands/store.js'
 import { dbCommand } from '../../src/commands/db.js'
 import { syncCommand } from '../../src/commands/sync.js'
 import { TABLES } from '../../src/store/schema.js'
+import { spawnLockHolder, lockVerdict, terminateHolder, LOCK_BUDGET_MS } from '../helpers/lock-holder.js'
 
+/** terminateHolder的测试侧包装：清理未确认时**保留夹具目录**——不得在可能仍开着的库
+ *文件上执行删除；目录留到下一用例开始时由 beforeEach复位（CR第六十七轮 major）。 */
+const terminateConfirmed = async (h: import('node:child_process').ChildProcess | undefined): Promise<void> => {
+ try { await terminateHolder(h) } catch (e) { keepFixtureDir = true; throw e }
+}
 let dir = '', out = '', err = ''
+// ⚠️清理未确认时保留目录（见 terminateConfirmed）。
+let keepFixtureDir = false
 const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-cmd-'))
@@ -19,7 +27,7 @@ beforeEach(() => {
   vi.stubEnv('HOME', dir)   // 隔离真实 ~
   vi.stubEnv('USERPROFILE', dir)
 })
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }) })
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); if (keepFixtureDir) { keepFixtureDir = false; return } rmSync(dir, { recursive: true, force: true }) })
 const data = (): Record<string, unknown> => JSON.parse(out).data
 
 describe('store init', () => {
@@ -279,6 +287,56 @@ describe('store status', () => {
     out = ''
     expect(await storeCommand(['status', '--db', join(dir, 'clean.db')])).toBe(0)
     expect(JSON.parse(out).meta.warnings).toBeUndefined()
+  })
+
+  it('表名提取判据自身双向：字符串数组与 {name,rows} 数组都取到名字（CodeRabbit + Codex PR#81）', () => {
+    const namesOf = (tables: unknown): string[] => (tables as Array<string | { name: string }>)
+      .map((x) => (typeof x === 'string' ? x : x.name))
+    expect(namesOf(['a', 'b'])).toEqual(['a', 'b'])
+    expect(namesOf([{ name: 'tickets', rows: 0 }])).toEqual(['tickets'])
+    // 反控：漏取名字时（把对象当成名字）这条会红
+    expect(namesOf([{ name: 'tickets', rows: 0 }])).not.toContain('[object Object]')
+  })
+
+  it('声明表在库里被删 → init/status 都点名「声明有而库中无」+ 成因 + 不谎称能补建（历史审查 PR#4 复核）', async () => {
+    // 事故事实（Sourcery PR#4-7「Missing tables pass initialization」）：库记录着最新
+    // schema_version、却少一张声明表时，`init` 跳过全部迁移（只重放 version > MAX(version)
+    // 的）→ 被删的表**不会**被重建；若此时再报"初始化成功、一切正常"，调用方读到的是
+    // 一份缺表却自称完整的库。
+    // 现在的口径不变的是**退出码**（README：库有漂移只警告、不失败 —— 与 db tables 同口径），
+    // 变的是**必须如实点名**：缺哪张、为什么、以及"store init 不会重建它"。
+    const p = dbPath()
+    expect(await storeCommand(['init', '--db', p])).toBe(0)
+    const mod = (await import('@duckdb/node-api')) as unknown as {
+      DuckDBInstance: { create: (x: string) => Promise<{ connect: () => Promise<{ run: (s: string) => Promise<unknown>; closeSync: () => void }>; closeSync: () => void }> }
+    }
+    const inst = await mod.DuckDBInstance.create(p)
+    const conn = await inst.connect()
+    await conn.run('DROP TABLE "tickets"')
+    conn.closeSync(); inst.closeSync()
+
+    for (const sub of ['init', 'status'] as const) {
+      out = ''
+      expect(await storeCommand([sub, '--db', p]), `${sub}：漂移不失败（README 口径）`).toBe(0)
+      const d = JSON.parse(out) as { data: { tables: unknown; schema_version: number }; meta: { warnings?: string[] } }
+      const text = (d.meta.warnings ?? []).join('\n')
+      expect(text, `${sub} 必须点名缺表（不得报干净的 ok）`).toMatch(/声明有而库中无/)
+      expect(text).toContain('tickets')
+      // 不许谎称"再 init 一次就好" —— 迁移已到最新版时它不会重建
+      expect(text).toMatch(/store init 不会重建/)
+      // 版本号仍在最新：证明"跳过迁移"确实发生了（这是缺表不会被补的机制）
+      expect(d.data.schema_version, `${sub}：库版本仍是最新，故 init 不会重放迁移`).toBeGreaterThan(0)
+      // 表清单不得把缺的表当成在。
+      // ⚠️ 必须**先取出名字**再断言（CodeRabbit + Codex PR#81）：`init` 的 tables 是字符串
+      // 数组、`status` 的是 `{name, rows}` 数组，两者都 `Array.isArray === true` ——
+      // 首版按「数组就原样用」写，status 那条拿对象数组去 `not.toContain('tickets')`
+      // 恒真（对象 !== 'tickets'），错返回 tickets 条目也照样绿（Codex 探针实测）。
+      const namesOf = (tables: unknown): string[] => (tables as Array<string | { name: string }>)
+        .map((x) => (typeof x === 'string' ? x : x.name))
+      const names = namesOf(d.data.tables)
+      expect(names, `${sub} 的 tables 必须真的是表名（判据自身不得空转）`).toContain('schema_version')
+      expect(names).not.toContain('tickets')
+    }
   })
 
   // 2026-11-14（历史审查 PR#4 复核）：`store status` 对全库逐表 COUNT，DuckDB 的
@@ -571,7 +629,11 @@ describe('store 命令面与 help', () => {
     expect(readFileSync(p).equals(before)).toBe(true)
   })
 
-  it('--db 指向已损坏的库（截断 / 页校验和不对）→ 1 + store_not_initialized + 「先备份再重建」hint，不进 internal 兜底', { timeout: 60_000 }, async () => {
+  // ⚠️ 预算 180s（原 60s）：`makeCorruptDb` 每种损坏都要 spawn 一个**新 node 进程**建真库
+  // （本进程建库会命中实例缓存，损坏不可见），而新进程不吃 setup-warm 的预热，各付一次
+  // 原生绑定冷启动 —— 高负载实测 10–34s/次，本用例循环两种损坏即两次。60s 在负载高时
+  // 会把「机器忙」报成「损坏成因归错了」。判据本身（kind/hint 逐字）不受影响。
+  it('--db 指向已损坏的库（截断 / 页校验和不对）→ 1 + store_not_initialized + 「先备份再重建」hint，不进 internal 兜底', { timeout: 180_000 }, async () => {
     // 2026-11-05 审查修：两类损坏报文（`Could not read enough bytes…` / `Corrupt database
     // file: computed checksum…`）此前既不匹配权限也不匹配「非 DuckDB 文件」，落进 internal
     // 兜底 —— hint 是「请用 qiyu store status 检查数据库状态」，拿自己查自己。
@@ -621,7 +683,7 @@ describe('store 命令面与 help', () => {
     expect(e.message).toContain(p)
   })
 
-  it('写者撞锁不重试 → 立即抛 store_locked（跨进程持真锁，spec §5.2）', { timeout: 120_000 }, async () => {
+  it('写者撞锁不重试 → 立即抛 store_locked（跨进程持真锁，spec §5.2）', { timeout: LOCK_BUDGET_MS + 60_000 }, async () => {
     // ⚠️ 锁只在跨进程成立（第四轮实测：同进程双开不撞锁）——spawn 子进程持锁，
     // storeCommand 的写者（init 用 rw 模式）打开 → 立即失败、不走退避。
     // status 是 ro 会真退避 30s，不能在本测试用。
@@ -629,66 +691,45 @@ describe('store 命令面与 help', () => {
     // ① @duckdb/node-api 有**进程内实例缓存** —— 测试进程打开过的库再开一律
     //    命中缓存、绕过文件锁（因此不做「先 init 建库」，holder 直接对全新路径
     //    持锁，DuckDBInstance.create 会建文件）；
-    // ② 子进程打印 'locked' 时锁可能尚未真正落盘（探针 12 次中 1 次）——打印
-    //    信号不可信，需要独立子进程校验锁已生效；
+    // ② 持有者先跑一条语句再打标记（语句成功即证明写事务已取得、锁已落盘；实测
+    //    20/20 CONFLICT），再用独立子进程校验锁已生效（绕开进程内实例缓存）；
     // ③ 极少数情况下校验 CONFLICT 后写者仍能打开（锁落盘竞态窗口）——按轮
     //    重试：每轮换全新路径，直到「校验 CONFLICT 且 init 返回 1」，最多 5 轮。
-    //    锁生效是平台保证的行为（T5 duckdb.test.ts 同款用例也间歇红），重试只
-    //    对冲竞态窗口，不改变被测语义。
-    const { spawn } = await import('node:child_process')
-    const pkgUrl = new URL('../../node_modules/@duckdb/node-api/lib/index.js', import.meta.url)
-    const spawnHolder = async (dbPath: string) => {
-      const child = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(async ({ DuckDBInstance }) => {
-          const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
-          console.log('locked')
-          setInterval(() => {}, 1 << 30)
-          await new Promise(() => {})
-        })`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let o = ''
-      child.stdout?.on('data', (d) => { o += String(d) })
-      const ok = await new Promise<boolean>((resolve) => {
-        const iv = setInterval(() => { if (o.includes('locked')) { clearInterval(iv); resolve(true) } }, 100)
-        setTimeout(() => { clearInterval(iv); resolve(false) }, 5000)
-      })
-      if (!ok) { child.kill('SIGKILL'); throw new Error(`锁持有者未能启动：${o.slice(0, 200)}`) }
-      return child
-    }
-    // 独立子进程校验锁（绕开进程内实例缓存）：
-    const lockVerdict = async (dbPath: string): Promise<string> => {
-      const chk = spawn(process.execPath, ['-e', `
-        import(${JSON.stringify(pkgUrl.href)}).then(({ DuckDBInstance }) =>
-          DuckDBInstance.create(${JSON.stringify(dbPath)}))
-          .then(() => console.log('OPENED'))
-          .catch(() => console.log('CONFLICT'))`], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let co = ''
-      chk.stdout?.on('data', (d) => { co += String(d) })
-      return await new Promise<string>((resolve) => {
-        chk.on('close', () => resolve(co.includes('CONFLICT') ? 'CONFLICT' : 'OPENED'))
-        setTimeout(() => { chk.kill('SIGKILL'); resolve('TIMEOUT') }, 10000)
-      })
-    }
+    //    锁生效是平台保证的行为，重试只对冲竞态窗口，不改变被测语义。
+    // ⚠️ 超时预算与 duckdb.test.ts 撞锁用例同因：每轮两个子进程各付一次原生绑定
+    //    冷启动（本机高负载实测 10–34s）；等待统管在 helpers 的单一截止时刻上。
+    const deadline = Date.now() + LOCK_BUDGET_MS
     let holder: import('node:child_process').ChildProcess | undefined
     try {
       let asserted = false
+      let roundsRun = 0
+      let lockConfirmed = 0   // 独立子进程看到 CONFLICT 的轮数（区分「锁没生效」与「锁生效后仍打开」）
       for (let round = 0; round < 5 && !asserted; round++) {
-        const p = dbPath()   // 每轮换全新路径（避开本进程实例缓存）
-        if (holder) holder.kill('SIGKILL')
-        holder = await spawnHolder(p)
-        if (await lockVerdict(p) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        roundsRun = round + 1
+        // ⚠️ **预算耗尽后不再换轮**（CR 第六十一轮追问）：deadline 已过去时，新一轮夹具
+        // 的就绪/close 等待全是负数预算，失败会被报成「未就绪」而不是「预算耗尽」。
+        if (Date.now() >= deadline) break
+        const p = join(dir, `w-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
+        if (holder) await terminateConfirmed(holder)
+        holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `w-holder-${round}`, deadline })
+        if (await lockVerdict(p, dir, deadline) !== 'CONFLICT') continue   // 锁未落盘，换轮
+        lockConfirmed++
         out = ''; err = ''
-        const t0 = Date.now()
+        const started = Date.now()
         const rc = await storeCommand(['init', '--db', p])
         if (rc !== 1) continue   // 锁竞态窗口（CONFLICT 后仍打开），换轮重来
         const e = JSON.parse(out).error
         expect(e.kind).toBe('store_locked')
         expect(e.retryable).toBe(true)
-        expect(Date.now() - t0).toBeLessThan(5000)   // 未走满 30s 退避（写者不重试）
+        // ⚠️ 判据是「没走满读者那条 30s 退避」，不是某个魔法值：写者不重试。探测到的
+        // open 耗时（进程内已预热）通常几十毫秒，这里只把「几乎肯定走了退避」挡出去。
+        expect(Date.now() - started, '写者不得重试（撞锁应立返，30s 退避是读者那条）').toBeLessThan(30_000)
         asserted = true
       }
-      expect(asserted, '5 轮内未取得「锁生效且 init 撞锁返回 1」——锁落盘竞态超预期').toBe(true)
+      expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— 锁未生效（夹具或平台行为变了），不是竞态窗口').toBeGreaterThan(0)
+      expect(asserted, `未取得「锁生效且 init 撞锁返回 1」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
-      holder?.kill('SIGKILL')
+      await terminateConfirmed(holder)
     }
   })
 
@@ -731,6 +772,103 @@ describe('store 命令面与 help', () => {
     } finally {
       vi.doUnmock('../../src/store/index.js')
     }
+  })
+
+  it('迁移失败且回滚未能确认 → 命令出口必须保住「先核对、再决定是否重放」（CR 第四十八轮 major）', { timeout: 60000 }, async () => {
+    // 探针实测（2026-11-20）：迁移抛的是 plain Error（没有 kind），`annotateUnconfirmedRollback`
+    // 补了 code/hint 但没补 kind —— `thrownToExit` 走「无 kind」分支、用通用 hint 覆盖掉
+    // 「核对后再重放」，store init 的操作者只看到「执行期错误，换个库验证」。
+    // ⚠️ 必须用**全新路径**：已建到 LATEST_VERSION 的库没有待放迁移，`init` 直接成功。
+    const freshPath = join(dir, 'migrate-fail.db')
+    out = ''; err = ''
+    const real = await import('@duckdb/node-api')
+    const importer = async (): Promise<unknown> => ({
+      ...real,
+      DuckDBInstance: {
+        create: async (...a: unknown[]) => {
+          const inst = await (real.DuckDBInstance.create as (...x: unknown[]) => Promise<unknown>)(...a)
+          const ii = inst as { connect: () => Promise<unknown>; closeSync?: () => void }
+          return {
+            ...(inst as object),
+            closeSync: () => ii.closeSync?.(),
+            connect: async () => {
+              const c = await ii.connect()
+              const cc = c as { runAndReadAll: (s: string, p?: unknown[]) => Promise<unknown>; extractStatements: (x: string) => unknown; closeSync?: () => void }
+              return {
+                ...(c as object),
+                closeSync: () => cc.closeSync?.(),
+                extractStatements: (sql: string) => cc.extractStatements(sql),
+                runAndReadAll: async (sql: string, params?: unknown[]) => {
+                  if (sql === 'ROLLBACK') throw new Error('注入：ROLLBACK 在执行前被拒绝')
+                  return cc.runAndReadAll(sql, params)
+                },
+              }
+            },
+          }
+        },
+      },
+    })
+    vi.resetModules()
+    vi.doMock('../../src/store/index.js', async (importOriginal) => {
+      const orig = await importOriginal<typeof import('../../src/store/index.js')>()
+      const { createDuckDbStore } = await import('../../src/store/duckdb.js')
+      return {
+        ...orig,
+        openStore: async (cfg: unknown, mode: unknown) => {
+          const s = await createDuckDbStore(cfg as never, mode as never, { importer: importer as never })
+          const origExec = (s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }).execSql
+          vi.spyOn(s as unknown as { execSql: (sql: string, p?: unknown[]) => Promise<unknown> }, 'execSql')
+            .mockImplementation(async (sql: string, p?: unknown[]) => {
+              // 迁移建表照常，版本行写不进去 → 事务回调抛 plain Error（无 kind）
+              if (sql.startsWith('INSERT INTO schema_version')) throw new Error('migration failed')
+              return origExec(sql, p)
+            })
+          return s
+        },
+      }
+    })
+    try {
+      // ⚠️ 动态导入放进受保护区（Codex 第五十轮 P3）：它在 `try` 之外失败时 `doUnmock` 不会执行，
+      // 模块 mock 会污染后续用例。
+      const { storeCommand: mockedCommand } = await import('../../src/commands/store.js')
+      expect(await mockedCommand(['init', '--db', freshPath])).toBe(1)
+      const e = JSON.parse(out).error
+      expect(e.kind, '无 kind 会在命令出口被换成通用文案').toBe('internal')
+      // ⚠️ CLI 出口的 `code` 与 `kind` 同值（`thrownToExit` 的映射），`store_retired` 只由
+      // 编排层（sync 引擎直接消费 store 错误）识别 —— 这里不重复断言 code。
+      expect(e.message).toMatch(/回滚未能确认/)
+      expect(e.message).toMatch(/migration failed/)
+      expect(e.hint, '恢复动作必须保住「先核对数据、再决定是否重放」').toMatch(/核对/)
+      expect(e.hint).toMatch(/重放/)
+    } finally {
+      vi.doUnmock('../../src/store/index.js')
+    }
+  })
+
+  it('命令出口：退役包装保留原 kind（store_locked）→ retryable:false 且「核对后再重放」hint 原样到达（CR 第六十三轮 major）', async () => {
+    // 引擎层用例只断言到 `runTask` 交回的错误为止。CR 的追问：这条错误到达命令出口
+    // （`thrownToExit`，`store status` 族与 `sync run` 共用）之后，输出会不会又变回
+    // 「撞锁可重试」的通用形态、把核对与重放的指引丢掉？
+    // 形态出处：`duckdb.ts` 的 `annotateUnconfirmedRollback` —— 回滚未确认的撞锁失败
+    // **保留原 kind**（`store_locked`）、`retryable` 置 false、`code` 打 `store_retired`、
+    // hint 换成「先核对再决定是否重放」。这里按该形态构造并钉住出口渲染。
+    const { thrownToExit } = await import('../../src/commands/store.js')
+    const retired = Object.assign(
+      new Error('Store 已退役：撞锁重试超过上限 ——（事务收尾）回滚未能确认：该事务也许仍然开着'),
+      {
+        kind: 'store_locked',
+        retryable: false,
+        code: 'store_retired',
+        hint: '关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）再决定是否重放；本实例上的后续语句都会被拒',
+      },
+    )
+    expect(thrownToExit(retired), '退役 = 业务失败，不是可重试的环境故障').toBe(1)
+    const e = JSON.parse(out).error
+    expect(e.kind, '原 kind 透传（引擎层的重试分流靠它）').toBe('store_locked')
+    expect(e.retryable, '退役实例绝不可重试 —— 重试只会撞上同一个退役错误').toBe(false)
+    expect(e.hint, '恢复动作必须保住「先核对、再决定是否重放」').toMatch(/核对/)
+    expect(e.hint).toMatch(/重放/)
+    expect(e.hint, '不得退回普通撞锁的「稍后重试」指引').not.toMatch(/稍后重试/)
   })
 
   // —— 权限错误（errno）分流：判据必须匹配**真实到达该函数的报文形态** ——

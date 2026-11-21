@@ -21,6 +21,15 @@ import { LATEST_VERSION, TABLES } from '../src/store/schema.js'
 
 const read = (rel: string): string => readFileSync(fileURLToPath(new URL(`../${rel}`, import.meta.url)), 'utf8')
 
+// ⚠️ 文件级超时 40s 的来由与标定（2026-11-19 复核）：上一行这行 `setConfig` 自 2026-10-28
+// 引入起就没有注释，像是随手抄的宽松值。实测（本机 load average 361，外部 VM 占满）：
+//   整个文件 9 条用例，**用例体合计 1.6s**，DuckDB 冷启动由 `tests/setup-warm.ts` 在
+//   每个 worker 进程开跑前付掉（本次 3.8s，在用例计时之外）。
+// 即 40s 相对真实成本有 ~25 倍余量。这里**不往小改**：本文件无子进程、无退避路径
+// （status 的 30s readOnlyRetryMs 走不到 —— 库是同进程刚 init 的，命中实例缓存），
+// 收紧只会把「机器忙」重新换成假红；它的作用只是兜住「真的挂住」的形态，让文件报红
+// 而不是无限期占着 worker。若将来有人加入会付冷启动的**子进程**用例，请按那条用例单独
+// 设预算（参照 tests/helpers/lock-holder.ts 的单一截止时刻写法），不要再抬文件级上限。
 vi.setConfig({ testTimeout: 40_000 })
 
 let dir = ''
