@@ -848,12 +848,18 @@ describe('整体早于接口下界的区间（CI 实测修正）', () => {
 describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案）', () => {
   /** 关掉第 N 次 COMMIT 的结果交回（提交在驱动里已执行；N 从 init 之后的第一次提交数起）。 */
   async function storeWithCommitFailureAt(n: number,
-    failWrite?: (sql: string) => boolean): Promise<{ store: Store; commits: () => number }> {
+    failWrite?: (sql: string) => boolean): Promise<{ store: Store; commits: () => number; commitLog: Array<{ lastMutating: string }> }> {
     const real = await import('@duckdb/node-api')
     let seen = 0
     // ⚠️ init 的迁移自己就会提交很多次（每个迁移一个事务）—— 计数必须在 init **之后**开，
     // 否则注入打中的是迁移的 COMMIT，Store 在 init 里就退役了。
     let injectAt = 0
+ // ⚠️记录每次注入 COMMIT之前最后一条写语句（CR第六十七轮 major：只按序号断言时，
+ //数据窗的提交结果未知会满足同一组断言 ——必须能证明第3次提交来自清锁事务）。
+ let lastMutating = ''
+ const commitLog: Array<{ lastMutating: string }> = []
+ // ⚠️写失败注入在 init之后才武装：迁移里也可能出现写语句，武装过早会在建库阶段就炸。
+ let armed = false
     const importer = async (): Promise<unknown> => ({
       ...real,
       DuckDBInstance: {
@@ -877,10 +883,13 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
                 extractStatements: (sql: string) => cc.extractStatements(sql),
                 runAndReadAll: async (sql: string, params?: unknown[]) => {
                   // 普通写入失败注入（与 COMMIT 回执注入可叠加：#2 的「窗口写失败 + 缺口提交未知」）
-                  if (failWrite !== undefined && sql !== 'COMMIT' && failWrite(sql)) {
+                  if (armed && failWrite !== undefined && sql !== 'COMMIT' && failWrite(sql)) {
                     throw new Error('注入：窗口写入失败')
                   }
+                  //记录本次提交之前的最后一条写语句（INSERT/UPDATE/DELETE），用于证明注入打中的是哪个事务。
+                  if (sql !== 'COMMIT' && /^(INSERT|UPDATE|DELETE)/i.test(sql.trim())) lastMutating = sql
                   const out = await cc.runAndReadAll(sql, params)
+                  if (sql === 'COMMIT' && injectAt !== 0 && seen + 1 === injectAt) commitLog.push({ lastMutating })
                   if (sql === 'COMMIT' && injectAt !== 0 && ++seen === injectAt) {
                     throw new Error('注入：COMMIT 已执行、结果交回失败')
                   }
@@ -894,9 +903,10 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     })
     const store = await createDuckDbStore(cfg, 'rw', { importer })
     await store.init()
+ armed = true
     seen = 0
     injectAt = n
-    return { store, commits: () => seen }
+    return { store, commits: () => seen, commitLog }
   }
 
   it('windowed：交回原始失败（带「核对后再重放」），不是退役文案', async () => {
@@ -1043,7 +1053,7 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
     // 成功路径的提交次数：#1 markPending、#2 数据窗、#3 清锁（releaseLock 的 clearLock 事务）。
     // 清锁事务丢掉回执 = 它自己的 COMMIT 结果未知、当场退役 —— 这不是任何主失败的次生结果，
     // 旧实现按「次生」吞掉并返回 complete：实例已退役、写者锁可能没清，却被报成全部成功。
-    const { store } = await storeWithCommitFailureAt(3)
+    const { store, commitLog } = await storeWithCommitFailureAt(3)
     try {
       const t = fakeTask({
         fetch: async () => ({ rows: [{ id: '1', name: 'A', color: '#111111' }], apiCount: 1 }),
@@ -1052,6 +1062,10 @@ describe('COMMIT 结果未知 → 引擎交回主失败（不换成退役文案�
       expect(e, '清锁事务的提交结果未知必须上抛，不能当 complete').not.toBeNull()
       expect(e!.message).toMatch(/提交结果未知/)
       expect(e!.hint, '恢复动作：先核对再决定是否重放').toMatch(/核对/)
+    expect(commitLog[0], '注入必须打中第3次提交（清锁事务）').toBeDefined()
+    expect(commitLog[0]!.lastMutating, '清锁事务最后写的是 sync_state ——不是数据窗的 tags')
+     .toMatch(/sync_state/)
+    expect(commitLog[0]!.lastMutating, '排除把数据窗提交误当成清锁提交').not.toMatch(/tags/)
     } finally {
       await store.close()
     }

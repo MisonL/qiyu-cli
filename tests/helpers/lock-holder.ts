@@ -384,7 +384,7 @@ function assertBudget(deadline: number, what: string): void {
 /** 起一个跨进程持锁者（RW 独占锁 / RO 共享锁），就绪后才返回。 */
 export async function spawnLockHolder(
   o: { dbPath: string; scriptDir: string; name?: string; accessMode?: 'READ_ONLY' | 'READ_WRITE'; deadline: number },
-): Promise<ChildProcess> {
+): Promise<LockHolder> {
   assertBudget(o.deadline, '锁持有者')
   const script = o.accessMode === 'READ_ONLY'
     ? `const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
@@ -401,6 +401,18 @@ await c.run('CREATE TABLE IF NOT EXISTS lock_probe (x INTEGER)')
 console.log('locked')
 setInterval(() => {}, 1 << 30)`
   const child = runScript(script, o.scriptDir, o.name ?? 'holder', o.deadline)
+  // ⚠️ **close / error在 spawn侧登记**（CR第六十七轮 major）：测试可能在等校验进程时
+  //持有者已经自己结束 —— close事件不会重放，terminateHolder只看调用时刻的监听会白等
+  //满宽限再失败。error也在这里兜住（信号送不出去 / spawn失败），terminateHolder用它的
+  //原文作归因；同一监听同时避免未处理的 error冒成未捕获异常。
+  const holder = child as LockHolder
+  // ⚠️这两个监听是**状态标记**，不是等待原语：没有定时器、不持有引用（随 child一起回收），
+  //且必须活到用例收尾才能回答「它是不是已经 close过」——`expectClean`的「零 close监听」
+  //只对会挂住/泄漏的监听有意义，故用标记把它们与真正的等待监听区分开（见测试侧的过滤）。
+  const onCloseMark = Object.assign((): void => { holder.lockClosed = true }, { __lockHolderTrack: true })
+  const onErrorMark = Object.assign((e: Error): void => { holder.lockError ??= e }, { __lockHolderTrack: true })
+  holder.on('close', onCloseMark)
+  holder.on('error', onErrorMark)
   await waitForMarker(child, 'locked', o.deadline, '锁持有者')
   return child
 }
@@ -524,25 +536,64 @@ inst.closeSync()`, scriptDir, 'seed', deadline)
  *说成正常收尾（Windows上还会直接删不掉）。有界等待；等不到就响亮失败。
  * ⚠️只用于**当前仍在运行的**持锁者（每轮换路径的旧持有者由轮次循环自行 kill）。
  */
-export async function terminateHolder(child: ChildProcess | undefined,
+/** spawnLockHolder返回的句柄：close / error在 spawn侧就登记，terminateHolder才看得见迟到事件。 */
+export interface LockHolder extends ChildProcess {
+ /**已观察到 close（进程与 stdio都已放开）。 */
+ lockClosed?: boolean
+ /**原生 error事件（信号送不出去等）——终止失败时作为 cause/文案来源。 */
+ lockError?: Error
+}
+
+/**
+ *结束跨进程持锁者并**确认它已 close**（CR第六十六/六十七轮）：`kill()`只发信号 —— stdio
+ *与库文件句柄可能仍未放开，调用方在 close之前删夹具目录 /复用同一路径，会把「清理未确认」
+ *说成正常收尾（Windows上还会直接删不掉）。有界等待；等不到就响亮失败。
+ * ⚠️判据分三段，各自有出处（CR第六十七轮 major）：
+ * ·已经 close（spawn侧登记的 `lockClosed`）→直接返回，不再为一个不会重放的事件空等宽限；
+ * · `kill()`抛错或子进程报原生 `error` → **仍然等 close**（信号没送达不等于进程没结束），
+ * close到达时把原始错误照样交回（清理已确认也不吞失败）；
+ * ·等不到 close →文案点名「宽限内未 close」，原生错误（如有）挂在 `cause`与正文里。
+ * ⚠️只用于**当前仍在运行的**持锁者（每轮换路径的旧持有者由轮次循环自行 terminate）。
+ */
+export async function terminateHolder(child: LockHolder | ChildProcess | undefined,
  graceMs: number = CLOSE_GRACE_MS): Promise<void> {
  if (child === undefined) return
+ const h = child as LockHolder
+ // ⚠️ spawn之后、调用方收尾之前进程可能已经自己结束（测试在等校验进程时）——事件不会重放，
+ //不看登记就会白等满宽限再失败（CR第六十七轮 major）。
+ if (h.lockClosed === true) return
+ //原生 error事件可能在我们等待期间才到（信号没送达）——先挂监听，既不漏归因也不让它冒成未捕获异常。
+ let nativeError: Error | undefined = h.lockError
+ const onError = (e: Error): void => { nativeError ??= e }
+ h.on('error', onError)
  let timer: ReturnType<typeof setTimeout> | undefined
  const closed = new Promise<boolean>((resolve) => {
  const done = (): void => {
  if (timer !== undefined) clearTimeout(timer)
  resolve(true)
  }
- child.once('close', done)
- timer = setTimeout(() => { child.off('close', done); resolve(false) }, graceMs)
+ h.once('close', done)
+ timer = setTimeout(() => { h.off('close', done); resolve(false) }, graceMs)
  })
  //监听先挂、再发信号：kill与 close之间没有窗口。
+ let killError: Error | undefined
  try {
- child.kill('SIGKILL')
+ h.kill('SIGKILL')
  } catch (e) {
- throw new Error(`终止持锁者失败（它可能仍占着库文件）：${(e as Error).message}`, { cause: e })
+ killError = e as Error
  }
- if (!(await closed)) {
- throw new Error('持锁者未在宽限内 close ——它可能仍占着库文件，不得删除夹具目录或复用同一路径')
+ const arrived = await closed
+ h.off('error', onError)
+ const native = killError ?? nativeError ?? h.lockError
+ if (arrived) {
+ h.lockClosed = true
+ if (killError !== undefined) {
+ //清理已确认，但「信号没送出去」仍不得吞成成功（CR第六十七轮 major）。
+ throw new Error(`终止持锁者失败（信号未能送达）：${killError.message}`, { cause: killError })
  }
+ return
+ }
+ const base = '持锁者未在宽限内 close ——它可能仍占着库文件，不得删除夹具目录或复用同一路径'
+ if (native !== undefined) throw new Error(`${base}（终止动作的原始错误：${native.message}）`, { cause: native })
+ throw new Error(base)
 }

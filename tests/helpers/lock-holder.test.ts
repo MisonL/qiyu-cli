@@ -112,7 +112,12 @@ function observe<T>(promise: Promise<T>) {
 function expectClean(child: ChildProcess) {
   expect(vi.getTimerCount(), '夹具不得遗留定时器').toBe(0)
   expect(child.listenerCount('exit'), '夹具不得遗留 exit 监听').toBe(0)
-  expect(child.listenerCount('close'), '夹具不得遗留 close 监听').toBe(0)
+  // ⚠️状态标记监听（`__lockHolderTrack`）不算遗留：没有定时器、不挂起等待，且必须在
+  //用例收尾时仍然在场才能回答「持锁者是不是早已 close」（CR第六十七轮 major）。真正的
+  //等待监听（ScriptRun的 onClose / terminateHolder的临时监听）仍按零容忍检查。
+  const trackedClose = child.listeners('close').filter(
+   (l) => (l as { __lockHolderTrack?: boolean }).__lockHolderTrack === true).length
+  expect(child.listenerCount('close') - trackedClose, '夹具不得遗留 close监听').toBe(0)
   expect(child.stdout?.listenerCount('data')).toBe(0)
   expect(child.stderr?.listenerCount('data')).toBe(0)
 }
@@ -672,6 +677,38 @@ describe('terminateHolder（持锁者收尾必须确认 close）', () => {
  const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter
  ;(ch as unknown as { kill: () => boolean }).kill = () => { throw new Error('EPERM:注入') }
  await expect(terminateHolder(ch,50)).rejects.toThrow(/EPERM:注入/)
+ })
+
+ it('kill抛错但 close到达 →清理已确认，原始错误仍交回（不吞成成功）', async () => {
+ const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter
+ ;(ch as unknown as { kill: () => boolean }).kill = () => {
+ setTimeout(() => ch.emit('close', null, 'SIGKILL'),5)
+ throw new Error('EPERM:注入')
+ }
+ await expect(terminateHolder(ch,200)).rejects.toThrow(/EPERM:注入/)
+ })
+
+ it('已经 close的持锁者 →立刻返回，不再空等宽限', async () => {
+ const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter & { lockClosed?: boolean }
+ ch.lockClosed = true
+ let killed = false
+ ;(ch as unknown as { kill: () => boolean }).kill = () => { killed = true; return true }
+ const t0 = Date.now()
+ await terminateHolder(ch,500)
+ expect(Date.now() - t0, '必然已在宽限之前返回').toBeLessThan(400)
+ expect(killed, '已 close就不必再发信号').toBe(false)
+ })
+
+ it('原生 error事件（信号未送达）且没有 close →宽限失败带上原始错误', async () => {
+ const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter
+ ;(ch as unknown as { kill: () => boolean }).kill = () => true
+ const native = new Error('ESRCH:注入')
+ setTimeout(() => ch.emit('error', native),5)
+ const err = await terminateHolder(ch,80).then(() => null, (e: unknown) => e as Error)
+ expect(err).not.toBeNull()
+ expect(err!.message).toMatch(/未在宽限内 close/)
+ expect(err!.message).toMatch(/ESRCH:注入/)
+ expect((err as Error & { cause?: unknown }).cause, '原始错误挂 cause').toBe(native)
  })
 })
 

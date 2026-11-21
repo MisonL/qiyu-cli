@@ -239,7 +239,7 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   // ⚠️ 真实 API（第四轮实测）：runAndReadAll(sql, params) 返回带 getRowObjectsJson()
   // 与 columnNames() 的读取器；run() 返回的 Result 没有取行方法。
   // `extractStatements` 在**原型**上（不在自有属性里）：测试里包一层的导入缝若要让它可见，
-  // 必须显式转发（`...(conn as object)` 展开拿不到原型方法，见 `parseStatementCount` 的报错）。
+  // 必须显式转发（`...(conn as object)` 展开拿不到原型方法，见 `rejectMultiStatements` 的报错）。
   const c = conn as {
     run: (sql: string, params?: unknown[]) => Promise<unknown>
     runAndReadAll: (sql: string, params?: unknown[]) => Promise<{
@@ -502,6 +502,11 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   // 放弃等待之后、回调返回之前自己交回 —— 只看 stuck 会为了一个已经结束的探针跳过 ROLLBACK
   // 并错误退役。记账以**收尾时刻**为准：原始 promise 一落定就把这里翻成 true。
   let nativeProbeSettled = true
+ // ⚠️ **每个探针各记各的账**（CR第六十七轮 major）：同一事务里两条在途语句先后失败，会各自
+ //起一次 `SELECT1`。若「已交回」只用一个共享布尔，旧探针 A交回会把**仍挂住的新探针 B**
+ //记成已结束 →收尾发出 ROLLBACK、排在 B后面超时，把「探针挂住」误报成「回滚未确认」。
+ //收尾只认**最近一次**探针的状态：锁存代次，过期探针的交回/超时都不再改状态。
+ let nativeProbeGen = 0
   /**
    * `hint` 只在成因的恢复动作与通用说法**不同**时才给（CR 第四十一轮 major）：COMMIT
    * 结果未知时写入可能已落库，「关掉重建后直接重试」就是重复写，通用的
@@ -612,27 +617,43 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
           ? `事务回调返回时仍有 ${ownPending} 条本事务的语句没有交回结果（是不是没有 await 它们？）`
           : `事务提交时仍有 ${foreignInFlight} 条其他异步链下发的语句没有交回结果，它执行期报错会把本事务标成 aborted`)
     // ⚠️ 顺序：先退役令牌（停掉后续下发），再等在途语句交回，最后才 ROLLBACK（`closeTx`）。
-    const closed = await closeTx(token)
-    const rolledBack = closed === 'confirmed'
+    // ⚠️ `none`与 `unconfirmed`必须分开说（Codex第十四轮 P2）：`none` =连接已关闭（未提交
+    //写入随连接丢弃）或 ROLLBACK被拒但活动事务探针确认连接上**已无事务** ——实例没有退役，
+    //后续语句照常可用；旧实现把两者都写成「该连接已退役」并打 `store_retired`，而同一实例
+    //随后还能成功查询，恢复动作被指向了不存在的故障。只有 `unconfirmed`（回滚可能没执行、
+    //事务也许还开着）才退役。
+    const closeState = await closeTx(token)
+    const rolledBack = closeState === 'confirmed'
+    const retired = closeState === 'unconfirmed'
     txInFlight.delete(token)
     txWrites.delete(token)
-    const err = new Error(`事务未提交：${why} —— 该事务可能已被 DuckDB 标成 aborted，`
+    const rollbackNote = rolledBack
+      ? '因此已整体回滚'
+      : retired
+       ? '**回滚也未能确认**（连接可能已关闭、或还有语句未交回）：该连接已退役，'
+        + '不要把该事务的任何写入当成已保存'
+       : closed
+       ? '连接已关闭，未提交的写入随连接丢弃，本实例不可再用 —— 但不要把该事务的任何写入当成已保存'
+       : '回滚没有确认回执，但连接上已无活动事务（该事务已经结束）：实例仍可用，'
+        + '但该事务的写入是否落库无法从本连接确认，不要把它的任何写入当成已保存'
+    const err = new Error(`事务未提交：${why} ——该事务可能已被 DuckDB 标成 aborted，`
       + 'COMMIT 可能返回成功却丢弃全部写入，'
-      + (rolledBack
-        ? '因此已整体回滚'
-        : '**回滚也未能确认**（连接可能已关闭、或还有语句未交回）：该连接已退役，'
-          + '不要把该事务的任何写入当成已保存'))
+      + rollbackNote)
     ;(err as { kind?: string }).kind = 'internal'
-    // ⚠️ 恢复动作按**收尾状态**给（CR 第四十三轮 major）：这条拒绝不经过外层 catch 的
-    // `annotateUnconfirmedRollback`（身份集合让它跳过回滚），所以「回滚也未能确认、连接已退役」
-    // 的恢复动作必须在这里自己给 —— 否则 hint 只说「让操作串行」，而实例已经退役、照做也没用。
+    // ⚠️恢复动作按**收尾状态**给（CR第四十三轮 major）：这条拒绝不经过外层 catch的
+    // `annotateUnconfirmedRollback`（身份集合让它跳过回滚），所以退役状态的恢复动作必须在这里
+    //自己给 ——否则 hint只说「让操作串行」，而实例已经退役、照做也没用。
+    const serializeHint = '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
     ;(err as { hint?: string }).hint = rolledBack
-      ? '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
-      : '让同一个 Store 实例上的操作串行执行，并 await 事务回调里的每一次写：不要用 Promise.all 并行调用 upsert/delete/transaction/query/count'
+      ? serializeHint
+      : retired
+       ? serializeHint
         + '；本次回滚也未能确认、该连接已退役 —— 请关闭并重建 Store 实例，先核对数据（本事务的写入是否落库）再决定是否重放'
-    // ⚠️ 稳定标记（CR 第四十七轮 major）：这条拒绝不经过顶层 catch 的标注，编排层按 code 判
-    // 「实例已退役」—— 已确认回滚时实例仍可用，不带标记。
-    if (!rolledBack) (err as { code?: string }).code = 'store_retired'
+       : serializeHint
+        + '；本次事务的写入是否落库无法确认 —— 先核对数据再决定是否重放（不必重建 Store 实例）'
+    // ⚠️稳定标记（CR第四十七轮 major）：这条拒绝不经过顶层 catch的标注，编排层按 code判
+    // 「实例已退役」——已确认回滚或「连接上已无事务」时实例仍可用，不带标记。
+    if (retired) (err as { code?: string }).code = 'store_retired'
     // 回滚**已由这里负责**（唯一处理点，CR 第三十六轮 major）：外层 catch 见到这个拒绝就不再
     // 回滚第二次 —— 两次回滚里只要一次成功、另一次失败，上一行对「回滚是否确认」的说法就不可信。
     refusals.set(err, token)
@@ -653,15 +674,18 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       timer = setTimeout(() => reject(new Error('事务失效性探针超时')), 50)
     })
     let raw: Promise<unknown> | undefined
+    let gen = -1
     try {
       // 同一次派发前的复核（关闭 / 退役后这条探针不回交任何有意义的答案，直接按保守侧处理）。
       if (closed || poisoned !== undefined) return true
+      gen = ++nativeProbeGen
       raw = c.runAndReadAll('SELECT 1', []) as unknown as Promise<unknown>
       nativeProbeSettled = false
-      raw.then(() => { nativeProbeSettled = true }, () => { nativeProbeSettled = true })
+      const settle = (): void => { if (gen === nativeProbeGen) nativeProbeSettled = true }
+      raw.then(settle, settle)
       void raw.catch(() => { /* 归因价值由探针结果承担，避免迟到拒绝冒成 unhandled */ })
       await Promise.race([raw, timeout])
-      nativeProbeStuck = false
+      if (gen === nativeProbeGen) nativeProbeStuck = false
       return false
     } catch {
       try { (c as { interrupt?: () => void }).interrupt?.() } catch { /* 中断失败照旧按已失效处理 */ }
@@ -673,28 +697,19 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         raw.then(() => true, () => true),
         new Promise<boolean>((resolve) => { setTimeout(() => resolve(false), 100) }),
       ])
-      nativeProbeStuck = !settled
+      if (gen === nativeProbeGen) nativeProbeStuck = !settled
       return true
     } finally {
       if (timer !== undefined) clearTimeout(timer)
     }
   }
   /**
-   * 事务关键字的**文本初筛**：只决定「要不要交给 DuckDB 解析」，本身不是判据。
-   *
-   * 事务控制语句不可能不写出这些词，所以初筛没有假阴性；假阳性（字符串字面量里的
-   * `'END'`、`CASE … END` 的 END）只会多花一次解析（实测 0.05–0.5 ms）。
-   * ⚠️ 真正判据在 `rejectRawTxControl`：DuckDB 把 `END` / `ABORT` / `START TRANSACTION`
-   * 都解析成 TRANSACTION，注释前缀与多语句同样绕过文本前缀匹配 —— 这些形态只有解析能判
-   * （直连驱动探针 2026-11-19：`SELECT 1; END` 的 statementType 序列是 [1, 10]）。
+   *多语句的**文本初筛**：只决定「要不要交给 DuckDB 解析」，判据是解析结果的语句数。
+   *对象是剥掉字面量 /注释 /引号标识符 / dollar 引用后的**代码**：引用与注释里的 `;`
+   *不执行，不算多语句；真正分隔语句的分号必然留在代码里，所以没有假阴性。末尾分号去掉
+   *后仍含 `;`才解析（`SELECT 1;`实测 `count === 1`，不再多花一次解析）。
    */
-  const TX_KEYWORD = /(?:^|[^A-Za-z0-9_])(?:BEGIN|COMMIT|ROLLBACK|END|ABORT|START|TRANSACTION)(?:[^A-Za-z0-9_]|$)/i
-  /**
-   * 多语句的**文本初筛**（与 `TX_KEYWORD` 同一角色：只决定「要不要解析」，判据是解析结果
-   * 的语句数）。没有假阴性：多语句必然在末尾之前出现 `;`。假阳性（字符串 / 注释里的 `;`、
-   * 块末尾的分号）只多花一次解析 —— 单条带尾分号实测 `count === 1`，照常放行。
-   */
-  const mightBeMulti = (sql: string): boolean => sql.replace(/[\s;]+$/, '').includes(';')
+  const mightBeMulti = (sql: string): boolean => stripSqlLiterals(sql).replace(/[\s;]+$/, '').includes(';')
   /**
    * 把 SQL 里**不执行**的文本剥掉（字符串字面量 / 引号标识符 / 行注释 / 块注释 / dollar 引用），
    * 只给「原文里有没有事务关键字」这类**初判**用（CR 第六十二轮 / Codex PR#81 第五十二轮 P2）。
@@ -742,26 +757,61 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     return out
   }
   /**
-   * 去掉 `CASE … END` 结构（EXPLAIN 的事务控制初判用，Codex 第十三轮 P2）：
-   * `EXPLAIN ANALYZE SELECT CASE WHEN … THEN … END` 是合法只读诊断，而 `END` 恰好也是
-   * `TX_KEYWORD` 的一员 —— 旧判据把它误判成事务控制并拒绝。字面量 / 注释先由
-   * `stripSqlLiterals` 剥掉，再按「最近的 CASE…END 配对」删除（可嵌套，有界迭代到不动点）。
-   * 边界：未加引号的标识符 `case` 会被一并剥掉 —— 那只可能让初判**放行**，而真正的事务控制
-   * 语句类型仍由 `prepare` 的 statementType 兜底（`EXPLAIN ANALYZE COMMIT` 照常拒）。
+   *事务控制的**词法判据**（唯一判据，2026-11-21 由「解析后看 statementType」改回文本）。
+   *
+   *判据为什么是文本、且必须是文本：
+   *① **语法闭包**已用真驱动枚举过（`@duckdb/node-api` 1.5.6-r.1）：全部事务控制写法 ——
+   *   `BEGIN [TRANSACTION]` / `COMMIT [WORK|TRANSACTION]` / `ROLLBACK [WORK]` /
+   *   `END [TRANSACTION]` / `ABORT` / `START TRANSACTION [READ ONLY]`，含注释前缀与尾分号 ——
+   *   `prepare(0).statementType` 都是 `TRANSACTION`，且**都以这六个词开头**；DuckDB 没有
+   *   `PREPARE TRANSACTION`（直接语法错误）。所以句首锚定的词法判据没有假阴性。
+   *② 用 `prepare(0)` 当判据有**副作用**（真驱动探针 2026-11-21）：prepare 会求值 table
+   *   function 参数 —— `SELECT * FROM range(nextval('s'))` 在 prepare 时序列前进一格、执行时
+   *   再前进一格（结果从 1 行变 2 行）；自动提交下 prepare 这条查询还会以 DuckDB 内部断言
+   *   「read-only but has made changes」失败，把一条合法查询变成 internal 错误。分类判据
+   *   不得改变被分类语句的结果。
+   *③ 判据对象是 `stripSqlLiterals` 之后的**代码**，锚定在（剥掉 `EXPLAIN` 包装后的）语句
+   *   开头：字符串里的 `COMMIT`、`CASE … END`、别名 `AS start` 都不会命中（真驱动接受
+   *   `EXPLAIN ANALYZE SELECT 1 AS start`）。
+   *边界：多语句由语句数判据先拒（`SELECT 1; COMMIT` 的归因是多语句）；`EXPLAIN` 包装
+   *由 `stripExplainWrapper` 剥掉后判里层（`EXPLAIN ANALYZE COMMIT` / `EXPLAIN (ANALYZE)
+   *COMMIT` 实测都会执行里层）。
    */
-  const stripCaseEnds = (s: string): string => {
+  const TX_CONTROL_AT_START = /^\s*(?:(?:BEGIN|COMMIT|ROLLBACK|END|ABORT)\b|START\s+TRANSACTION\b)/i
+  /**
+   *剥掉 `EXPLAIN [ANALYZE] [(选项…)]` 包装（有界，最多四层）：`EXPLAIN ANALYZE COMMIT` 的外层
+   *语句类型是 EXPLAIN，但 DuckDB 照常执行里层计划（真驱动探针 2026-11-20：事务里写入 →
+   *`EXPLAIN ANALYZE COMMIT` → ROLLBACK 报 `no transaction is active`、写入已在库里）。
+   *入参是 `stripSqlLiterals` 的产物：括号只可能来自代码（选项里的字符串已被空格替换），
+   *平衡括号不会被字面量里的括号破坏。
+   */
+  const stripExplainWrapper = (s: string): string => {
     let t = s
-    // 从**最内层**开始剥：非贪婪 `CASE…END` 会先配上最近的 END，嵌套 CASE 的内层先消失，
-    // 外层的 END 才轮得到；从外往里剥「第一个 CASE + 第一个 END」会把内层 END 当外层配对，
-    // 留下一个孤立的 END（实测 `CASE WHEN … THEN CASE WHEN … END ELSE … END` 仍被误判）。
-    for (let i = 0; i < 64; i++) {
-      const n = t.replace(/\bCASE\b((?:(?!\bCASE\b)[\s\S])*?)\bEND\b/i, ' ')
-      if (n === t) return t
-      t = n
+    for (let i = 0; i < 4; i++) {
+      const m = /^\s*EXPLAIN\b/i.exec(t)
+      if (m === null) return t
+      t = t.slice(m[0].length)
+      const a = /^\s+ANALYZE\b/i.exec(t)
+      if (a !== null) t = t.slice(a[0].length)
+      const opt = /^\s*\(/.exec(t)
+      if (opt !== null) {
+        let depth = 0
+        let j = opt[0].length - 1
+        for (; j < t.length; j++) {
+          if (t[j] === '(') depth++
+          else if (t[j] === ')') {
+            depth--
+            if (depth === 0) { j++; break }
+          }
+        }
+        t = t.slice(j)
+      }
     }
     return t
   }
-  /** 原始事务控制的拒绝错误（`execSql` 与 `rejectRawTxControl` 共用一份文案）。 */
+  /** 原始事务控制（含 `EXPLAIN` 里层）的唯一判据。 */
+  const isRawTxControl = (sql: string): boolean => TX_CONTROL_AT_START.test(stripExplainWrapper(stripSqlLiterals(sql)))
+ /**原始事务控制的拒绝错误（`execSql`的唯一出口）。 */
   const rawTxError = (): Error => {
     const err = new Error('事务控制语句不得经 `query` / 原始 SQL 下发 —— 它绕过事务归属与收尾判据'
       + '（回调里发 COMMIT 会让「回调随后抛错」无法回滚）')
@@ -770,97 +820,43 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     return err
   }
   /**
-   * 原始事务控制的**唯一判据**（CR 第四十一轮 major）：交给 DuckDB 解析，逐条语句看类型。
-   *
-   * ⚠️ 为什么必须解析：旧判据是文本前缀 `^\s*(?:BEGIN|COMMIT|ROLLBACK)`，而 `END` /
-   * `ABORT` / `START TRANSACTION` 同样是事务控制（DuckDB 1.5.6 实测 statementType=10），
-   * 注释前缀 `/*c*\/ COMMIT` 与多语句 `SELECT 1; COMMIT` 也能绕过前缀 —— 最后一种实测
-   * 会**真的执行 COMMIT**，即回调里的写入被提前提交、随后抛错也回滚不了。
-   * 解析失败（空 SQL / 语法错 / 目标表不存在）**不在这里归因**：照常派发，让驱动交出与
-   * 既往一致的原文（`extractStatements` 的 Catalog/Binder 错误与 `runAndReadAll` 同源，
-   * 但 kind 映射、abort 探针等逻辑都在派发路径上）。事务控制语句一定能被解析，所以
-   * 「解析失败 → 放行」不会漏掉任何真实的事务控制形态。
+   *多语句的**唯一判据**（CR 第四十一轮 major）：解析一次、按语句数判。
+   *`SELECT 1; COMMIT` 实测会被驱动逐条执行 —— 第一条 SELECT、第二条 COMMIT，回调里的写入
+   *被提前提交，随后抛错也回滚不了。初筛（`mightBeMulti`）只看剥掉字面量 / 注释后的代码，
+   *真正分隔语句的分号必然留在代码里，所以没有假阴性。
+   * ⚠️ **解析失败不得放行**（CR 第五十九轮 major，真驱动探针 2026-11-20）：驱动在派发时
+   *会**再次解析**并依次执行各语句 —— 实测「首次 extractStatements 异步拒绝、随后放行」
+   *时，`CREATE TABLE probeA(…); CREATE TABLE probeB(…)` 两条都真的执行了。拿不到语句数
+   *就无法证明只有一条，只能拒绝；原生解析错误挂在 `cause`（措辞用 safeValueText，
+   *访问器/无原型对象不得把诊断换掉）。
+   * ⚠️ 判据**不再经过 `prepare(0)`**（Codex 第十四轮 P2）：旧实现为了语句类型做预编译，
+   *真驱动探针证明它会求值 table function 参数、改变查询结果（见 `TX_CONTROL_AT_START`）。
    */
-  const rejectRawTxControl = async (sql: string): Promise<void> => {
+  const rejectMultiStatements = async (sql: string): Promise<void> => {
     if (typeof c.extractStatements !== 'function') {
       // 真实连接的方法在**原型**上（`...(conn as object)` 展开拿不到它），手写假对象可能
-      // 只包了 runAndReadAll。这里必须响亮失败而不是放行：跳过判据等于把这道守卫关掉，
-      // 而这些假对象恰恰是在测 `execSql` 路径的。
-      const err = new Error('连接缺少 extractStatements —— 无法判定原始 SQL 是否含事务控制语句')
+      // 只包了 runAndReadAll。这里必须响亮失败而不是放行：跳过判据等于把多语句守卫关掉。
+      const err = new Error('连接缺少 extractStatements —— 无法判定 SQL 的语句数')
       ;(err as { kind?: string }).kind = 'internal'
       ;(err as { hint?: string }).hint = 'Store 连接必须提供 extractStatements（@duckdb/node-api 的 DuckDBConnection 原生具备）；手写的测试假连接需显式转发该方法'
       throw err
     }
-    // 解析层的失败（空 SQL / 语法错 / 目标表不存在）不在这里归因：交给派发路径给出与
-    // 既往一致的原文与 kind（`extractStatements` 对同类错误与 `runAndReadAll` 同源，但
-    // abort 探针、错误映射等逻辑都在派发路径上）。事务控制语句一定能被解析，所以
-    // 「解析失败 → 放行」不会漏掉任何真实的事务控制形态。
     let parseFailure: unknown
     const ex = await c.extractStatements(sql).catch((e: unknown) => { parseFailure = e; return undefined })
     if (ex === undefined) {
-      // ⚠️ **解析失败不得放行**（CR 第五十九轮 major，真驱动探针 2026-11-20）：驱动在派发时
-      // 会**再次解析**并依次执行各语句 —— 实测「首次 extractStatements 异步拒绝、随后放行」
-      // 时，`CREATE TABLE probeA(…); CREATE TABLE probeB(…)` 两条都真的执行了。拿不到语句数
-      // 就无法证明只有一条，只能拒绝；原生解析错误挂在 `cause`（措辞用 safeValueText，
-      // 访问器/无原型对象不得把诊断换掉）。
       const err = new Error(`无法解析 SQL 的语句数（${safeValueText(parseFailure, 160)}）——`
-        + '为安全起见拒绝派发：多语句会被驱动逐条执行，事务控制或写入可能夹在其中')
+       + '为安全起见拒绝派发：多语句会被驱动逐条执行，事务控制或写入可能夹在其中')
       ;(err as { kind?: string }).kind = 'internal'
       ;(err as { hint?: string }).hint = '把多条语句拆成多次 query 调用；写入请放进 store.transaction() 的回调里'
       ;(err as { cause?: unknown }).cause = parseFailure
       throw err
     }
-    // ⚠️ 多语句**先拒**（CR 第四十一轮 major）：`SELECT 1; COMMIT` 实测就是把两条语句
-    // 依次执行。检查顺序刻意在 prepare 之前 —— prepare 会因缺表/绑定失败提前 return，
-    // 若把多语句判定放在其后，「第一条绑不上、第二条是 COMMIT」的形态会漏过这道守卫
-    // （虽然运行期第一条也会抛、第二条未必执行，但「未必」不是判据）。
     if (ex.count > 1) {
       const err = new Error(`一次只接受一条语句（检测到 ${ex.count} 条）—— 多语句会被逐条执行，`
-        + '事务控制或写入可能夹在其中，绕过归属与收尾判据')
+       + '事务控制或写入可能夹在其中，绕过归属与收尾判据')
       ;(err as { kind?: string }).kind = 'usage'
       ;(err as { hint?: string }).hint = '把多条语句拆成多次 query 调用；写入请放进 store.transaction() 的回调里'
       throw err
-    }
-    // ⚠️ **解析结果在途期间连接可能已被关闭 / 退役**（CR 第四十二轮 major，真驱动探针
-    // 2026-11-20 复现）：`close()` 之后交回的解析句柄照旧能用，旧实现无条件 `prepare(0)`，
-    // 在**已关闭的连接**上又做了一次原生操作。这里不再碰原生上下文，归因交给 `execSql`
-    // 派发前的同源重判（与 `close()` 之后任何语句一样报「数据库连接已关闭」）。
-    if (closed) throw usage('数据库连接已关闭')
-    if (poisoned !== undefined) throw poisonedError(poisoned)
-    const ST = mod.StatementType ?? {}
-    const TRANSACTION = typeof ST.TRANSACTION === 'number' ? ST.TRANSACTION : 10
-    // ⚠️ **可执行包装器**（CR 第四十四轮 major，真驱动探针 2026-11-20）：`EXPLAIN ANALYZE COMMIT`
-    // 的外层语句类型是 `EXPLAIN`(4)，DuckDB 照常执行里层计划 —— 探针实测「事务里写入 →
-    // `EXPLAIN ANALYZE COMMIT` → ROLLBACK 报 `no transaction is active`、写入已在库里」。
-    // 所以外层类型是 EXPLAIN 且（剥掉字面量/注释后）含事务关键字时拒。
-    // ⚠️ **只匹配 SQL 代码部分**（CR 第六十二轮 / Codex PR#81 第五十二轮 P2）：`EXPLAIN ANALYZE
-    // SELECT 'COMMIT'` 与注释里的 COMMIT 都是**不执行**的文本 —— 旧判据匹配整条原文，把合法
-    // 只读诊断误拒。字面量 / 引号标识符 / 行注释 / 块注释 / dollar 引用全部剥掉再匹配：事务
-    // 控制不可能藏在字面量里执行，剥离不会放宽判据。
-    // （`EXPLAIN (ANALYZE)` / `EXPLAIN (ANALYZE true)` 同一探针同样执行里层。）
-    const EXPLAIN = typeof ST.EXPLAIN === 'number' ? ST.EXPLAIN : 4
-    let p: { statementType: number; destroySync?: () => void }
-    try {
-      p = await ex.prepare(0)
-    } catch (prepareFailure) {
-      // ⚠️ **类型无法判定时不得放行**（CR 第六十轮 major）：旧实现 `return` 装作分类成功，
-      // 驱动在派发里**再次解析并执行** —— 此时语句类型（TRANSACTION / EXPLAIN / 普通）
-      // 完全未知，无法证明它不含事务控制。代价如实记录：带事务关键字/多语句嫌疑、又恰好
-      // 绑不上表的 SQL（如 `SELECT … FROM missing -- END`）会从「表不存在」变成这条内部错误，
-      // 原生错误挂在 `cause` 上；不触发解析的普通 SQL 不受影响。
-      const err = new Error(`无法判定语句类型（${safeValueText(prepareFailure, 160)}）——`
-        + '为安全起见拒绝派发：拿不到语句类型就无法证明它不含事务控制语句')
-      ;(err as { kind?: string }).kind = 'internal'
-      ;(err as { hint?: string }).hint = '把多条语句拆成多次 query 调用；写入请放进 store.transaction() 的回调里'
-      ;(err as { cause?: unknown }).cause = prepareFailure
-      throw err
-    }
-    try {
-      if (p.statementType === TRANSACTION) throw rawTxError()
-      if (p.statementType === EXPLAIN && TX_KEYWORD.test(stripCaseEnds(stripSqlLiterals(sql)))) throw rawTxError()
-    } finally {
-      // 预编译语句持有原生句柄：不释放会在长会话里累积（同 sandbox 的做法）。
-      p.destroySync?.()
     }
   }
   /**
@@ -882,12 +878,25 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     }
     // 连接已退役：事务状态无法确认，一条语句都不许再发（CR 第三十七轮 major #4）。
     if (poisoned !== undefined) throw poisonedError(poisoned)
+    // ⚠️ **未决的失效探针占着单连接**（Codex第十四轮 P2）：探针超时且中断后仍未交回时，
+    //连接上任何新语句都只会排在它后面、永不交回 ——回调若 catch掉原错误再 await
+    // count()/query()，回调就永远不返回，回滚收尾（连同 ROLLBACK自己的有界预算）根本没机会
+    //开始。此时拒绝一切新语句（txControl除外：收尾的 ROLLBACK由 closeTx自己先按「无法
+    //确认」处理），让回调尽快返回、由收尾退役实例。
+    if (!txControl && nativeProbeStuck && !nativeProbeSettled) {
+      const err = new Error('事务失效性探针超时后仍未交回：连接可能仍被它占用，已拒绝下发新语句'
+        + '（继续下发只会排在它后面永不交回，事务收尾也就没有机会开始）')
+      ;(err as { kind?: string }).kind = 'internal'
+      ;(err as { hint?: string }).hint = '不要在事务回调里继续执行语句：让回调返回或抛错，由 Store 收尾（回滚）；若收尾也未能确认，关闭并重建 Store 实例'
+      throw err
+    }
     // ⚠️ **原始事务控制一律拒绝**（CR 第三十九轮 major #4，第四十一轮改为按**解析出的语句
     // 类型**判）：托管回调里 `s.query('COMMIT')` 会通过归属检查、把回调里的写入提前提交 ——
     // 随后回调抛错也无法回滚（「报失败、数据却落库」）。事务控制只能由 Store 自己
     // （`txControl` 豁免）经 `transaction()` / 自动事务发出。
-    // 文本初筛只决定是否解析（`'END'` 字符串、`CASE … END` 会多花一次毫秒级解析），
-    // 判据本身在 `rejectRawTxControl`，它在下方的代号窗口里执行（见那里的注释）。
+    //事务控制由**词法判据**（`isRawTxControl`，见 `TX_CONTROL_AT_START`的注释）在下方
+    //同步判：不需要解析，也就不再为拿 statementType去 `prepare`（真驱动探针证明那会
+    //求值 table function参数、改变查询结果）。
     // ⚠️ **已结束事务的残留上下文**里不得再下发语句（CR 第三十七轮 major #3）：令牌过期只可能来自
     // 「回调里没 await 的语句」或「事务里的 Promise 存到事务外再 await」—— 它的副作用与结果
     // 都不可信。事务控制语句（ROLLBACK）走 `txControl` 豁免：收尾时必须能发出去。
@@ -901,9 +910,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const epochBefore = txEpoch
     // ⚠️ **多语句必须独立于关键字初筛判**（CR 第四十五轮 major，真驱动探针 2026-11-20）：
     // `INSERT INTO scratch VALUES (1); SELECT * FROM missing_table` 里没有事务关键字，旧实现
-    // 直接派发 —— 驱动先执行 INSERT、再准备第二条时报错，**行已经写进去了**。所以只要解析
-    // 可用就解析一次、按语句数判；`TX_KEYWORD` 仍决定要不要额外做事务控制判定。
-    const needsParse = !txControl && (TX_KEYWORD.test(sql) || mightBeMulti(sql))
+    //直接派发 ——驱动先执行 INSERT、再准备第二条时报错，**行已经写进去了**。只要剥掉
+    //字面量 /注释后的**代码**里还有分号，就解析一次、按语句数判。
+    const needsParse = !txControl && mightBeMulti(sql)
     if (needsParse) {
       // 解析同样占用连接（extract/prepare 走原生上下文）：按在途登记，BEGIN 准入才看得见它。
       // ⚠️ **归属先于登记**（CR 第四十二轮 major，实测复现）：判据必须是「当前链就是这条事务的
@@ -913,13 +922,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
       assertTxOwnership()
       const untrackParse = inTx && txToken !== undefined ? trackOwn(txToken) : trackForeign()
       try {
-        await rejectRawTxControl(sql)
+        await rejectMultiStatements(sql)
       } catch (e) {
-        // ⚠️ **解析 / 预编译也会绑定并求值**（CR 第六十六轮 major，DuckDB 在 prepare 期做
-        // constant folding 与 table-function 参数求值）：`SELECT * FROM range(CAST('x' AS
-        // BIGINT)) -- END` 会因注释进入分类，Conversion Error 在**派发之前**就把事务标成
-        // aborted —— 旧实现直接把它当普通拒绝交回，回调吞掉后 `commitOrRefuse` 只看到在途
-        // 归零，COMMIT 被 DuckDB 静默改成 ROLLBACK，写入丢失。
+      // ⚠️ **解析失败也可能让事务失效**（CR第六十六轮 major的同一形态）：DuckDB的解析会
+      //做绑定与 constant folding，解析期的报错同样可能把事务标成 aborted ——旧实现直接
+      //把它当普通拒绝交回，回调吞掉后 `commitOrRefuse`只看到在途归零，COMMIT被 DuckDB
+      //静默改成 ROLLBACK，写入丢失。（执行期的同名形态由派发路径的同一探针兜住。）
         // 拒绝照旧是**原始解析错误**（不换掉）；只在事务所有者的计数登记内问一次连接，
         // 探针说已失效才打 brokenTx 记号。local usage（事务控制语句）与派发前被拒的形态
         // 没动过连接状态，不问。
@@ -942,6 +950,14 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         throw epochChangedError()
       }
     }
+    // ⚠️ **原始事务控制一律拒绝**（CR第三十九轮 major #4）：托管回调里 `s.query('COMMIT')`
+    //会通过归属检查、把回调里的写入提前提交 ——随后回调抛错也无法回滚（「报失败、数据却
+    //落库」）。事务控制只能由 Store自己（`txControl`豁免）经 `transaction()` /自动事务发出；
+    //判据是词法 + `EXPLAIN`里层（见 `TX_CONTROL_AT_START`），不碰连接、不求值参数。
+    if (!txControl) {
+      assertTxOwnership()
+      if (isRawTxControl(sql)) throw rawTxError()
+    }
     // ⚠️ **一切语句派发都过归属闸门**（CodeRabbit PR#81 第十六轮 major，实测复现）：单连接
     // 上的语句会加入当前活动事务 —— 包括读语句。别人的事务开着时，另一条链发出的 SELECT
     // 也落在那条事务里；它一旦执行期报错（实测：目标表是 CAST 失败的 view），DuckDB 就把
@@ -959,7 +975,12 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
     const untrack = inTx && txToken !== undefined ? trackOwn(txToken) : trackForeign()
     let result: unknown
     try {
-      result = await c.runAndReadAll(sql, params)
+      // ⚠️ **无参语句不得传空数组**（Codex第十四轮 P2，真驱动探针2026-11-21）：驱动把
+      //「传了 values」当成走 `runUntilLast`（extract + **prepare** + bind + run）的信号 ——
+      //空数组也是 truthy，于是每条无参查询都被预编译：prepare会求值 table function参数
+      //（`range(nextval(…))`因此多前进一格；自动提交下还以内部断言「read-only but has
+      // made changes」失败）。不传参数时驱动走原生一次性查询，语义相同、不预编译。
+      result = params.length ===0 ? await c.runAndReadAll(sql) : await c.runAndReadAll(sql, params)
     } catch (e) {
       // ⚠️ **失败路径同样要检查代号**（CodeRabbit PR#81 第二十八轮 major）：驱动报错时
       // `runAndReadAll` 抛出，若只成功路径检查，最危险的情形（外部语句执行期报错 → 把别人的

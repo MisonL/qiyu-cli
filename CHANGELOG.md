@@ -140,6 +140,30 @@
 之前自己交回的形态，旧判据只看 `stuck` 会为一个已经结束的探针跳过 ROLLBACK 并错误退役。
 现在额外记「原始 promise 已落定」，收尾只对**收尾此刻仍未交回**的探针跳过 ROLLBACK。
 
+- **事务控制改回词法判据，分类不再预编译**（Codex第十四轮 P2）：旧实现为取 `statementType`
+对触发初筛的 SQL调 `prepare(0)`，而 DuckDB在 prepare期就会求值 table function参数 ——
+真驱动探针实测 `SELECT * FROM range(nextval('s'))`在分类路径上序列前进两格（结果2行、
+下一次 nextval=3；基线是1行/2），自动提交下还会以内部断言「read-only but has made
+ changes」失败、把合法查询变成 internal错误。判据改为「剥掉字面量/注释后的句首词法」
+ （`BEGIN|COMMIT|ROLLBACK|END|ABORT|START TRANSACTION`，真驱动枚举过全部 type=10写法，
+不含 `PREPARE TRANSACTION`），`EXPLAIN`包装剥掉后判里层；分类不再碰连接。
+由此 `EXPLAIN ANALYZE SELECT 1 AS start`等合法别名不再被误拒（旧判据在包装里搜关键字）。
+**根因还有一层**：`execSql`一直把默认参数 `[]`传给驱动，而空数组是 truthy ——驱动据此走
+`runUntilLast`（extract + prepare + bind）路径，**每条无参语句都被预编译**。现在无参语句
+不再传数组（驱动走原生一次性查询，语义相同、不预编译）。
+- **失效探针未交回时拒绝新语句**（Codex第十四轮 P2）：探针超时且中断后仍未交回，连接
+仍被它占着；回调 catch掉原错误再 `await count()/query()`时，新语句排在后面永不交回，
+回调与回滚收尾一起挂死。现在 `execSql`在派发前同步判「最近一次探针未交回」并拒绝
+（txControl由 `closeTx`自行处理），让回调可以返回、由收尾退役实例。
+- **收尾三态的 `none`与 `unconfirmed`不再混说**（Codex第十四轮 P2）：ROLLBACK真的执行、
+只是回执被拒，活动事务探针确认连接上已无事务时 `closeTx`返回 `none`（实例未退役）；
+旧拒绝文案把所有非 `confirmed`都写成「该连接已退役」并打 `store_retired`，而同一实例
+随后还能成功查询。现在只有 `unconfirmed`才退役；`none`的文案与 hint如实说「连接上
+已无活动事务、实例仍可用，但写入是否落库无法从本连接确认」。
+- **事务失效探针各记各的账**（CR第六十七轮 major）：同一事务里两条在途语句先后失败会各自起一次
+探针；「已交回」原用一个共享布尔，旧探针交回会把**仍挂住的新探针**记成已结束 →收尾发出
+ ROLLBACK、排在挂住的探针后面超时，把「探针挂住」误报成「回滚未确认」。现在按代次锁存：
+只有**最近一次**探针的交回/超时能改状态；用例（两条失败语句 +显式闸门）与变异（退回共享布尔）均已验证。
 ### 文档
 
 - README 可读性重构：当前状态、输出契约、配置凭证分节，事实与承诺不变。
@@ -255,6 +279,42 @@
 不等 `close` → 宽限用例红（promise resolved）；`stripCaseEnds` 退化为不剥离 → `EXPLAIN`
  CASE 用例红；预编译期探针不记账 → 提交误报成功；收尾只看 `stuck` → 探针已交回用例红。
  `initCache` 移除后无任何用例变红（纯性能缓存，等价变异，如实记录）。
+- 分类判据回归（Codex第十四轮）：带注释/字符串关键字的 `range(nextval('s'))`只求值一次
+（基线语义：1行、下次取值2；旧分类路径实测2行/3，自动提交下还会内部断言失败）；
+`EXPLAIN ANALYZE SELECT 1 AS start`、`(ANALYZE) … AS "transaction"`不再被误拒；
+`EXPLAIN ANALYZE COMMIT` / `(ANALYZE) ROLLBACK`仍按词法判据拒收（判据自检：真驱动枚举了
+全部 type=10写法）。
+-未决探针拒绝：回调 catch掉原错误再 `count()`时必须得到明确拒绝且该语句一条都不派发，
+整条 `transaction()`在8s内交回（不再挂死）。
+-收尾三态：ROLLBACK回执丢失但活动事务探针确认已无事务时，拒绝错误不带 `store_retired`、
+文案不说「已退役」、hint不含「重建」，同一实例随后查询照常成功。
+-Codex第十四轮六条修复逐一变异：词法判据关闭 →`END`拒收用例红；`EXPLAIN`包装不剥 →
+`EXPLAIN ANALYZE COMMIT`用例红；未决探针闸门关闭 →新拒绝用例红；退役判据退回
+`!rolledBack` → `none`用例红；解析后重判删除 → close窗口用例红（改由驱动报
+「connection disconnected」）；空参数照旧传 `[]` → `range(nextval)`回归红（DuckDB内部
+断言）。六条全部恢复字节一致。
+-删除「类型无法判定（prepare被拒）」用例：分类不再 `prepare`，该前提与判据一起消失；
+「解析失败不得放行」（extract失败）用例保留。
+-静态守卫补五种此前看不见的形态（CR第六十七轮 major）：并发登记器的**本地别名保留修饰链**
+ （`const check = it.concurrent; check(…)`，含命名空间导入与传递闭包）；hook的
+ **`.apply`命名元组**（`const args = [setup] as const; beforeEach.apply(null, args)`），
+解析不出即响亮报告；`sequence`经**本地常量绑定**进配置（`defineConfig({ test: { sequence } })`）
+按 AST求值，求不出按违规处理；**互不相关的多个 for-of源**不再互相拖累 ——原先
+ `isMutated → staticBindingInitializer → isMutated`的互相递归在12个独立循环下**实测卡死**
+ （同步守卫 >300s），循环源解析改用不递归的声明前段后回到毫秒级，并留12循环回归。
+-持锁者收尾：`terminateHolder`认「spawn侧登记的 close」（测试在等校验进程时持锁者可能早已
+结束，事件不重放），`kill()`抛错或子进程报原生 `error`时仍**有界等 close**并把原始错误
+带出（close到了也不吞）、宽限内等不到时在文案与 `cause`里点名真正成因；清理未确认时
+ **保留夹具目录**（不在可能仍开着的库文件上删除）。状态标记监听与等待监听分离，`expectClean`
+仍对后者零容忍。
+-闸门用例：迁移探针用例改**显式闸门**（定时器只证明已派发，不能证明已交回）；两条 count
+闸门用例的失败路径统一 `finally`放闸、收回 delete并关闭 Store；真原生重查询在**派发之前**
+就失败时立刻交回（不再裸等就绪信号到90s超时）；包装夹具显式转发 `extractStatements`；
+ `COMMIT结果未知`夹具的写失败注入在 `init`之后才武装，第三次提交用「提交前最后一条写
+语句」证明来自清锁事务（sync_state），排除把数据窗提交误当成清锁提交。
+-变异记录：并发别名/apply元组/apply无法解析/sequence绑定/探针代次/`terminateHolder`四种
+行为逐一删改 →对应用例各红，恢复字节一致；`initCache`为纯性能缓存（等价变异），循环源
+递归的 RED证据是12循环回归用例在修复前 >300s超时。
 
 
 ## [0.2.2] - 2026-11-12

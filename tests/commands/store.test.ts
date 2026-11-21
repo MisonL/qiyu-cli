@@ -11,7 +11,14 @@ import { syncCommand } from '../../src/commands/sync.js'
 import { TABLES } from '../../src/store/schema.js'
 import { spawnLockHolder, lockVerdict, terminateHolder, LOCK_BUDGET_MS } from '../helpers/lock-holder.js'
 
+/** terminateHolder的测试侧包装：清理未确认时**保留夹具目录**——不得在可能仍开着的库
+ *文件上执行删除；目录留到下一用例开始时由 beforeEach复位（CR第六十七轮 major）。 */
+const terminateConfirmed = async (h: import('node:child_process').ChildProcess | undefined): Promise<void> => {
+ try { await terminateHolder(h) } catch (e) { keepFixtureDir = true; throw e }
+}
 let dir = '', out = '', err = ''
+// ⚠️清理未确认时保留目录（见 terminateConfirmed）。
+let keepFixtureDir = false
 const dbPath = (): string => join(dir, 'q.db')
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'qiyu-cmd-'))
@@ -20,7 +27,7 @@ beforeEach(() => {
   vi.stubEnv('HOME', dir)   // 隔离真实 ~
   vi.stubEnv('USERPROFILE', dir)
 })
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }) })
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); if (keepFixtureDir) { keepFixtureDir = false; return } rmSync(dir, { recursive: true, force: true }) })
 const data = (): Record<string, unknown> => JSON.parse(out).data
 
 describe('store init', () => {
@@ -703,7 +710,7 @@ describe('store 命令面与 help', () => {
         // 的就绪/close 等待全是负数预算，失败会被报成「未就绪」而不是「预算耗尽」。
         if (Date.now() >= deadline) break
         const p = join(dir, `w-${round}.db`)   // 每轮换全新路径（避开本进程实例缓存）
-        if (holder) holder.kill('SIGKILL')
+        if (holder) await terminateConfirmed(holder)
         holder = await spawnLockHolder({ dbPath: p, scriptDir: dir, name: `w-holder-${round}`, deadline })
         if (await lockVerdict(p, dir, deadline) !== 'CONFLICT') continue   // 锁未落盘，换轮
         lockConfirmed++
@@ -722,7 +729,7 @@ describe('store 命令面与 help', () => {
       expect(lockConfirmed, '5 轮里没有任何一轮的独立校验看到 CONFLICT —— 锁未生效（夹具或平台行为变了），不是竞态窗口').toBeGreaterThan(0)
       expect(asserted, `未取得「锁生效且 init 撞锁返回 1」—— 已跑 ${roundsRun} 轮（${lockConfirmed} 轮锁已确认）。锁落盘竞态超预期，不是被测代码。`).toBe(true)
     } finally {
-      await terminateHolder(holder)
+      await terminateConfirmed(holder)
     }
   })
 

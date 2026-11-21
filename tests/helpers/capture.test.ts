@@ -484,7 +484,7 @@ function isMutatedUnchecked(sf: ts.SourceFile, name: string): boolean {
       if (ts.isForOfStatement(n) && n.initializer !== undefined) {
         let src = unwrap(n.expression)
         if (ts.isIdentifier(src)) {
-          const init = staticBindingInitializer(sf, src.text)
+          const init = declarationInitializer(sf, src.text)
           if (init !== undefined) src = unwrap(init)
         }
         if (ts.isArrayLiteralExpression(src)
@@ -762,7 +762,7 @@ function staticBindingInitializer(sf: ts.SourceFile, name: string): ts.Expressio
     active.delete(name)
   }
 }
-function staticBindingInitializerUnchecked(sf: ts.SourceFile, name: string): ts.Expression | undefined {
+function declarationInitializer(sf: ts.SourceFile, name: string): ts.Expression | undefined {
   let found: ts.Expression | undefined
   let shadowed = false
   // ⚠️ 同名声明必须**全文件唯一**（Codex PR#81 第二十五轮 P2「按初始化位置求值」，探针复现：
@@ -810,7 +810,19 @@ function staticBindingInitializerUnchecked(sf: ts.SourceFile, name: string): ts.
     }
   }
   if (found === undefined || shadowed) return undefined
-  return isMutated(sf, name) ? undefined : found
+ return found
+}
+/**
+ * `staticBindingInitializer`的**非递归前段**：只做「全文件唯一声明 +初始值 +被写入 →不给」里的
+ *前三项，不调用 `isMutated`。给 `isMutated`自己的循环源解析用（CR第六十七轮 major）：
+ * `isMutated → staticBindingInitializer → isMutated`的互相递归在多个互不相关的 for-of源上
+ *是排列级的（12个独立循环就能把同步守卫卡死）。`isMutated`只要看到源表达式**长什么样**，
+ *不需要它当前有没有被改写 ——被改写时用旧字面量只会多收别名（更保守、不会漏），边界如实记录。
+ */
+function staticBindingInitializerUnchecked(sf: ts.SourceFile, name: string): ts.Expression | undefined {
+ const found = declarationInitializer(sf, name)
+ if (found === undefined) return undefined
+ return isMutated(sf, name) ? undefined : found
 }
 
 /**
@@ -985,6 +997,13 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
    * 且只映射到注册表里的基名（`import { expect as e }` 之类不影响）。
    */
   const registrarAlias = new Map<string, string>()
+ /**
+ * ⚠️ **本地别名同样保留修饰链**（CR第六十七轮 major）：`const check = it.concurrent`之后
+ * `check(名,体)`在运行时就是 `it.concurrent` ——只认注册器本身的修饰链时整条被当成无关
+ *调用，并发登记从守卫眼前消失。只记**静态可证明是注册器 + concurrent修饰**的别名；
+ *值走普通别名表会把修饰链抹掉（那才是错的方向）。
+ */
+ const concurrentLocals = new Map<string, string>()
   for (const st of sf.statements) {
     if (!ts.isImportDeclaration(st) || st.importClause?.namedBindings === undefined) continue
     const from = ts.isStringLiteral(st.moduleSpecifier) ? st.moduleSpecifier.text : ''
@@ -1021,11 +1040,28 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
     for (const st of sf.statements) {
       if (!ts.isVariableStatement(st)) continue
       for (const d of st.declarationList.declarations) {
-        if (!ts.isIdentifier(d.name) || registrarAlias.has(d.name.text) || d.initializer === undefined) continue
+        if (!ts.isIdentifier(d.name) || registrarAlias.has(d.name.text) || concurrentLocals.has(d.name.text) || d.initializer === undefined) continue
         const init = unwrap(d.initializer)
-        if (!ts.isIdentifier(init)) continue
-        const base = registrarAlias.get(init.text) ?? (REGISTRARS.has(init.text) ? init.text : undefined)
-        if (base !== undefined) { registrarAlias.set(d.name.text, base); changed = true }
+        if (ts.isIdentifier(init)) {
+         //传递：`const c2 = check`（check是 it.concurrent的别名）同样是并发登记。
+         const viaConc = concurrentLocals.get(init.text)
+         if (viaConc !== undefined) { concurrentLocals.set(d.name.text, viaConc); changed = true; continue }
+         const base = registrarAlias.get(init.text) ?? (REGISTRARS.has(init.text) ? init.text : undefined)
+         if (base !== undefined) { registrarAlias.set(d.name.text, base); changed = true }
+         continue
+        }
+        if (!ts.isPropertyAccessExpression(init)) continue
+        //值链（只收标识符段）：`it.concurrent` / `vt.it.concurrent` / `check.concurrent`。
+        const segs: string[] = []
+        let e: ts.Expression = init
+        while (ts.isPropertyAccessExpression(e)) { segs.unshift(e.name.text); e = unwrap(e.expression) }
+        if (!ts.isIdentifier(e)) continue
+        segs.unshift(e.text)
+        if (segs.length <2) continue
+        const rest = vitestNamespaces.has(segs[0]!) ? segs.slice(1) : segs
+        if (rest.length <2 || rest[rest.length -1]!.toLowerCase() !== 'concurrent') continue
+        const concBase = registrarAlias.get(rest[0]!) ?? (REGISTRARS.has(rest[0]!) ? rest[0]! : undefined)
+        if (concBase !== undefined) { concurrentLocals.set(d.name.text, concBase); changed = true }
       }
     }
   }
@@ -1116,6 +1152,14 @@ function concurrentViolations(sf: ts.SourceFile): Array<{ line: number; why: str
     const base = registrarBase(chain[0]!)
     // 链式登记的两层调用（表格层 / 登记层）落在同一行，同一处违规只报一次
     if (seen.has(outermostRegistration(call))) continue
+    // ⚠️ **经本地别名登记的并发链**（CR第六十七轮 major）：`const check = it.concurrent;
+    // check(名,体)` / `check.each(表)(名,体)`都是并发登记，链首已不是注册器名。
+    const concBase = concurrentLocals.get(chain[0]!)
+    if (concBase !== undefined) {
+     out.push({ line: lineOf(sf, call), why: `.concurrent 修饰链：${chain.join('.')}`, testName: registeredName(call) })
+     seen.add(outermostRegistration(call))
+     continue
+    }
     if (REGISTRARS.has(base)) {
       const isAlias = chain.includes('concurrent')
         || chain.some((seg) => seg.toLowerCase() === 'concurrent')
@@ -1805,6 +1849,10 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
     const roots: ts.Node[] = [call]
     // ⚠️ **还原 call/apply 与静态展开后的实参**（Codex 第七轮 P2）：`beforeEach.apply(null,
     // [setup])` 与 `beforeEach(...[setup])` 的命名回调不在 `call.arguments` 的字面位置上。
+    /**
+     * `.apply`的实参数组求不出时的节点（由 IIFE外的报告循环统一交出；不当成「没有实参」）。
+     */
+    const applyUnresolved: ts.Node[] = []
     const hookArgs: ts.Expression[] = (() => {
       const chain = callChain(call)?.chain ?? []
       const expand = (list: readonly ts.Expression[]): ts.Expression[] => {
@@ -1844,11 +1892,22 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       }
       /** 一层调用自身的实参：`.call` 去掉 thisArg、`.apply` 取第二实参的数组。 */
       const fromCall = (c: ts.CallExpression, name: string | undefined): ts.Expression[] => {
-        if (name === 'apply') {
-          const arr = unwrap(c.arguments[1] as ts.Expression | undefined ?? ({} as ts.Expression))
-          return ts.isArrayLiteralExpression(arr) ? expand(arr.elements) : []
+       if (name === 'apply') {
+        const raw = c.arguments[1] as ts.Expression | undefined
+        if (raw === undefined) return []
+        const arr = unwrap(raw)
+        if (ts.isArrayLiteralExpression(arr)) return expand(arr.elements)
+        // ⚠️ **命名元组同样是实参**（CR第六十七轮 major）：`const args = [setup] as const;
+        // beforeEach.apply(null, args)`里 Vitest收到的就是 setup ——旧实现只看数组字面量，
+        //标识符形态直接返回空列表，setup体内的调度原语从守卫眼前消失。
+        if (ts.isIdentifier(arr)) {
+        const init = staticBindingInitializer(sf, arr.text)
+        if (init !== undefined && ts.isArrayLiteralExpression(init)) return expand(init.elements)
         }
-        return expand(name === 'call' ? c.arguments.slice(1) : c.arguments)
+        applyUnresolved.push(arr)
+        return []
+       }
+       return expand(name === 'call' ? c.arguments.slice(1) : c.arguments)
       }
       // ⚠️ **逐层向被调方回溯**（CR 第六十一轮 major）：链里可能叠了 bind 与 call/apply
       // （`beforeEach.call(null, setup)`、`beforeEach.bind(null, setup)()`、
@@ -1876,6 +1935,11 @@ function hookSchedulingViolations(sf: ts.SourceFile): Array<{ line: number; why:
       }
       return acc
     })()
+    for (const node of applyUnresolved) {
+     const reason = 'hook的 .apply实参数组无法静态解析为常量元组，无法证明其中没有回调'
+     const key = `${lineOf(sf, node)}:${reason}`
+     if (!outSeen.has(key)) { outSeen.add(key); out.push({ line: lineOf(sf, node), why: reason }) }
+    }
     for (const arg of hookArgs) {
       const u = unwrap(arg)
       // ⚠️ **展开不出来就要报告**（CR 第六十六轮 major）：可能是参数 / 重赋值 / 非字面量
@@ -2109,6 +2173,45 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       // ⚠️ **按值判，不按拼写判**（CR 第六十五轮 major）：`--sequence.concurrent=false` 是显式
       // 关闭；带引号的键名（`{ 'sequence': { 'concurrent': true } }`）一样能启用。
       // 配置面：sequence 下的 concurrent 为 true/1（键名可带引号、可点号或对象形式）。
+      /**
+       * ⚠️ **`sequence`经本地常量绑定的形态**（CR第六十七轮 major）：
+       * `const sequence = { concurrent: true }; export default defineConfig({ test: { sequence } })`
+       *启用的就是同一个 runner选项，而纯文本正则只看得到字面量。这里按 AST解析
+       * `sequence`属性：值是对象字面量或本文件唯一常量 →按 `concurrent`的求值判；
+       *求不出（参数 / import /非对象）→ `unresolved`（调用方按违规处理，不能默认串行）。
+       */
+      const configEnables = (txt: string): boolean | 'unresolved' => {
+       const sf = parseTs(txt)
+       let out: boolean | 'unresolved' = false
+       const checkSeq = (obj: ts.ObjectLiteralExpression): void => {
+       for (const p of obj.properties) {
+       const name = ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p) ? p.name.getText(sf) : undefined
+       if (name === undefined || name.replace(/^['"]|['"]$/g, '') !== 'sequence') continue
+       const valueExpr = ts.isPropertyAssignment(p) ? p.initializer
+        : ts.isShorthandPropertyAssignment(p) ? p.name : undefined
+        if (valueExpr === undefined) continue
+        let v: ts.Expression = unwrap(valueExpr)
+       if (ts.isIdentifier(v)) {
+       const init = staticBindingInitializer(sf, v.text)
+       if (init === undefined) { out = 'unresolved'; continue }
+       v = unwrap(init)
+       }
+       if (!ts.isObjectLiteralExpression(v)) { out = 'unresolved'; continue }
+       for (const q of v.properties) {
+       const kname = ts.isPropertyAssignment(q) || ts.isShorthandPropertyAssignment(q) ? q.name.getText(sf).replace(/^['"]|['"]$/g, '') : undefined
+       if (kname !== 'concurrent') continue
+       const on = ts.isPropertyAssignment(q) ? boolLiteralValue(sf, q.initializer) : undefined
+       if (on === true) out = true
+       }
+       }
+       }
+       const walk = (n: ts.Node): void => {
+       if (ts.isObjectLiteralExpression(n)) checkSeq(n)
+       ts.forEachChild(n, walk)
+       }
+       walk(sf)
+       return out
+      }
       const enables = (txt: string): boolean => {
         const key = `['"]?concurrent['"]?`
         // ⚠️ **每一处旗标都要看**（CR 第六十六轮 major）：一段文本里可能先有 `=false`、
@@ -2134,6 +2237,16 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
       expect(enables("{ 'sequence': { 'concurrent': false } }"), '引号包裹的显式关闭').toBe(false)
       expect(enables('sequence.concurrent: true'), '点号形态').toBe(true)
       expect(enables('export default { test: { maxWorkers: 1 } }'), '无关配置').toBe(false)
+ expect(configEnables(`const sequence = { concurrent: true }\nexport default defineConfig({ test: { sequence } })`),
+ '常量绑定的 sequence（简写属性）').toBe(true)
+ expect(configEnables(`const sequence = { concurrent: true }\nexport default defineConfig({ test: { sequence: sequence } })`),
+ '常量绑定的 sequence（显式属性）').toBe(true)
+ expect(configEnables(`const sequence = { concurrent: false }\nexport default defineConfig({ test: { sequence } })`),
+ '常量绑定的显式关闭').toBe(false)
+ expect(configEnables(`export default defineConfig({ test: { sequence: seq } })`),
+ '求不出的 sequence绑定必须报告').toBe('unresolved')
+ expect(configEnables(`export default defineConfig({ test: { maxWorkers:1 } })`),
+ 'AST判据：无关配置').toBe(false)
       const files = ['vitest.config.ts', 'vitest.config.mts', 'vitest.workspace.ts',
         'package.json', 'scripts/test-shards.mjs', 'scripts/test-shards.test.ts']
       const offenders: string[] = []
@@ -2142,7 +2255,12 @@ describe('静态守卫：captureSinks 的两条边界不得被踩（Sourcery PR#
           try { return readFileSync(join(REPO_ROOT, rel), 'utf8') } catch { return undefined }
         })()
         if (txt === undefined) continue
-        if (enables(txt)) offenders.push(rel)
+        if (rel.endsWith('.ts') || rel.endsWith('.mts')) {
+         const r = configEnables(txt)
+         if (r === true) offenders.push(rel)
+         if (r === 'unresolved') offenders.push(rel + '（sequence绑定无法静态求值）')
+         }
+         else if (enables(txt)) offenders.push(rel)
       }
       expect(offenders, 'captureSinks 的归属前提是全局串行；要并发请改用 startCapture() 句柄形态').toEqual([])
     })
@@ -2997,6 +3115,15 @@ it('Q34', oQ34, () => {})`),
       expect(hits.length, '无法解析的展开必须报告').toBe(1)
       expect(hits[0]).toMatch(/展开无法静态解析/)
     }
+ // ⚠️ **命名元组的 .apply**（CR第六十七轮 major）：`const args = [setup] as const;
+ // beforeEach.apply(null, args)`登记的仍是 setup；旧实现只认数组字面量，整条变成空实参。
+ expect(hookHits(bt('function setupA99() { ', ST, '(w,80) }\nconst argsA99 = [setupA99] as const\n', H, '.apply(null, argsA99)')),
+ '命名元组的 apply').toEqual([`${ST}(`])
+ {
+ const hits = hookHits(bt('declare const argsB99: unknown[]\n', H, '.apply(null, argsB99)'))
+ expect(hits.length, '无法解析的 apply元组必须报告').toBe(1)
+ expect(hits[0]).toMatch(/apply.*无法静态解析/)
+ }
     // ㉚ **使用点的参数绑定遮蔽同名函数**（CR 第六十六轮 major）：`const body = () => {}`
     // 在外层，但 `it('x', body)` 的 body 是**最近的参数** —— 运行时值可能是 `{concurrent:true}`，
     // 把它当执行体会整个跳过选项判据。判据按使用点解析，最近的参数绑定说了算。
@@ -3010,6 +3137,15 @@ it('Q34', oQ34, () => {})`),
     expect(hookHits(bt('const arrA99 = [() => {}]\nconst arrB99 = [() => {}]\n'
       + 'for (const itemA99 of arrA99) {}\nfor (const itemB99 of arrB99) {}\n',
     H, '(() => { ', ST, '(w, 80) })')), '多个互不相关的循环源').toEqual([`${ST}(`])
+ // ⚠️ **多个互不相关的循环源不得互相拖累**（CR第六十七轮 major：性能 +正确性）：
+ //解析选项对象时每个循环源都会触发一次静态求值 ——本用例同时是性能回归（整条自检
+ //保持在百毫秒级；若缓存退化成排列级扫描，这里会先拖慢整份仓库检查）。
+ expect(concHits([
+ ...Array.from({ length:12 }, (_, i) => `const arr${i} = [{ concurrent: false }]`),
+ ...Array.from({ length:12 }, (_, i) => `for (const x${i} of arr${i}) { void x${i} }`),
+ "const optsL99 = { concurrent: true }",
+ "it('LOOP99', optsL99, () => {})",
+ ].join('\n')), '多个互不相关的循环源').toEqual(['opt'])
     // 未被重新赋值的 let 仍可解析（不因噎废食）
     expect(hookHits(bt('let setupH88 = () => { ', ST, '(w, 80) }\n', H, '(setupH88)')),
       '未重新赋值的 let 照常下钻').toEqual([`${ST}(`])
@@ -3287,6 +3423,20 @@ it('Q34', oQ34, () => {})`),
       '绑定到非测试函数的名字不是登记').toEqual([])
     expect(concHits(bt("it.apply(...[null, ['RP10', { con", 'current: true }, () => {}]] as const)')),
       '.apply 的两个实参整体经展开').toEqual(['opt'])
+ // ⚠️ **本地别名保留 `.concurrent`修饰链**（CR第六十七轮 major）：
+ // `const check = it.concurrent; check(…)`运行时就是并发登记。
+ expect(concHits(`const check = it.con${'current'}\ncheck('AL3', () => {})`),
+ '并发登记器的本地别名').toEqual(['alias:check'])
+ expect(concHits(`const check = it.con${'current'}\ncheck.each([[1]])('AL4', () => {})`),
+ '并发别名上的参数化登记').toEqual(['alias:check.each'])
+ expect(concHits(`const check = it.con${'current'}\nconst c2 = check\nc2('AL5', () => {})`),
+ '并发别名的传递闭包').toEqual(['alias:c2'])
+ expect(concHits(`import * as vt from 'vitest'\nconst check = vt.it.con${'current'}\ncheck('AL6', () => {})`),
+ '命名空间导入后的并发别名').toEqual(['alias:check'])
+ expect(concHits(`const check = helper.con${'current'}\ncheck('AL7', () => {})`),
+ '非 vitest的 .concurrent不是登记').toEqual([])
+ expect(concHits(`const check = it\ncheck('AL8', { con${'current: false }'}, () => {})`),
+ '无修饰的别名照旧按选项判（这里是显式串行）').toEqual([])
 
     // —— 3：非计算键 `__proto__` 设的是原型，不是自有键。Vitest 2.1.9 的套件在合并选项
     // **之前**直接读 options.concurrent / options.sequential，原型链上的开关因此生效（探针实测：
