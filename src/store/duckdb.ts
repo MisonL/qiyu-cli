@@ -712,9 +712,9 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
   const mightBeMulti = (sql: string): boolean => stripSqlLiterals(sql).replace(/[\s;]+$/, '').includes(';')
   /**
    * 把 SQL 里**不执行**的文本剥掉（字符串字面量 / 引号标识符 / 行注释 / 块注释 / dollar 引用），
-   * 只给「原文里有没有事务关键字」这类**初判**用（CR 第六十二轮 / Codex PR#81 第五十二轮 P2）。
-   * ⚠️ 它不是 SQL 解析器，边界如实记录：块注释按「到第一个星号加斜杠为止」处理
-   * （剥离只会更保守地停下，不会把关键字漏进结果）；`E'…'` 之类前缀照常按普通字面量剥。
+   * 只给「事务控制 / 多语句」两条**词法判据**用（`isRawTxControl`与 `mightBeMulti`）。
+   * ⚠️ 它不是 SQL 解析器，边界如实记录：块注释按 DuckDB 的**嵌套**规则消费到配平的
+   * 「星号加斜杠」；真驱动探针 2026-11-21：内层注释里含 COMMIT 的嵌套注释查询照常合法。
    */
   const stripSqlLiterals = (sql: string): string => {
     let out = ''
@@ -726,9 +726,17 @@ export async function createDuckDbStore(cfg: StoreConfig, mode: StoreMode, deps:
         continue
       }
       if (ch === '/' && sql[i + 1] === '*') {
+        // DuckDB 的块注释可以**嵌套**（真驱动探针 2026-11-21：
+        // `/* outer /* inner */ COMMIT */ SELECT 1` 返回 {v:1}）。按深度消费到配平的 `*/`；
+        // 只认第一个 `*/` 会把内层之后的 `COMMIT */ SELECT` 当成代码，合法查询被误拒成 usage。
+        let depth = 1
         i += 2
-        while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i++
-        i++
+        while (i < sql.length && depth > 0) {
+          if (sql[i] === '/' && sql[i + 1] === '*') { depth++; i += 2; continue }
+          if (sql[i] === '*' && sql[i + 1] === '/') { depth--; i += 2; continue }
+          i++
+        }
+        i--
         out += ' '
         continue
       }

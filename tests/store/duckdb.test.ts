@@ -2078,6 +2078,18 @@ describe('duckdb —— 事务', () => {
     await s.close()
   })
 
+  it('嵌套块注释按 DuckDB 规则完整剥离：注释里的 COMMIT /分号不得把合法查询拒成 usage（Codex 第十五轮 P2）', { timeout: 90_000 }, async () => {
+    // 真驱动探针 2026-11-21：DuckDB 支持**嵌套**块注释 ——
+    // `/* outer /* inner */ COMMIT */ SELECT 1 AS v` 返回 {v:1}。非嵌套剥离器在内层 `*/`
+    // 就停，把剩下的 `COMMIT */ SELECT` 当成事务控制 →合法查询被误拒成 usage。
+    const s = await fresh()
+    expect(Number((await s.query('/* outer /* inner */ COMMIT */ SELECT 1 AS v')).rows[0]!.v)).toBe(1)
+    expect(Number((await s.query('/* a /* b ; c */ d */ SELECT 2 AS v')).rows[0]!.v), '嵌套注释里的分号不得触发多语句拒收').toBe(2)
+    // 嵌套注释之后的真事务控制仍必须被挡住（深度剥离不能把后续代码吃掉）
+    await expect(s.query('/* outer /* inner */ x */ COMMIT'), '嵌套注释后的真 COMMIT 必须在派发前被拒').rejects.toMatchObject({ kind: 'usage' })
+    await s.close()
+  })
+
   it('提交被拒 + 回滚也未能确认 → 拒绝错误自己必须带「重建 → 核对 → 再重放」（CR 第四十三轮 major）', { timeout: 90_000 }, async () => {
     // 事故：`commitOrRefuse` 的拒绝走身份集合（`refusals`），外层 catch 不再回滚、也**不会**
     // 经过 `annotateUnconfirmedRollback` —— 于是「回滚也未能确认、连接已退役」这句在 message 里，

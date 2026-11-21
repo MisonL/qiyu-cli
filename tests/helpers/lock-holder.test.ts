@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { accessSync, mkdtempSync, rmSync } from 'node:fs'
+import { accessSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -86,6 +86,9 @@ async function closeRealChild(run: RealChild): Promise<void> {
 type Fixture = 'holder' | 'seed' | 'verdict'
 const fixtures: Fixture[] = ['holder', 'seed', 'verdict']
 const BUDGET = 100
+/** 「marker 就绪 → 锁对另一进程可见」允许等的观测窗口（CI Node 22 实测两种模式各偶发一次 OPENED）。 */
+const LOCK_SETTLE_MS = 5_000
+const LOCK_SETTLE_POLL_MS = 200
 function invoke(fixture: Fixture, deadline: number): Promise<unknown> {
   const dbPath = join(dir, 'q.db')
   if (fixture === 'holder') return spawnLockHolder({ dbPath, scriptDir: dir, deadline })
@@ -688,6 +691,22 @@ describe('terminateHolder（持锁者收尾必须确认 close）', () => {
  await expect(terminateHolder(ch,200)).rejects.toThrow(/EPERM:注入/)
  })
 
+  it('原生 error事件（信号未送达）但 close到达 → 清理已确认，原始错误仍交回（Codex 第十五轮 P2）', async () => {
+    // 事故：`kill()` 同步接受信号（返回 true），真正的失败只经 `error` 事件到达；随后进程在
+    // 宽限内 close。旧实现只看同步抛出的 killError，把「信号没送达」吞成成功收尾。
+    const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter
+    ;(ch as unknown as { kill: () => boolean }).kill = () => {
+      setTimeout(() => {
+        ch.emit('error', new Error('ESRCH:注入'))
+        setTimeout(() => ch.emit('close', 1, 'SIGKILL'), 5)
+      }, 5)
+      return true
+    }
+    const err = await terminateHolder(ch, 200).then(() => null, (e: unknown) => e as Error)
+    expect(err, '清理已确认也不得吞掉「信号未送达」的原始失败').not.toBeNull()
+    expect(err!.message).toMatch(/ESRCH:注入/)
+  })
+
  it('已经 close的持锁者 →立刻返回，不再空等宽限', async () => {
  const ch = new EventEmitter() as unknown as ChildProcess & EventEmitter & { lockClosed?: boolean }
  ch.lockClosed = true
@@ -712,6 +731,54 @@ describe('terminateHolder（持锁者收尾必须确认 close）', () => {
  })
 })
 
+/**
+ * 有界等待「跨进程锁确实挡住另一进程」。
+ * ⚠️ marker 就绪 ≠ 锁在观测上已立即可见：`lockVerdict` 的文档把 OPENED 定义为
+ * 「锁未落盘/竞态窗口」，`LOCK_BUDGET_MS` 的余量也明确留给「一次竞态换轮」。CI 的
+ * Node 22 job 两次实测（READ_WRITE 与 READ_ONLY 各一次）：marker 已到、holder 仍存活，
+ * 首查却读到 OPENED；本机（含 CPU 压力）无法复现，根因未定位。窗口耗尽仍是 OPENED
+ * 说明 holder 真的没持锁——必须红，不能靠重试无限放行。
+ */
+type LockVerdict = 'CONFLICT' | 'OPENED' | 'TIMEOUT'
+type ReadVerdict = (dbPath: string, fixtureDir: string, deadline: number) => Promise<LockVerdict>
+async function conflictWithin(
+  dbPath: string, fixtureDir: string, deadline: number,
+  read: ReadVerdict = lockVerdict, settleMs: number = LOCK_SETTLE_MS,
+): Promise<{ verdict: LockVerdict; attempts: number }> {
+  const until = Date.now() + settleMs
+  let attempts = 0
+  let verdict: LockVerdict = await read(dbPath, fixtureDir, deadline)
+  attempts++
+  while (verdict === 'OPENED' && Date.now() < until) {
+    await new Promise((resolve) => setTimeout(resolve, LOCK_SETTLE_POLL_MS))
+    verdict = await read(dbPath, fixtureDir, deadline)
+    attempts++
+  }
+  return { verdict, attempts }
+}
+
+describe('conflictWithin 机制', () => {
+  // 窗口内 OPENED→CONFLICT：必须继续等到 CONFLICT（现实形态：锁晚于 marker 落盘）。
+  it('首查 OPENED、随后落盘 → 继续等到 CONFLICT', async () => {
+    const seq: LockVerdict[] = ['OPENED', 'CONFLICT']
+    const read: ReadVerdict = async () => seq.shift() ?? 'CONFLICT'
+    const r = await conflictWithin(join(dir, 'q.db'), dir, Date.now() + LOCK_BUDGET_MS, read, 300)
+    expect(r).toEqual({ verdict: 'CONFLICT', attempts: 2 })
+  })
+  // 窗口耗尽仍是 OPENED：如实交回 OPENED（由调用方断言红），不得被重试改写成 CONFLICT。
+  it('窗口耗尽仍是 OPENED → 如实交回 OPENED', async () => {
+    const read: ReadVerdict = async () => 'OPENED'
+    const r = await conflictWithin(join(dir, 'q.db'), dir, Date.now() + LOCK_BUDGET_MS, read, 300)
+    expect(r.verdict).toBe('OPENED')
+    expect(r.attempts, '窗口内应至少复查过一次').toBeGreaterThanOrEqual(2)
+  })
+  // TIMEOUT 不是 OPENED：不得当成「锁未落盘」继续等。
+  it('TIMEOUT 不触发重试，原样交回', async () => {
+    const read: ReadVerdict = async () => 'TIMEOUT'
+    const r = await conflictWithin(join(dir, 'q.db'), dir, Date.now() + LOCK_BUDGET_MS, read, 300)
+    expect(r).toEqual({ verdict: 'TIMEOUT', attempts: 1 })
+  })
+})
 describe('真实子进程端到端', () => {
   // OS 拒 spawn 的真实形态（不 mock spawn 本身）：execPath 指向不存在的可执行文件，
   // Node 发 `error`（ENOENT）而非 exit/close。夹具必须原样交回这条错误、不裸抛。
@@ -739,8 +806,48 @@ describe('真实子进程端到端', () => {
     expect((err as Error).message).toMatch(/夹具或环境问题/)
     expect(realChildren.every((run) => run.closed)).toBe(true)
   })
+  // ⚠️ 确定性复刻 CI 的偶发形态（Node 22 job 实测两次，READ_WRITE / READ_ONLY 各一次）：
+  // marker 已到、holder 仍存活，但锁在**观测上**还没落盘，单次校验读到 OPENED。
+  // 本机（含 CPU 压力）无法复现，根因未定位——这里用「闸门控制拿锁时机」把它变成确定性的：
+  // holder 先报到、等测试方开闸后才真正打开数据库。断言按 helper 的文档契约（OPENED 可能是
+  // 「锁未落盘/竞态窗口」）在窗口内等待，而不是把窗口当成失败。
+  it('锁晚到：marker 已到但锁未落盘时，单次 OPENED 不得当成「锁没生效」（窗口内落盘仍判 CONFLICT）', { timeout: LOCK_BUDGET_MS + 60_000 }, async () => {
+    accessSync(PKG_URL)
+    const deadline = Date.now() + LOCK_BUDGET_MS
+    const dbPath = join(dir, 'q.db')
+    const gate = join(dir, 'open-gate')
+    expect(await lockVerdict(dbPath, dir, deadline)).toBe('OPENED')
+    const scriptPath = join(dir, 'late-holder.mjs')
+    writeFileSync(scriptPath, `import { existsSync } from 'node:fs'
+import { setTimeout as sleep } from 'node:timers/promises'
+console.log('locked')
+while (!existsSync(${JSON.stringify(gate)})) await sleep(10)
+const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
+const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
+const c = await inst.connect()
+await c.run('CREATE TABLE IF NOT EXISTS lock_probe (x INTEGER)')
+setInterval(() => {}, 1 << 30)
+`)
+    const child = spawn(process.execPath, [scriptPath], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const lateRun = realChildren.find((run) => run.child === child)!
+    let out = ''
+    await new Promise<void>((resolve, reject) => {
+      child.stdout!.on('data', (d: Buffer) => {
+        out += d.toString()
+        if (out.split('\n').some((line) => line.trim() === 'locked')) resolve()
+      })
+      child.on('error', reject)
+    })
+    expect(lateRun.closed, 'marker 就绪时晚到的 holder 应仍存活').toBe(false)
+    // 此时闸门未开：锁一定还没落盘——立即校验读到 OPENED（CI 偶发形态的确定性复刻；
+    // 单次断言会把窗口误判成「锁没生效」）。
+    expect(await lockVerdict(dbPath, dir, deadline)).toBe('OPENED')
+    writeFileSync(gate, '')
+    const settled = await conflictWithin(dbPath, dir, deadline)
+    expect(settled.verdict, `闸门打开后锁应在 ${LOCK_SETTLE_MS}ms 窗口内落盘（共 ${settled.attempts} 次校验）`).toBe('CONFLICT')
+  })
 
-  it.each(['READ_WRITE', 'READ_ONLY'] as const)('$0：seed/marker → CONFLICT → 真 close → OPENED', { timeout: LOCK_BUDGET_MS + 60_000 }, async (accessMode) => {
+  it.each(['READ_WRITE', 'READ_ONLY'] as const)('%s：seed/marker → CONFLICT → 真 close → OPENED', { timeout: LOCK_BUDGET_MS + 60_000 }, async (accessMode) => {
     accessSync(PKG_URL)
     const deadline = Date.now() + LOCK_BUDGET_MS
     const dbPath = join(dir, 'q.db')
@@ -754,7 +861,8 @@ describe('真实子进程端到端', () => {
     const holder = await spawnLockHolder({ dbPath, scriptDir: dir, deadline, accessMode })
     const holderRun = realChildren.find((run) => run.child === holder)!
     expect(holderRun.closed, 'marker 就绪时应仍持有跨进程锁').toBe(false)
-    expect(await lockVerdict(dbPath, dir, deadline)).toBe('CONFLICT')
+    const lockSeen = await conflictWithin(dbPath, dir, deadline)
+    expect(lockSeen.verdict, `marker 就绪后 ${LOCK_SETTLE_MS}ms 内锁仍未挡住另一进程（共 ${lockSeen.attempts} 次校验）`).toBe('CONFLICT')
     expect(realChildren.at(-1)?.closed, 'verdict 必须已 close 才交回').toBe(true)
     await closeRealChild(holderRun)
     expect(holderRun.closed).toBe(true)

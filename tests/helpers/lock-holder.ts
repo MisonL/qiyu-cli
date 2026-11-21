@@ -587,9 +587,9 @@ export async function terminateHolder(child: LockHolder | ChildProcess | undefin
  const native = killError ?? nativeError ?? h.lockError
  if (arrived) {
  h.lockClosed = true
- if (killError !== undefined) {
+ if (native !== undefined) {
  //清理已确认，但「信号没送出去」仍不得吞成成功（CR第六十七轮 major）。
- throw new Error(`终止持锁者失败（信号未能送达）：${killError.message}`, { cause: killError })
+ throw new Error(`终止持锁者失败（信号未能送达）：${native.message}`, { cause: native })
  }
  return
  }
