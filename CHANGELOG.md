@@ -5,10 +5,11 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.2.3] - 2026-11-14
+## [0.2.3] - 2026-11-22
 
-> **材料已备，未 tag、未 npm publish，待授权。** tag / publish 完成后本行改为发布事实，
-> 并把文末 `[0.2.3]` 的基址从 `compare/v0.2.2...HEAD` 换成 `compare/v0.2.2...v0.2.3`。
+> 2026-11-22 发布：tag `v0.2.3`（指向 main `5756fa8`，GitHub/GitLab 双远端）+ npm publish
+> （shasum `a2deaeba9e62db20b2bb626f190eebb13a9b43e7`）；沙箱安装实测通过
+> （`qiyu --version` = 0.2.3、`skill check` 退出 0）。
 
 ### 新增
 
@@ -2723,7 +2724,7 @@
 - 响应信封归一化，含畸形 JSON（整数键未加引号）的容错修复
 - 逐接口限频表与 `retry_after` 提示
 
-[0.2.3]: https://github.com/MisonL/qiyu-cli/compare/v0.2.2...HEAD
+[0.2.3]: https://github.com/MisonL/qiyu-cli/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/MisonL/qiyu-cli/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/MisonL/qiyu-cli/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/MisonL/qiyu-cli/compare/v0.1.0...v0.2.0
