@@ -22,11 +22,14 @@
   Agent 看得到 `bad_time`（`errors.ts` 有该出口，`http.test.ts` 有行为用例钉着）。skill 正文早已按实况写，
   这次把设计稿与 `src/core/http.ts` 的注释两条入口对齐；同文件的最终 hint 死提及「HTTP 429/5xx」改为
   插值实际状态码（429 在更早的分支就被截走归 rate_limit，该句只会因 5xx 出现），与 Spring JSON 载体同形。
-- **§5.2 `not_found`的「一律」按实现收窄**：原文写「`code:200` 且无数据字段的一律当作 `not_found`」，
-  实现只判**结构性**为空（`data` 键缺失 / `{}` / `[]`），形状 M 的空 `message` 不判、业务性为空
-  （`ticket.search` 的 `{total:0, tickets:[]}`）判不出来——`not_found:false` 只说明结构上非空，不等于有数据。
-  `responseShape` 已随 params 加载并在 `api schema` 透出，但 not_found 判据不消费它（如实写明）。
-  此条源自 Codex 评审对本轮裁决文档的 P1-7 发现。
+- **§5.2 `not_found` 的「一律」按实现收窄为「形状已登记 + 载荷结构性为空」双条件**：原文「`code:200` 且无数据字段的
+  一律当作 `not_found`」比实现强两轮——第一轮（Codex 对裁决文档的 P1-7）去掉「一律」改判结构性为空，第二轮
+  （Codex 对 PR #82 的 P2）补上**形状条件**：`envelope` 未登记（`null`，此前观测到的全是写接口，`deleteKnowledges`
+  的空数组是**全部成功**）即便载荷空也返回 `notFound:false`；形状 D 的 `{code}` 与 M 的空 `message` 是纯确认/形态
+  漂移、不判；同为 `{code:200}` 报文的 `robot.transfer.config`（正常空壳）与 `robot.session.msgAssociate`（那是它的
+  not-found 路径）只能靠**分别登记 `D` / `D-nf`** 区分；形状 C 判的是 `message` 解析出的载荷；业务性为空
+  （`ticket.search` 的 `{total:0,tickets:[]}`）判不出（`responseShape` 已在 schema 透出但判据不消费它）。
+  → `not_found:false` 既不保证有数据、也不保证形状已登记。逐格核对 `envelope.ts` 后重写，守卫补形状条件两判据。
 - **§3.2 目录树加交付状态注**：`store/sandbox.ts` 实际落在 `src/query/`、`store/kysely.ts` 未交付（C2 挂账）、
   `sync/export.ts` 不是单独文件（实现散在 `src/sync/tasks/pipeline.ts` 与 `sessions.ts`）、`domains/` 整层未建——
   Agent 照树找文件会四处落空。注只纠正「文件在哪」，分层结构结论不变。

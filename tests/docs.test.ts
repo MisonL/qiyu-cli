@@ -1081,6 +1081,17 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(rule, '必须承认业务性为空判不出').toMatch(/业务性为空|判不出|不等于有数据/)
     expect(rule, 'responseShape 的实况必须写准（已在 schema 透出，但判据不消费）')
       .toMatch(/response_shape.*不消费它|不消费/)
+    // Codex 对 PR#82 的 P2：只说「结构性为空就判」仍然过宽——实现要求**该接口的 envelope
+    // 形状已登记（实测过）才判**，未登记（null）与形状 D/M 都不判。真驱动探针：
+    // normalize({code:200,data:[]}, null) → notFound:false。
+    // ⚠️判据必须是**段内复合锚**（B2 变异实证）：单 token 的 /未登记|已登记/ 会被别处的
+    //  incidental 命中满足——整段「未登记形状不判」被删时守卫照样绿。复合锚要求该档自己
+    // 携带「不判的后果」（notFound:false / 纯确认…不判），删档即红。
+    expect(rule, '未登记档必须自带「即便载荷空也不判」的后果').toMatch(/未登记[^。；]{0,180}notFound:false/)
+    expect(rule, 'D/M 例外档必须自带「不判」语义').toMatch(/(纯确认|形态漂移)[^。；]{0,120}不判/)
+    // ⚠️段内复合锚（B4 变异实证）：全句只数 `/D-nf/` 的话，删掉「分别登记 D/D-nf」那处
+    // 仍会被别处写到的 D-nf 满足——判据要钉在「分辨这两个接口」的那一档自己身上。
+    expect(rule, '同报文两接口的分辨档必须点名 D-nf').toMatch(/无从分辨[^。；]{0,120}D-nf/)
     // 双向自检：旧「一律」句必被判据①拒掉
     const ACCIDENT = '…`code:200` 且无数据字段的，一律当作 `not_found`，不当作成功。'
     expect(/无数据字段的，一律当作/.test(ACCIDENT), '事故行必被①抓红').toBe(true)
