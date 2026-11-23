@@ -1187,7 +1187,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(probe, '必须点明属主可以自行补 ACE 的机制（WRITE_DAC）').toMatch(/WRITE_DAC/)
     expect(probe, '必须要求继承关闭（否则父目录一变就带进名单外 ACE）').toMatch(/继承关闭/)
     // 父目录：文件 ACL 再紧，父目录可写就能被整个换掉（与 POSIX 目录判据同构）。
-    expect(probe, '父目录也必须受信（可被替换 = 文件 ACL 无意义）').toMatch(/父目录同样受信/)
+    expect(probe, '父目录的**写面**必须受信（可被替换 = 文件 ACL 无意义），只读 ACE 不算')
+      .toMatch(/父目录的写面受信/)
     // ⚠️ **CodeRabbit round 77（major）**：父目录判据必须**早于建 tmp** —— tmp 继承父目录 ACL，
     // 别人可在收紧前以共享读打开它，而**改 DACL 不撤销已打开句柄**，事后收紧救不回来。
     // 判据钉在写序里（⓪ 在最前），不是只钉「父目录要受信」这句话在场。
