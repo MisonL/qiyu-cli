@@ -121,8 +121,15 @@ function expectClean(child: ChildProcess) {
   const trackedClose = child.listeners('close').filter(
    (l) => (l as { __lockHolderTrack?: boolean }).__lockHolderTrack === true).length
   expect(child.listenerCount('close') - trackedClose, '夹具不得遗留 close监听').toBe(0)
-  expect(child.stdout?.listenerCount('data')).toBe(0)
-  expect(child.stderr?.listenerCount('data')).toBe(0)
+  // 诊断缓冲（`holder.lockOutput`）的 data 监听同样是**状态标记**：没有定时器、不挂起等待，
+  // 且必须活到用例收尾（spawn 时就得开始捕获 marker，见 `spawnLockHolder`）。只减标记、不放宽零容忍。
+  const trackedData = (s: ChildProcess['stdout']): number => (s === null || s === undefined ? 0
+    : s.listeners('data').filter(
+      (l) => (l as { __lockHolderTrack?: boolean }).__lockHolderTrack === true).length)
+  expect((child.stdout?.listenerCount('data') ?? 0) - trackedData(child.stdout),
+    '夹具不得遗留 stdout data 监听').toBe(0)
+  expect((child.stderr?.listenerCount('data') ?? 0) - trackedData(child.stderr),
+    '夹具不得遗留 stderr data 监听').toBe(0)
 }
 function swallowOn(child: ChildProcess): void {
   child.on('error', () => {})
@@ -865,16 +872,20 @@ setInterval(() => {}, 1 << 30)
     }
     const holder = await spawnLockHolder({ dbPath, scriptDir: dir, deadline, accessMode })
     const holderRun = realChildren.find((run) => run.child === holder)!
-    // holder 的输出在用例里收一份：失败时它能把「锁没生效」与「holder 中途没了」分开。
-    let holderOut = ''
-    holder.stdout?.on('data', (d: Buffer) => { holderOut += d.toString() })
+    // ⚠️ 诊断输出必须在 **spawn 时**就开始累积（Codex round 19 P3）：`waitForMarker`
+    // 成功后 `dispose()` 掉自己的 stdout 监听，用例再挂 `holder.stdout.on('data')` 只能
+    // 拿到 marker **之后**的输出——正常 holder 打印完 `locked` 就不再说话，失败文案会
+    // 永远打 `(空)`，把「holder 中途死掉」与「锁没生效」重新混回一个。判据直接钉住
+    // helper 的缓冲本身：marker 那一行必须在里面。
+    expect(holder.lockOutput, 'holder 诊断缓冲必须含 marker 输出（否则失败归因永远拿到空串）')
+      .toMatch(/locked/)
     expect(holderRun.closed, 'marker 就绪时应仍持有跨进程锁').toBe(false)
     const lockSeen = await conflictWithin(dbPath, dir, deadline)
     // ⚠️ 归因必须能分开两种实况（2026-11-23）：窗口耗尽仍 OPENED，可能是「锁真没取到」，
     // 也可能是 holder 在窗口内**死掉**了（锁随进程消失，此后每次打开都成功）。旧文案只说
     // 「锁仍未挡住另一进程」，把后者也说成前者。CI run 45121310111（Node 20.12）的 READ_ONLY
     // 臂就红在这里，而本机（macOS 22/24）与 Linux 真机（20.12/24，2 核限核 + 加压）都不复现。
-    expect(holderRun.closed, `校验窗口内 holder 应一直持有锁（stdout：${holderOut.trim().slice(-200) || '(空)'}）；`
+    expect(holderRun.closed, `校验窗口内 holder 应一直持有锁（输出：${holder.lockOutput.trim().slice(-200) || '(空)'}）；`
       + '它若已退出，锁随进程消失——这是 holder 失败，不是「锁没生效」').toBe(false)
     expect(lockSeen.verdict, `marker 就绪后 ${LOCK_SETTLE_MS}ms 内锁仍未挡住另一进程（共 ${lockSeen.attempts} 次校验）`).toBe('CONFLICT')
     expect(realChildren.at(-1)?.closed, 'verdict 必须已 close 才交回').toBe(true)
