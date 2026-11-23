@@ -390,7 +390,13 @@ export async function spawnLockHolder(
     ? `const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
 const inst = await DuckDBInstance.create(${JSON.stringify(o.dbPath)}, { access_mode: 'READ_ONLY' })
 const c = await inst.connect()
-await c.run('SELECT 1')
+// ⚠️ 报到前**真读一次存储层**，不靠 \`SELECT 1\`（2026-11-23）：marker 的语义是「锁已取得」，
+// 而 \`SELECT 1\` 是常量折叠式查询、不触碰数据库文件——它证明的只是「连接可用」。决定改谓词
+// 的是 CI run 45121310111（Node 20.12）的 READ_ONLY 臂：holder 存活、marker 已到，18 次独立
+// 校验却全 OPENED。⚠️ **根因未定位**：本机 /proc/locks 探针显示该版本 create 时就已持有锁
+// （macOS 22/24 与 Linux 真机 Ubuntu 24.04 的 Node 20.12/24、2 核限核加压都不复现）。
+// 所以这是一次**谓词加固**（与 RW 臂「先跑 DDL 再报到」同源），不宣称已修好 CI 那条红。
+await c.run('SELECT count(*) FROM duckdb_tables()')
 console.log('locked')
 setInterval(() => {}, 1 << 30)`
     // ⚠️ 先跑一条 DDL 再报到：语句成功 = 写事务已取得，文件锁已在盘上。

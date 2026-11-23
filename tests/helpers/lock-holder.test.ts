@@ -865,8 +865,17 @@ setInterval(() => {}, 1 << 30)
     }
     const holder = await spawnLockHolder({ dbPath, scriptDir: dir, deadline, accessMode })
     const holderRun = realChildren.find((run) => run.child === holder)!
+    // holder 的输出在用例里收一份：失败时它能把「锁没生效」与「holder 中途没了」分开。
+    let holderOut = ''
+    holder.stdout?.on('data', (d: Buffer) => { holderOut += d.toString() })
     expect(holderRun.closed, 'marker 就绪时应仍持有跨进程锁').toBe(false)
     const lockSeen = await conflictWithin(dbPath, dir, deadline)
+    // ⚠️ 归因必须能分开两种实况（2026-11-23）：窗口耗尽仍 OPENED，可能是「锁真没取到」，
+    // 也可能是 holder 在窗口内**死掉**了（锁随进程消失，此后每次打开都成功）。旧文案只说
+    // 「锁仍未挡住另一进程」，把后者也说成前者。CI run 45121310111（Node 20.12）的 READ_ONLY
+    // 臂就红在这里，而本机（macOS 22/24）与 Linux 真机（20.12/24，2 核限核 + 加压）都不复现。
+    expect(holderRun.closed, `校验窗口内 holder 应一直持有锁（stdout：${holderOut.trim().slice(-200) || '(空)'}）；`
+      + '它若已退出，锁随进程消失——这是 holder 失败，不是「锁没生效」').toBe(false)
     expect(lockSeen.verdict, `marker 就绪后 ${LOCK_SETTLE_MS}ms 内锁仍未挡住另一进程（共 ${lockSeen.attempts} 次校验）`).toBe('CONFLICT')
     expect(realChildren.at(-1)?.closed, 'verdict 必须已 close 才交回').toBe(true)
     await closeRealChild(holderRun)
