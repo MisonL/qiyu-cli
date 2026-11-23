@@ -1117,8 +1117,10 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 旧版本段里，但 `currentChangelogSection` 不再包含它，守卫会因发版而假红。
     // 设计稿规则行本身的断言（上面那些）与版本段无关，保持不变。
     const cl = allVersionSections(read('CHANGELOG.md'))
+    // 判据钉「按载体分档」这句本身 + 同段里的 message 照判语义（复合锚）：
+    // 单 token `/载体/` 在 CHANGELOG 里被别的条目（多载体转义契约等）满足，等于白守。
     expect(cl, 'CHANGELOG 必须写明载体分档（message 判、data/result 不判）')
-      .toMatch(/载体[\s\S]{0,120}(message|照判)|message[\s\S]{0,60}照判/)
+      .toMatch(/按载体分档[\s\S]{0,400}message/)
     expect(rule, '必须写明 null 的两种含义').toMatch(/从未实测[^。；]{0,120}(不在 A\/B\/C\/D|非标)/)
     expect(rule, 'D/M 例外档必须自带「不判」语义').toMatch(/(纯确认|形态漂移)[^。；]{0,120}不判/)
     // ⚠️段内复合锚（B4 变异实证）：全句只数 `/D-nf/` 的话，删掉「分别登记 D/D-nf」那处
