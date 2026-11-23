@@ -29,7 +29,8 @@
   漂移、不判；同为 `{code:200}` 报文的 `robot.transfer.config`（正常空壳）与 `robot.session.msgAssociate`（那是它的
   not-found 路径）只能靠**分别登记 `D` / `D-nf`** 区分；形状 C 判的是 `message` 解析出的载荷；业务性为空
   （`ticket.search` 的 `{total:0,tickets:[]}`）判不出（`responseShape` 已在 schema 透出但判据不消费它）。
-  → `not_found:false` 既不保证有数据、也不保证形状已登记。逐格核对 `envelope.ts` 后重写，守卫补形状条件两判据。
+  → `not_found:false` 既不保证有数据、也不保证形状已登记。逐格核对 `envelope.ts` 后重写，守卫补形状条件判据。
+  另钉一层易误读处：形状 M 的空 `message`、走到形状 C 却缺 `message` 的响应是**失败响应**（`ok:false`，真驱动探针实测），根本不参与 not_found 判定——旧措辞把它们与 D 的「成功但纯确认」并列成「不判」，Agent 会把 `not_found:false` 读成「成功但没查到」。
 - **§3.2 目录树加交付状态注**：`store/sandbox.ts` 实际落在 `src/query/`、`store/kysely.ts` 未交付（C2 挂账）、
   `sync/export.ts` 不是单独文件（实现散在 `src/sync/tasks/pipeline.ts` 与 `sessions.ts`）、`domains/` 整层未建——
   Agent 照树找文件会四处落空。注只纠正「文件在哪」，分层结构结论不变。

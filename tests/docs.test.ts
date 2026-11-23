@@ -1092,6 +1092,11 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // ⚠️段内复合锚（B4 变异实证）：全句只数 `/D-nf/` 的话，删掉「分别登记 D/D-nf」那处
     // 仍会被别处写到的 D-nf 满足——判据要钉在「分辨这两个接口」的那一档自己身上。
     expect(rule, '同报文两接口的分辨档必须点名 D-nf').toMatch(/无从分辨[^。；]{0,120}D-nf/)
+    // 真驱动探针实测：M 的空 message、走到 C 却缺 message 的响应都是 **ok:false 失败响应**，
+    // 压根不参与 not_found 判定。文档若只把它们与 D 的「成功但纯确认」并列成「不判」，
+    // Agent 会把 not_found:false 读成「成功但没查到」——判据钉住「失败响应…不参与」。
+    expect(rule, '必须写明 M 空 message / C 缺 message 是失败响应，不是「成功但不判」')
+      .toMatch(/失败响应[^。；]{0,140}不参与/)
     // 双向自检：旧「一律」句必被判据①拒掉
     const ACCIDENT = '…`code:200` 且无数据字段的，一律当作 `not_found`，不当作成功。'
     expect(/无数据字段的，一律当作/.test(ACCIDENT), '事故行必被①抓红').toBe(true)
