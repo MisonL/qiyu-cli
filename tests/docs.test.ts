@@ -1088,6 +1088,23 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     //  incidental 命中满足——整段「未登记形状不判」被删时守卫照样绿。复合锚要求该档自己
     // 携带「不判的后果」（notFound:false / 纯确认…不判），删档即红。
     expect(rule, '未登记档必须自带「即便载荷空也不判」的后果').toMatch(/未登记[^。；]{0,180}notFound:false/)
+    // ⚠️ **Codex 对 PR#82 的 round-18 P2**：`envelope` 未登记时规则**不是一刀切**
+    // （真驱动探针 9 格）：`data`/`result`/无载荷 → notFound:false；但载荷在 JSON `message`
+    // 里且解析出来是 `[]`/`{}` → **notFound:true**（`smstask.status` 的 `{code:200,message:"[]"}`
+    // 就是「成功但查无此物」，smstask.status 现在登记为 C，但宽松分支对未登记接口同样适用）。
+    // 规则行若写成「未登记一律 notFound:false」，Agent 会把真实的查无此物读成未判定。
+    expect(rule, '未登记档必须按载荷载体分开：message 里的空 JSON 判、data/result 不判')
+      .toMatch(/`message`[^。；]{0,80}(判|查无此物)[^。；]{0,120}(data|result)[^。；]{0,80}不判|按载荷载体/)
+    // 同一括号里我此前写「null 以前全是写接口」——源码注释明写 null 有两种含义，
+    // 其中一类是**实测过但形状不在 A/B/C/D**（chat.queue.group.query / ipcc.customfield.template.get）。
+    expect(rule, '不得再说 envelope:null 全是写接口').not.toMatch(/全是写接口/)
+    // CHANGELOG 的当前段同样写过那两条错（它也是被 Agent 读的文本）。这里**只做正向**断言：
+    // 反向的整段 not.toMatch 与「叙述里引用旧的错句」天然冲突（引用即红），而漂移风险
+    // 集中在**契约面**（design.md 的规则行，Agent 照它分支），那段才是负向锚的对象。
+    const cl = currentChangelogSection(read('CHANGELOG.md'))
+    expect(cl, 'CHANGELOG 必须写明载体分档（message 判、data/result 不判）')
+      .toMatch(/载体[\s\S]{0,120}(message|照判)|message[\s\S]{0,60}照判/)
+    expect(rule, '必须写明 null 的两种含义').toMatch(/从未实测[^。；]{0,120}(不在 A\/B\/C\/D|非标)/)
     expect(rule, 'D/M 例外档必须自带「不判」语义').toMatch(/(纯确认|形态漂移)[^。；]{0,120}不判/)
     // ⚠️段内复合锚（B4 变异实证）：全句只数 `/D-nf/` 的话，删掉「分别登记 D/D-nf」那处
     // 仍会被别处写到的 D-nf 满足——判据要钉在「分辨这两个接口」的那一档自己身上。

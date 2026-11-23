@@ -22,15 +22,19 @@
   Agent 看得到 `bad_time`（`errors.ts` 有该出口，`http.test.ts` 有行为用例钉着）。skill 正文早已按实况写，
   这次把设计稿与 `src/core/http.ts` 的注释两条入口对齐；同文件的最终 hint 死提及「HTTP 429/5xx」改为
   插值实际状态码（429 在更早的分支就被截走归 rate_limit，该句只会因 5xx 出现），与 Spring JSON 载体同形。
-- **§5.2 `not_found` 的「一律」按实现收窄为「形状已登记 + 载荷结构性为空」双条件**：原文「`code:200` 且无数据字段的
-  一律当作 `not_found`」比实现强两轮——第一轮（Codex 对裁决文档的 P1-7）去掉「一律」改判结构性为空，第二轮
-  （Codex 对 PR #82 的 P2）补上**形状条件**：`envelope` 未登记（`null`，此前观测到的全是写接口，`deleteKnowledges`
-  的空数组是**全部成功**）即便载荷空也返回 `notFound:false`；形状 D 的 `{code}` 与 M 的空 `message` 是纯确认/形态
-  漂移、不判；同为 `{code:200}` 报文的 `robot.transfer.config`（正常空壳）与 `robot.session.msgAssociate`（那是它的
+- **§5.2 `not_found` 的「一律」按实现收窄，并逐轮纠偏到「形状已登记 + 载荷结构性为空 + 按载体分档」**：原文「`code:200` 且无数据字段的
+  一律当作 `not_found`」比实现强，收窄过程走了三轮——第一轮（Codex 对裁决文档的 P1-7）去掉「一律」改判结构性为空；第二轮
+  （Codex 对 PR #82 的 P2）补上**形状条件**：`envelope` 未登记（`null`）不判，形状 D 的 `{code}` 是纯确认、M 的空 `message`
+  与走到 C 却缺 `message` 的是失败响应，均不参与；同为 `{code:200}` 报文的 `robot.transfer.config`（正常空壳）与 `robot.session.msgAssociate`（那是它的
   not-found 路径）只能靠**分别登记 `D` / `D-nf`** 区分；形状 C 判的是 `message` 解析出的载荷；业务性为空
   （`ticket.search` 的 `{total:0,tickets:[]}`）判不出（`responseShape` 已在 schema 透出但判据不消费它）。
   → `not_found:false` 既不保证有数据、也不保证形状已登记。逐格核对 `envelope.ts` 后重写，守卫补形状条件判据。
   另钉一层易误读处：形状 M 的空 `message`、走到形状 C 却缺 `message` 的响应是**失败响应**（`ok:false`，真驱动探针实测），根本不参与 not_found 判定——旧措辞把它们与 D 的「成功但纯确认」并列成「不判」，Agent 会把 `not_found:false` 读成「成功但没查到」。
+  第三轮（Codex 对 PR #82 的 round-18 P2）拆掉我自己引入的**新的一刀切**：第二轮的措辞把未登记形状写成「即便载荷空也返回 `notFound:false`」，
+  但 `envelope.ts` 的宽松分支对**载荷在 JSON `message` 里**的情况照判空（`normalize({code:200,message:'[]'})` → `notFound:true`，
+  `tests/core/envelope.test.ts` 钉住）——`smstask.status` 的 `{code:200,message:"[]"}` 正是「成功但查无此物」；只有 `data`/`result`/无载荷
+  才不判（`data` 的语义在读／写接口上相反：`deleteKnowledges` 的空数组是**全部成功**）。同一句里的「`null` 此前观测到的全是写接口」也与源码注释相反——
+  `null` 有两类来源：从未实测，以及**实测过但形状不在 A/B/C/D**（`chat.queue.group.query` 的 `staffInfo`、`ipcc.customfield.template.get` 的裸数组）。
 - **§3.2 目录树加交付状态注**：`store/sandbox.ts` 实际落在 `src/query/`、`store/kysely.ts` 未交付（C2 挂账）、
   `sync/export.ts` 不是单独文件（实现散在 `src/sync/tasks/pipeline.ts` 与 `sessions.ts`）、`domains/` 整层未建——
   Agent 照树找文件会四处落空。注只纠正「文件在哪」，分层结构结论不变。
