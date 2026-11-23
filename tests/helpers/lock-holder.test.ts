@@ -820,9 +820,14 @@ describe('真实子进程端到端', () => {
     const scriptPath = join(dir, 'late-holder.mjs')
     writeFileSync(scriptPath, `import { existsSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
+const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
+// 冷启动是**进程级首开**（本机 CI 实测 >5s；ff498d9 那次红是 18 次校验全落在冷启动窗口里）：
+// 先用 :memory: 把它付掉（不碰目标库、不产生锁），marker 才只表示「已热、仍未持锁」。
+// 否则 marker 到拿锁之间隔着整个首次 create——5s 观测窗口测的永远是冷启动而不是锁落盘竞态。
+const warm = await DuckDBInstance.create(':memory:')
+warm.closeSync()
 console.log('locked')
 while (!existsSync(${JSON.stringify(gate)})) await sleep(10)
-const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
 const inst = await DuckDBInstance.create(${JSON.stringify(dbPath)})
 const c = await inst.connect()
 await c.run('CREATE TABLE IF NOT EXISTS lock_probe (x INTEGER)')
