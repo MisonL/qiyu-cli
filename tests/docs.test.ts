@@ -1196,15 +1196,25 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 判据钉在写序里（⓪ 在最前），不是只钉「父目录要受信」这句话在场。
     // 写序在「真探测 ACL」之前，用 §2.4 整段（sp）而不是 probe 切片断言。
     const writeOrder = sp.slice(sp.indexOf('2. **方案 A（以真机为闸）**'), probeAt)
+    // ⚠️ 前缀陷阱（Codex round 21）：`indexOf('正确顺序：⓪')` 也会命中 `⓪′` —— 先断言
+    // 写序里不存在带撇号的变体标记，否则序号判断会被前缀命中骗成假绿。
+    expect(writeOrder, '写序不得残留 ⓪′ 一类带撇号变体标记').not.toMatch(/⓪[′'’]/)
     const i0 = writeOrder.indexOf('正确顺序：⓪')
-    const i1 = writeOrder.indexOf('① **建空 tmp**')
+    const i1 = writeOrder.indexOf('① **以受限安全描述符原子地创建空 tmp**')
     expect(i0, '写序必须点名父目录校验（⓪）').toBeGreaterThanOrEqual(0)
-    expect(i1, '写序必须保留「建空 tmp」这一步').toBeGreaterThanOrEqual(0)
-    expect(i0, '父目录校验必须排在「建空 tmp」之前（顺序判据，不靠相邻字符数）').toBeLessThan(i1)
+    expect(i1, '写序必须保留「创建空 tmp」这一步（round 79 后必须带受限 SD 创建）').toBeGreaterThanOrEqual(0)
+    expect(i0, '父目录校验必须排在「创建空 tmp」之前（顺序判据，不靠相邻字符数）').toBeLessThan(i1)
     expect(writeOrder, '必须点明「改 DACL 不撤销已打开句柄」这条机制')
-      .toMatch(/不(会)?撤销已[^。；]{0,10}句柄/)
+      .toMatch(/不(会)?撤销已(打开|授予)的(句柄|访问)/)
     expect(writeOrder, '不可信目录必须「不建 tmp、不写 secret」，不是「先建再补救」')
       .toMatch(/不建 tmp、不写 secret/)
+    // ⚠️ **CodeRabbit round 79**：「先建空 tmp 再 icacls」仍有句柄窗口——必须创建时刻就受限。
+    expect(writeOrder, 'tmp 必须在创建时刻就带受限 SD（不能 writeFileSync 之后补 icacls）')
+      .toMatch(/以受限安全描述符原子地创建空 tmp/)
+    expect(writeOrder, '必须点明「只在打开时检查访问、改 DACL 不撤销已授予的访问」')
+      .toMatch(/只在\*\*打开时\*\*检查访问|不撤销已授予的访问/)
+    expect(writeOrder, '三种候选机制都未实测，必须如实标注')
+      .toMatch(/均未真机实测/)
     // 候选机制尚未实测必须如实标注（不能用未验证机制冒认已验）
     expect(probe, '取 SDDL 的机制未真机实测，必须写明').toMatch(/尚未真机实测|实测定稿前不/)
     // 双向自检：事故原句必被第一条判据拒掉（连粗体包裹的实际事故形态一起）
