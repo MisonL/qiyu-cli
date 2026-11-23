@@ -1233,6 +1233,9 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/不得按路径重新打开/)
     expect(writeOrder, '必须钉住目录身份（句柄保持或 file ID 比对）')
       .toMatch(/目录身份|file ID/)
+    // ⚠️ **Codex round 24**：句柄不带 `FILE_SHARE_DELETE` 才挡得住删除/改名——只写「持有句柄」不够。
+    expect(writeOrder, '必须写明句柄不得带 FILE_SHARE_DELETE（否则挡不住删除/改名）')
+      .toMatch(/不得带 `FILE_SHARE_DELETE`/)
     // 候选机制尚未实测必须如实标注（不能用未验证机制冒认已验）
     expect(probe, '取 SDDL 的机制未真机实测，必须写明').toMatch(/尚未真机实测|实测定稿前不/)
     // 双向自检：事故原句必被第一条判据拒掉（连粗体包裹的实际事故形态一起）
