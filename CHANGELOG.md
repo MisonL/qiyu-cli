@@ -5,6 +5,42 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 文档
+
+- **设计稿 §9.1 失败样本按真实出口逐字段校准**（2026-11-22）：旧样本写 `retryable: false`（实现恒 `true`，
+  `errors.ts` 的裁决注释早就写在源码里）、 `hint` 「该接口每分钟限 1 次」（全 src 无此文案）、
+  `retry_after` 缺类型**必填**的 `source`（skill 正文的秒数可信度分流整个建立在它上面）、
+  `fallback` 首表与「未登记档」自相矛盾（`order_performance` 的端点已登记 observed/30s）。
+  样本是自称的 Agent 契约，错一处就是教 Agent 分支一个不可能出现的形状；`tests/docs.test.ts` 加逐字段双向守卫。
+- **§4.1 与 §12 的「原始 TCP 抓包」口径矛盾收口**：§4.1 逐字声称「已抓包逐字节比对」而 §12 挂账「未做」——
+  实况是设计期只做过**真实凭证往返**（`code:200`），报文级产物从未留存仓库。§4.1 收窄为如实措辞，
+  §12 把挂账升格为**显式非目标**并附判据（校验和与传输层无关、抓 TLS 内层相对本地真 undici 出站无额外
+  证明力；`BASE` 硬编码无注入缝，真凭证送 mitm 是泄露面）。
+- **§4.3「14003 对 Agent 永不可见」补前提**：实况是「救得回才不可见」——偏差 >5min 或重签仍被拒时
+  Agent 看得到 `bad_time`（`errors.ts` 有该出口，`http.test.ts` 有行为用例钉着）。skill 正文早已按实况写，
+  这次把设计稿与 `src/core/http.ts` 的注释两条入口对齐；同文件的最终 hint 死提及「HTTP 429/5xx」改为
+  插值实际状态码（429 在更早的分支就被截走归 rate_limit，该句只会因 5xx 出现），与 Spring JSON 载体同形。
+- **§5.2 `not_found`的「一律」按实现收窄**：原文写「`code:200` 且无数据字段的一律当作 `not_found`」，
+  实现只判**结构性**为空（`data` 键缺失 / `{}` / `[]`），形状 M 的空 `message` 不判、业务性为空
+  （`ticket.search` 的 `{total:0, tickets:[]}`）判不出来——`not_found:false` 只说明结构上非空，不等于有数据。
+  `responseShape` 已随 params 加载并在 `api schema` 透出，但 not_found 判据不消费它（如实写明）。
+  此条源自 Codex 评审对本轮裁决文档的 P1-7 发现。
+- **§3.2 目录树加交付状态注**：`store/sandbox.ts` 实际落在 `src/query/`、`store/kysely.ts` 未交付（C2 挂账）、
+  `sync/export.ts` 不是单独文件（实现散在 `src/sync/tasks/pipeline.ts` 与 `sessions.ts`）、`domains/` 整层未建——
+  Agent 照树找文件会四处落空。注只纠正「文件在哪」，分层结构结论不变。
+- **364 天口径冲突如实标注（未裁决）**：§7.3 与 §14 的「`transferHuman` 364 天报 Internal error、上限压 ≤360」
+  与 §7.4.1 的 2026-09-30 二分结论（「不存在边界不稳定」）互斥，两边都自称实测而无可复核记录留存——
+  两处各加「未裁决、勿作实现依据」标注；裁决留给一次只读真接口复测（需授权，且 sync 侧早已按天切片）。
+
+### 测试
+
+- 文档校准的守卫全部是**双向自检**形态：从文档按行提取样本、逐字段过判据（不写会漂移的行号锚），
+  事故原文喂给同一判据必红、校准后文本必绿。`tests/core/http.test.ts` 新增「非 JSON 的 5xx 与 429」用例，
+  钉住 hint 按状态码插值、两种载体同落 rate_limit/network（RED 证据：修改前实测 hint 是「HTTP 429/5xx」死提及）。
+
+
 ## [0.2.3] - 2026-11-22
 
 > 2026-11-22 发布：tag `v0.2.3`（指向 main `5756fa8`，GitHub/GitLab 双远端）+ npm publish
@@ -2724,6 +2760,7 @@
 - 响应信封归一化，含畸形 JSON（整数键未加引号）的容错修复
 - 逐接口限频表与 `retry_after` 提示
 
+[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.2.3...HEAD
 [0.2.3]: https://github.com/MisonL/qiyu-cli/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/MisonL/qiyu-cli/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/MisonL/qiyu-cli/compare/v0.2.0...v0.2.1

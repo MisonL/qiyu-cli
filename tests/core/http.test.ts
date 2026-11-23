@@ -600,6 +600,35 @@ describe('call', () => {
     }
   })
 
+
+  it('非 JSON 的 5xx 与 429：hint 只点名实际状态码，且两条载体同口径（2026-11-22）', async () => {
+    // 事故：HTML 载体（body 非 JSON）的最终 hint 硬编码「网关瞬时故障（HTTP 429/5xx）」，
+    // 但 429 在更早的分支就被截走并归 rate_limit —— 这条 hint 永远只会在 5xx 时出现，
+    // 「429」是死提及；而 Spring JSON 载体（errors.ts）用的是插值实际状态码。
+    // 同一状态两种说法 = Agent 按载体拿到不同文案，正是本仓反复收口的「两条入口分叉」。
+    for (const status of [500, 502, 503, 504]) {
+      fetchMock.mockImplementationOnce(() => Promise.resolve(
+        new Response('<html>bad gateway</html>', { status, headers: { 'content-type': 'text/html' } })))
+      const err = await call(byId('ticket.list'), {}, { credentials: CREDS, noRetry: true })
+        .catch((e) => e)
+      expect(err.kind, `HTTP ${status} 应归 network`).toBe('network')
+      expect(err.hint, `hint 必须点名实际状态码 ${status}`).toBe(`网关瞬时故障（HTTP ${status}），请退避后重试`)
+    }
+    // 429 到不了那句 hint：它自己走 rate_limit + 限流说明（与 errors.ts 同一语义）
+    fetchMock.mockImplementationOnce(() => Promise.resolve(
+      new Response('<html>too many</html>', { status: 429, headers: { 'content-type': 'text/html' } })))
+    const e429 = await call(byId('ticket.list'), {}, { credentials: CREDS, noRetry: true }).catch((e) => e)
+    expect(e429.kind).toBe('rate_limit')
+    expect(e429.hint, '429 不得复用 5xx 那句「网关瞬时故障」').not.toMatch(/网关瞬时故障/)
+    expect(e429.hint).toMatch(/限流/)
+    // Spring JSON 载体对照：同一次 429 也归 rate_limit（两载体语义一致）
+    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response(
+      JSON.stringify({ code: '429', message: 'Too Many Requests' }), { status: 200,
+      headers: { 'content-type': 'application/json' } })))
+    const j429 = await call(byId('ticket.list'), {}, { credentials: CREDS, noRetry: true }).catch((e) => e)
+    expect(j429.kind, '429 无论载体都必须落 rate_limit').toBe('rate_limit')
+  })
+
   it('服务端返回非 JSON 但状态码是 200 —— 那是真缺陷，不可重试', async () => {
     // 反向：**乙类**（body 完整但不是 JSON）的区分依据是 HTTP 状态码。
     // 200 + 非 JSON 意味着服务端真的返回了畸形响应，重试一万次也一样。

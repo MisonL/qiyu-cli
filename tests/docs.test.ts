@@ -959,6 +959,134 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(s, '「D 交付后缓存查询生效」的旧承诺不得回归').not.toMatch(/D 交付后缓存查询生效/)
   })
 
+
+  it('设计稿 §4.1 与 §12 的抓包口径一致（2026-11-22 校准，两处不得再分叉）', () => {
+    // 事故：§4.1 原文逐字声称「已对线上 API 验证（原始 TCP 抓包、逐字节比对…）」，
+    // §12 却挂账「原始 TCP 抓包验证实际发出的字节——未做」——同一文档两套口径，读者
+    // 无从判断到底做没做过（报文级产物从未留存仓库）。修法：§4.1 收窄为「真实凭证往返、
+    // 抓包产物未留存」，§12 把「未做仍挂账」升格为「显式非目标」并附判据。
+    const s = design()
+    // ① §4.1 不得再出现「已…抓包」的完成时声称（锚整句形态，校准注里引用的原文带「」引号，命中不了本锚）
+    expect(s, '§4.1 不得再声称已完成原始 TCP 抓包验证')
+      .not.toMatch(/^已对线上 API 验证（原始 TCP 抓包、逐字节比对/m)
+    expect(s, '§4.1 必须改成「往返验证」并保留真实覆盖范围')
+      .toMatch(/^已对线上 API 往返验证（\*\*真实凭证、覆盖中文\/emoji\/转义\/换行，均 `code:200`\*\*）/m)
+    // ② 校准注在场
+    expect(s, '§4.1 与 §12 的矛盾必须写明（口径校准注）').toMatch(/口径校准（2026-11-22）/)
+    expect(s).toMatch(/报文级抓取产物从未留存于本仓库/)
+    // ③ §12 不得回到「未做，仍挂账」，必须是显式非目标
+    expect(s, '§12 不得再把抓包写成待办挂账').not.toMatch(/原始 TCP 抓包验证实际发出的字节 —— \*\*未做\*\*，仍挂账/)
+    expect(s, '§12 必须升级为显式非目标并给判据').toMatch(/原始 TCP 抓包验证实际发出的字节 —— \*\*显式非目标（2026-11-22 裁定，与 §4.1 口径一致）\*\*/)
+    expect(s).toMatch(/校验和只覆盖 `body 原文` 与 `time` 文本、与传输层无关/)
+    // ④ 双向自检：事故原文必须被①③的锚抓到
+    const ACC1 = '已对线上 API 验证（原始 TCP 抓包、逐字节比对，覆盖中文/emoji/转义/换行）：undici 将…'
+    const ACC2 = '原始 TCP 抓包验证实际发出的字节 —— **未做**，仍挂账（需要抓包环境…）'
+    expect(/^已对线上 API 验证（原始 TCP 抓包、逐字节比对/m.test(ACC1), '事故§4.1必被①锚抓到').toBe(true)
+    expect(/原始 TCP 抓包验证实际发出的字节 —— \*\*未做\*\*，仍挂账/.test(ACC2), '事故§12必被③锚抓到').toBe(true)
+  })
+
+
+  it('设计稿 §9.1 失败样本与真实出口逐字段一致（2026-11-22 校准，不得回归）', () => {
+    // 事故：样本曾写 `retryable: false`（实现恒 true，errors.ts 的裁决注释就在源码里）、
+    // hint 写「该接口每分钟限 1 次」（全 src 无该文案）、retry_after 缺类型必填的 source
+    // （skill 正文的秒数可信度分流整个建立在 source 上）、fallback 首表 order_performance
+    // 与其端点已登记 observed/30s 的限频档自相矛盾。样本自称契约，错一处就是教 Agent
+    // 分支一个不可能的形状。判据对「文档里的真实样本」与「按行锚提取」生效。
+    const s = design()
+    const failSample = /"ok": false, "error": \{([\s\S]*?)\n\}\}/.exec(s)?.[1]
+    expect(failSample, '失败样本必须能按现形提取到（改格式时同步改本守卫）').toBeDefined()
+    const line = (src: string, k: string): string =>
+      src.split('\n').map((l) => l.trim()).find((l) => l.startsWith(`"${k}"`)) ?? ''
+    const L = (k: string): string => line(failSample!, k)
+    // ① 逐字段判据（每条都能被对应事故形态触发）
+    expect(L('code'), '样本 14009 行必须是 retryable: true —— 实现恒 true（errors.ts裁决注释）')
+      .toMatch(/^"code": "14009", "kind": "rate_limit", "retryable": true,?$/)
+    expect(L('hint'), '样本 hint 不得是 src 里不存在的编造文案').not.toMatch(/每分钟限 1 次/)
+    expect(L('hint'), '样本 hint 必须是未登记档 + fallback 追加段的拼接完整形态（api.ts 是拼接）')
+      .toMatch(/该接口未登记在本地限频表[\s\S]*该接口在同步任务里有本地表映射[\s\S]*没有打开库、没有确认这些表存在/)
+    expect(L('retry_after'), 'retry_after.source 是类型必填五值，样本缺它就教 Agent 读不可能的载荷')
+      .toMatch(/^"retry_after": \{"seconds": \d+, "source": "(observed|doc|local|header|fallback)"\},?$/)
+    expect(L('fallback'), 'fallback 首表与「未登记档」自洽（order_performance 端点已登记 observed/30s，矛盾）')
+      .toBe('"fallback": "qiyu query --table tickets"')
+    // ② 校准注在场（删注必须红）
+    expect(s, '样本校准说明必须在场').toMatch(/样本校准说明（2026-11-22）/)
+    //③ 双向自检：把 2026-11-22 之前的**事故样本**喂给①的同一组判据，四条都必须不通过
+    const ACCIDENT = [
+      '  "code": "14009", "kind": "rate_limit", "retryable": false,',
+      '  "message": "api call too frequent",',
+      '  "hint": "该接口每分钟限 1 次",',
+      '  "retry_after": {"seconds": 43},',
+      '  "retry_strategy": "switch_to_local",',
+      '  "fallback": "qiyu query --table order_performance"',
+    ].join('\n')
+    expect(/^"code": "14009", "kind": "rate_limit", "retryable": true,?$/.test(line(ACCIDENT, 'code')), '事故 retryable 必被①判红').toBe(false)
+    expect(!/每分钟限 1 次/.test(line(ACCIDENT, 'hint')), '事故 hint 必被①判红').toBe(false)
+    expect(/^"retry_after": \{"seconds": \d+, "source": "(observed|doc|local|header|fallback)"\},?$/.test(line(ACCIDENT, 'retry_after')), '事故缺 source 必被①判红').toBe(false)
+    expect(line(ACCIDENT, 'fallback') === '"fallback": "qiyu query --table tickets"', '事故矛盾首表必被①判红').toBe(false)
+  })
+
+
+  it('设计稿 §3.2 目录树的交付状态注在场，四处实际落点逐个点名（2026-11-22 回写，不得回归）', () => {
+    // 事故：§3.2 是设计期目标布局，从未对齐交付实况——sandbox 实际在 src/query/、
+    // kysely.ts 未交付（C2 挂账）、sync/export.ts 从未单独成文件（实现在 tasks/pipeline+
+    // sessions）、domains/ 整层未建。Agent 照树找文件会四处落空，而全文没有一处说明。
+    const s = design()
+    const tree = /### 3\.2 目录结构[\s\S]*?\n```[\s\S]*?\n```/.exec(s)
+    expect(tree, '§3.2 树必须还在（本守卫锚它后面的状态注）').not.toBeNull()
+    const after = s.slice(tree!.index + tree![0].length, tree!.index + tree![0].length + 1600)
+    expect(after, '树后必须紧跟交付状态注').toMatch(/交付状态注（2026-11-22 回写）/)
+    //四处偏差逐条点名（漏一条注就退化成泛泛"以仓库为准"，等于没写）
+    expect(after).toMatch(/`store\/sandbox\.ts`[\s\S]*?src\/query\/sandbox\.ts/)
+    expect(after).toMatch(/`store\/kysely\.ts`[\s\S]*?未交付/)
+    expect(after).toMatch(/`sync\/export\.ts`[\s\S]*?不是单独文件/)
+    expect(after).toMatch(/`domains\/`[\s\S]*?未建/)
+    // 结构结论不变的边界也要写（防止把注读成"整节作废"）
+    expect(after).toMatch(/结构性结论不变/)
+    //双向自检：事故形态（无注的旧文）必红——after 里如果只有树没有注，上面的锚即红；
+    //这里对「泛泛一句」的退化形态显式验证判据抓得住
+    const DEGENERATE = '以运行时仓库为准。'
+    expect(/`store\/sandbox\.ts`[\s\S]*?src\/query\/sandbox\.ts/.test(DEGENERATE)).toBe(false)
+  })
+
+
+  it('设计稿 §4.3：14003「永不可见」已补前提（bad_time 出口可达，2026-11-22 校准）', () => {
+    // 事故：§4.3 表格写「core 层自动重新签名并重试，对 Agent 永不可见」是无条件句，
+    // 但 errors.ts 有真实的 bad_time 出口（偏差>5min 或重签仍被拒时 Agent 看得到它），
+    // skill 正文 errors.md 早已按实况写「已自动重签重试过；仍失败说明本机时钟真的偏了」
+    // —— 同一契约的两条入口（设计稿 vs skill）说两套话，只修一条就是回归。
+    // 行号会漂移，所以文档里只写 文件名+键名，不写 :303/:17。
+    const s = design()
+    const row = s.split('\n').find((l) => l.includes('| 14003 |')) ?? '(找不到 14003 行)'
+    expect(row).toMatch(/前提：时钟偏差在 5 分钟内/)
+    expect(row).toMatch(/bad_time/)
+    expect(row, '「永不可见」只能以被纠正原文（带「」）的形态出现').toMatch(/「对 Agent 永不可见」是无条件句/)
+    expect(row, '校准注里的引用不得再嵌会漂移的行号').not.toMatch(/errors\.ts:\d+|errors\.md:\d+/)
+    // 与 skill 正文同口径（两条入口对齐）
+    const sk = read('src/skill/qiyu/errors.md')
+    expect(sk).toMatch(/已自动重签重试过；仍失败说明本机时钟真的偏了/)
+    // 双向自检：无条件句的旧行必须被上面判据拒掉
+    const ACCIDENT = '| 14003 | time 错误 | — | **core 层自动重新签名并重试，对 Agent 永不可见** |'
+    expect(/前提：时钟偏差在 5 分钟内/.test(ACCIDENT), '事故行必被①判红').toBe(false)
+  })
+
+
+  it('设计稿 §5.2：`not_found` 的「一律」已按实现收窄为结构性判据（2026-11-22，Codex P1-7）', () => {
+    // 事故：原文「`code:200` 且无数据字段的一律当作 `not_found`」比实现强。实现只判**结构性**
+    // 为空（data 键缺失 / {} / []）；形状 M 的空 message 不判、业务性为空（ticket.search 的
+    // {total:0,tickets:[]}）判不出来。Agent 若信「一律」，会把 not_found:false 读成「有数据」。
+    const s = design()
+    const rule = s.split('\n').find((l) => l.includes('信封归一化层不得假定')) ?? '(找不到规则行)'
+    expect(rule, '「一律」不得作为无保留的通用规则').not.toMatch(/无数据字段的，一律当作/)
+    expect(rule, '必须点明是结构性判据').toMatch(/结构性为空/)
+    expect(rule, '必须承认业务性为空判不出').toMatch(/业务性为空|判不出|不等于有数据/)
+    expect(rule, 'responseShape 的实况必须写准（已在 schema 透出，但判据不消费）')
+      .toMatch(/response_shape.*不消费它|不消费/)
+    // 双向自检：旧「一律」句必被判据①拒掉
+    const ACCIDENT = '…`code:200` 且无数据字段的，一律当作 `not_found`，不当作成功。'
+    expect(/无数据字段的，一律当作/.test(ACCIDENT), '事故行必被①抓红').toBe(true)
+  })
+
+
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
     const s = read('docs/superpowers/specs/2026-10-13-存储层-design.md')
     expect(s).toMatch(/本 spec 是 2026-10-13 的历史记录（2026-10-30 状态注）/)
