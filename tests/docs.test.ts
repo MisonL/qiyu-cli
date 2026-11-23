@@ -1163,6 +1163,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/夹具 8 是对照组/)
     expect(sp, 'ACL 夹具必须含「继承开启」反例（round 76）')
       .toMatch(/继承开启、当前 ACE 恰好只含受信主体/)
+    expect(sp, 'ACL 夹具必须含「父目录对他人可写」反例（文件 ACL 再紧也能被换掉）')
+      .toMatch(/父目录对另一个普通账户可写[\s\S]{0,80}必须 `ok:false`/)
     // ⚠️ **CodeRabbit round 75（major）**：「空名单」不等于「已保护」——null DACL 表示
     // 所有人完全访问，而它的 ACE 枚举同样是**空列表**，只按允许名单判会把最危险的形态
     // 判成 `checked:true, ok:true`。判据顺序必须是「先 DACL 存在/非空，再名单」。
@@ -1180,6 +1182,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(probe, '必须校验属主 SID（属主隐含 WRITE_DAC）').toMatch(/属主（owner SID）|属主\s*SID/)
     expect(probe, '必须点明属主可以自行补 ACE 的机制（WRITE_DAC）').toMatch(/WRITE_DAC/)
     expect(probe, '必须要求继承关闭（否则父目录一变就带进名单外 ACE）').toMatch(/继承关闭/)
+    // 父目录：文件 ACL 再紧，父目录可写就能被整个换掉（与 POSIX 目录判据同构）。
+    expect(probe, '父目录也必须受信（可被替换 = 文件 ACL 无意义）').toMatch(/父目录同样受信/)
     // 候选机制尚未实测必须如实标注（不能用未验证机制冒认已验）
     expect(probe, '取 SDDL 的机制未真机实测，必须写明').toMatch(/尚未真机实测|实测定稿前不/)
     // 双向自检：事故原句必被第一条判据拒掉（连粗体包裹的实际事故形态一起）
