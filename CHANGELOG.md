@@ -52,6 +52,17 @@
 - 文档校准的守卫全部是**双向自检**形态：从文档按行提取样本、逐字段过判据（不写会漂移的行号锚），
   事故原文喂给同一判据必红、校准后文本必绿。`tests/core/http.test.ts` 新增「非 JSON 的 5xx 与 429」用例，
   钉住 hint 按状态码插值、两种载体同落 rate_limit/network（RED 证据：修改前实测 hint 是「HTTP 429/5xx」死提及）。
+- **夹具不再依赖宿主 umask**（2026-11-23，Linux 真机首次全量暴露）：`mkdirSync(dir, { recursive: true })`
+  不传 mode 时权限是 `0777 & ~umask` —— umask 0022 的机器上 0755（无 group 写位）、umask 0002 的机器上
+  0775（group 有写位），后者会让产品侧 `checkPermissions` 的目录判据 `(dirMode & 0o022) !== 0` **正当**
+  告警「配置目录权限过宽」，于是 23 条断言「无警告」的用例假红（5 条 config + 18 条命令层）。
+  产品侧一行未改（写目录本就用 `mode: 0o700`，umask 只会去位）；8 个测试文件的夹具显式收紧配置目录权限
+  （`mode: 0o700` + `chmodSync` 双保险；systemd user / LaunchAgents / DuckDB 目录不动）。
+  验证：macOS umask 0022 与 0002 各 310/310，Linux 真机 umask 0002 310/310 且全量 110 文件 2865 passed。
+- 锁夹具的失败诊断输出改为**从 spawn 起累积**（`LockHolder.lockOutput`）：`waitForMarker` 成功即
+  `dispose()` 自己的 data 监听，用例事后挂监听拿不到唯一的 `locked` 行，那条「holder 中途死掉 vs
+  锁没生效」的归因文案会永远打 `(空)`。先红后绿钉住；`expectClean` 的数据监听零容忍同步改为减去
+  标记监听（只减标记，不放宽）。
 
 
 ## [0.2.3] - 2026-11-22
