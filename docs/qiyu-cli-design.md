@@ -1301,14 +1301,26 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 - **退出码**：`0` 成功 · `1` 业务错误 · `2` 用法错误 · `3` 网络错误 · `4` 需要 `--yes`
 - **退出码 4 必须携带** `confirm_required: true` + `confirm_arg: "--yes"` + `risk: "irreversible"` + `target`，以及 `retryable: false`
 
-> **⚠️ 样本校准说明（2026-11-22）**：上面的样本对应**完整 `api call` 链路**的输出，不是一次 `classify()` 的结果> （两者必须分开：`classify(14009)` 只交回 `code/kind/retryable/message` 四个字段，实测形态是> `{"ok":false,"error":{"code":"14009","kind":"rate_limit","retryable":true,"message":"api call too frequent"}}` ——> `hint` 与 `retry_after` 由 `http.ts` 的 `decorateRateLimit` 补，`retry_strategy/fallback` 还要 `api.ts` 拿到 spec、> 接口非危险、fallback provider 已接线且配置库路径是普通文件才会出现）。旧样本三处不实、会教 Agent 读到不可能出现的形态：
-> 旧样本会教 Agent 读到不可能出现的形态：① `retryable` 旧写 `false`，而实现恒 `true`（`src/core/errors.ts` 里
-> 「设计稿在限流的 retryable 上自相矛盾，本计划取 true」的裁决注释）—— 只有 `retryable:true` 才让
-> §11.2 D 表按 `retry_after` 秒数分流有意义；② `hint` 旧写「该接口每分钟限 1 次」，src 全仓无该文案，
-> 真实文案由 `decorateRateLimit` 按三态（未登记 / 实测无限频 / doc 来源）生成，样本取的是「未登记」档；
-> ③ `retry_after` 旧写 `{"seconds":43}`，而 `source` 是类型**必填**五值（`observed/doc/local/header/fallback`），
-> skill 正文的整个「该不该信这个秒数」分流都建立在 `source` 上——缺它就教 Agent 读一个不可能出现的载荷。
-> 样本取 `fallback` 档（未登记接口的保守兜底 60s），与上面的 hint 同源；本样本的接口是 `ticket.search`（未登记在限频表、有本地表映射，首表 `tickets`）—— 三键同源才自洽：未登记 → hint「未登记」档 + `source:"fallback"` + 映射表首表。 `hint` 是「限流分类档 + fallback 追加段」**拼接后**的完整形态（`src/commands/api.ts` 里 `hint = hint ? hint + note : note`），不是单一分支文案。
+> **⚠️ 样本校准说明（2026-11-22）**：上面的样本对应**完整 `api call` 链路**的输出，不是一次 `classify()` 的结果。
+> 各字段由哪一层加，必须标清：
+> - `classify(14009)` 只交回 `code/kind/retryable/message` 四个字段，返回的是**裸错误对象**；
+>   命令行看到的外壳 `{"ok":false,"error":{…}}` 由 `api.ts` 的 `fail()` 加上，不是 `classify()` 的产物。
+> - `hint` 与 `retry_after` 由 `http.ts` 的 `decorateRateLimit` 补。
+> - `retry_strategy`/`fallback` 还要 `api.ts` 拿到 spec、接口非危险、fallback provider 已接线且配置库路径是普通文件才会出现。
+>
+> 旧样本三处不实、会教 Agent 读到不可能出现的形态：
+> - ① `retryable` 旧写 `false`，而实现恒 `true`（`src/core/errors.ts` 里
+>   「设计稿在限流的 retryable 上自相矛盾，本计划取 true」的裁决注释）—— 只有 `retryable:true` 才让
+>   §11.2 D 表按 `retry_after` 秒数分流有意义。
+> - ② `hint` 旧写「该接口每分钟限 1 次」，src 全仓无该文案，真实文案由 `decorateRateLimit` 按三态
+>   （未登记 / 实测无限频 / doc 来源）生成，样本取的是「未登记」档。
+> - ③ `retry_after` 旧写 `{"seconds":43}`，而 `source` 是类型**必填**五值（`observed/doc/local/header/fallback`），
+>   skill 正文的整个「该不该信这个秒数」分流都建立在 `source` 上——缺它就教 Agent 读一个不可能出现的载荷。
+>
+> 样本取 `fallback` 档（未登记接口的保守兜底 60s），与上面的 hint 同源；本样本的接口是 `ticket.search`
+> （未登记在限频表、有本地表映射，首表 `tickets`）—— 三键同源才自洽：未登记 → hint「未登记」档 +
+> `source:"fallback"` + 映射表首表。`hint` 是「限流分类档 + fallback 追加段」**拼接后**的完整形态
+> （`src/commands/api.ts` 里 `hint = hint ? hint + note : note`），不是单一分支文案。
 > `retry_strategy`/`fallback` 仍是**条件键**（下方 G1 交付注的三条边界不变），不是恒有。
 
 > **`retry_strategy` / `fallback` 的交付状态（2026-10-24，G1）**：上面示例里这两个字段**已有生产者** —— `api call` 撞限流（`kind: rate_limit`）且该接口**非危险**、有同步任务映射、本地库文件存在时，输出 `retry_strategy: "switch_to_local"` 与 `fallback: "qiyu query --table <表>"`，并在 `hint` 里点名该接口的其余本地表。三处诚实边界：
