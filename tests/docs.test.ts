@@ -1151,6 +1151,20 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 夹具清单里必须有这条判据的最小反例：写成黑名单的实现只有它必红。
     expect(sp, 'ACL 夹具必须含「另一个具名用户 SID 显式 Read」最小反例')
       .toMatch(/另一个具名用户 SID[\s\S]{0,120}(最小反例|只有这条会红)/)
+    expect(sp, 'ACL 夹具必须含 null DACL 与空 DACL 两条空态（round 75）')
+      .toMatch(/null DACL\*\*[\s\S]{0,160}空 DACL\*\*/)
+    // ⚠️ **CodeRabbit round 75（major）**：「空名单」不等于「已保护」——null DACL 表示
+    // 所有人完全访问，而它的 ACE 枚举同样是**空列表**，只按允许名单判会把最危险的形态
+    // 判成 `checked:true, ok:true`。判据顺序必须是「先 DACL 存在/非空，再名单」。
+    expect(probe, '必须先把 null DACL 判掉（空名单 ≠ 已保护）').toMatch(/null DACL/)
+    expect(probe, '必须写明 null DACL 的语义是「所有人完全访问」，而不是「枚举结果为空」')
+      .toMatch(/所有人[^。；]{0,20}完全访问|无访问控制/)
+    expect(probe, '判据顺序必须是三步：① DACL 存在 ② DACL 非空 ③ 再做允许名单')
+      .toMatch(/①\s*\*\*DACL 存在\*\*[\s\S]{0,120}②\s*\*\*DACL 非空\*\*[\s\S]{0,120}③/)
+    expect(probe, '空 DACL（拒绝所有人）也必须判不通过，不得当成「收紧得好」')
+      .toMatch(/空 DACL[^。；]{0,80}(ok:false|判不通过|拒)/)
+    // 候选机制尚未实测必须如实标注（不能用未验证机制冒认已验）
+    expect(probe, '取 SDDL 的机制未真机实测，必须写明').toMatch(/尚未真机实测|实测定稿前不/)
     // 双向自检：事故原句必被第一条判据拒掉（连粗体包裹的实际事故形态一起）
     expect(BLACKLIST.test('必须**枚举现有 ACE 确认没有残留的显式广域主体**（`*S-1-1-0` Everyone…）'),
       '事故原句必被抓红').toBe(true)
