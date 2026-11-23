@@ -9,6 +9,12 @@ let home = ''
 const writeCfg = (obj: unknown): string => {
   const dir = join(home, '.config', 'qiyu')
   mkdirSync(dir, { recursive: true })
+  // ⚠️ `mkdirSync` 不传 mode 时得到 `0777 & ~umask`，**随宿主 umask 漂移**：
+  // umask 0022 → 0755（无 group 写位，checkPermissions 不警告）；umask 0002 → 0775
+  // （group 有写位 → 正当判成「配置目录权限过宽」）。2026-11-23 在 umask 0002 的
+  // Linux 主机实测 23 条用例假红，本机 macOS（umask 0022）全绿。
+  // 夹具必须显式收紧，断言才只考实现而不考宿主 umask。
+  chmodSync(dir, 0o700)
   const p = join(dir, 'config.json')
   writeFileSync(p, typeof obj === 'string' ? obj : JSON.stringify(obj))
   return p

@@ -24,7 +24,12 @@ const cfgPath = (): string => join(home, '.config', 'qiyu', 'config.json')
 
 /** 写配置并显式设权限（默认 0600 —— 含凭证的文件权限过宽会被拒绝）。 */
 function writeCfg(obj: unknown, mode = 0o600): void {
-  mkdirSync(join(home, '.config', 'qiyu'), { recursive: true })
+  const dir = join(home, '.config', 'qiyu')
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  // ⚠️ 目录权限同样显式收紧：`mkdirSync` 不传 mode = `0777 & ~umask`，umask 0002 的机器
+  // 上得到 0775（group 写位）→ checkPermissions 正当告警，断言「无警告」的用例假红
+  // （2026-11-23 Linux 真机实测）。夹具只该考实现，不该考宿主 umask。
+  chmodSync(dir, 0o700)
   writeFileSync(cfgPath(), typeof obj === 'string' ? obj : JSON.stringify(obj))
   chmodSync(cfgPath(), mode)
 }
@@ -260,6 +265,8 @@ describe('权限裁决（loadConfigChecked）', () => {
     // 换个路径仍要警告（去重按路径记键，不是全局只说一次）
     const other = configPathFor(join(home, 'otherhome'))
     mkdirSync(dirname(other), { recursive: true })
+    // 目录同样收紧（umask 0002 下默认 0775 会多出一条「配置目录」警告，把计数抬到 3）
+    chmodSync(dirname(other), 0o700)
     writeFileSync(other, JSON.stringify({ profiles: { default: { store: {} } } }))
     chmodSync(other, 0o644)
     checkPermissions(other, { hasCredentials: false, onWarn })
@@ -305,7 +312,7 @@ describe('原子写入（writeConfigFile）', () => {
   it('符号链接 → 拒绝写入，链接目标原样不变', () => {
     const target = join(home, 'elsewhere.json')
     writeFileSync(target, '{"profiles":{}}')
-    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true })
+    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true, mode: 0o700 })
     symlinkSync(target, cfgPath())
     expect(() => writeConfigFile(cfgPath(), content)).toThrow(/符号链接/)
     expect(readFileSync(target, 'utf8')).toBe('{"profiles":{}}')

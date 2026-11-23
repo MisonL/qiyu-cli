@@ -594,7 +594,7 @@ describe('store 命令面与 help', () => {
     vi.stubEnv('USERPROFILE', dir)
     // ① 配置含未知键 → resolveStoreConfig 抛 → usageFail（验收 8）
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({ bogus: 1 }))
     expect(await storeCommand(['status'])).toBe(2)
     expect(JSON.parse(out).error.kind).toBe('usage')
@@ -939,7 +939,7 @@ describe('store 命令 —— 未知 profile 必须拒绝（2026-10-27 实测修
   // 退出码 2（usage：改参数重来）+ 绝不产生文件。
   const writeConfig = (): void => {
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
       defaultProfile: 'prod',
       profiles: { prod: { store: { path: join(dir, 'prod.duckdb') } } },

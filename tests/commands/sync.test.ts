@@ -772,7 +772,7 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
     // 注入 robotId 后 categories 不再依赖 items 的 DISTINCT —— 配置文件给 1000009
     //（不在 items 落库集内），断言 getCategoryTree 收到注入的 robotId。
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
       profiles: { default: { store: {
         path: dbPath(),
@@ -807,7 +807,7 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
     // 任一元素不是正整数即 usageFail —— 此前 map(Number).filter 会把 ["abc", -1]
     // 静默丢成空数组（用户 typo 了 robotId 却毫无反馈）。
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     const writeCfg = (ids: unknown): void => {
       writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
         profiles: { default: { store: { path: dbPath(), options: { knowledgeRobotIds: ids } } } },
@@ -872,7 +872,7 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
     // `profiles.<name>.robots` 映射，若不接一个真实消费方，它就是个声明了却没人读的
     // 字段 —— 而那正是「契约诚实性」要消灭的形态（配置里写了 robotId，同步却当没看见）。
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
       profiles: { default: {
         store: { path: dbPath() },     // 不含 options.knowledgeRobotIds
@@ -909,7 +909,7 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
     // ⚠️ 含凭证时是**拒绝**（不是警告），所以这条必须用不含凭证的配置 ——
     // 那正是"警告不阻断"这半边口径唯一还能观察到的地方。
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
       profiles: { default: { store: { path: dbPath() } } },
     }))
@@ -928,7 +928,7 @@ describe('sync run —— 生产接线（fetchZip / 任务排序 / robotId 注�
 
   it('knowledgeRobotIds 优先于 robots 键（显式配置不被兜底覆盖）', async () => {
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
       profiles: { default: {
         store: { path: dbPath(), options: { knowledgeRobotIds: [1000009] } },
@@ -1250,7 +1250,7 @@ describe('sync verify', () => {
 describe('sync run/verify —— --profile 同时选中凭证与库（A1）', () => {
   /** 写一份两份凭证的配置，并清掉环境变量凭证（env 齐备时根本不读文件）。 */
   function fileCredentialsOnly(): void {
-    mkdirSync(join(dir, '.config', 'qiyu'), { recursive: true })
+    mkdirSync(join(dir, '.config', 'qiyu'), { recursive: true, mode: 0o700 })
     const p = join(dir, '.config', 'qiyu', 'config.json')
     writeFileSync(p, JSON.stringify({ defaultProfile: 'prod', profiles: {
       prod: { credentials: { appKey: 'prod-key', appSecret: 'prod-secret' } },
@@ -1461,7 +1461,7 @@ describe('sync install', () => {
     // 用 --profile 断言「只透传显式给出者」）
     out = ''
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
       profiles: { default: { store: { path: dbPath() } } },
     }))
@@ -1511,7 +1511,7 @@ describe('sync install', () => {
     vi.stubEnv('USERPROFILE', dir)
     await fresh().then((s) => s.close())
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
       profiles: { default: { store: { path: dbPath() } } },
     }))
@@ -1574,7 +1574,7 @@ describe('sync install', () => {
     // 后果不是立刻报错，而是静默钉死：之后改配置文件的 store.path 对已装的调度任务
     // 永远不生效，且用户从未设过的变量变成了一个显式 flag。
     const cfgDir = join(dir, '.config', 'qiyu')
-    mkdirSync(cfgDir, { recursive: true })
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 })
     writeFileSync(join(cfgDir, 'config.json'), JSON.stringify({
       profiles: { default: { store: { path: dbPath() } } },
     }))

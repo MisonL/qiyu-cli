@@ -36,7 +36,7 @@ const dbPath = (): string => join(home, 'q.db')
 /** 写一份**含凭证**且权限过宽的配置（默认 0644，可改判据覆盖的其他形态）。 */
 function writeWideConfig(mode = 0o644): string {
   const dir = join(home, '.config', 'qiyu')
-  mkdirSync(dir, { recursive: true })
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
   const p = join(dir, 'config.json')
   writeFileSync(p, JSON.stringify({
     profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } },
@@ -123,7 +123,7 @@ posixOnly('含凭证且权限过宽（0644）→ 六条命令同一种行为', (
     // 这条会红。C1 既有口径在 store 侧由 tests/store/config.test.ts 钉着，
     // 这里在**命令级**再钉一次（那条是解析层）。
     const dir = join(home, '.config', 'qiyu')
-    mkdirSync(dir, { recursive: true })
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
     const p = join(dir, 'config.json')
     writeFileSync(p, JSON.stringify({ profiles: { default: {} } }, null, 2))
     chmodSync(p, 0o644)
@@ -168,7 +168,7 @@ posixOnly('hint 里的路径必须可直接粘贴执行（含空格的 HOME）',
   it('HOME 含空格 → hint 里的路径被双引号包住', async () => {
     // 换一个带空格的 home 目录：beforeEach 的 home 是 mkdtemp 产物（无空格）。
     const spaced = join(home, 'with space')
-    mkdirSync(join(spaced, '.config', 'qiyu'), { recursive: true })
+    mkdirSync(join(spaced, '.config', 'qiyu'), { recursive: true, mode: 0o700 })
     const p = join(spaced, '.config', 'qiyu', 'config.json')
     writeFileSync(p, JSON.stringify({
       profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } },
@@ -197,7 +197,7 @@ posixOnly('hint 里的路径必须可直接粘贴执行（含空格的 HOME）',
     // 在另一处不可执行。
     const spaced = join(home, 'with space')
     const dir = join(spaced, '.config', 'qiyu')
-    mkdirSync(dir, { recursive: true })
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
     writeFileSync(join(dir, 'config.json'), JSON.stringify({
       profiles: { default: { credentials: { appKey: 'k', appSecret: 's' } } },
     }, null, 2))
