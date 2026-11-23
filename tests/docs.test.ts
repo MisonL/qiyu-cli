@@ -1095,6 +1095,17 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 规则行若写成「未登记一律 notFound:false」，Agent 会把真实的查无此物读成未判定。
     expect(rule, '未登记档必须按载荷载体分开：message 里的空 JSON 判、data/result 不判')
       .toMatch(/`message`[^。；]{0,80}(判|查无此物)[^。；]{0,120}(data|result)[^。；]{0,80}不判|按载荷载体/)
+    // ⚠️ **CodeRabbit round 73（minor）**：开头句「判据是「形状已登记」+「载荷结构性为空」
+    // 两条同时成立」把登记条件说成**无条件**，与同段「message 载体未登记也照判」直接矛盾——
+    // 读者按开头句理解就排除掉 `{code:200,message:"[]"}` → notFound:true 这条实测行为。
+    // 判据：开头句必须把登记条件**限定到 data/result 载体**，且写出 message 的例外。
+    const head = rule.split('：·')[0]
+    // 事故形态是**无条件**：「`not_found` 的判据是「形状已登记」+…」紧跟开头。
+    // 判据钉这个形态（所以「限定到 data/result 载体后再写双条件」是允许的写法）。
+    expect(head, '开头句不得把「形状已登记」写成无条件前提')
+      .not.toMatch(/`not_found` 的判据是\*\*「形状已登记」/)
+    expect(head, '开头句必须把登记条件限定到 data/result 载体，并点明 message 的空 JSON 例外')
+      .toMatch(/data`\/`result`[\s\S]{0,120}(时，判据是|已登记)[\s\S]{0,200}message[\s\S]{0,120}(不要求登记|例外|照判)/)
     // 同一括号里我此前写「null 以前全是写接口」——源码注释明写 null 有两种含义，
     // 其中一类是**实测过但形状不在 A/B/C/D**（chat.queue.group.query / ipcc.customfield.template.get）。
     expect(rule, '不得再说 envelope:null 全是写接口').not.toMatch(/全是写接口/)
