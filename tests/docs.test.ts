@@ -1112,7 +1112,11 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // CHANGELOG 的当前段同样写过那两条错（它也是被 Agent 读的文本）。这里**只做正向**断言：
     // 反向的整段 not.toMatch 与「叙述里引用旧的错句」天然冲突（引用即红），而漂移风险
     // 集中在**契约面**（design.md 的规则行，Agent 照它分支），那段才是负向锚的对象。
-    const cl = currentChangelogSection(read('CHANGELOG.md'))
+    // ⚠️ 扫**全部版本段**而不是「当前版本段」（CodeRabbit round 77 minor）：这条是
+    // 历史修正的「它在 CHANGELOG 里被记录过」检查——一旦发版切段，它还会被原样保留在
+    // 旧版本段里，但 `currentChangelogSection` 不再包含它，守卫会因发版而假红。
+    // 设计稿规则行本身的断言（上面那些）与版本段无关，保持不变。
+    const cl = allVersionSections(read('CHANGELOG.md'))
     expect(cl, 'CHANGELOG 必须写明载体分档（message 判、data/result 不判）')
       .toMatch(/载体[\s\S]{0,120}(message|照判)|message[\s\S]{0,60}照判/)
     expect(rule, '必须写明 null 的两种含义').toMatch(/从未实测[^。；]{0,120}(不在 A\/B\/C\/D|非标)/)
@@ -1184,6 +1188,20 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(probe, '必须要求继承关闭（否则父目录一变就带进名单外 ACE）').toMatch(/继承关闭/)
     // 父目录：文件 ACL 再紧，父目录可写就能被整个换掉（与 POSIX 目录判据同构）。
     expect(probe, '父目录也必须受信（可被替换 = 文件 ACL 无意义）').toMatch(/父目录同样受信/)
+    // ⚠️ **CodeRabbit round 77（major）**：父目录判据必须**早于建 tmp** —— tmp 继承父目录 ACL，
+    // 别人可在收紧前以共享读打开它，而**改 DACL 不撤销已打开句柄**，事后收紧救不回来。
+    // 判据钉在写序里（⓪ 在最前），不是只钉「父目录要受信」这句话在场。
+    // 写序在「真探测 ACL」之前，用 §2.4 整段（sp）而不是 probe 切片断言。
+    const writeOrder = sp.slice(sp.indexOf('2. **方案 A（以真机为闸）**'), probeAt)
+    const i0 = writeOrder.indexOf('正确顺序：⓪')
+    const i1 = writeOrder.indexOf('① **建空 tmp**')
+    expect(i0, '写序必须点名父目录校验（⓪）').toBeGreaterThanOrEqual(0)
+    expect(i1, '写序必须保留「建空 tmp」这一步').toBeGreaterThanOrEqual(0)
+    expect(i0, '父目录校验必须排在「建空 tmp」之前（顺序判据，不靠相邻字符数）').toBeLessThan(i1)
+    expect(writeOrder, '必须点明「改 DACL 不撤销已打开句柄」这条机制')
+      .toMatch(/不(会)?撤销已[^。；]{0,10}句柄/)
+    expect(writeOrder, '不可信目录必须「不建 tmp、不写 secret」，不是「先建再补救」')
+      .toMatch(/不建 tmp、不写 secret/)
     // 候选机制尚未实测必须如实标注（不能用未验证机制冒认已验）
     expect(probe, '取 SDDL 的机制未真机实测，必须写明').toMatch(/尚未真机实测|实测定稿前不/)
     // 双向自检：事故原句必被第一条判据拒掉（连粗体包裹的实际事故形态一起）
