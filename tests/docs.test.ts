@@ -1131,6 +1131,33 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
   })
 
 
+  it('spec §2.4：win32 ACL 探测必须是最小允许名单，不得退回广域主体黑名单（2026-11-23，CodeRabbit round 74）', () => {
+    // 事故：探测判据写成「枚举现有 ACE 确认没有残留的显式广域主体」（Everyone /
+    // BUILTIN\Users / Authenticated Users 枚举）。具名用户被 `icacls /grant:r *<SID>:(R)`
+    // 显式授权、且无对应 deny ACE 时，黑名单漏判 → 报 `checked:true, ok:true`，而那个账户
+    // 照样能读 appSecret —— 与 spec §2.1 自己定义的「凭证可被他人读却报成功」同类。
+    // ⚠️ 负向锚钉「判据形态」而不是某一版排版：事故原句的粗体包住整段
+    // （`**枚举现有 ACE 确认没有残留的显式广域主体**`），所以锚里不能带 `**`。
+    const BLACKLIST = /确认没有残留的显式广域主体/
+    const sp = read('docs/superpowers/specs/2026-11-22-剩余功能域对接封装-design.md')
+    const probe = sp.split('\n').find((l) => l.includes('真探测 ACL')) ?? '(找不到探测段)'
+    expect(probe, '探测判据不得写成广域主体黑名单').not.toMatch(BLACKLIST)
+    expect(probe, '探测判据必须是最小允许名单（名单外一律拒绝，不是枚举广域主体）')
+      .toMatch(/最小允许名单/)
+    expect(probe, '「默认拒绝」必须落在句子里：出现任何其他主体的允许 ACE 即判不通过')
+      .toMatch(/任何其他主体的允许 ACE 即判/)
+    expect(probe, '必须点破漏判的具体形态：具名用户的显式授权（黑名单天然漏一族）')
+      .toMatch(/具名用户[^。；]{0,60}(SID|显式授权)/)
+    // 夹具清单里必须有这条判据的最小反例：写成黑名单的实现只有它必红。
+    expect(sp, 'ACL 夹具必须含「另一个具名用户 SID 显式 Read」最小反例')
+      .toMatch(/另一个具名用户 SID[\s\S]{0,120}(最小反例|只有这条会红)/)
+    // 双向自检：事故原句必被第一条判据拒掉（连粗体包裹的实际事故形态一起）
+    expect(BLACKLIST.test('必须**枚举现有 ACE 确认没有残留的显式广域主体**（`*S-1-1-0` Everyone…）'),
+      '事故原句必被抓红').toBe(true)
+    expect(BLACKLIST.test('必须枚举现有 ACE，出现任何其他主体的允许 ACE 即判 ok:false'),
+      '最小允许名单形态必须放过').toBe(false)
+  })
+
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
     const s = read('docs/superpowers/specs/2026-10-13-存储层-design.md')
     expect(s).toMatch(/本 spec 是 2026-10-13 的历史记录（2026-10-30 状态注）/)
