@@ -1131,7 +1131,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
   })
 
 
-  it('spec §2.4：win32 ACL 探测必须是最小允许名单，不得退回广域主体黑名单（2026-11-23，CodeRabbit round 74）', () => {
+  it('spec §2.4：win32 ACL 探测必须是封闭式受信状态清单（round 74/75/76 逐个堵漏后收敛）', () => {
     // 事故：探测判据写成「枚举现有 ACE 确认没有残留的显式广域主体」（Everyone /
     // BUILTIN\Users / Authenticated Users 枚举）。具名用户被 `icacls /grant:r *<SID>:(R)`
     // 显式授权、且无对应 deny ACE 时，黑名单漏判 → 报 `checked:true, ok:true`，而那个账户
@@ -1140,7 +1140,11 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // （`**枚举现有 ACE 确认没有残留的显式广域主体**`），所以锚里不能带 `**`。
     const BLACKLIST = /确认没有残留的显式广域主体/
     const sp = read('docs/superpowers/specs/2026-11-22-剩余功能域对接封装-design.md')
-    const probe = sp.split('\n').find((l) => l.includes('真探测 ACL')) ?? '(找不到探测段)'
+    // ⚠️ 探测判据已从「一段话」长成「一个清单」（round 75/76 后是 7 条），按单行提取会
+    // 只拿到第一行——判据必须取「真探测 ACL」到 §2.5 之间的整段（清单条目在其后各行）。
+    const probeAt = sp.indexOf('真探测 ACL')
+    const probeEnd = sp.indexOf('### 2.5', probeAt)
+    const probe = probeAt >= 0 && probeEnd > probeAt ? sp.slice(probeAt, probeEnd) : '(找不到探测段)'
     expect(probe, '探测判据不得写成广域主体黑名单').not.toMatch(BLACKLIST)
     expect(probe, '探测判据必须是最小允许名单（名单外一律拒绝，不是枚举广域主体）')
       .toMatch(/最小允许名单/)
@@ -1153,16 +1157,29 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/另一个具名用户 SID[\s\S]{0,120}(最小反例|只有这条会红)/)
     expect(sp, 'ACL 夹具必须含 null DACL 与空 DACL 两条空态（round 75）')
       .toMatch(/null DACL\*\*[\s\S]{0,160}空 DACL\*\*/)
+    expect(sp, 'ACL 夹具必须含「外来属主」反例（round 76）')
+      .toMatch(/另一个普通账户作属主[\s\S]{0,120}必须 `ok:false`/)
+    expect(sp, '外来属主夹具必须点名夹具 8 为对照组（否则无法证明没有把好形态一起拒掉）')
+      .toMatch(/夹具 8 是对照组/)
+    expect(sp, 'ACL 夹具必须含「继承开启」反例（round 76）')
+      .toMatch(/继承开启、当前 ACE 恰好只含受信主体/)
     // ⚠️ **CodeRabbit round 75（major）**：「空名单」不等于「已保护」——null DACL 表示
     // 所有人完全访问，而它的 ACE 枚举同样是**空列表**，只按允许名单判会把最危险的形态
     // 判成 `checked:true, ok:true`。判据顺序必须是「先 DACL 存在/非空，再名单」。
     expect(probe, '必须先把 null DACL 判掉（空名单 ≠ 已保护）').toMatch(/null DACL/)
     expect(probe, '必须写明 null DACL 的语义是「所有人完全访问」，而不是「枚举结果为空」')
       .toMatch(/所有人[^。；]{0,20}完全访问|无访问控制/)
-    expect(probe, '判据顺序必须是三步：① DACL 存在 ② DACL 非空 ③ 再做允许名单')
-      .toMatch(/①\s*\*\*DACL 存在\*\*[\s\S]{0,120}②\s*\*\*DACL 非空\*\*[\s\S]{0,120}③/)
+    expect(probe, '判据必须是封闭清单：任一条不满足即拒（不是逐个补黑名单）')
+      .toMatch(/封闭清单|任一条不满足即/)
+    expect(probe, '清单第 1/2 条必须是 DACL 存在 + 非空（按序号相邻）')
+      .toMatch(/1\.\s*\*\*DACL 存在\*\*[\s\S]{0,200}2\.\s*\*\*DACL 非空\*\*/)
     expect(probe, '空 DACL（拒绝所有人）也必须判不通过，不得当成「收紧得好」')
       .toMatch(/空 DACL[^。；]{0,80}(ok:false|判不通过|拒)/)
+    // ⚠️ **CodeRabbit round 76（major）**：属主隐含 WRITE_DAC —— 非受信账户作属主时
+    // 可以随时给自己补读 ACE，ACE 名单永远看不出来。判据必须把属主也列入受信状态。
+    expect(probe, '必须校验属主 SID（属主隐含 WRITE_DAC）').toMatch(/属主（owner SID）|属主\s*SID/)
+    expect(probe, '必须点明属主可以自行补 ACE 的机制（WRITE_DAC）').toMatch(/WRITE_DAC/)
+    expect(probe, '必须要求继承关闭（否则父目录一变就带进名单外 ACE）').toMatch(/继承关闭/)
     // 候选机制尚未实测必须如实标注（不能用未验证机制冒认已验）
     expect(probe, '取 SDDL 的机制未真机实测，必须写明').toMatch(/尚未真机实测|实测定稿前不/)
     // 双向自检：事故原句必被第一条判据拒掉（连粗体包裹的实际事故形态一起）
