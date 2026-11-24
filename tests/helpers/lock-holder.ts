@@ -390,7 +390,13 @@ export async function spawnLockHolder(
     ? `const { DuckDBInstance } = await import(${JSON.stringify(PKG_URL.href)})
 const inst = await DuckDBInstance.create(${JSON.stringify(o.dbPath)}, { access_mode: 'READ_ONLY' })
 const c = await inst.connect()
-await c.run('SELECT 1')
+// ⚠️ 报到前**真读一次存储层**，不靠 \`SELECT 1\`（2026-11-23）：marker 的语义是「锁已取得」，
+// 而 \`SELECT 1\` 是常量折叠式查询、不触碰数据库文件——它证明的只是「连接可用」。决定改谓词
+// 的是 CI run 45121310111（Node 20.12）的 READ_ONLY 臂：holder 存活、marker 已到，18 次独立
+// 校验却全 OPENED。⚠️ **根因未定位**：本机 /proc/locks 探针显示该版本 create 时就已持有锁
+// （macOS 22/24 与 Linux 真机 Ubuntu 24.04 的 Node 20.12/24、2 核限核加压都不复现）。
+// 所以这是一次**谓词加固**（与 RW 臂「先跑 DDL 再报到」同源），不宣称已修好 CI 那条红。
+await c.run('SELECT count(*) FROM duckdb_tables()')
 console.log('locked')
 setInterval(() => {}, 1 << 30)`
     // ⚠️ 先跑一条 DDL 再报到：语句成功 = 写事务已取得，文件锁已在盘上。
@@ -406,6 +412,15 @@ setInterval(() => {}, 1 << 30)`
   //满宽限再失败。error也在这里兜住（信号送不出去 / spawn失败），terminateHolder用它的
   //原文作归因；同一监听同时避免未处理的 error冒成未捕获异常。
   const holder = child as LockHolder
+  // ⚠️ 诊断缓冲在 marker 等待**之前**就要开始累积（Codex round 19 P3）：`waitForMarker`
+  // 成功后 `dispose()` 掉自己的 data 监听，用例事后挂 `holder.stdout.on('data')` 只能拿到
+  // marker 之后的输出——正常 holder 打印完 `locked` 就不再说话，失败归因会永远打 `(空)`。
+  // 监听带 `__lockHolderTrack` 标记，与下面 close/error 的状态标记同一约定（不挂起等待、
+  // 不持引用），`expectClean` 的零容忍只对非标记监听生效。
+  holder.lockOutput = ''
+  const onOutMark = Object.assign((d: unknown): void => { holder.lockOutput += String(d) }, { __lockHolderTrack: true })
+  holder.stdout?.on('data', onOutMark)
+  holder.stderr?.on('data', onOutMark)
   // ⚠️这两个监听是**状态标记**，不是等待原语：没有定时器、不持有引用（随 child一起回收），
   //且必须活到用例收尾才能回答「它是不是已经 close过」——`expectClean`的「零 close监听」
   //只对会挂住/泄漏的监听有意义，故用标记把它们与真正的等待监听区分开（见测试侧的过滤）。
@@ -414,7 +429,7 @@ setInterval(() => {}, 1 << 30)`
   holder.on('close', onCloseMark)
   holder.on('error', onErrorMark)
   await waitForMarker(child, 'locked', o.deadline, '锁持有者')
-  return child
+  return holder
 }
 
 /**
@@ -542,6 +557,12 @@ export interface LockHolder extends ChildProcess {
  lockClosed?: boolean
  /**原生 error事件（信号送不出去等）——终止失败时作为 cause/文案来源。 */
  lockError?: Error
+ /**
+  *从 spawn 起累积的 stdout+stderr（诊断用）。
+  * ⚠️必须在 `waitForMarker` **之前**开始捕获：它在成功后 `dispose()` 自己的 data 监听，
+  * 外部事后挂监听拿不到已经吐过的 marker 行（Codex round 19 P3）。
+  */
+ lockOutput: string
 }
 
 /**

@@ -28,6 +28,9 @@ afterEach(() => {
 function pointConfigAt(dbPath: string): void {
   const dir = join(home, '.config', 'qiyu')
   mkdirSync(dir, { recursive: true })
+  // 目录权限同样不随宿主 umask 漂移：不传 mode 时 umask 0002 下得到 0775，
+  // 配置层会正当告警「配置目录权限过宽」，与文件 0600 的处理同源。
+  chmodSync(dir, 0o700)
   const p = join(dir, 'config.json')
   writeFileSync(p, JSON.stringify({
     profiles: { default: { store: { path: dbPath } } },
@@ -113,6 +116,7 @@ describe('默认提供者：endpoint → 本地表映射', () => {
     const dir = join(home, '.config', 'qiyu')
     mkdirSync(dir, { recursive: true })
     const p = join(dir, 'config.json')
+    chmodSync(dir, 0o700)
     writeFileSync(p, '{不是 JSON')
     chmodSync(p, 0o600)
     vi.stubEnv('HOME', home)

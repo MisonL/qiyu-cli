@@ -491,14 +491,15 @@ export async function call(
         // 两者都是"请求没到达业务层"，而不是"业务层拒绝了请求"。
         transient
           ? { code: String(status), kind: 'network', retryable: true,
-              hint: '网关瞬时故障（HTTP 429/5xx），请退避后重试' }
+              hint: `网关瞬时故障（HTTP ${status}），请退避后重试` }
           : { code: String(status), kind: 'internal', retryable: false },
       )
     }
 
     const norm = normalize(raw, spec.envelope ?? undefined)
 
-    // 时间戳超期：core 层用新时间戳重签重试一次，对 Agent 永不可见。
+    // 时间戳超期：core 层用新时间戳重签重试一次 —— **救得回才对 Agent 不可见**：偏差在 5 分钟内
+    // 且重签能拿到新时间戳时 Agent 看不到 14003；第二次仍被拒就如实落 `bad_time`（下方注释）。
     // ⚠️ 必须一并检查 `opts.noRetry` —— 否则 `noRetry:true` 下仍会发出第二个
     // 请求，与 `CallOptions.noRetry` 的注释（"跳过令牌桶与重试"）不符。
     // 网络重试那一支已有这个检查，这里漏了会让两条重试路径的语义不一致。

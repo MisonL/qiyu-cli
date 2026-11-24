@@ -959,6 +959,292 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(s, '「D 交付后缓存查询生效」的旧承诺不得回归').not.toMatch(/D 交付后缓存查询生效/)
   })
 
+
+  it('设计稿 §4.1 与 §12 的抓包口径一致（2026-11-22 校准，两处不得再分叉）', () => {
+    // 事故：§4.1 原文逐字声称「已对线上 API 验证（原始 TCP 抓包、逐字节比对…）」，
+    // §12 却挂账「原始 TCP 抓包验证实际发出的字节——未做」——同一文档两套口径，读者
+    // 无从判断到底做没做过（报文级产物从未留存仓库）。修法：§4.1 收窄为「真实凭证往返、
+    // 抓包产物未留存」，§12 把「未做仍挂账」升格为「显式非目标」并附判据。
+    const s = design()
+    // ① §4.1 不得再出现「已…抓包」的完成时声称（锚整句形态，校准注里引用的原文带「」引号，命中不了本锚）
+    expect(s, '§4.1 不得再声称已完成原始 TCP 抓包验证')
+      .not.toMatch(/^已对线上 API 验证（原始 TCP 抓包、逐字节比对/m)
+    expect(s, '§4.1 必须改成「往返验证」并保留真实覆盖范围')
+      .toMatch(/^已对线上 API 往返验证（\*\*真实凭证、覆盖中文\/emoji\/转义\/换行，均 `code:200`\*\*）/m)
+    // ⚠️ **Codex round 23（P2）**：往返成功 ≠ 观测到 undici 的出站头。此前把
+    // 「Content-Length 为字节数」写成往返实测结论——它只是库行为说明，未在本仓库测量。
+    expect(s, '必须写明往返验证的是「服务端认了签名」，不是出站报文')
+      .toMatch(/验证的是「服务端接受并认了签名」这一结果，不是出站报文本身/)
+    expect(s, 'undici 的两条行为必须标注「未在本仓库独立测量」')
+      .toMatch(/undici 库行为说明（未在本仓库独立测量）/)
+    expect(s, '不得再把 Content-Length 写成逐字节/往返实测结论')
+      .not.toMatch(/Content-Length` 为字节数，所有往返校验均通过/)
+    // ② 校准注在场
+    expect(s, '§4.1 与 §12 的矛盾必须写明（口径校准注）').toMatch(/口径校准（2026-11-22）/)
+    expect(s).toMatch(/报文级抓取产物从未留存于本仓库/)
+    // ③ §12 不得回到「未做，仍挂账」，必须是显式非目标
+    expect(s, '§12 不得再把抓包写成待办挂账').not.toMatch(/原始 TCP 抓包验证实际发出的字节 —— \*\*未做\*\*，仍挂账/)
+    expect(s, '§12 必须升级为显式非目标并给判据').toMatch(/原始 TCP 抓包验证实际发出的字节 —— \*\*显式非目标（2026-11-22 裁定，与 §4.1 口径一致）\*\*/)
+    expect(s).toMatch(/校验和只覆盖 `body 原文` 与 `time` 文本、与传输层无关/)
+    // ④ 双向自检：事故原文必须被①③的锚抓到
+    const ACC1 = '已对线上 API 验证（原始 TCP 抓包、逐字节比对，覆盖中文/emoji/转义/换行）：undici 将…'
+    const ACC2 = '原始 TCP 抓包验证实际发出的字节 —— **未做**，仍挂账（需要抓包环境…）'
+    expect(/^已对线上 API 验证（原始 TCP 抓包、逐字节比对/m.test(ACC1), '事故§4.1必被①锚抓到').toBe(true)
+    expect(/原始 TCP 抓包验证实际发出的字节 —— \*\*未做\*\*，仍挂账/.test(ACC2), '事故§12必被③锚抓到').toBe(true)
+  })
+
+
+  it('设计稿 §9.1 失败样本与真实出口逐字段一致（2026-11-22 校准，不得回归）', () => {
+    // 事故：样本曾写 `retryable: false`（实现恒 true，errors.ts 的裁决注释就在源码里）、
+    // hint 写「该接口每分钟限 1 次」（全 src 无该文案）、retry_after 缺类型必填的 source
+    // （skill 正文的秒数可信度分流整个建立在 source 上）、fallback 首表 order_performance
+    // 与其端点已登记 observed/30s 的限频档自相矛盾。样本自称契约，错一处就是教 Agent
+    // 分支一个不可能的形状。判据对「文档里的真实样本」与「按行锚提取」生效。
+    const s = design()
+    const failSample = /"ok": false, "error": \{([\s\S]*?)\n\}\}/.exec(s)?.[1]
+    expect(failSample, '失败样本必须能按现形提取到（改格式时同步改本守卫）').toBeDefined()
+    const line = (src: string, k: string): string =>
+      src.split('\n').map((l) => l.trim()).find((l) => l.startsWith(`"${k}"`)) ?? ''
+    const L = (k: string): string => line(failSample!, k)
+    // ① 逐字段判据（每条都能被对应事故形态触发）
+    expect(L('code'), '样本 14009 行必须是 retryable: true —— 实现恒 true（errors.ts裁决注释）')
+      .toMatch(/^"code": "14009", "kind": "rate_limit", "retryable": true,?$/)
+    expect(L('hint'), '样本 hint 不得是 src 里不存在的编造文案').not.toMatch(/每分钟限 1 次/)
+    expect(L('hint'), '样本 hint 必须是未登记档 + fallback 追加段的拼接完整形态（api.ts 是拼接）')
+      .toMatch(/该接口未登记在本地限频表[\s\S]*该接口在同步任务里有本地表映射[\s\S]*没有打开库、没有确认这些表存在/)
+    expect(L('retry_after'), 'retry_after.source 是类型必填五值，样本缺它就教 Agent 读不可能的载荷')
+      .toMatch(/^"retry_after": \{"seconds": \d+, "source": "(observed|doc|local|header|fallback)"\},?$/)
+    expect(L('fallback'), 'fallback 首表与「未登记档」自洽（order_performance 端点已登记 observed/30s，矛盾）')
+      .toBe('"fallback": "qiyu query --table tickets"')
+    // ② 校准注在场（删注必须红）
+    expect(s, '样本校准说明必须在场').toMatch(/样本校准说明（2026-11-22）/)
+    //③ 双向自检：把 2026-11-22 之前的**事故样本**喂给①的同一组判据，四条都必须不通过
+    const ACCIDENT = [
+      '  "code": "14009", "kind": "rate_limit", "retryable": false,',
+      '  "message": "api call too frequent",',
+      '  "hint": "该接口每分钟限 1 次",',
+      '  "retry_after": {"seconds": 43},',
+      '  "retry_strategy": "switch_to_local",',
+      '  "fallback": "qiyu query --table order_performance"',
+    ].join('\n')
+    expect(/^"code": "14009", "kind": "rate_limit", "retryable": true,?$/.test(line(ACCIDENT, 'code')), '事故 retryable 必被①判红').toBe(false)
+    expect(!/每分钟限 1 次/.test(line(ACCIDENT, 'hint')), '事故 hint 必被①判红').toBe(false)
+    expect(/^"retry_after": \{"seconds": \d+, "source": "(observed|doc|local|header|fallback)"\},?$/.test(line(ACCIDENT, 'retry_after')), '事故缺 source 必被①判红').toBe(false)
+    expect(line(ACCIDENT, 'fallback') === '"fallback": "qiyu query --table tickets"', '事故矛盾首表必被①判红').toBe(false)
+  })
+
+
+  it('设计稿 §3.2 目录树的交付状态注在场，四处实际落点逐个点名（2026-11-22 回写，不得回归）', () => {
+    // 事故：§3.2 是设计期目标布局，从未对齐交付实况——sandbox 实际在 src/query/、
+    // kysely.ts 未交付（C2 挂账）、sync/export.ts 从未单独成文件（实现在 tasks/pipeline+
+    // sessions）、domains/ 整层未建。Agent 照树找文件会四处落空，而全文没有一处说明。
+    const s = design()
+    const tree = /### 3\.2 目录结构[\s\S]*?\n```[\s\S]*?\n```/.exec(s)
+    expect(tree, '§3.2 树必须还在（本守卫锚它后面的状态注）').not.toBeNull()
+    const after = s.slice(tree!.index + tree![0].length, tree!.index + tree![0].length + 1600)
+    expect(after, '树后必须紧跟交付状态注').toMatch(/交付状态注（2026-11-22 回写）/)
+    //四处偏差逐条点名（漏一条注就退化成泛泛"以仓库为准"，等于没写）
+    expect(after).toMatch(/`store\/sandbox\.ts`[\s\S]*?src\/query\/sandbox\.ts/)
+    expect(after).toMatch(/`store\/kysely\.ts`[\s\S]*?未交付/)
+    expect(after).toMatch(/`sync\/export\.ts`[\s\S]*?不是单独文件/)
+    expect(after).toMatch(/`domains\/`[\s\S]*?未建/)
+    // 结构结论不变的边界也要写（防止把注读成"整节作废"）
+    expect(after).toMatch(/结构性结论不变/)
+    //双向自检：事故形态（无注的旧文）必红——after 里如果只有树没有注，上面的锚即红；
+    //这里对「泛泛一句」的退化形态显式验证判据抓得住
+    const DEGENERATE = '以运行时仓库为准。'
+    expect(/`store\/sandbox\.ts`[\s\S]*?src\/query\/sandbox\.ts/.test(DEGENERATE)).toBe(false)
+  })
+
+
+  it('设计稿 §4.3：14003「永不可见」已补前提（bad_time 出口可达，2026-11-22 校准）', () => {
+    // 事故：§4.3 表格写「core 层自动重新签名并重试，对 Agent 永不可见」是无条件句，
+    // 但 errors.ts 有真实的 bad_time 出口（偏差>5min 或重签仍被拒时 Agent 看得到它），
+    // skill 正文 errors.md 早已按实况写「已自动重签重试过；仍失败说明本机时钟真的偏了」
+    // —— 同一契约的两条入口（设计稿 vs skill）说两套话，只修一条就是回归。
+    // 行号会漂移，所以文档里只写 文件名+键名，不写 :303/:17。
+    const s = design()
+    const row = s.split('\n').find((l) => l.includes('| 14003 |')) ?? '(找不到 14003 行)'
+    expect(row).toMatch(/前提：时钟偏差在 5 分钟内/)
+    expect(row).toMatch(/bad_time/)
+    expect(row, '「永不可见」只能以被纠正原文（带「」）的形态出现').toMatch(/「对 Agent 永不可见」是无条件句/)
+    expect(row, '校准注里的引用不得再嵌会漂移的行号').not.toMatch(/errors\.ts:\d+|errors\.md:\d+/)
+    // 与 skill 正文同口径（两条入口对齐）
+    const sk = read('src/skill/qiyu/errors.md')
+    expect(sk).toMatch(/已自动重签重试过；仍失败说明本机时钟真的偏了/)
+    // 双向自检：无条件句的旧行必须被上面判据拒掉
+    const ACCIDENT = '| 14003 | time 错误 | — | **core 层自动重新签名并重试，对 Agent 永不可见** |'
+    expect(/前提：时钟偏差在 5 分钟内/.test(ACCIDENT), '事故行必被①判红').toBe(false)
+  })
+
+
+  it('设计稿 §5.2：`not_found` 的「一律」已按实现收窄为结构性判据（2026-11-22，Codex P1-7）', () => {
+    // 事故：原文「`code:200` 且无数据字段的一律当作 `not_found`」比实现强。实现只判**结构性**
+    // 为空（data 键缺失 / {} / []）；形状 M 的空 message 不判、业务性为空（ticket.search 的
+    // {total:0,tickets:[]}）判不出来。Agent 若信「一律」，会把 not_found:false 读成「有数据」。
+    const s = design()
+    const rule = s.split('\n').find((l) => l.includes('信封归一化层不得假定')) ?? '(找不到规则行)'
+    expect(rule, '「一律」不得作为无保留的通用规则').not.toMatch(/无数据字段的，一律当作/)
+    expect(rule, '必须点明是结构性判据').toMatch(/结构性为空/)
+    expect(rule, '必须承认业务性为空判不出').toMatch(/业务性为空|判不出|不等于有数据/)
+    expect(rule, 'responseShape 的实况必须写准（已在 schema 透出，但判据不消费）')
+      .toMatch(/response_shape.*不消费它|不消费/)
+    // Codex 对 PR#82 的 P2：只说「结构性为空就判」仍然过宽——实现要求**该接口的 envelope
+    // 形状已登记（实测过）才判**，未登记（null）与形状 D/M 都不判。真驱动探针：
+    // normalize({code:200,data:[]}, null) → notFound:false。
+    // ⚠️判据必须是**段内复合锚**（B2 变异实证）：单 token 的 /未登记|已登记/ 会被别处的
+    //  incidental 命中满足——整段「未登记形状不判」被删时守卫照样绿。复合锚要求该档自己
+    // 携带「不判的后果」（notFound:false / 纯确认…不判），删档即红。
+    expect(rule, '未登记档必须自带「即便载荷空也不判」的后果').toMatch(/未登记[^。；]{0,180}notFound:false/)
+    // ⚠️ **Codex 对 PR#82 的 round-18 P2**：`envelope` 未登记时规则**不是一刀切**
+    // （真驱动探针 9 格）：`data`/`result`/无载荷 → notFound:false；但载荷在 JSON `message`
+    // 里且解析出来是 `[]`/`{}` → **notFound:true**（`smstask.status` 的 `{code:200,message:"[]"}`
+    // 就是「成功但查无此物」，smstask.status 现在登记为 C，但宽松分支对未登记接口同样适用）。
+    // 规则行若写成「未登记一律 notFound:false」，Agent 会把真实的查无此物读成未判定。
+    expect(rule, '未登记档必须按载荷载体分开：message 里的空 JSON 判、data/result 不判')
+      .toMatch(/`message`[^。；]{0,80}(判|查无此物)[^。；]{0,120}(data|result)[^。；]{0,80}不判|按载荷载体/)
+    // ⚠️ **CodeRabbit round 73（minor）**：开头句「判据是「形状已登记」+「载荷结构性为空」
+    // 两条同时成立」把登记条件说成**无条件**，与同段「message 载体未登记也照判」直接矛盾——
+    // 读者按开头句理解就排除掉 `{code:200,message:"[]"}` → notFound:true 这条实测行为。
+    // 判据：开头句必须把登记条件**限定到 data/result 载体**，且写出 message 的例外。
+    const head = rule.split('：·')[0]
+    // 事故形态是**无条件**：「`not_found` 的判据是「形状已登记」+…」紧跟开头。
+    // 判据钉这个形态（所以「限定到 data/result 载体后再写双条件」是允许的写法）。
+    expect(head, '开头句不得把「形状已登记」写成无条件前提')
+      .not.toMatch(/`not_found` 的判据是\*\*「形状已登记」/)
+    expect(head, '开头句必须把登记条件限定到 data/result 载体，并点明 message 的空 JSON 例外')
+      .toMatch(/data`\/`result`[\s\S]{0,120}(时，判据是|已登记)[\s\S]{0,200}message[\s\S]{0,120}(不要求登记|例外|照判)/)
+    // 同一括号里我此前写「null 以前全是写接口」——源码注释明写 null 有两种含义，
+    // 其中一类是**实测过但形状不在 A/B/C/D**（chat.queue.group.query / ipcc.customfield.template.get）。
+    expect(rule, '不得再说 envelope:null 全是写接口').not.toMatch(/全是写接口/)
+    // CHANGELOG 的当前段同样写过那两条错（它也是被 Agent 读的文本）。这里**只做正向**断言：
+    // 反向的整段 not.toMatch 与「叙述里引用旧的错句」天然冲突（引用即红），而漂移风险
+    // 集中在**契约面**（design.md 的规则行，Agent 照它分支），那段才是负向锚的对象。
+    // ⚠️ 扫**全部版本段**而不是「当前版本段」（CodeRabbit round 77 minor）：这条是
+    // 历史修正的「它在 CHANGELOG 里被记录过」检查——一旦发版切段，它还会被原样保留在
+    // 旧版本段里，但 `currentChangelogSection` 不再包含它，守卫会因发版而假红。
+    // 设计稿规则行本身的断言（上面那些）与版本段无关，保持不变。
+    const cl = allVersionSections(read('CHANGELOG.md'))
+    // 判据钉「按载体分档」这句本身 + 同段里的 message 照判语义（复合锚）：
+    // 单 token `/载体/` 在 CHANGELOG 里被别的条目（多载体转义契约等）满足，等于白守。
+    expect(cl, 'CHANGELOG 必须写明载体分档（message 判、data/result 不判）')
+      .toMatch(/按载体分档[\s\S]{0,400}message/)
+    expect(rule, '必须写明 null 的两种含义').toMatch(/从未实测[^。；]{0,120}(不在 A\/B\/C\/D|非标)/)
+    expect(rule, 'D/M 例外档必须自带「不判」语义').toMatch(/(纯确认|形态漂移)[^。；]{0,120}不判/)
+    // ⚠️段内复合锚（B4 变异实证）：全句只数 `/D-nf/` 的话，删掉「分别登记 D/D-nf」那处
+    // 仍会被别处写到的 D-nf 满足——判据要钉在「分辨这两个接口」的那一档自己身上。
+    expect(rule, '同报文两接口的分辨档必须点名 D-nf').toMatch(/无从分辨[^。；]{0,120}D-nf/)
+    // 真驱动探针实测：M 的空 message、走到 C 却缺 message 的响应都是 **ok:false 失败响应**，
+    // 压根不参与 not_found 判定。文档若只把它们与 D 的「成功但纯确认」并列成「不判」，
+    // Agent 会把 not_found:false 读成「成功但没查到」——判据钉住「失败响应…不参与」。
+    expect(rule, '必须写明 M 空 message / C 缺 message 是失败响应，不是「成功但不判」')
+      .toMatch(/失败响应[^。；]{0,140}不参与/)
+    // 双向自检：旧「一律」句必被判据①拒掉
+    const ACCIDENT = '…`code:200` 且无数据字段的，一律当作 `not_found`，不当作成功。'
+    expect(/无数据字段的，一律当作/.test(ACCIDENT), '事故行必被①抓红').toBe(true)
+  })
+
+
+  it('spec §2.4：win32 ACL 探测必须是封闭式受信状态清单（round 74/75/76 逐个堵漏后收敛）', () => {
+    // 事故：探测判据写成「枚举现有 ACE 确认没有残留的显式广域主体」（Everyone /
+    // BUILTIN\Users / Authenticated Users 枚举）。具名用户被 `icacls /grant:r *<SID>:(R)`
+    // 显式授权、且无对应 deny ACE 时，黑名单漏判 → 报 `checked:true, ok:true`，而那个账户
+    // 照样能读 appSecret —— 与 spec §2.1 自己定义的「凭证可被他人读却报成功」同类。
+    // ⚠️ 负向锚钉「判据形态」而不是某一版排版：事故原句的粗体包住整段
+    // （`**枚举现有 ACE 确认没有残留的显式广域主体**`），所以锚里不能带 `**`。
+    const BLACKLIST = /确认没有残留的显式广域主体/
+    const sp = read('docs/superpowers/specs/2026-11-22-剩余功能域对接封装-design.md')
+    // ⚠️ 探测判据已从「一段话」长成「一个清单」（round 75/76 后是 7 条），按单行提取会
+    // 只拿到第一行——判据必须取「真探测 ACL」到 §2.5 之间的整段（清单条目在其后各行）。
+    const probeAt = sp.indexOf('真探测 ACL')
+    const probeEnd = sp.indexOf('### 2.5', probeAt)
+    const probe = probeAt >= 0 && probeEnd > probeAt ? sp.slice(probeAt, probeEnd) : '(找不到探测段)'
+    expect(probe, '探测判据不得写成广域主体黑名单').not.toMatch(BLACKLIST)
+    expect(probe, '探测判据必须是最小允许名单（名单外一律拒绝，不是枚举广域主体）')
+      .toMatch(/最小允许名单/)
+    expect(probe, '「默认拒绝」必须落在句子里：出现任何其他主体的允许 ACE 即判不通过')
+      .toMatch(/任何其他主体的允许 ACE 即判/)
+    expect(probe, '必须点破漏判的具体形态：具名用户的显式授权（黑名单天然漏一族）')
+      .toMatch(/具名用户[^。；]{0,60}(SID|显式授权)/)
+    // 夹具清单里必须有这条判据的最小反例：写成黑名单的实现只有它必红。
+    expect(sp, 'ACL 夹具必须含「另一个具名用户 SID 显式 Read」最小反例')
+      .toMatch(/另一个具名用户 SID[\s\S]{0,120}(最小反例|只有这条会红)/)
+    expect(sp, 'ACL 夹具必须含 null DACL 与空 DACL 两条空态（round 75）')
+      .toMatch(/null DACL\*\*[\s\S]{0,160}空 DACL\*\*/)
+    expect(sp, 'ACL 夹具必须含「外来属主」反例（round 76）')
+      .toMatch(/另一个普通账户作属主[\s\S]{0,120}必须 `ok:false`/)
+    expect(sp, '外来属主夹具必须点名夹具 8 为对照组（否则无法证明没有把好形态一起拒掉）')
+      .toMatch(/夹具 8 是对照组/)
+    expect(sp, 'ACL 夹具必须含「继承开启」反例（round 76）')
+      .toMatch(/继承开启、当前 ACE 恰好只含受信主体/)
+    expect(sp, 'ACL 夹具必须含「父目录对他人可写」反例（文件 ACL 再紧也能被换掉）')
+      .toMatch(/父目录对另一个普通账户可写[\s\S]{0,80}必须 `ok:false`/)
+    // ⚠️ **CodeRabbit round 75（major）**：「空名单」不等于「已保护」——null DACL 表示
+    // 所有人完全访问，而它的 ACE 枚举同样是**空列表**，只按允许名单判会把最危险的形态
+    // 判成 `checked:true, ok:true`。判据顺序必须是「先 DACL 存在/非空，再名单」。
+    expect(probe, '必须先把 null DACL 判掉（空名单 ≠ 已保护）').toMatch(/null DACL/)
+    expect(probe, '必须写明 null DACL 的语义是「所有人完全访问」，而不是「枚举结果为空」')
+      .toMatch(/所有人[^。；]{0,20}完全访问|无访问控制/)
+    expect(probe, '判据必须是封闭清单：任一条不满足即拒（不是逐个补黑名单）')
+      .toMatch(/封闭清单|任一条不满足即/)
+    expect(probe, '清单第 1/2 条必须是 DACL 存在 + 非空（按序号相邻）')
+      .toMatch(/1\.\s*\*\*DACL 存在\*\*[\s\S]{0,200}2\.\s*\*\*DACL 非空\*\*/)
+    expect(probe, '空 DACL（拒绝所有人）也必须判不通过，不得当成「收紧得好」')
+      .toMatch(/空 DACL[^。；]{0,80}(ok:false|判不通过|拒)/)
+    // ⚠️ **CodeRabbit round 76（major）**：属主隐含 WRITE_DAC —— 非受信账户作属主时
+    // 可以随时给自己补读 ACE，ACE 名单永远看不出来。判据必须把属主也列入受信状态。
+    expect(probe, '必须校验属主 SID（属主隐含 WRITE_DAC）').toMatch(/属主（owner SID）|属主\s*SID/)
+    expect(probe, '必须点明属主可以自行补 ACE 的机制（WRITE_DAC）').toMatch(/WRITE_DAC/)
+    expect(probe, '必须要求继承关闭（否则父目录一变就带进名单外 ACE）').toMatch(/继承关闭/)
+    // 父目录：文件 ACL 再紧，父目录可写就能被整个换掉（与 POSIX 目录判据同构）。
+    expect(probe, '父目录的**写面**必须受信（可被替换 = 文件 ACL 无意义），只读 ACE 不算')
+      .toMatch(/父目录的写面受信/)
+    // ⚠️ **CodeRabbit round 77（major）**：父目录判据必须**早于建 tmp** —— tmp 继承父目录 ACL，
+    // 别人可在收紧前以共享读打开它，而**改 DACL 不撤销已打开句柄**，事后收紧救不回来。
+    // 判据钉在写序里（⓪ 在最前），不是只钉「父目录要受信」这句话在场。
+    // 写序在「真探测 ACL」之前，用 §2.4 整段（sp）而不是 probe 切片断言。
+    const writeOrder = sp.slice(sp.indexOf('2. **方案 A（以真机为闸）**'), probeAt)
+    // ⚠️ 前缀陷阱（Codex round 21）：`indexOf('正确顺序：⓪')` 也会命中 `⓪′` —— 先断言
+    // 写序里不存在带撇号的变体标记，否则序号判断会被前缀命中骗成假绿。
+    expect(writeOrder, '写序不得残留 ⓪′ 一类带撇号变体标记').not.toMatch(/⓪[′'’]/)
+    const i0 = writeOrder.indexOf('正确顺序：⓪')
+    const i1 = writeOrder.indexOf('① **以受限安全描述符原子地创建空 tmp**')
+    expect(i0, '写序必须点名父目录校验（⓪）').toBeGreaterThanOrEqual(0)
+    expect(i1, '写序必须保留「创建空 tmp」这一步（round 79 后必须带受限 SD 创建）').toBeGreaterThanOrEqual(0)
+    expect(i0, '父目录校验必须排在「创建空 tmp」之前（顺序判据，不靠相邻字符数）').toBeLessThan(i1)
+    expect(writeOrder, '必须点明「改 DACL 不撤销已打开句柄」这条机制')
+      .toMatch(/不(会)?撤销已(打开|授予)的(句柄|访问)/)
+    expect(writeOrder, '不可信目录必须「不建 tmp、不写 secret」，不是「先建再补救」')
+      .toMatch(/不建 tmp、不写 secret/)
+    // ⚠️ **CodeRabbit round 79**：「先建空 tmp 再 icacls」仍有句柄窗口——必须创建时刻就受限。
+    expect(writeOrder, 'tmp 必须在创建时刻就带受限 SD（不能 writeFileSync 之后补 icacls）')
+      .toMatch(/以受限安全描述符原子地创建空 tmp/)
+    expect(writeOrder, '必须点明「只在打开时检查访问、改 DACL 不撤销已授予的访问」')
+      .toMatch(/只在\*\*打开时\*\*检查访问|不撤销已授予的访问/)
+    expect(writeOrder, '三种候选机制都未实测，必须如实标注')
+      .toMatch(/均未真机实测/)
+    // ⚠️ **CodeRabbit round 81（major）**：③ 必须写进 ① 拿到的同一个句柄 + 目录身份钉住——
+    // 按路径重开 tmp 会被祖先目录替换劫持（TOCTOU），secret 进了攻击者可读的文件。
+    // 复合锚（变异实证：「不得按路径重新打开」这句解释本身也带关键词，单用 /同一个句柄|不得按路径/
+    // 会被它满足——删掉正向要求仍绿）。正向要求与解释必须分开钉。
+    expect(writeOrder, '必须写明「写进创建时拿到的同一个句柄」这条正向要求')
+      .toMatch(/必须写进 ① 创建时拿到的同一个句柄/)
+    expect(writeOrder, '必须点破按路径重开的风险')
+      .toMatch(/不得按路径重新打开/)
+    expect(writeOrder, '必须钉住目录身份（句柄保持或 file ID 比对）')
+      .toMatch(/目录身份|file ID/)
+    // ⚠️ **Codex round 24**：句柄不带 `FILE_SHARE_DELETE` 才挡得住删除/改名——只写「持有句柄」不够。
+    expect(writeOrder, '必须写明句柄不得带 FILE_SHARE_DELETE（否则挡不住删除/改名）')
+      .toMatch(/不得带 `FILE_SHARE_DELETE`/)
+    // 候选机制尚未实测必须如实标注（不能用未验证机制冒认已验）
+    expect(probe, '取 SDDL 的机制未真机实测，必须写明').toMatch(/尚未真机实测|实测定稿前不/)
+    // 双向自检：事故原句必被第一条判据拒掉（连粗体包裹的实际事故形态一起）
+    expect(BLACKLIST.test('必须**枚举现有 ACE 确认没有残留的显式广域主体**（`*S-1-1-0` Everyone…）'),
+      '事故原句必被抓红').toBe(true)
+    expect(BLACKLIST.test('必须枚举现有 ACE，出现任何其他主体的允许 ACE 即判 ok:false'),
+      '最小允许名单形态必须放过').toBe(false)
+  })
+
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
     const s = read('docs/superpowers/specs/2026-10-13-存储层-design.md')
     expect(s).toMatch(/本 spec 是 2026-10-13 的历史记录（2026-10-30 状态注）/)

@@ -130,6 +130,13 @@ src/
   schedule/                scheduled task generation (crontab/launchd/systemd/schtasks)
 ```
 
+> **⚠️ 交付状态注（2026-11-22 回写）**：本节是 **设计期目标布局**，与交付实况有四处偏差，Agent 照树找文件会落空——
+> · `store/sandbox.ts` 实际落在 **`src/query/sandbox.ts`**（只读沙箱与查询层同居 `src/query/`，不在 `store/`）；
+> · `store/kysely.ts` **未交付**（外部后端是挂账项 C2，见 §12；现状只有 `duckdb.ts` 一个实现）；
+> · `sync/export.ts` **不是单独文件**——会话导出 create→poll→download→unzip→parse 落在 `src/sync/tasks/pipeline.ts` 与 `src/sync/tasks/sessions.ts`；
+> · `domains/` 整层**未建**——stats 在 `src/query/metric-catalog.ts` + `src/commands/stats.ts`，工单/知识库同步在 `src/sync/tasks/`，`resolve` 即 §9.4 挂账项。
+> 本注只纠正「文件在哪」；树的 **结构性结论不变**（core/store/sync/commands/schedule 的分层与职责就是交付后的分层）。
+
 分层原则：`core/` 不 import `commands/`；`store/` 不 import `sync/`。
 
 ## 4. 鉴权
@@ -145,7 +152,9 @@ time     = current UTC second-level timestamp                 // 有效期 5 分
 
 **md5 必须针对实际发送的字节计算。** 任何序列化差异（key 顺序、空白、中文转义）都会导致 14002。**序列化一次，签名，原样发送。**
 
-已对线上 API 验证（原始 TCP 抓包、逐字节比对，覆盖中文/emoji/转义/换行）：undici 将字符串 body 编码为 UTF-8，`Content-Length` 为字节数，所有往返校验均通过。两点补充：
+> **⚠️ 口径校准（2026-11-22）**：本句原文「已对线上 API 验证（**原始 TCP 抓包、逐字节比对**…）」与 §12 的挂账句（「原始 TCP 抓包验证实际发出的字节——**未做**」）自相矛盾。实况：设计期做的是**真实凭证的线上往返**（中文/emoji/转义/换行的 body 都拿到 `code:200`，见下方「不传 body 时按 `md5('')` 签名（2026-10-02 用真实凭证实测）」段）——**报文级抓取产物从未留存于本仓库**，也无从复核。因此 undici 行为结论（UTF-8 编码、`Content-Length` 为字节数）**既无逐字节抓包证明、也无出站请求头的直接测量**——当前只有「往返成功」这个间接支持（而且它对签名正确性不是必要条件：服务端按收到的字节算 md5，我们按同一字符串算，二者一致由往返结果间接表明）。仓库内的现存 字节级证据止于 fetch 边界：`tests/core/sign.test.ts` 的官方样例对拍 + `tests/core/http.test.ts` 「对 fetch 实际收到的 body 重算 checksum 相等」。传输层之下的原始字节复核列为**显式非目标**（理由见 §12 ）——校验和只覆盖 `body 原文` 与 `time` 文本， TLS/代理不改这些字节，抓 TLS 内层相对本地真 undici 出站**无额外证明力**，而 `BASE` 硬编码、无注入缝，把真凭证送进 mitm 反而是泄露面。
+
+已对线上 API 往返验证（**真实凭证、覆盖中文/emoji/转义/换行，均 `code:200`**）——**验证的是「服务端接受并认了签名」这一结果，不是出站报文本身**；我们没有观测过 undici 实际发出的请求头（Codex round 23）。下面两条是 **undici 库行为说明（未在本仓库独立测量）**，不是本次往返的实测结论：
 - 你**必须显式设置** `Content-Type: application/json`（undici 默认是 `text/plain`）
 - undici 会透明解压 gzip 响应，但保留压缩后的 `Content-Length` 头 → 需要时在请求中加上 `Accept-Encoding: identity`
 
@@ -208,7 +217,7 @@ qiyu auth whoami               # 显示当前 profile 与凭证**来源**（+ so
 |---|---|---|---|
 | 14001 | appKey 错误 | 否 | hint 指向配置 |
 | 14002 | checksum 错误 | 否 | 内部 bug |
-| 14003 | time 错误 | — | **core 层自动重新签名并重试，对 Agent 永不可见** |
+| 14003 | time 错误 | — | **core 层自动重新签名并重试（前提：时钟偏差在 5 分钟内、且重签能拿到新时间戳）；救不回来时如实报 `kind: bad_time`**（2026-11-22 校准：原文「对 Agent 永不可见」是无条件句，与 `errors.ts` 的 `bad_time` 出口矛盾，skill 正文 `errors.md` 的 `bad_time` 行早已按实况写「已自动重签重试过；仍失败说明本机时钟真的偏了」） |
 | 14004 | 格式校验错误 | 否 | 透出服务端 message |
 | 14008 | IP 不在白名单 | 否 | 必须在七鱼控制台配置 |
 | 14009 | 请求频率过快 | 见下文 | 携带 `retry_after` + `retry_strategy` |
@@ -823,7 +832,7 @@ qiyu sync verify [task]         # 校验本地与远端一致性
 | **考勤明细 `salaryDetail`** | **无限制**（400 天也可以） | `staff_id + work_date` | **必须传单个 `staffId`**；只返回该窗口的起始日 |
 | **订单绩效 `performance`** | **365 天** | `query_start` | 明细 + `sum`；测试账号没有这类数据 |
 | **机器人会话统计 `robot.summary`** | **31 天** | `query_start` | 忽略 `robotId`；超限报 `14004`（不是 `14501`） |
-| **转人工统计 `transferHuman`** | **365 天**（建议 ≤360） | `query_start` | 忽略 `type`；364 天会报 `Internal error` |
+| **转人工统计 `transferHuman`** | **365 天**（建议 ≤360） | `query_start` | 忽略 `type`；「364 天会报 `Internal error`」与 §7.4.1 二分结论互斥、**未裁决**（见 §14 同行的冲突标注，勿作实现依据） |
 | **实时数据 `data.overview.session`** | **不支持任何时间参数** | `captured_at` | **实时快照，无法回补** |
 | 呼叫概览 `/ipcc/overview` | 实时快照 | — | **间隔 ≥5 分钟**，无法回补 |
 | 呼叫坐席历史 `/ipcc/history/seat` | 文档说 90 天 | `query_start` | 实测约 20 秒冷却 / `14402`；`message` = JSON 字符串 → **数组** |
@@ -1232,7 +1241,7 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
 >
 > **⚠️ 本句与上方 `chat.queue.group.query` 那行（§9.0 表）冲突，以那一行为准（2026-10-02 记录）。** 本句把「空的 `staffInfo`」列为应判 `not_found` 的编码之一，但同一张表里 `chat.queue.group.query` 那行明确写着"空的 `staffInfo`（`[]`）是正常的『无人在线』状态，不是错误：24 个真实组中有 15 个返回 `[]` 且 `code:200`"。**两者不能同时成立** —— 若按本句把空 `staffInfo` 判为 `not_found`，会把 **62%（15/24）的正常响应误报为"查无此物"**，正是 §9.2 要消灭的静默失败，只是方向相反。→ **实现取"不是 not_found"**（`envelope.ts` 的 `staffInfo` 分支返回 `notFound:false`）。本句的"三种编码"里，`data` 缺失与 `data`/`{}`/`[]` 是**通用**规则，而空 `staffInfo` 是**该接口特有**的正常状态，不应并入通用规则。
 
-**规则**：信封归一化层不得假定 `code`/`data`/`message` 是固定组合；它必须**按接口 id 在注册表中查询 `envelope` 字段**来决定解析策略。`code:200` 且无数据字段的，一律当作 `not_found`，不当作成功。
+**规则**：信封归一化层不得假定 `code`/`data`/`message` 是固定组合；它必须**按接口 id 在注册表中查询 `envelope` 字段**来决定解析策略。`not_found` 的判据要**按载荷载体分开说**：载荷挂在 `data`/`result` 上（或完全缺席）时，判据是**「形状已登记」+「载荷结构性为空」两条同时成立**；载荷在 JSON `message` 里时**不要求登记**，解析出空 JSON 即判（例外见下条）。（2026-11-22 按 `src/core/envelope.ts` 逐行校准；Codex 对 PR #82 的 P2 补上形状条件——此前只写「结构性为空」仍过宽；CodeRabbit round 73 指出开头句把登记条件写成了无条件，与下面的 message 例外自相矛盾。）· **未登记形状按载荷载体分档，不搞一刀切**——`envelope` 为 `null` 的接口，载荷挂在 `data`/`result` 上或完全缺席时一律 `notFound:false`（`data` 的语义在写接口上与读接口相反：`deleteKnowledges` 的空数组是**全部成功**，不知道是哪种就不能断言）；但载荷在 JSON `message` 里、解析出 `[]`/`{}` 时**照判** `notFound:true`——`smstask.status` 的 `{code:200,message:"[]"}` 正是「成功但查无此物」，宽松分支对未登记接口同样适用（`tests/core/envelope.test.ts` 的「未实测信封 + message 承载载荷」用例钉住）。`envelope:null` 本身有两类来源：① 从未实测（写接口全部如此）② 实测过但形状不在 A/B/C/D（`chat.queue.group.query` 的 `staffInfo`、`ipcc.customfield.template.get` 的裸数组，由更前面的结构分支接住，走不到宽松分支）；· **成功响应的空载荷才分档**——形状 `D` 的 `{code}` 是「纯确认」，**不判**为查无此物；同为 `{code:200}` 报文的 `robot.transfer.config`（正常空壳）与 `robot.session.msgAssociate`（那是它的 not-found 路径）从报文里无从分辨，靠**分别登记 `D`与 `D-nf`** 来区分——`D-nf` 就是「形状 D，但空报文表示查无此物」这一档；· **不是所有「空」都走到分档**：形状 `M` 的空 `message`、以及走到形状 `C` 却缺 `message` 的响应，都是**失败响应**（`ok:false`，真驱动探针实测），根本不参与 not_found 判定——别把它们的 `not_found:false` 读成「成功但没查到」；· **形状 C 判的是 `message` 解析出来的载荷**（`{code:200,data:[]}` 走到 C 会因缺 `message` 先报错，不判空）；· **业务性为空判不出**——如 `ticket.search` 的 `{total:0, tickets:[]}`，信封层眼里那是「有 2 个键的对象」；要判这一级必须知道每接口载荷形状（`responseShape` **已随 params 加载、并在 `api schema` 以 `response_shape` 透出**，但 `not_found` 判据本身**不消费它**）。→ 所以 `not_found:false` 只说明「在当前登记形状下未判为查无此物」，**既不保证有数据、也不保证形状已登记**；§9.2 的「0 行 ≠ 没数据」仍要调用方自己按 `data_coverage` / `resolved_range` 判断。
 
 ### 9.0.1 实测限频（证伪文档所暗示的普遍性）
 
@@ -1277,20 +1286,42 @@ Version 1 的致命缺口：Agent 写 `SELECT ... FROM staff_satisfaction`，但
   "last_synced_at": "2026-09-30T10:15:00+08:00"
 }}
 
-// 失败
+// 失败（2026-11-22 校准：本样本按真实出口渲染逐字段复核过 —— 旧样本三处不实）
 {"ok": false, "error": {
-  "code": "14009", "kind": "rate_limit", "retryable": false,
+  "code": "14009", "kind": "rate_limit", "retryable": true,
   "message": "api call too frequent",
-  "hint": "该接口每分钟限 1 次",
-  "retry_after": {"seconds": 43},
+  "hint": "该接口未登记在本地限频表，下面的等待秒数是**保守兜底值、不是实测冷却**，可能短于服务端真实冷却（睡完仍可能再吃限频）。真实配额见接口文档。 该接口在同步任务里有本地表映射：tickets。⚠️ 但这里只确认了「配置指向的库文件存在」，**没有打开库、没有确认这些表存在**，更没有确认它们有数据或覆盖你要的时间窗 —— 用之前先跑 `qiyu db tables` 看清单与行数。⚠️ 它还是**整表数据源，不是这次请求的等价替代** —— 不会带上你这次 body 里的任何筛选条件（时间窗、状态、关键字等），拿到的行可能根本不符合你要的条件。要用它请自己补 WHERE 条件（`--sql` 更灵活，`--since`/`--until` 只覆盖时间列）；水位与覆盖范围用 `qiyu sync status` 看。",
+  "retry_after": {"seconds": 60, "source": "fallback"},
   "retry_strategy": "switch_to_local",
-  "fallback": "qiyu query --table order_performance"
+  "fallback": "qiyu query --table tickets"
 }}
 ```
 
 - stdout 只输出 JSON；`--pretty` 用于人类可读（**G1 已实现**：缩进 JSON，写在具体子命令之后；用法错误仍是紧凑 JSON —— 先修参数再看格式）；日志走 stderr
 - **退出码**：`0` 成功 · `1` 业务错误 · `2` 用法错误 · `3` 网络错误 · `4` 需要 `--yes`
 - **退出码 4 必须携带** `confirm_required: true` + `confirm_arg: "--yes"` + `risk: "irreversible"` + `target`，以及 `retryable: false`
+
+> **⚠️ 样本校准说明（2026-11-22）**：上面的样本对应**完整 `api call` 链路**的输出，不是一次 `classify()` 的结果。
+> 各字段由哪一层加，必须标清：
+> - `classify(14009)` 只交回 `code/kind/retryable/message` 四个字段，返回的是**裸错误对象**；
+>   命令行看到的外壳 `{"ok":false,"error":{…}}` 由 `api.ts` 的 `fail()` 加上，不是 `classify()` 的产物。
+> - `hint` 与 `retry_after` 由 `http.ts` 的 `decorateRateLimit` 补。
+> - `retry_strategy`/`fallback` 还要 `api.ts` 拿到 spec、接口非危险、fallback provider 已接线且配置库路径是普通文件才会出现。
+>
+> 旧样本三处不实、会教 Agent 读到不可能出现的形态：
+> - ① `retryable` 旧写 `false`，而实现恒 `true`（`src/core/errors.ts` 里
+>   「设计稿在限流的 retryable 上自相矛盾，本计划取 true」的裁决注释）—— 只有 `retryable:true` 才让
+>   §11.2 D 表按 `retry_after` 秒数分流有意义。
+> - ② `hint` 旧写「该接口每分钟限 1 次」，src 全仓无该文案，真实文案由 `decorateRateLimit` 按三态
+>   （未登记 / 实测无限频 / doc 来源）生成，样本取的是「未登记」档。
+> - ③ `retry_after` 旧写 `{"seconds":43}`，而 `source` 是类型**必填**五值（`observed/doc/local/header/fallback`），
+>   skill 正文的整个「该不该信这个秒数」分流都建立在 `source` 上——缺它就教 Agent 读一个不可能出现的载荷。
+>
+> 样本取 `fallback` 档（未登记接口的保守兜底 60s），与上面的 hint 同源；本样本的接口是 `ticket.search`
+> （未登记在限频表、有本地表映射，首表 `tickets`）—— 三键同源才自洽：未登记 → hint「未登记」档 +
+> `source:"fallback"` + 映射表首表。`hint` 是「限流分类档 + fallback 追加段」**拼接后**的完整形态
+> （`src/commands/api.ts` 里 `hint = hint ? hint + note : note`），不是单一分支文案。
+> `retry_strategy`/`fallback` 仍是**条件键**（下方 G1 交付注的三条边界不变），不是恒有。
 
 > **`retry_strategy` / `fallback` 的交付状态（2026-10-24，G1）**：上面示例里这两个字段**已有生产者** —— `api call` 撞限流（`kind: rate_limit`）且该接口**非危险**、有同步任务映射、本地库文件存在时，输出 `retry_strategy: "switch_to_local"` 与 `fallback: "qiyu query --table <表>"`，并在 `hint` 里点名该接口的其余本地表。三处诚实边界：
 > ① **只承诺「有表可查」**，不承诺表非空、更不承诺覆盖调用方要的时间窗 —— hint 要求先 `qiyu db tables` / `qiyu sync status` 确认；
@@ -1952,7 +1983,7 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 > 的人类用户会给出错误判断。skill 正文（`src/skill/qiyu/forbidden.md` §2）已按此口径写：
 > 「对 Agent 没有增益」而不是「未实现」。
 
-> **裁决依据（F 实施波回写，与本 spec D5 一致）**：E 的原文是「不要使用 `--pretty`/`--table`」，逐字执行会与 §11.2 B 的路由表自相矛盾——B 表明确把「历史趋势 / 聚合 / JOIN / 跨窗口」导向本地数据库通道，而 `query --table` 正是这一通道的受约束入口（§8 定义其为列白名单 + 时间语义 + 精确脱敏），禁掉它等于禁掉 B 的一半；§9.1 的限流降级示例本身就建议 `fallback: "qiyu query --table order_performance"`。两个并列项的性质也不同：`--pretty` 是「承诺过、未实现」（每次调用都给明确话术），`--table` 是已交付的通道。故 E 那句的本意是「别把 `--table` 当成任意查询的通用替代品」，而不是通道级禁令。落到 skill 正文：单表过滤/分组计数用 `query --table`（列白名单与精确脱敏），JOIN/跨表聚合用 `query --sql`，`--pretty` 一律不用。
+> **裁决依据（F 实施波回写，与本 spec D5 一致）**：E 的原文是「不要使用 `--pretty`/`--table`」，逐字执行会与 §11.2 B 的路由表自相矛盾——B 表明确把「历史趋势 / 聚合 / JOIN / 跨窗口」导向本地数据库通道，而 `query --table` 正是这一通道的受约束入口（§8 定义其为列白名单 + 时间语义 + 精确脱敏），禁掉它等于禁掉 B 的一半；§9.1 的限流降级示例本身就建议 `fallback: "qiyu query --table <本地表>"`（样本现用 `tickets`；2026-11-22 校准前曾是 `order_performance`）。两个并列项的性质也不同：`--pretty` 是「承诺过、未实现」（每次调用都给明确话术），`--table` 是已交付的通道。故 E 那句的本意是「别把 `--table` 当成任意查询的通用替代品」，而不是通道级禁令。落到 skill 正文：单表过滤/分组计数用 `query --table`（列白名单与精确脱敏），JOIN/跨表聚合用 `query --sql`，`--pretty` 一律不用。
 >
 > **⚠️ 2026-10-30 复核**：本段裁决**仍然成立**（`--table` 不是通道级禁令），但括号里的依据有一半已过时 ——
 > `--pretty` **已实现**（G1，2026-10-24），不再是「承诺过、未实现」。裁决的**结论**（不用 `--pretty` 写进
@@ -2000,7 +2031,7 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 
 ## 12. 测试策略
 
-- **`core/sign`（已交付，2026-10-25）**：与七鱼官方 Java `QiyuPushCheckSum` 样例做**逐字节比对**。样例**已取得** —— 来自 Apifox 文档页 `doc-436971`（`.md` 后缀取全文字段表），存档在 `private/docs/apifox-436971-数据校验.md`（`private/` 已 gitignore，不入公开仓库）。`tests/core/sign.test.ts` 内置该样例的 Node 移植版 `javaEncode` 作对拍 oracle，配固定向量，并附一条**反恒真**断言（oracle 必须与实现给出不同中间结果，否则「两边一致」只是抄了同一份代码）。⚠️ 原始 TCP 抓包验证实际发出的字节 —— **未做**，仍挂账（需要抓包环境，且当前校验和已由签名对拍覆盖）
+- **`core/sign`（已交付，2026-10-25）**：与七鱼官方 Java `QiyuPushCheckSum` 样例做**逐字节比对**。样例**已取得** —— 来自 Apifox 文档页 `doc-436971`（`.md` 后缀取全文字段表），存档在 `private/docs/apifox-436971-数据校验.md`（`private/` 已 gitignore，不入公开仓库）。`tests/core/sign.test.ts` 内置该样例的 Node 移植版 `javaEncode` 作对拍 oracle，配固定向量，并附一条**反恒真**断言（oracle 必须与实现给出不同中间结果，否则「两边一致」只是抄了同一份代码）。⚠️ 原始 TCP 抓包验证实际发出的字节 —— **显式非目标（2026-11-22 裁定，与 §4.1 口径一致）**：校验和只覆盖 `body 原文` 与 `time` 文本、与传输层无关， TLS/代理不改这些字节，故抓 TLS 内层相对本地真 undici 出站无额外证明力；`BASE` 硬编码无注入缝，真凭证送 mitm 是泄露面。**非目标**而非「待办」：现存字节级证据止于 fetch 边界（`http.test.ts` 对 fetch 实收 body 重算 checksum 相等），更深层由真实凭证往返 `code:200` 兜底
 - **`core/envelope`（已交付，2026-10-25）**：设计稿 §9.0 记录的 **40 条 key+type 实测签名样本不在仓库里**（会随服务端演化），故 `tests/core/envelope-matrix.test.ts` 改覆盖**形状 × `message` 类型**的语义矩阵（A / B / C / D / D-nf × string / object / integer / boolean / array），每格要么断言解释规则、要么显式标注无实测依据。矩阵附**覆盖度自检**：从 `src/core/envelope.ts` 读 `EnvelopeShape` 的真实定义，且覆盖判据是**观测式**的（`normalizeIn` 只在真实用例里登记被喂过的形状），双向断言「声明的形状都跑到了 / 跑到的形状都在声明里」，另要求至少两个形状给出不同结论 —— 手抄清单式的自检（清单 vs 类型定义）守不住「加了新形状但没有用例」这个形态
 - `store`：对 DuckDB 和 SQLite 跑同一组用例，断言**类型与 upsert 语义完全一致**（已知差异见 §6.3）。**随 C2（外部后端）交付** —— 当前只有 DuckDB 一个引擎，「两引擎一致」无对照物
 - `store/sandbox`：完整攻击用例集（§8.2 表格的全部 9 行）必须全部被拦截
@@ -2040,7 +2071,7 @@ knowledge_categories(           -- 按 robotId 隔离，必须把 robot_id 纳�
 | ~~报表粒度未实测~~ | **已实测（2026-09-30，183 次探测）**：10 张报表的粒度**各不相同** —— 多数是每个客服一行，但 **`staff_attendance` 是按客服 × 按小时**，`salaryDetail` 是「一次调用 = 一个客服，且只含窗口的起始日」，而 `data.overview.session` **是实时快照，无法作为历史存储**。`date` 字段在每个接口里含义都不同（恒为 0 / startTime 的回显 / 账号创建时间）→ **日期一律由调用方提供**。见 §6.2 |
 | ~~限频粒度未知~~ | **已实测**：大约是 **30 秒冷却**，**按接口（路径）**计，不是全局。**不同路径可以连续背靠背调用 7 次** → 报表按**天**轮转，而不是按接口串行 |
 | ~~逐日调用报表的成本~~ | **已更正**：按天轮转后，31 天约 **16 分钟**（原先 2.6 小时的估计错误地假设了串行模型）。完整的一年 365 天仍然需要可中断 + 进度输出 + ETA |
-| **报表时间跨度上限不统一** | 实测：**31 天 / 365 天 / 不限**，共三档，且超限错误码在 `14501` / `14004` / `14500` 之间变化，文案中英混杂 → **CLI 必须按接口注册 `maxWindowDays` 并提前校验**，而不是依赖错误码。`transferHuman` 在 364 天时也会报 `Internal error`（边界不稳定），因此**要留余量，上限压到 ≤360 天** |
+| **报表时间跨度上限不统一** | 实测：**31 天 / 365 天 / 不限**，共三档，且超限错误码在 `14501` / `14004` / `14500` 之间变化，文案中英混杂 → **CLI 必须按接口注册 `maxWindowDays` 并提前校验**，而不是依赖错误码。`transferHuman` 在 364 天时也会报 `Internal error`（边界不稳定），因此**要留余量，上限压到 ≤360 天**—— ⚠️ **本行与 §7.4.1 的 2026-09-30 二分结论（「不存在边界不稳定」）互斥，两边都自称实测**；且 sync 侧 `transferHuman` 早已 `maxWindowDays: 1` 按天切片，360/365 之争不再是运行时约束。在拿新的复测证据裁决之前，本行按原样保留、**不作为实现依据**（引用方见 §7.3 表与 §7.4.1 注） |
 | **报表的空结果可能是瞬时假象** | 实测：`staffAttendance` 用完全相同的请求体首次调用返回 `{"result":[],"total":0}`，重试后恢复了 17,765 行 → **任何空结果都至少重试一次**再判定为空，否则整个窗口会被静默丢弃 |
 | **该传毫秒却传了秒时会静默降级** | `overview` 传入秒值 → **69 个字段中有 49 个变成 `-1`，但 `code` 仍是 200** → 这是最危险的一类陷阱；CLI 必须要求 ISO8601 输入，并在内部转换为毫秒 |
 | **回填耗时** | 一年的会话是 61 个六天窗口；报表按天轮转。必须可中断，并带进度输出和 ETA |

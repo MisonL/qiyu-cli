@@ -26,7 +26,7 @@ const fileCredentialsForTest = (): { profileName: string; hasCreds: boolean } =>
 /** 写配置文件并把权限收紧到 0600（含凭证的文件权限过宽会被拒绝，见 checkPermissions）。 */
 function writeCfg(obj: unknown, mode = 0o600): string {
   const dir = join(home, '.config', 'qiyu')
-  mkdirSync(dir, { recursive: true })
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
   const p = cfgPath()
   writeFileSync(p, typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2))
   chmodSync(p, mode)
@@ -295,7 +295,7 @@ describe('auth login', () => {
   it('配置文件是符号链接 → 拒绝写入（防止穿透到任意路径）', async () => {
     const target = join(home, 'elsewhere.json')
     writeFileSync(target, JSON.stringify({ profiles: {} }))
-    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true })
+    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true, mode: 0o700 })
     symlinkSync(target, cfgPath())
     vi.stubEnv('QIYU_APP_KEY', 'k'); vi.stubEnv('QIYU_APP_SECRET', 's')
     const code = await authCommand(['login'])
@@ -475,7 +475,7 @@ describe('auth login 写盘失败（A11，2026-11-06 审查）', () => {
     vi.stubEnv('QIYU_APP_SECRET', 's-test')
     const dir = join(home, '.config', 'qiyu')
     // 先把目录建出来再收掉写位：login 走到 writeConfigFile 时 EACCES。
-    mkdirSync(dir, { recursive: true })
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
     writeCfg({ profiles: {} })
     chmodSync(dir, 0o500)
     try {

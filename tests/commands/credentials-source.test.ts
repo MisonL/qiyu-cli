@@ -16,7 +16,7 @@ let home = ''
 const cfgPath = (): string => join(home, '.config', 'qiyu', 'config.json')
 
 function writeCfg(obj: unknown, mode = 0o600): void {
-  mkdirSync(join(home, '.config', 'qiyu'), { recursive: true })
+  mkdirSync(join(home, '.config', 'qiyu'), { recursive: true, mode: 0o700 })
   writeFileSync(cfgPath(), JSON.stringify(obj))
   chmodSync(cfgPath(), mode)
 }
@@ -36,7 +36,7 @@ describe('环境变量 > 配置文件', () => {
     // ⚠️ 这条是"env 完整时不读文件"契约的直接证明：文件被写成畸形 JSON，
     // 若实现无条件读文件，这里会带出「配置文件不是合法 JSON」的 warn 或直接失败。
     writeFileSync(join(home, 'x'), '')
-    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true })
+    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true, mode: 0o700 })
     writeFileSync(cfgPath(), '{ 坏 JSON')
     const r = resolveCredentialsUsingFile({ appKey: 'ek', appSecret: 'es' }, { configPath: cfgPath() })
     expect(r).toEqual({ ok: true, creds: { appKey: 'ek', appSecret: 'es' } })
@@ -119,7 +119,7 @@ describe('失败路径', () => {
   })
 
   it('配置文件畸形 → 仍报 auth_missing，但把真正的原因说出来', () => {
-    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true })
+    mkdirSync(join(home, '.config', 'qiyu'), { recursive: true, mode: 0o700 })
     writeFileSync(cfgPath(), '{ 坏 JSON')
     const r = resolveCredentialsUsingFile({}, { configPath: cfgPath() })
     expect(r.ok).toBe(false)

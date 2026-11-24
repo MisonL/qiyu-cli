@@ -5,6 +5,66 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 文档
+
+- **设计稿 §9.1 失败样本按真实出口逐字段校准**（2026-11-22）：旧样本写 `retryable: false`（实现恒 `true`，
+  `errors.ts` 的裁决注释早就写在源码里）、 `hint` 「该接口每分钟限 1 次」（全 src 无此文案）、
+  `retry_after` 缺类型**必填**的 `source`（skill 正文的秒数可信度分流整个建立在它上面）、
+  `fallback` 首表与「未登记档」自相矛盾（`order_performance` 的端点已登记 observed/30s）。
+  样本是自称的 Agent 契约，错一处就是教 Agent 分支一个不可能出现的形状；`tests/docs.test.ts` 加逐字段双向守卫。
+- **§4.1 与 §12 的「原始 TCP 抓包」口径矛盾收口**：§4.1 逐字声称「已抓包逐字节比对」而 §12 挂账「未做」——
+  实况是设计期只做过**真实凭证往返**（`code:200`），报文级产物从未留存仓库。§4.1 收窄为如实措辞，
+  §12 把挂账升格为**显式非目标**并附判据（校验和与传输层无关、抓 TLS 内层相对本地真 undici 出站无额外
+  证明力；`BASE` 硬编码无注入缝，真凭证送 mitm 是泄露面）。
+- **§4.3「14003 对 Agent 永不可见」补前提**：实况是「救得回才不可见」——偏差 >5min 或重签仍被拒时
+  Agent 看得到 `bad_time`（`errors.ts` 有该出口，`http.test.ts` 有行为用例钉着）。skill 正文早已按实况写，
+  这次把设计稿与 `src/core/http.ts` 的注释两条入口对齐；同文件的最终 hint 死提及「HTTP 429/5xx」改为
+  插值实际状态码（429 在更早的分支就被截走归 rate_limit，该句只会因 5xx 出现），与 Spring JSON 载体同形。
+- **§5.2 `not_found` 的「一律」按实现收窄，并逐轮纠偏到「形状已登记 + 载荷结构性为空 + 按载体分档」**：原文「`code:200` 且无数据字段的
+  一律当作 `not_found`」比实现强，收窄过程走了三轮——第一轮（Codex 对裁决文档的 P1-7）去掉「一律」改判结构性为空；第二轮
+  （Codex 对 PR #82 的 P2）补上**形状条件**：`envelope` 未登记（`null`）不判，形状 D 的 `{code}` 是纯确认、M 的空 `message`
+  与走到 C 却缺 `message` 的是失败响应，均不参与；同为 `{code:200}` 报文的 `robot.transfer.config`（正常空壳）与 `robot.session.msgAssociate`（那是它的
+  not-found 路径）只能靠**分别登记 `D` / `D-nf`** 区分；形状 C 判的是 `message` 解析出的载荷；业务性为空
+  （`ticket.search` 的 `{total:0,tickets:[]}`）判不出（`responseShape` 已在 schema 透出但判据不消费它）。
+  → `not_found:false` 既不保证有数据、也不保证形状已登记。逐格核对 `envelope.ts` 后重写，守卫补形状条件判据。
+  另钉一层易误读处：形状 M 的空 `message`、走到形状 C 却缺 `message` 的响应是**失败响应**（`ok:false`，真驱动探针实测），根本不参与 not_found 判定——旧措辞把它们与 D 的「成功但纯确认」并列成「不判」，Agent 会把 `not_found:false` 读成「成功但没查到」。
+  第三轮（Codex 对 PR #82 的 round-18 P2）拆掉我自己引入的**新的一刀切**：第二轮的措辞把未登记形状写成「即便载荷空也返回 `notFound:false`」，
+  但 `envelope.ts` 的宽松分支对**载荷在 JSON `message` 里**的情况照判空（`normalize({code:200,message:'[]'})` → `notFound:true`，
+  `tests/core/envelope.test.ts` 钉住）——`smstask.status` 的 `{code:200,message:"[]"}` 正是「成功但查无此物」；只有 `data`/`result`/无载荷
+  才不判（`data` 的语义在读／写接口上相反：`deleteKnowledges` 的空数组是**全部成功**）。同一句里的「`null` 此前观测到的全是写接口」也与源码注释相反——
+  `null` 有两类来源：从未实测，以及**实测过但形状不在 A/B/C/D**（`chat.queue.group.query` 的 `staffInfo`、`ipcc.customfield.template.get` 的裸数组）。
+- **§3.2 目录树加交付状态注**：`store/sandbox.ts` 实际落在 `src/query/`、`store/kysely.ts` 未交付（C2 挂账）、
+  `sync/export.ts` 不是单独文件（实现散在 `src/sync/tasks/pipeline.ts` 与 `sessions.ts`）、`domains/` 整层未建——
+  Agent 照树找文件会四处落空。注只纠正「文件在哪」，分层结构结论不变。
+- **364 天口径冲突如实标注（未裁决）**：§7.3 与 §14 的「`transferHuman` 364 天报 Internal error、上限压 ≤360」
+  与 §7.4.1 的 2026-09-30 二分结论（「不存在边界不稳定」）互斥，两边都自称实测而无可复核记录留存——
+  两处各加「未裁决、勿作实现依据」标注；裁决留给一次只读真接口复测（需授权，且 sync 侧早已按天切片）。
+
+### 测试
+
+- 锁夹具的「锁晚到」用例修正**测量对象**（CI 上实测真红，`ff498d9`）：原 holder 在 marker **之后**才首次打开
+  数据库，而 DuckDB 的首开是**进程级冷启动**（CI 实测 >5s）——5s 观测窗口测到的永远是冷启动、不是锁落盘
+  竞态， 18 次校验全 OPENED 后如实红。改成先用 `:memory:` 把冷启动付掉、再打 marker，窗口才只覆盖
+  「已热且不持锁 → 持锁」这一段（同因也会打断 READ_WRITE 变体「锁挡住另一进程」的断言：首开落在两条
+  校验之间）。机制变异验证：让 holder 永不持锁 → 窗口耗尽后用例照常红（修正没有把真失败也吞掉）。
+- 文档校准的守卫全部是**双向自检**形态：从文档按行提取样本、逐字段过判据（不写会漂移的行号锚），
+  事故原文喂给同一判据必红、校准后文本必绿。`tests/core/http.test.ts` 新增「非 JSON 的 5xx 与 429」用例，
+  钉住 hint 按状态码插值、两种载体同落 rate_limit/network（RED 证据：修改前实测 hint 是「HTTP 429/5xx」死提及）。
+- **夹具不再依赖宿主 umask**（2026-11-23，Linux 真机首次全量暴露）：`mkdirSync(dir, { recursive: true })`
+  不传 mode 时权限是 `0777 & ~umask` —— umask 0022 的机器上 0755（无 group 写位）、umask 0002 的机器上
+  0775（group 有写位），后者会让产品侧 `checkPermissions` 的目录判据 `(dirMode & 0o022) !== 0` **正当**
+  告警「配置目录权限过宽」，于是 23 条断言「无警告」的用例假红（5 条 config + 18 条命令层）。
+  产品侧一行未改（写目录本就用 `mode: 0o700`，umask 只会去位）；8 个测试文件的夹具显式收紧配置目录权限
+  （`mode: 0o700` + `chmodSync` 双保险；systemd user / LaunchAgents / DuckDB 目录不动）。
+  验证：macOS umask 0022 与 0002 各 310/310，Linux 真机 umask 0002 310/310 且全量 110 文件 2865 passed。
+- 锁夹具的失败诊断输出改为**从 spawn 起累积**（`LockHolder.lockOutput`）：`waitForMarker` 成功即
+  `dispose()` 自己的 data 监听，用例事后挂监听拿不到唯一的 `locked` 行，那条「holder 中途死掉 vs
+  锁没生效」的归因文案会永远打 `(空)`。先红后绿钉住；`expectClean` 的数据监听零容忍同步改为减去
+  标记监听（只减标记，不放宽）。
+
+
 ## [0.2.3] - 2026-11-22
 
 > 2026-11-22 发布：tag `v0.2.3`（指向 main `5756fa8`，GitHub/GitLab 双远端）+ npm publish
@@ -2724,6 +2784,7 @@
 - 响应信封归一化，含畸形 JSON（整数键未加引号）的容错修复
 - 逐接口限频表与 `retry_after` 提示
 
+[未发布]: https://github.com/MisonL/qiyu-cli/compare/v0.2.3...HEAD
 [0.2.3]: https://github.com/MisonL/qiyu-cli/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/MisonL/qiyu-cli/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/MisonL/qiyu-cli/compare/v0.2.0...v0.2.1
