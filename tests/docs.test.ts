@@ -1341,6 +1341,13 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(i5, '⑤ 写 secret 步骤必须在场').toBeGreaterThanOrEqual(0)
     expect(i3, 'DACL 自检必须排在收紧之前').toBeLessThan(i4)
     expect(i3, 'DACL 自检必须排在写 secret 之前').toBeLessThan(i5)
+    // ⚠️ **第七轮自查**：独占句柄只活在打开它的进程里——「一步一个子进程」会在步间关闭句柄，
+    // 祖先目录钉住随之消失，父进程也没有 fd 可 fstat，只能退回按路径查（正是会被替换劫持的那侧）。
+    // 这条硬约束若不钉住，实现大概率每步 spawn 一次，看似每步都执行、实际防线在进程边界断开。
+    expect(sec, '必须写明「②–⑥ 在同一个长驻子进程内连续完成」这条硬约束')
+      .toMatch(/硬约束：②–⑥[\s\S]{0,60}同一个长驻子进程/)
+    expect(sec, '必须点明两个后果：句柄随进程关闭 + 父进程没有 fd')
+      .toMatch(/独占句柄只存在于[\s\S]{0,200}父进程里根本没有那个 fd|步一个子进程[\s\S]{0,200}关闭句柄/)
     expect(sec, '必须规定 secret 只能经 stdin 交付子进程')
       .toMatch(/secret 只能经 stdin 交给那个 PowerShell 子进程|stdin 进、结构结果出，argv 只带路径/)
     expect(sec, '必须把环境变量 / 临时明文文件一起禁止').toMatch(/环境变量[^。；]{0,40}(明文文件|同样不许)/)
