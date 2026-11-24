@@ -1319,8 +1319,24 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/以真独占（`.NET FileShare\.None`）打开|`FileShare\.None`（独占）打开/)
     expect(sec, '必须写明独占句柄的第二个作用：钉住祖先目录，让 ③④ 的按路径判据可信')
       .toMatch(/钉住祖先目录[\s\S]{0,200}按路径[\s\S]{0,60}劫持/)
-    expect(sec, '失败语义必须收窄为「已有其他持有者」，不得写成「内容已泄露」')
-      .toMatch(/只证明「\*\*该文件已有其他持有者\*\*」[\s\S]{0,200}不写「内容已泄露」/)
+    // ⚠️ 这条守卫**原本钉的是第五轮那句收窄**（「失败 ⇒ 已有其他持有者」），而 CR round 96 minor 1
+    // 证明**那句本身也是过度归因**——探针 17 分出三档，只有 `0x80070020` 支持「有持有者」。
+    // 守卫落后于修正会把文档拖回旧错（本仓记过的「同一能力两条入口只修被点名那条」的测试版），
+    // 所以判据换成三档分类：共享冲突 / 收紧把自己挡在门外 / tmp 已不在路径上，且禁止笼统归因。
+    // 三档 HRESULT 必须都在场且按「共享冲突→收紧自挡→路径消失」的顺序出现（用 index 比序，
+    // 不用固定字符窗——CJK 间距会变，钉死窗口下次同义改写就假红）。
+    const hrShare = sec.indexOf('0x80070020')
+    const hrDeny = sec.indexOf('0x80070005')
+    const hrMiss = sec.indexOf('0x80070002')
+    expect(hrShare, '共享冲突档（0x80070020）必须在场').toBeGreaterThanOrEqual(0)
+    expect(hrDeny, '收紧自挡档（0x80070005）必须在场').toBeGreaterThanOrEqual(0)
+    expect(hrMiss, '路径消失档（0x80070002）必须在场').toBeGreaterThanOrEqual(0)
+    expect(hrShare, '共享冲突档必须排在收紧自挡之前').toBeLessThan(hrDeny)
+    expect(hrDeny, '收紧自挡档必须排在路径消失之前').toBeLessThan(hrMiss)
+    expect(sec, '必须禁止把三档笼统归因成「已有其他持有者」')
+      .toMatch(/不得共用一句「已有其他持有者」|三档[^。；]{0,40}各自点名真实成因/)
+    expect(sec, '即使是共享冲突档也只能证明「有人持有」，不能推出「读过」')
+      .toMatch(/不能\*\*推出「内容已被读过」\*\*|不能[^。；]{0,10}推出「内容已被读过」/)
     expect(sec, '必须写明纯 Node 的 fd 挡不住 rmdir、不满足本契约')
       .toMatch(/纯 Node 实现不满足本契约/)
     // ⚠️ **载体红线（第六轮探针 15–16，自查发现）**：②–⑤ 落到子进程后，secret 的交付载体
