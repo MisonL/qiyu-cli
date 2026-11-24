@@ -1260,7 +1260,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const claimed = /（2026-11-24，([一二三四五六七八九十])轮(?: \/ \d+ 个探针)?；/.exec(title)?.[1]
     expect(claimed, '标题必须写明探针轮次（中文数字）').toBeDefined()
     const n = CN[claimed as keyof typeof CN]
-    expect(n, '轮次数必须 ≥3（当前实况四轮）').toBeGreaterThanOrEqual(3)
+    expect(n, '轮次数必须 ≥3（本设计的探针至少跑了三轮）').toBeGreaterThanOrEqual(3)
     // 正文逐轮枚举必须覆盖到第 n 轮（第一…第 n），且不得少一轮
     for (let k = 1; k <= n; k++) {
       expect(sec, `正文必须逐轮枚举到第${k}轮`).toContain(`第${'一二三四五六七八九十'[k - 1]}轮`)
@@ -1268,7 +1268,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 探针编号也不得与轮次混用（第四轮里的第 12 个探针写成「第十二探针」会被读成第五轮之后）
     expect(sec, '探针序号必须带轮次限定，不得裸写「第 N 探针」')
       .not.toMatch(/(?<![\d一二三四五六七八九十])第[一二三四五六七八九十]+探针/)
-    expect(sec, '探针总数也要与标题一致').toMatch(/探针 13/)
+    // 探针编号同样不能钉死字面值：从标题读出总数，再要求正文引用到的**最大探针号等于它、且不越界**。
+    const pc = /（2026-11-24，[一二三四五六七八九十]轮 \/ (\d+) 个探针；/.exec(title)?.[1]
+    expect(pc, '标题必须写明探针总数').toBeDefined()
+    const total = Number(pc)
+    const nums = [...sec.matchAll(/探针 (\d+)(?:[–-](\d+))?/g)]
+      .flatMap((m) => [Number(m[1]), m[2] ? Number(m[2]) : Number(m[1])])
+    expect(nums.length, '正文必须引用到具体探针号').toBeGreaterThan(0)
+    expect(Math.max(...nums), '正文最大探针号必须等于标题总数').toBe(total)
+    expect(Math.min(...nums), '探针号不得越界').toBeGreaterThanOrEqual(1)
     // 逐轮枚举的句子必须存在，且**正文出现的最大轮次必须等于标题轮次**：
     // 标题少报（正文已有第四轮却写「三轮」）与标题多报（写五轮而正文只到第四轮）都要红。
     expect(sec, '必须有逐轮起因的枚举句').toMatch(/轮都由审查推动|三轮的起因都是审查/)
