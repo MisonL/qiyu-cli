@@ -1287,7 +1287,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(Math.min(...nums), '探针号不得越界').toBeGreaterThanOrEqual(1)
     // 逐轮枚举的句子必须存在，且**正文出现的最大轮次必须等于标题轮次**：
     // 标题少报（正文已有第四轮却写「三轮」）与标题多报（写五轮而正文只到第四轮）都要红。
-    expect(sec, '必须有逐轮起因的枚举句').toMatch(/轮都由审查推动|三轮的起因都是审查/)
+    expect(sec, '必须有逐轮起因的枚举句').toMatch(/轮由审查与自查推动|轮都由审查推动/)
     const ORD = '一二三四五六七八九十'
     const mentioned = [...sec.matchAll(/第([一二三四五六七八九十])轮/g)]
       .map((m) => ORD.indexOf(m[1] as string) + 1)
