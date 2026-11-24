@@ -1345,6 +1345,17 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(hrMiss, '路径消失档（0x80070002）必须在场').toBeGreaterThanOrEqual(0)
     expect(hrShare, '共享冲突档必须排在收紧自挡之前').toBeLessThan(hrDeny)
     expect(hrDeny, '收紧自挡档必须排在路径消失之前').toBeLessThan(hrMiss)
+    // ⚠️ **CodeRabbit round 99（minor 1）**：`0x80070005` 的成因**不止收紧自挡**——路径是目录
+    // （探针 17 的 D 档）也是同一个 HRESULT。一律报「收紧把我们挡在门外」会把
+    // 「路径上落着别的东西」误诊成 ACL 问题。判据：必须写「先再检查一次才归因 ACL」。
+    // 两条判据**各自独立**、各自窗口收紧：上一版把它们并成一条跨 240+160 字符的正则，
+    // 变异只删「不止一种」时后半句仍在窗口内 → 守卫照样绿（半恒真）。
+    const denyRegion = sec.slice(hrDeny, sec.indexOf('0x80070002', hrDeny) > hrDeny
+      ? sec.indexOf('0x80070002', hrDeny) : hrDeny + 600)
+    expect(denyRegion, '0x80070005 档必须明写成因不止一种')
+      .toMatch(/成因[^。；]{0,10}不止一种/)
+    expect(denyRegion, '归因「收紧失败」必须以再检查一次为前提，不得一律归因')
+      .toMatch(/只有再用一次检查确认[\s\S]{0,60}才报「收紧失败」/)
     // ⚠️ **CodeRabbit round 97（两条）**：③ 必须把「属主校验」也跑上（否则攻击者预置「只授当前用户、
     // 但自己作属主」的 tmp 能过②③，靠隐含 WRITE_DAC 读走⑤ 的 secret）。
     // CR97 当时还派生了「失败档分档删除 / ③ 删前先关句柄」两条要求——**CR round 98 major 2 把整套
@@ -1480,6 +1491,21 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(step6, '⑥ 不得再要求删除目标文件（CR98 已取消）').not.toMatch(/删除该目标文件/)
     expect(sec, '残余窗口必须如实声明、不得写成已彻底防御')
       .toMatch(/残余（如实声明[\s\S]{0,400}(完全消除|已彻底防御)/)
+    // ⚠️ **CR round 99 minor 2抓到的正是我自己的 grep 窗口太窄**：第十轮我只扫了 ③/⑥ 两段切片，
+    // 漏掉切片外的两处现行指令（「读回不通过就删除 tmp」「发现并**清除**冒充文件」）——
+    // 于是「统一规则：失败路径一律不删」与另两处仍在派生删除动作并存，文档自相矛盾。
+    // 判据因此**按整段扫**：规范区内任何一行把「删除/清除/清理」当**现行动作**要求，
+    // 又没带作废/引用/机制解释标记，即为违规。
+    const normStart = sec.indexOf('**设计据此收敛')
+    expect(normStart, '规范区起点必须在场').toBeGreaterThanOrEqual(0)
+    const normRegion = sec.slice(normStart)
+    const ACTION = /(删除|清除|清理|移走)[^。；]{0,10}(tmp|目标|文件|残留|冒充)/
+    const CANCEL = /不删除|不按路径|绝不删除|取消|作废|推翻|取代|误写|漏了|收回|不再|降为|只作机制解释|翻转|旧锚|历史记录|保留原样|分不清|禁止|已被|判据|为什么|统一规则|失败路径|无法|留给 0\.2\.4|「删除|「清除|「尽力清/
+    const offenders = normRegion.split('\n')
+      .map((l, i) => ({ l, i })).filter(({ l }) => ACTION.test(l) && !CANCEL.test(l))
+      .map(({ i, l }) => `第${i}行: ${l.trim().slice(0, 80)}`)
+    expect(offenders, `规范区仍有把删除/清除当现行动作的行（统一规则被架空）:\n${offenders.join('\n')}`)
+      .toEqual([])
   })
 
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
