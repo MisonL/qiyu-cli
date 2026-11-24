@@ -1203,7 +1203,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 别人可在收紧前以共享读打开它，而**改 DACL 不撤销已打开句柄**，事后收紧救不回来。
     // 判据钉在写序里（⓪ 在最前），不是只钉「父目录要受信」这句话在场。
     // 写序在「真探测 ACL」之前，用 §2.4 整段（sp）而不是 probe 切片断言。
-    const writeOrder = sp.slice(sp.indexOf('2. **方案 A（以真机为闸）**'), probeAt)
+    const writeOrder = sp.slice(sp.indexOf('2. **方案 A（以真机为闸'), probeAt)
     // ⚠️ 前缀陷阱（Codex round 21）：`indexOf('正确顺序：⓪')` 也会命中 `⓪′` —— 先断言
     // 写序里不存在带撇号的变体标记，否则序号判断会被前缀命中骗成假绿。
     expect(writeOrder, '写序不得残留 ⓪′ 一类带撇号变体标记').not.toMatch(/⓪[′'’]/)
@@ -1243,6 +1243,24 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       '事故原句必被抓红').toBe(true)
     expect(BLACKLIST.test('必须枚举现有 ACE，出现任何其他主体的允许 ACE 即判 ok:false'),
       '最小允许名单形态必须放过').toBe(false)
+  })
+
+  it('spec §2.4a：机制真机探针结果在场，且两条被推翻的机制不得再写成「待实测即可用」', () => {
+    // 2026-11-24 真机探针（PowerShell 5.1）：FileSystem.AccessControl 加载不了、
+    // File.Open 打不开目录——原设计的「创建时刻带受限 SD」「持有目录句柄钉身份」两条
+    // 在最小依赖面下不成立。设计据此改成「父目录完全受信否则拒写」+「file ID 三次比对」。
+    // 守卫：这两条验证结论必须在场；替换方案必须写清；「未实测」不得再被当作可用机制兜售。
+    const sp = read('docs/superpowers/specs/2026-11-22-剩余功能域对接封装-design.md')
+    const sec = sp.slice(sp.indexOf('### 2.4a'), sp.indexOf('### 2.4b'))
+    expect(sec, '§2.4a 必须存在').not.toBe('')
+    expect(sec).toMatch(/System\.IO\.FileSystem\.AccessControl[^。；]{0,80}加载不了|找不到程序集/)
+    expect(sec).toMatch(/File\]::Open[^。；]{0,60}打不开目录|FILE_FLAG_BACKUP_SEMANTICS/)
+    expect(sec).toMatch(/父目录完全受信/)
+    expect(sec).toMatch(/file ID/)
+    // 空 DACL 造不出来这条也必须写明（否则夹具 7 会被当成已验证覆盖）
+    expect(sec).toMatch(/空 DACL[^。；]{0,40}(不生效|造不出)/)
+    // 双向自检：把探针结论句删掉，上面的断言必须能红（用同一条正则对空串验证）
+    expect(/System\.IO\.FileSystem\.AccessControl[^。；]{0,80}加载不了|找不到程序集/.test(''), '空串必不通过').toBe(false)
   })
 
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
