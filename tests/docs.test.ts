@@ -1158,7 +1158,9 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 只拿到第一行——判据必须取「真探测 ACL」到 §2.5 之间的整段（清单条目在其后各行）。
     const probeAt = sp.indexOf('真探测 ACL')
     const probeEnd = sp.indexOf('### 2.5', probeAt)
-    const probe = probeAt >= 0 && probeEnd > probeAt ? sp.slice(probeAt, probeEnd) : '(找不到探测段)'
+    expect(probeAt, '「真探测 ACL」锚必须在场').toBeGreaterThanOrEqual(0)
+    expect(probeEnd, '探测段结束锚（### 2.5）必须在场且晚于起点').toBeGreaterThan(probeAt)
+    const probe = sp.slice(probeAt, probeEnd)
     expect(probe, '探测判据不得写成广域主体黑名单').not.toMatch(BLACKLIST)
     expect(probe, '探测判据必须是最小允许名单（名单外一律拒绝，不是枚举广域主体）')
       .toMatch(/最小允许名单/)
@@ -1211,7 +1213,11 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 别人可在收紧前以共享读打开它，而**改 DACL 不撤销已打开句柄**，事后收紧救不回来。
     // 判据钉在写序里（⓪ 在最前），不是只钉「父目录要受信」这句话在场。
     // 写序在「真探测 ACL」之前，用 §2.4 整段（sp）而不是 probe 切片断言。
-    const writeOrder = sp.slice(sp.indexOf('2. **方案 A（以真机为闸'), probeAt)
+    const oa = sp.indexOf('2. **方案 A（以真机为闸')
+    expect(oa, '§2.4 方案 A 的起点锚必须在场（否则 slice(-1,…) 静默扩大范围）')
+      .toBeGreaterThanOrEqual(0)
+    expect(oa, '方案 A 起点必须早于探测段').toBeLessThan(probeAt)
+    const writeOrder = sp.slice(oa, probeAt)
     // ⚠️ 前缀陷阱（Codex round 21）：`indexOf('正确顺序：⓪')` 也会命中 `⓪′` —— 先断言
     // 写序里不存在带撇号的变体标记，否则序号判断会被前缀命中骗成假绿。
     expect(writeOrder, '写序不得残留 ⓪′ 一类带撇号变体标记').not.toMatch(/⓪[′'’]/)
@@ -1259,8 +1265,14 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 在最小依赖面下不成立。设计据此改成「父目录完全受信否则拒写」+「file ID 三次比对」。
     // 守卫：这两条验证结论必须在场；替换方案必须写清；「未实测」不得再被当作可用机制兜售。
     const sp = read('docs/superpowers/specs/2026-11-22-剩余功能域对接封装-design.md')
-    const sec = sp.slice(sp.indexOf('### 2.4a'), sp.indexOf('### 2.4b'))
-    expect(sec, '§2.4a 必须存在').not.toBe('')
+    // ⚠️ Codex round 28 P2：两个分界标题先断言存在、且结束晚于开始，再切片。
+    // `indexOf` 找不到返回 -1，`slice(start, -1)` 会静默吞进几乎整份后续文档——
+    // 删掉 §2.4b 标题连带其内容时本守卫不红，切片范围悄悄扩大（负向锚的对象也随之变多）。
+    const a0 = sp.indexOf('### 2.4a')
+    const b0 = sp.indexOf('### 2.4b')
+    expect(a0, '§2.4a 标题必须在场').toBeGreaterThanOrEqual(0)
+    expect(b0, '§2.4b 标题必须在场（否则切片边界失效）').toBeGreaterThan(a0)
+    const sec = sp.slice(a0, b0)
     // 探针轮次是**活的**：每轮审查都可能加一轮。判据不能钉死某个数字（那正是「量化词不随
     // 实况同步」的形态本身），而要**从标题读出数字、再要求正文的枚举与它一致**。
     const CN = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 } as const
@@ -1316,6 +1328,19 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 判据：必须点名 argv 泄露、必须指定 stdin 为唯一合法载体、必须禁止环境变量/明文文件。
     expect(sec, '必须写明 argv 会被其他进程读到（探针 15 双机制实测）')
       .toMatch(/完整命令行对同机其他进程可读[\s\S]{0,120}(wmic|Win32_Process)/)
+    // ⚠️ Codex round 28 P2：恢复基线里被替换掉的「DACL 自检在收紧与写 secret 之前」顺序判据
+    // ——round 89/93 重写守卫时我只加了新锚，把这条旧锚删了（「同一能力两条入口只修被点名那条」
+    // 的测试版）。删 ③ 行或把 ⑤ 挪到 ③ 之前，必须在这里变红。
+    const i3 = sec.indexOf('- ③ 读 DACL')
+    const i3x = sec.indexOf('删除 tmp 并失败', i3)
+    const i4 = sec.indexOf('- ④ `icacls')
+    const i5 = sec.indexOf('- ⑤ **通过 ② 拿到的句柄写 secret**')
+    expect(i3, '③ DACL 自检步骤必须在场').toBeGreaterThanOrEqual(0)
+    expect(i3x, '③ 必须自带「发现非受信 ACE → 删除 tmp并失败」').toBeGreaterThan(i3)
+    expect(i4, '④ 收紧步骤必须在场').toBeGreaterThanOrEqual(0)
+    expect(i5, '⑤ 写 secret 步骤必须在场').toBeGreaterThanOrEqual(0)
+    expect(i3, 'DACL 自检必须排在收紧之前').toBeLessThan(i4)
+    expect(i3, 'DACL 自检必须排在写 secret 之前').toBeLessThan(i5)
     expect(sec, '必须规定 secret 只能经 stdin 交付子进程')
       .toMatch(/secret 只能经 stdin 交给那个 PowerShell 子进程|stdin 进、结构结果出，argv 只带路径/)
     expect(sec, '必须把环境变量 / 临时明文文件一起禁止').toMatch(/环境变量[^。；]{0,40}(明文文件|同样不许)/)
@@ -1338,7 +1363,10 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // round 89/93：⑥ 的守卫序列 —— 换名前比身份、换名后复核、不一致删目标并响亮失败、残余如实声明。
     // 判据按**语义要素各自在场且顺序正确**，不钉具体措辞（钉字句=下次同义改写必假红）。
     const i6 = sec.indexOf('- ⑥')
-    const step6 = i6 >= 0 ? sec.slice(i6, sec.indexOf('\n 残余', i6) > 0 ? sec.indexOf('\n  残余', i6) : i6 + 900) : ''
+    expect(i6, '⑥ 步骤必须在场').toBeGreaterThanOrEqual(0)
+    const iResidual = sec.indexOf('残余（如实声明', i6)
+    expect(iResidual, '⑥ 之后必须有「残余（如实声明…）」段作为切片边界').toBeGreaterThan(i6)
+    const step6 = sec.slice(i6, iResidual)
     const iPre = step6.indexOf('比对 `ino`/`dev`')
     const iRen = step6.indexOf('renameSync')
     const iPost = step6.indexOf('复核')
