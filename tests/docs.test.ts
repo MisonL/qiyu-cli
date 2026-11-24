@@ -1253,6 +1253,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const sp = read('docs/superpowers/specs/2026-11-22-剩余功能域对接封装-design.md')
     const sec = sp.slice(sp.indexOf('### 2.4a'), sp.indexOf('### 2.4b'))
     expect(sec, '§2.4a 必须存在').not.toBe('')
+    // 三轮探针的事实必须自述一致（量化词随轮次推进要同步，否则文档自己就是不实声明）
+    expect(sec, '轮次数必须与实际探针轮次一致').toMatch(/三轮[\s\S]{0,200}第一轮[\s\S]{0,200}第三轮/)
     // 第二轮探针推翻了第一轮结论：FileStream+FileSecurity 重载可用 —— 必须写明并声明撤回
     expect(sec, '必须写明 FileStream 构造重载可用（第一轮结论已撤回）')
       .toMatch(/FileStream\(path, FileMode, FileSystemRights,[\s\S]{0,80}FileSecurity\)/)
