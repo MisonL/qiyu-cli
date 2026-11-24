@@ -1253,14 +1253,19 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const sp = read('docs/superpowers/specs/2026-11-22-剩余功能域对接封装-design.md')
     const sec = sp.slice(sp.indexOf('### 2.4a'), sp.indexOf('### 2.4b'))
     expect(sec, '§2.4a 必须存在').not.toBe('')
-    expect(sec).toMatch(/System\.IO\.FileSystem\.AccessControl[^。；]{0,80}加载不了|找不到程序集/)
+    // 第二轮探针推翻了第一轮结论：FileStream+FileSecurity 重载可用 —— 必须写明并声明撤回
+    expect(sec, '必须写明 FileStream 构造重载可用（第一轮结论已撤回）')
+      .toMatch(/FileStream\(path, FileMode, FileSystemRights,[\s\S]{0,80}FileSecurity\)/)
+    expect(sec, '必须明确声明「只能引原生依赖」的旧结论被撤回')
+      .toMatch(/错误并已撤回|已撤回/)
     expect(sec).toMatch(/File\]::Open[^。；]{0,60}打不开目录|FILE_FLAG_BACKUP_SEMANTICS/)
-    expect(sec).toMatch(/父目录完全受信/)
-    expect(sec).toMatch(/file ID/)
-    // 空 DACL 造不出来这条也必须写明（否则夹具 7 会被当成已验证覆盖）
+    // 空 DACL 造不出来 + null DACL 未经原生读回，两条都不得写成已验证
     expect(sec).toMatch(/空 DACL[^。；]{0,40}(不生效|造不出)/)
-    // 双向自检：把探针结论句删掉，上面的断言必须能红（用同一条正则对空串验证）
-    expect(/System\.IO\.FileSystem\.AccessControl[^。；]{0,80}加载不了|找不到程序集/.test(''), '空串必不通过').toBe(false)
+    expect(sec, 'null DACL 必须写明未经原生描述符读回').toMatch(/没有做原生描述符读回/)
+    // 主路线是「创建后自检 tmp 的 DACL、有非受信 ACE 就删掉失败」
+    expect(sec, '必须写明主路线：创建后立刻自检 tmp 的 DACL 并中止')
+      .toMatch(/立即读 tmp 自己的 DACL[\s\S]{0,80}删除 tmp 并失败/)
+    expect(sec).toMatch(/父目录受信/)
   })
 
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
