@@ -1253,8 +1253,30 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const sp = read('docs/superpowers/specs/2026-11-22-剩余功能域对接封装-design.md')
     const sec = sp.slice(sp.indexOf('### 2.4a'), sp.indexOf('### 2.4b'))
     expect(sec, '§2.4a 必须存在').not.toBe('')
-    // 三轮探针的事实必须自述一致（量化词随轮次推进要同步，否则文档自己就是不实声明）
-    expect(sec, '轮次数必须与实际探针轮次一致').toMatch(/三轮[\s\S]{0,200}第一轮[\s\S]{0,200}第三轮/)
+    // 探针轮次是**活的**：每轮审查都可能加一轮。判据不能钉死某个数字（那正是「量化词不随
+    // 实况同步」的形态本身），而要**从标题读出数字、再要求正文的枚举与它一致**。
+    const CN = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 } as const
+    const title = sec.split('\n')[0]
+    const claimed = /（2026-11-24，([一二三四五六七八九十])轮(?: \/ \d+ 个探针)?；/.exec(title)?.[1]
+    expect(claimed, '标题必须写明探针轮次（中文数字）').toBeDefined()
+    const n = CN[claimed as keyof typeof CN]
+    expect(n, '轮次数必须 ≥3（当前实况四轮）').toBeGreaterThanOrEqual(3)
+    // 正文逐轮枚举必须覆盖到第 n 轮（第一…第 n），且不得少一轮
+    for (let k = 1; k <= n; k++) {
+      expect(sec, `正文必须逐轮枚举到第${k}轮`).toContain(`第${'一二三四五六七八九十'[k - 1]}轮`)
+    }
+    // 探针编号也不得与轮次混用（第四轮里的第 12 个探针写成「第十二探针」会被读成第五轮之后）
+    expect(sec, '探针序号必须带轮次限定，不得裸写「第 N 探针」')
+      .not.toMatch(/(?<![\d一二三四五六七八九十])第[一二三四五六七八九十]+探针/)
+    expect(sec, '探针总数也要与标题一致').toMatch(/探针 13/)
+    // 逐轮枚举的句子必须存在，且**正文出现的最大轮次必须等于标题轮次**：
+    // 标题少报（正文已有第四轮却写「三轮」）与标题多报（写五轮而正文只到第四轮）都要红。
+    expect(sec, '必须有逐轮起因的枚举句').toMatch(/轮都由审查推动|三轮的起因都是审查/)
+    const ORD = '一二三四五六七八九十'
+    const mentioned = [...sec.matchAll(/第([一二三四五六七八九十])轮/g)]
+      .map((m) => ORD.indexOf(m[1] as string) + 1)
+    expect(Math.max(...mentioned), '正文最大轮次必须与标题轮次一致')
+      .toBe(n)
     // 第二轮探针推翻了第一轮结论：FileStream+FileSecurity 重载可用 —— 必须写明并声明撤回
     expect(sec, '必须写明 FileStream 构造重载可用（第一轮结论已撤回）')
       .toMatch(/FileStream\(path, FileMode, FileSystemRights,[\s\S]{0,80}FileSecurity\)/)
@@ -1266,15 +1288,21 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(sec, 'null DACL 必须写明未经原生描述符读回').toMatch(/没有做原生描述符读回/)
     // 主路线（round 89 后）：建空 tmp → 独占打开 → 判 DACL → 收紧 → **通过同一句柄写 secret**
     expect(sec, '必须写明独占打开这一步及其探测语义')
-      .toMatch(/`FileShare\.None`（独占）打开/)
+      .toMatch(/以真独占（`.NET FileShare\.None`）打开|`FileShare\.None`（独占）打开/)
+    expect(sec, '必须写明独占句柄的第二个作用：钉住祖先目录，让 ③④ 的按路径判据可信')
+      .toMatch(/钉住祖先目录[\s\S]{0,200}按路径[\s\S]{0,60}劫持/)
+    expect(sec, '失败语义必须收窄为「已有其他持有者」，不得写成「内容已泄露」')
+      .toMatch(/只证明「\*\*该文件已有其他持有者\*\*」[\s\S]{0,200}不写「内容已泄露」/)
+    expect(sec, '必须写明纯 Node 的 fd 挡不住 rmdir、不满足本契约')
+      .toMatch(/纯 Node 实现不满足本契约/)
     expect(sec, '独占打开失败必须判为「有人已持有句柄」并删除 tmp')
-      .toMatch(/独占打开\*\*会失败\*\*|独占打开[^。；]{0,40}失败[^。；]{0,60}删除 tmp/)
+      .toMatch(/独占打开\*\*当场失败\*\*|独占打开[^。；]{0,40}失败[^。；]{0,80}删除 tmp/)
     expect(sec, 'secret 必须写进同一个独占句柄，不得按路径重开')
       .toMatch(/通过 ② 拿到的句柄写 secret[\s\S]{0,40}不许按路径重开/)
     // Node 的 fs 在 Windows 给不出独占打开 —— 这条边界必须写明（否则实施者会写出假保护）
     expect(sec, '必须写明 Node fs 无法独占打开、需要 PowerShell/P-Invoke')
       .toMatch(/libuv[\s\S]{0,80}FILE_SHARE|Node 的 `fs` 在 Windows 上给不出独占打开/)
-    expect(sec, '不得声称纯 Node 实现已保护').toMatch(/如实声明残余风险/)
+    expect(sec, '纯 Node 路线不得声称已保护，必须标为弱保证').toMatch(/不得声称已保护|弱保证/)
     // 两个残余窗口各自「里面是什么内容」必须写明，否则「有窗口」会被读成「必然泄露」
     expect(sec, '①→② 窗口必须写明此时文件是空的、且抢先打开会让② 失败')
       .toMatch(/①→② 之间[\s\S]{0,160}(空的|0 字节)/)
@@ -1283,8 +1311,21 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(sec).toMatch(/父目录受信/)
     // round 87：null DACL 与显式 Everyone ACE 是两条判据；文件身份校验是必需项
     expect(sec, '必须区分 null DACL 与显式 Everyone ACE 两条判据').toMatch(/不是同一条判据/)
-    // round 89：身份比对必须落在「写 secret 之后、换入之前」，且写必须走同一句柄
-    expect(sec, '换入前必须比对文件身份').toMatch(/比对一次[\s\S]{0,40}`ino`\/`dev`/)
+    // round 89/93：⑥ 的守卫序列 —— 换名前比身份、换名后复核、不一致删目标并响亮失败、残余如实声明。
+    // 判据按**语义要素各自在场且顺序正确**，不钉具体措辞（钉字句=下次同义改写必假红）。
+    const i6 = sec.indexOf('- ⑥')
+    const step6 = i6 >= 0 ? sec.slice(i6, sec.indexOf('\n 残余', i6) > 0 ? sec.indexOf('\n  残余', i6) : i6 + 900) : ''
+    const iPre = step6.indexOf('比对 `ino`/`dev`')
+    const iRen = step6.indexOf('renameSync')
+    const iPost = step6.indexOf('复核')
+    expect(iPre, '⑥ 必须有换名前的身份比对').toBeGreaterThanOrEqual(0)
+    expect(iRen, '⑥必须有换名步骤').toBeGreaterThanOrEqual(0)
+    expect(iPost, '⑥ 必须有换名后的目标复核').toBeGreaterThanOrEqual(0)
+    expect(iPre, '身份比对必须在 renameSync 之前').toBeLessThan(iRen)
+    expect(iPost, '复核必须在 renameSync 之后').toBeGreaterThan(iRen)
+    expect(step6, '复核不一致必须删除目标并响亮失败').toMatch(/不一致 → 删除该目标文件、响亮失败/)
+    expect(sec, '残余窗口必须如实声明、不得写成已彻底防御')
+      .toMatch(/残余（如实声明[\s\S]{0,400}(完全消除|已彻底防御)/)
   })
 
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
