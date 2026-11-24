@@ -1275,6 +1275,11 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(sec, '必须写明 Node fs 无法独占打开、需要 PowerShell/P-Invoke')
       .toMatch(/libuv[\s\S]{0,80}FILE_SHARE|Node 的 `fs` 在 Windows 上给不出独占打开/)
     expect(sec, '不得声称纯 Node 实现已保护').toMatch(/如实声明残余风险/)
+    // 两个残余窗口各自「里面是什么内容」必须写明，否则「有窗口」会被读成「必然泄露」
+    expect(sec, '①→② 窗口必须写明此时文件是空的、且抢先打开会让② 失败')
+      .toMatch(/①→② 之间[\s\S]{0,160}(空的|0 字节)/)
+    expect(sec, '⑥ 关句柄→换名窗口必须写明依赖 ④ 收紧已生效')
+      .toMatch(/⑥ 关句柄→换名之间[\s\S]{0,160}已收紧/)
     expect(sec).toMatch(/父目录受信/)
     // round 87：null DACL 与显式 Everyone ACE 是两条判据；文件身份校验是必需项
     expect(sec, '必须区分 null DACL 与显式 Everyone ACE 两条判据').toMatch(/不是同一条判据/)
