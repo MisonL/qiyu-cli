@@ -1311,6 +1311,14 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/只证明「\*\*该文件已有其他持有者\*\*」[\s\S]{0,200}不写「内容已泄露」/)
     expect(sec, '必须写明纯 Node 的 fd 挡不住 rmdir、不满足本契约')
       .toMatch(/纯 Node 实现不满足本契约/)
+    // ⚠️ **载体红线（第六轮探针 15–16，自查发现）**：②–⑤ 落到子进程后，secret 的交付载体
+    // 是新的泄露面——Windows 上任何进程完整命令行对同机其他进程可读（WMI/wmic 双证）。
+    // 判据：必须点名 argv 泄露、必须指定 stdin 为唯一合法载体、必须禁止环境变量/明文文件。
+    expect(sec, '必须写明 argv 会被其他进程读到（探针 15 双机制实测）')
+      .toMatch(/完整命令行对同机其他进程可读[\s\S]{0,120}(wmic|Win32_Process)/)
+    expect(sec, '必须规定 secret 只能经 stdin 交付子进程')
+      .toMatch(/secret 只能经 stdin 交给那个 PowerShell 子进程|stdin 进、结构结果出，argv 只带路径/)
+    expect(sec, '必须把环境变量 / 临时明文文件一起禁止').toMatch(/环境变量[^。；]{0,40}(明文文件|同样不许)/)
     expect(sec, '独占打开失败必须判为「有人已持有句柄」并删除 tmp')
       .toMatch(/独占打开\*\*当场失败\*\*|独占打开[^。；]{0,40}失败[^。；]{0,80}删除 tmp/)
     expect(sec, 'secret 必须写进同一个独占句柄，不得按路径重开')
