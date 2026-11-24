@@ -1345,6 +1345,23 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(hrMiss, '路径消失档（0x80070002）必须在场').toBeGreaterThanOrEqual(0)
     expect(hrShare, '共享冲突档必须排在收紧自挡之前').toBeLessThan(hrDeny)
     expect(hrDeny, '收紧自挡档必须排在路径消失之前').toBeLessThan(hrMiss)
+    // ⚠️ **CodeRabbit round 97（两条）**：③ 必须把「属主校验」也跑上（否则攻击者预置「只授当前用户、
+    // 但自己作属主」的 tmp 能过②③，靠隐含 WRITE_DAC 读走⑤ 的 secret），并且失败档的**清理**不能写成
+    // 无条件删除——② 失败时若持有者不含 FILE_SHARE_DELETE 就删不掉（探针 19），而③ 成功时我们是持有方，
+    // 按路径删要**先关句柄**（探针 20）。三处都用 index 判序，不钉固定字符窗。
+    expect(sec, '③ 必须执行属主校验（CR97 major）')
+      .toMatch(/③[^。；]{0,80}(或属主不在受信集合|属主校验|owner SID[\s\S]{0,40}受信)/)
+    const ownerIn3 = sec.search(/③[\s\S]{0,400}属主[\s\S]{0,120}(受信|WRITE_DAC)/)
+    expect(ownerIn3, '③ 段落里必须点名属主与受信集合/WRITE_DAC').toBeGreaterThan(-1)
+    const iWriteSecret = sec.indexOf('- ⑤ **通过 ② 拿到的句柄写 secret**')
+    expect(iWriteSecret, '⑤ 必须在场').toBeGreaterThan(-1)
+    expect(ownerIn3, '属主校验必须排在写 secret 之前').toBeLessThan(iWriteSecret)
+    // 清理分档（CR97 minor + 探针 19）：不得再写「三档都删除 tmp」
+    expect(sec, '失败档的清理必须分档：持有者不含删除共享时删不掉，不得谎称已删除')
+      .toMatch(/清理能力分档[\s\S]{0,600}(不得谎称已删除|既删不掉也移不走)/)
+    // ③ 删除前须关句柄（探针 20）
+    expect(sec, '③ 删除 tmp 必须先关闭 ② 的句柄')
+      .toMatch(/③[\s\S]{0,220}(先关闭 ② 的独占句柄|先 `CloseHandle`|必须先[^。；]{0,10}关[^。；]{0,10}句柄)/)
     expect(sec, '必须禁止把三档笼统归因成「已有其他持有者」')
       .toMatch(/不得共用一句「已有其他持有者」|三档[^。；]{0,40}各自点名真实成因/)
     expect(sec, '即使是共享冲突档也只能证明「有人持有」，不能推出「读过」')
@@ -1360,11 +1377,17 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // ——round 89/93 重写守卫时我只加了新锚，把这条旧锚删了（「同一能力两条入口只修被点名那条」
     // 的测试版）。删 ③ 行或把 ⑤ 挪到 ③ 之前，必须在这里变红。
     const i3 = sec.indexOf('- ③ 读 DACL')
-    const i3x = sec.indexOf('删除 tmp 并失败', i3)
+    // 只在 ③ 自己地里找，避免命中 ②文「于是 ③④⑤」这类交叉引用。
+    const i4b = sec.indexOf('- ④ `icacls', i3)
+    const step3Region = sec.slice(i3, i4b > i3 ? i4b : i3 + 1200)
+    const i3x = i3 + step3Region.search(/(再删除 tmp[\s\S]{0,20}(并以非 0 退出|并失败)|删除 tmp 并失败)/)
     const i4 = sec.indexOf('- ④ `icacls')
     const i5 = sec.indexOf('- ⑤ **通过 ② 拿到的句柄写 secret**')
     expect(i3, '③ DACL 自检步骤必须在场').toBeGreaterThanOrEqual(0)
-    expect(i3x, '③ 必须自带「发现非受信 ACE → 删除 tmp并失败」').toBeGreaterThan(i3)
+    // ③ 必须自带失败清理档（原锚「删除 tmp 并失败」；CR97+探针20 后措辞升级为
+    // 「先关 ② 的句柄、再删除 tmp 并以非 0 退出」——语义不变，锚跟着改，不回退文档迁就旧锚）。
+    expect(i3x, '③ 必须自带「发现非受信 ACE/属主 → 先关句柄再删除 tmp、非 0 退出」')
+      .toBeGreaterThan(i3)
     expect(i4, '④ 收紧步骤必须在场').toBeGreaterThanOrEqual(0)
     expect(i5, '⑤ 写 secret 步骤必须在场').toBeGreaterThanOrEqual(0)
     expect(i3, 'DACL 自检必须排在收紧之前').toBeLessThan(i4)
