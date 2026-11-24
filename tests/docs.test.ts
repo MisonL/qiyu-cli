@@ -1262,13 +1262,22 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 空 DACL 造不出来 + null DACL 未经原生读回，两条都不得写成已验证
     expect(sec).toMatch(/空 DACL[^。；]{0,40}(不生效|造不出)/)
     expect(sec, 'null DACL 必须写明未经原生描述符读回').toMatch(/没有做原生描述符读回/)
-    // 主路线是「创建后自检 tmp 的 DACL、有非受信 ACE 就删掉失败」
-    expect(sec, '必须写明主路线：创建后立刻自检 tmp 的 DACL 并中止')
-      .toMatch(/立即读 tmp 自己的 DACL[\s\S]{0,80}删除 tmp 并失败/)
+    // 主路线（round 89 后）：建空 tmp → 独占打开 → 判 DACL → 收紧 → **通过同一句柄写 secret**
+    expect(sec, '必须写明独占打开这一步及其探测语义')
+      .toMatch(/`FileShare\.None`（独占）打开/)
+    expect(sec, '独占打开失败必须判为「有人已持有句柄」并删除 tmp')
+      .toMatch(/独占打开\*\*会失败\*\*|独占打开[^。；]{0,40}失败[^。；]{0,60}删除 tmp/)
+    expect(sec, 'secret 必须写进同一个独占句柄，不得按路径重开')
+      .toMatch(/通过 ② 拿到的句柄写 secret[\s\S]{0,40}不许按路径重开/)
+    // Node 的 fs 在 Windows 给不出独占打开 —— 这条边界必须写明（否则实施者会写出假保护）
+    expect(sec, '必须写明 Node fs 无法独占打开、需要 PowerShell/P-Invoke')
+      .toMatch(/libuv[\s\S]{0,80}FILE_SHARE|Node 的 `fs` 在 Windows 上给不出独占打开/)
+    expect(sec, '不得声称纯 Node 实现已保护').toMatch(/如实声明残余风险/)
     expect(sec).toMatch(/父目录受信/)
     // round 87：null DACL 与显式 Everyone ACE 是两条判据；文件身份校验是必需项
     expect(sec, '必须区分 null DACL 与显式 Everyone ACE 两条判据').toMatch(/不是同一条判据/)
-    expect(sec, '文件身份校验必须写明是必需项').toMatch(/文件身份校验是必需项/)
+    // round 89：身份比对必须落在「写 secret 之后、换入之前」，且写必须走同一句柄
+    expect(sec, '换入前必须比对文件身份').toMatch(/比对一次[\s\S]{0,40}`ino`\/`dev`/)
   })
 
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
