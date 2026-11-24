@@ -1496,16 +1496,39 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 于是「统一规则：失败路径一律不删」与另两处仍在派生删除动作并存，文档自相矛盾。
     // 判据因此**按整段扫**：规范区内任何一行把「删除/清除/清理」当**现行动作**要求，
     // 又没带作废/引用/机制解释标记，即为违规。
+    // ⚠️ **CR round 99 minor 2 + round 100 minor 1：这一族的机械化防线**
+    // 第九轮我只扫 ③/⑥ 两段切片，漏了段外两处现行删除指令；第十轮改成「动词+宾语」正则扫整段，
+    // CR 100 又证明它有两个假阴性：`清除 + 不报成功`（**动词后没宾语**）与 `失败路径必须删除 tmp`
+    // （**`失败路径` 被我把整行豁免了**）。再往「语义分类器」投入就是无底洞（玩具用例 5 个不过）。
+    // 所以这道防线**退到客观形态**：钉住「迄今每一次回归的原句字面量」为禁止串 + 统一规则本句在场。
+    // **边界如实声明**：它挡得住已知形态复发，挡不住全新措辞——文本扫描的天花板就在这；
+    // 真正可执行的正/负断言要到 0.2.4 的实现测试里才有（那时判据作用于代码行为，不是文字）。
+    // 规范区 = sec 里「设计据此收敛」起、到 §2.4a 末（sec 本身已按 2.4a/2.4b 切好，
+    // 历史记录 §6.x 全在 sec 外，所以历史原话不会被误伤）。
     const normStart = sec.indexOf('**设计据此收敛')
     expect(normStart, '规范区起点必须在场').toBeGreaterThanOrEqual(0)
     const normRegion = sec.slice(normStart)
-    const ACTION = /(删除|清除|清理|移走)[^。；]{0,10}(tmp|目标|文件|残留|冒充)/
-    const CANCEL = /不删除|不按路径|绝不删除|取消|作废|推翻|取代|误写|漏了|收回|不再|降为|只作机制解释|翻转|旧锚|历史记录|保留原样|分不清|禁止|已被|判据|为什么|统一规则|失败路径|无法|留给 0\.2\.4|「删除|「清除|「尽力清/
-    const offenders = normRegion.split('\n')
-      .map((l, i) => ({ l, i })).filter(({ l }) => ACTION.test(l) && !CANCEL.test(l))
-      .map(({ i, l }) => `第${i}行: ${l.trim().slice(0, 80)}`)
-    expect(offenders, `规范区仍有把删除/清除当现行动作的行（统一规则被架空）:\n${offenders.join('\n')}`)
-      .toEqual([])
+    expect(normRegion, '统一规则本句必须在规范区里')
+      .toMatch(/失败路径一律不按路径删除\/移动任何对象/)
+    // 每条禁止串 = 一次真实回归的原句（不是凭空设想的措辞）
+    const REGRESSIONS = [
+      '不满足即删除 tmp',                    // CR 97 版 ③ 属主档；CR98 取消删除动作时漏改
+      '读回不通过就删除 tmp',                // CR 99 minor 2：切片外残留
+      '发现并清除冒充文件',                  // CR99 minor 2：切片外残留
+      '（清除 + 不报成功）',                 // CR 100 minor 1：动词后无宾语、逃过正则
+      '拒绝并删除 tmp',                     // CR 93 版夹具 13(b)
+      '删除该目标文件',                      // CR 93 版 ⑥
+    ]
+    const present = REGRESSIONS.filter((lit) => normRegion.includes(lit))
+    expect(present, `规范区复现了历史上的删除/清除指令形态：${present.join(' ｜ ')}`).toEqual([])
+    // 最小反例（扫描判据必须自带能抓住自己的样本）：把禁止串当独立行喂进同一条 includes 判据，
+    // 若某天禁止串列表被清空/失真，这条会先红。
+    expect(REGRESSIONS.length, '回归字面量清单不得为空').toBeGreaterThan(0)
+    // 最小反例（扫描判据自带）：把禁止串追加进规范区再跑同一条 filter，必须抓出非空——
+    // 否则说明清单或判据本身已经空转。
+    const poisoned = normRegion + '\n读回不通过就删除 tmp、不换名。\n'
+    expect(REGRESSIONS.filter((lit) => poisoned.includes(lit)), '判据对人为回归样本必须报警')
+      .not.toEqual([])
   })
 
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
