@@ -1266,6 +1266,9 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(sec, '必须写明主路线：创建后立刻自检 tmp 的 DACL 并中止')
       .toMatch(/立即读 tmp 自己的 DACL[\s\S]{0,80}删除 tmp 并失败/)
     expect(sec).toMatch(/父目录受信/)
+    // round 87：null DACL 与显式 Everyone ACE 是两条判据；文件身份校验是必需项
+    expect(sec, '必须区分 null DACL 与显式 Everyone ACE 两条判据').toMatch(/不是同一条判据/)
+    expect(sec, '文件身份校验必须写明是必需项').toMatch(/文件身份校验是必需项/)
   })
 
   it('存储层 spec：auth login / --pretty 的「尚未实现」就地状态注在场，且旧断言的废除写明', () => {
