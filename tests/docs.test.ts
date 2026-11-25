@@ -1284,7 +1284,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 单字正则读不出来（本轮把它读成 undefined 直接假红）。序数表与解析器同一处维护。
     const ORDINALS = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二', '十三', '十四', '十五']
     const title = sec.split('\n')[0]
-    const claimed = /（2026-11-24，([一二三四五六七八九十]+)轮(?: \/ \d+ 个探针)?；/.exec(title)?.[1]
+    // 日期不再是钉死的字面量：探针会跨天，钉死会让「换天补跑」被判红（Codex round 38 那轮起用新日期）。
+    const claimed = /（\d{4}-\d{2}-\d{2}，([一二三四五六七八九十]+)轮(?: \/ \d+ 个探针)?；/.exec(title)?.[1]
     expect(claimed, '标题必须写明探针轮次（中文数字）').toBeDefined()
     const n = ORDINALS.indexOf(claimed as string) + 1
     expect(n, '轮次数必须能在序数表里解析（≥3：本设计的探针至少跑了三轮）').toBeGreaterThanOrEqual(3)
@@ -1296,7 +1297,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(sec, '探针序号必须带轮次限定，不得裸写「第 N 探针」')
       .not.toMatch(/(?<![\d一二三四五六七八九十])第[一二三四五六七八九十]+探针/)
     // 探针编号同样不能钉死字面值：从标题读出总数，再要求正文引用到的**最大探针号等于它、且不越界**。
-    const pc = /（2026-11-24，[一二三四五六七八九十]+轮 \/ (\d+) 个探针；/.exec(title)?.[1]
+    const pc = /（\d{4}-\d{2}-\d{2}，[一二三四五六七八九十]+轮 \/ (\d+) 个探针；/.exec(title)?.[1]
     expect(pc, '标题必须写明探针总数').toBeDefined()
     const total = Number(pc)
     const nums = [...sec.matchAll(/探针 (\d+)(?:[–-](\d+))?/g)]
@@ -1325,6 +1326,39 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // （元数据句柄不与 FileShare.None 互斥），不能只写成「独占打开」这一步。
     expect(sec, '必须写明受限创建+独占持有是同一次调用（FileStream 七参重载）')
       .toMatch(/FileStream\(path, FileMode\.CreateNew,[\s\S]{0,160}FileShare\.None[\s\S]{0,120}fileSecurity/)
+    // ⚠️ Codex round 38 P1：整条写序都在 PowerShell 子进程内完成，而 `renameSync` 只存在于 Node——
+    // 照字面实现编不出来。判据两半：子进程那句里**不得**出现 `renameSync`；换名的可执行形态
+    // （`MoveFileExW` + `MOVEFILE_REPLACE_EXISTING`）与三个反面证据必须写明。
+    // 只切「子进程内完成 → 只把结构化结果」这一句：后面的解释块*可以*提到 `renameSync` 作对照，
+    // 判据要抓的是**被要求执行的序列**本身（切太宽会把合法的对照说明也判红）。
+    const seqSentence = (text: string) => {
+      const a = text.indexOf('子进程内完成')
+      const b = text.indexOf('只把结构化结果', a)
+      return a >= 0 && b > a ? text.slice(a, b) : ''
+    }
+    expect(seqSentence(sec), '「子进程内完成…」那句必须在场（锚缺失时下一条会空转）').not.toEqual('')
+    expect(seqSentence(sec), '被要求执行的写序不得点名 Node 的 `renameSync`（Codex round 38 P1）')
+      .not.toMatch(/renameSync/)
+    expect(seqSentence(sec), '写序里的换名必须写成子进程可执行的调用').toMatch(/MoveFileExW/)
+    expect(sec, '必须写明子进程可执行的换名调用：MoveFileExW + MOVEFILE_REPLACE_EXISTING')
+      .toMatch(/MoveFileExW[\s\S]{0,80}MOVEFILE_REPLACE_EXISTING/)
+    expect(sec, '必须写明 File.Replace 保留被替换文件的 ACL（会带回宽松 ACL，不得使用）')
+      .toMatch(/Replace[\s\S]{0,200}(保留|带过去)[\s\S]{0,60}被替换|Replace[\s\S]{0,200}保留的是被替换文件/)
+    expect(sec, '必须写明两参 File.Move 在目标已存在时失败（0xB7）')
+      .toMatch(/File\]::Move[\s\S]{0,120}(0xB7|ERROR_ALREADY_EXISTS|已存在时失败)/)
+    // Codex round 38 P2（残留路径）：核不出身份时必须如实说「无法确认」，不得断言那个路径上有凭证。
+    expect(sec, '残留路径必须附核实依据；核不出时须明确写「残留位置无法确认」')
+      .toMatch(/残留位置无法确认/)
+    expect(sec, '不得断言未核实路径的内容（「不得断言其内容」这类边界要求必须在场）')
+      .toMatch(/不得断言其内容|不得断言那个路径/)
+    // Codex round 38 P2（夹具 13(b)）：判红必须覆盖「调用了写入」这一档，旧的全称已被取代。
+    // ⚠️ 夹具 13 在 §2.5，不在 §2.4a 的切片里——这两条必须扫 `sp`（第一版写成 sec，实测假红）。
+    expect(sp, '夹具 13(b) 的判红条件必须覆盖「写入被调用」与「发现 secret 字节」两档')
+      .toMatch(/写入函数被调用次数非 0[\s\S]{0,40}或「发现 secret 字节」/)
+    expect(sp, '不得再留「只接受 secret 已落盘判红」这条放行提前写入的旧句')
+      .not.toMatch(/只接受「secret 已落盘」判红/)
+    expect(sec, '必须如实声明：换名权限这一档因探针机特权而无法实测')
+      .toMatch(/SeBackup[\s\S]{0,200}(绕过|无从实测|无法实测)/)
     expect(sec, '必须写明「不许拆成先建再打开两步」及其实证依据')
       .toMatch(/不许拆成「先建空文件、再打开它」两步[\s\S]{0,200}(WRITE_DAC|元数据)/
       )
@@ -1332,11 +1366,21 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/CR round 103/)
     // CR round 106：`.NET Framework` 的 `FileSystemRights` **没有** `ReadWrite` 成员——
     // 我上一版把它写进配方，照着实现编不过。守卫钉三件事：不许再出现该形式；
-    // `Read | Write` 与实测掩码 `0x12019f` 必须在场；成员缺失这一事实要写明。
+    // 配方与实测掩码必须在场；成员缺失这一事实要写明。
+    // ⚠️ Codex round 38 之后掩码是 `0x13019f`（ACE 多了 `Delete`，换名要用）。正文里仍会出现
+    // `0x12019f`（探针 32 那一档用的是 `Read | Write`、以及「父目录只授 Modify」的反例句），
+    // 所以判据钉的是**「实测产物 SDDL 是…」这句自己的内容**，而不是全段禁词。
     expect(sec, '不得再写 `FileSystemRights::ReadWrite`（.NET Framework 无此成员，CR106）')
       .not.toMatch(/FileSystemRights::ReadWrite|FileSystemRights\.ReadWrite/)
-    expect(sec, '必须写明 Read | Write 与实测掩码 0x12019f')
-      .toMatch(/Read \| Write[\s\S]{0,160}0x12019f/)
+    expect(sec, '配方必须写全 Read | Write | Delete（Codex round 38）')
+      .toMatch(/Read \| Write \| Delete/)
+    // 掩码钉在**「实测产物 SDDL 是…」这句自己**上：上一版写成「Read | Write | Delete 后 200 字内有
+    // 0x13019f」，把产物那句的掩码改回 0x12019f 仍然绿（同一段里另有 0x13019f 满足了下限）。
+    const sddlClaim = /实测产物 SDDL 是 `([^`]*)`/.exec(sec)?.[1] ?? ''
+    expect(sddlClaim, '必须声明实测产物的 SDDL（锚缺失时下一条会空转）').not.toEqual('')
+    expect(sddlClaim, '实测产物 SDDL 必须带 0x13019f（ACE 含 Delete）').toContain('0x13019f')
+    expect(sec, '必须写明「仅当前用户可删」的理由：换名依据是文件自身的 DELETE（父目录可能不给 DELETE_CHILD）')
+      .toMatch(/DELETE[\s\S]{0,80}必须在场|必须在场[\s\S]{0,80}DELETE/)
     expect(sec, '必须写明 ReadWrite 成员不存在这一事实')
       .toMatch(/没有 `ReadWrite` 成员/)
     expect(sec, '必须写明独占句柄的第二个作用：钉住祖先目录，让 ③④ 的按路径判据可信')
@@ -1359,9 +1403,11 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 旧路线的窗口论证必须标为作废，不得继续当现行契约（否则实施者会按旧形态写两次调用）。
     expect(sec, '旧 ①→② 窗口的论证必须标为随旧路线作废')
       .toMatch(/随旧路线一起作废|随旧路线[\s\S]{0,20}作废/)
-    const hrShare = sec.indexOf('0x80070020')
-    const hrDeny = sec.indexOf('0x80070005')
-    const hrMiss = sec.indexOf('0x80070002')
+    // 三档的定位必须带**档位前缀**，不能只搜裸 HRESULT：Codex round 38 那轮我在别的段落里
+    // 引用了同一个 `0x80070005`（32d 的对照实验），裸搜索会命中它、把档序判据指到错的段落。
+    const hrShare = sec.indexOf('HRESULT `0x80070020`')
+    const hrDeny = sec.indexOf('`UnauthorizedAccessException` / `0x80070005`')
+    const hrMiss = sec.indexOf('`FileNotFoundException` / `0x80070002`')
     expect(hrShare, '共享冲突档（0x80070020）必须在场').toBeGreaterThanOrEqual(0)
     expect(hrDeny, '收紧自挡档（0x80070005）必须在场').toBeGreaterThanOrEqual(0)
     expect(hrMiss, '路径消失档（0x80070002）必须在场').toBeGreaterThanOrEqual(0)
@@ -1430,6 +1476,23 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // ⚠️ **CodeRabbit round 94（minor）**：只判 i3<i4 与 i3<i5 时，把 ⑤ 挪到 ③④ 之间两判据照样过
     // ——等于允许「收紧之前就写 secret」（泄露面本身）。收紧必须早于写入，这条要单独钉。
     expect(i4, 'icacls 收紧必须排在写 secret 之前').toBeLessThan(i5)
+    // ⚠️ **Codex round 38 P2**：上面只比了标题先后——把「读回确认、全部七条」整句挪到写入之后，
+    // 标题顺序不变、86/86 照样绿（它在隔离副本里实测过）。收紧的真正要求是「**读回通过**才写」，
+    // 所以判据要落在 ④ 的**区段内部**：读回与「全部七条」必须都在 ④ 与 ⑤ 之间。
+    const step4HasReadback = (text: string) => {
+      const a = text.indexOf('- ④ `icacls')
+      const b = text.indexOf('- ⑤ **通过')
+      if (a < 0 || b <= a) return false
+      const block = text.slice(a, b)
+      return block.includes('读回') && /全部七条/.test(block)
+    }
+    expect(step4HasReadback(sec), '④ 的区段内必须含「读回确认」且要求跑全部七条（读回通过才写）').toBe(true)
+    // 反例直接跑同一条判据（合成文本，不依赖真文档的措辞，0.2.4 怎么改写都不会假红）：
+    // 读回句被挪到 ⑤ 之后 → 必须判红；读回句留在 ④ 之内 → 必须放过。
+    expect(step4HasReadback('- ④ `icacls` 收紧。\n- ⑤ **通过句柄写 secret**（读回确认、全部七条）\n'),
+      '反例：读回挪到写入之后必须判红（Codex round 38 的复现手法）').toBe(false)
+    expect(step4HasReadback('- ④ `icacls` 收紧并读回确认，跑全部七条。\n- ⑤ **通过句柄写**\n'),
+      '反例的另一臂：读回在 ④ 之内不得误伤').toBe(true)
     // ⚠️ **CR round 95 major 曾要求「给 ⑥ 的删除动作配跨进程串行化」；CR round 98 major 2 连处置一起
     // 推翻**：路径式锁挡不住目录替换（A 在旧目录持锁、目录被换、B 在同一路径拿到新目录里的另一把锁），
     // 要锁有效得钉**目录对象**，纯 Node 拿不到。正解是**取消 ⑥ 对目标的破坏性动作**——竞态因
@@ -1506,8 +1569,10 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(iResidual, '⑥ 之后必须有「残余（如实声明…）」段作为切片边界').toBeGreaterThan(i6)
     const step6 = sec.slice(i6, iResidual)
     const iPre = step6.indexOf('比对 `ino`/`dev`')
-    const iRen = step6.indexOf('renameSync')
-    const iPost = step6.indexOf('复核')
+    // 换名步骤的判据认**动作**而不是某个 API 名：Codex round 38 起 ⑥ 在子进程内用
+    // `MoveFileExW`（Node 的 `renameSync` 不能出现在「子进程内完成」那一句里）。
+    const iRen = step6.search(/MoveFileExW|renameSync/)
+    const iPost = step6.indexOf('复核', iPre)
     expect(iPre, '⑥ 必须有换名前的身份比对').toBeGreaterThanOrEqual(0)
     expect(iRen, '⑥必须有换名步骤').toBeGreaterThanOrEqual(0)
     expect(iPost, '⑥ 必须有换名后的目标复核').toBeGreaterThanOrEqual(0)
@@ -1554,7 +1619,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 句子切分见下：**换行先按块合并（空行或列表标记起新块），再按 。；切句**——
     // CR 107 指出按 \n 直接切会把换行折断的句子劈成碎片（「都能搬走/删掉」单独一片），
     // 文档没改却被判红。合并规则与「排版不影响判定」这条声明一致。
-    // 代价（如实声明，实测过边界）：改这 40 句里任何一句的**文字**都会红，须回来确认它仍不是
+    // 代价（如实声明，实测过边界）：改这 44 句里任何一句的**文字**都会红，须回来确认它仍不是
     // 现行删除指令并更新清单；纯排版（`**`/反引号/空白/续行换行）不会红（比对前归一化，M16 实证）。
     // 这是有意的取舍：假阳性可见、成本一次性；假阴性会让「失败路径一律不删」被悄悄推翻。
     const ALLOWED_DELETE_MENTIONS = [
@@ -1598,10 +1663,16 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       '且**删除本身在持有者不含删除共享时会失败**，         CodeRabbit round 97——见探针 19），必须是**观测「写 secret 那一步从未被执行」**         ——测试对写入函数打桩计数：任一前置检查失败时写入次数必须为 0，且 secret 字节不出现在任何文件',
       '**不删除是规定动作，不是失败降级**',
       '**不可逆性**：注册表无任何 ticket 删除接口——create 出的工单无法通过 API 清除，是一次写就永久污染租户的对象级不可逆',
+      '同轮还查出 **探针机的令牌会让这一条无从实测**：ssh 会话是已提权管理员、`SeBackup`/`SeRestore` 均已启用， 删除与改名的 ACL 校验被绕过（显式 `DENY` 也拦不住，而 `DENY READ_DATA` 照样能拦读取）',
+      '**换名权限这一条在本机无法实测**（探针 32d）：该机 ssh 会话的令牌是**已提权管理员**且   `SeBackupPrivilege`/`SeRestorePrivilege` 均为**已启用**，这两个特权使 `DeleteFile`/`MoveFileEx`   **绕过 ACL 校验**——即使文件上写死 `DENY DELETE`、父目录写死 `DENY DELETE_CHILD`，改名与删除**照样成功**   （对照：`DENY READ_DATA` 时读取确实被拒 `0x80070005`，说明 ACL 校验本身是生效的，被绕过的只是   删除/改名这一侧）',
+      '「目标须同卷」那条限制针对的是移动**目录**），     与探针实测的「按路径换名成功、把攻击者文件送进目标位」一致',
+      '**本机造不出干净的判据**：探针机的 ssh 令牌带已启用的 `SeBackup`/`SeRestore`，删除与改名会         **绕过 ACL**（探针 32d：显式 `DENY DELETE` + 父目录 `DENY DELETE_CHILD` 仍然改名成功），         所以这一档的「权限不够就失败」**未实测**，0.2.4 必须在普通账户下补跑',
     ]
     const normSent = (x: string) => x.replace(/\*\*/g, '').replace(/`/g, '').replace(/\s+/g, '')
     const allowed = new Set(ALLOWED_DELETE_MENTIONS.map(normSent))
-    const DELETE_VERB = /(删除|清除|清理|移走|清扫|删掉)/
+    // Codex round 38 P2：统一规则写的是「不按路径删除/**移动**任何对象」，入口判据却漏了「移动」
+    // ——注入「复核失败时将目标文件移动到隔离目录」当时 86/86 全绿。禁止语与判据必须同集合。
+    const DELETE_VERB = /(删除|清除|清理|移走|清扫|删掉|移动)/
     // 块边界 = 空行 或 列表/编号/⚠️ 起始行；块内换行是续行，合并成一个空格。
     const splitBlocks = (text: string) => {
       const blocks: string[] = []
@@ -1656,9 +1727,20 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // ② ⑤ 之后那一臂必须写明 secret 可能已落盘；③ 必须要求报告「含 secret 的残留路径」。
     const sec24a = sp.slice(sp.indexOf('### 2.4a'), sp.indexOf('### 2.4b'))
     expect(sec24a.length, '§2.4a 切片必须非空（锚缺失时下面三条会假绿）').toBeGreaterThan(1000)
-    const normA = normSent(sec24a)
-    expect(normA, 'CR108：⑤ 之后的失败必须写明 secret 可能已落盘').toContain('secret可能已落盘')
-    expect(normA, 'CR108：⑤ 之后的失败必须要求报告含 secret 的残留路径').toContain('含secret的残留路径')
+    // ⚠️ **Codex round 38 P2**：这两条原先搜整节——⑤ 的步骤说明里也有「secret 可能已落盘」，
+    // 把权威失败分支那句改成「已落盘」，86/86 照样绿（它实测过）。判据必须限定在**分臂那一段**内。
+    const armBlock = (text: string) => {
+      const a = text.indexOf('失败语义按 secret 是否已写分两臂')
+      const b = text.indexOf('统一规则：失败路径一律不按路径删除', a)
+      return a >= 0 && b > a ? normSent(text.slice(a, b)) : ''
+    }
+    expect(armBlock(sec24a), 'CR108：⑤ 之后的失败必须写明 secret 可能已落盘（限分臂段内）')
+      .toContain('secret可能已落盘')
+    expect(armBlock(sec24a), 'CR108：⑤ 之后的失败必须要求报告含 secret 的残留路径（限分臂段内）')
+      .toContain('含secret的残留路径')
+    // 反例：同一措辞放在分臂段**之外**不得满足判据（这正是旧版被绕过的手法）。
+    expect(armBlock('失败语义按 secret 是否已写分两臂。统一规则：失败路径一律不按路径删除。secret 可能已落盘，含 secret 的残留路径。'),
+      '反例：分臂段之外的同一措辞不得满足这两条').not.toContain('secret可能已落盘')
     // ① 全称句的判据扫**整个规范窗**（不只 §2.4a）：CR 108 指出的原句住在 §2.4 方案 A 里，
     //    只扫 §2.4a 会让「回到全称」这条回归一路绿灯（我第一版就是这么写的，变异 N1 实测没红）。
     const blanketOf = (text: string) => sentencesOf(text)
