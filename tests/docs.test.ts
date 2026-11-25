@@ -1480,22 +1480,30 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/allow 只含 `Read` \+ deny `READ_DATA`[\s\S]{0,120}ok:false/)
     expect(fx9c, '夹具 9(c)(ii) 必须写「无 deny → 读面 ok:true」的对照档')
       .toMatch(/无 deny[\s\S]{0,80}ok:true/)
-    // ⚠️ **自查（把 Codex round 46 的发现推广到全组）**：上面这些夹具断言多数搜整份 `sp`——把某条夹具
-    // 整块搬进 §6 历史区，断言仍由历史副本满足，现行验收清单却已失去它（r46 对 9(c) 实测过）。
-    // 逐个切片会漏（漏一个就再复现一次），所以再钉一条**结构不变量**：§2.5 的 ACL 夹具标题
-    // 必须**全部住在规范区**（`## 6.` 之前）。任何一条被搬进历史区 → 这里先红。
-    const iHistSection = sp.indexOf('## 6. ')
-    expect(iHistSection, '规范区终点锚（`## 6.`）必须在场（锚缺失时下一条会静默放大）').toBeGreaterThan(0)
-    const normativeOnly = sp.slice(0, iHistSection)
-    const fixtureHeads = [
-      '1. **DACL 存在', '2. **DACL 非空', '3. **属主（owner SID）', '4. **所有允许 ACE 的主体',
-      '5. **当前用户的允许 ACE', '6. **继承关闭', '7. **父目录的写面受信', '8. **任一条判不了',
-      '9(b). ', '9(c). ', '10. **继承开启', '11. **文件本身干净', '12. **父目录不可信时的写序',
-      '13. **父目录对他人有可继承的只读 ACE',
-    ]
-    expect(fixtureHeads.length, '夹具标题清单不得被清空（清空后下一条会恒真）').toBeGreaterThanOrEqual(14)
-    const homeless = fixtureHeads.filter((h) => !normativeOnly.includes(h))
-    expect(homeless, `这些夹具条目不在规范区（被搬进 §6 历史区？）：\n${homeless.join('\n')}`).toEqual([])
+    // ⚠️ **自查（把 Codex round 46 的发现推广到全组）+ CodeRabbit round 119 minor 的纠错**：
+    // 上面这些夹具断言多数搜整份 `sp`——把某条夹具整块搬进 §6 历史区，断言仍由历史副本满足。
+    // 逐条切片会漏，所以钉一条**结构不变量**。**第一版写错了**：清单前八项抄的是 §2.4 的**判据清单**
+    // 标题（`1. **DACL 存在` 等），不是 §2.5 的**夹具**标题——两条清单恰好都从 1 编号，所以第一版
+    // 在夹具被搬走后仍能找到 §2.4 的同号标题而过关。现在改为在 **§2.5 窗口内**按 fixture 编号判。
+    const i25 = sp.indexOf('### 2.5 回归防线')
+    const i3sec = sp.indexOf('## 3. ', i25)
+    expect(i25, '§2.5 标题必须在场').toBeGreaterThanOrEqual(0)
+    expect(i3sec, '§2.5 终点锚（`## 3. `）必须在场（否则窗口静默扩大）').toBeGreaterThan(i25)
+    expect(i3sec - i25, '§2.5 窗口跨度必须收敛（>20000 说明终点锚命中了别处）').toBeLessThan(20000)
+    const fixtureRegion = sp.slice(i25, i3sec)
+    // 夹具编号是活的（会随轮次增删），但「1–14 齐全且 9(b)/9(c) 在」是当前清单的结构事实；
+    // 用行首编号判，避免正文里偶然出现的「3.」满足判据。
+    const needNums = ['1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.', '9(b).', '9(c).',
+      '10.', '11.', '12.', '13.', '14.']
+    const missing = needNums.filter((n) => {
+      const re = new RegExp(`^\\s*${n.replace(/[()]/g, '\\$&')}\\s`, 'm')
+      return !re.test(fixtureRegion)
+    })
+    expect(missing, `这些夹具编号不在 §2.5（被搬进 §6 历史区？）：${missing.join(', ')}`).toEqual([])
+    // 夹具 6 是 null DACL——单列一条，确保「编号在但内容被换掉」也能被发现。
+    expect(fixtureRegion, '§2.5 的夹具 6 必须是 null DACL（不是别的条目）')
+      .toMatch(/^\s*6\.\s.*null DACL/m)
+
     expect(sec, '必须写明「仅当前用户可删」的理由：换名依据是文件自身的 DELETE（父目录可能不给 DELETE_CHILD）')
       .toMatch(/DELETE[\s\S]{0,80}必须在场|必须在场[\s\S]{0,80}DELETE/)
     expect(sec, '必须写明 ReadWrite 成员不存在这一事实')
@@ -1515,8 +1523,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 是 SDDL 形态的直接推论，本轮没有用第二个 Windows 账户做过跨账户实测（本机只有一个可登账户）。
     expect(sec, '合并形态的实测事实必须写明：受限创建产物 SDDL 与两项性质')
       .toMatch(/受限创建与独占持有可以是一次调用[\s\S]{0,400}钉住祖先目录[\s\S]{0,200}数据读被拒/)
-    expect(sec, '跨账户抢占仍是推断，必须如实标注（本机只有一个可登账户）')
-      .toMatch(/跨账户(实测)?[\s\S]{0,120}(推断|未实测|没有)/)
+    // ⚠️ **Codex round 48 P2**：原来只要窗口里出现「推断|未实测|没有」——把结论反转成
+    // 「是【已验证】而非【推断】」后，「推断」仍出现在否定那半句里，86/86 照样绿（实测）。
+    // 判据必须钉**肯定状态**：归一化后要求「是【推断】而非【已验证】」这一整句在场，并内置反转对照。
+    const flatSec = sec.replace(/[*`]/g, '').replace(/\s+/g, '')
+    expect(flatSec, '「首次可见即打不开」必须明确标为【推断】而非【已验证】（肯定状态）')
+      .toContain('是【推断】而非【已验证】')
+    const claimOf = (t: string) => t.replace(/[*`]/g, '').replace(/\s+/g, '').includes('是【推断】而非【已验证】')
+    expect(claimOf('「首次可见即打不开」是【推断】而非【已验证】。'), '正例必须通过').toBe(true)
+    expect(claimOf('「首次可见即打不开」是【已验证】而非【推断】。'), '反例：状态反转必须判红').toBe(false)
     // 旧路线的窗口论证必须标为作废，不得继续当现行契约（否则实施者会按旧形态写两次调用）。
     expect(sec, '旧 ①→② 窗口的论证必须标为随旧路线作废')
       .toMatch(/随旧路线一起作废|随旧路线[\s\S]{0,20}作废/)
