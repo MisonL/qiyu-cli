@@ -1379,6 +1379,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const sddlClaim = /实测产物 SDDL 是 `([^`]*)`/.exec(sec)?.[1] ?? ''
     expect(sddlClaim, '必须声明实测产物的 SDDL（锚缺失时下一条会空转）').not.toEqual('')
     expect(sddlClaim, '实测产物 SDDL 必须带 0x13019f（ACE 含 Delete）').toContain('0x13019f')
+    // CodeRabbit round 110：清单第 5 条必须把 DELETE 写成必要项，否则「收紧抹掉 DELETE」能全绿通过。
+    // 切片到第 5 条自己的文字里判：上一版用「至少含读权限 + 200 字内有 DELETE」，
+    // 把 DELETE 从句删掉后后面的条目仍在窗口内，判据照样绿（变异 N5 实测）。
+    // 注意：清单在 §2.4（sec 切片之前），不在 §2.4a 里——这里必须扫 `sp`。
+    const item5 = sp.slice(sp.indexOf('5. **当前用户的允许 ACE'), sp.indexOf('6. **继承关闭'))
+    expect(item5.length, '清单第 5 条切片必须非空（锚缺失时下两条会空转）').toBeGreaterThan(20)
+    expect(item5, '清单第 5 条必须要求 DELETE（否则 ④ 抹掉它也能全绿通过）').toContain('`DELETE`')
+    expect(item5, '清单第 5 条必须标明不得含 WRITE_DAC/WRITE_OWNER')
+      .toMatch(/不得含[\s\S]{0,40}WRITE_DAC/)
     expect(sec, '必须写明「仅当前用户可删」的理由：换名依据是文件自身的 DELETE（父目录可能不给 DELETE_CHILD）')
       .toMatch(/DELETE[\s\S]{0,80}必须在场|必须在场[\s\S]{0,80}DELETE/)
     expect(sec, '必须写明 ReadWrite 成员不存在这一事实')
@@ -1487,6 +1496,20 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       return block.includes('读回') && /全部七条/.test(block)
     }
     expect(step4HasReadback(sec), '④ 的区段内必须含「读回确认」且要求跑全部七条（读回通过才写）').toBe(true)
+    // ⚠️ **CodeRabbit round 110 major + Codex round 39 P2-1**：④ 的 `/grant:r` 是**替换**该委托人的
+    // 显式 ACE，写 `(R,W)` 会把 ① 的 `DELETE` 抹掉（探针 33 B 档实测），而七条读回只要求「至少含读权限」
+    // 拦不住。判据：④ 的命令必须带 `D`；且「读回通过才写」必须是硬门（Codex P2-3 指出的
+    // 「先查继承、写完再补跑七条」形态不得通过）。
+    const step4Block = sec.slice(sec.indexOf('- ④ `icacls'), sec.indexOf('- ⑤ **通过'))
+    expect(step4Block, '④ 的收紧命令必须写 (R,W,D)，不得只写 (R,W)')
+      .toMatch(/\(R,W,D\)/)
+    expect(step4Block, '④ 的收紧命令不得回到只授 (R,W) 的旧形态')
+      .not.toMatch(/grant:r[^\n]{0,40}\(R,W\)/)
+    expect(step4Block, '读回不通过必须直接挡住 ⑤（硬门）').toMatch(/读回不通过就不得进入 ⑤/)
+    // 「写完再补跑七条」这一形态必须被拦：整节里不得出现「写完后/写入之后 … 全部七条」的延后安排。
+    const deferral = /(写完后|写入之后|写完再)[^。；]{0,40}(全部七条|七条)/
+    expect(sec, '不得把完整读回延后到写入之后（Codex round 39 P2-3）').not.toMatch(deferral)
+    expect(deferral.test('④ 先只查继承，写完后补跑全部七条。'), '反例：延后安排必须被这条判据抓住').toBe(true)
     // 反例直接跑同一条判据（合成文本，不依赖真文档的措辞，0.2.4 怎么改写都不会假红）：
     // 读回句被挪到 ⑤ 之后 → 必须判红；读回句留在 ④ 之内 → 必须放过。
     expect(step4HasReadback('- ④ `icacls` 收紧。\n- ⑤ **通过句柄写 secret**（读回确认、全部七条）\n'),
@@ -1571,7 +1594,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const iPre = step6.indexOf('比对 `ino`/`dev`')
     // 换名步骤的判据认**动作**而不是某个 API 名：Codex round 38 起 ⑥ 在子进程内用
     // `MoveFileExW`（Node 的 `renameSync` 不能出现在「子进程内完成」那一句里）。
-    const iRen = step6.search(/MoveFileExW|renameSync/)
+    // ⚠️ **Codex round 39 P2-4**：这里原用 `search(/MoveFileExW|renameSync/)`，于是把 ⑥ 的**详细步骤**
+    // 改回 `renameSync`（保留前面摘要里的 MoveFileExW）时照样绿。判据必须落在 ⑥ 的动作句本身：
+    // 从「- ⑥ 关闭句柄」到第一个 ⚠️ 之间不得出现 renameSync，且必须写出可执行原语与替换标志。
+    const step6Action = step6.slice(0, step6.indexOf('⚠️') > 0 ? step6.indexOf('⚠️') : step6.length)
+    expect(step6Action, '⑥ 的动作句必须写 MoveFileExW + MOVEFILE_REPLACE_EXISTING')
+      .toMatch(/MoveFileExW[\s\S]{0,60}MOVEFILE_REPLACE_EXISTING/)
+    expect(step6Action, '⑥ 的动作句不得写成 Node 的 renameSync（子进程里调不到）')
+      .not.toMatch(/renameSync/)
+    const iRen = step6.search(/MoveFileExW/)
     const iPost = step6.indexOf('复核', iPre)
     expect(iPre, '⑥ 必须有换名前的身份比对').toBeGreaterThanOrEqual(0)
     expect(iRen, '⑥必须有换名步骤').toBeGreaterThanOrEqual(0)
@@ -1619,7 +1650,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 句子切分见下：**换行先按块合并（空行或列表标记起新块），再按 。；切句**——
     // CR 107 指出按 \n 直接切会把换行折断的句子劈成碎片（「都能搬走/删掉」单独一片），
     // 文档没改却被判红。合并规则与「排版不影响判定」这条声明一致。
-    // 代价（如实声明，实测过边界）：改这 44 句里任何一句的**文字**都会红，须回来确认它仍不是
+    // 代价（如实声明，实测过边界）：改这 45 句里任何一句的**文字**都会红，须回来确认它仍不是
     // 现行删除指令并更新清单；纯排版（`**`/反引号/空白/续行换行）不会红（比对前归一化，M16 实证）。
     // 这是有意的取舍：假阳性可见、成本一次性；假阴性会让「失败路径一律不删」被悄悄推翻。
     const ALLOWED_DELETE_MENTIONS = [
@@ -1635,7 +1666,6 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       '第八轮（CR 94/95/96，探针 14b–14d、17）把 error 87 查到**信息类号**级（真因是类号写错， 修正后仍闭合不了⑥ 窗口），并收回两处过度声明（并发删除竞态、检测范围全称承诺）， 再把独占打开失败按异常类型分成三档',
       '删除时机——他人不含删除共享时 删不掉、自己持有时也要先关句柄才删得掉）',
       '第十轮（CR 98/99/100，无新实验）把九轮累积下来的**互相打架的删除语义收敛成一条统一规则**：失败路径一律 不按路径删除/移动任何对象——路径那一刻无法正名「这是我的对象」（② 失败没有句柄、③ 要删就得先丢句柄、 ⑥ 不一致时可能是并发写者刚验收的配置），于是 CR 95「给删除配串行化」与 CR 97「删除分档/先关句柄再删」 **都作为派生要求作废**，只留机制解释',
-      '`DELETE` 缺席不影响   ⑥ 的 `renameSync`（换名要的是父目录上的删除子项权，不是文件自身的 `DELETE`，探针 31 A 档实测换名成功）',
       '**统一规则：失败路径一律不按路径删除/移动任何对象**（CR round 98 major 2 把 round 97的   「清理能力分档」进一步合并掉——分档讨论的前提是「有该删的」，而正名问题让「该删」无法安全判定）：   ② 失败时我们**没有句柄**、③ 失败时若先关句柄再删，删除发生在**已放弃唯一正名手段之后**——   路径那一刻是谁的对象**无从证明**（并发写者/攻击者的同名对象都可能在场）',
       '是否清扫、何时清扫**留给 0.2.4 设计并写明判据**——两个坑先列全：① 崩在 ⑤ 之后的 tmp   **含 secret**，「只扫空文件」恰好漏掉最该清的',
       '②并发 login 的 tmp 名含 `pid`+时间戳，   撞名极罕见，但无脑清扫仍会踩到别人正在写的对象',
@@ -1663,10 +1693,12 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       '且**删除本身在持有者不含删除共享时会失败**，         CodeRabbit round 97——见探针 19），必须是**观测「写 secret 那一步从未被执行」**         ——测试对写入函数打桩计数：任一前置检查失败时写入次数必须为 0，且 secret 字节不出现在任何文件',
       '**不删除是规定动作，不是失败降级**',
       '**不可逆性**：注册表无任何 ticket 删除接口——create 出的工单无法通过 API 清除，是一次写就永久污染租户的对象级不可逆',
-      '同轮还查出 **探针机的令牌会让这一条无从实测**：ssh 会话是已提权管理员、`SeBackup`/`SeRestore` 均已启用， 删除与改名的 ACL 校验被绕过（显式 `DENY` 也拦不住，而 `DENY READ_DATA` 照样能拦读取）',
-      '**换名权限这一条在本机无法实测**（探针 32d）：该机 ssh 会话的令牌是**已提权管理员**且   `SeBackupPrivilege`/`SeRestorePrivilege` 均为**已启用**，这两个特权使 `DeleteFile`/`MoveFileEx`   **绕过 ACL 校验**——即使文件上写死 `DENY DELETE`、父目录写死 `DENY DELETE_CHILD`，改名与删除**照样成功**   （对照：`DENY READ_DATA` 时读取确实被拒 `0x80070005`，说明 ACL 校验本身是生效的，被绕过的只是   删除/改名这一侧）',
+      '把这三个特权 在进程内**置 0** 后再跑同一组实验，改名与删除立刻变成 `0x5 ACCESS_DENIED`、而 `DENY READ_DATA` 读仍是 `0x80070005`（探针 36 的受控对照）——特权就是成因，不是猜的',
+      '同一轮把探针机的特权归因从「whoami 输出」换成 **`GetTokenInformation` + 进程内禁用特权的受控对照** （探针 35b/36）：禁用后改名/删除立即 `0x5 ACCESS_DENIED`，读的对照仍 `0x80070005`',
+      '**换名权限这一条在本机无法实测**（探针 32d）：该机 ssh 会话的令牌是**已提权管理员**且   `SeBackupPrivilege`/`SeRestorePrivilege`/`SeTakeOwnershipPrivilege` 均**已启用**（`GetTokenInformation`   读出的 `attr=0x3`，探针 35b），这几个特权使 `DeleteFile`/`MoveFileEx` **绕过 ACL 校验**——即使文件上写死   `DENY DELETE`、父目录写死 `DENY DELETE_CHILD`，改名与删除**照样成功**',
+      '把这些特权在进程内禁用后   立刻变成 `0x5 ACCESS_DENIED`（探针 36 的受控对照，成因已确认而非推断）   （对照：`DENY READ_DATA` 时读取确实被拒 `0x80070005`，说明 ACL 校验本身是生效的，被绕过的只是   删除/改名这一侧）',
+      '**本机造不出干净的判据**：探针机的 ssh 令牌带已启用的 `SeBackup`/`SeRestore`（探针 35b），         删除与改名会**绕过 ACL**（探针 32d：显式 `DENY DELETE` + 父目录 `DENY DELETE_CHILD` 仍然改名成功',
       '「目标须同卷」那条限制针对的是移动**目录**），     与探针实测的「按路径换名成功、把攻击者文件送进目标位」一致',
-      '**本机造不出干净的判据**：探针机的 ssh 令牌带已启用的 `SeBackup`/`SeRestore`，删除与改名会         **绕过 ACL**（探针 32d：显式 `DENY DELETE` + 父目录 `DENY DELETE_CHILD` 仍然改名成功），         所以这一档的「权限不够就失败」**未实测**，0.2.4 必须在普通账户下补跑',
     ]
     const normSent = (x: string) => x.replace(/\*\*/g, '').replace(/`/g, '').replace(/\s+/g, '')
     const allowed = new Set(ALLOWED_DELETE_MENTIONS.map(normSent))
@@ -1704,6 +1736,13 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toEqual([])
     expect(ALLOWED_DELETE_MENTIONS.length, '允许清单不得被清空（清空后上一条会恒真）')
       .toBeGreaterThanOrEqual(30)
+    // ⚠️ **Codex round 39 P2-5**：清单只增不减会给**已撤回的结论**发通行证——§6.32 把
+    // 「DELETE 缺席不影响换名」推翻后，那句仍留在清单里，把老句子塞回去照样绿。
+    // 判据：清单里每一条都必须仍是**现行规范窗**里的句子（归一化后是窗口的子串）。
+    const normWindow = normSent(normativeAll)
+    const staleEntries = ALLOWED_DELETE_MENTIONS.filter((e) => !normWindow.includes(normSent(e)))
+    expect(staleEntries, `允许清单里有 ${staleEntries.length} 条已不在规范区（撤回的结论必须从清单删除）：\n${staleEntries.join('\n')}`)
+      .toEqual([])
     // 判据自带五条最小反例（CR round 107 的三个假绿/假红形态 + Codex 36 的两条逃逸形态），都直接跑同一条流水线：
     // ① `复核不一致就删除目标。` —— 动词前是「不一致就」，旧版把它当否定豁免（CR107 minor 3）；
     // ② `不删除目标文件。` —— 否定式但**仍是**一句删除指令的存在性提示，旧版豁免、新版必须拦（不豁免肯否）；
