@@ -1357,6 +1357,22 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/写入函数被调用次数非 0[\s\S]{0,40}或「发现 secret 字节」/)
     expect(sp, '不得再留「只接受 secret 已落盘判红」这条放行提前写入的旧句')
       .not.toMatch(/只接受「secret 已落盘」判红/)
+    // ⚠️ **CodeRabbit round 111 minor（探针 37）**：`DELETE` 只覆盖「源文件」这一侧；覆盖已有目标还要
+    // **目标自身**的 `DELETE`（或目标父目录的 `FILE_DELETE_CHILD`），源文件的不能代替。防这条契约
+    // 被写回「加了 DELETE 就不依赖父目录」的无条件形态：
+    expect(sp, '必须写明源/目标两侧分别判（覆盖已有目标还要目标自己的 DELETE）')
+      .toMatch(/只解决「源文件」这一侧[\s\S]{0,80}目标自己的 `DELETE`/)
+    expect(sp, '夹具 13(c) 必须拆成「目标不存在 / 目标存在且无 DELETE」两档')
+      .toMatch(/\(i\) \*\*目标不存在[\s\S]{0,400}\(ii\) \*\*目标已存在且其 ACL 不含 `DELETE`\*\*/)
+    // 第三条必须**切到夹具 13(c) 的 (ii) 档内**：`configured:true` 在 §2.4a ⑥ 的正文里也出现，
+    // 搜整个 `sp` 会被邻段满足（M3 变异实测仍绿）。
+    const i13c = sp.indexOf('(c) **父目录只授当前用户 Modify')
+    const i13end = sp.indexOf('14. **`qiyu` 目录的祖先把', i13c)
+    expect(i13c, '夹具 13(c) 起点锚必须在场').toBeGreaterThanOrEqual(0)
+    expect(i13end, '夹具 13(c) 终点锚必须在场（否则切片静默扩大）').toBeGreaterThan(i13c)
+    const fixture13c = sp.slice(i13c, i13end)
+    expect(fixture13c, '夹具 13(c) 的 (ii) 档必须写明不得报 configured:true')
+      .toMatch(/不得报 `configured:true`/)
     expect(sec, '必须如实声明：换名权限这一档因探针机特权而无法实测')
       .toMatch(/SeBackup[\s\S]{0,200}(绕过|无从实测|无法实测)/)
     expect(sec, '必须写明「不许拆成先建再打开两步」及其实证依据')
@@ -1505,6 +1521,16 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/\(R,W,D\)/)
     expect(step4Block, '④ 的收紧命令不得回到只授 (R,W) 的旧形态')
       .not.toMatch(/grant:r[^\n]{0,40}\(R,W\)/)
+    // 方案 A 正文是同一收紧命令的第二个载体（CR 108 曾在这里漏过一次）：只钉 ④ 那一条，
+    // 正文退回 (R,W) 仍会让实施者照抄错命令。两处都必须是 (R,W,D)，且不得留旧形态。
+    const oaLocal = sp.indexOf('2. **方案 A（以真机为闸')
+    const a24a = sp.indexOf('### 2.4a')
+    expect(oaLocal, '方案 A 起点锚必须在场（锚缺失时下一行切片会静默扩大）').toBeGreaterThanOrEqual(0)
+    expect(a24a, '§2.4a 标题必须在场').toBeGreaterThan(oaLocal)
+    const planA = sp.slice(oaLocal, a24a)
+    expect(planA, '方案 A 的收紧命令载体必须在场').toMatch(/grant:r[^\n]{0,60}\(R,W,D\)/)
+    expect(planA, '方案 A 不得残留只授 (R,W) 的收紧命令')
+      .not.toMatch(/grant:r[^\n]{0,60}\(R,W\)/)
     expect(step4Block, '读回不通过必须直接挡住 ⑤（硬门）').toMatch(/读回不通过就不得进入 ⑤/)
     // 「写完再补跑七条」这一形态必须被拦：整节里不得出现「写完后/写入之后 … 全部七条」的延后安排。
     const deferral = /(写完后|写入之后|写完再)[^。；]{0,40}(全部七条|七条)/
@@ -1650,7 +1676,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 句子切分见下：**换行先按块合并（空行或列表标记起新块），再按 。；切句**——
     // CR 107 指出按 \n 直接切会把换行折断的句子劈成碎片（「都能搬走/删掉」单独一片），
     // 文档没改却被判红。合并规则与「排版不影响判定」这条声明一致。
-    // 代价（如实声明，实测过边界）：改这 45 句里任何一句的**文字**都会红，须回来确认它仍不是
+    // 代价（如实声明，实测过边界）：改这 47 句里任何一句的**文字**都会红，须回来确认它仍不是
     // 现行删除指令并更新清单；纯排版（`**`/反引号/空白/续行换行）不会红（比对前归一化，M16 实证）。
     // 这是有意的取舍：假阳性可见、成本一次性；假阴性会让「失败路径一律不删」被悄悄推翻。
     const ALLOWED_DELETE_MENTIONS = [
@@ -1698,6 +1724,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       '**换名权限这一条在本机无法实测**（探针 32d）：该机 ssh 会话的令牌是**已提权管理员**且   `SeBackupPrivilege`/`SeRestorePrivilege`/`SeTakeOwnershipPrivilege` 均**已启用**（`GetTokenInformation`   读出的 `attr=0x3`，探针 35b），这几个特权使 `DeleteFile`/`MoveFileEx` **绕过 ACL 校验**——即使文件上写死   `DENY DELETE`、父目录写死 `DENY DELETE_CHILD`，改名与删除**照样成功**',
       '把这些特权在进程内禁用后   立刻变成 `0x5 ACCESS_DENIED`（探针 36 的受控对照，成因已确认而非推断）   （对照：`DENY READ_DATA` 时读取确实被拒 `0x80070005`，说明 ACL 校验本身是生效的，被绕过的只是   删除/改名这一侧）',
       '**本机造不出干净的判据**：探针机的 ssh 令牌带已启用的 `SeBackup`/`SeRestore`（探针 35b），         删除与改名会**绕过 ACL**（探针 32d：显式 `DENY DELETE` + 父目录 `DENY DELETE_CHILD` 仍然改名成功',
+      '覆盖已有目标还要目标自己的 `DELETE`（CR round 111 minor）**：   上面这段依据的是 DeleteFile 文档，管的是**源对象**能不能被移走',
+      '`MOVEFILE_REPLACE_EXISTING` 换入时   Windows 还要**单独**判定被替换的那个目标能否被删除，依据同样是「目标自身的 `DELETE`」**或**「目标父目录的   `FILE_DELETE_CHILD`」——**源文件带 `DELETE` 不能代替**',
       '「目标须同卷」那条限制针对的是移动**目录**），     与探针实测的「按路径换名成功、把攻击者文件送进目标位」一致',
     ]
     const normSent = (x: string) => x.replace(/\*\*/g, '').replace(/`/g, '').replace(/\s+/g, '')
