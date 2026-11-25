@@ -1925,10 +1925,22 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const residualText = sec.slice(iResidual, iResidual + 800)
     expect(residualText, '残余说明必须写出「别写成已彻底防御」的禁令形态')
       .toMatch(/别写成「(已彻底防御|完全消除)」/)
-    const overclaimOf = (t: string) => /已彻底防御|完全消除/.test(t.replace(/别写成「(?:已彻底防御|完全消除)」/g, ''))
-    expect(overclaimOf(residualText), '残余段不得在禁令之外声称已彻底防御/完全消除（过度承诺不是披露）').toBe(false)
+    // ⚠️ **Codex round 52 的隔离变异**：第一版只做「剥掉禁令后不得再出现这两个词」——**诚实表述也判红**
+    // （「该窗口尚未完全消除」「介入式替换仍未彻底防御」都含这两个词），是「判据看不见否定」的镜像形态。
+    // 判据改为：逐处看**前四个字里有没有否定词**，只有**肯定**形态才算过度承诺。
+    const overclaimOf = (t: string) => {
+      const stripped = t.replace(/别写成「(?:已彻底防御|完全消除)」/g, '')
+      return [...stripped.matchAll(/完全消除|彻底防御/g)].some((m) => {
+        const before = stripped.slice(Math.max(0, (m.index ?? 0) - 4), m.index ?? 0)
+        return !/未|没/.test(before)
+      })
+    }
+    expect(overclaimOf(residualText), '残余段不得在禁令之外**肯定地**声称已彻底防御/完全消除（过度承诺不是披露）').toBe(false)
     expect(overclaimOf('残余（如实声明，别写成「已彻底防御」）：关句柄到换名之间窗口重开。'), '正例：只有禁令时必须放过').toBe(false)
     expect(overclaimOf('残余（如实声明，别写成「已彻底防御」）：该窗口已彻底防御。'), '反例：禁令之外再声称已彻底防御必须判红').toBe(true)
+    expect(overclaimOf('残余（如实声明）：该窗口尚未完全消除，介入式替换仍未彻底防御。'),
+      '正例：诚实的否定表述必须放过（Codex 52 的隔离变异）').toBe(false)
+    expect(overclaimOf('残余（如实声明）：该窗口已经完全消除。'), '反例：肯定的「已经完全消除」必须判红').toBe(true)
     // ⚠️ **CR round 99/100 + Codex round 33：这道「删除语义」防线的四轮加固史**
     // 九轮：只扫 ③/⑥ 切片 → CR99 指出切片外有现行指令。十轮：改正则扫整段 → CR100 指出
     // 「动词无宾语」「失败路径整行豁免」两个假阴性。再改「有限禁止串清单」→ Codex33 用变异
