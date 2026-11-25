@@ -1188,7 +1188,26 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // ⚠️ **CodeRabbit round 93（major 2）**：夹具 14 必须按 ② 的实现分档——.NET 独占挡得住替换，
     // 纯 Node 挡不住只能声明弱保证；不得再写成「替换总会成功、靠事后比对兜底」的单档旧形态。
     expect(sp, '夹具 14 必须分 .NET / 纯 Node 两档').toMatch(/FileShare\.None` 持有期间[\s\S]{0,300}纯 Node fd/)
-    expect(sp, '夹具 14 的 .NET 档必须写「替换当场失败」').toMatch(/替换\*\*当场失败\*\*/)
+    // ⚠️ **Codex round 51 P2（CodeRabbit 122 同源）**：原先只在整份文档里搜「替换**当场失败**」——
+    // 把 .NET 档和 Node 档的结论**对调**后，失败措辞仍在（只是跑到了 Node 那档），判据照样绿，
+    // 两种实现的关键安全结论完全反转也不报警。必须**按档切片**，各自只认自己档内的肯定结论。
+    const parts14 = (t: string) => {
+      const a = t.indexOf('(a) **`.NET')
+      const b = t.indexOf('(b) **纯 Node')
+      const c = t.indexOf('判据统一', b)
+      return { net: a >= 0 && b > a ? t.slice(a, b) : '', node: b >= 0 && c > b ? t.slice(b, c) : '' }
+    }
+    const fx14 = parts14(sp)
+    expect(fx14.net.length, '夹具 14 的 (a) .NET 档必须在场').toBeGreaterThan(20)
+    expect(fx14.node.length, '夹具 14 的 (b) 纯 Node 档必须在场').toBeGreaterThan(20)
+    expect(fx14.net, '夹具 14 的 .NET 档必须写「替换当场失败」的**肯定**结论')
+      .toMatch(/替换\*\*当场失败\*\*/)
+    expect(fx14.net, '.NET 档不得把「当场失败」写成否定/非预期')
+      .not.toMatch(/不是[^。；]{0,14}预期|不得[^。；]{0,8}(当场失败|失败)/)
+    expect(fx14.node, '夹具 14 的纯 Node 档必须写「替换会成功」的**肯定**结论')
+      .toMatch(/替换\*\*会成功\*\*/)
+    expect(fx14.node, 'Node 档不得把「会成功」写成否定')
+      .not.toMatch(/不[^。；]{0,8}会成功|不是[^。；]{0,14}预期/)
     // ⚠️ **CodeRabbit round 75（major）**：「空名单」不等于「已保护」——null DACL 表示
     // 所有人完全访问，而它的 ACE 枚举同样是**空列表**，只按允许名单判会把最危险的形态
     // 判成 `checked:true, ok:true`。判据顺序必须是「先 DACL 存在/非空，再名单」。
@@ -1257,8 +1276,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       /已实测可用[^。；]{0,40}FileStream七参重载/.test(t.replace(/[*`]/g, '').replace(/\s+/g, ''))
     expect(statusOf('已实测可用的是 .NET `FileStream` 七参重载 + `FileSecurity`'), '正例必须通过').toBe(true)
     expect(statusOf('尚未实测的是 .NET `FileStream` 七参重载 + `FileSecurity`'), '反例：状态改成未实测必须判红').toBe(false)
-    expect(writeOrder, 'P/Invoke 备选必须如实标为未实测')
-      .toMatch(/等价备选但\*\*未实测\*\*/)
+    // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：`等价备选但**未实测**` 只要求这句话在场——
+    // 把 P/Invoke 标成「已实测」而让**另一条**备选顶着这句时，判据照样绿。状态必须绑在 P/Invoke 身上。
+    expect(writeOrder, 'P/Invoke 备选必须如实标为未实测（状态与主体同一句）')
+      .toMatch(/P\/Invoke[^。；]{0,60}等价备选但\*\*未实测\*\*|等价备选但\*\*未实测\*\*[^。；]{0,60}P\/Invoke/)
+    const pInvokeUntested = (t: string) =>
+      /P\/Invoke[^。；]{0,60}等价备选但\*\*未实测\*\*|等价备选但\*\*未实测\*\*[^。；]{0,60}P\/Invoke/.test(t)
+    expect(pInvokeUntested('`CreateFile` + `SECURITY_ATTRIBUTES`（P/Invoke）是等价备选但**未实测**'), '正例必须通过').toBe(true)
+    expect(pInvokeUntested('P/Invoke 已实测可用；`icacls` 路线是等价备选但**未实测**'),
+      '反例：状态标到别的机制身上必须判红').toBe(false)
     // ⚠️ **CodeRabbit round 81（major）**：③ 必须写进 ① 拿到的同一个句柄 + 目录身份钉住——
     // 按路径重开 tmp 会被祖先目录替换劫持（TOCTOU），secret 进了攻击者可读的文件。
     // 复合锚（变异实证：「不得按路径重新打开」这句解释本身也带关键词，单用 /同一个句柄|不得按路径/
@@ -1299,7 +1325,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 实况同步」的形态本身），而要**从标题读出数字、再要求正文的枚举与它一致**。
     // 轮次用中文序数写，探针轮数会随审查增长：第十一轮之后「十一」是两个字符，
     // 单字正则读不出来（本轮把它读成 undefined 直接假红）。序数表与解析器同一处维护。
-    const ORDINALS = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二', '十三', '十四', '十五']
+    const ORDINALS = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二', '十三', '十四', '十五',
+      '十六', '十七', '十八', '十九', '二十']
     const title = sec.split('\n')[0]
     // 日期不再是钉死的字面量：探针会跨天，钉死会让「换天补跑」被判红（Codex round 38 那轮起用新日期）。
     const claimed = /（\d{4}-\d{2}-\d{2}，([一二三四五六七八九十]+)轮(?: \/ \d+ 个探针)?；/.exec(title)?.[1]
@@ -1332,6 +1359,13 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(countingN, '枚举句里的轮次数必须与标题一致').toBe(n)
     const mentioned = [...sec.matchAll(/第([一二三四五六七八九十]+)轮/g)]
       .map((m) => ORDINALS.indexOf(m[1] as string) + 1)
+    // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：`ORDINALS.indexOf` 解析不了时返回 -1（+1 即 0），
+    // 而 `Math.max` 不看 0——正文加一个「第十六轮」而序数表只到十五时，最大值仍是十五，判据照样绿。
+    // 先把解析不了的序数单独判红，再比最大值；序数表本身也随之下延两位，并有一条「能解析」的控制。
+    expect(ORDINALS.indexOf('十六') + 1, '序数表必须能解析「第十六轮」（否则一加轮次就静默映射成 0）').toBe(16)
+    expect(mentioned.length, '正文必须至少枚举一轮').toBeGreaterThan(0)
+    expect(mentioned.filter((k) => k === 0), '正文的轮次序数必须都能解析（超出现有表时先扩表，不能映射成 0）')
+      .toEqual([])
     expect(Math.max(...mentioned), '正文最大轮次必须与标题轮次一致')
       .toBe(n)
     // 第二轮探针推翻了第一轮结论：FileStream+FileSecurity 重载可用 —— 必须写明并声明撤回
@@ -1528,7 +1562,9 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const needNums = ['1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.', '9(b).', '9(c).',
       '10.', '11.', '12.', '13.', '14.']
     const missing = needNums.filter((n) => {
-      const re = new RegExp(`^\\s*${n.replace(/[()]/g, '\\$&')}\\s`, 'm')
+      // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：原先只转义括号，`9(b).` 里的 `.` 是**通配符**，
+      // 于是 `9(b)x` 也能满足——编号被改名成形近写法时判据照样绿。标点也要转义。
+      const re = new RegExp(`^\\s*${n.replace(/[.()]/g, '\\$&')}\\s`, 'm')
       return !re.test(fixtureRegion)
     })
     expect(missing, `这些夹具编号不在 §2.5（被搬进 §6 历史区？）：${missing.join(', ')}`).toEqual([])
@@ -1648,9 +1684,19 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       const b = text.indexOf('- ⑤ **通过')
       if (a < 0 || b <= a) return false
       const block = text.slice(a, b)
-      return block.includes('读回') && /全部七条/.test(block)
+      // ⚠️ **Codex round 51 P2 / CodeRabbit 122 minor**：原先只查「读回」「全部七条」两个关键词共现——
+      // 把「读回确认**必须**再跑一遍 §2.4 清单全部七条」改成「**不得**再跑一遍」，两个词仍在，判据照样绿；
+      // 而用户要求的是「七条**必须**跑完才写」。判据要钉**肯定绑定**：读回 → 必须 → 全部七条 同一句。
+      return /读回[^。；]{0,20}必须[^。；]{0,20}全部七条/.test(block)
     }
-    expect(step4HasReadback(sec), '④ 的区段内必须含「读回确认」且要求跑全部七条（读回通过才写）').toBe(true)
+    expect(step4HasReadback(sec), '④ 的区段内必须肯定地要求「读回必须跑全部七条」（读回通过才写）').toBe(true)
+    // 三条对照：肯定式过、否定式红、把其余六条延后到 ⑤ 之后也红（合成文本，不依赖真文档措辞）。
+    expect(step4HasReadback('- ④ `icacls` 收紧。**读回确认必须再跑一遍 §2.4 清单全部七条**。\n- ⑤ **通过句柄写 secret**\n'),
+      '正例必须通过').toBe(true)
+    expect(step4HasReadback('- ④ `icacls` 收紧。**读回确认不得再跑一遍 §2.4 清单全部七条**。\n- ⑤ **通过句柄写 secret**\n'),
+      '反例：把「必须」改成「不得」必须判红').toBe(false)
+    expect(step4HasReadback('- ④ `icacls` 收紧，读回只查继承，其余检查（全部七条里的六条）放到 ⑤ 之后。\n- ⑤ **通过句柄写 secret**\n'),
+      '反例：把完整读回延后到 ⑤ 之后必须判红').toBe(false)
     // ⚠️ **CodeRabbit round 110 major + Codex round 39 P2-1**：④ 的 `/grant:r` 是**替换**该委托人的
     // 显式 ACE，写 `(R,W)` 会把 ① 的 `DELETE` 抹掉（探针 33 B 档实测），而七条读回只要求「至少含读权限」
     // 拦不住。判据：④ 的命令必须带 `D`；且「读回通过才写」必须是硬门（Codex P2-3 指出的
@@ -1666,20 +1712,24 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(i4act, '④ 动作句起点必须在场').toBeGreaterThanOrEqual(0)
     expect(i4end, '④ 动作句终点锚（「收紧并读回」）必须在场').toBeGreaterThan(i4act)
     const step4Block = sec.slice(i4act, sec.indexOf('- ⑤ **通过'))
-    // 判据只看命令本身：剥空白，但**引号是形态的一部分**——PowerShell 5.1 里不带引号的
-    // `*<SID>:(R,W,D)` 会被当成表达式。同一个切取器（**唯一实现点**）同时服务 ④ 的动作句与方案 A 两个载体。
+    // 判据只看命令本身：**引号是形态的一部分**（PowerShell 5.1 里不带引号的 `*<SID>:(R,W,D)` 会被当表达式）。
+    // 同一个切取器（**唯一实现点**）同时服务 ④ 的动作句与方案 A 两个载体。
     // ⚠️ **CodeRabbit round 121 minor**：④ 原先剥掉引号再钉串，把命令的引号删掉照样绿。
     // ⚠️ **Codex round 50 P2**：只要求「有一个开引号」还不行——① 删掉**闭引号**（不配对）仍绿，
     // ② 反引号被当成引号（PowerShell 里 `` ` `` 是转义符，命令直接语法错误）也仍绿。
     // 所以引号必须**成对**（开/闭各一种写法、闭与开对应），且**排除反引号**。
+    // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：只归一**折行**、不删参数之间的空白——
+    // 否则 `/inheritance:r/grant:r` 这种把两个选项粘成一个的写法（icacls 不认）也会被当成合法命令。
     const QUOTE_PAIRS: ReadonlyArray<readonly [string, string]> = [
       ['"', '"'], ["'", "'"], ['“', '”'], ['‘', '’'],
     ]
+    const normCmd = (t: string) => t.replace(/[ \t]*\n[ \t]*/g, ' ').replace(/[ \t]+/g, ' ')
     const grantCmdsOf = (t: string): string[] => {
-      const flat = t.replace(/\s+/g, '')
+      const flat = normCmd(t)
       const out: string[] = []
       for (const [open, close] of QUOTE_PAIRS) {
-        const re = new RegExp(`/grant:r${open}\\*<[^>]{0,30}>:\\([A-Z,]+\\)${close}`, 'g')
+        // 前一个字符不得是词/路径分隔符：挡住 `/inheritance:r/grant:r` 这类粘连写法。
+        const re = new RegExp(`(?<![\\w:/.-])\\/grant:r ${open}\\*<[^>]{0,30}>:\\([A-Z,]+\\)${close}`, 'g')
         out.push(...(flat.match(re) ?? []))
       }
       return out
@@ -1697,6 +1747,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(okOf('icacls <tmp> /inheritance:r /grant:r *<SID>:(R,W,D)'), '反例：不带引号在 PowerShell 里不可执行，不得算命令').toBe(false)
     expect(okOf('icacls <tmp> /inheritance:r /grant:r "*<SID>:(R,W,D)'), '反例：缺闭引号（不配对）必须判红').toBe(false)
     expect(okOf('icacls <tmp> /inheritance:r /grant:r `*<SID>:(R,W,D)`'), '反例：反引号是 PowerShell 的转义符，不是引号').toBe(false)
+    expect(okOf('icacls <tmp> /inheritance:r/grant:r "*<SID>:(R,W,D)"'), '反例：选项粘连（`/inheritance:r` 与 `/grant:r` 之间少空格）不是合法 icacls 命令').toBe(false)
+    expect(okOf('icacls <tmp> /inheritance:r /grant:r"*<SID>:(R,W,D)"'), '反例：`/grant:r` 与引号之间没有空白也不是合法命令').toBe(false)
     expect(okOf("icacls <tmp> /inheritance:r /grant:r '*<SID>:(R,W)'"), '反例：单引号 (R,W) 必须判红').toBe(false)
     expect(okOf('/grant:r <某个具名用户>:(R)'), '反例：散文里的泛称形态不算命令').toBe(false)
     // 方案 A 正文是同一收紧命令的第二个载体（CR 108 曾在这里漏过一次）：只钉 ④ 那一条，
@@ -1719,8 +1771,24 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     }
     // 数量不能只靠「随便两条带掩码的引号命令」凑：两个载体各自都要在场（Codex round 45 P2-2 的原意）。
     // 只要求 ≥2 时，把 ② 退回 `(R,W)` 而散文里另有两条 `(R,W,D)` 副本就能凑够数量。
-    expect(grantCmds.some((c) => c.includes('<当前用户SID>')), '摘要载体（`*<当前用户 SID>`）必须在场且为 (R,W,D)').toBe(true)
+    expect(grantCmds.some((c) => c.includes('<当前用户 SID>')), '摘要载体（`*<当前用户 SID>`）必须在场且为 (R,W,D)').toBe(true)
     expect(grantCmds.some((c) => c.includes('<SID>')), '② 步载体（`*<SID>`）必须在场且为 (R,W,D)').toBe(true)
+    // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：上面两条只证明「方案 A 里有这两个串」——
+    // 若 ② 步**自己**的命令丢了引号（被切取器丢弃），散文中一份正确的 `*<SID>` 示例仍能让两条都过。
+    // 判据必须**按位置**绑：摘要那一段自己要有合法命令，② 步那一段自己也要有。
+    const carriersOk = (t: string) => {
+      const a = t.indexOf('② 对它')
+      const b = t.indexOf('收紧', a)
+      if (a <= 0 || b <= a) return false
+      const step2 = grantCmdsOf(t.slice(a, b))
+      const summary = grantCmdsOf(t.slice(0, a))
+      return step2.some((c) => c.includes('<SID>') && c.includes('(R,W,D)'))
+        && summary.some((c) => c.includes('<当前用户 SID>') && c.includes('(R,W,D)'))
+    }
+    expect(carriersOk(planA), '摘要与 ② 步**各自**都必须有自己的合法命令（不能被散文示例顶替）').toBe(true)
+    expect(carriersOk('2. **方案 A**：`icacls /inheritance:r /grant:r "*<当前用户 SID>:(R,W,D)"`。'
+      + '② 对它 `icacls /inheritance:r /grant:r *<SID>:(R,W,D)` 收紧。'),
+      '反例：② 步自己的命令丢了引号、只剩散文示例时必须判红').toBe(false)
     // Codex round 41 P2-1：写序第 ④ 步曾把 `renameSync` 当动作（子进程里调不到）。它只能作为
     // 「旧实现描述」出现，因此必须同时点名最终原语 `MoveFileExW`。
     expect(planA, '方案 A 的写序必须点名换名原语 MoveFileExW（renameSync 只能作旧实现描述）')
@@ -1734,8 +1802,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 读回句被挪到 ⑤ 之后 → 必须判红；读回句留在 ④ 之内 → 必须放过。
     expect(step4HasReadback('- ④ `icacls` 收紧。\n- ⑤ **通过句柄写 secret**（读回确认、全部七条）\n'),
       '反例：读回挪到写入之后必须判红（Codex round 38 的复现手法）').toBe(false)
-    expect(step4HasReadback('- ④ `icacls` 收紧并读回确认，跑全部七条。\n- ⑤ **通过句柄写**\n'),
-      '反例的另一臂：读回在 ④ 之内不得误伤').toBe(true)
+    expect(step4HasReadback('- ④ `icacls` 收紧并读回确认，必须跑全部七条。\n- ⑤ **通过句柄写**\n'),
+      '反例的另一臂：带「必须」的完整读回留在 ④ 之内不得误伤').toBe(true)
     // ⚠️ **CR round 95 major 曾要求「给 ⑥ 的删除动作配跨进程串行化」；CR round 98 major 2 连处置一起
     // 推翻**：路径式锁挡不住目录替换（A 在旧目录持锁、目录被换、B 在同一路径拿到新目录里的另一把锁），
     // 要锁有效得钉**目录对象**，纯 Node 拿不到。正解是**取消 ⑥ 对目标的破坏性动作**——竞态因
@@ -1829,6 +1897,20 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(iPost, '⑥ 必须有换名后的目标复核').toBeGreaterThanOrEqual(0)
     expect(iPre, '身份比对必须在 renameSync 之前').toBeLessThan(iRen)
     expect(iPost, '复核必须在 renameSync 之后').toBeGreaterThan(iRen)
+    // ⚠️ **Codex round 51 P2 / CodeRabbit 122 minor**：`iPost` 只找「复核」二字、不验对象——
+    // 把「换入后立刻复核**目标路径**上的对象」改成「复核**旧 tmp 路径**上的对象」，位置判据照样过，
+    // 于是一个检查已移走源路径的退化版仍被称为「换名后复核」。判据必须把复核**绑到目标**。
+    const recheckOf = (t: string) => {
+      const a = t.search(/MoveFileExW/)
+      const rest = a >= 0 ? t.slice(a) : ''
+      return /复核[^。；]{0,20}(目标路径|目标上的?对象|最终文件)/.test(rest)
+        && !/复核[^。；]{0,20}(tmp|源)\s*路径/.test(rest)
+    }
+    expect(recheckOf(step6), '⑥ 的换名后复核必须针对**目标路径/目标对象**，不得只复核已移走的 tmp').toBe(true)
+    expect(recheckOf('换名换入（子进程内 `MoveFileExW` + `MOVEFILE_REPLACE_EXISTING`）→ 换入后立刻复核目标路径上的对象身份。'),
+      '正例必须通过').toBe(true)
+    expect(recheckOf('换名换入（子进程内 `MoveFileExW` + `MOVEFILE_REPLACE_EXISTING`）→ 换入后立刻复核旧 tmp 路径上的对象身份。'),
+      '反例：只复核 tmp 的退化形态必须判红').toBe(false)
     // ⚠️ CR93 时代这里要求「不一致 → 删除该目标文件」；**CR round 98 major 2 取消了这个破坏性动作**
     // （不一致时无法区分攻击者冒充文件与并发写者 B 刚验收的合法配置，删/移都会毁掉 B 的成果；
     // 而路径式锁又挡不住目录替换）。判据跟着翻转：⑥ 必须写「绝不删除、也绝不改名移走目标」，
@@ -1836,8 +1918,17 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(step6, '⑥ 复核不一致必须响亮失败且**不碰目标**')
       .toMatch(/响亮失败[\s\S]{0,60}绝不删除、也绝不改名移走/)
     expect(step6, '⑥ 不得再要求删除目标文件（CR98 已取消）').not.toMatch(/删除该目标文件/)
-    expect(sec, '残余窗口必须如实声明、不得写成已彻底防御')
-      .toMatch(/残余（如实声明[\s\S]{0,400}(完全消除|已彻底防御)/)
+    // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：原判据在「残余（如实声明」之后 400 字内搜
+    // 「完全消除|已彻底防御」——可那句原本就是**禁令**里的引用（「别写成已彻底防御」）。于是再加上一句
+    // 「该窗口已彻底防御。」仍能满足判据，把过度承诺当成披露的证据。改为：禁令形态必须在场，
+    // 且**剥掉禁令里的引用之后**不得再出现这两种说法。
+    const residualText = sec.slice(iResidual, iResidual + 800)
+    expect(residualText, '残余说明必须写出「别写成已彻底防御」的禁令形态')
+      .toMatch(/别写成「(已彻底防御|完全消除)」/)
+    const overclaimOf = (t: string) => /已彻底防御|完全消除/.test(t.replace(/别写成「(?:已彻底防御|完全消除)」/g, ''))
+    expect(overclaimOf(residualText), '残余段不得在禁令之外声称已彻底防御/完全消除（过度承诺不是披露）').toBe(false)
+    expect(overclaimOf('残余（如实声明，别写成「已彻底防御」）：关句柄到换名之间窗口重开。'), '正例：只有禁令时必须放过').toBe(false)
+    expect(overclaimOf('残余（如实声明，别写成「已彻底防御」）：该窗口已彻底防御。'), '反例：禁令之外再声称已彻底防御必须判红').toBe(true)
     // ⚠️ **CR round 99/100 + Codex round 33：这道「删除语义」防线的四轮加固史**
     // 九轮：只扫 ③/⑥ 切片 → CR99 指出切片外有现行指令。十轮：改正则扫整段 → CR100 指出
     // 「动词无宾语」「失败路径整行豁免」两个假阴性。再改「有限禁止串清单」→ Codex33 用变异
@@ -1870,7 +1961,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 句子切分见下：**换行先按块合并（空行或列表标记起新块），再按 。；切句**——
     // CR 107 指出按 \n 直接切会把换行折断的句子劈成碎片（「都能搬走/删掉」单独一片），
     // 文档没改却被判红。合并规则与「排版不影响判定」这条声明一致。
-    // 代价（如实声明，实测过边界）：改这 49 句里任何一句的**文字**都会红，须回来确认它仍不是
+    // 代价（如实声明，实测过边界）：改这 63 句里任何一句的**文字**都会红，须回来确认它仍不是
     // 现行删除指令并更新清单；纯排版（`**`/反引号/空白/续行换行）不会红（比对前归一化，M16 实证）。
     // 这是有意的取舍：假阳性可见、成本一次性；假阴性会让「失败路径一律不删」被悄悄推翻。
     const ALLOWED_DELETE_MENTIONS = [
@@ -1923,12 +2014,28 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       '覆盖已有目标还要目标自己的 `DELETE`（CR round 111 minor）**：   上面这段依据的是 DeleteFile 文档，管的是**源对象**能不能被移走',
       '`MOVEFILE_REPLACE_EXISTING` 换入时   Windows 还要**单独**判定被替换的那个目标能否被删除，依据同样是「目标自身的 `DELETE`」**或**「目标父目录的   `FILE_DELETE_CHILD`」——**源文件带 `DELETE` 不能代替**',
       '「目标须同卷」那条限制针对的是移动**目录**），     与探针实测的「按路径换名成功、把攻击者文件送进目标位」一致',
+'**若**将来改成对现有文件 **原地改写**（不走换入），则 `/inheritance:r` 只断继承、`/grant:r <自己>` 不删**他人已显式授予**的 ACE——旧的 `Everyone`会存活，那种形态必须额外 `/remove` 广域主体',
+'夹具 9(b) 造「allow `(R,W,D)` + deny `DELETE`」    必须红——**这条前提本轮已真机验证**（探针 38：同一用户 allow `0x13019f` + deny `DELETE` 时，    覆盖换名 `0x5` 且目标内容原样、单删同文件也 `0x5`',
+'收紧用的是**重建整份 DACL**（断继承 + 删他人显式 ACE + 仅授当前用户），`/grant:r <自己>` 单用**不会删别人的显式授权**，残留即泄露',
+'在 Windows 10 19045 / PowerShell 5.1 / Node 上对 §2.4 的候选机制做探针（临时目录，测完自删）',
+'合规处理不是「连目标一起收紧」（那要先改别人的文件，⓪ 与统一规则都不允许），而是：   **把换名失败按「secret 可能已落盘」那一臂处理**——非 0 退出、报告含 secret 的残留路径、不删不移',
+'被删或被换）——也不等于「有人读过」',
+'所以什么都不删：   ⑤ 之前的失败**留下空 tmp**（无 secret',
+'安全候选形态是「能独占打开 + 判 size/年龄」再删，   但**未验证**，本轮不写进契约',
+'**为什么干脆不删（探针 20 是直接诱因）**：③ 这一档我们持独占句柄，**持有期间按路径删不掉**   （`DeleteFile` 报 `0x80070020`），要删就**必须先 `CloseHandle`**——而「关句柄之后再按路径删」正是   把唯一能证明「这是我的对象」的手段丢在身后',
+'即便将来验通，也只是删自己那个空   tmp 的优化，不改变「失败路径不碰别人对象」的底线',
+'**「不一致就删/移目标」不再是契约的一部分',
+'**祖先目录被删而路径消失时，Node 的 `renameSync`/`statSync` 直接 `ENOENT` 失败**（fail-closed，实测）',
+'它的失败判据仍是：         实现必须在**写入任何 secret 之前**         以独占打开失败或 DACL/属主自检失败的方式**拒绝退出（不删任何东西）**',
+'(ii) **目标已存在且其 ACL 不含 `DELETE`**（如历史遗留的 `0x12019f`）→ 换名会 `0x5` 失败（探针 37 实测），         这是**允许的结局**，但必须按「secret 可能已落盘」那一臂：非 0 退出 + 报告含 secret 的残留路径 +         不删不移',
     ]
     const normSent = (x: string) => x.replace(/\*\*/g, '').replace(/`/g, '').replace(/\s+/g, '')
     const allowed = new Set(ALLOWED_DELETE_MENTIONS.map(normSent))
     // Codex round 38 P2：统一规则写的是「不按路径删除/**移动**任何对象」，入口判据却漏了「移动」
     // ——注入「复核失败时将目标文件移动到隔离目录」当时 86/86 全绿。禁止语与判据必须同集合。
-    const DELETE_VERB = /(删除|清除|清理|移走|清扫|删掉|移动)/
+    // ⚠️ **Codex round 51 P2**：动词表原先只认「删除/删掉」，**单字「删」**（如「所以什么都不删」反转成
+    // 「所以什么都删」）根本不进扫描——反转后的删除指令在进入允许清单前就被过滤掉。单个「删」也必须是动词。
+    const DELETE_VERB = /(删|清除|清理|移走|清扫|移动)/
     // 块边界 = 空行 或 列表/编号/⚠️ 起始行；块内换行是续行，合并成一个空格。
     const splitBlocks = (text: string) => {
       const blocks: string[] = []
@@ -1963,8 +2070,11 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // ⚠️ **Codex round 39 P2-5**：清单只增不减会给**已撤回的结论**发通行证——§6.32 把
     // 「DELETE 缺席不影响换名」推翻后，那句仍留在清单里，把老句子塞回去照样绿。
     // 判据：清单里每一条都必须仍是**现行规范窗**里的句子（归一化后是窗口的子串）。
-    const normWindow = normSent(normativeAll)
-    const staleEntries = ALLOWED_DELETE_MENTIONS.filter((e) => !normWindow.includes(normSent(e)))
+    // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：原先用整窗 `includes` 判「这条还在不在」——
+    // 清单项若只在**跨空行合并**后出现（`删` 与 `除` 被空行隔开），整窗归一化会把它拼起来而扫描器
+    // 根本不会产出这条句子，于是「已撤回的结论」照样被当成现行句。判据改成**与扫描器产出的句子集合**比对。
+    const scannedSentences = new Set(sentencesOf(normativeAll).map(normSent))
+    const staleEntries = ALLOWED_DELETE_MENTIONS.filter((e) => !scannedSentences.has(normSent(e)))
     expect(staleEntries, `允许清单里有 ${staleEntries.length} 条已不在规范区（撤回的结论必须从清单删除）：\n${staleEntries.join('\n')}`)
       .toEqual([])
     // 判据自带五条最小反例（CR round 107 的三个假绿/假红形态 + Codex 36 的两条逃逸形态），都直接跑同一条流水线：
@@ -1974,14 +2084,26 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const pipeline = (text: string) => deleteSentences(text).filter((x) => !allowed.has(normSent(x)))
     expect(pipeline('复核不一致就删除目标。'), 'CR107-3：否定词在别的短语里不得豁免删除指令').not.toEqual([])
     expect(pipeline('不删除目标文件。'), '否定式删除句也须登记，不得被豁免').not.toEqual([])
-    const wrapped = ALLOWED_DELETE_MENTIONS.find((x) => x.includes('搬走/删掉')) as string
-    const broken = wrapped.replace('都能搬走', '都能\n搬走')
-    expect(pipeline(broken), 'CR107-1：续行换行不得让已登记的句子被判红').toEqual([])
+    // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：原先从**生产清单**里 `find()` 一条含「搬走/删掉」的句子
+    // 做折行对照——措辞一改 `find()` 就是 undefined，`as string` 拦不住，下一行直接 TypeError（假红）。
+    // 对照必须自带句子与清单，与生产措辞解耦。
+    const pipelineWith = (text: string, entries: string[]) => {
+      const allow = new Set(entries.map(normSent))
+      return deleteSentences(text).filter((x) => !allow.has(normSent(x)))
+    }
+    const syntheticEntry = '复核不一致时，冒充文件都能搬走/删掉'
+    const broken = syntheticEntry.replace('都能搬走', '都能\n搬走')
+    expect(pipelineWith(broken, [syntheticEntry]), 'CR107-1：续行换行不得让已登记的句子被判红').toEqual([])
+    expect(pipelineWith(syntheticEntry, []), '同一条句子不在清单里时必须判红（对照是活的）').not.toEqual([])
     // ④/⑤ 是 Codex round 36 的漏洞形态：判据在归一化**前**做判断（先测动词、先卡长度），
     // 折行或短句就整句逃出清单。两条都必须被拦，否则「每句提到动词的话都要登记」不成立。
     expect(pipeline('不满足即删\n除 tmp、非 0 退出、写入次数为 0。'),
       'Codex36：动词被换行折断不得绕过允许清单').not.toEqual([])
     expect(pipeline('删掉。'), '短句没有长度豁免，同样必须登记').not.toEqual([])
+    // ⚠️ **Codex round 51 P2**：动词表原先不认单字「删」，于是把「所以什么都不删」反转成「所以什么都删」
+    // 时句子根本不进扫描（实测 86/86）。两条对照钉住新形态：反转式必须被判红，登记原句必须放过。
+    expect(pipelineWith('所以什么都不删', ['所以什么都不删']), '正例：已登记的单字「删」句必须放过').toEqual([])
+    expect(pipelineWith('所以什么都删', ['所以什么都不删']), '反例：单字「删」的反转指令必须被判红').not.toEqual([])
     // ⚠️ **CR round 108 minor：失败语义必须分两臂，不许写成全称。**
     // 旧版在 §2.4 方案 A 与统一规则里都写「任一步失败…不写 secret」，而 ⑤ 写完 secret 之后 ⑥ 才失败时
     // secret 已经落盘——同一份文档另一处（残余窗口）自己也承认这一点，属「同一契约两套话」。
@@ -2006,14 +2128,21 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       '反例：分臂段之外的同一措辞不得满足这两条').not.toContain('secret可能已落盘')
     // ① 全称句的判据扫**整个规范窗**（不只 §2.4a）：CR 108 指出的原句住在 §2.4 方案 A 里，
     //    只扫 §2.4a 会让「回到全称」这条回归一路绿灯（我第一版就是这么写的，变异 N1 实测没红）。
+    // ⚠️ **CodeRabbit round 122（嵌入审查）minor**：原先只要句子里**任何地方**出现「之前/之后/两臂」
+    // 就当成已限定——「任一步失败均不写 secret（退出之前会记录错误）」里的「之前」说的是**记日志**的时机，
+    // 与「不写 secret」的边界无关，却因此被豁免。限定词必须**绑定到不写 secret 这条主张**。
+    const qualifierBound = (t: string) => /两臂/.test(t)
+      || /(写secret|⑤|写入)[^。；]{0,20}之前[^。；]{0,20}不写secret/.test(t)
     const blanketOf = (text: string) => sentencesOf(text)
       .map(normSent)
-      .filter((t) => t.includes('任一步失败') && t.includes('不写secret') && !/(之前|之后|两臂)/.test(t))
-    // 两条内置反例：证明判据活着，且不误伤带分臂限定的正确写法（不依赖改 spec 才能自证）。
+      .filter((t) => t.includes('任一步失败') && t.includes('不写secret') && !qualifierBound(t))
+    // 三条内置反例：证明判据活着，且不误伤带分臂限定的正确写法（不依赖改 spec 才能自证）。
     expect(blanketOf('**任一步失败的处理一律走 §2.4a 的统一规则**（不写 secret、非 0 退出、不删除也不移动任何对象。'),
       'CR108 反例：全称句必须被这条判据抓住').not.toEqual([])
     expect(blanketOf('**任一步失败的处理一律走 §2.4a 的统一规则，且按 secret 是否已写分两臂**（⑤ 写 secret 之前的失败不写 secret。'),
       'CR108 反例：带分臂限定词的句子不得误伤').toEqual([])
+    expect(blanketOf('**任一步失败均不写 secret**（退出之前会记录错误，日志写进 stderr）。'),
+      'CR122 反例：与不写 secret 无关的「之前」不得豁免全称句').not.toEqual([])
     expect(blanketOf(normativeAll), '规范区不得出现「任一步失败…不写 secret」的全称句（⑤ 之后 secret 已落盘）')
       .toEqual([])
     // 非空转证明分两层，都**不依赖任何现行句、0.2.4 怎么改写都不会假红**：
