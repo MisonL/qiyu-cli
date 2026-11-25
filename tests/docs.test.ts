@@ -1199,8 +1199,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/封闭清单|任一条不满足即/)
     expect(probe, '清单第 1/2 条必须是 DACL 存在 + 非空（按序号相邻）')
       .toMatch(/1\.\s*\*\*DACL 存在\*\*[\s\S]{0,200}2\.\s*\*\*DACL 非空\*\*/)
-    expect(probe, '空 DACL（拒绝所有人）也必须判不通过，不得当成「收紧得好」')
-      .toMatch(/空 DACL[^。；]{0,80}(ok:false|判不通过|拒)/)
+    // ⚠️ **Codex round 49 P2 的同族自查**：原判据的备选里含裸「拒」——而它实际是被 §2.4 第 2 条里
+    // 「→ 拒并提示重建 ACL」这句散文满足的（`空 DACL` 的规范表述在 §2.5 夹具 7，不在本切片内）；
+    // 反转成「不得拒并提示重建 ACL」时，「拒」这个字仍在，判据照样绿（把「不」插进短语内部即可）。
+    // 修法：钉**带引出符的肯定结论整句**，否定词插在「→」与结论之间即判红。
+    expect(probe, '空 DACL（拒绝所有人）必须判拒并提示重建 ACL，不得当成「收紧得好」')
+      .toMatch(/空 DACL[^。；]{0,140}→ 拒并提示重建 ACL，不得当成「收紧得好」放行/)
+    expect(/空 DACL[^。；]{0,140}→ 拒并提示重建 ACL，不得当成「收紧得好」放行/.test(
+      '（空 DACL = 「显式拒绝所有人」，不是本 CLI 写序可能产出的形态 → 不得拒并提示重建 ACL，不得当成「收紧得好」放行）'),
+      '反例：空 DACL 的否定形态必须判红').toBe(false)
     // ⚠️ **CodeRabbit round 76（major）**：属主隐含 WRITE_DAC —— 非受信账户作属主时
     // 可以随时给自己补读 ACE，ACE 名单永远看不出来。判据必须把属主也列入受信状态。
     expect(probe, '必须校验属主 SID（属主隐含 WRITE_DAC）').toMatch(/属主（owner SID）|属主\s*SID/)
@@ -1317,7 +1324,12 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(Math.min(...nums), '探针号不得越界').toBeGreaterThanOrEqual(1)
     // 逐轮枚举的句子必须存在，且**正文出现的最大轮次必须等于标题轮次**：
     // 标题少报（正文已有第四轮却写「三轮」）与标题多报（写五轮而正文只到第四轮）都要红。
-    expect(sec, '必须有逐轮起因的枚举句').toMatch(/轮由审查与自查推动|轮都由审查推动/)
+    // ⚠️ **CodeRabbit round 120 minor**：原先只要求「轮由审查与自查推动」在场，**句子前面的数字没被检查**——
+    // 标题写「十五轮」而正文写「十一轮由审查与自查推动」，判据照样绿（实测）。必须把序数也读出来比对。
+    const counting = /([一二三四五六七八九十]+)轮由审查与自查推动|([一二三四五六七八九十]+)轮都由审查推动/.exec(sec)
+    expect(counting, '必须有逐轮起因的枚举句').not.toBeNull()
+    const countingN = ORDINALS.indexOf((counting?.[1] ?? counting?.[2]) as string) + 1
+    expect(countingN, '枚举句里的轮次数必须与标题一致').toBe(n)
     const mentioned = [...sec.matchAll(/第([一二三四五六七八九十]+)轮/g)]
       .map((m) => ORDINALS.indexOf(m[1] as string) + 1)
     expect(Math.max(...mentioned), '正文最大轮次必须与标题轮次一致')
@@ -1435,7 +1447,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/9\(b\)\.[\s\S]{0,60}deny `DELETE`/)
     // ⚠️ **CodeRabbit round 114 minor**：清单是**读面判据**（`checkPermissions` 给只读命令用），
     // 把写序专用的 `DELETE` 塞进去会让「只读可用」的合法配置被判不安全。判据必须钉住分层：
-    // ① 第 5 条明写 DELETE 是写序专用、不在读面判据里；② ④ 的读回要**附加**第八条而不是并进七条。
+    // ① 第 5 条明写 DELETE 是写序专用、不在读面判据里；② ④ 的读回要**附加**写序附加项 `W1` 而不是并进七条。
+    // （round 120：原先叫「第八条」，与清单第 8 条「任一条判不了」撞号，已改名 `W1`。）
     expect(item5, '清单第 5 条必须写明 DELETE 是写序专用、不属于读面判据')
       .toMatch(/写序专用[\s\S]{0,40}不在读面判据/)
     // ⚠️ **Codex round 44 P2**：原来搜整个 `sec`——把这条附加检查从 ④ 挪到 ⑤ 末尾、⑥ 之前，
@@ -1446,7 +1459,14 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(i5write, '⑤ 起点锚必须在场（否则切片静默扩大）').toBeGreaterThan(i4cmd)
     expect(sec.slice(i4cmd, i5write),
       '④ 的读回必须在七条之外附加「对该 tmp 的有效 DELETE」一条（且发生在 ⑤ 之前）')
-      .toMatch(/写序专用的第八条[\s\S]{0,120}DELETE|附加[\s\S]{0,40}第八条/)
+      .toMatch(/写序附加项 `W1`[\s\S]{0,160}DELETE/)
+    // 反向自检：旧名「第八条」不得再作为写序附加项的标识出现（撞号会让实施者把它并进第 8 条的回退档）。
+    expect(sec, '写序附加项不得再用「第八条」这个与清单第 8 条撞号的叫法')
+      .not.toMatch(/写序专用的第八条/)
+    // round 120：标识符必须**三个载体同名**——§2.4 的分层说明、§2.4a ④、夹具 9(b) 都要叫 `W1`。
+    // 只在 ④ 与 9(b) 用新名、§2.4 仍写「再附加一条」，实施者读清单时仍不知道它就是 ④ 的 `W1`。
+    expect(item5, '§2.4 的分层说明必须同样用 `W1` 这个名字（三个载体同名）')
+      .toMatch(/附加一条[\s\S]{0,20}`W1`/)
     // CodeRabbit round 115 minor：读面也必须按**有效读**判（deny READ_DATA 压过 allow Read，探针 39）。
     expect(item5, '读面判据必须按有效读判定（不能只看 Allow 含 Read）')
       .toMatch(/有效权利判|有效读/)
@@ -1476,10 +1496,22 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(i10, '夹具 10 起点锚必须在场（否则 9(c) 切片静默扩大）').toBeGreaterThan(i9c)
     expect(i10 - i9c, '9(c) 切片跨度必须收敛（>2000 说明锚命中了别处）').toBeLessThan(2000)
     const fx9c = safe.slice(i9c, i10)
-    expect(fx9c, '夹具 9(c)(i) 必须写「allow 只含 Read + deny READ_DATA → 读面 ok:false」')
-      .toMatch(/allow 只含 `Read` \+ deny `READ_DATA`[\s\S]{0,120}ok:false/)
-    expect(fx9c, '夹具 9(c)(ii) 必须写「无 deny → 读面 ok:true」的对照档')
-      .toMatch(/无 deny[\s\S]{0,80}ok:true/)
+    // ⚠️ **Codex round 49 P2**：原先只认关键词 `ok:false` / `ok:true`——把结论反转成
+    // 「读面**不得** `ok:false`」「读面**不得** `ok:true`」两条断言照样绿（Codex 两向变异实测 86/86）。
+    // 与 §6.43 的「必须拒 / 不得拒」、§6.46 的「推断 / 已验证」同一形态：**判据只看关键词、不看肯否位置**。
+    // 修法：归一化标记与空白后钉**肯定结论整句**（`读面必须ok:false` / `读面必须ok:true`），并内置反转对照。
+    const fx9cFlat = fx9c.replace(/[*`]/g, '').replace(/\s+/g, '')
+    expect(fx9cFlat, '夹具 9(c)(i) 必须写「allow 只含 Read + deny READ_DATA → 读面必须 ok:false」')
+      .toMatch(/allow只含Read\+denyREAD_DATA[\s\S]{0,120}读面必须ok:false/)
+    expect(fx9cFlat, '夹具 9(c)(ii) 必须写「allow 只含 Read、无 deny → 读面必须 ok:true」的对照档')
+      .toMatch(/allow只含Read、无deny[\s\S]{0,80}读面必须ok:true/)
+    // 反向自检：同一条判据必须拒掉否定形态（合成文本，不依赖真文档措辞）。
+    const affirms = (t: string, k: 'true' | 'false') =>
+      new RegExp(`读面必须ok:${k}`).test(t.replace(/[*`]/g, '').replace(/\s+/g, ''))
+    expect(affirms('… → 读面必须 `ok:false`（探针 40 B 档）', 'false'), '正例必须通过').toBe(true)
+    expect(affirms('… → 读面不得 `ok:false`', 'false'), '反例：否定形态必须判红').toBe(false)
+    expect(affirms('… → 读面必须 `ok:true`（探针 40 A 档）', 'true'), '正例必须通过').toBe(true)
+    expect(affirms('… → 读面不得 `ok:true`', 'true'), '反例：否定形态必须判红').toBe(false)
     // ⚠️ **自查（把 Codex round 46 的发现推广到全组）+ CodeRabbit round 119 minor 的纠错**：
     // 上面这些夹具断言多数搜整份 `sp`——把某条夹具整块搬进 §6 历史区，断言仍由历史副本满足。
     // 逐条切片会漏，所以钉一条**结构不变量**。**第一版写错了**：清单前八项抄的是 §2.4 的**判据清单**
@@ -1650,13 +1682,35 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // Codex round 44 P2：同上——`[^\n]` 跨不了折行。归一化空白后钉命令本身（SID 由当前用户占位符表示）。
     // ⚠️ **Codex round 45 P2-2**：方案 A 有**两个**命令载体，SID 占位符写法不同——
     // 段首摘要用 `*<当前用户 SID>`、② 步用 `*<SID>`。只钉前者时，把 ② 单独改回 `(R,W)` 仍全绿（实测）。
-    // 判据：把所有 `/grant:r` 命令逐个切出来（归一化空白），**每一条**都必须是 (R,W,D)。
-    const flatA = planA.replace(/\s+/g, '')
-    const grantCmds = flatA.match(/\/grant:r"[^"]*"[)）]?/g) ?? []
-    expect(grantCmds.length, '方案 A 必须至少有两处收紧命令（摘要 + ② 步）').toBeGreaterThanOrEqual(2)
+    // 判据：把所有 `/grant:r` 命令逐个切出来（归一化空白后按 `引号 + *<SID> + 掩码` 形态切），
+    // **每一条**都必须是 (R,W,D)，且两个载体（摘要的 `*<当前用户 SID>` 与 ② 步的 `*<SID>`）都必须在内。
+    // ⚠️ **Codex round 49**：原正则只认双引号形态（`/grant:r"…"`），④ 的动作句却在 CR 47 之后对引号形态无关——
+    // 同一个合法写法（PowerShell 单引号字符串）在一处放过、在另一处判红，且报错写成「至少两处」会把
+    // 「引号形态不同」误报成「命令缺失」。判据只看**掩码**；但**引号仍是形态的一部分**（不带的写法
+    // 在 PowerShell 里 `(R,W,D)` 会被当表达式，命令根本不可执行），所以引号位接受单/双/中文引号、不接受缺省。
+    const grantCmdsOf = (t: string) =>
+      t.replace(/\s+/g, '').match(/\/grant:r["'`“”‘’]\*<[^>]{0,30}>:\([A-Z,]+\)/g) ?? []
+    const grantCmds = grantCmdsOf(planA)
+    expect(grantCmds.length, '方案 A 必须至少有两处收紧命令（摘要 + ② 步，都是带引号的可执行形态）')
+      .toBeGreaterThanOrEqual(2)
     for (const cmd of grantCmds) {
       expect(cmd, `方案 A 的每一条收紧命令都必须写 (R,W,D)：${cmd}`).toContain('(R,W,D)')
     }
+    // 数量不能只靠「随便两条带掩码的引号命令」凑：两个载体各自都要在场（Codex round 45 P2-2 的原意）。
+    // 只要求 ≥2 时，把 ② 退回 `(R,W)` 而散文里另有两条 `(R,W,D)` 副本就能凑够数量。
+    expect(grantCmds.some((c) => c.includes('<当前用户SID>')), '摘要载体（`*<当前用户 SID>`）必须在场且为 (R,W,D)').toBe(true)
+    expect(grantCmds.some((c) => c.includes('<SID>')), '② 步载体（`*<SID>`）必须在场且为 (R,W,D)').toBe(true)
+    // 双向自检（合成文本，不依赖真文档措辞）。`okOf` 要求**至少切出一条**——空集上 `.every()` 恒真，
+    // 只写 every 会让「一条都没切到」也算通过。
+    const okOf = (t: string) => {
+      const cmds = grantCmdsOf(t)
+      return cmds.length > 0 && cmds.every((c) => c.includes('(R,W,D)'))
+    }
+    expect(okOf('icacls <tmp> /inheritance:r /grant:r "*<SID>:(R,W,D)"'), '正例：双引号必须放过').toBe(true)
+    expect(okOf("icacls <tmp> /inheritance:r /grant:r '*<SID>:(R,W,D)'"), '正例：单引号同一命令必须放过（引号形态不是判据）').toBe(true)
+    expect(okOf('icacls <tmp> /inheritance:r /grant:r *<SID>:(R,W,D)'), '反例：不带引号的写法在 PowerShell 里不可执行，不得算命令').toBe(false)
+    expect(okOf("icacls <tmp> /inheritance:r /grant:r '*<SID>:(R,W)'"), '反例：单引号 (R,W) 必须判红').toBe(false)
+    expect(okOf('/grant:r <某个具名用户>:(R)'), '反例：散文里的泛称形态不算命令').toBe(false)
     // Codex round 41 P2-1：写序第 ④ 步曾把 `renameSync` 当动作（子进程里调不到）。它只能作为
     // 「旧实现描述」出现，因此必须同时点名最终原语 `MoveFileExW`。
     expect(planA, '方案 A 的写序必须点名换名原语 MoveFileExW（renameSync 只能作旧实现描述）')
