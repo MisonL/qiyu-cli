@@ -1376,12 +1376,16 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/\(i\) \*\*目标不存在[\s\S]{0,400}\(ii\) \*\*目标已存在且其 ACL 不含 `DELETE`\*\*/)
     // 第三条必须**切到夹具 13(c) 的 (ii) 档内**：`configured:true` 在 §2.4a ⑥ 的正文里也出现，
     // 搜整个 `sp` 会被邻段满足（M3 变异实测仍绿）。
-    const i13c = sp.indexOf('(c) **父目录只授当前用户 Modify')
-    const i13end = sp.indexOf('14. **`qiyu` 目录的祖先把', i13c)
-    expect(i13c, '夹具 13(c) 起点锚必须在场').toBeGreaterThanOrEqual(0)
-    expect(i13end, '夹具 13(c) 终点锚必须在场（否则切片静默扩大）').toBeGreaterThan(i13c)
-    const fixture13c = sp.slice(i13c, i13end)
-    expect(fixture13c, '夹具 13(c) 的 (ii) 档必须写明不得报 configured:true')
+    // ⚠️ **Codex round 46 P2**：切片原本从 (c) 开头起——(i) 档里的同一句话也能满足断言。
+    // 隔离变异：把「不得报 `configured:true`」挪到 (i)、把 (ii) 改成「可以报」，86/86 仍绿。
+    // 必须**从 (ii) 标记起切**，让 (i) 的文字不能替 (ii) 背书。
+    const i13ii = sp.indexOf('(ii) **目标已存在且其 ACL 不含 `DELETE`**')
+    const i13end = sp.indexOf('14. **`qiyu` 目录的祖先把', i13ii)
+    expect(i13ii, '夹具 13(c) 的 (ii) 档起点锚必须在场').toBeGreaterThanOrEqual(0)
+    expect(i13end, '夹具 13(c) 区段终点锚必须在场（否则切片静默扩大）').toBeGreaterThan(i13ii)
+    expect(i13end - i13ii, '切片跨度必须收敛（>2000 说明终点锚命中了别处）').toBeLessThan(2000)
+    const fixture13ii = sp.slice(i13ii, i13end)
+    expect(fixture13ii, '夹具 13(c) 的 (ii) 档必须写明不得报 configured:true')
       .toMatch(/不得报 `configured:true`/)
     expect(sec, '必须如实声明：换名权限这一档因探针机特权而无法实测')
       .toMatch(/SeBackup[\s\S]{0,200}(绕过|无从实测|无法实测)/)
@@ -1454,10 +1458,17 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     const fx9b = sp.slice(i9b, i9c)
     expect(fx9b, '夹具 9(b) 读面必须仍 ok:true').toMatch(/读面[\s\S]{0,60}必须 `ok:true`/)
     expect(fx9b, '夹具 9(b) 写序必须拒（有效 DELETE 为假）').toMatch(/写序[\s\S]{0,40}拒/)
-    expect(sp, '夹具 9(c) 必须有「allow 只有 Read + deny READ_DATA」这一档并写明读面 ok:false')
-      .toMatch(/9\(c\)[\s\S]{0,400}allow 只含 `Read` \+ deny `READ_DATA`[\s\S]{0,120}ok`:?\*?\*?false|allow 只含 `Read` \+ deny `READ_DATA`[\s\S]{0,120}读面必须 `ok:false`/)
-    expect(sp, '夹具 9(c) 必须同时有「无 deny 必须通过」的对照档（否则判据被别的拒绝条件遮蔽）')
-      .toMatch(/无 deny[\s\S]{0,60}ok`:?\*?\*?true|ok:true[\s\S]{0,40}读取成功/)
+    // ⚠️ **Codex round 46 P2**：两条原先是搜整个 `sp`，负向正则的第二个分支还不带 `9(c)` 前缀——
+    // 把 9(c) 的两档从现行夹具区挪到 §6 历史区，86/86 仍绿（历史文字替已撤出的夹具背书）。
+    // 必须先切出 9(c) → 10. 的区段，再分别验证两档。
+    const i10 = sp.indexOf('10. **继承开启、当前 ACE 恰好只含受信主体**', i9c)
+    expect(i10, '夹具 10 起点锚必须在场（否则 9(c) 切片静默扩大）').toBeGreaterThan(i9c)
+    expect(i10 - i9c, '9(c) 切片跨度必须收敛（>2000 说明锚命中了别处）').toBeLessThan(2000)
+    const fx9c = sp.slice(i9c, i10)
+    expect(fx9c, '夹具 9(c)(i) 必须写「allow 只含 Read + deny READ_DATA → 读面 ok:false」')
+      .toMatch(/allow 只含 `Read` \+ deny `READ_DATA`[\s\S]{0,120}ok:false/)
+    expect(fx9c, '夹具 9(c)(ii) 必须写「无 deny → 读面 ok:true」的对照档')
+      .toMatch(/无 deny[\s\S]{0,80}ok:true/)
     expect(sec, '必须写明「仅当前用户可删」的理由：换名依据是文件自身的 DELETE（父目录可能不给 DELETE_CHILD）')
       .toMatch(/DELETE[\s\S]{0,80}必须在场|必须在场[\s\S]{0,80}DELETE/)
     expect(sec, '必须写明 ReadWrite 成员不存在这一事实')
