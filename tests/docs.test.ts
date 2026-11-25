@@ -1666,12 +1666,39 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(i4act, '④ 动作句起点必须在场').toBeGreaterThanOrEqual(0)
     expect(i4end, '④ 动作句终点锚（「收紧并读回」）必须在场').toBeGreaterThan(i4act)
     const step4Block = sec.slice(i4act, sec.indexOf('- ⑤ **通过'))
-    // 引号（半角/全角/反引号）与空白一律剥掉：这样单引号、双引号、弯引号写法的命令会被归一成同一形态。
-    const act4 = sec.slice(i4act, i4end).replace(/["'`“”‘’\s]/g, '')
-    expect(act4, '④ 的动作句必须写出 (R,W,D) 的收紧命令（引号形态无关）')
-      .toContain('grant:r*<SID>:(R,W,D)')
-    expect(act4, '④ 的动作句不得写成只授 (R,W) 的形态（单双引号都算）')
-      .not.toContain('grant:r*<SID>:(R,W)')
+    // 判据只看命令本身：剥空白，但**引号是形态的一部分**——PowerShell 5.1 里不带引号的
+    // `*<SID>:(R,W,D)` 会被当成表达式。同一个切取器（**唯一实现点**）同时服务 ④ 的动作句与方案 A 两个载体。
+    // ⚠️ **CodeRabbit round 121 minor**：④ 原先剥掉引号再钉串，把命令的引号删掉照样绿。
+    // ⚠️ **Codex round 50 P2**：只要求「有一个开引号」还不行——① 删掉**闭引号**（不配对）仍绿，
+    // ② 反引号被当成引号（PowerShell 里 `` ` `` 是转义符，命令直接语法错误）也仍绿。
+    // 所以引号必须**成对**（开/闭各一种写法、闭与开对应），且**排除反引号**。
+    const QUOTE_PAIRS: ReadonlyArray<readonly [string, string]> = [
+      ['"', '"'], ["'", "'"], ['“', '”'], ['‘', '’'],
+    ]
+    const grantCmdsOf = (t: string): string[] => {
+      const flat = t.replace(/\s+/g, '')
+      const out: string[] = []
+      for (const [open, close] of QUOTE_PAIRS) {
+        const re = new RegExp(`/grant:r${open}\\*<[^>]{0,30}>:\\([A-Z,]+\\)${close}`, 'g')
+        out.push(...(flat.match(re) ?? []))
+      }
+      return out
+    }
+    const act4Cmds = grantCmdsOf(sec.slice(i4act, i4end))
+    expect(act4Cmds.length, '④ 的动作句必须有且只有一条**成对引号**的收紧命令（引号是形态的一部分）').toBe(1)
+    expect(act4Cmds[0], '④ 的动作句必须写 (R,W,D)（写 (R,W) 会被切出来并在这里判红）').toContain('(R,W,D)')
+    // 双向自检（合成文本，不依赖真文档措辞）。`okOf` 要求**至少切出一条**——空集上 `.every()` 恒真。
+    const okOf = (t: string) => {
+      const cmds = grantCmdsOf(t)
+      return cmds.length > 0 && cmds.every((c) => c.includes('(R,W,D)'))
+    }
+    expect(okOf('icacls <tmp> /inheritance:r /grant:r "*<SID>:(R,W,D)"'), '正例：双引号必须放过').toBe(true)
+    expect(okOf("icacls <tmp> /inheritance:r /grant:r '*<SID>:(R,W,D)'"), '正例：单引号同一命令必须放过（引号形态不是判据）').toBe(true)
+    expect(okOf('icacls <tmp> /inheritance:r /grant:r *<SID>:(R,W,D)'), '反例：不带引号在 PowerShell 里不可执行，不得算命令').toBe(false)
+    expect(okOf('icacls <tmp> /inheritance:r /grant:r "*<SID>:(R,W,D)'), '反例：缺闭引号（不配对）必须判红').toBe(false)
+    expect(okOf('icacls <tmp> /inheritance:r /grant:r `*<SID>:(R,W,D)`'), '反例：反引号是 PowerShell 的转义符，不是引号').toBe(false)
+    expect(okOf("icacls <tmp> /inheritance:r /grant:r '*<SID>:(R,W)'"), '反例：单引号 (R,W) 必须判红').toBe(false)
+    expect(okOf('/grant:r <某个具名用户>:(R)'), '反例：散文里的泛称形态不算命令').toBe(false)
     // 方案 A 正文是同一收紧命令的第二个载体（CR 108 曾在这里漏过一次）：只钉 ④ 那一条，
     // 正文退回 (R,W) 仍会让实施者照抄错命令。两处都必须是 (R,W,D)，且不得留旧形态。
     const oaLocal = sp.indexOf('2. **方案 A（以真机为闸')
@@ -1682,14 +1709,8 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // Codex round 44 P2：同上——`[^\n]` 跨不了折行。归一化空白后钉命令本身（SID 由当前用户占位符表示）。
     // ⚠️ **Codex round 45 P2-2**：方案 A 有**两个**命令载体，SID 占位符写法不同——
     // 段首摘要用 `*<当前用户 SID>`、② 步用 `*<SID>`。只钉前者时，把 ② 单独改回 `(R,W)` 仍全绿（实测）。
-    // 判据：把所有 `/grant:r` 命令逐个切出来（归一化空白后按 `引号 + *<SID> + 掩码` 形态切），
-    // **每一条**都必须是 (R,W,D)，且两个载体（摘要的 `*<当前用户 SID>` 与 ② 步的 `*<SID>`）都必须在内。
-    // ⚠️ **Codex round 49**：原正则只认双引号形态（`/grant:r"…"`），④ 的动作句却在 CR 47 之后对引号形态无关——
-    // 同一个合法写法（PowerShell 单引号字符串）在一处放过、在另一处判红，且报错写成「至少两处」会把
-    // 「引号形态不同」误报成「命令缺失」。判据只看**掩码**；但**引号仍是形态的一部分**（不带的写法
-    // 在 PowerShell 里 `(R,W,D)` 会被当表达式，命令根本不可执行），所以引号位接受单/双/中文引号、不接受缺省。
-    const grantCmdsOf = (t: string) =>
-      t.replace(/\s+/g, '').match(/\/grant:r["'`“”‘’]\*<[^>]{0,30}>:\([A-Z,]+\)/g) ?? []
+    // 判据：用 ④ 那个切取器把方案 A 的 `/grant:r` 命令逐个切出来，**每一条**都必须是 (R,W,D)，
+    // 且两个载体各自都在场（数量不能只靠「随便两条带掩码的引号命令」凑）。
     const grantCmds = grantCmdsOf(planA)
     expect(grantCmds.length, '方案 A 必须至少有两处收紧命令（摘要 + ② 步，都是带引号的可执行形态）')
       .toBeGreaterThanOrEqual(2)
@@ -1700,17 +1721,6 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 只要求 ≥2 时，把 ② 退回 `(R,W)` 而散文里另有两条 `(R,W,D)` 副本就能凑够数量。
     expect(grantCmds.some((c) => c.includes('<当前用户SID>')), '摘要载体（`*<当前用户 SID>`）必须在场且为 (R,W,D)').toBe(true)
     expect(grantCmds.some((c) => c.includes('<SID>')), '② 步载体（`*<SID>`）必须在场且为 (R,W,D)').toBe(true)
-    // 双向自检（合成文本，不依赖真文档措辞）。`okOf` 要求**至少切出一条**——空集上 `.every()` 恒真，
-    // 只写 every 会让「一条都没切到」也算通过。
-    const okOf = (t: string) => {
-      const cmds = grantCmdsOf(t)
-      return cmds.length > 0 && cmds.every((c) => c.includes('(R,W,D)'))
-    }
-    expect(okOf('icacls <tmp> /inheritance:r /grant:r "*<SID>:(R,W,D)"'), '正例：双引号必须放过').toBe(true)
-    expect(okOf("icacls <tmp> /inheritance:r /grant:r '*<SID>:(R,W,D)'"), '正例：单引号同一命令必须放过（引号形态不是判据）').toBe(true)
-    expect(okOf('icacls <tmp> /inheritance:r /grant:r *<SID>:(R,W,D)'), '反例：不带引号的写法在 PowerShell 里不可执行，不得算命令').toBe(false)
-    expect(okOf("icacls <tmp> /inheritance:r /grant:r '*<SID>:(R,W)'"), '反例：单引号 (R,W) 必须判红').toBe(false)
-    expect(okOf('/grant:r <某个具名用户>:(R)'), '反例：散文里的泛称形态不算命令').toBe(false)
     // Codex round 41 P2-1：写序第 ④ 步曾把 `renameSync` 当动作（子进程里调不到）。它只能作为
     // 「旧实现描述」出现，因此必须同时点名最终原语 `MoveFileExW`。
     expect(planA, '方案 A 的写序必须点名换名原语 MoveFileExW（renameSync 只能作旧实现描述）')
