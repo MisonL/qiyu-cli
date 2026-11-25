@@ -1554,13 +1554,16 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 句子切分见下：**换行先按块合并（空行或列表标记起新块），再按 。；切句**——
     // CR 107 指出按 \n 直接切会把换行折断的句子劈成碎片（「都能搬走/删掉」单独一片），
     // 文档没改却被判红。合并规则与「排版不影响判定」这条声明一致。
-    // 代价（如实声明，实测过边界）：改这 37 句里任何一句的**文字**都会红，须回来确认它仍不是
+    // 代价（如实声明，实测过边界）：改这 40 句里任何一句的**文字**都会红，须回来确认它仍不是
     // 现行删除指令并更新清单；纯排版（`**`/反引号/空白/续行换行）不会红（比对前归一化，M16 实证）。
     // 这是有意的取舍：假阳性可见、成本一次性；假阴性会让「失败路径一律不删」被悄悄推翻。
     const ALLOWED_DELETE_MENTIONS = [
       '**目录身份必须先钉住**：打开 `qiyu` 目录的句柄并保持到 ④ 完成（Windows 上持有目录句柄可阻止其被删除/改名——**前提是打开时不得带 `FILE_SHARE_DELETE`**：共享标志里给了删除共享，别人照样能删/改名，句柄形同虚设',
-      '**任一步失败的处理一律走 §2.4a 的统一规则**（不写 secret、非 0 退出、不删除也不移动任何对象',
-      '此处原写「就删除 tmp 且不换入」是收敛前的旧语义，与统一规则矛盾，Codex round 33 P2 指出后改掉）',
+      '**任一步失败的处理一律走 §2.4a 的统一规则，且按 secret 是否已写分两臂**（本例编号 ③（= §2.4a 的 ⑤）写 secret 之前的失败 → 非 0 退出、**不写 secret**、不删除也不移动任何对象',
+      '③ 之后（本例 ④ = §2.4a 的 ⑥）的失败发生在 secret 已写之后 → 非 0 退出、**如实报告含 secret 的残留路径**、同样不删除也不移动任何对象',
+      '此处原写「就删除 tmp 且不换入」是收敛前的旧语义，与统一规则矛盾，Codex round 33 P2 指出后改掉',
+      '**⑤ 写 secret 之前**（⓪–④ 任一步失败）：secret 从未写出，**写入次数为 0**、非 0 退出、不删除也不移动',
+      '同样**不删除也不移动任何对象**（「能正名」这个删除先决条件在这一臂同样不成立）',
       '那个具名用户即使在别处有 deny ACE 也按「先判 allow 名单」处理——宁可误报要求人工 `icacls` 清理，也不放过',
       '**父目录的写面受信**（不是「所有 ACE 都受信」）：非受信账户对目录没有任何**写类**权限（创建/删除子项、`WRITE_DAC`、改属主）——否则别人可以**整个换掉**这个文件',
       '探针 14 独立复现 `rmdir` 被挡），而 **Node 的 fd 不能**（libuv 带删除共享）',
@@ -1619,18 +1622,18 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 旧的长度下限 `>= 4` 是同类漏洞：短句（`删掉。` 归一化后 2 字）也会被静默丢弃，
     // 与「每句提到动词的话都必须登记」这条契约矛盾，一并去掉——判据只做一件事：
     // 归一化后含动词的句子全部进入 offenders/允许清单比对。
-    const deleteSentences = (text: string) =>
+    const sentencesOf = (text: string) =>
       splitBlocks(text)
         .map((b) => b.replace(/^\s*(?:[-·]|⚠️|⚠|\d+\.)\s*/, ''))
         .flatMap((b) => b.split(/[。；]/))
         .map((s) => s.trim())
-        .filter((s) => DELETE_VERB.test(normSent(s)))
+    const deleteSentences = (text: string) => sentencesOf(text).filter((s) => DELETE_VERB.test(normSent(s)))
     const offenders = deleteSentences(normativeAll).filter((x) => !allowed.has(normSent(x)))
     expect(offenders, `规范区出现允许清单外的删除/清除句（先确认它不是现行指令，再登记）：\n${offenders.join('\n')}`)
       .toEqual([])
     expect(ALLOWED_DELETE_MENTIONS.length, '允许清单不得被清空（清空后上一条会恒真）')
       .toBeGreaterThanOrEqual(30)
-    // 判据自带三条最小反例（CR round 107 逐条指出过的三个假绿/假红形态），都直接跑同一条流水线：
+    // 判据自带五条最小反例（CR round 107 的三个假绿/假红形态 + Codex 36 的两条逃逸形态），都直接跑同一条流水线：
     // ① `复核不一致就删除目标。` —— 动词前是「不一致就」，旧版把它当否定豁免（CR107 minor 3）；
     // ② `不删除目标文件。` —— 否定式但**仍是**一句删除指令的存在性提示，旧版豁免、新版必须拦（不豁免肯否）；
     // ③ 把一句登记过的长句在字中间折断 —— 旧版按 \n 切句会劈出碎片判红（CR107 minor 1），新版必须放过。
@@ -1645,6 +1648,29 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(pipeline('不满足即删\n除 tmp、非 0 退出、写入次数为 0。'),
       'Codex36：动词被换行折断不得绕过允许清单').not.toEqual([])
     expect(pipeline('删掉。'), '短句没有长度豁免，同样必须登记').not.toEqual([])
+    // ⚠️ **CR round 108 minor：失败语义必须分两臂，不许写成全称。**
+    // 旧版在 §2.4 方案 A 与统一规则里都写「任一步失败…不写 secret」，而 ⑤ 写完 secret 之后 ⑥ 才失败时
+    // secret 已经落盘——同一份文档另一处（残余窗口）自己也承认这一点，属「同一契约两套话」。
+    // 判据三条，都钉在 **§2.4a 权威区**（不收 §6.x 历史区满足）：
+    // ① 全称句若同时含「任一步失败」与「不写 secret」，必须带分臂限定词（之前/之后/两臂）；
+    // ② ⑤ 之后那一臂必须写明 secret 可能已落盘；③ 必须要求报告「含 secret 的残留路径」。
+    const sec24a = sp.slice(sp.indexOf('### 2.4a'), sp.indexOf('### 2.4b'))
+    expect(sec24a.length, '§2.4a 切片必须非空（锚缺失时下面三条会假绿）').toBeGreaterThan(1000)
+    const normA = normSent(sec24a)
+    expect(normA, 'CR108：⑤ 之后的失败必须写明 secret 可能已落盘').toContain('secret可能已落盘')
+    expect(normA, 'CR108：⑤ 之后的失败必须要求报告含 secret 的残留路径').toContain('含secret的残留路径')
+    // ① 全称句的判据扫**整个规范窗**（不只 §2.4a）：CR 108 指出的原句住在 §2.4 方案 A 里，
+    //    只扫 §2.4a 会让「回到全称」这条回归一路绿灯（我第一版就是这么写的，变异 N1 实测没红）。
+    const blanketOf = (text: string) => sentencesOf(text)
+      .map(normSent)
+      .filter((t) => t.includes('任一步失败') && t.includes('不写secret') && !/(之前|之后|两臂)/.test(t))
+    // 两条内置反例：证明判据活着，且不误伤带分臂限定的正确写法（不依赖改 spec 才能自证）。
+    expect(blanketOf('**任一步失败的处理一律走 §2.4a 的统一规则**（不写 secret、非 0 退出、不删除也不移动任何对象。'),
+      'CR108 反例：全称句必须被这条判据抓住').not.toEqual([])
+    expect(blanketOf('**任一步失败的处理一律走 §2.4a 的统一规则，且按 secret 是否已写分两臂**（⑤ 写 secret 之前的失败不写 secret。'),
+      'CR108 反例：带分臂限定词的句子不得误伤').toEqual([])
+    expect(blanketOf(normativeAll), '规范区不得出现「任一步失败…不写 secret」的全称句（⑤ 之后 secret 已落盘）')
+      .toEqual([])
     // 非空转证明分两层，都**不依赖任何现行句、0.2.4 怎么改写都不会假红**：
     // ① 窗的边界：secStart/histStart 都是**结构标题**（§6.x 历史引用区在 histStart 之后，天然被切掉）；
     // ② 窗的覆盖：上面两条 `扫描窗必须含…标题` 断言已证明窗真伸到夹具区与方案A正文——
