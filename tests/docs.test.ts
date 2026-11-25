@@ -1419,6 +1419,13 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/判的是「有效」`DELETE`/)
     expect(sp, '夹具必须有 allow(R,W,D)+deny DELETE 的一档')
       .toMatch(/9\(b\)\.[\s\S]{0,60}deny `DELETE`/)
+    // ⚠️ **CodeRabbit round 114 minor**：清单是**读面判据**（`checkPermissions` 给只读命令用），
+    // 把写序专用的 `DELETE` 塞进去会让「只读可用」的合法配置被判不安全。判据必须钉住分层：
+    // ① 第 5 条明写 DELETE 是写序专用、不在读面判据里；② ④ 的读回要**附加**第八条而不是并进七条。
+    expect(item5, '清单第 5 条必须写明 DELETE 是写序专用、不属于读面判据')
+      .toMatch(/写序专用[\s\S]{0,40}不在读面判据/)
+    expect(sec, '④ 的读回必须在七条之外附加「对该 tmp 的有效 DELETE」一条')
+      .toMatch(/写序专用的第八条[\s\S]{0,120}DELETE|附加[\s\S]{0,40}第八条/)
     expect(sec, '必须写明「仅当前用户可删」的理由：换名依据是文件自身的 DELETE（父目录可能不给 DELETE_CHILD）')
       .toMatch(/DELETE[\s\S]{0,80}必须在场|必须在场[\s\S]{0,80}DELETE/)
     expect(sec, '必须写明 ReadWrite 成员不存在这一事实')
@@ -1695,7 +1702,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 句子切分见下：**换行先按块合并（空行或列表标记起新块），再按 。；切句**——
     // CR 107 指出按 \n 直接切会把换行折断的句子劈成碎片（「都能搬走/删掉」单独一片），
     // 文档没改却被判红。合并规则与「排版不影响判定」这条声明一致。
-    // 代价（如实声明，实测过边界）：改这 48 句里任何一句的**文字**都会红，须回来确认它仍不是
+    // 代价（如实声明，实测过边界）：改这 49 句里任何一句的**文字**都会红，须回来确认它仍不是
     // 现行删除指令并更新清单；纯排版（`**`/反引号/空白/续行换行）不会红（比对前归一化，M16 实证）。
     // 这是有意的取舍：假阳性可见、成本一次性；假阴性会让「失败路径一律不删」被悄悄推翻。
     const ALLOWED_DELETE_MENTIONS = [
@@ -1743,6 +1750,7 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       '**换名权限这一条在本机无法实测**（探针 32d）：该机 ssh 会话的令牌是**已提权管理员**且   `SeBackupPrivilege`/`SeRestorePrivilege`/`SeTakeOwnershipPrivilege` 均**已启用**（`GetTokenInformation`   读出的 `attr=0x3`，探针 35b），这几个特权使 `DeleteFile`/`MoveFileEx` **绕过 ACL 校验**——即使文件上写死   `DENY DELETE`、父目录写死 `DENY DELETE_CHILD`，改名与删除**照样成功**',
       '把这些特权在进程内禁用后   立刻变成 `0x5 ACCESS_DENIED`（探针 36 的受控对照，成因已确认而非推断）   （对照：`DENY READ_DATA` 时读取确实被拒 `0x80070005`，说明 ACL 校验本身是生效的，被绕过的只是   删除/改名这一侧）',
       '**本机造不出干净的判据**：探针机的 ssh 令牌带已启用的 `SeBackup`/`SeRestore`（探针 35b），         删除与改名会**绕过 ACL**（探针 32d：显式 `DENY DELETE` + 父目录 `DENY DELETE_CHILD` 仍然改名成功',
+      '**`DELETE` 是「写序专用」加项，不在读面判据里（CodeRabbit round 114 minor）**：本清单同时被   `checkPermissions` 用（它服务于只读命令——`api call`/`query`/`sync` 之前都要读配置），   而 `DELETE` 只影响**删除/覆盖**，与「能不能安全地读」无关',
       '仍未实测的是：`CreateFile`+`SECURITY_ATTRIBUTES`（等价备选）、   `icacls` 造 **null/空 DACL** 的实际形态、以及「权限不够时换名/删除会失败」这一档（探针机特权绕过，   只能进程内禁用特权模拟，普通账户未跑）',
       '覆盖已有目标还要目标自己的 `DELETE`（CR round 111 minor）**：   上面这段依据的是 DeleteFile 文档，管的是**源对象**能不能被移走',
       '`MOVEFILE_REPLACE_EXISTING` 换入时   Windows 还要**单独**判定被替换的那个目标能否被删除，依据同样是「目标自身的 `DELETE`」**或**「目标父目录的   `FILE_DELETE_CHILD`」——**源文件带 `DELETE` 不能代替**',
