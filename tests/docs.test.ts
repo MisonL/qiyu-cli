@@ -1238,8 +1238,18 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 第十一轮后机制已实测：`FileStream` 七参重载在 PowerShell 5.1 可用（探针 25/27/29）。
     // 旧的「三种候选机制均未真机实测」是上一轮的真话、现在是假话，判据随之翻转：
     // 必须写明哪个已实测可用、哪个仍是未实测的备选。
-    expect(writeOrder, '必须写明受限创建机制已实测可用')
-      .toMatch(/已实测可用的是 .NET `FileStream` 七参重载|FileStream` 七参重载 \+ `FileSecurity`/)
+    // ⚠️ **CodeRabbit round 116 minor**：第二条备选只查了机制名——把「已实测可用」改成「尚未实测」，
+    // 机制名仍在，判据照样通过。先把 Markdown 标记与空白归一化，再要求**状态与机制名在同一处**。
+    const flatWrite = writeOrder.replace(/[*`]/g, '').replace(/\s+/g, '')
+    // 注意：原文状态词与机制之间夹着 `**` 与「的是」→ 归一化后是「已实测可用的是FileStream七参重载」，
+    // 窗口给 40 字足够（含「的是」与上一句的 `**` 残留）。
+    expect(flatWrite, '必须写明「FileStream 七参重载 + FileSecurity」已实测可用（状态与机制同一处）')
+      .toMatch(/已实测可用[^。；]{0,20}FileStream七参重载/)
+    // 负向对照：状态被改成「尚未实测」时判据必须变红（合成文本，不依赖真实措辞）。
+    const statusOf = (t: string) =>
+      /已实测可用[^。；]{0,40}FileStream七参重载/.test(t.replace(/[*`]/g, '').replace(/\s+/g, ''))
+    expect(statusOf('已实测可用的是 .NET `FileStream` 七参重载 + `FileSecurity`'), '正例必须通过').toBe(true)
+    expect(statusOf('尚未实测的是 .NET `FileStream` 七参重载 + `FileSecurity`'), '反例：状态改成未实测必须判红').toBe(false)
     expect(writeOrder, 'P/Invoke 备选必须如实标为未实测')
       .toMatch(/等价备选但\*\*未实测\*\*/)
     // ⚠️ **CodeRabbit round 81（major）**：③ 必须写进 ① 拿到的同一个句柄 + 目录身份钉住——
@@ -1439,13 +1449,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // 夹具 9(b) 必须同时写出**两个方向相反**的期望，否则会把读面拒绝装回去。
     const i9b = sp.indexOf('9(b). **allow `(R,W,D)` + deny `DELETE`**')
     expect(i9b, '夹具 9(b) 起点锚必须在场').toBeGreaterThanOrEqual(0)
-    const i9c = sp.indexOf('9(c). **allow `FullControl` + deny `READ_DATA`**')
+    const i9c = sp.indexOf('9(c). **读面 deny 的隔离夹具')
     expect(i9c, '夹具 9(c) 起点锚必须在场（否则下一条切片静默扩大）').toBeGreaterThan(i9b)
     const fx9b = sp.slice(i9b, i9c)
     expect(fx9b, '夹具 9(b) 读面必须仍 ok:true').toMatch(/读面[\s\S]{0,60}必须 `ok:true`/)
     expect(fx9b, '夹具 9(b) 写序必须拒（有效 DELETE 为假）').toMatch(/写序[\s\S]{0,40}拒/)
-    expect(sp, '夹具 9(c) 必须写明 deny READ_DATA 压过 allow（读面 ok:false）')
-      .toMatch(/9\(c\)[\s\S]{0,120}读面必须 `ok:false`/)
+    expect(sp, '夹具 9(c) 必须有「allow 只有 Read + deny READ_DATA」这一档并写明读面 ok:false')
+      .toMatch(/9\(c\)[\s\S]{0,400}allow 只含 `Read` \+ deny `READ_DATA`[\s\S]{0,120}ok`:?\*?\*?false|allow 只含 `Read` \+ deny `READ_DATA`[\s\S]{0,120}读面必须 `ok:false`/)
+    expect(sp, '夹具 9(c) 必须同时有「无 deny 必须通过」的对照档（否则判据被别的拒绝条件遮蔽）')
+      .toMatch(/无 deny[\s\S]{0,60}ok`:?\*?\*?true|ok:true[\s\S]{0,40}读取成功/)
     expect(sec, '必须写明「仅当前用户可删」的理由：换名依据是文件自身的 DELETE（父目录可能不给 DELETE_CHILD）')
       .toMatch(/DELETE[\s\S]{0,80}必须在场|必须在场[\s\S]{0,80}DELETE/)
     expect(sec, '必须写明 ReadWrite 成员不存在这一事实')
@@ -1575,11 +1587,15 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(a24a, '§2.4a 标题必须在场').toBeGreaterThan(oaLocal)
     const planA = sp.slice(oaLocal, a24a)
     // Codex round 44 P2：同上——`[^\n]` 跨不了折行。归一化空白后钉命令本身（SID 由当前用户占位符表示）。
+    // ⚠️ **Codex round 45 P2-2**：方案 A 有**两个**命令载体，SID 占位符写法不同——
+    // 段首摘要用 `*<当前用户 SID>`、② 步用 `*<SID>`。只钉前者时，把 ② 单独改回 `(R,W)` 仍全绿（实测）。
+    // 判据：把所有 `/grant:r` 命令逐个切出来（归一化空白），**每一条**都必须是 (R,W,D)。
     const flatA = planA.replace(/\s+/g, '')
-    expect(flatA, '方案 A 的收紧命令载体必须在场且写 (R,W,D)')
-      .toContain('/grant:r"*<当前用户SID>:(R,W,D)"')
-    expect(flatA, '方案 A 不得残留只授 (R,W) 的收紧命令（折行也逃不掉）')
-      .not.toContain('/grant:r"*<当前用户SID>:(R,W)"')
+    const grantCmds = flatA.match(/\/grant:r"[^"]*"[)）]?/g) ?? []
+    expect(grantCmds.length, '方案 A 必须至少有两处收紧命令（摘要 + ② 步）').toBeGreaterThanOrEqual(2)
+    for (const cmd of grantCmds) {
+      expect(cmd, `方案 A 的每一条收紧命令都必须写 (R,W,D)：${cmd}`).toContain('(R,W,D)')
+    }
     // Codex round 41 P2-1：写序第 ④ 步曾把 `renameSync` 当动作（子进程里调不到）。它只能作为
     // 「旧实现描述」出现，因此必须同时点名最终原语 `MoveFileExW`。
     expect(planA, '方案 A 的写序必须点名换名原语 MoveFileExW（renameSync 只能作旧实现描述）')
