@@ -1451,24 +1451,51 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(item5, '读面判据必须按有效读判定（不能只看 Allow 含 Read）')
       .toMatch(/有效权利判|有效读/)
     // 夹具 9(b) 必须同时写出**两个方向相反**的期望，否则会把读面拒绝装回去。
-    const i9b = sp.indexOf('9(b). **allow `(R,W,D)` + deny `DELETE`**')
+    // ⚠️ **Codex round 47 P2**：这些锚原先在整份 `sp` 里找——把 9(c) 连同夹具 10 一起搬进 §6 历史区，
+    // 两个锚仍然「有序且距离 < 2000」，历史副本继续替现行清单背书，而 §2.5 已经没有 9(c)（实测仍绿）。
+    // 判据：所有夹具锚只在**规范区**（`## 6.` 之前）内定位。
+    const iHist = sp.indexOf('## 6. ')
+    expect(iHist, '规范区终点锚（`## 6.`）必须在场').toBeGreaterThan(0)
+    const safe = sp.slice(0, iHist)
+    const i9b = safe.indexOf('9(b). **allow `(R,W,D)` + deny `DELETE`**')
     expect(i9b, '夹具 9(b) 起点锚必须在场').toBeGreaterThanOrEqual(0)
-    const i9c = sp.indexOf('9(c). **读面 deny 的隔离夹具')
+    const i9c = safe.indexOf('9(c). **读面 deny 的隔离夹具')
     expect(i9c, '夹具 9(c) 起点锚必须在场（否则下一条切片静默扩大）').toBeGreaterThan(i9b)
-    const fx9b = sp.slice(i9b, i9c)
+    const fx9b = safe.slice(i9b, i9c)
     expect(fx9b, '夹具 9(b) 读面必须仍 ok:true').toMatch(/读面[\s\S]{0,60}必须 `ok:true`/)
-    expect(fx9b, '夹具 9(b) 写序必须拒（有效 DELETE 为假）').toMatch(/写序[\s\S]{0,40}拒/)
+    // ⚠️ **Codex round 47 P2**：原来只要求窗口内出现「拒」字——把它改成意义相反的「不得拒」，
+    // 正则照样命中，86/86 全绿（实测）。必须匹配**完整的肯定拒绝结论**，并内置负向对照。
+    const refuseOf = (t: string) => /写序[\s\S]{0,60}必须拒/.test(t)
+    expect(fx9b, '夹具 9(b) 写序必须写「必须拒」（有效 DELETE 为假）').toMatch(/写序[\s\S]{0,60}必须拒/)
+    expect(refuseOf('· **写序**（对该 tmp 的有效 `DELETE` 那一条）→ **必须拒**'), '正例必须通过').toBe(true)
+    expect(refuseOf('· **写序**（对该 tmp 的有效 `DELETE` 那一条）→ **不得拒**'), '反例：「不得拒」必须判红').toBe(false)
     // ⚠️ **Codex round 46 P2**：两条原先是搜整个 `sp`，负向正则的第二个分支还不带 `9(c)` 前缀——
     // 把 9(c) 的两档从现行夹具区挪到 §6 历史区，86/86 仍绿（历史文字替已撤出的夹具背书）。
     // 必须先切出 9(c) → 10. 的区段，再分别验证两档。
-    const i10 = sp.indexOf('10. **继承开启、当前 ACE 恰好只含受信主体**', i9c)
+    const i10 = safe.indexOf('10. **继承开启、当前 ACE 恰好只含受信主体**', i9c)
     expect(i10, '夹具 10 起点锚必须在场（否则 9(c) 切片静默扩大）').toBeGreaterThan(i9c)
     expect(i10 - i9c, '9(c) 切片跨度必须收敛（>2000 说明锚命中了别处）').toBeLessThan(2000)
-    const fx9c = sp.slice(i9c, i10)
+    const fx9c = safe.slice(i9c, i10)
     expect(fx9c, '夹具 9(c)(i) 必须写「allow 只含 Read + deny READ_DATA → 读面 ok:false」')
       .toMatch(/allow 只含 `Read` \+ deny `READ_DATA`[\s\S]{0,120}ok:false/)
     expect(fx9c, '夹具 9(c)(ii) 必须写「无 deny → 读面 ok:true」的对照档')
       .toMatch(/无 deny[\s\S]{0,80}ok:true/)
+    // ⚠️ **自查（把 Codex round 46 的发现推广到全组）**：上面这些夹具断言多数搜整份 `sp`——把某条夹具
+    // 整块搬进 §6 历史区，断言仍由历史副本满足，现行验收清单却已失去它（r46 对 9(c) 实测过）。
+    // 逐个切片会漏（漏一个就再复现一次），所以再钉一条**结构不变量**：§2.5 的 ACL 夹具标题
+    // 必须**全部住在规范区**（`## 6.` 之前）。任何一条被搬进历史区 → 这里先红。
+    const iHistSection = sp.indexOf('## 6. ')
+    expect(iHistSection, '规范区终点锚（`## 6.`）必须在场（锚缺失时下一条会静默放大）').toBeGreaterThan(0)
+    const normativeOnly = sp.slice(0, iHistSection)
+    const fixtureHeads = [
+      '1. **DACL 存在', '2. **DACL 非空', '3. **属主（owner SID）', '4. **所有允许 ACE 的主体',
+      '5. **当前用户的允许 ACE', '6. **继承关闭', '7. **父目录的写面受信', '8. **任一条判不了',
+      '9(b). ', '9(c). ', '10. **继承开启', '11. **文件本身干净', '12. **父目录不可信时的写序',
+      '13. **父目录对他人有可继承的只读 ACE',
+    ]
+    expect(fixtureHeads.length, '夹具标题清单不得被清空（清空后下一条会恒真）').toBeGreaterThanOrEqual(14)
+    const homeless = fixtureHeads.filter((h) => !normativeOnly.includes(h))
+    expect(homeless, `这些夹具条目不在规范区（被搬进 §6 历史区？）：\n${homeless.join('\n')}`).toEqual([])
     expect(sec, '必须写明「仅当前用户可删」的理由：换名依据是文件自身的 DELETE（父目录可能不给 DELETE_CHILD）')
       .toMatch(/DELETE[\s\S]{0,80}必须在场|必须在场[\s\S]{0,80}DELETE/)
     expect(sec, '必须写明 ReadWrite 成员不存在这一事实')
@@ -1584,12 +1611,20 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // ⚠️ **Codex round 44 P2**：只在这个区段里搜 `(R,W,D)` 会被**后文解释**里的同一个串满足；
     // 反向判据用 `[^\n]` 又跨不了折行——把实际命令折成两行并写回 `(R,W)`，86/86 仍全绿（实测）。
     // 判据必须**先把空白归一化，再只钉那条命令本身**。
-    const step4Block = sec.slice(sec.indexOf('- ④ `icacls'), sec.indexOf('- ⑤ **通过'))
-    const flat4 = step4Block.replace(/\s+/g, '')
-    expect(flat4, '④ 的实际收紧命令必须写 (R,W,D)（归一化空白后匹配命令本身）')
-      .toContain('/grant:r"*<SID>:(R,W,D)"')
-    expect(flat4, '④ 的实际收紧命令不得回到只授 (R,W) 的旧形态（折行也逃不掉）')
-      .not.toContain('/grant:r"*<SID>:(R,W)"')
+    // ⚠️ **Codex round 47 P2**：上两版仍可被绕过——把实际命令改成**单引号**的 `(R,W)`、而解释区
+    // 保留双引号 `(R,W,D)` 示例时，正向匹配被解释区满足、反向只认双引号。判据改成：
+    // **只取动作行**（④ 那一行的**全部续到句末**），**把引号统一成双引号**、去空白后再钉命令。
+    const i4act = sec.indexOf('- ④ `icacls')
+    const i4end = sec.indexOf('收紧并读回', i4act) >= 0 ? sec.indexOf('收紧并读回', i4act) : -1
+    expect(i4act, '④ 动作句起点必须在场').toBeGreaterThanOrEqual(0)
+    expect(i4end, '④ 动作句终点锚（「收紧并读回」）必须在场').toBeGreaterThan(i4act)
+    const step4Block = sec.slice(i4act, sec.indexOf('- ⑤ **通过'))
+    // 引号（半角/全角/反引号）与空白一律剥掉：这样单引号、双引号、弯引号写法的命令会被归一成同一形态。
+    const act4 = sec.slice(i4act, i4end).replace(/["'`“”‘’\s]/g, '')
+    expect(act4, '④ 的动作句必须写出 (R,W,D) 的收紧命令（引号形态无关）')
+      .toContain('grant:r*<SID>:(R,W,D)')
+    expect(act4, '④ 的动作句不得写成只授 (R,W) 的形态（单双引号都算）')
+      .not.toContain('grant:r*<SID>:(R,W)')
     // 方案 A 正文是同一收紧命令的第二个载体（CR 108 曾在这里漏过一次）：只钉 ④ 那一条，
     // 正文退回 (R,W) 仍会让实施者照抄错命令。两处都必须是 (R,W,D)，且不得留旧形态。
     const oaLocal = sp.indexOf('2. **方案 A（以真机为闸')
