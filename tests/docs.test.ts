@@ -1191,13 +1191,20 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     // ⚠️ **Codex round 51 P2（CodeRabbit 122 同源）**：原先只在整份文档里搜「替换**当场失败**」——
     // 把 .NET 档和 Node 档的结论**对调**后，失败措辞仍在（只是跑到了 Node 那档），判据照样绿，
     // 两种实现的关键安全结论完全反转也不报警。必须**按档切片**，各自只认自己档内的肯定结论。
+    // ⚠️ **Codex round 53 P2**：切片原先在**整份 `sp`** 里找——把两档正文整块搬进 §6 历史区、
+    // 只在 §2.5 留编号和标题，历史副本继续替已撤出的现行要求背书（它实测仍 86/86）。
+    // 必须在 **§2.5 夹具区**内切片。
+    const i25fx = sp.indexOf('### 2.5 回归防线')
+    const i3fx = sp.indexOf('## 3. ', i25fx)
+    expect(i25fx, '§2.5 标题必须在场（夹具 14 切片左界）').toBeGreaterThanOrEqual(0)
+    expect(i3fx, '§3 标题必须在场且晚于 §2.5（夹具 14 切片右界）').toBeGreaterThan(i25fx)
     const parts14 = (t: string) => {
       const a = t.indexOf('(a) **`.NET')
       const b = t.indexOf('(b) **纯 Node')
       const c = t.indexOf('判据统一', b)
       return { net: a >= 0 && b > a ? t.slice(a, b) : '', node: b >= 0 && c > b ? t.slice(b, c) : '' }
     }
-    const fx14 = parts14(sp)
+    const fx14 = parts14(sp.slice(i25fx, i3fx))
     expect(fx14.net.length, '夹具 14 的 (a) .NET 档必须在场').toBeGreaterThan(20)
     expect(fx14.node.length, '夹具 14 的 (b) 纯 Node 档必须在场').toBeGreaterThan(20)
     expect(fx14.net, '夹具 14 的 .NET 档必须写「替换当场失败」的**肯定**结论')
@@ -1795,9 +1802,16 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/MoveFileExW[\s\S]{0,160}renameSync|renameSync[\s\S]{0,160}MoveFileExW/)
     expect(step4Block, '读回不通过必须直接挡住 ⑤（硬门）').toMatch(/读回不通过就不得进入 ⑤/)
     // 「写完再补跑七条」这一形态必须被拦：整节里不得出现「写完后/写入之后 … 全部七条」的延后安排。
-    const deferral = /(写完后|写入之后|写完再)[^。；]{0,40}(全部七条|七条)/
-    expect(sec, '不得把完整读回延后到写入之后（Codex round 39 P2-3）').not.toMatch(deferral)
-    expect(deferral.test('④ 先只查继承，写完后补跑全部七条。'), '反例：延后安排必须被这条判据抓住').toBe(true)
+    // ⚠️ **Codex round 53 P2**：这条只看「写完后…七条」同句共现，不看肯否——在 ④ 后追加**合法禁令**
+    // 「不得写完后补跑全部七条。」反而被判红（它实测 86 → 85）。禁止式说明是在**加强**契约，必须放过。
+    // 判据：先剥掉「不得/不许/禁止/严禁」引导的禁止小句，再匹配延后安排。
+    const deferralOf = (t: string) => /(写完后|写入之后|写完再)[^。；]{0,40}(全部七条|七条)/
+      .test(t.replace(/(不得|不许|禁止|严禁)[^。；]{0,40}(写完后|写入之后|写完再)[^。；]{0,40}(全部七条|七条)/g, ''))
+    expect(deferralOf(sec), '不得把完整读回延后到写入之后（Codex round 39 P2-3）').toBe(false)
+    expect(deferralOf('④ 先只查继承，写完后补跑全部七条。'), '反例：延后安排必须被这条判据抓住').toBe(true)
+    expect(deferralOf('④ 完整七条的读回必须发生在写 secret **之前**；不得写完后补跑全部七条。'),
+      '正例：禁止式说明不得被判红（Codex 53）').toBe(false)
+    expect(deferralOf('④ 先只查继承；禁止把全部七条留到写入之后补。'), '正例：禁止式说明的另一种句式也不得误伤').toBe(false)
     // 反例直接跑同一条判据（合成文本，不依赖真文档的措辞，0.2.4 怎么改写都不会假红）：
     // 读回句被挪到 ⑤ 之后 → 必须判红；读回句留在 ④ 之内 → 必须放过。
     expect(step4HasReadback('- ④ `icacls` 收紧。\n- ⑤ **通过句柄写 secret**（读回确认、全部七条）\n'),
@@ -1927,12 +1941,23 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
       .toMatch(/别写成「(已彻底防御|完全消除)」/)
     // ⚠️ **Codex round 52 的隔离变异**：第一版只做「剥掉禁令后不得再出现这两个词」——**诚实表述也判红**
     // （「该窗口尚未完全消除」「介入式替换仍未彻底防御」都含这两个词），是「判据看不见否定」的镜像形态。
-    // 判据改为：逐处看**前四个字里有没有否定词**，只有**肯定**形态才算过度承诺。
+    // ⚠️ **CodeRabbit round 124 minor**：否定词只列了「未/没」→「不能/无法」型披露也被判红；否定词扩到 未/没/不/无。
+    // ⚠️ **Codex round 53 P2（两处）**：① 固定 6 字窗口里的**任意**否定字都当豁免——「该窗口**未**测
+    // 但已完全消除」里「未」否定的是「测」，肯定承诺却因此被放过；② 先归一化排版（`**` 与折行）
+    // 再判——「尚未**\n完全消除**」这种加粗折行写法第一版读不出否定词而假红。
+    // 判据：归一化后，**否定词必须紧贴被否定的那件事**——前缀里否定词到目标词之间不得出现
+    // 「但/却/而」（转折把否定划回前一件事），后缀里出现「不可能/不存在/无从」也算否定。
+    const AFFIRM = /完全消除|彻底防御/g
     const overclaimOf = (t: string) => {
-      const stripped = t.replace(/别写成「(?:已彻底防御|完全消除)」/g, '')
-      return [...stripped.matchAll(/完全消除|彻底防御/g)].some((m) => {
-        const before = stripped.slice(Math.max(0, (m.index ?? 0) - 4), m.index ?? 0)
-        return !/未|没/.test(before)
+      const stripped = t.replace(/\*\*/g, '').replace(/\s+/g, '')
+        .replace(/别写成「(?:已彻底防御|完全消除)」/g, '')
+      return [...stripped.matchAll(AFFIRM)].some((m) => {
+        const i = m.index ?? 0
+        const before = stripped.slice(Math.max(0, i - 8), i)
+        const after = stripped.slice(i + m[0].length, i + m[0].length + 8)
+        const negatedBefore = /[未没不无][^。；，、]{0,6}$/.test(before) && !/[但却而]/.test(before)
+        const negatedAfter = /^是?(不可能|不存在|无从|并非|不是)/.test(after)
+        return !negatedBefore && !negatedAfter
       })
     }
     expect(overclaimOf(residualText), '残余段不得在禁令之外**肯定地**声称已彻底防御/完全消除（过度承诺不是披露）').toBe(false)
@@ -1940,6 +1965,11 @@ describe('PR5 文档一致性回写 —— 陈旧声明与承诺收窄（2026-10
     expect(overclaimOf('残余（如实声明，别写成「已彻底防御」）：该窗口已彻底防御。'), '反例：禁令之外再声称已彻底防御必须判红').toBe(true)
     expect(overclaimOf('残余（如实声明）：该窗口尚未完全消除，介入式替换仍未彻底防御。'),
       '正例：诚实的否定表述必须放过（Codex 52 的隔离变异）').toBe(false)
+    expect(overclaimOf('残余（如实声明）：该窗口不能完全消除，无法彻底防御。'), '正例：「不能/无法」也是诚实的否定（CR 124）').toBe(false)
+    expect(overclaimOf('残余（如实声明）：该窗口尚未**\n    完全消除**。'), '正例：加粗折行的否定披露必须放过（Codex 53）').toBe(false)
+    expect(overclaimOf('残余（如实声明）：该窗口完全消除是不可能的。'), '正例：否定跟在结论之后（「是不可能的」）也必须放过').toBe(false)
+    expect(overclaimOf('残余（如实声明）：该窗口未测但已完全消除。'),
+      '反例：转折把否定划回前一件事时，后面的肯定承诺必须判红（Codex 53）').toBe(true)
     expect(overclaimOf('残余（如实声明）：该窗口已经完全消除。'), '反例：肯定的「已经完全消除」必须判红').toBe(true)
     // ⚠️ **CR round 99/100 + Codex round 33：这道「删除语义」防线的四轮加固史**
     // 九轮：只扫 ③/⑥ 切片 → CR99 指出切片外有现行指令。十轮：改正则扫整段 → CR100 指出
