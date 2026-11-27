@@ -228,91 +228,91 @@
 
 - **真实凭证端到端实测发现的会话导出两处硬故障 + 契约诚实性收敛（2026-11-07/08 多代理审计，每条发现先复现再改）**（逐条明细见 git 历史）
 - **skill / 凭证 / CLI 输出的三十八处契约修正（2026-11-06 独立三路审查：skill 域 / auth 与凭证域 / cli 与输出域，24 条发现逐条先复现再改）**：
-  · · **`skill install` 与 `where` / `check` 对「受管文件集」的口径分叉**：install 把用户额外放进 skill 目录的任意文件也算成「可能被手工修改」并建议 `--force`
-  · · **三条检查规则的释义与实现不符**：`table_name` 是「写了就红」（不查表是否存在）、`sql_sequence` 要求 SELECT 与 FROM 同时出现（`DROP TABLE` 不属这条）
-  · · **`skill where --dir` 时把启动探测的结论套到本命令上**：启动探测不读命令行参数，定位不到实体时说的是「未安装/已过期」，而本命令的实体根本不来自探测。
-  · · **清单被占用时 `--force` 的效果被写成单一状态**：实测两种状态 —— 正文被手工改过时`--force` 只覆盖正文（status 报 updated）
-  · · **`--profile` 不作用于凭证**：sync run / sync verify 的存储路径、机器人配置读的是`--profile` 档
-  · · **`auth login --profile` 写非 default 档后默认档名是否跟着改没说清**：行为（顶层默认档名不变）是刻意的
-  · · **顶层 `--help` 漏列 `auth login`**，而测试还用「未实现」把它钉死 —— 帮助清单与`command-tree` 用例同步补齐，测试改为按命令树集合对照。
-  · · **`auth login` 对已存在的 0755 目录的处理被文档说过头**：实测已有目录原样保留（不改权限，只对**新建**目录设 0700），文档 5 处收窄为「新建的目录 0700」，并新增用例钉住「不改已存在目录」。
-  · · **配置文件权限判据的文案窄于实现**：实现拒绝任何 group/other 权限位，文案只说「group/other 可写」—— 0644（可读）能通过提示却同样会泄漏 appSecret。
-  · · **`resolveCredentials` 的 `fromArgs` 形参是死参数**：没有任何调用方传过非空值，「预留的第三来源」只会让人以为凭证可以从命令行给。
-  · · **README 的脱敏承诺大于实现**：改写为「请求/响应链路」的输出都会脱敏，并明写边界 ——不扫描用户自己敲进 argv 的凭证（`auth login` 拒收 `--app-key` 正是为了这个）。
-  · · **配置文件权限警告的用例是空转**：原用例把 stderr 攒在内存变量里却断言别的东西，警告删掉也不红。
-  · · **帮助与 README 的 error kind 清单漏 `sync_not_run`**：三个帮助入口补齐，README 改成「常见值，不是穷举」并指向 `ERROR_KINDS` / skill `errors.md`
-  · · **`api call` 的「不接受任何参数」与事实相反**：它接受 `--help` / `--pretty`。
-  · · **`auth login` 写盘失败的 hint 会把人引向不存在的路径**：配置路径由 `HOME` 固定、CLI 没有改路径的参数，旧 hint 却让人「检查路径」。
-  · · **纯空白凭证被当成有效值**：`' '` 是 truthy，一路穿到签名，服务端回 14001 ——报错点离真正给坏值的地方隔了一层命令。
-  · · **控制台地址一处写成唯一形态**：两种写法都有（有无 `admin` 段），以后台真实页为准，两处都列出；尝试浏览器核对未登录、无法实证，如实标注为未验证。
-  · · **`--help` 与合法参数同现被判「未知参数」**（8 个命令族）：`--help` 是帮助请求，追加的已知参数（如 `query --help --sql`）不该报未知。
-  · · **`--help` / `--version` / `--pretty` 三个伪命令互相不豁免**：`api list --pretty --help`一类组合会被一侧判成未知参数，三处统一按「全局选项任意次序」处理。
-  · · **退出码 1 但 stdout 仍是 `{ok:true,…}` 的路径没有机器可读标志**：skill check 两条路径（单文件检查与 `--compare`）都补了**真实的** `meta.exit_code` 字段与图
-  · · **`output.test.ts` 的 kind 覆盖不全且集合断言自比较恒真**：旧表只钉 9 个 kind、其对照组两边都是本文件常量（除自相矛盾外恒真）。
-  · · **`query --help` 的额外参数列表是自拼字符串**：空串会渲染成「冒号后空白」，且不点名取值。
-  · · **「可用：」清单一处列 `--pretty`、两处不列**：三处统一为同一份清单来源。
-  · · **`check --compare` 只比清单文件集**（Codex）：与 `install` 同款缺陷的第二处 ——包新增文件后，实体与包在旧子集上相等 → CI 的 `--compare` 退 0 漏报「装的是旧包」。
-  · · **`--profile` 拼错被报成缺凭证**（Codex）：凭证侧先按 flag 选档，拼错的档选不到凭证 → `auth_missing`（退 1），而真相是参数错误（退 2）。
-  · · **帮助模式的取值规则与正常解析不同源**（Codex 两轮）：`db tables --db --bogus --help`曾打印帮助并静默吞掉 `--bogus`
-  · · **EACCES 用例在 root / Windows 上假失败**（CodeRabbit）：收掉目录写位造不出EACCES，改用 `it.skipIf`（仓库既有约定）
-  · · **`whoami` 漏了配置文件里的空白凭证**（Codex）：只查环境变量时，文件里的 `" "`被 `nonEmptyValue` 当成「有」→ `configured: true`，而 api/sync 会拒绝它。
-  · · **`writeWideConfig(mode)` 的 `mode` 没被用上**（CodeRabbit）：0602 / 0601 两条用例实际跑在 0644 上 —— 上面 A5 那条「两条用例钉住判据与措辞」在修复前是**假的*
-  · · **文件集比对把「重复条目」当相等**（Codex 第四轮）：清单含重复条目并漏一个文件时长度恰好相等 → `check --compare` 退 0、`install` 的 `--force` 也跳过修复。
-  · · **`sync tasks --help` 用全族并集校验参数**（Codex 第四轮）：兄弟命令的`--full` / `--db` 被当成合法参数（退 0 打印帮助）
-  · · **umask 077 下的夹具假失败**（Codex 第四轮）：`mkdirSync({ mode: 0o755 })` 会被进程 umask 收紧成 0700，断言 0755 的用例假失败 —— 夹具改为显式 `chmodSyn
-  · · **受管条目直接 `readFileSync` 会挂死**（Codex 第五轮）：换成受管集哈希后
-  · · **README 的 `--profile` 建议对部分命令不可执行**（Codex 第五轮）：`api *` /`auth whoami` / `sync tasks` 都**不接受** `--profile`（逐个实测退 2）
-  · · **接受清单里错列了 `sync uninstall`**（Codex 第六轮）：它只接受全局 flag 与 `--yes`（实测 `sync uninstall --profile staging` 退 2）—— 照新文档执行必然
-  · · **清单文件自身是 FIFO 同样挂死**（Codex 第六轮）：上一处只挡住了受管正文
-  · · **`auth login` 的空白变量 hint 建议 `unset` 后重跑**（Codex 第七轮）：login 只从环境变量读
-  · · **whoami 的空白配置键 hint 建议「删掉这个键」**（Codex 第七轮）：`credentials`块要求 appKey / appSecret 同时是非空字符串
+  · **`skill install` 与 `where` / `check` 对「受管文件集」的口径分叉**：install 把用户额外放进 skill 目录的任意文件也算成「可能被手工修改」并建议 `--force`，而 `--force` 又不管这些文件 —— 提示永远不收敛；`check --compare` 还会无端退 1。
+  · **三条检查规则的释义与实现不符**：`table_name` 是「写了就红」（不查表是否存在）、`sql_sequence` 要求 SELECT 与 FROM 同时出现（`DROP TABLE` 不属这条）、`unknown_positional` 按命令 spec 域判定。
+  · **`skill where --dir` 时把启动探测的结论套到本命令上**：启动探测不读命令行参数，定位不到实体时说的是「未安装/已过期」，而本命令的实体根本不来自探测。
+  · **清单被占用时 `--force` 的效果被写成单一状态**：实测两种状态 —— 正文被手工改过时`--force` 只覆盖正文（status 报 updated），正文与包内一致时连 `--force` 也零写入（status 报 skipped）。
+  · **`--profile` 不作用于凭证**：sync run / sync verify 的存储路径、机器人配置读的是`--profile` 档，凭证却只按环境变量 / 默认档取 —— 多档用户会拿 A 档的 key 去开 B 档的库。
+  · **`auth login --profile` 写非 default 档后默认档名是否跟着改没说清**：行为（顶层默认档名不变）是刻意的，但文档没写 —— README 与 login 的字段说明补上「之后的命令仍须用`--profile` 或 `QIYU_PROFILE` 指向它」。
+  · **顶层 `--help` 漏列 `auth login`**，而测试还用「未实现」把它钉死 —— 帮助清单与`command-tree` 用例同步补齐，测试改为按命令树集合对照。
+  · **`auth login` 对已存在的 0755 目录的处理被文档说过头**：实测已有目录原样保留（不改权限，只对**新建**目录设 0700），文档 5 处收窄为「新建的目录 0700」，并新增用例钉住「不改已存在目录」。
+  · **配置文件权限判据的文案窄于实现**：实现拒绝任何 group/other 权限位，文案只说「group/other 可写」—— 0644（可读）能通过提示却同样会泄漏 appSecret。
+  · **`resolveCredentials` 的 `fromArgs` 形参是死参数**：没有任何调用方传过非空值，「预留的第三来源」只会让人以为凭证可以从命令行给。
+  · **README 的脱敏承诺大于实现**：改写为「请求/响应链路」的输出都会脱敏，并明写边界 ——不扫描用户自己敲进 argv 的凭证（`auth login` 拒收 `--app-key` 正是为了这个）。
+  · **配置文件权限警告的用例是空转**：原用例把 stderr 攒在内存变量里却断言别的东西，警告删掉也不红。
+  · **帮助与 README 的 error kind 清单漏 `sync_not_run`**：三个帮助入口补齐，README 改成「常见值，不是穷举」并指向 `ERROR_KINDS` / skill `errors.md`，新增 `--help` 运行时断言。
+  · **`api call` 的「不接受任何参数」与事实相反**：它接受 `--help` / `--pretty`。
+  · **`auth login` 写盘失败的 hint 会把人引向不存在的路径**：配置路径由 `HOME` 固定、CLI 没有改路径的参数，旧 hint 却让人「检查路径」。
+  · **纯空白凭证被当成有效值**：`' '` 是 truthy，一路穿到签名，服务端回 14001 ——报错点离真正给坏值的地方隔了一层命令。
+  · **控制台地址一处写成唯一形态**：两种写法都有（有无 `admin` 段），以后台真实页为准，两处都列出；尝试浏览器核对未登录、无法实证，如实标注为未验证。
+  · **`--help` 与合法参数同现被判「未知参数」**（8 个命令族）：`--help` 是帮助请求，追加的已知参数（如 `query --help --sql`）不该报未知。
+  · **`--help` / `--version` / `--pretty` 三个伪命令互相不豁免**：`api list --pretty --help`一类组合会被一侧判成未知参数，三处统一按「全局选项任意次序」处理。
+  · **退出码 1 但 stdout 仍是 `{ok:true,…}` 的路径没有机器可读标志**：skill check 两条路径（单文件检查与 `--compare`）都补了**真实的** `meta.exit_code` 字段与图例，写明「不要按 `error.kind` 分支、也不要用『有没有 error』判断检查是否通过，先看退出码」。
+  · **`output.test.ts` 的 kind 覆盖不全且集合断言自比较恒真**：旧表只钉 9 个 kind、其对照组两边都是本文件常量（除自相矛盾外恒真）。
+  · **`query --help` 的额外参数列表是自拼字符串**：空串会渲染成「冒号后空白」，且不点名取值。
+  · **「可用：」清单一处列 `--pretty`、两处不列**：三处统一为同一份清单来源。
+  · **`check --compare` 只比清单文件集**（Codex）：与 `install` 同款缺陷的第二处 ——包新增文件后，实体与包在旧子集上相等 → CI 的 `--compare` 退 0 漏报「装的是旧包」。
+  · **`--profile` 拼错被报成缺凭证**（Codex）：凭证侧先按 flag 选档，拼错的档选不到凭证 → `auth_missing`（退 1），而真相是参数错误（退 2）。
+  · **帮助模式的取值规则与正常解析不同源**（Codex 两轮）：`db tables --db --bogus --help`曾打印帮助并静默吞掉 `--bogus`；改成「取值不以 `--` 开头才跳过」后又把`query --sql "-- 注释…"` 的合法 SQL 判成未知 flag、且 `--db --help`（缺值）不报。
+  · **EACCES 用例在 root / Windows 上假失败**（CodeRabbit）：收掉目录写位造不出EACCES，改用 `it.skipIf`（仓库既有约定）；
+  · **`whoami` 漏了配置文件里的空白凭证**（Codex）：只查环境变量时，文件里的 `" "`被 `nonEmptyValue` 当成「有」→ `configured: true`，而 api/sync 会拒绝它。
+  · **`writeWideConfig(mode)` 的 `mode` 没被用上**（CodeRabbit）：0602 / 0601 两条用例实际跑在 0644 上 —— 上面 A5 那条「两条用例钉住判据与措辞」在修复前是**假的**。
+  · **文件集比对把「重复条目」当相等**（Codex 第四轮）：清单含重复条目并漏一个文件时长度恰好相等 → `check --compare` 退 0、`install` 的 `--force` 也跳过修复。
+  · **`sync tasks --help` 用全族并集校验参数**（Codex 第四轮）：兄弟命令的`--full` / `--db` 被当成合法参数（退 0 打印帮助），而正常解析与 `skill check`都判非法 —— 运行时与契约校验又一次分叉。
+  · **umask 077 下的夹具假失败**（Codex 第四轮）：`mkdirSync({ mode: 0o755 })` 会被进程 umask 收紧成 0700，断言 0755 的用例假失败 —— 夹具改为显式 `chmodSync`；
+  · **受管条目直接 `readFileSync` 会挂死**（Codex 第五轮）：换成受管集哈希后，清单里一条被 **FIFO** 占住 → `readFileSync` 打开读端等写端 → `install` 与`check --compare` **无限阻塞**（实测去掉筛选后进程跑满 600s、`testTimeout`打不断同步读取）；被换成**指向目录外的符号链接**则读取跟随、可能误判「正文一致」。
+  · **README 的 `--profile` 建议对部分命令不可执行**（Codex 第五轮）：`api *` /`auth whoami` / `sync tasks` 都**不接受** `--profile`（逐个实测退 2），原文「在每条命令上写 `--profile staging`」是做不到的动作。
+  · **接受清单里错列了 `sync uninstall`**（Codex 第六轮）：它只接受全局 flag 与 `--yes`（实测 `sync uninstall --profile staging` 退 2）—— 照新文档执行必然失败。
+  · **清单文件自身是 FIFO 同样挂死**（Codex 第六轮）：上一处只挡住了受管正文，`readManifestSafe` / `readManifestStrict` 仍直接 `readFileSync` 清单 —— 清单路径被FIFO 占住时 `skill install` / `where` / `check --compare` 全部无限阻塞。
+  · **`auth login` 的空白变量 hint 建议 `unset` 后重跑**（Codex 第七轮）：login 只从环境变量读、不回落配置文件（实测：`unset` 后重跑必然是「缺少 …」退 2）—— 照 hint 执行解决不了问题。
+  · **whoami 的空白配置键 hint 建议「删掉这个键」**（Codex 第七轮）：`credentials`块要求 appKey / appSecret 同时是非空字符串，只删一个键会让 `parseConfig` 拒绝**整份配置**（实测：按旧 hint 操作后 whoami 变成「配置文件读取失败」，api/sync也读不到其它档）。
 - **查询 / 存储 / 元数据命令的十五处契约修正（2026-11-05 第二路独立审查，三路探子 + 探针实测 + 十余轮双路收敛）**：
-  · · **执行期的文件访问与扩展加载被误报成「internal
-  · · **写者撞锁把持有者说成「写进程」**：实测 DuckDB 是「写者独占 / 读者共享」，一个READ_ONLY 会话同样挡住写者；旧文案让 Agent 去等一个并不存在的同步任务。
-  · · **库文件已损坏没有归因**：截断（`Could not read enough bytes from file`）与页校验和（`Corrupt database file: computed checksum` 不同）两类报文此前
-  · · **`mask_warnings` 图例只讲了一半来源**：该键还装 `GROUP BY` / `DISTINCT` 压平、`query()`/`query_table()`/`COLUMNS()` 嵌套
-  · · **`GROUP BY` 别名列漏掉分组失真警告（判据只看分组键）**：`SELECT userPhone AS p … GROUP BY p` 的输出列不叫 `userPhone`，判据只看输出列名 → 只剩「别名缺口」一条
-  · · **`db describe` 的 `time_column` 图例路径错位**：枚举翻译挂在 `time_column` 上（实际在 `time_column.kind`）
-  · · **OOM 报文透出沙箱里必然失败的 `SET` 建议**：DuckDB 的「Possible solutions」三条 SET在只读沙箱（`lock_configuration=true`）里全部报 `configuration 
-  · · **时间过滤静默丢掉脏时间值**：`query --table --since/--until` 的 WHERE 里带形态谓词，脏值行不进 `rows`、不进 `data_coverage`
-  · · **元数据命令的超时 hint 建议了它们没有的参数**：`db tables` / `db describe` /`stats fields` 共用 `query` 的「缩小时间范围或加过滤条件」，而它们不接受任何过滤参数。
-  · · **带正则元字符的别名会让脱敏阶段崩掉**：`SELECT userPhone AS "p(" … GROUP BY "p("`的查询本身已成功，`wordHit` 却把别名直接拼进 `new RegExp`
-  · · **分组判据不认子句的作用域**：`GROUP BY` / `DISTINCT` 的起点取的是**第一个**匹配
-  · · **表达式别名不产生分组警告**：别名解析只认「列名紧跟别名」，`SELECT lower(userPhone)AS p, COUNT(*) … GROUP BY p` 实测按 `lower(userPhone)` 分组
-  · · **`DISTINCT` 判据既不看作用域、也丢了过去重键**（两个方向都错）：`WHERE x IN(SELECT DISTINCT x …)` 里的内层去重被当成外层 `DISTINCT`
-  · · **撞锁提示里残留「写锁」自我否定**：写者撞锁的 hint 前半句写「正持有该数据库**写锁**」，后半句又说持有者可能是只读会话 —— READ_ONLY 持有的是共享锁
-  · · **`SELECT DISTINCT(userPhone)` 无空格写法零警告**：两处 `DISTINCT` 正则都要求 `\s+`，而 DuckDB 实测接受无空格写法并去重（3 行 → 2 行）—— 这条查询会一条警告都没有
+  · **执行期的文件访问与扩展加载被误报成「internal，请报告此问题」**：layer2 拦截（`sniff_csv` 这类在执行期才碰文件的函数）与 `Extension Autoloading Error` 只判在prepare 期，执行期 catch 一律包成 internal —— 用户拿到的是「请报告此问题」，而真相是「沙箱拦截了它，换个写法就能跑」。
+  · **写者撞锁把持有者说成「写进程」**：实测 DuckDB 是「写者独占 / 读者共享」，一个READ_ONLY 会话同样挡住写者；旧文案让 Agent 去等一个并不存在的同步任务。
+  · **库文件已损坏没有归因**：截断（`Could not read enough bytes from file`）与页校验和（`Corrupt database file: computed checksum` 不同）两类报文此前既不匹配权限、也不匹配「非 DuckDB 文件」，落进各命令的兜底 —— `store status` 说「请用 store status 检查」（拿自己查自己）、`query` 说「跑 store init」（对损坏文件同样打不开）。
+  · **`mask_warnings` 图例只讲了一半来源**：该键还装 `GROUP BY` / `DISTINCT` 压平、`query()`/`query_table()`/`COLUMNS()` 嵌套、非敏感列按值形态误改 —— 图例改为按「缺口 / 副作用」两组穷举并声明「包括但不限于」。
+  · **`GROUP BY` 别名列漏掉分组失真警告（判据只看分组键）**：`SELECT userPhone AS p … GROUP BY p` 的输出列不叫 `userPhone`，判据只看输出列名 → 只剩「别名缺口」一条，而「3 个号码被压成 1 行」一个字不提。
+  · **`db describe` 的 `time_column` 图例路径错位**：枚举翻译挂在 `time_column` 上（实际在 `time_column.kind`），而 `time_column: null`（没有声明时间列）没有释义。
+  · **OOM 报文透出沙箱里必然失败的 `SET` 建议**：DuckDB 的「Possible solutions」三条 SET在只读沙箱（`lock_configuration=true`）里全部报 `configuration has been locked`。
+  · **时间过滤静默丢掉脏时间值**：`query --table --since/--until` 的 WHERE 里带形态谓词，脏值行不进 `rows`、不进 `data_coverage`，而 `db tables` 对同一张表会报数量 —— 现在`query` 也点名数量并说明它们被排除（没有时间过滤时不报：那时脏值行照常返回）。
+  · **元数据命令的超时 hint 建议了它们没有的参数**：`db tables` / `db describe` /`stats fields` 共用 `query` 的「缩小时间范围或加过滤条件」，而它们不接受任何过滤参数。
+  · **带正则元字符的别名会让脱敏阶段崩掉**：`SELECT userPhone AS "p(" … GROUP BY "p("`的查询本身已成功，`wordHit` 却把别名直接拼进 `new RegExp`，`\bp(\b` 抛 SyntaxError ——整条命令报 internal、一行数据都拿不回来（`AS "[x"` 同）。
+  · **分组判据不认子句的作用域**：`GROUP BY` / `DISTINCT` 的起点取的是**第一个**匹配，而它可能在子查询里 —— `SELECT userPhone … FROM (SELECT any_value(userPhone) …GROUP BY session_type) t GROUP BY userPhone` 只看到内层那次分组，外层真正把手机号压平的那一次反而漏报（Codex 第四轮 P2）。
+  · **表达式别名不产生分组警告**：别名解析只认「列名紧跟别名」，`SELECT lower(userPhone)AS p, COUNT(*) … GROUP BY p` 实测按 `lower(userPhone)` 分组、脱敏后两个号码塌成一行，却一条警告都没有（Codex 第四轮 P2）。
+  · **`DISTINCT` 判据既不看作用域、也丢了过去重键**（两个方向都错）：`WHERE x IN(SELECT DISTINCT x …)` 里的内层去重被当成外层 `DISTINCT`，拿外层选择列表判完就对外层投影的敏感列谎报分组失真（CodeRabbit 第五轮 minor）；而 `DISTINCT ON (…)` 的去重键是`ON (…)` 里的**列**、不是整张选择列表 —— 收敛作用域时把 `(ON\s*\()` 的捕获组写成非捕获组，于是 `SELECT DISTINCT ON (session_type) userPhone …`（实测按 session_type去重）被误报（Codex 第五轮 P2）。
+  · **撞锁提示里残留「写锁」自我否定**：写者撞锁的 hint 前半句写「正持有该数据库**写锁**」，后半句又说持有者可能是只读会话 —— READ_ONLY 持有的是共享锁，前半句把同一个错误归因带了回来（CodeRabbit 第十三轮 minor；测试只锚后半句，所以一直没发现）。
+  · **`SELECT DISTINCT(userPhone)` 无空格写法零警告**：两处 `DISTINCT` 正则都要求 `\s+`，而 DuckDB 实测接受无空格写法并去重（3 行 → 2 行）—— 这条查询会一条警告都没有，比改动前的判据（任何 DISTINCT + 命中列名即报）还退步（CodeRabbit 第十四轮 minor）。
 - **同步与调度的十处契约修正（2026-11-05 独立审查）**：
-  · · **launchd 的 Weekday 被整体后移一天**：cron 与 launchd 是**同一套**周几编号（man launchd.plist：「0 and 7 are Sunday」，1 = 周一）
-  · · **`sessions.export` 的缺 id 行造成整窗回滚**：缺 id 行此前留到 enrich 才丢
-  · · **cron 分隔符只接受空格与 Tab**：`trim()` / `split(/\s+/)` 会把 CR/LF/U+00A0/U+2028 当空白放过
-  · · **linux 卸载把 daemon-reload 跑在删文件之前**：命令层是「跑完 commands 再删文件」，于是 reload 的仍是即将被删的 unit
-  · · **schtasks 分钟计划的相位漂移**：`/SC MINUTE /MO N` 缺 `/ST` 时起始时刻取「本机当前时刻」，`*/30` 会装成「安装那一刻 + 30 分」的相位（14:07 装 →:07/:37）
-  · · **schtasks 每月计划用多日 `/D`**：`/SC MONTHLY /D` 只接受一个日期（文档原文），`0 0 1,15 * *` 此前被 join 成 `/D 1,15`，dry-run 先给出一个装了也会被拒的计划。
-  · · **systemd `ExecStart=` 孤立一个 `;` 未转义**：裸 `;` 是命令分隔符
-  · · **快照任务不用 `apiCount`**：windowed 与 `sync verify` 都把它当配对核对基准，快照只用 `kept.length` —— 同一字段三条路径三种读法，上游声明多于解析结果时只有快照静默吞掉。
-  · · **四处图例口径**：`rows.written` 补「快照的 count_mismatch / write_failed 记 0（偏小而非偏大）」并修正 README「落库行数」的绝对说法
-  · · **同一窗的两类缺口互相覆盖**：`sessions.export` 既可能缺行（`row_missing_key`）又可能缺尾部标记行（`export_fixture_unreported`），旧实现让后者「让位」
+  · **launchd 的 Weekday 被整体后移一天**：cron 与 launchd 是**同一套**周几编号（man launchd.plist：「0 and 7 are Sunday」，1 = 周一），旧代码 `v + 1` 让「周一执行」装成周日，**每条按周计划都错一天**；而测试把错误行为钉成了期望值（断言 cron 1 → launchd 2）。
+  · **`sessions.export` 的缺 id 行造成整窗回滚**：缺 id 行此前留到 enrich 才丢，而`apiCount` 按**丢弃前**的行数取好 —— written < expected → 整窗 count_mismatch回滚（连正常行一起丢），gap 只说「应写 N 实际 M」不点名成因。
+  · **cron 分隔符只接受空格与 Tab**：`trim()` / `split(/\s+/)` 会把 CR/LF/U+00A0/U+2028 当空白放过，而 schedule 原文又原样进 crontab 兜底行与回显 —— 实测`0 0 *\r* *` 解析成合法 5 段、兜底行里是字面 CR（cron 整行失效），`0 0 * * *\n` 把一条计划劈成两行。
+  · **linux 卸载把 daemon-reload 跑在删文件之前**：命令层是「跑完 commands 再删文件」，于是 reload 的仍是即将被删的 unit，删完后没人让 systemd 忘掉它（notes 却写着「再删除 unit 文件并 daemon-reload」）。
+  · **schtasks 分钟计划的相位漂移**：`/SC MINUTE /MO N` 缺 `/ST` 时起始时刻取「本机当前时刻」，`*/30` 会装成「安装那一刻 + 30 分」的相位（14:07 装 →:07/:37），而 cron 是 :00/:30。
+  · **schtasks 每月计划用多日 `/D`**：`/SC MONTHLY /D` 只接受一个日期（文档原文），`0 0 1,15 * *` 此前被 join 成 `/D 1,15`，dry-run 先给出一个装了也会被拒的计划。
+  · **systemd `ExecStart=` 孤立一个 `;` 未转义**：裸 `;` 是命令分隔符，会把一条ExecStart 劈成两条命令（systemd.service(5)：「An argument solely consisting of";" must be escaped, i.e. specified as "\;"」）。
+  · **快照任务不用 `apiCount`**：windowed 与 `sync verify` 都把它当配对核对基准，快照只用 `kept.length` —— 同一字段三条路径三种读法，上游声明多于解析结果时只有快照静默吞掉。
+  · **四处图例口径**：`rows.written` 补「快照的 count_mismatch / write_failed 记 0（偏小而非偏大）」并修正 README「落库行数」的绝对说法；`rows.fetched` 改为「进入引擎的行数」并点明 fetch 侧丢弃行不计入；`range_status.pending` 的「每轮开跑就置 pending」收窄为「有可执行窗口的轮次」；`commands[].command` 点明是 argv空格拼接、不能直接粘进 shell（win32 的 `/TR` 本身就是命令串）。
+  · **同一窗的两类缺口互相覆盖**：`sessions.export` 既可能缺行（`row_missing_key`）又可能缺尾部标记行（`export_fixture_unreported`），旧实现让后者「让位」，消费方按`gaps[].reason` 分支时永远漏一类；而 `sync_gaps` 主键 `(dataset, range_start)` 也让两条提示在落库时互相覆盖。
 - **注册表与 api 图例的九处契约修正（2026-11-04 独立审查）**：
-  · · **`export.session` / `export.session.check` 的唯一载荷被丢弃并谎报「无数据」**：设计稿 §7.5 实测两者的成功载荷就是 message 原文（任务 key / 下载链接）
-  · · **`export.*` 四个文档外接口的 body 参数表是空的**：生成器对它们硬编码`params: []`、`body_kind: 'none'`，而 create/check 的 body 是必需的、流水线就在发。
-  · · **`icoutcall.history.team` 的路径与 seat 完全相同**：设计稿两处记载 team 是独立路径`/ipcc/history/team`、载荷为对象（55 字段）
-  · · **`api list` 的 `verified` 图例把「实测范围」全指给每行 note**：53 条 verified:true里 42 条没有 note，Agent 无从判断。
-  · · **`path` 图例说 null 路径「仍可能是本方可主动调用的」**：加载器强制`callable:true` 必有 path，该组合不可达。
-  · · **`body_kind` 图例说非 json「原样透传」**：实现恒 `JSON.stringify` +`application/json`
-  · · **`params[].type/required` 的强制范围漏了 body_kind**：`validateBody` 对`bodyKind !== 'json'` 直接早返回
-  · · **`warnings` 图例把 `missing_required` 列为告警 kind**：它是硬拒绝（退出码 2、错误信封），永远不进 warnings。
-  · · **`not_found` 图例漏掉 message 载体与宽松模式**：形状 C 或 envelope 未登记时，message 能解析成 JSON 且解析结果为空同样置位。
+  · **`export.session` / `export.session.check` 的唯一载荷被丢弃并谎报「无数据」**：设计稿 §7.5 实测两者的成功载荷就是 message 原文（任务 key / 下载链接），同步流水线也按此实现；但注册表把它们登记成形状 A（载荷在 data），而响应里没有data —— `api call` 输出 `"data":null, "not_found":true, "warning":"接口返回成功但无数据"`，Agent 完成导出创建后拿不到 key。
+  · **`export.*` 四个文档外接口的 body 参数表是空的**：生成器对它们硬编码`params: []`、`body_kind: 'none'`，而 create/check 的 body 是必需的、流水线就在发。
+  · **`icoutcall.history.team` 的路径与 seat 完全相同**：设计稿两处记载 team 是独立路径`/ipcc/history/team`、载荷为对象（55 字段），而注册表沿用了文档页重复项（与 seat同路径、信封 C 数组）—— 按旧登记调用会把 team 的 body 发到 seat 路由、静默拿到坐席数组。
+  · **`api list` 的 `verified` 图例把「实测范围」全指给每行 note**：53 条 verified:true里 42 条没有 note，Agent 无从判断。
+  · **`path` 图例说 null 路径「仍可能是本方可主动调用的」**：加载器强制`callable:true` 必有 path，该组合不可达。
+  · **`body_kind` 图例说非 json「原样透传」**：实现恒 `JSON.stringify` +`application/json`，xml/multipart/text 的原始字节无法表达（`--body '<xml>'` 直接退出码 2）。
+  · **`params[].type/required` 的强制范围漏了 body_kind**：`validateBody` 对`bodyKind !== 'json'` 直接早返回，`kefu.add`（xml）传 `{}` 不报缺必填；图例却承诺「缺必填拒绝」。
+  · **`warnings` 图例把 `missing_required` 列为告警 kind**：它是硬拒绝（退出码 2、错误信封），永远不进 warnings。
+  · **`not_found` 图例漏掉 message 载体与宽松模式**：形状 C 或 envelope 未登记时，message 能解析成 JSON 且解析结果为空同样置位。
 - **核心请求/错误/存储写入的九处契约修正（2026-11-04 独立审查）**：
-  · · **配置文件解析失败会回显文件内容（安全红线）**：`readConfigRaw` 把 V8 的`JSON.parse` 原文拼进错误（实测 `Unexpected token 'X', "FAKESECRET..." is not
-  · · **HTTP 429 被当成「可能已执行」的网络故障**：429 是服务端在执行业务逻辑**之前**拒绝的限流（肯定没执行），却被归 `network` —— 危险接口收到「请求可能已被服务端执行，重发会再执行一次」的反向劝阻
-  · · **限流 hint 把「实测无限频」说成「未登记」**：`limitFor` 把两者压成同一个 null
-  · · **`14004 appId not bind` 被说成「核对字段名与类型」**：真实成因是账号未绑定公众号，改参数与重试都无效。
-  · · **`retryAfter.source:'local'` 的注释断言「交付形态不可达」**：`qiyu sync run` 在同进程对同一路径反复 `call()` 时就会撞上本地令牌桶（`pace.ts` 专为它而写）
-  · · **`--no-validate` 的 usage 只说「关闭 body 校验」**：它实际还关闭别名改写与warnings（spec §九 验收 19 的既定语义）。
-  · · **未知接口 id 的 hint 指向默认 `api list`**：默认列表只含 136 条可主动调用接口，入站接口与不可调用项要 `--all`。
-  · · **`integer` 类型校验放行 1.5**：只判 `typeof === 'number'`，小数 id/页码静默通过，而图例承诺「类型不符是软告警」。
-  · · **同批重复主键的 upsert 结果取决于 batchSize**：DuckDB 多行 `INSERT ... ON CONFLICT`在同一语句内遇到重复键保留**第一条**，逐条写入则后一条获胜。
+  · **配置文件解析失败会回显文件内容（安全红线）**：`readConfigRaw` 把 V8 的`JSON.parse` 原文拼进错误（实测 `Unexpected token 'X', "FAKESECRET..." is not validJSON`）——配置文件里就有 appSecret，等于把凭据前若干字符写进 stdout。
+  · **HTTP 429 被当成「可能已执行」的网络故障**：429 是服务端在执行业务逻辑**之前**拒绝的限流（肯定没执行），却被归 `network` —— 危险接口收到「请求可能已被服务端执行，重发会再执行一次」的反向劝阻，且不带任何等待建议。
+  · **限流 hint 把「实测无限频」说成「未登记」**：`limitFor` 把两者压成同一个 null，5 个显式登记为 `null` 的接口（如 `export.session.check`）撞限流时被告知「未登记在本地限频表」——与 `api schema` 的 `rate_limit` 图例（「null = 实测过，确实没有」）直接矛盾。
+  · **`14004 appId not bind` 被说成「核对字段名与类型」**：真实成因是账号未绑定公众号，改参数与重试都无效。
+  · **`retryAfter.source:'local'` 的注释断言「交付形态不可达」**：`qiyu sync run` 在同进程对同一路径反复 `call()` 时就会撞上本地令牌桶（`pace.ts` 专为它而写），注释会让后续维护者把它当死值。
+  · **`--no-validate` 的 usage 只说「关闭 body 校验」**：它实际还关闭别名改写与warnings（spec §九 验收 19 的既定语义）。
+  · **未知接口 id 的 hint 指向默认 `api list`**：默认列表只含 136 条可主动调用接口，入站接口与不可调用项要 `--all`。
+  · **`integer` 类型校验放行 1.5**：只判 `typeof === 'number'`，小数 id/页码静默通过，而图例承诺「类型不符是软告警」。
+  · **同批重复主键的 upsert 结果取决于 batchSize**：DuckDB 多行 `INSERT ... ON CONFLICT`在同一语句内遇到重复键保留**第一条**，逐条写入则后一条获胜。
 - **#63 新增图例的自查修正：params 的「通道」谎言、recorded_at 形态说反、rows.written 记法（2026-11-04）**（逐条明细见 git 历史）
 - **反向图例覆盖：18 个带图例的命令补齐「输出 ⊆ 图例 ∪ 自明键」，下沉到元素层（HANDOFF #38 挂账，2026-11-04）**：
 - **报表空载荷漂移守卫：`{}` / `[]` 不再被当合法空窗（HANDOFF 报表层 #6，2026-11-04 真实上游采样）**：
