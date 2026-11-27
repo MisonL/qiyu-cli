@@ -74,7 +74,9 @@ export function renderWriteScript(_plan: WritePlan): string {
     '# 8. done: emit exactly one JSON result line.',
     '# The single result line is parsed by Node from the LAST stdout line only,',
     '# because PowerShell progress/CLIXML noise may precede it.',
-    '# ConvertTo-Json will emit the result record once the stages are implemented.',
+    '# Emit the result record as ONE line: ConvertTo-Json -Compress (PS 5.1 defaults to multi-line).',
+    '# A processed failure still exits 0 and carries its stage/problem in the record;',
+    '# only a hard crash may exit non-zero (Node discards records from non-zero exits).',
     '',
   ].join('\r\n')
 }
@@ -89,16 +91,37 @@ export function buildDefaultEnv(configPath: string, parentDir: string): Record<s
   return { QIYU_ACL_FILE: configPath, QIYU_ACL_PARENT: parentDir }
 }
 
+/**
+ * 传给 PowerShell 子进程的环境变量**白名单**。
+ *
+ * ⚠️ 不能 `{...process.env}`：`auth login` 的 secret 来源之一就是 `QIYU_APP_SECRET`
+ * 环境变量（`src/commands/auth.ts`），整份继承会把明文 secret 随环境交给子进程，
+ * 违背「secret 只经 stdin」这条本模块自己的约束（审查 P1）。只放 PowerShell 启动与
+ * 临时目录需要的系统变量；业务/凭证类变量一律不传。
+ */
+const SAFE_ENV_KEYS = [
+  'PATH', 'PATHEXT', 'COMSPEC', 'SystemRoot', 'windir',
+  'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+] as const
+
+export function pickSafeEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const k of SAFE_ENV_KEYS) {
+    const v = source[k]
+    if (typeof v === 'string') out[k] = v
+  }
+  return out
+}
+
 function defaultRunner(args: Parameters<Runner>[0]): ReturnType<Runner> {
   const encoded = Buffer.from(args.script, 'utf16le').toString('base64')
   const res = spawnSync(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
     {
-      // 路径经 env 传给脚本（$env:QIYU_ACL_FILE / $env:QIYU_ACL_PARENT）——不传这两个键，
-      // 脚本里取到的就是空串，写序会对着空路径动手。父进程环境照常合并（PowerShell 要
-      // PATH/SystemRoot），secret **不在** env 里，只经 stdin。
-      env: { ...process.env, ...args.env },
+      // 路径经 env 传给脚本（$env:QIYU_ACL_FILE / $env:QIYU_ACL_PARENT）；其余 env 只来自
+      // 系统变量白名单，secret 只经 stdin，绝不随环境进子进程。
+      env: { ...pickSafeEnv(), ...args.env },
       input: args.stdin,
       encoding: 'utf8',
       timeout: args.timeoutMs,

@@ -54,9 +54,10 @@ describe('renderWriteScript：纯 ASCII 骨架', () => {
     expect(script).toMatch(/^[\x00-\x7F]*$/)
   })
 
-  it('不含非 ASCII 时也一样干净的输入：secret 不进脚本（plan 里根本没有 secret 槽位）', () => {
+  it('路径与 secret 都不进脚本：路径经 env 传，secret 经 stdin', () => {
     const script = renderWriteScript(plan())
-    expect(script).not.toContain(SECRET)
+    expect(script).not.toContain(CONFIG)
+    expect(script).not.toContain(PARENT)
   })
 
   it('注释里按顺序写出将来各阶段（probe → … → done）', () => {
@@ -75,8 +76,10 @@ describe('renderWriteScript：纯 ASCII 骨架', () => {
   it('骨架本身不从 stdin 读 secret、不写任何文件（Task 1 无副作用）', () => {
     const script = renderWriteScript(plan())
     expect(script).not.toMatch(/WriteAllText|WriteAllBytes|Out-File|Set-Content|\[Console\]::In\b/)
-    // 只回一条结果记录，形状与 runWriteScript 的解析契约一致
-    expect(script).toMatch(/ConvertTo-Json/)
+    // 结果必须是单行 JSON：PS 5.1 的 ConvertTo-Json 默认多行，注释里钉住 -Compress
+    expect(script).toMatch(/ConvertTo-Json -Compress/)
+    // 已处理的失败也 exit 0（非 0 的记录会被 Node 丢弃），注释里钉住
+    expect(script).toMatch(/processed failure still exits 0/)
   })
 })
 
@@ -125,7 +128,7 @@ describe('runWriteScript：stdin 是 secret 的唯一去向', () => {
     expect(stdin).toEqual({ config: CONFIG_JSON, secret: SECRET })
   })
 
-  it('env 只放路径，显式传 env 不继承 process.env（不传的键上调用方读不到）', () => {
+  it('注入的 Runner 只拿到两个路径键（其余 env 由默认 Runner 自己按白名单补）', () => {
     const { run, calls } = recording()
     runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload(), run)
     expect(calls[0]!.env).toEqual(buildDefaultEnv(CONFIG, PARENT))
@@ -281,6 +284,24 @@ describe('defaultRunner：spawnSync 命令行契约', () => {
     expect(Object.keys(o.env as Record<string, string>)).toEqual(
       expect.arrayContaining(['QIYU_ACL_FILE', 'QIYU_ACL_PARENT']),
     )
+  })
+
+  it('process.env 里的凭证变量不得进子进程 env（auth login 的 secret 来源之一）', () => {
+    const saved = process.env.QIYU_APP_SECRET
+    process.env.QIYU_APP_SECRET = SECRET
+    try {
+      mocked.mockReturnValue({ status: 0, stdout: '{"ok":true,"stage":"done"}', stderr: '' } as never)
+      runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload())
+      const [, , opts] = mocked.mock.calls[0]!
+      const env = (opts as Record<string, unknown>).env as Record<string, string>
+      expect(env.QIYU_APP_SECRET).toBeUndefined()
+      expect(JSON.stringify(env)).not.toContain(SECRET)
+      // 白名单仍然带上 PowerShell 启动所需的系统变量
+      expect(Object.keys(env)).toEqual(expect.arrayContaining(['QIYU_ACL_FILE', 'QIYU_ACL_PARENT']))
+    } finally {
+      if (saved === undefined) delete process.env.QIYU_APP_SECRET
+      else process.env.QIYU_APP_SECRET = saved
+    }
   })
 
   it('spawnSync 的 error（ENOENT/超时不抛，回 error+status null）→ script-failed', () => {
