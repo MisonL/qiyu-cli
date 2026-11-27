@@ -153,6 +153,7 @@ describe('runWriteScript：失败统一收敛', () => {
     ['stdout stage 不在 Stage 集合', () => ({ status: 0, stdout: '{"ok":true,"stage":"nope"}', stderr: '' })],
     ['stdout ok:true 且 stage 不是 done（自相矛盾）', () => ({ status: 0, stdout: '{"ok":true,"stage":"replace"}', stderr: '' })],
     ['stdout ok:false 但缺 problem', () => ({ status: 0, stdout: '{"ok":false,"stage":"probe"}', stderr: '' })],
+    ['stdout ok:false 且 stage 是 done（自相矛盾的另一面）', () => ({ status: 0, stdout: '{"ok":false,"stage":"done","problem":"x"}', stderr: '' })],
     // status 校验必须独立于「stdout 解析得出解析不出」：这一档有合法结果行，只有 status 拦得住
     ['status 非 0 但 stdout 是合法成功行', () => ({ status: 1, stdout: '{"ok":true,"stage":"done"}', stderr: '' })],
     ['status 非 0 但 stdout 是合法失败行', () => ({ status: 2, stdout: '{"ok":false,"stage":"replace","problem":"x"}', stderr: '' })],
@@ -257,12 +258,14 @@ describe('defaultRunner：spawnSync 命令行契约', () => {
       '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64'),
     ])
     const o = opts as Record<string, unknown>
-    expect(o).toEqual({
+    expect(o).toMatchObject({
       input: JSON.stringify({ config: CONFIG_JSON, secret: SECRET }),
       encoding: 'utf8',
       timeout: 15_000,
       windowsHide: true,
     })
+    // 路径必须真的经 env 传给脚本：漏传就是给空路径动手（父进程环境合并保留 PATH 等）。
+    expect(o.env).toMatchObject({ QIYU_ACL_FILE: CONFIG, QIYU_ACL_PARENT: PARENT })
   })
 
   it('secret 不在文件名、argv 或 env 选项里（只经 stdin）', () => {
@@ -274,8 +277,10 @@ describe('defaultRunner：spawnSync 命令行契约', () => {
     expect((argv as string[]).join('\u0000')).not.toContain(SECRET)
     const o = opts as Record<string, unknown>
     expect(JSON.stringify(o.env ?? {})).not.toContain(SECRET)
-    // 且默认 Runner 根本不传 env 选项：父进程环境里有没有 secret 与本模块无关
-    expect(o.env).toBeUndefined()
+    // env 必须传（否则脚本取不到路径），但只多出两个路径键，secret 只走 stdin
+    expect(Object.keys(o.env as Record<string, string>)).toEqual(
+      expect.arrayContaining(['QIYU_ACL_FILE', 'QIYU_ACL_PARENT']),
+    )
   })
 
   it('spawnSync 的 error（ENOENT/超时不抛，回 error+status null）→ script-failed', () => {

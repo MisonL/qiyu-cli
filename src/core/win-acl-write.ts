@@ -42,7 +42,7 @@ export type Runner = (args: {
   env: Record<string, string>
   stdin: string
   timeoutMs: number
-}) => { status: number; stdout: string; stderr: string }
+}) => { status: number | null; stdout: string; stderr: string }
 
 const STAGES: readonly Stage[] = [
   'probe', 'create-tmp', 'verify-tmp', 'write-secret', 'close', 'check-reparse', 'replace', 'verify-target', 'done',
@@ -89,14 +89,23 @@ export function buildDefaultEnv(configPath: string, parentDir: string): Record<s
   return { QIYU_ACL_FILE: configPath, QIYU_ACL_PARENT: parentDir }
 }
 
-function defaultRunner(script: string, payload: { config: string; secret: string }): ReturnType<Runner> {
-  const encoded = Buffer.from(script, 'utf16le').toString('base64')
+function defaultRunner(args: Parameters<Runner>[0]): ReturnType<Runner> {
+  const encoded = Buffer.from(args.script, 'utf16le').toString('base64')
   const res = spawnSync(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
-    { input: JSON.stringify(payload), encoding: 'utf8', timeout: 15_000, windowsHide: true },
+    {
+      // 路径经 env 传给脚本（$env:QIYU_ACL_FILE / $env:QIYU_ACL_PARENT）——不传这两个键，
+      // 脚本里取到的就是空串，写序会对着空路径动手。父进程环境照常合并（PowerShell 要
+      // PATH/SystemRoot），secret **不在** env 里，只经 stdin。
+      env: { ...process.env, ...args.env },
+      input: args.stdin,
+      encoding: 'utf8',
+      timeout: args.timeoutMs,
+      windowsHide: true,
+    },
   )
-  return { status: res.status as number, stdout: res.stdout ?? '', stderr: res.stderr ?? '' }
+  return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '' }
 }
 
 const FAILED: WriteScriptResult = { ok: false, stage: 'probe', problem: 'script-failed' }
@@ -121,6 +130,8 @@ function parseResultLine(stdout: string): WriteScriptResult | null {
   const d = data as Record<string, unknown>
   if (typeof d.ok !== 'boolean' || !isStage(d.stage)) return null
   if (d.ok && d.stage !== 'done') return null
+  // `done` 是「整条写序成功走完」的唯一终态：它带 ok:false 是自相矛盾的结果行，不能放行。
+  if (!d.ok && d.stage === 'done') return null
   if (!d.ok && (typeof d.problem !== 'string' || d.problem === '')) return null
   if (d.path !== undefined && typeof d.path !== 'string') return null
   if (d.sddlReadback !== undefined && typeof d.sddlReadback !== 'string') return null
@@ -145,7 +156,7 @@ export function runWriteScript(
   payload: { config: string; secret: string },
   run?: Runner,
 ): WriteScriptResult {
-  const runner = run ?? ((args: Parameters<Runner>[0]) => defaultRunner(args.script, payload))
+  const runner = run ?? defaultRunner
   let response: ReturnType<Runner>
   try {
     response = runner({
