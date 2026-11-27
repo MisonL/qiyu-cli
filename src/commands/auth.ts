@@ -4,10 +4,11 @@ import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty, EXIT } from '../output.js'
 import {
   configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions,
-  isWhitespaceOnly, nonEmptyValue,
+  isWhitespaceOnly, nonEmptyValue, aclFixCommand,
   resolveProfileName, shellPath,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
+import { describeAclProblem } from '../core/win-acl.js'
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -316,12 +317,22 @@ async function login(argv: string[]): Promise<number> {
   try {
     const perm = checkPermissions(configPath, { hasCredentials: true, onWarn: () => {} })
     if (!perm.ok) {
+      const isAcl = perm.reason === 'acl' || perm.reason === 'acl-unchecked'
+      const aclDetail = perm.aclProblem === undefined ? undefined : { problem: perm.aclProblem, selfSid: perm.selfSid }
       return fail({
         code: 'config_insecure', kind: 'config_insecure', retryable: false,
-        message: `凭证已写入 ${configPath}，但落盘权限不合格（${perm.reason === 'file' ? '文件' : '目录'}过宽）`,
+        message: isAcl
+          ? `凭证已写入 ${configPath}，但 Windows ACL 复核不合格（`
+            + `${perm.aclProblem === undefined ? '成因未知' : describeAclProblem(perm.aclProblem)}）`
+          : `凭证已写入 ${configPath}，但落盘权限不合格（${perm.reason === 'file' ? '文件' : '目录'}过宽）`,
         // ⚠️ 路径必须走 shellPath 引号（CodeRabbit 2026-10-26）：HOME 可含空格，
         // 不引号的 chmod 在那种 HOME 下照着抄是坏的。与 core 的 insecureConfigError 同源。
-        hint: `请执行 chmod ${perm.reason === 'file' ? `600 ${shellPath(configPath)}` : `700 ${shellPath(dirname(configPath))}`}`,
+        hint: perm.reason === 'acl'
+          ? `请执行：${aclFixCommand(configPath, dirname(configPath), aclDetail)}`
+          : perm.reason === 'acl-unchecked'
+            ? '请先确认 PowerShell 可用、配置文件放在 NTFS 卷上，再用 icacls 查看当前 ACL；'
+              + '判定不了时本次写入不视为「权限已复核」'
+            : `请执行 chmod ${perm.reason === 'file' ? `600 ${shellPath(configPath)}` : `700 ${shellPath(dirname(configPath))}`}`,
       })
     }
   } catch { /* 自检失败不影响"已写入"这一事实；下一次任何命令都会再查一次 */ }

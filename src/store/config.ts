@@ -123,7 +123,8 @@ export function resolveStoreConfig(opts: ResolveOpts = {}): {
       // sync 上被降级成退出码 2 + `kind: usage`（"改参数重来"）且 hint 丢失，只有
       // auth/api 那条路径如实给出退出码 1 + `kind: config_insecure`。同一个危险状态两种
       // 行为，Agent 会去改参数而真正的动作是 chmod。统一由 core 的构造点产出。
-      throw insecureConfigError(configPath, perm.reason)
+      throw insecureConfigError(configPath, perm.reason, undefined, process.platform,
+        perm.aclProblem === undefined ? undefined : { problem: perm.aclProblem, selfSid: perm.selfSid })
     }
   }
 
