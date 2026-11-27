@@ -27,6 +27,9 @@ export interface WriteScriptResult {
   ok: boolean
   stage: Stage
   problem?: string
+  /** 本次探到的当前用户 SID（非秘密；上层用它比对归属与重建 ACL）。 */
+  selfSid?: string
+  /** 脚本相关路径（tmp 或目标）；不含 secret。 */
   path?: string
   sddlReadback?: string
 }
@@ -34,7 +37,8 @@ export interface WriteScriptResult {
 export interface WritePlan {
   configPath: string
   parentDir: string
-  selfSid?: string
+  /** tmp 的完整路径（必须与目标同目录 → 同卷，换入才成立）。Node 生成，脚本只消费。 */
+  tmpPath: string
 }
 
 export type Runner = (args: {
@@ -49,34 +53,110 @@ const STAGES: readonly Stage[] = [
 ]
 
 /**
- * 生成 PowerShell 骨架（纯函数、纯 ASCII）。
+ * 生成 PowerShell 写序脚本（纯函数、纯 ASCII）。
  *
- * 各阶段的顺序写在注释里，Task 2–5 按注释逐段填入真实机制；此时不读 stdin、
- * 不碰任何文件、不回结果记录（真跑也会因缺结果而判 script-failed，符合 Task 1 无副作用）。
+ * 当前已落地 ①（Task 2）：以受限 SD 原子创建 tmp、独占持有、按**句柄**读回 SDDL。
+ * ②–⑥ 由 Task 3–5 在「STAGE-BLOCK」之后逐段填充；阶段次序写在注释里，
+ * 测试按出现次序查找，改名/换序都会被挡住。
+ *
+ * 契约（写序实现必须遵守，见计划与设计稿 §2.4a）：
+ * - secret 只经 stdin 传入，绝不进 argv / env / 脚本 / 日志；
+ * - 结果记录必须**单行**（`ConvertTo-Json -Compress`；PS 5.1 默认多行，Node 只认末行）；
+ * - 已处理的失败**一律 exit 0** 并带上 stage/problem（非 0 退出的记录会被 Node 丢弃）。
  */
 export function renderWriteScript(_plan: WritePlan): string {
   // 注释里逐行钉住写序的阶段名：测试按出现次序查找，改名/换序都会被挡住。
   const order = STAGES.map((s, i) => `# ${i + 1}. ${s}`).join('\r\n')
   return [
-    '# Windows credential write-order skeleton (Task 1: no side effects).',
+    '# Windows credential write-order script (Tasks 2-5 fill the stages below).',
     '# Secret is supplied on stdin only; never in argv, env, script or logs.',
-    '# Path inputs: $env:QIYU_ACL_FILE (target), $env:QIYU_ACL_PARENT (parent).',
-    '# Stage order (to be filled in by Tasks 2-5; do not reorder):',
+    '# Path inputs: $env:QIYU_ACL_FILE (target), $env:QIYU_ACL_PARENT (parent), $env:QIYU_ACL_TMP (tmp).',
+    '# Stage order (do not reorder):',
     order,
-    '# 0. probe: parent directory handle and trusted state.',
-    '# 1. create-tmp: create tmp under a restricted SD while holding the handle.',
-    '# 2. verify-tmp: read back the SD and verify the handle identity.',
-    '# 3. write-secret: write the secret through the same handle.',
-    '# 4. close: close the tmp handle after the write is verified.',
-    '# 5. check-reparse: reject reparse points before replacement.',
-    '# 6. replace: rename tmp over the target on the same volume.',
-    '# 7. verify-target: read back target SD and identity after replacement.',
-    '# 8. done: emit exactly one JSON result line.',
-    '# The single result line is parsed by Node from the LAST stdout line only,',
-    '# because PowerShell progress/CLIXML noise may precede it.',
+    '# Stage implementations land in order; current file covers 1 (create-tmp).',
     '# Emit the result record as ONE line: ConvertTo-Json -Compress (PS 5.1 defaults to multi-line).',
     '# A processed failure still exits 0 and carries its stage/problem in the record;',
     '# only a hard crash may exit non-zero (Node discards records from non-zero exits).',
+    '',
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+    '',
+    'Add-Type -TypeDefinition @"',
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    '',
+    '[StructLayout(LayoutKind.Sequential)]',
+    'public struct QiyuSA { public int nLength; public IntPtr sd; public bool inherit; }',
+    '',
+    'public static class QiyuWrite {',
+    '  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]',
+    '  static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string s, uint rev, out IntPtr sd, out uint size);',
+    '  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]',
+    '  static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint rev, uint info, out IntPtr str, out uint len);',
+    '  [DllImport("advapi32.dll", SetLastError=true)]',
+    '  static extern uint GetSecurityInfo(IntPtr h, int type, uint info, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr sd);',
+    '  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]',
+    '  static extern IntPtr CreateFileW(string name, uint access, uint share, ref QiyuSA sa, uint disposition, uint flags, IntPtr template);',
+    '  [DllImport("kernel32.dll", SetLastError=true)]',
+    '  [return: MarshalAs(UnmanagedType.Bool)]',
+    '  public static extern bool CloseHandle(IntPtr h);',
+    '  [DllImport("kernel32.dll")]',
+    '  static extern IntPtr LocalFree(IntPtr p);',
+    '',
+    '  // GENERIC_READ|GENERIC_WRITE|WRITE_DAC|DELETE ; FILE_SHARE_READ ; CREATE_NEW ; FILE_ATTRIBUTE_NORMAL',
+    '  public static IntPtr CreateRestricted(string path, string sddl, out int err) {',
+    '    IntPtr sd; uint size;',
+    '    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out sd, out size)) { err = Marshal.GetLastWin32Error(); return IntPtr.Zero; }',
+    '    try {',
+    '      QiyuSA sa = new QiyuSA(); sa.nLength = Marshal.SizeOf(typeof(QiyuSA)); sa.sd = sd; sa.inherit = false;',
+    '      IntPtr h = CreateFileW(path, 0xC0000000u | 0x40000u | 0x10000u, 0x1u, ref sa, 1u, 0x80u, IntPtr.Zero);',
+    '      err = (h == new IntPtr(-1)) ? Marshal.GetLastWin32Error() : 0;',
+    '      return h;',
+    '    } finally { LocalFree(sd); }',
+    '  }',
+    '',
+    '  // SE_FILE_OBJECT=1, OWNER|GROUP|DACL=7',
+    '  public static string SddlFromHandle(IntPtr h) {',
+    '    IntPtr o, g, d, s, sd;',
+    '    uint rc = GetSecurityInfo(h, 1, 7, out o, out g, out d, out s, out sd);',
+    '    if (rc != 0) return "";',
+    '    try {',
+    '      IntPtr str; uint len;',
+    '      if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 7, out str, out len)) return "";',
+    '      try { return Marshal.PtrToStringUni(str); } finally { LocalFree(str); }',
+    '    } finally { LocalFree(sd); }',
+    '  }',
+    '}',
+    '"@',
+    '',
+    '$result = @{ ok = $false; stage = "probe" }',
+    'try {',
+    '  $file = $env:QIYU_ACL_FILE',
+    '  $parent = $env:QIYU_ACL_PARENT',
+    '  if ([string]::IsNullOrEmpty($file) -or [string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($env:QIYU_ACL_TMP)) { $result.problem = "missing-paths"; throw "stop" }',
+    '  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+    '  $result.selfSid = $sid',
+    '  $result.stage = "create-tmp"',
+    '  $sddl = "D:P(A;;0x12019f;;;$sid)"',
+    '  $tmp = $env:QIYU_ACL_TMP',
+    '  $err = 0',
+    '  $h = [QiyuWrite]::CreateRestricted($tmp, $sddl, [ref]$err)',
+    '  if ($h -eq [IntPtr]::Zero -or $h.ToInt64() -eq -1) {',
+    '    # 80 = ERROR_FILE_EXISTS / 183 = ERROR_ALREADY_EXISTS (CreateFile vs CreateDirectory)',
+    '    $result.problem = if ($err -eq 80 -or $err -eq 183) { "already-exists" } else { "create-failed" }',
+    '  } else {',
+    '    $result.ok = $true',
+    '    $result.path = $tmp',
+    '    $result.sddlReadback = [QiyuWrite]::SddlFromHandle($h)',
+    '    # STAGE-BLOCK: verify-tmp / write-secret / close / check-reparse / replace / verify-target',
+    '    # The handle intentionally stays open until process exit here; later stages close it themselves.',
+    '  }',
+    '} catch {',
+    '  if (-not $result.ContainsKey("problem")) { $result.problem = "script-error" }',
+    '}',
+    '$result | ConvertTo-Json -Compress',
+    'exit 0',
     '',
   ].join('\r\n')
 }
@@ -86,9 +166,19 @@ export function buildWritePayload(configJson: string, secretText: string): { con
   return { config: configJson, secret: secretText }
 }
 
-/** env 只放两个路径变量；secret 永不进 env。 */
-export function buildDefaultEnv(configPath: string, parentDir: string): Record<string, string> {
-  return { QIYU_ACL_FILE: configPath, QIYU_ACL_PARENT: parentDir }
+/** env 只放三个路径变量；secret 永不进 env。 */
+export function buildDefaultEnv(configPath: string, parentDir: string, tmpPath = defaultTmpPath(configPath)): Record<string, string> {
+  return { QIYU_ACL_FILE: configPath, QIYU_ACL_PARENT: parentDir, QIYU_ACL_TMP: tmpPath }
+}
+
+/**
+ * 默认 tmp 路径：与目标**同目录**（同卷才能 `MoveFileExW` 换名），名字沿用
+ * `writeConfigFile` 的既有约定（`${pid}-${Date.now()}`），并显式给出以便结果记录点名。
+ */
+export function defaultTmpPath(configPath: string, now: number = Date.now()): string {
+  const dir = configPath.slice(0, Math.max(configPath.lastIndexOf('/'), configPath.lastIndexOf('\\')) + 1)
+  const base = configPath.slice(dir.length)
+  return `${dir}.${base}.tmp-${process.pid}-${now}`
 }
 
 /**
@@ -152,14 +242,17 @@ function parseResultLine(stdout: string): WriteScriptResult | null {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return null
   const d = data as Record<string, unknown>
   if (typeof d.ok !== 'boolean' || !isStage(d.stage)) return null
-  if (d.ok && d.stage !== 'done') return null
-  // `done` 是「整条写序成功走完」的唯一终态：它带 ok:false 是自相矛盾的结果行，不能放行。
+  // `ok:true` 的含义是「走到该 stage 为止没有失败」（分阶段落地期间 Task 2 只到 create-tmp）；
+  // 发版脚本只在整条写序走完时给 stage='done'，Task 6 的成功判据必须显式要求 done。
+  // 但 `done` 是终态：它带 ok:false 是自相矛盾的结果行，不能放行。
   if (!d.ok && d.stage === 'done') return null
   if (!d.ok && (typeof d.problem !== 'string' || d.problem === '')) return null
-  if (d.path !== undefined && typeof d.path !== 'string') return null
-  if (d.sddlReadback !== undefined && typeof d.sddlReadback !== 'string') return null
+  for (const k of ['problem', 'selfSid', 'path', 'sddlReadback'] as const) {
+    if (d[k] !== undefined && typeof d[k] !== 'string') return null
+  }
   const out: WriteScriptResult = { ok: d.ok, stage: d.stage }
   if (typeof d.problem === 'string') out.problem = d.problem
+  if (typeof d.selfSid === 'string') out.selfSid = d.selfSid
   if (typeof d.path === 'string') out.path = d.path
   if (typeof d.sddlReadback === 'string') out.sddlReadback = d.sddlReadback
   return out
@@ -178,13 +271,14 @@ export function runWriteScript(
   parentDir: string,
   payload: { config: string; secret: string },
   run?: Runner,
+  tmpPath: string = defaultTmpPath(configPath),
 ): WriteScriptResult {
   const runner = run ?? defaultRunner
   let response: ReturnType<Runner>
   try {
     response = runner({
       script,
-      env: buildDefaultEnv(configPath, parentDir),
+      env: buildDefaultEnv(configPath, parentDir, tmpPath),
       stdin: JSON.stringify(payload),
       timeoutMs: 15_000,
     })

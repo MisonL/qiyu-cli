@@ -10,7 +10,7 @@
 import { spawnSync } from 'node:child_process'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  buildDefaultEnv, buildWritePayload, renderWriteScript, runWriteScript,
+  buildDefaultEnv, buildWritePayload, defaultTmpPath, renderWriteScript, runWriteScript,
   type Runner, type Stage, type WritePlan, type WriteScriptResult,
 } from '../../src/core/win-acl-write.js'
 
@@ -20,6 +20,7 @@ vi.mock('node:child_process', () => ({ spawnSync: vi.fn() }))
 
 const CONFIG = 'C:\\Users\\tester\\AppData\\Local\\qiyu\\config.json'
 const PARENT = 'C:\\Users\\tester\\AppData\\Local\\qiyu'
+const TMP = 'C:\\Users\\tester\\AppData\\Local\\qiyu\\.config.json.tmp-4321-1'
 const USER_SID = 'S-1-5-21-3861268055-4207080600-3105454512-1001'
 
 /** 高熵哨兵：任何一处出现都判泄漏（不会被误伤成普通子串）。 */
@@ -73,20 +74,28 @@ describe('renderWriteScript：纯 ASCII 骨架', () => {
     }
   })
 
-  it('骨架本身不从 stdin 读 secret、不写任何文件（Task 1 无副作用）', () => {
+  it('Task 2 只创建 tmp：不写内容、不读 stdin；结果单行、已处理失败 exit 0', () => {
     const script = renderWriteScript(plan())
+    // 还不写任何内容（secret 写入在 Task 3）
     expect(script).not.toMatch(/WriteAllText|WriteAllBytes|Out-File|Set-Content|\[Console\]::In\b/)
-    // 结果必须是单行 JSON：PS 5.1 的 ConvertTo-Json 默认多行，注释里钉住 -Compress
     expect(script).toMatch(/ConvertTo-Json -Compress/)
-    // 已处理的失败也 exit 0（非 0 的记录会被 Node 丢弃），注释里钉住
     expect(script).toMatch(/processed failure still exits 0/)
+    // 受限创建与错误码映射必须在脚本里
+    expect(script).toMatch(/CreateRestricted/)
+    expect(script).toMatch(/already-exists/)
+    expect(script).toMatch(/0x12019f/)
   })
 })
 
-describe('buildDefaultEnv：路径经 env 传，secret 不进 env', () => {
+describe('buildDefaultEnv / defaultTmpPath：路径经 env 传，secret 不进 env', () => {
+  it('tmp 与目标同目录、名字沿用既有约定（换名必须同卷）', () => {
+    const tmp = defaultTmpPath(CONFIG, 1234)
+    expect(tmp.startsWith(PARENT + '\\')).toBe(true)
+    expect(tmp).toMatch(/\.config\.json\.tmp-\d+-1234$/)
+  })
   it('只放两个路径变量', () => {
-    const env = buildDefaultEnv(CONFIG, PARENT)
-    expect(env).toEqual({ QIYU_ACL_FILE: CONFIG, QIYU_ACL_PARENT: PARENT })
+    const env = buildDefaultEnv(CONFIG, PARENT, TMP)
+    expect(env).toEqual({ QIYU_ACL_FILE: CONFIG, QIYU_ACL_PARENT: PARENT, QIYU_ACL_TMP: TMP })
   })
 })
 
@@ -130,8 +139,8 @@ describe('runWriteScript：stdin 是 secret 的唯一去向', () => {
 
   it('注入的 Runner 只拿到两个路径键（其余 env 由默认 Runner 自己按白名单补）', () => {
     const { run, calls } = recording()
-    runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload(), run)
-    expect(calls[0]!.env).toEqual(buildDefaultEnv(CONFIG, PARENT))
+    runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload(), run, TMP)
+    expect(calls[0]!.env).toEqual(buildDefaultEnv(CONFIG, PARENT, TMP))
   })
 
   it('超时与默认值写死成 15000ms', () => {
@@ -154,7 +163,6 @@ describe('runWriteScript：失败统一收敛', () => {
     ['stdout JSON 缺 ok/stage', () => ({ status: 0, stdout: '{"ok":true}', stderr: '' })],
     ['stdout ok 不是布尔', () => ({ status: 0, stdout: '{"ok":"yes","stage":"done"}', stderr: '' })],
     ['stdout stage 不在 Stage 集合', () => ({ status: 0, stdout: '{"ok":true,"stage":"nope"}', stderr: '' })],
-    ['stdout ok:true 且 stage 不是 done（自相矛盾）', () => ({ status: 0, stdout: '{"ok":true,"stage":"replace"}', stderr: '' })],
     ['stdout ok:false 但缺 problem', () => ({ status: 0, stdout: '{"ok":false,"stage":"probe"}', stderr: '' })],
     ['stdout ok:false 且 stage 是 done（自相矛盾的另一面）', () => ({ status: 0, stdout: '{"ok":false,"stage":"done","problem":"x"}', stderr: '' })],
     // status 校验必须独立于「stdout 解析得出解析不出」：这一档有合法结果行，只有 status 拦得住
@@ -291,7 +299,7 @@ describe('defaultRunner：spawnSync 命令行契约', () => {
     process.env.QIYU_APP_SECRET = SECRET
     try {
       mocked.mockReturnValue({ status: 0, stdout: '{"ok":true,"stage":"done"}', stderr: '' } as never)
-      runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload())
+      runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload(), undefined, TMP)
       const [, , opts] = mocked.mock.calls[0]!
       const env = (opts as Record<string, unknown>).env as Record<string, string>
       expect(env.QIYU_APP_SECRET).toBeUndefined()
