@@ -40,11 +40,14 @@
   Agent 照树找文件会四处落空。注只纠正「文件在哪」，分层结构结论不变。
 - **0.2.4 前置：Windows ACL 机制真机探针（PR #83，设计契约收口，未含实现）**：对 spec §2.4 的候选机制
   在 Windows 10 19045 / PowerShell 5.1 / Node 上做真机探针，给出【已验证】/【推断】/【已证伪】分级，
-  并**保留明确未实测项**（`CreateFile + SECURITY_ATTRIBUTES` 路线、目录句柄本身、null/空 DACL 的实际
+  并**保留明确未实测项**（`CreateFile + SECURITY_ATTRIBUTES` 路线、`CreateFileW + SECURITY_ATTRIBUTES`
+  受限创建目录、首次登录完整序列与跨账户档（目录句柄的打开与「持有期间挡住祖先改名」已由探针 42/42b/42c
+  实测，同账户）、null/空 DACL 的实际
   形态、权限不足时的换名/删除、加 `ChangePermissions` 请求位的七参调用——清单见 spec §2.4 平台假设）。
   （**累计十六轮 / 42 个探针**，逐轮增删——本条最初写作「十一轮 / 29 个探针」，那是历史快照，已不再是最终计数；原始输出存 gitignored 证据）。**结论**：`.NET FileShare.None`
   独占句柄持有期间其**直接父目录**的 `rmdir`/`ren`/重建全部失败（钉住成立；更上层祖先的改名已由
-  **探针 42/42b/42c** 补测：持目录句柄期间父到第 4 级祖先改名均 `0x5`、跨进程亦然，同账户），
+  **探针 42/42b/42c** 补测（同账户）：持 `qiyu` 句柄改自身 `0x20`、改父/祖父 `0x5`（42），第 3、4 级祖先
+  `0x5`（42c，同进程），42b 的跨进程档只补了父/祖父两臂——第 3、4 级的跨进程档与跨账户档未测），
   Node 的 fd（libuv 带删除共享）挡不住 `rmdir` 与路径重建（README:119-122；**`fs.renameSync` 未单独实测，按推断记**） → **纯 Node 实现不满足本契约**；secret 交付子进程**只能经 stdin**（argv 会被同机进程
   经 WMI/wmic 读到）；error 87 的真因是把信息类号传错（`FileRenameInfo = 3`），**修正后按句柄换名
   仍闭合不了 ⑥ 残余窗口**（调用成功但目标按路径不可见）；创建/打开失败按异常分档，且**报错必须点名
@@ -78,8 +81,8 @@
   **用户裁决（2026-11-26）：不对文档写测试**——本 PR 的全部文本守卫已移除，`tests/docs.test.ts`
   回退到 `origin/main`，另删一条因 §2.4 重写而失效的旧断言块（85→84，spec §6.55）。契约的执行性验证留给 0.2.4 用真实文件系统 + 真实子进程断言
   （读面判据、写序 ⓪–⑥、夹具 9(i)–9(k)/13/14（含 13(g)））。守卫移除后另继续了纯文档的事实核对轮次
-  （CR 126–175 / Codex 55–93 + 一份过期快照回报，**Codex 92/93 的完整回执逐条处置见 §6.118/§6.119**；
-  留痕见 §6.56–§6.119），不再涉及文本守卫。
+  （CR 126–176 / Codex 55–94 + 一份过期快照回报，**Codex 92/93/94 的完整回执逐条处置见
+  §6.118/§6.119/§6.120**；留痕见 §6.56–§6.120），不再涉及文本守卫。
 
 - **364 天口径冲突如实标注（未裁决）**：§7.3 与 §14 的「`transferHuman` 364 天报 Internal error、上限压 ≤360」
   与 §7.4.1 的 2026-09-30 二分结论（「不存在边界不稳定」）互斥，两边都自称实测而无可复核记录留存——
@@ -328,14 +331,14 @@
 - **四条错误分类判据（本轮第二批落点）之外，另有五处独立缺陷**（均由独立审查 agent 发现并复现）（逐条明细见 git 历史）
 - **同一形态的第三批落点：四条错误分类判据也是裸子串判，能被列值与 SQL 回显仿冒**。（逐条明细见 git 历史）
 - **撞锁判据的子串搜索把「路径里含 `Conflicting lock` 的非 DuckDB 文件」判成撞锁**。
-- **`db` / `stats` 的「未知参数」把空串渲染成隐形**。`query` / `api` 早走 `describeArgs`
+- **`db` / `stats` 的「未知参数」把空串渲染成隐形**。`query` / `api` 早走 `describeArgs`（空串渲染成 `''`），`db` / `stats` 共八处仍是裸 `join(' ')` —— `db tables ''` 得到「未知参数：」冒号后一片空白，退出码 2 的全部价值（「改哪里」）丢失。八处统一改走 `describeArgs`。
 - **`sync run` 的 `tasks[].gaps` 图例用位置指代「后四个 reason」**。
 - **`tests/store-field-notes.test.ts` 的文件头与文件内断言互相矛盾**：头部注释写「`db tables`只列业务表、两边数量不同」，而下方用例 `expect(dbNames).toEqual(storeNames)` 早已证伪（实测两边都含内部表、都是同一组）。
 - **DuckDB 报文回声污染：用户数据与用户 SQL 能把错误伪装成「查询超时」或「沙箱拦截」**。（逐条明细见 git 历史）
 - **`store status` 遇到库里有未声明的表时整条命令失败（`未知表：stray_table`，退出码 2）**。
 - **`TYPE_NAMES[21]` 写成 `INSTALL`，驱动枚举里 21 是 `LOAD`**。
 - **skill 正文 `errors.md` 仍教「结束边界不得晚于今天零点」**。
-- **只读库前置检查的三份副本收敛到 `src/commands/store-precheck.ts`**。`db` / `sync` / `store`
+- **只读库前置检查的三份副本收敛到 `src/commands/store-precheck.ts`**。`db` / `sync` / `store` 各自维护一份 `statGuard`（不存在 / 权限 / 非普通文件）与 `schema_version` 缺表探测，`store init` 还把命名管道、设备等特殊文件一律报成「是目录」（`!isFile()` 覆盖四种成因，文案只写了一种）。现在七个读命令对目录 / FIFO / 字符设备 / 父目录 `chmod 000` / 不存在 / 空库 / 他人库给出逐字相同的 hint，特殊文件报「不是普通文件」。
 - **三条恒真的漂移守卫**（独立审查发现）：`tests/docs.test.ts` 的「补全承诺限定末残段」反锚用的锚句 `由下轮日对齐` 已不在正文里，循环零次迭代；`tests/commands/command-tree.test.ts`的「first 只许在第一槽位」在真实树上零次迭代（没有命令有两个槽位）；README tables 形态断言的备选正则 `/name.*rows/` 会撞上无关段落，删掉被守卫的原句仍绿。
 - **同一起因、两个命令族、两种说法：「打开库文件失败」的解码规则收敛到单一实现点**。
 - **`store` 的权限错误归因是死的：真实 EACCES 拿到「数据库执行期错误」的 hint**。
@@ -360,7 +363,7 @@
 - **最后三处无图例的输出：`skill where` 的 `cli_contract_version`、`--version`、`auth login`**。（逐条明细见 git 历史）
 - **`store init` / `store status` 无图例，且 README 把两者的 `tables` 形状说成同一个**。（逐条明细见 git 历史）
 - **`db describe` / `db tables` 把「声明」与「实况」混在同一层输出里，字段名不区分**。（逐条明细见 git 历史）
-- **`query` 的 9 个 meta 键全仓无释义，其中三处的字面与事实不符**。`query` 是 skill 协议。（逐条明细见 git 历史）
+- **`query` 的 9 个 meta 键全仓无释义，其中三处的字面与事实不符**。`query` 是 skill 协议指定的主查询入口，而它的 `meta` 此前**一条释义都没有**（README 有散文，但 Agent 读的是 stdout）。（逐条明细见 git 历史）
 - **`sync status` 的 `range_status` 两个取值字面与事实相反，且四个命令的状态位全仓无释义**。（逐条明细见 git 历史）
 - **`stats fields` 是唯一没有 `meta.field_notes` 的读命令，`declared` 的机器值域全仓无释义**。
 - **`declared.higher_is_better` 恒为 `null` 却没有任何出处**。
