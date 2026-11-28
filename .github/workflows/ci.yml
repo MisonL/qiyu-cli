@@ -52,3 +52,22 @@ jobs:
       - run: npm test
         env:
           QIYU_TEST_SHARDS: 1
+
+  # Windows 专用最小 job（0.2.4）：读面三态探测与写序的**纯函数层**在 Windows 上也要绿。
+  # 只跑这两个文件——其余用例含 POSIX 权限/符号链接语义，Windows 上本就不成立。
+  # 真机端到端（auth login 全链）在 Windows 真机手工执行，不在 CI 里。
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npx vitest run tests/core/win-acl.test.ts tests/core/win-acl-write.test.ts --maxWorkers=1 --no-file-parallelism

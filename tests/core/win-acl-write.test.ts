@@ -13,7 +13,7 @@ import {
   buildDefaultEnv, buildWritePayload, defaultTmpPath, renderWriteScript, runWriteScript, runWriteInteractive,
   CP_PREFIX, READY_LINE, RESULT_PREFIX, judgeCheckpoint, writeConfigFileWin32, WinWriteError,
   type SpawnLike, type WriteScriptResult,
-  type Runner, type Stage, type WritePlan, type WriteScriptResult,
+  type Runner, type Stage, type WritePlan,
 } from '../../src/core/win-acl-write.js'
 
 // 默认 Runner 的 spawnSync 契约用替身钉住（真实 powershell.exe 只在 Windows 上有）。
