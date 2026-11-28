@@ -30,11 +30,11 @@ const CONFIG_JSON = JSON.stringify({ appId: 'app-1', appSecret: SECRET })
 const plan = (over: Partial<WritePlan> = {}): WritePlan => ({
   configPath: CONFIG,
   parentDir: PARENT,
-  selfSid: USER_SID,
+  tmpPath: TMP,
   ...over,
 })
 
-const payload = () => buildWritePayload(CONFIG_JSON, SECRET)
+const payload = () => buildWritePayload(CONFIG_JSON)
 
 const FAILED: WriteScriptResult = { ok: false, stage: 'probe', problem: 'script-failed' }
 
@@ -99,22 +99,20 @@ describe('buildDefaultEnv / defaultTmpPath：路径经 env 传，secret 不进 e
   })
 })
 
-describe('buildWritePayload：内容与 secret 分字段、不改内容', () => {
-  it('config 逐字节等于入参，secret 逐字节等于入参', () => {
-    const p = buildWritePayload(CONFIG_JSON, SECRET)
+describe('buildWritePayload：整份配置是唯一载荷、不改内容', () => {
+  it('config 逐字节等于入参', () => {
+    const p = buildWritePayload(CONFIG_JSON)
     expect(p.config).toBe(CONFIG_JSON)
-    expect(p.secret).toBe(SECRET)
   })
 
   it('config 不是 JSON 字符串（不二次序列化）', () => {
-    const p = buildWritePayload('{"a": 1}\n', SECRET)
+    const p = buildWritePayload('{"a": 1}\n')
     expect(p.config).toBe('{"a": 1}\n')
     expect(p.config).not.toBe(JSON.stringify('{"a": 1}\n'))
   })
 
-  it('原文里除 secret 外无任何秘密时也照样分流：两字段独立', () => {
-    const p = buildWritePayload('plain', 's')
-    expect(p).toEqual({ config: 'plain', secret: 's' })
+  it('载荷形状封闭：只有 config 一个字段（不留没人读的 secret 槽位）', () => {
+    expect(buildWritePayload('plain')).toEqual({ config: 'plain' })
   })
 })
 
@@ -134,7 +132,7 @@ describe('runWriteScript：stdin 是 secret 的唯一去向', () => {
     }
     // stdin 是「{config, secret}」的 JSON：secret 只出现在 secret 字段
     const stdin = JSON.parse(call.stdin) as Record<string, unknown>
-    expect(stdin).toEqual({ config: CONFIG_JSON, secret: SECRET })
+    expect(stdin).toEqual({ config: CONFIG_JSON })
   })
 
   it('注入的 Runner 只拿到两个路径键（其余 env 由默认 Runner 自己按白名单补）', () => {
@@ -270,7 +268,7 @@ describe('defaultRunner：spawnSync 命令行契约', () => {
     ])
     const o = opts as Record<string, unknown>
     expect(o).toMatchObject({
-      input: JSON.stringify({ config: CONFIG_JSON, secret: SECRET }),
+      input: JSON.stringify({ config: CONFIG_JSON }),
       encoding: 'utf8',
       timeout: 15_000,
       windowsHide: true,

@@ -101,6 +101,14 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  [DllImport("kernel32.dll", SetLastError=true)]',
     '  [return: MarshalAs(UnmanagedType.Bool)]',
     '  public static extern bool CloseHandle(IntPtr h);',
+    '  [DllImport("kernel32.dll", SetLastError=true)]',
+    '  static extern bool WriteFile(IntPtr h, byte[] buf, uint len, out uint written, IntPtr ov);',
+    '  [DllImport("kernel32.dll", SetLastError=true)]',
+    '  static extern bool ReadFile(IntPtr h, byte[] buf, uint len, out uint read, IntPtr ov);',
+    '  [DllImport("kernel32.dll", SetLastError=true)]',
+    '  static extern bool SetFilePointerEx(IntPtr h, long dist, out long pos, uint method);',
+    '  [DllImport("kernel32.dll", SetLastError=true)]',
+    '  static extern bool GetFileSizeEx(IntPtr h, out long size);',
     '  [DllImport("kernel32.dll")]',
     '  static extern IntPtr LocalFree(IntPtr p);',
     '',
@@ -114,6 +122,26 @@ export function renderWriteScript(_plan: WritePlan): string {
     '      err = (h == new IntPtr(-1)) ? Marshal.GetLastWin32Error() : 0;',
     '      return h;',
     '    } finally { LocalFree(sd); }',
+    '  }',
+    '',
+    '  // Write the whole config through the SAME handle; 0 means success.',
+    '  public static int WriteAll(IntPtr h, byte[] b) {',
+    '    long pos;',
+    '    SetFilePointerEx(h, 0, out pos, 0);',
+    '    uint w;',
+    '    if (!WriteFile(h, b, (uint)b.Length, out w, IntPtr.Zero)) return Marshal.GetLastWin32Error();',
+    '    return ((int)w == b.Length) ? 0 : 1;',
+    '  }',
+    '',
+    '  // Read the file back through the same handle (UTF-8); null means read failure.',
+    '  public static string ReadAll(IntPtr h) {',
+    '    long size, pos;',
+    '    if (!GetFileSizeEx(h, out size)) return null;',
+    '    SetFilePointerEx(h, 0, out pos, 0);',
+    '    byte[] buf = new byte[size];',
+    '    uint read;',
+    '    if (!ReadFile(h, buf, (uint)size, out read, IntPtr.Zero)) return null;',
+    '    return System.Text.Encoding.UTF8.GetString(buf, 0, (int)read);',
     '  }',
     '',
     '  // SE_FILE_OBJECT=1, OWNER|GROUP|DACL=7',
@@ -149,7 +177,34 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    $result.ok = $true',
     '    $result.path = $tmp',
     '    $result.sddlReadback = [QiyuWrite]::SddlFromHandle($h)',
-    '    # STAGE-BLOCK: verify-tmp / write-secret / close / check-reparse / replace / verify-target',
+    '    # verify-tmp: the readback must literally carry the requested DACL and the current owner.',
+    '    $result.stage = "verify-tmp"',
+    '    $daclOk = $result.sddlReadback.Contains($sddl)',
+    '    $ownerOk = $result.sddlReadback.StartsWith("O:$sid")',
+    '    if (-not ($daclOk -and $ownerOk)) {',
+    '      $result.ok = $false',
+    '      $result.problem = "sddl-mismatch"',
+    '    } else {',
+    '      $result.stage = "write-secret"',
+    '      $stdin = [Console]::OpenStandardInput()',
+    '      $ms = New-Object System.IO.MemoryStream',
+    '      $stdin.CopyTo($ms)',
+    '      $text = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())',
+    '      $payload = $text | ConvertFrom-Json',
+    '      if ([string]::IsNullOrEmpty([string]$payload.config)) {',
+    '        $result.ok = $false; $result.problem = "missing-payload"',
+    '      } else {',
+    '        $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$payload.config)',
+    '        $wrc = [QiyuWrite]::WriteAll($h, $bytes)',
+    '        if ($wrc -ne 0) {',
+    '          $result.ok = $false; $result.problem = "write-failed"',
+    '        } else {',
+    '          $back = [QiyuWrite]::ReadAll($h)',
+    '          if ($back -ne [string]$payload.config) { $result.ok = $false; $result.problem = "readback-mismatch" }',
+    '        }',
+    '      }',
+    '    }',
+    '    # STAGE-BLOCK: close / check-reparse / replace / verify-target',
     '    # The handle intentionally stays open until process exit here; later stages close it themselves.',
     '  }',
     '} catch {',
@@ -161,9 +216,13 @@ export function renderWriteScript(_plan: WritePlan): string {
   ].join('\r\n')
 }
 
-/** 把配置内容与 secret 分成两个字段：不做序列化、不改内容。 */
-export function buildWritePayload(configJson: string, secretText: string): { config: string; secret: string } {
-  return { config: configJson, secret: secretText }
+/**
+ * 写序的唯一载荷：**整份配置 JSON**（credentials 就在里面，它本身就是秘密载体）。
+ *
+ * ⚠️ 不要拆出单独的 secret 字段：没有任何阶段读它，属于「声明了没人读」的假契约。
+ */
+export function buildWritePayload(configJson: string): { config: string } {
+  return { config: configJson }
 }
 
 /** env 只放三个路径变量；secret 永不进 env。 */
@@ -269,7 +328,7 @@ export function runWriteScript(
   script: string,
   configPath: string,
   parentDir: string,
-  payload: { config: string; secret: string },
+  payload: { config: string },
   run?: Runner,
   tmpPath: string = defaultTmpPath(configPath),
 ): WriteScriptResult {
