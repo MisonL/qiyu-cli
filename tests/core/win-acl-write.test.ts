@@ -80,10 +80,13 @@ describe('renderWriteScript：纯 ASCII 骨架', () => {
     expect(script).not.toMatch(/WriteAllText|WriteAllBytes|Out-File|Set-Content|\[Console\]::In\b/)
     expect(script).toMatch(/ConvertTo-Json -Compress/)
     expect(script).toMatch(/processed failure still exits 0/)
-    // 受限创建与错误码映射必须在脚本里
+    // 受限创建、错误码映射、换入前重解析点检查与换入后复核必须在脚本里
     expect(script).toMatch(/CreateRestricted/)
     expect(script).toMatch(/already-exists/)
     expect(script).toMatch(/0x12019f/)
+    expect(script).toMatch(/TargetIsReparse/)
+    expect(script).toMatch(/MoveFileExW\(\$tmp, \$file, \[uint32\]1\)/)
+    expect(script).toMatch(/verify-target/)
   })
 })
 
