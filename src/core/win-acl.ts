@@ -59,6 +59,7 @@ export type AclProblem =
   | 'dacl-inherited'
   | 'parent-untrusted-owner'
   | 'parent-writable'
+  | 'dir-recipe-mismatch'
   | 'restricted-token'
   | 'probe-failed'
 
@@ -123,6 +124,8 @@ export function describeAclProblem(problem: AclProblem): string {
       return '父目录属主不是受信主体（配置文件可被整体替换）'
     case 'parent-writable':
       return '父目录对受信名单之外的主体有写类权限（配置文件可被整体替换）'
+    case 'dir-recipe-mismatch':
+      return '配置目录的 ACL 不等于本契约的目录配方（受保护、只授当前用户、含七项目录访问位）'
     case 'restricted-token':
       return '进程是受限令牌，无法判定 restricting SID 的求值档'
     case 'probe-failed':
@@ -206,7 +209,7 @@ function hasDacl(sddl: string): boolean {
 }
 
 /** 父目录的写面受信（清单第 7 条）：属主受信 + 非受信主体没有写类允许 ACE。 */
-function evaluateParent(parent: AclSnapshot, token: TokenSnapshot): { ok: true } | { ok: false; problem: AclProblem } {
+export function evaluateParentAcl(parent: AclSnapshot, token: TokenSnapshot): { ok: true } | { ok: false; problem: AclProblem } {
   if (parent.aces.some((a) => a.cls !== FILE_SYSTEM_ACCESS_RULE || (a.type !== 'Allow' && a.type !== 'Deny'))) {
     return { ok: false, problem: 'unsupported-ace' }
   }
@@ -221,6 +224,33 @@ function evaluateParent(parent: AclSnapshot, token: TokenSnapshot): { ok: true }
 /** 「判不了」的成因：修法是查环境/换权限来源，不是清 ACL——不得与「不安全」混成一个 ok:false。 */
 const UNDECIDABLE: ReadonlySet<AclProblem> = new Set<AclProblem>(['unsupported-ace', 'restricted-token', 'probe-failed'])
 
+/**
+ * 目录配方的判定（写序 ⓪ 的 `qiyu` 目录档，设计稿 §2.4a「目录的 SD 要单独给」）。
+ *
+ * 判据取「**至少含七项目录访问位**」而不是与 `FA` 字符串相等：
+ * FILE_TRAVERSE(0x20) | FILE_LIST_DIRECTORY(0x1) | FILE_ADD_FILE(0x2) |
+ * FILE_ADD_SUBDIRECTORY(0x4) | DELETE(0x10000) | READ_CONTROL(0x20000) | SYNCHRONIZE(0x100000)。
+ * 允许比它更宽（`FA` 就是），但不许更窄，也不许把允许 ACE 授给当前用户之外的任何主体
+ * （SYSTEM/Administrators 在这个档**不放行**——规格对目录要求「只授当前用户」）。
+ */
+const DIR_REQUIRED = 0x20 | 0x1 | 0x2 | 0x4 | 0x10000 | 0x20000 | 0x100000
+
+export function evaluateDirectoryAcl(acl: AclSnapshot, selfSid: string): { ok: true } | { ok: false; problem: AclProblem } {
+  if (acl.aces.some((a) => a.cls !== FILE_SYSTEM_ACCESS_RULE || (a.type !== 'Allow' && a.type !== 'Deny'))) {
+    return { ok: false, problem: 'unsupported-ace' }
+  }
+  if (!hasDacl(acl.sddl)) return { ok: false, problem: 'dacl-missing' }
+  if (acl.aces.length === 0) return { ok: false, problem: 'dacl-empty' }
+  if (acl.ownerSid !== selfSid) return { ok: false, problem: 'untrusted-owner' }
+  if (!acl.daclProtected) return { ok: false, problem: 'dacl-inherited' }
+  if (acl.aces.some((a) => a.type === 'Allow' && a.sid !== selfSid)) return { ok: false, problem: 'untrusted-allow' }
+  const granted = acl.aces
+    .filter((a) => a.type === 'Allow' && a.sid === selfSid && !a.inheritOnly)
+    .reduce((acc, a) => acc | a.mask, 0)
+  if ((granted & DIR_REQUIRED) !== DIR_REQUIRED) return { ok: false, problem: 'dir-recipe-mismatch' }
+  return { ok: true }
+}
+
 /** 三态判据的唯一入口（纯函数，测试用合成快照驱动）。 */
 export function evaluateWinAcl(snapshot: ProbeSnapshot): WinAclVerdict {
   // 受限令牌：WRITE_RESTRICTED 标志无法从公开 API 读出，读面走第一遍还是两遍判不了。
@@ -229,7 +259,7 @@ export function evaluateWinAcl(snapshot: ProbeSnapshot): WinAclVerdict {
   }
   const file = evaluateAcl(snapshot.file, snapshot.token)
   if (!file.ok) return { ok: false, checked: !UNDECIDABLE.has(file.problem), problem: file.problem }
-  const parent = evaluateParent(snapshot.parent, snapshot.token)
+  const parent = evaluateParentAcl(snapshot.parent, snapshot.token)
   if (!parent.ok) return { ok: false, checked: !UNDECIDABLE.has(parent.problem), problem: parent.problem }
   return { ok: true, checked: true }
 }
@@ -371,14 +401,14 @@ export function parseProbeOutput(raw: string): ProbeSnapshot | null {
     return null
   }
   const d = data as Record<string, unknown>
-  const file = parseAclNode(d.file)
-  const parent = parseAclNode(d.parent)
+  const file = parseAclSnapshot(d.file)
+  const parent = parseAclSnapshot(d.parent)
   const token = parseTokenNode(d.token)
   if (file === null || parent === null || token === null) return null
   return { file, parent, token }
 }
 
-function parseAclNode(node: unknown): AclSnapshot | null {
+export function parseAclSnapshot(node: unknown): AclSnapshot | null {
   if (typeof node !== 'object' || node === null) return null
   const n = node as Record<string, unknown>
   if (typeof n.sddl !== 'string' || typeof n.daclProtected !== 'boolean' || typeof n.ownerSid !== 'string') return null

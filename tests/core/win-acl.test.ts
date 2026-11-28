@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
-  checkWinAcl, evaluateWinAcl, parseProbeOutput,
+  checkWinAcl, evaluateWinAcl, parseProbeOutput, evaluateDirectoryAcl,
   type AceSnapshot, type AclSnapshot, type ProbeSnapshot, type TokenSnapshot,
 } from '../../src/core/win-acl.js'
 import { __resetPermissionWarnings, checkPermissions } from '../../src/core/config.js'
@@ -280,6 +280,39 @@ describe('探测：输出解析与失败映射', () => {
     expect(checkWinAcl('C:\\x\\config.json', 'C:\\x', () => loose)).toEqual({
       verdict: { ok: false, checked: true, problem: 'untrusted-allow' },
       userSid: USER,
+    })
+  })
+})
+
+describe('目录配方判定（写序 ⓪ 的 qiyu 目录档）', () => {
+  const FA = 0x1f01ff
+  const base = (aces: AceSnapshot[], opts: Partial<AclSnapshot> = {}): AclSnapshot => ({
+    sddl: 'D:PAI', daclProtected: true, ownerSid: USER, aces, ...opts,
+  })
+
+  it('受保护、属主自己、只授自己 FA → ok（FA 覆盖七项必需位）', () => {
+    expect(evaluateDirectoryAcl(base([ace('Allow', USER, FA)]), USER)).toEqual({ ok: true })
+  })
+
+  it('少一项必需位（缺 SYNCHRONIZE）→ dir-recipe-mismatch', () => {
+    expect(evaluateDirectoryAcl(base([ace('Allow', USER, FA & ~0x100000)]), USER)).toEqual({
+      ok: false, problem: 'dir-recipe-mismatch',
+    })
+  })
+
+  it('把允许 ACE 授给 SYSTEM → untrusted-allow（目录档只认当前用户）', () => {
+    expect(evaluateDirectoryAcl(base([ace('Allow', SYSTEM, FA)]), USER)).toEqual({ ok: false, problem: 'untrusted-allow' })
+  })
+
+  it('属主不是当前用户 / 继承未关闭 / 空 DACL → 各自成因', () => {
+    expect(evaluateDirectoryAcl(base([ace('Allow', USER, FA)], { ownerSid: 'S-1-5-21-9-9' }), USER)).toEqual({ ok: false, problem: 'untrusted-owner' })
+    expect(evaluateDirectoryAcl(base([ace('Allow', USER, FA)], { daclProtected: false }), USER)).toEqual({ ok: false, problem: 'dacl-inherited' })
+    expect(evaluateDirectoryAcl(base([]), USER)).toEqual({ ok: false, problem: 'dacl-empty' })
+  })
+
+  it('INHERIT_ONLY 的允许 ACE 不计入配方（继承来的 ACE 不能冒认）', () => {
+    expect(evaluateDirectoryAcl(base([ace('Allow', USER, FA, { inheritOnly: true })]), USER)).toEqual({
+      ok: false, problem: 'dir-recipe-mismatch',
     })
   })
 })

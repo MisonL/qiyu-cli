@@ -76,19 +76,25 @@ describe('renderWriteScript：纯 ASCII 骨架', () => {
     }
   })
 
-  it('Task 2 只创建 tmp：不写内容、不读 stdin；结果单行、已处理失败 exit 0', () => {
+  it('脚本覆盖 ⓪–⑥ 机制与交互协议标记', () => {
     const script = renderWriteScript(plan())
-    // 还不写任何内容（secret 写入在 Task 3）
-    expect(script).not.toMatch(/WriteAllText|WriteAllBytes|Out-File|Set-Content|\[Console\]::In\b/)
+    // 不借助 .NET 的写文件 API（内容只经我方句柄写）
+    expect(script).not.toMatch(/WriteAllText|WriteAllBytes|Out-File|Set-Content/)
     expect(script).toMatch(/ConvertTo-Json -Compress/)
-    expect(script).toMatch(/processed failure still exits 0/)
-    // 受限创建、错误码映射、换入前重解析点检查与换入后复核必须在脚本里
     expect(script).toMatch(/CreateRestricted/)
     expect(script).toMatch(/already-exists/)
     expect(script).toMatch(/0x12019f/)
     expect(script).toMatch(/TargetIsReparse/)
     expect(script).toMatch(/MoveFileExW\(\$tmp, \$file, \[uint32\]1\)/)
     expect(script).toMatch(/verify-target/)
+    // ⓪：目录句柄、相对打开、按句柄取 ACL
+    expect(script).toMatch(/OpenDir/)
+    expect(script).toMatch(/OpenChildDir/)
+    expect(script).toMatch(/AclJson/)
+    // 协议：checkpoint 在写 secret 之前，READY 才读载荷
+    expect(script).toMatch(/Emit \("QIYU-CP "/)
+    expect(script).toMatch(/Emit "QIYU-READY"/)
+    expect(script.indexOf('Emit "QIYU-READY"')).toBeLessThan(script.indexOf('Emit ("QIYU-RESULT "'))
   })
 })
 
@@ -267,10 +273,9 @@ describe('defaultRunner：spawnSync 命令行契约', () => {
     expect(mocked).toHaveBeenCalledTimes(1)
     const [file, argv, opts] = mocked.mock.calls[0]!
     expect(file).toBe('powershell.exe')
-    expect(argv).toEqual([
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64'),
-    ])
+    // 脚本走临时 .ps1（-EncodedCommand 会超 Windows 命令行上限）；前五个参数固定
+    expect((argv as string[]).slice(0, 5)).toEqual(['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File'])
+    expect((argv as string[])[5]).toMatch(/qiyu-write-.+write\.ps1$/)
     const o = opts as Record<string, unknown>
     expect(o).toMatchObject({
       input: JSON.stringify({ config: CONFIG_JSON }),
