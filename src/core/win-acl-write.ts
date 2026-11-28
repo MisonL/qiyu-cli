@@ -10,7 +10,7 @@
  * ⚠️ 脚本源码必须纯 ASCII：PowerShell 5 按 ANSI 解码无 BOM UTF-8，中文注释会吞行
  * （真机实测），所以这里注释全英文，中文只出现在本 TS 文件的注释里。
  */
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 
 export type Stage =
   | 'probe'
@@ -339,12 +339,15 @@ function parseResultLine(stdout: string): WriteScriptResult | null {
   let last = ''
   for (const line of lines) if (line.trim() !== '') last = line
   if (last === '') return null
-  let data: unknown
   try {
-    data = JSON.parse(last)
+    return coerceResult(JSON.parse(last))
   } catch {
     return null
   }
+}
+
+/** 封闭形状校验（单行结果与交互协议的结果对象共用）。 */
+function coerceResult(data: unknown): WriteScriptResult | null {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return null
   const d = data as Record<string, unknown>
   if (typeof d.ok !== 'boolean' || !isStage(d.stage)) return null
@@ -397,4 +400,157 @@ export function runWriteScript(
   const stdout = (response as { stdout?: unknown }).stdout
   if (typeof stdout !== 'string') return { ...FAILED }
   return parseResultLine(stdout) ?? { ...FAILED }
+}
+
+// ── 交互协议（Task 5）──────────────────────────────────────────────────────
+//
+// 为什么需要（设计约束，不是风格选择）：⓪ 的判定必须发生在写 secret 之前，而判定是
+// Node 侧的纯函数（`win-acl.ts`）——不能为了同步 `spawnSync` 在 PowerShell 里再实现
+// 一份规则（同一判据两个实现点＝漂移）。所以脚本在关键点打印单行 checkpoint，
+// Node 判定后回 `GO` / `STOP <problem>`；只有脚本走到写入点并打印 `QIYU-READY`
+// 之后，Node 才把配置载荷写进 stdin。**secret 的发送时点由这里保证**。
+
+/** 脚本 → Node 的 checkpoint 行前缀。 */
+export const CP_PREFIX = 'QIYU-CP '
+/** 脚本 → Node：即将读取载荷（只会在全部 checkpoint 通过之后出现）。 */
+export const READY_LINE = 'QIYU-READY'
+/** 脚本 → Node 的最终结果行前缀。 */
+export const RESULT_PREFIX = 'QIYU-RESULT '
+
+export interface WriteCheckpoint {
+  stage: Stage
+  /** 脚本探到的当前用户 SID。 */
+  selfSid?: string
+  /** 待 Node 判定的 ACL 节点（形状与 `win-acl.ts` 的 `AclSnapshot` 一致）。 */
+  qiyu?: unknown
+  parent?: unknown
+  /** 首次登录：qiyu 目录不存在、脚本准备按受限 SD 创建。 */
+  createDir?: boolean
+}
+
+export type CheckpointDecision = { go: true } | { go: false; problem: string }
+
+export interface ChildLike {
+  stdin: { write(chunk: string): unknown; end(): void } | null
+  stdout: { on(event: 'data', cb: (chunk: Buffer | string) => void): unknown } | null
+  stderr: { on(event: 'data', cb: (chunk: Buffer | string) => void): unknown } | null
+  on(event: 'exit' | 'error', cb: (arg: unknown) => void): unknown
+  kill(): unknown
+}
+
+export type SpawnLike = (cmd: string, argv: string[], opts: Record<string, unknown>) => ChildLike
+
+export interface InteractiveArgs {
+  script: string
+  configPath: string
+  parentDir: string
+  tmpPath: string
+  /** 整份配置 JSON（秘密载体）——只有 READY 之后才会写进子进程 stdin。 */
+  config: string
+  onCheckpoint: (cp: WriteCheckpoint) => CheckpointDecision
+  spawnImpl?: SpawnLike
+  timeoutMs?: number
+}
+
+/**
+ * 跑交互式写序。返回与 `runWriteScript` 同形状的封闭结果。
+ *
+ * 失败一律 `{ ok:false, stage:'probe', problem:'script-failed' }`（含：子进程启动失败、
+ * 非 0 退出、超时、结果行缺失/畸形）。原始 stderr 不回传（可能夹带路径等外部字节）。
+ */
+export function runWriteInteractive(args: InteractiveArgs): Promise<WriteScriptResult> {
+  const timeoutMs = args.timeoutMs ?? 20_000
+  const spawnImpl = args.spawnImpl ?? (spawn as unknown as SpawnLike)
+  const encoded = Buffer.from(args.script, 'utf16le').toString('base64')
+  const argv = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]
+  const env = { ...pickSafeEnv(), ...buildDefaultEnv(args.configPath, args.parentDir, args.tmpPath) }
+
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (r: WriteScriptResult): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { child.kill() } catch { /* 已退出 */ }
+      resolve(r)
+    }
+
+    let child: ChildLike
+    try {
+      child = spawnImpl('powershell.exe', argv, { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    } catch {
+      resolve({ ...FAILED })
+      return
+    }
+
+    const timer = setTimeout(() => finish({ ...FAILED }), timeoutMs)
+    let buffer = ''
+    let payloadSent = false
+    /** 任一 checkpoint 被拒后，即使脚本仍打印 READY 也**不得**发送秘密。 */
+    let denied: string | null = null
+
+    const onLine = (line: string): void => {
+      if (settled) return
+      if (line.startsWith(CP_PREFIX)) {
+        let cp: WriteCheckpoint
+        try {
+          cp = JSON.parse(line.slice(CP_PREFIX.length)) as WriteCheckpoint
+        } catch {
+          finish({ ...FAILED })
+          return
+        }
+        if (payloadSent) { finish({ ...FAILED }); return } // checkpoint 不许出现在载荷之后
+        let decision: CheckpointDecision
+        try {
+          decision = args.onCheckpoint(cp)
+        } catch {
+          finish({ ...FAILED })
+          return
+        }
+        if (!decision.go) denied = decision.problem
+        try {
+          child.stdin?.write(decision.go ? 'GO\n' : `STOP ${decision.problem}\n`)
+        } catch {
+          finish({ ...FAILED })
+        }
+        return
+      }
+      if (line.trim() === READY_LINE) {
+        // 载荷只在这里发送：它是 secret 进入子进程的唯一时点。
+        if (denied !== null) { finish({ ok: false, stage: 'probe', problem: denied }); return }
+        payloadSent = true
+        try {
+          child.stdin?.write(`${JSON.stringify({ config: args.config })}\n`)
+        } catch {
+          finish({ ...FAILED })
+        }
+        return
+      }
+      if (line.startsWith(RESULT_PREFIX)) {
+        let parsed: WriteScriptResult | null
+        try {
+          parsed = coerceResult(JSON.parse(line.slice(RESULT_PREFIX.length)))
+        } catch {
+          parsed = null
+        }
+        finish(parsed ?? { ...FAILED })
+      }
+    }
+
+    child.stdout?.on('data', (chunk) => {
+      buffer += chunk.toString()
+      for (;;) {
+        const idx = buffer.search(/\r?\n/)
+        if (idx < 0) break
+        const line = buffer.slice(0, idx)
+        const sepLen = buffer.startsWith('\r\n', idx) ? 2 : 1
+        buffer = buffer.slice(idx + sepLen)
+        onLine(line)
+      }
+    })
+    child.on('exit', () => {
+      if (!settled) finish({ ...FAILED })
+    })
+    child.on('error', () => finish({ ...FAILED }))
+  })
 }

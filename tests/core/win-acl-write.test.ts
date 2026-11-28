@@ -10,7 +10,9 @@
 import { spawnSync } from 'node:child_process'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  buildDefaultEnv, buildWritePayload, defaultTmpPath, renderWriteScript, runWriteScript,
+  buildDefaultEnv, buildWritePayload, defaultTmpPath, renderWriteScript, runWriteScript, runWriteInteractive,
+  CP_PREFIX, READY_LINE, RESULT_PREFIX,
+  type SpawnLike, type WriteScriptResult,
   type Runner, type Stage, type WritePlan, type WriteScriptResult,
 } from '../../src/core/win-acl-write.js'
 
@@ -324,5 +326,95 @@ describe('defaultRunner：spawnSync 命令行契约', () => {
   it('stdout 为 null / 非 string（encoding 契约被打断）→ script-failed', () => {
     mocked.mockReturnValue({ status: 0, stdout: null, stderr: '' } as never)
     expect(runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload())).toEqual(FAILED)
+  })
+})
+
+// ── 交互协议（Task 5）：checkpoint → GO/STOP → READY 之后才允许发送秘密 ──────
+describe('runWriteInteractive：secret 只在 READY 之后进入子进程', () => {
+  class FakeChild {
+    writes: string[] = []
+    private out: ((c: Buffer | string) => void)[] = []
+    private exit: ((code: unknown) => void)[] = []
+    private error: ((e: unknown) => void)[] = []
+    stdin = { write: (c: string) => { this.writes.push(c); return true }, end: () => {} }
+    stdout = { on: (_e: 'data', cb: (c: Buffer | string) => void) => { this.out.push(cb) } }
+    stderr = { on: () => {} }
+    on = (e: 'exit' | 'error', cb: (arg: unknown) => void) => {
+      if (e === 'exit') this.exit.push(cb); else this.error.push(cb)
+    }
+    kill = () => {}
+    emitLine(s: string): void { for (const cb of this.out) cb(s + '\r\n') }
+    emitExit(code: number): void { for (const cb of this.exit) cb(code) }
+    emitError(e: unknown): void { for (const cb of this.error) cb(e) }
+  }
+
+  const CP = CP_PREFIX + JSON.stringify({ stage: 'probe', selfSid: 'S-1-5-21-1' })
+
+  it('happy path：CP→GO、READY→载荷、RESULT→结果；载荷前没有 secret', async () => {
+    const child = new FakeChild()
+    const spawnArgs: { cmd: string; argv: string[]; opts: Record<string, unknown> }[] = []
+    const spawnImpl: SpawnLike = (cmd, argv, opts) => { spawnArgs.push({ cmd, argv, opts }); return child }
+    const decide = vi.fn(() => ({ go: true as const }))
+    const p = runWriteInteractive({
+      script: renderWriteScript(plan()), configPath: CONFIG, parentDir: PARENT, tmpPath: TMP,
+      config: CONFIG_JSON, onCheckpoint: decide, spawnImpl, timeoutMs: 5000,
+    })
+
+    child.emitLine('noise line')
+    child.emitLine(CP)
+    expect(child.writes).toEqual(['GO\n'])
+    expect(decide).toHaveBeenCalledWith({ stage: 'probe', selfSid: 'S-1-5-21-1' })
+
+    child.emitLine(READY_LINE)
+    expect(child.writes[1]).toBe(JSON.stringify({ config: CONFIG_JSON }) + '\n')
+    // 载荷里有 secret，但它只在第 2 次写入时出现；argv/env 都没有
+    expect(spawnArgs[0]!.argv.join('\u0000')).not.toContain(SECRET)
+    expect(JSON.stringify(spawnArgs[0]!.opts.env)).not.toContain(SECRET)
+
+    child.emitLine(RESULT_PREFIX + '{"ok":true,"stage":"done"}')
+    await expect(p).resolves.toEqual({ ok: true, stage: 'done' })
+  })
+
+  it('STOP 后即使脚本打印 READY 也不得发送载荷', async () => {
+    const child = new FakeChild()
+    const p = runWriteInteractive({
+      script: renderWriteScript(plan()), configPath: CONFIG, parentDir: PARENT, tmpPath: TMP,
+      config: CONFIG_JSON,
+      onCheckpoint: () => ({ go: false, problem: 'parent-writable' }),
+      spawnImpl: () => child, timeoutMs: 5000,
+    })
+    child.emitLine(CP)
+    expect(child.writes).toEqual(['STOP parent-writable\n'])
+    child.emitLine(READY_LINE)
+    expect(child.writes).toEqual(['STOP parent-writable\n'])
+    await expect(p).resolves.toEqual({ ok: false, stage: 'probe', problem: 'parent-writable' })
+  })
+
+  it('超时 / 无结果退出 / 结果行畸形 → script-failed', async () => {
+    const mk = (): FakeChild => new FakeChild()
+    const runWith = (timeoutMs: number, drive: (c: FakeChild) => void): Promise<WriteScriptResult> => {
+      const c = mk()
+      const p = runWriteInteractive({
+        script: renderWriteScript(plan()), configPath: CONFIG, parentDir: PARENT, tmpPath: TMP,
+        config: CONFIG_JSON, onCheckpoint: () => ({ go: true }), spawnImpl: () => c, timeoutMs,
+      })
+      drive(c)
+      return p
+    }
+    await expect(runWith(30, () => {})).resolves.toEqual(FAILED)
+    await expect(runWith(5000, (c) => c.emitExit(1))).resolves.toEqual(FAILED)
+    await expect(runWith(5000, (c) => c.emitLine(RESULT_PREFIX + 'not json'))).resolves.toEqual(FAILED)
+  })
+
+  it('checkpoint 出现在载荷之后 → 立即失败（协议被破坏）', async () => {
+    const child = new FakeChild()
+    const p = runWriteInteractive({
+      script: renderWriteScript(plan()), configPath: CONFIG, parentDir: PARENT, tmpPath: TMP,
+      config: CONFIG_JSON, onCheckpoint: () => ({ go: true }), spawnImpl: () => child, timeoutMs: 5000,
+    })
+    child.emitLine(CP)
+    child.emitLine(READY_LINE)
+    child.emitLine(CP)
+    await expect(p).resolves.toEqual(FAILED)
   })
 })
