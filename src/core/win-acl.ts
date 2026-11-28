@@ -155,10 +155,15 @@ function allowMatches(sid: string, token: TokenSnapshot): boolean {
   )
 }
 
-/** deny 语义的命中：deny-only 组**照常**参与拒绝，所以只看 SID 是否在令牌里。 */
+/**
+ * deny 语义的命中：已启用或 deny-only 的组参与拒绝（MS-DTYP `SidInToken`）；
+ * 被禁用的普通组既不授予也不拒绝——把它算进 deny 会把安全 ACL 误报成 read-denied。
+ */
 function denyMatches(sid: string, token: TokenSnapshot): boolean {
   if (sid === token.userSid) return true
-  return token.groups.some((g) => g.sid === sid)
+  return token.groups.some(
+    (g) => g.sid === sid && (g.attr & (SE_GROUP_ENABLED | SE_GROUP_USE_FOR_DENY_ONLY)) !== 0,
+  )
 }
 
 /**
@@ -220,11 +225,13 @@ function hasDacl(sddl: string): boolean {
 
 /** 父目录的写面受信（清单第 7 条）：属主受信 + 非受信主体没有写类允许 ACE。 */
 export function evaluateParentAcl(parent: AclSnapshot, token: TokenSnapshot): { ok: true } | { ok: false; problem: AclProblem } {
-  if (parent.aces.some((a) => a.cls !== FILE_SYSTEM_ACCESS_RULE || (a.type !== 'Allow' && a.type !== 'Deny'))) {
+  // INHERIT_ONLY ACE 只作用于子项，不参与目录自身的访问检查——把它们算进写面会把安全父目录误报。
+  const effective = parent.aces.filter((a) => !a.inheritOnly)
+  if (effective.some((a) => a.cls !== FILE_SYSTEM_ACCESS_RULE || (a.type !== 'Allow' && a.type !== 'Deny'))) {
     return { ok: false, problem: 'unsupported-ace' }
   }
   if (!trustedSid(parent.ownerSid, token)) return { ok: false, problem: 'parent-untrusted-owner' }
-  const writable = parent.aces.some(
+  const writable = effective.some(
     (a) => a.type === 'Allow' && !trustedSid(a.sid, token) && (a.mask & DIR_WRITE_CLASS) !== 0,
   )
   if (writable) return { ok: false, problem: 'parent-writable' }
@@ -316,7 +323,8 @@ public static class QiyuTok {
       int got;
       if (!GetTokenInformation(tok, cls, buf, len, out got)) throw new Exception("query");
       int count = Marshal.ReadInt32(buf);
-      IntPtr arr = IntPtr.Add(buf, 8);
+      int arrOff = IntPtr.Size == 8 ? 8 : 4;
+      IntPtr arr = IntPtr.Add(buf, arrOff);
       int structSize = IntPtr.Size == 8 ? 16 : 8;
       var list = new List<string>();
       for (int i = 0; i < count; i++) {

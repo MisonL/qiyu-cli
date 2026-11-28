@@ -38,6 +38,8 @@ export interface WriteScriptResult {
   /** 脚本相关路径（tmp 或目标）；不含 secret。 */
   path?: string
   sddlReadback?: string
+  /** 失败收尾时 tmp 是否仍残留（含 secret，ACL 受限）。 */
+  tmpLeft?: boolean
 }
 
 export interface WritePlan {
@@ -300,7 +302,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  if ([string]::IsNullOrEmpty($file) -or [string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($tmp)) { $result.problem = "missing-paths"; throw "stop" }',
     '  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
     '  $result.selfSid = $sid',
-    '  $fileSddl = "D:P(A;;0x12019f;;;$sid)"',
+    '  $fileSddl = "D:P(A;;0x13019f;;;$sid)"',
     '  $dirSddl = "D:P(A;;FA;;;$sid)"',
     '',
     '  # 0. probe: bind the parent handle FIRST (hold it), read its ACL, let Node decide.',
@@ -369,9 +371,11 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  $result.path = $tmp',
     '  $result.sddlReadback = [QiyuWrite]::SddlFromHandle($h)',
     '',
-    '  # verify-tmp: the readback must literally carry the requested DACL and the current owner.',
+    '  # verify-tmp: the readback must carry the requested DACL and the current owner.',
+    '  # Some flows read back with the ACL-level AI flag (D:PAI); normalize it before comparing.',
     '  $result.stage = "verify-tmp"',
-    '  $daclOk = $result.sddlReadback.Contains($fileSddl)',
+    '  $rbTmp = $result.sddlReadback -replace ":PAI\\(", ":P("',
+    '  $daclOk = $rbTmp.Contains($fileSddl)',
     '  $ownerOk = $result.sddlReadback.StartsWith("O:$sid")',
     '  if (-not ($daclOk -and $ownerOk)) { $result.problem = "sddl-mismatch"; throw "stop" }',
     '',
@@ -405,13 +409,18 @@ export function renderWriteScript(_plan: WritePlan): string {
     '',
     '  # verify-target',
     '  $result.stage = "verify-target"',
-    '  $final = (Get-Acl -LiteralPath $file).Sddl',
+    '  $final = ((Get-Acl -LiteralPath $file).Sddl) -replace ":PAI\\(", ":P("',
     '  if (-not $final.Contains($fileSddl)) { $result.ok = $false; $result.problem = "target-sddl-mismatch"; throw "stop" }',
     '  $result.stage = "done"',
     '} catch {',
     '  if (-not $result.ContainsKey("problem")) { $result.problem = "script-error" }',
     '} finally {',
     '  foreach ($hh in @($h, $qi, $rel, $ph)) { if ($hh -ne [IntPtr]::Zero) { [QiyuWrite]::CloseHandle($hh) | Out-Null } }',
+    '  # A failed run must not leave the secret in the tmp file. Best effort: remove it and report.',
+    '  if ($result.stage -ne "done" -and [System.IO.File]::Exists($tmp)) {',
+    '    try { [System.IO.File]::Delete($tmp) } catch { }',
+    '    $result.tmpLeft = [System.IO.File]::Exists($tmp)',
+    '  }',
     '}',
     'Emit ("QIYU-RESULT " + ($result | ConvertTo-Json -Compress))',
     'exit 0',
@@ -779,10 +788,18 @@ export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
 
 /** 写序失败：带 stage 与 problem，供上层渲染成带修法的错误。 */
 export class WinWriteError extends Error {
-  constructor(readonly stage: Stage, readonly problem: string, readonly selfSid?: string) {
+  /**
+   * `wroteTarget`：就绪判据是「stage === 'verify-target'」——换入已发生，目标内容已是新凭证，
+   * 只是换入后的 ACL 复核没过；此时不能说「凭证未写入」，否则 Agent 会以为旧配置还在。
+   */
+  constructor(
+    readonly stage: Stage, readonly problem: string, readonly selfSid?: string,
+    readonly tmpPath?: string, readonly tmpLeft?: boolean,
+  ) {
     super(`Windows 写序在 ${stage} 阶段失败（${problem}）`)
     this.name = 'WinWriteError'
   }
+  get wroteTarget(): boolean { return this.stage === 'verify-target' }
 }
 
 export interface WinWriteOptions {
@@ -809,5 +826,7 @@ export async function writeConfigFileWin32(
     script, configPath, parentDir, tmpPath, config: serialized,
     onCheckpoint: judge,
   })
-  if (!r.ok || r.stage !== 'done') throw new WinWriteError(r.stage, r.problem ?? 'not-done', r.selfSid)
+  if (!r.ok || r.stage !== 'done') {
+    throw new WinWriteError(r.stage, r.problem ?? 'not-done', r.selfSid, tmpPath, r.tmpLeft)
+  }
 }

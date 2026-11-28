@@ -307,13 +307,28 @@ async function login(argv: string[]): Promise<number> {
     // 写盘失败是环境问题（权限/符号链接/磁盘）——归业务错误（退出码 1），
     // 不是"改参数重来"。文案带上底层原因，否则用户只知道"失败了"。
     if (e instanceof WinWriteError) {
-      // 只有 ACL 成因才给 DACL 修复命令；`parent-open-failed` 之类的路径/IO 成因照 ACL 修是修错对象（真机实测 2026-11-28）。
-      const aclHint = isAclProblem(e.problem)
-        ? `${e.stage} 阶段：${describeAclProblem(e.problem)}；可执行：${aclFixCommand(configPath, dirname(configPath), { problem: e.problem, selfSid: e.selfSid, onDir: e.stage === 'probe' })}`
-        : `${e.stage} 阶段失败（${e.problem}）；请检查 ${dirname(configPath)} 及其上级目录是否存在、盘符可用`
+      // 换入（replace）已成功、只是换入后复核失败时，文件里**已经是新凭证**——照实报告，
+      // 说「未写入」会让 Agent 以为旧配置还在（Codex 65 P2）。
+      // 只有 ACL 成因才给 DACL 修复命令；`parent-open-failed` 之类的路径/IO 成因照 ACL 修是修错对象（真机 2026-11-28）。
+      const problem = e.problem
+      const aclProblem = isAclProblem(problem)
+      const stageText = `${e.stage} ${aclProblem ? `阶段：${describeAclProblem(problem)}` : `阶段失败（${problem}）`}`
+      let aclHint: string
+      if (aclProblem) {
+        aclHint = `${stageText}；可执行：${aclFixCommand(configPath, dirname(configPath), { problem, selfSid: e.selfSid, onDir: e.stage === 'probe' })}`
+      } else if (e.wroteTarget) {
+        aclHint = `${stageText}；文件内容已更新为新凭证，请用 Get-Acl 复核该文件的 DACL（应受保护、只授当前账户），确认无误后可重新执行 auth login`
+      } else {
+        aclHint = `${stageText}；请检查 ${dirname(configPath)} 及其上级目录是否存在、盘符可用`
+        if (e.tmpLeft === true && e.tmpPath !== undefined) {
+          aclHint += `；临时文件仍残留：${e.tmpPath}（受限 ACL，仅当前账户可读），删除后可重试`
+        }
+      }
       return fail({
         code: 'config_insecure', kind: 'config_insecure', retryable: false,
-        message: `凭证未写入 ${configPath}（Windows 写序在 ${e.stage} 阶段失败：${describeAclProblemOr(e.problem)}）`,
+        message: e.wroteTarget
+          ? `凭证已写入 ${configPath}，但换入后的 ACL 复核未通过（Windows 写序在 ${e.stage} 阶段失败：${describeAclProblemOr(e.problem)}）`
+          : `凭证未写入 ${configPath}（Windows 写序在 ${e.stage} 阶段失败：${describeAclProblemOr(e.problem)}）`,
         hint: aclHint,
       })
     }

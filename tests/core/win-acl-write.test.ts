@@ -83,7 +83,7 @@ describe('renderWriteScript：纯 ASCII 骨架', () => {
     expect(script).toMatch(/ConvertTo-Json -Compress/)
     expect(script).toMatch(/CreateRestricted/)
     expect(script).toMatch(/already-exists/)
-    expect(script).toMatch(/0x12019f/)
+    expect(script).toMatch(/0x13019f/)
     expect(script).toMatch(/TargetIsReparse/)
     expect(script).toMatch(/MoveFileExW\(\$tmp, \$file, \[uint32\]1\)/)
     expect(script).toMatch(/verify-target/)
@@ -521,5 +521,61 @@ describe('judgeCheckpoint：created 阶段不需要 parent', () => {
     const cp = good()
     cp.qiyu = JSON.stringify({ sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID, aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: 0x1f01ff, inheritOnly: false }] })
     expect(judgeCheckpoint(cp as never)).toEqual({ go: false, problem: 'dacl-inherited' })
+  })
+})
+
+
+describe('Codex 65 写序修复', () => {
+  it('文件配方含 DELETE（0x13019f，规格 §2.4a）；不再出现无 DELETE 的 0x12019f', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('D:P(A;;0x13019f;;;$sid)')
+    expect(script).not.toContain('0x12019f')
+  })
+
+  it('回读带 AI 时先规范化再比（verify-tmp 与 verify-target 两处）', () => {
+    const script = renderWriteScript(plan())
+    const NORM = String.raw`-replace ":PAI\(", ":P("`
+    const normCount = script.split(NORM).length - 1
+    expect(normCount).toBe(2)
+    // 规范化必须发生在比较之前
+    expect(script.indexOf(NORM)).toBeLessThan(script.indexOf('$daclOk = $rbTmp.Contains($fileSddl)'))
+  })
+
+  it('注释行不得直接跟在续行符之后（反引号会吞注释，续行后语句被消除）', () => {
+    const lines = renderWriteScript(plan()).split('\r\n')
+    for (let i = 1; i < lines.length; i++) {
+      if (lines[i].trimStart().startsWith('#')) {
+        expect(lines[i - 1].trimEnd().endsWith('`'), `第 ${i} 行的注释被上一层续行吞掉：${lines[i]}`).toBe(false)
+      }
+    }
+
+  })
+
+  it('失败收尾会尝试删除含 secret 的 tmp 并报告残留', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('if ($result.stage -ne "done" -and [System.IO.File]::Exists($tmp))')
+    expect(script).toContain('[System.IO.File]::Delete($tmp)')
+    expect(script).toContain('$result.tmpLeft = [System.IO.File]::Exists($tmp)')
+  })
+
+  it('关键操作顺序：绑定父目录 → 受限创建 → 同一句柄写入 → 关闭 → 换名', () => {
+    const script = renderWriteScript(plan())
+    const order = ['OpenDir($up', 'CreateRestricted($tmp', 'WriteAll($h', 'CloseHandle($h)', 'MoveFileExW($tmp, $file']
+    const idx = order.map((op) => script.indexOf(op))
+    for (let i = 0; i < idx.length; i++) {
+      expect(idx[i], `${order[i]} 应在脚本里`).toBeGreaterThan(-1)
+      if (i > 0) expect(idx[i], `${order[i]} 应在 ${order[i - 1]} 之后`).toBeGreaterThan(idx[i - 1])
+    }
+  })
+
+  it('wroteTarget 只在 verify-target 阶段为真；tmpLeft 透传给上层', async () => {
+    const run = vi.fn(async () => ({ ok: false, stage: 'verify-target' as const, problem: 'target-sddl-mismatch', selfSid: USER_SID }))
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: run as never })).rejects.toMatchObject({
+      stage: 'verify-target', wroteTarget: true,
+    })
+    const run2 = vi.fn(async () => ({ ok: false, stage: 'replace' as const, problem: 'replace-failed', tmpLeft: true }))
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: run2 as never })).rejects.toMatchObject({
+      wroteTarget: false, tmpLeft: true,
+    })
   })
 })

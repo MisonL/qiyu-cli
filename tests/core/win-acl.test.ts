@@ -327,3 +327,19 @@ describe('isAclProblem：运行期成员清单（唯一出处）', () => {
     }
   })
 })
+
+describe('读面：Codex 65 判据（禁用组 / 父目录 INHERIT_ONLY）', () => {
+  it('deny 命中被禁用且非 deny-only 的组不算拒绝（既不授予也不拒绝）', () => {
+    const disabledAdmins: TokenSnapshot = { userSid: USER, groups: [{ sid: ADMINS, attr: 0 }], restrictedSids: [] }
+    const file = acl([ace('Deny', ADMINS, 0x1), ace('Allow', USER, FULL)])
+    expect(evaluateWinAcl(snapshot(file, cleanParent(), disabledAdmins))).toEqual({ ok: true, checked: true })
+  })
+
+  it('父目录的 INHERIT_ONLY 写 ACE 不参与目录自身访问检查 → 不误报 parent-writable', () => {
+    const parent = acl([
+      ace('Allow', OTHER_USER, FILE_ADD_FILE, { inheritOnly: true }),
+      ace('Allow', USER, FULL),
+    ])
+    expect(evaluateWinAcl(snapshot(acl([ace('Allow', USER, FULL)]), parent))).toEqual({ ok: true, checked: true })
+  })
+})
