@@ -8,7 +8,17 @@ import {
   resolveProfileName, shellPath,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
-import { describeAclProblem } from '../core/win-acl.js'
+import { describeAclProblem, type AclProblem } from '../core/win-acl.js'
+import { WinWriteError } from '../core/win-acl-write.js'
+
+/** 写序 problem 若是 ACL 成因，用同一份文案；否则原样给稳定串。 */
+function describeAclProblemOr(problem: string): string {
+  const known: AclProblem[] = [
+    'dacl-missing', 'dacl-empty', 'unsupported-ace', 'untrusted-owner', 'untrusted-allow', 'read-denied',
+    'dacl-inherited', 'parent-untrusted-owner', 'parent-writable', 'dir-recipe-mismatch', 'restricted-token', 'probe-failed',
+  ]
+  return (known as string[]).includes(problem) ? describeAclProblem(problem as AclProblem) : problem
+}
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -296,10 +306,20 @@ async function login(argv: string[]): Promise<number> {
     },
   }
   try {
-    writeConfigFile(configPath, next)
+    await writeConfigFile(configPath, next)
   } catch (e) {
     // 写盘失败是环境问题（权限/符号链接/磁盘）——归业务错误（退出码 1），
     // 不是"改参数重来"。文案带上底层原因，否则用户只知道"失败了"。
+    if (e instanceof WinWriteError) {
+      const aclHint = /parent-|dir-|dacl|untrusted|reparse/.test(e.problem)
+        ? `${e.stage} 阶段：${describeAclProblemOr(e.problem)}；可执行：${aclFixCommand(configPath, dirname(configPath))}`
+        : `${e.stage} 阶段失败（${e.problem}）；请检查目录可写、config.json 不是符号链接`
+      return fail({
+        code: 'config_insecure', kind: 'config_insecure', retryable: false,
+        message: `凭证未写入 ${configPath}（Windows 写序在 ${e.stage} 阶段失败：${describeAclProblemOr(e.problem)}）`,
+        hint: aclHint,
+      })
+    }
     const msg = (e as Error).message
     // 符号链接是我们的显式拒绝 —— 也归这里（用户的动作是"换成普通文件"）。
     return fail({

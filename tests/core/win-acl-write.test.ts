@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildDefaultEnv, buildWritePayload, defaultTmpPath, renderWriteScript, runWriteScript, runWriteInteractive,
-  CP_PREFIX, READY_LINE, RESULT_PREFIX,
+  CP_PREFIX, READY_LINE, RESULT_PREFIX, judgeCheckpoint, writeConfigFileWin32, WinWriteError,
   type SpawnLike, type WriteScriptResult,
   type Runner, type Stage, type WritePlan, type WriteScriptResult,
 } from '../../src/core/win-acl-write.js'
@@ -421,5 +421,59 @@ describe('runWriteInteractive：secret 只在 READY 之后进入子进程', () =
     child.emitLine(READY_LINE)
     child.emitLine(CP)
     await expect(p).resolves.toEqual(FAILED)
+  })
+})
+
+// ── Task 6：判定与 win32 写入入口 ──────────────────────────────────────────
+describe('judgeCheckpoint / writeConfigFileWin32', () => {
+  const DIR_FA = 0x1f01ff
+  const aclJson = (over: Record<string, unknown> = {}): string => JSON.stringify({
+    sddl: 'D:PAI',
+    daclProtected: true,
+    ownerSid: USER_SID,
+    aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: DIR_FA, inheritOnly: false }],
+    ...over,
+  })
+  const parentAcl = (): string => JSON.stringify({
+    sddl: 'D:AI',
+    daclProtected: false,
+    ownerSid: USER_SID,
+    aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: DIR_FA, inheritOnly: false }],
+  })
+
+  it('复用档全绿 → GO；宽松父目录 → parent-writable', () => {
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, created: false, identityMatch: true, reparse: false, qiyu: aclJson(), parent: parentAcl() }))
+      .toEqual({ go: true })
+    const looseParent = JSON.stringify({
+      sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
+      aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: 'S-1-1-0', mask: 0x2, inheritOnly: false }],
+    })
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, created: false, identityMatch: true, reparse: false, qiyu: aclJson(), parent: looseParent }))
+      .toEqual({ go: false, problem: 'parent-writable' })
+  })
+
+  it('身份不符 / 重解析点 / 目录配方不合规 → 各自 STOP', () => {
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, created: true, identityMatch: false, reparse: false, qiyu: aclJson(), parent: parentAcl() }))
+      .toEqual({ go: false, problem: 'dir-identity-mismatch' })
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, created: true, identityMatch: true, reparse: true, qiyu: aclJson(), parent: parentAcl() }))
+      .toEqual({ go: false, problem: 'dir-is-reparse' })
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, created: true, identityMatch: true, reparse: false, qiyu: aclJson({ daclProtected: false }), parent: parentAcl() }))
+      .toEqual({ go: false, problem: 'dacl-inherited' })
+  })
+
+  it('首次登录：parent 阶段 created=true 时不要求身份（目录尚不存在）', () => {
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, created: true, parent: parentAcl() }))
+      .toEqual({ go: true })
+  })
+
+  it('writeConfigFileWin32：done 才成功；其余 stage 抛 WinWriteError（不返回部分成功）', async () => {
+    const okRun = vi.fn(async () => ({ ok: true, stage: 'done' as const }))
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: okRun as never })).resolves.toBeUndefined()
+    const failRun = vi.fn(async () => ({ ok: false, stage: 'verify-tmp' as const, problem: 'sddl-mismatch' }))
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: failRun as never })).rejects.toMatchObject({
+      name: 'WinWriteError', stage: 'verify-tmp', problem: 'sddl-mismatch',
+    })
+    const partialRun = vi.fn(async () => ({ ok: true, stage: 'write-secret' as const }))
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: partialRun as never })).rejects.toMatchObject({ stage: 'write-secret' })
   })
 })

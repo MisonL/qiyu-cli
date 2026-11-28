@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import { join, dirname, isAbsolute } from 'node:path'
 import { shellArg } from './shell.js'
 import { checkWinAcl, describeAclProblem, type AclProblem } from './win-acl.js'
+import { writeConfigFileWin32 } from './win-acl-write.js'
 
 /** 顶层已知键 —— 未知键 fail-closed（spec §3.3）。 */
 export const KNOWN_TOP = new Set(['defaultProfile', 'profiles'])
@@ -611,7 +612,12 @@ export function fileCredentials(
  * ⚠️ config 是符号链接时拒绝 —— 写入会穿透到链接目标（可能是任意路径）。
  * ⚠️ 合并语义由调用方先算好完整内容；本函数只负责「安全落盘」。
  */
-export function writeConfigFile(configPath: string, content: QiyuConfigFile): void {
+export function writeConfigFile(configPath: string, content: QiyuConfigFile): void | Promise<void> {
+  // Windows：POSIX 权限位不映射 NTFS ACL，走写序 ⓪–⑥（异步：需要 checkpoint 往返）。
+  // POSIX 分支逐字节不变（现有用例是验收线）。
+  if (process.platform === 'win32') {
+    return writeConfigFileWin32(configPath, serializeConfig(content))
+  }
   const dir = dirname(configPath)
   // ⚠️ lstat 不跟随链接：statSync 会穿透到目标，探测不到「config 本身是链接」。
   // 文件不存在（首次 login）是正常路径 —— ENOENT 放行，其余 errno 照常抛。

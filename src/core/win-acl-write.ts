@@ -11,6 +11,9 @@
  * （真机实测），所以这里注释全英文，中文只出现在本 TS 文件的注释里。
  */
 import { spawn, spawnSync } from 'node:child_process'
+import {
+  evaluateDirectoryAcl, evaluateParentAcl, parseAclSnapshot, type TokenSnapshot,
+} from './win-acl.js'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -581,13 +584,19 @@ export const RESULT_PREFIX = 'QIYU-RESULT '
 
 export interface WriteCheckpoint {
   stage: Stage
+  /** 'parent'（绑定父目录后）或 'created'（首次登录已建目录后）。 */
+  phase?: 'parent' | 'created'
   /** 脚本探到的当前用户 SID。 */
   selfSid?: string
-  /** 待 Node 判定的 ACL 节点（形状与 `win-acl.ts` 的 `AclSnapshot` 一致）。 */
+  /** 待 Node 判定的 ACL 节点（JSON 字符串或已解析对象，形状同 `AclSnapshot`）。 */
   qiyu?: unknown
   parent?: unknown
-  /** 首次登录：qiyu 目录不存在、脚本准备按受限 SD 创建。 */
-  createDir?: boolean
+  /** qiyu 是否由本次调用创建。 */
+  created?: boolean
+  /** 相对打开的身份是否与 qiyu 句柄一致（仅复用档有）。 */
+  identityMatch?: boolean
+  /** qiyu 是否为重解析点。 */
+  reparse?: boolean
 }
 
 export type CheckpointDecision = { go: true } | { go: false; problem: string }
@@ -721,4 +730,74 @@ export function runWriteInteractive(args: InteractiveArgs): Promise<WriteScriptR
     })
     child.on('error', () => finish({ ...FAILED }))
   })
+}
+
+// ── 判定与入口（Task 6）────────────────────────────────────────────────────
+
+/** checkpoint 的**默认判定**：全部走 `win-acl.ts` 的纯函数（唯一判据实现点）。 */
+export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
+  const userSid = cp.selfSid
+  if (typeof userSid !== 'string' || userSid === '') return { go: false, problem: 'missing-selfsid' }
+  const token: TokenSnapshot = { userSid, groups: [], restrictedSids: [] }
+  const parse = (v: unknown): ReturnType<typeof parseAclSnapshot> => {
+    if (typeof v === 'string') { try { return parseAclSnapshot(JSON.parse(v)) } catch { return null } }
+    return parseAclSnapshot(v)
+  }
+  const parent = parse(cp.parent)
+  if (parent === null) return { go: false, problem: 'parent-unparsable' }
+  const pv = evaluateParentAcl(parent, token)
+  if (!pv.ok) return { go: false, problem: pv.problem }
+  if (cp.phase === 'created') {
+    if (cp.reparse === true) return { go: false, problem: 'dir-is-reparse' }
+    if (cp.identityMatch !== true) return { go: false, problem: 'dir-identity-mismatch' }
+    const qiyu = parse(cp.qiyu)
+    if (qiyu === null) return { go: false, problem: 'dir-unparsable' }
+    const dv = evaluateDirectoryAcl(qiyu, userSid)
+    return dv.ok ? { go: true } : { go: false, problem: dv.problem }
+  }
+  // phase 'parent'：复用档（目录已存在）在同一个 checkpoint 里附带了 qiyu 的判定材料。
+  if (cp.created !== true) {
+    if (cp.reparse === true) return { go: false, problem: 'dir-is-reparse' }
+    if (cp.identityMatch !== true) return { go: false, problem: 'dir-identity-mismatch' }
+    const qiyu = parse(cp.qiyu)
+    if (qiyu === null) return { go: false, problem: 'dir-unparsable' }
+    const dv = evaluateDirectoryAcl(qiyu, userSid)
+    if (!dv.ok) return { go: false, problem: dv.problem }
+  }
+  return { go: true }
+}
+
+/** 写序失败：带 stage 与 problem，供上层渲染成带修法的错误。 */
+export class WinWriteError extends Error {
+  constructor(readonly stage: Stage, readonly problem: string) {
+    super(`Windows 写序在 ${stage} 阶段失败（${problem}）`)
+    this.name = 'WinWriteError'
+  }
+}
+
+export interface WinWriteOptions {
+  run?: typeof runWriteInteractive
+  judge?: (cp: WriteCheckpoint) => CheckpointDecision
+}
+
+/**
+ * win32 的配置写入入口：整条写序（⓪–⑥）在一个 PowerShell 进程内完成。
+ *
+ * 成功判据必须显式是 `stage === 'done'`（`ok:true` 只表示「走到该 stage 没失败」）。
+ * 失败抛 `WinWriteError`，**不返回部分成功**——上层据此报 `config_insecure` 而不是
+ * `configured:true`。
+ */
+export async function writeConfigFileWin32(
+  configPath: string, serialized: string, opts: WinWriteOptions = {},
+): Promise<void> {
+  const parentDir = configPath.slice(0, Math.max(configPath.lastIndexOf('/'), configPath.lastIndexOf('\\')))
+  const tmpPath = defaultTmpPath(configPath)
+  const script = renderWriteScript({ configPath, parentDir, tmpPath })
+  const run = opts.run ?? runWriteInteractive
+  const judge = opts.judge ?? judgeCheckpoint
+  const r = await run({
+    script, configPath, parentDir, tmpPath, config: serialized,
+    onCheckpoint: judge,
+  })
+  if (!r.ok || r.stage !== 'done') throw new WinWriteError(r.stage, r.problem ?? 'not-done')
 }
