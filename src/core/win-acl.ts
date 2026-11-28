@@ -169,7 +169,7 @@ export function describeAclProblem(problem: AclProblem): string {
  * 这类 ACE 显示成普通 FileSystemAccessRule 或干脆丢掉——只看类名不足以发现它们，
  * 所以在 SDDL 形态上也拦一道（仍不是完备判据：SDDL 也被投影过时无从得知）。
  */
-const SDDL_EXTENDED_ACE = /\((?:OA|OU|XA|XD|OD|RA)[A-Z]*;/
+const SDDL_EXTENDED_ACE = /\((?:OA|OU|XA|XD|OD|RA|ZA|ZD)[A-Z]*;/
 
 function hasExtendedAce(acl: AclSnapshot): boolean {
   return SDDL_EXTENDED_ACE.test(acl.sddl)

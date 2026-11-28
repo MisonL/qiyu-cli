@@ -402,6 +402,14 @@ async function login(argv: string[]): Promise<number> {
     }
   } catch {
     // 自检本身炸了（例如探测输出无法解析）：写入已是事实，但不能把「没查成」说成「查过且合格」。
+    // win32 与 acl-unchecked 走同一个响应（退出码 1）：同一件事不能因「抛异常/返回判不了」而两种结局。
+    if (process.platform === 'win32') {
+      return fail({
+        code: 'config_insecure', kind: 'config_insecure', retryable: false,
+        message: `凭证已写入 ${configPath}，但 Windows ACL 复核未完成（探测执行失败，结论未知）`,
+        hint: '先确认 PowerShell 可用、配置文件位于 NTFS 卷上，再用 Get-Acl 复核其 DACL（应受保护、只授当前账户）',
+      })
+    }
     verifyWarnings.push('凭证已写入，但写入后的权限自检未完成（自检执行失败）；本次写入不视为「权限已复核」')
   }
 

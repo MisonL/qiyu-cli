@@ -877,3 +877,20 @@ describe('Codex 第五轮：SID 形状', () => {
     })).toEqual({ go: false, problem: 'selfsid-unparsable' })
   })
 })
+
+
+describe('CR 第三轮：tmp 绑定与逐字节比较', () => {
+  it('受限创建后用 qiyu 句柄相对打开比 tmp 身份（祖先被换时能识别）', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('tmp-identity-mismatch')
+    const createAt = script.indexOf('CreateRestricted($tmp')
+    const relAt = script.indexOf('OpenChildFile($qi, (Split-Path -Leaf $tmp)')
+    expect(relAt).toBeGreaterThan(createAt)
+  })
+
+  it('写后读回用 -cne（PowerShell 比较不区分大小写，内容比较必须区分）', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('$back -cne [string]$payload.config')
+    expect(script).not.toContain('$back -ne [string]$payload.config')
+  })
+})

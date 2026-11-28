@@ -99,6 +99,21 @@ describe('auth login：Windows 写序失败的如实报告', () => {
     expect(e.hint).toContain('.config.json.tmp-1')
   })
 
+  it('win32 自检抛异常 → 与 acl-unchecked 同为 config_insecure（退出 1）', async () => {
+    const orig = Object.getOwnPropertyDescriptor(process, 'platform')
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+    try {
+      writeConfigFile.mockResolvedValue(undefined)
+      checkPermissions.mockImplementation(() => { throw new Error('probe output null') })
+      expect(await login()).toBe(1)
+      const e = errorOf()
+      expect(e.kind).toBe('config_insecure')
+      expect(e.message).toContain('复核未完成')
+    } finally {
+      if (orig) Object.defineProperty(process, 'platform', orig)
+    }
+  })
+
   it('写后自检抛异常 → 成功但带 warnings（不能把「没查成」说成「查过且合格」）', async () => {
     writeConfigFile.mockResolvedValue(undefined)
     checkPermissions.mockImplementation(() => { throw new Error('probe output null') })

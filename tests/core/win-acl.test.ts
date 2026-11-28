@@ -371,6 +371,8 @@ describe('CodeRabbit 17：读面补漏', () => {
 
   it('SDDL 里出现条件/对象 ACE 标记 → 判不了（.NET 的 Access 投影可能丢类型）', () => {
     const file = acl([ace('Allow', USER, FULL)], { sddl: 'D:P(XA;;0x120089;;;S-1-1-0;(Member_of{SID(S-1-5-32-544)}))' })
+    const za = acl([ace('Allow', USER, FULL)], { sddl: 'D:P(ZA;;0x120089;;;S-1-1-0)' })
+    expect(evaluateWinAcl(snapshot(za, cleanParent()))).toEqual({ ok: false, checked: false, problem: 'unsupported-ace' })
     const v = evaluateWinAcl(snapshot(file, cleanParent()))
     expect(v).toEqual({ ok: false, checked: false, problem: 'unsupported-ace' })
   })
