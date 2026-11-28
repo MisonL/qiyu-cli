@@ -192,15 +192,17 @@ export function shellPath(p: string): string {
 export type PermReason = 'file' | 'dir' | 'unreadable' | 'dir-unreadable' | 'acl' | 'acl-unchecked'
 
 /**
- * ACL 不合格时的**修法**（win32）：重建为「受保护 + 只授当前用户」的 DACL。
+ * ACL 不合格时的**修法**（win32）：按 SID 重建「受保护 + 只授当前用户」的 DACL。
  *
  * 为什么带 SID 而不是 `%USERNAME%`：hint 会被原样执行，`%USERNAME%` 只在 cmd 展开、
- * Git Bash 与 pwsh 下是字面量；`*S-1-5-…` 在各 shell 下含义一致（icacls 的 SID 前缀 `*`）。
- * 父目录问题要授 `(OI)(CI)F`，否则其下的配置文件仍可被他人继承替换。
+ * Git Bash 与 pwsh 下是字面量；SID 在各 shell 下含义一致。
  *
- * ⚠️ 修复目标必须与**真正出事的对象**一致（真机 2026-11-28）：`parent-*` 修的是 qiyu 目录的
- * 上一级（`~/.config`）；写序 `probe` 阶段判的是 qiyu 目录本身（`onDir`），不是 config.json——
- * 对着文件跑 icacls 修不好目录的继承开关。文件级成因（`verify-target`）才修 configPath。
+ * ⚠️ 为什么不用 `icacls /inheritance:r /grant:r`（CodeRabbit 2026-11-28）：`/inheritance:r`
+ * 会把继承来的 ACE 转成显式 ACE **保留**，`/grant:r` 只替换当前 SID 的授权——名单外账户的
+ * 显式/继承授权都删不掉，跑了也修不好；它也改不了属主。这里用 PowerShell 新建一个
+ * 受保护、单 ACE、属主=当前用户的 ACL 整体写回，才真正满足契约。
+ *
+ * ⚠️ 片段本身在 **PowerShell** 里执行（`$` 变量在外面被展开会坏），单引号字符串按 PS 规则转义。
  */
 export function aclFixCommand(
   configPath: string, dir: string, acl?: { problem: AclProblem; selfSid?: string; onDir?: boolean },
@@ -208,12 +210,23 @@ export function aclFixCommand(
   const onParent = acl?.problem.startsWith('parent-') ?? false
   const onDir = !onParent && (acl?.onDir ?? false)
   const target = onParent ? win32.dirname(dir) : onDir ? dir : configPath
+  const ps = (v: string): string => `'${v.replace(/'/g, "''")}'`
   if (acl?.selfSid === undefined) {
     return `用「属性 → 安全 → 高级」把 ${target} 的 DACL 重建为只授当前账户（受保护、断开继承）——`
       + `判定拿不到当前用户 SID，不给出可能半途失败的命令`
   }
-  const grant = shellArg(`*${acl.selfSid}:${onParent || onDir ? '(OI)(CI)F' : '(F)'}`, 'win32')
-  return `icacls ${shellArg(target, 'win32')} /inheritance:r /grant:r ${grant}`
+  const isDir = onParent || onDir
+  const aclType = isDir ? 'DirectorySecurity' : 'FileSecurity'
+  const rule = isDir
+    ? `New-Object System.Security.AccessControl.FileSystemAccessRule($aclSid,'FullControl','ContainerInherit, ObjectInherit','None','Allow')`
+    : `New-Object System.Security.AccessControl.FileSystemAccessRule($aclSid,'FullControl','Allow')`
+  return '在 PowerShell 中执行：'
+    + `$aclPath=${ps(target)}; `
+    + `$aclSid=New-Object System.Security.Principal.SecurityIdentifier(${ps(acl.selfSid)}); `
+    + `$aclObj=New-Object System.Security.AccessControl.${aclType}; `
+    + '$aclObj.SetOwner($aclSid); $aclObj.SetAccessRuleProtection($true,$false); '
+    + `$aclObj.AddAccessRule((${rule})); `
+    + 'Set-Acl -LiteralPath $aclPath -AclObject $aclObj'
 }
 
 /**

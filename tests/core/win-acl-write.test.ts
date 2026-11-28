@@ -340,15 +340,19 @@ describe('runWriteInteractive：secret 只在 READY 之后进入子进程', () =
     writes: string[] = []
     private out: ((c: Buffer | string) => void)[] = []
     private exit: ((code: unknown) => void)[] = []
+    private close: ((code: unknown) => void)[] = []
     private error: ((e: unknown) => void)[] = []
     stdin = { write: (c: string) => { this.writes.push(c); return true }, end: () => {} }
     stdout = { on: (_e: 'data', cb: (c: Buffer | string) => void) => { this.out.push(cb) } }
     stderr = { on: () => {} }
-    on = (e: 'exit' | 'error', cb: (arg: unknown) => void) => {
-      if (e === 'exit') this.exit.push(cb); else this.error.push(cb)
+    on = (e: 'exit' | 'close' | 'error', cb: (arg: unknown) => void) => {
+      if (e === 'exit') this.exit.push(cb)
+      else if (e === 'close') this.close.push(cb)
+      else this.error.push(cb)
     }
     kill = () => {}
     emitLine(s: string): void { for (const cb of this.out) cb(s + '\r\n') }
+    emitClose(code = 0): void { for (const cb of this.close) cb(code) }
     emitExit(code: number): void { for (const cb of this.exit) cb(code) }
     emitError(e: unknown): void { for (const cb of this.error) cb(e) }
   }
@@ -407,7 +411,7 @@ describe('runWriteInteractive：secret 只在 READY 之后进入子进程', () =
       return p
     }
     await expect(runWith(30, () => {})).resolves.toEqual(FAILED)
-    await expect(runWith(5000, (c) => c.emitExit(1))).resolves.toEqual(FAILED)
+    await expect(runWith(5000, (c) => c.emitClose(1))).resolves.toEqual(FAILED)
     await expect(runWith(5000, (c) => c.emitLine(RESULT_PREFIX + 'not json'))).resolves.toEqual(FAILED)
   })
 
@@ -528,7 +532,8 @@ describe('judgeCheckpoint：created 阶段不需要 parent', () => {
 describe('Codex 65 写序修复', () => {
   it('文件配方含 DELETE（0x13019f，规格 §2.4a）；不再出现无 DELETE 的 0x12019f', () => {
     const script = renderWriteScript(plan())
-    expect(script).toContain('D:P(A;;0x13019f;;;$sid)')
+    expect(script).toContain('0x13019f')
+    expect(script).toContain('$fileDacl = "D:P(A;;0x13019f;;;" + $sid + ")"')
     expect(script).not.toContain('0x12019f')
   })
 
@@ -538,7 +543,7 @@ describe('Codex 65 写序修复', () => {
     const normCount = script.split(NORM).length - 1
     expect(normCount).toBe(2)
     // 规范化必须发生在比较之前
-    expect(script.indexOf(NORM)).toBeLessThan(script.indexOf('$daclOk = $rbTmp.Contains($fileSddl)'))
+    expect(script.indexOf(NORM)).toBeLessThan(script.indexOf('$daclOk = $rbTmp.Contains($fileDacl)'))
   })
 
   it('注释行不得直接跟在续行符之后（反引号会吞注释，续行后语句被消除）', () => {
@@ -601,5 +606,111 @@ describe('Codex 复查：tmpLeft 必须经结果解析器（真实交互通道�
       'QIYU-RESULT ' + JSON.stringify({ ok: false, stage: 'replace', problem: 'replace-failed', tmpLeft: 'yes' }),
     ), TMP)
     expect(out).toMatchObject({ ok: false, problem: 'script-failed' })
+  })
+})
+
+
+describe('CodeRabbit 17：写序安全面修复', () => {
+  it('文件与目录 SD 都显式写属主（提权令牌默认属主可能是 Administrators）', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('$dirDacl = "D:P(A;;FA;;;" + $sid + ")"')
+    expect(script).toContain('$fileSddl = "O:" + $sid + $fileDacl')
+    expect(script).toContain('$dirSddl = "O:" + $sid + $dirDacl')
+  })
+
+  it('身份读不到/重解析点判不了 → 在发 CP 之前就停，不能把两个空串当相等', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('identity-failed')
+    expect(script).toContain('reparse-check-failed')
+    expect(script).toMatch(/\$idRel -eq "" -or \$idQ -eq ""/)
+  })
+
+  it('换入后按句柄复核身份与 ACL（Get-Acl 路径读不再作为终判）', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('OpenFile($file')
+    expect(script).toContain('target-identity-mismatch')
+    expect(script).toContain('SddlFromHandle($fh)')
+    expect(script).not.toContain('(Get-Acl -LiteralPath $file)')
+  })
+
+  it('换入成功后不再把 tmp 名字当自己的（$createdTmp 复位）', () => {
+    const script = renderWriteScript(plan())
+    const moveAt = script.indexOf('MoveFileExW($tmp, $file')
+    const resetAt = script.indexOf('$createdTmp = $false', moveAt)
+    expect(resetAt).toBeGreaterThan(moveAt)
+  })
+
+  it('同步通道把载荷当回复读到时，problem 是固定码而不是回声（secret 不得进错误文本）', () => {
+    const out = runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload(), () => ({
+      status: 0,
+      stdout: `${'QIYU-CP'} {}\r\n` + 'QIYU-RESULT ' + JSON.stringify({ ok: false, stage: 'probe', problem: 'unexpected-reply' }),
+      stderr: '',
+    }), TMP)
+    // 脚本侧固定码：回声路径已被固定码取代（脚本断言）
+    const script = renderWriteScript(plan())
+    expect(script).toContain('unexpected-reply')
+    expect(script).toContain('$reply.Substring(5)')
+    expect(out.ok).toBe(false)
+  })
+
+  it('载荷发出后子进程关闭 stdin 出错 → 结果未知（不能说未写入）', async () => {
+    const c = new FakeChildForUnknown()
+    const p = runWriteInteractive({
+      script: renderWriteScript(plan()), configPath: CONFIG, parentDir: PARENT, tmpPath: TMP,
+      config: CONFIG_JSON, onCheckpoint: () => ({ go: true }), spawnImpl: () => c as never, timeoutMs: 100,
+    })
+    c.emitLine('QIYU-CP {}')
+    c.emitLine('QIYU-READY')
+    c.emitStdinError()
+    await expect(p).resolves.toMatchObject({ ok: false, outcomeUnknown: true, stage: 'write-secret' })
+  })
+
+  it('载荷发出后进程 close → 结果未知；载荷发出前 close 仍是 script-failed', async () => {
+    const mk = () => new FakeChildForUnknown()
+    const run = (drive: (c: FakeChildForUnknown) => void) => {
+      const c = mk()
+      const p = runWriteInteractive({
+        script: renderWriteScript(plan()), configPath: CONFIG, parentDir: PARENT, tmpPath: TMP,
+        config: CONFIG_JSON, onCheckpoint: () => ({ go: true }), spawnImpl: () => c as never, timeoutMs: 5000,
+      })
+      drive(c)
+      return p
+    }
+    await expect(run((c) => { c.emitLine('QIYU-CP {}'); c.emitLine('QIYU-READY'); c.emitClose(1) }))
+      .resolves.toMatchObject({ outcomeUnknown: true })
+    const pre = await run((c) => c.emitClose(1))
+    expect(pre).toMatchObject({ ok: false, stage: 'probe' })
+    expect(pre.outcomeUnknown).toBeUndefined()
+  })
+})
+
+class FakeChildForUnknown {
+  writes: string[] = []
+  private out: ((c: Buffer | string) => void)[] = []
+  private closeCbs: ((code: unknown) => void)[] = []
+  private errCbs: ((e: unknown) => void)[] = []
+  private stdinErr: ((e: unknown) => void)[] = []
+  stdin = { write: (c: string) => { this.writes.push(c); return true }, end: () => {}, on: (_e: 'error', cb: (e: unknown) => void) => { this.stdinErr.push(cb) } }
+  stdout = { on: (_e: 'data', cb: (c: Buffer | string) => void) => { this.out.push(cb) } }
+  stderr = { on: () => {} }
+  on = (e: 'exit' | 'close' | 'error', cb: (arg: unknown) => void) => {
+    if (e === 'close') this.closeCbs.push(cb)
+    else if (e === 'error') this.errCbs.push(cb)
+  }
+  kill = () => {}
+  emitLine(s: string): void { for (const cb of this.out) cb(s + '\r\n') }
+  emitClose(code = 0): void { for (const cb of this.closeCbs) cb(code) }
+  emitStdinError(): void { for (const cb of this.stdinErr) cb(new Error('EPIPE')) }
+}
+
+
+describe('PowerShell 保留变量守卫（真机 script-error 事故 2026-11-28）', () => {
+  it('脚本不得给 $home/$input/$args/$error/$host/$pwd 等自动变量赋值', () => {
+    const script = renderWriteScript(plan())
+    // 事故形态：`$home = Split-Path ...` → SessionStateUnauthorizedAccessException（$HOME 只读），
+    // 被 catch 统一收敛成 script-error，看不出成因。
+    for (const name of ['home', 'input', 'args', 'error', 'host', 'pwd', 'profile', 'pshome']) {
+      expect(script, name).not.toMatch(new RegExp('\\$' + name + '\\s*=', 'i'))
+    }
   })
 })

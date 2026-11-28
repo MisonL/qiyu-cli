@@ -512,21 +512,34 @@ describe('aclFixCommand：修复目标必须是真正出事的对象', () => {
   const CFG = 'C:\\Users\\t\\.config\\qiyu\\config.json'
   const DIR = 'C:\\Users\\t\\.config\\qiyu'
   const SID = 'S-1-5-21-1-2-3-1001'
-  it('parent-* 修 qiyu 目录的上一级（~/.config），授 (OI)(CI)F', () => {
+  it('parent-* 修 qiyu 目录的上一级（~/.config），用 DirectorySecurity 重建', () => {
     const cmd = aclFixCommand(CFG, DIR, { problem: 'parent-writable', selfSid: SID })
     expect(cmd).toContain('C:\\Users\\t\\.config')
     expect(cmd).not.toContain('config.json')
-    expect(cmd).toContain('(OI)(CI)F')
+    expect(cmd).toContain('DirectorySecurity')
+    expect(cmd).toContain('ContainerInherit, ObjectInherit')
   })
   it('写序 probe 阶段的目录成因修 qiyu 目录本身', () => {
     const cmd = aclFixCommand(CFG, DIR, { problem: 'dacl-inherited', selfSid: SID, onDir: true })
     expect(cmd).toContain(DIR + "'")
     expect(cmd).not.toContain('config.json')
-    expect(cmd).toContain('(OI)(CI)F')
+    expect(cmd).toContain('DirectorySecurity')
   })
-  it('文件级成因修 config.json，授 (F)', () => {
+  it('文件级成因修 config.json，用 FileSecurity 单 ACE', () => {
     const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-allow', selfSid: SID })
     expect(cmd).toContain('config.json')
-    expect(cmd).toContain(':(F)')
+    expect(cmd).toContain('FileSecurity')
+    expect(cmd).not.toContain('ContainerInherit')
+  })
+  it('修法是整体重建：受保护 + 属主=当前用户（icacls 删不掉名单外 ACE、改不了属主）', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-owner', selfSid: SID })
+    expect(cmd).toContain('SetAccessRuleProtection($true,$false)')
+    expect(cmd).toContain('SetOwner($aclSid)')
+    expect(cmd).toContain('Set-Acl -LiteralPath $aclPath')
+    expect(cmd).not.toContain('icacls')
+  })
+  it('拿不到 SID 时不给可能半途失败的命令', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-allow' })
+    expect(cmd).toContain('属性 → 安全 → 高级')
   })
 })

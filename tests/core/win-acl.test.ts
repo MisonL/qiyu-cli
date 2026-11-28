@@ -343,3 +343,35 @@ describe('读面：Codex 65 判据（禁用组 / 父目录 INHERIT_ONLY）', () 
     expect(evaluateWinAcl(snapshot(acl([ace('Allow', USER, FULL)]), parent))).toEqual({ ok: true, checked: true })
   })
 })
+
+describe('CodeRabbit 17：读面补漏', () => {
+  it('父目录 null DACL（SDDL 无 D: 段）不能当成「没人有写权限」', () => {
+    const parent = acl([], { sddl: 'O:' + USER })
+    const v = evaluateWinAcl(snapshot(acl([ace('Allow', USER, FULL)]), parent))
+    expect(v).toEqual({ ok: false, checked: true, problem: 'dacl-missing' })
+  })
+
+  it('目录配方按 ACE 顺序求有效权利：deny DELETE 在 allow 前 → 不合格', () => {
+    const FA = 0x1f01ff
+    const bad = acl([
+      ace('Deny', USER, 0x10000),
+      ace('Allow', USER, FA),
+    ], { sddl: 'D:P' })
+    expect(evaluateDirectoryAcl(bad, USER)).toEqual({ ok: false, problem: 'dir-recipe-mismatch' })
+  })
+
+  it('allow 在前、deny 只覆盖已授予权利 → 仍合格（RemainingAccess 只减不增）', () => {
+    const FA = 0x1f01ff
+    const okDir = acl([
+      ace('Allow', USER, FA),
+      ace('Deny', USER, 0x10000),
+    ], { sddl: 'D:P' })
+    expect(evaluateDirectoryAcl(okDir, USER)).toEqual({ ok: true })
+  })
+
+  it('SDDL 里出现条件/对象 ACE 标记 → 判不了（.NET 的 Access 投影可能丢类型）', () => {
+    const file = acl([ace('Allow', USER, FULL)], { sddl: 'D:P(XA;;0x120089;;;S-1-1-0;(Member_of{SID(S-1-5-32-544)}))' })
+    const v = evaluateWinAcl(snapshot(file, cleanParent()))
+    expect(v).toEqual({ ok: false, checked: false, problem: 'unsupported-ace' })
+  })
+})

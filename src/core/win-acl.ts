@@ -29,6 +29,7 @@
  *   读出——判不了就走 `checked:false`，不按某一档假定。
  */
 import { execFileSync } from 'node:child_process'
+import { pickSafeEnv } from './win-env.js'
 
 // ── 位与 SID 常量（MS-DTYP / WinNT.h）───────────────────────────────────────
 const SID_SYSTEM = 'S-1-5-18'
@@ -143,6 +144,17 @@ export function describeAclProblem(problem: AclProblem): string {
   }
 }
 
+/**
+ * SDDL 里的对象 ACE（OA/OU）与条件 ACE（XA/RA 等）标记。.NET 的 `.Access` 投影可能把
+ * 这类 ACE 显示成普通 FileSystemAccessRule 或干脆丢掉——只看类名不足以发现它们，
+ * 所以在 SDDL 形态上也拦一道（仍不是完备判据：SDDL 也被投影过时无从得知）。
+ */
+const SDDL_EXTENDED_ACE = /\((?:OA|OU|XA|RA)[A-Z]*;/
+
+function hasExtendedAce(acl: AclSnapshot): boolean {
+  return SDDL_EXTENDED_ACE.test(acl.sddl)
+}
+
 function trustedSid(sid: string, token: TokenSnapshot): boolean {
   return sid === token.userSid || sid === SID_SYSTEM || sid === SID_ADMINISTRATORS
 }
@@ -179,7 +191,7 @@ function denyMatches(sid: string, token: TokenSnapshot): boolean {
 function evaluateAcl(acl: AclSnapshot, token: TokenSnapshot): { ok: true } | { ok: false; problem: AclProblem } {
   // 条件 ACE / callback ACE / 任何非普通 ACE：读面判不了，不冒认。
   const unsupported = acl.aces.some((a) => a.cls !== FILE_SYSTEM_ACCESS_RULE || (a.type !== 'Allow' && a.type !== 'Deny'))
-  if (unsupported) return { ok: false, problem: 'unsupported-ace' }
+  if (unsupported || hasExtendedAce(acl)) return { ok: false, problem: 'unsupported-ace' }
 
   // 第 1、2 条：DACL 存在且非空。
   if (!hasDacl(acl.sddl)) return { ok: false, problem: 'dacl-missing' }
@@ -225,11 +237,14 @@ function hasDacl(sddl: string): boolean {
 
 /** 父目录的写面受信（清单第 7 条）：属主受信 + 非受信主体没有写类允许 ACE。 */
 export function evaluateParentAcl(parent: AclSnapshot, token: TokenSnapshot): { ok: true } | { ok: false; problem: AclProblem } {
+  // null DACL（SDDL 里没有 D: 段）= 无访问控制，所有人可写；空 ACE 列表不等于它。
+  if (!hasDacl(parent.sddl)) return { ok: false, problem: 'dacl-missing' }
   // INHERIT_ONLY ACE 只作用于子项，不参与目录自身的访问检查——把它们算进写面会把安全父目录误报。
   const effective = parent.aces.filter((a) => !a.inheritOnly)
   if (effective.some((a) => a.cls !== FILE_SYSTEM_ACCESS_RULE || (a.type !== 'Allow' && a.type !== 'Deny'))) {
     return { ok: false, problem: 'unsupported-ace' }
   }
+  if (hasExtendedAce(parent)) return { ok: false, problem: 'unsupported-ace' }
   if (!trustedSid(parent.ownerSid, token)) return { ok: false, problem: 'parent-untrusted-owner' }
   const writable = effective.some(
     (a) => a.type === 'Allow' && !trustedSid(a.sid, token) && (a.mask & DIR_WRITE_CLASS) !== 0,
@@ -261,10 +276,19 @@ export function evaluateDirectoryAcl(acl: AclSnapshot, selfSid: string): { ok: t
   if (acl.ownerSid !== selfSid) return { ok: false, problem: 'untrusted-owner' }
   if (!acl.daclProtected) return { ok: false, problem: 'dacl-inherited' }
   if (acl.aces.some((a) => a.type === 'Allow' && a.sid !== selfSid)) return { ok: false, problem: 'untrusted-allow' }
-  const granted = acl.aces
-    .filter((a) => a.type === 'Allow' && a.sid === selfSid && !a.inheritOnly)
-    .reduce((acc, a) => acc | a.mask, 0)
-  if ((granted & DIR_REQUIRED) !== DIR_REQUIRED) return { ok: false, problem: 'dir-recipe-mismatch' }
+  if (hasExtendedAce(acl)) return { ok: false, problem: 'unsupported-ace' }
+  // 按 ACE 顺序求**有效**权利（与 evaluateAcl 同一 RemainingAccess 模型）：
+  // 只并集 allow 会放过「先 deny DELETE、后整份 allow」——Windows 上该目录并不授予 DELETE。
+  let remaining = DIR_REQUIRED
+  for (const ace of acl.aces) {
+    if (ace.inheritOnly || ace.sid !== selfSid) continue
+    if (ace.type === 'Deny') {
+      if ((ace.mask & remaining) !== 0) return { ok: false, problem: 'dir-recipe-mismatch' }
+      continue
+    }
+    remaining &= ~ace.mask
+  }
+  if (remaining !== 0) return { ok: false, problem: 'dir-recipe-mismatch' }
   return { ok: true }
 }
 
@@ -390,7 +414,7 @@ function defaultRunner(script: string, env: Record<string, string>): string {
   return execFileSync(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
-    { env: { ...process.env, ...env }, encoding: 'utf8', timeout: 15000, windowsHide: true },
+    { env: { ...pickSafeEnv(), ...env }, encoding: 'utf8', timeout: 15000, windowsHide: true },
   )
 }
 

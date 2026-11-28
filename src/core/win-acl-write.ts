@@ -14,6 +14,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import {
   evaluateDirectoryAcl, evaluateParentAcl, parseAclSnapshot, type TokenSnapshot,
 } from './win-acl.js'
+import { pickSafeEnv } from './win-env.js'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -40,6 +41,8 @@ export interface WriteScriptResult {
   sddlReadback?: string
   /** 失败收尾时 tmp 是否仍残留（含 secret，ACL 受限）。 */
   tmpLeft?: boolean
+  /** 载荷已发送后子进程消失/超时：目标可能已被换入，写入结果未知（Node 侧标记，不来自脚本）。 */
+  outcomeUnknown?: boolean
 }
 
 export interface WritePlan {
@@ -132,7 +135,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  [DllImport("kernel32.dll", SetLastError=true)]',
     '  static extern bool GetFileInformationByHandle(IntPtr h, out BY_HANDLE_FILE_INFORMATION info);',
     '  [DllImport("kernel32.dll", SetLastError=true)]',
-    '  static extern bool GetFileInformationByHandleEx(IntPtr h, int cls, byte[] buf, uint size, out uint ret);',
+    '  static extern bool GetFileInformationByHandleEx(IntPtr h, int cls, byte[] buf, uint size);',
     '  [DllImport("kernel32.dll", SetLastError=true)]',
     '  [return: MarshalAs(UnmanagedType.Bool)]',
     '  public static extern bool CloseHandle(IntPtr h);',
@@ -175,6 +178,13 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    return h;',
     '  }',
     '',
+    '  // FILE_READ_DATA|FILE_READ_ATTRIBUTES|READ_CONTROL ; share R|W|D ; OPEN_EXISTING',
+    '  public static IntPtr OpenFile(string path, out int err) {',
+    '    IntPtr h = CreateFileW(path, 0x1u | 0x80u | 0x20000u, 0x7u, IntPtr.Zero, 3u, 0x80u, IntPtr.Zero);',
+    '    err = (h == new IntPtr(-1)) ? Marshal.GetLastWin32Error() : 0;',
+    '    return h;',
+    '  }',
+    '',
     '  public static int CreateDir(string path, string sddl) {',
     '    IntPtr sd; uint size;',
     '    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out sd, out size)) return Marshal.GetLastWin32Error();',
@@ -208,8 +218,8 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  }',
     '',
     '  public static int IsReparse(IntPtr h) {',
-    '    byte[] buf = new byte[8]; uint ret;',
-    '    if (!GetFileInformationByHandleEx(h, 9, buf, 8, out ret)) return -1;',
+    '    byte[] buf = new byte[8];',
+    '    if (!GetFileInformationByHandleEx(h, 9, buf, 8)) return -1;',
     '    return (BitConverter.ToUInt32(buf, 0) & 0x400u) != 0 ? 1 : 0;',
     '  }',
     '',
@@ -291,6 +301,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '',
     '$result = @{ ok = $false; stage = "probe" }',
     '$qi = [IntPtr]::Zero; $ph = [IntPtr]::Zero; $rel = [IntPtr]::Zero; $h = [IntPtr]::Zero',
+    '$hph = [IntPtr]::Zero; $fh = [IntPtr]::Zero',
     'function Emit([string]$line) { [Console]::Out.WriteLine($line); [Console]::Out.Flush() }',
     '# stdin is UTF-8 (the payload carries non-ASCII config text); [Console]::In would decode as OEM.',
     '$stdinReader = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), [System.Text.Encoding]::UTF8)',
@@ -302,8 +313,12 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  if ([string]::IsNullOrEmpty($file) -or [string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($tmp)) { $result.problem = "missing-paths"; throw "stop" }',
     '  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
     '  $result.selfSid = $sid',
-    '  $fileSddl = "D:P(A;;0x13019f;;;$sid)"',
-    '  $dirSddl = "D:P(A;;FA;;;$sid)"',
+    '  # Explicit owner: without O: the new object takes the token default owner, which an',
+    '  # elevated token may resolve to Administrators and then fail our own owner check.',
+    '  $fileDacl = "D:P(A;;0x13019f;;;" + $sid + ")"',
+    '  $dirDacl = "D:P(A;;FA;;;" + $sid + ")"',
+    '  $fileSddl = "O:" + $sid + $fileDacl',
+    '  $dirSddl = "O:" + $sid + $dirDacl',
     '',
     '  # 0. probe: bind the parent handle FIRST (hold it), read its ACL, let Node decide.',
     '  #    First login needs a second checkpoint after the directory is created (the recipe',
@@ -317,6 +332,13 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    # A fresh Windows account has no ~/.config: create it with the same user-only recipe',
     '    # the qiyu directory gets, then bind the handle. Real-machine e2e 2026-11-28.',
     '    if ($err -ne 2 -and $err -ne 3) { $result.problem = "parent-open-failed"; throw "stop" }',
+    '    # Bind the first existing ancestor (HOME) before the first filesystem change.',
+    '    # $HOME is a read-only automatic variable (rename; real-machine 2026-11-28).',
+    '    $homeDir = Split-Path -Parent $up',
+    '    $err = 0',
+    '    $hph = [QiyuWrite]::OpenDir($homeDir, [ref]$err)',
+    '    if ($hph -eq [IntPtr]::Zero -or $hph.ToInt64() -eq -1) { $result.problem = "ancestor-open-failed"; throw "stop" }',
+    '    $homeAcl = [QiyuWrite]::AclJson($hph)',
     '    $pcerr = [QiyuWrite]::CreateDir($up, $dirSddl)',
     '    if ($pcerr -ne 0) { $result.problem = "parent-create-failed"; throw "stop" }',
     '    $err = 0',
@@ -331,16 +353,25 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  }',
     '  $cp1 = @{ stage = "probe"; phase = "parent"; selfSid = $sid; created = $created }',
     '  $cp1.parent = [QiyuWrite]::AclJson($ph)',
+    '  if (-not [string]::IsNullOrEmpty($homeAcl)) { $cp1.home = $homeAcl }',
     '  if (-not $created) {',
     '    $rel = [QiyuWrite]::OpenChildDir($ph, $leaf, [ref]$err)',
-    '    $cp1.identityMatch = (($rel -ne [IntPtr]::Zero) -and ([QiyuWrite]::Identity($rel) -eq [QiyuWrite]::Identity($qi)))',
-    '    $cp1.reparse = ([QiyuWrite]::IsReparse($qi) -eq 1)',
+    '    $idRel = if ($rel -eq [IntPtr]::Zero) { "" } else { [QiyuWrite]::Identity($rel) }',
+    '    $idQ = [QiyuWrite]::Identity($qi)',
+    '    if ($idRel -eq "" -or $idQ -eq "") { $result.problem = "identity-failed"; throw "stop" }',
+    '    $cp1.identityMatch = ($idRel -eq $idQ)',
+    '    $rp = [QiyuWrite]::IsReparse($qi)',
+    '    if ($rp -lt 0) { $result.problem = "reparse-check-failed"; throw "stop" }',
+    '    $cp1.reparse = ($rp -eq 1)',
     '    $cp1.qiyu = [QiyuWrite]::AclJson($qi)',
     '  }',
     '  Emit ("QIYU-CP " + ($cp1 | ConvertTo-Json -Compress -Depth 6))',
     '  $reply = ReadCtl',
-    '  if ($null -eq $reply -or $reply -ne "GO") {',
-    '    $result.problem = if ($null -eq $reply) { "no-decision" } else { $reply -replace "^STOP ", "" }',
+    '  if ($null -eq $reply) { $result.problem = "no-decision"; throw "stop" }',
+    '  if ($reply -ne "GO") {',
+    '    # Never echo an unexpected reply: a caller that already sent the payload would',
+    '    # otherwise get the secret copied into the error text.',
+    '    $result.problem = if ($reply.StartsWith("STOP ") -and $reply.Length -gt 5) { $reply.Substring(5) } else { "unexpected-reply" }',
     '    throw "stop"',
     '  }',
     '  if ($created) {',
@@ -351,13 +382,19 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    if ($qi -eq [IntPtr]::Zero -or $qi.ToInt64() -eq -1) { $result.problem = "dir-open-failed"; throw "stop" }',
     '    $rel = [QiyuWrite]::OpenChildDir($ph, $leaf, [ref]$err)',
     '    $cp2 = @{ stage = "probe"; phase = "created"; selfSid = $sid; created = $true }',
-    '    $cp2.identityMatch = (($rel -ne [IntPtr]::Zero) -and ([QiyuWrite]::Identity($rel) -eq [QiyuWrite]::Identity($qi)))',
-    '    $cp2.reparse = ([QiyuWrite]::IsReparse($qi) -eq 1)',
+    '    $idRel2 = if ($rel -eq [IntPtr]::Zero) { "" } else { [QiyuWrite]::Identity($rel) }',
+    '    $idQ2 = [QiyuWrite]::Identity($qi)',
+    '    if ($idRel2 -eq "" -or $idQ2 -eq "") { $result.problem = "identity-failed"; throw "stop" }',
+    '    $cp2.identityMatch = ($idRel2 -eq $idQ2)',
+    '    $rp2 = [QiyuWrite]::IsReparse($qi)',
+    '    if ($rp2 -lt 0) { $result.problem = "reparse-check-failed"; throw "stop" }',
+    '    $cp2.reparse = ($rp2 -eq 1)',
     '    $cp2.qiyu = [QiyuWrite]::AclJson($qi)',
     '    Emit ("QIYU-CP " + ($cp2 | ConvertTo-Json -Compress -Depth 6))',
     '    $reply2 = ReadCtl',
-    '    if ($null -eq $reply2 -or $reply2 -ne "GO") {',
-    '      $result.problem = if ($null -eq $reply2) { "no-decision" } else { $reply2 -replace "^STOP ", "" }',
+    '    if ($null -eq $reply2) { $result.problem = "no-decision"; throw "stop" }',
+    '    if ($reply2 -ne "GO") {',
+    '      $result.problem = if ($reply2.StartsWith("STOP ") -and $reply2.Length -gt 5) { $reply2.Substring(5) } else { "unexpected-reply" }',
     '      throw "stop"',
     '    }',
     '  }',
@@ -370,6 +407,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    throw "stop"',
     '  }',
     '  $createdTmp = $true',
+    '  $tmpId = [QiyuWrite]::Identity($h)',
     '  $result.path = $tmp',
     '  $result.sddlReadback = [QiyuWrite]::SddlFromHandle($h)',
     '',
@@ -377,7 +415,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  # Some flows read back with the ACL-level AI flag (D:PAI); normalize it before comparing.',
     '  $result.stage = "verify-tmp"',
     '  $rbTmp = $result.sddlReadback -replace ":PAI\\(", ":P("',
-    '  $daclOk = $rbTmp.Contains($fileSddl)',
+    '  $daclOk = $rbTmp.Contains($fileDacl)',
     '  $ownerOk = $result.sddlReadback.StartsWith("O:$sid")',
     '  if (-not ($daclOk -and $ownerOk)) { $result.problem = "sddl-mismatch"; throw "stop" }',
     '',
@@ -408,16 +446,22 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  # replace',
     '  $result.stage = "replace"',
     '  if (-not [QiyuWrite]::MoveFileExW($tmp, $file, [uint32]1)) { $result.ok = $false; $result.problem = "replace-failed"; throw "stop" }',
+    '  $createdTmp = $false',
     '',
     '  # verify-target',
     '  $result.stage = "verify-target"',
-    '  $final = ((Get-Acl -LiteralPath $file).Sddl) -replace ":PAI\\(", ":P("',
-    '  if (-not $final.Contains($fileSddl)) { $result.ok = $false; $result.problem = "target-sddl-mismatch"; throw "stop" }',
+    '  $err = 0',
+    '  $fh = [QiyuWrite]::OpenFile($file, [ref]$err)',
+    '  if ($fh -eq [IntPtr]::Zero -or $fh.ToInt64() -eq -1) { $result.ok = $false; $result.problem = "target-open-failed"; throw "stop" }',
+    '  if ([string]::IsNullOrEmpty($tmpId) -or [QiyuWrite]::Identity($fh) -ne $tmpId) { $result.ok = $false; $result.problem = "target-identity-mismatch"; throw "stop" }',
+    '  $final = ([QiyuWrite]::SddlFromHandle($fh)) -replace ":PAI\\(", ":P("',
+    '  if (-not $final.StartsWith("O:" + $sid)) { $result.ok = $false; $result.problem = "target-owner-mismatch"; throw "stop" }',
+    '  if (-not $final.Contains($fileDacl)) { $result.ok = $false; $result.problem = "target-sddl-mismatch"; throw "stop" }',
     '  $result.stage = "done"',
     '} catch {',
     '  if (-not $result.ContainsKey("problem")) { $result.problem = "script-error" }',
     '} finally {',
-    '  foreach ($hh in @($h, $qi, $rel, $ph)) { if ($hh -ne [IntPtr]::Zero) { [QiyuWrite]::CloseHandle($hh) | Out-Null } }',
+    '  foreach ($hh in @($h, $fh, $qi, $rel, $ph, $hph)) { if ($hh -ne [IntPtr]::Zero) { [QiyuWrite]::CloseHandle($hh) | Out-Null } }',
     '  # A failed run must not leave the secret in the tmp file. Best effort: remove it and report.',
     '  # Only OUR tmp: on already-exists/create-failed the same name belongs to someone else.',
     '  if ($createdTmp -and $result.stage -ne "done" -and [System.IO.File]::Exists($tmp)) {',
@@ -454,27 +498,8 @@ export function defaultTmpPath(configPath: string, now: number = Date.now()): st
   return `${dir}.${base}.tmp-${process.pid}-${now}`
 }
 
-/**
- * 传给 PowerShell 子进程的环境变量**白名单**。
- *
- * ⚠️ 不能 `{...process.env}`：`auth login` 的 secret 来源之一就是 `QIYU_APP_SECRET`
- * 环境变量（`src/commands/auth.ts`），整份继承会把明文 secret 随环境交给子进程，
- * 违背「secret 只经 stdin」这条本模块自己的约束（审查 P1）。只放 PowerShell 启动与
- * 临时目录需要的系统变量；业务/凭证类变量一律不传。
- */
-const SAFE_ENV_KEYS = [
-  'PATH', 'PATHEXT', 'COMSPEC', 'SystemRoot', 'windir',
-  'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
-] as const
-
-export function pickSafeEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
-  const out: Record<string, string> = {}
-  for (const k of SAFE_ENV_KEYS) {
-    const v = source[k]
-    if (typeof v === 'string') out[k] = v
-  }
-  return out
-}
+// 环境白名单的唯一实现在 win-env.ts（读面 probe 与写序脚本共用）；这里转出以保留既有导入面。
+export { pickSafeEnv } from './win-env.js'
 
 /**
  * 把脚本写到临时 `.ps1` 再执行。
@@ -614,6 +639,8 @@ export interface WriteCheckpoint {
   /** 待 Node 判定的 ACL 节点（JSON 字符串或已解析对象，形状同 `AclSnapshot`）。 */
   qiyu?: unknown
   parent?: unknown
+  /** 首个既有祖先（首登自建 `~/.config` 时为 HOME）的 ACL；同样按写面受信判。 */
+  home?: unknown
   /** qiyu 是否由本次调用创建。 */
   created?: boolean
   /** 相对打开的身份是否与 qiyu 句柄一致（仅复用档有）。 */
@@ -625,10 +652,10 @@ export interface WriteCheckpoint {
 export type CheckpointDecision = { go: true } | { go: false; problem: string }
 
 export interface ChildLike {
-  stdin: { write(chunk: string): unknown; end(): void } | null
+  stdin: { write(chunk: string): unknown; end(): void; on?(event: 'error', cb: (arg: unknown) => void): unknown } | null
   stdout: { on(event: 'data', cb: (chunk: Buffer | string) => void): unknown } | null
   stderr: { on(event: 'data', cb: (chunk: Buffer | string) => void): unknown } | null
-  on(event: 'exit' | 'error', cb: (arg: unknown) => void): unknown
+  on(event: 'close' | 'exit' | 'error', cb: (arg: unknown) => void): unknown
   kill(): unknown
 }
 
@@ -683,9 +710,11 @@ export function runWriteInteractive(args: InteractiveArgs): Promise<WriteScriptR
       return
     }
 
-    const timer = setTimeout(() => finish({ ...FAILED }), timeoutMs)
-    let buffer = ''
     let payloadSent = false
+    const unknown = (): WriteScriptResult => ({ ok: false, stage: 'write-secret', problem: 'interrupted', outcomeUnknown: true })
+    const failNow = (): WriteScriptResult => (payloadSent ? unknown() : { ...FAILED })
+    const timer = setTimeout(() => finish(failNow()), timeoutMs)
+    let buffer = ''
     /** 任一 checkpoint 被拒后，即使脚本仍打印 READY 也**不得**发送秘密。 */
     let denied: string | null = null
 
@@ -748,10 +777,13 @@ export function runWriteInteractive(args: InteractiveArgs): Promise<WriteScriptR
         onLine(line)
       }
     })
-    child.on('exit', () => {
-      if (!settled) finish({ ...FAILED })
+    // 'close' 而不是 'exit'：exit 可能先于最后一行 stdout 到达，会把已完成的写入判成失败。
+    child.on('close', () => {
+      if (!settled) finish(failNow())
     })
-    child.on('error', () => finish({ ...FAILED }))
+    child.on('error', () => finish(failNow()))
+    // 子进程提前关闭 stdin 时 write() 会异步发 error；不挂监听会变成未捕获异常。
+    child.stdin?.on?.('error', () => finish(failNow()))
   })
 }
 
@@ -774,6 +806,12 @@ export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
     if (qiyu === null) return { go: false, problem: 'dir-unparsable' }
     const dv = evaluateDirectoryAcl(qiyu, userSid)
     return dv.ok ? { go: true } : { go: false, problem: dv.problem }
+  }
+  if (cp.home !== undefined) {
+    const home = parse(cp.home)
+    if (home === null) return { go: false, problem: 'ancestor-unparsable' }
+    const hv = evaluateParentAcl(home, token)
+    if (!hv.ok) return { go: false, problem: hv.problem }
   }
   const parent = parse(cp.parent)
   if (parent === null) return { go: false, problem: 'parent-unparsable' }
@@ -799,7 +837,7 @@ export class WinWriteError extends Error {
    */
   constructor(
     readonly stage: Stage, readonly problem: string, readonly selfSid?: string,
-    readonly tmpPath?: string, readonly tmpLeft?: boolean,
+    readonly tmpPath?: string, readonly tmpLeft?: boolean, readonly outcomeUnknown?: boolean,
   ) {
     super(`Windows 写序在 ${stage} 阶段失败（${problem}）`)
     this.name = 'WinWriteError'
@@ -832,6 +870,6 @@ export async function writeConfigFileWin32(
     onCheckpoint: judge,
   })
   if (!r.ok || r.stage !== 'done') {
-    throw new WinWriteError(r.stage, r.problem ?? 'not-done', r.selfSid, tmpPath, r.tmpLeft)
+    throw new WinWriteError(r.stage, r.problem ?? 'not-done', r.selfSid, tmpPath, r.tmpLeft, r.outcomeUnknown)
   }
 }

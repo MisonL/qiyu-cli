@@ -307,6 +307,14 @@ async function login(argv: string[]): Promise<number> {
     // 写盘失败是环境问题（权限/符号链接/磁盘）——归业务错误（退出码 1），
     // 不是"改参数重来"。文案带上底层原因，否则用户只知道"失败了"。
     if (e instanceof WinWriteError) {
+      if (e.outcomeUnknown === true) {
+        return fail({
+          code: 'config_insecure', kind: 'config_insecure', retryable: false,
+          message: `写入结果未知：${configPath} 的写序在发出凭证后中断（${e.problem}），文件可能已是新凭证、也可能仍是旧内容`,
+          hint: `先检查 ${configPath} 是否存在、内容是否为新凭证（不要打印内容），再用 Get-Acl 复核其 DACL；`
+            + '确认状态后可重新执行 auth login（幂等）',
+        })
+      }
       // 换入（replace）已成功、只是换入后复核失败时，文件里**已经是新凭证**——照实报告，
       // 说「未写入」会让 Agent 以为旧配置还在（Codex 65 P2）。
       // 只有 ACL 成因才给 DACL 修复命令；`parent-open-failed` 之类的路径/IO 成因照 ACL 修是修错对象（真机 2026-11-28）。
@@ -346,6 +354,7 @@ async function login(argv: string[]): Promise<number> {
   }
   // 权限自检：写出的文件必须 0600，否则这次"成功"是假的（凭证已落盘且可被他人读）。
   // writeConfigFile 用 0600 创建，这里只做一次如实复核 —— 失败则如实报告。
+  const verifyWarnings: string[] = []
   try {
     const perm = checkPermissions(configPath, { hasCredentials: true, onWarn: () => {} })
     if (!perm.ok) {
@@ -367,10 +376,14 @@ async function login(argv: string[]): Promise<number> {
             : `请执行 chmod ${perm.reason === 'file' ? `600 ${shellPath(configPath)}` : `700 ${shellPath(dirname(configPath))}`}`,
       })
     }
-  } catch { /* 自检失败不影响"已写入"这一事实；下一次任何命令都会再查一次 */ }
+  } catch {
+    // 自检本身炸了（例如探测输出无法解析）：写入已是事实，但不能把「没查成」说成「查过且合格」。
+    verifyWarnings.push('凭证已写入，但 Windows ACL 自检未完成（探测执行失败）；本次写入不视为「权限已复核」')
+  }
 
   // ⚠️ 绝不回显 appKey/appSecret —— 连末四位都不（与 whoami 同一条约束）。
   return ok({ configured: true, profile: name, config_path: configPath, source: 'file' }, {
+    ...(verifyWarnings.length > 0 ? { warnings: verifyWarnings } : {}),
     field_notes: {
       configured: 'true 只表示两个字段都已写入配置文件，不代表它们有效'
         + '（拼错的 appKey 同样返回 true）。⚠️ auth whoami 也只查「有没有配」，'
