@@ -197,7 +197,8 @@ export function renderWriteScript(_plan: WritePlan): string {
     '        for (int i = 0; i < count; i++) {',
     '          IntPtr sidPtr = Marshal.ReadIntPtr(IntPtr.Add(buf, off + i * structSize));',
     '          int attr = Marshal.ReadInt32(IntPtr.Add(buf, off + i * structSize + IntPtr.Size));',
-    '          list.Add(new System.Security.Principal.SecurityIdentifier(sidPtr).Value + ";" + attr);',
+    '          // Attributes are 32-bit flags; SE_GROUP_LOGON_ID (0x40000000) would read as negative int.',
+    '          list.Add(new System.Security.Principal.SecurityIdentifier(sidPtr).Value + ";" + ((uint)attr).ToString());',
     '        }',
     '        return list.ToArray();',
     '      } finally { Marshal.FreeHGlobal(buf); }',
@@ -865,14 +866,19 @@ function ancestorProblem(p: AclProblem): AclProblem {
 export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
   const userSid = cp.selfSid
   if (typeof userSid !== 'string' || userSid === '') return { go: false, problem: 'missing-selfsid' }
-  // 组列表形状不对就不能假装「没有组」：组 deny 会被静默放行。
-  if (cp.groups !== undefined && !Array.isArray(cp.groups)) return { go: false, problem: 'groups-unparsable' }
+  // 组列表是 deny 求值的一部分：缺失/空/形状不对一律判不了——假装「没有组」会静默放行组 deny。
+  if (cp.groups === undefined || !Array.isArray(cp.groups) || cp.groups.length === 0) {
+    return { go: false, problem: 'groups-unparsable' }
+  }
   const groups: TokenSnapshot['groups'] = []
-  for (const g of cp.groups ?? []) {
+  for (const g of cp.groups) {
     if (typeof g !== 'string') return { go: false, problem: 'groups-unparsable' }
-    const [gsid, gattr] = g.split(';')
+    const parts = g.split(';')
+    if (parts.length !== 2) return { go: false, problem: 'groups-unparsable' }
+    const [gsid, gattr] = parts
+    if (gsid === '' || !/^\d+$/.test(gattr)) return { go: false, problem: 'groups-unparsable' }
     const attr = Number(gattr)
-    if (gsid === undefined || gsid === '' || !Number.isInteger(attr)) return { go: false, problem: 'groups-unparsable' }
+    if (!Number.isSafeInteger(attr) || attr < 0 || attr > 0xffffffff) return { go: false, problem: 'groups-unparsable' }
     groups.push({ sid: gsid, attr })
   }
   const token: TokenSnapshot = { userSid, groups, restrictedSids: [] }

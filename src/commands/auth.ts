@@ -322,6 +322,14 @@ async function login(argv: string[]): Promise<number> {
           hint: `确认 ${configPath} 未被其它进程占用、路径不是重解析点，再用 Get-Acl 复核其 DACL`,
         })
       }
+      // verify-target 上的其它失败（如 script-error）：换入可能已发生，复核没跑完 → 结果未知。
+      if (e.stage === 'verify-target' && !e.wroteTarget) {
+        return fail({
+          code: 'config_insecure', kind: 'config_insecure', retryable: false,
+          message: `换入后的 ACL 复核未完成（Windows 写序在 ${e.stage} 阶段失败：${e.problem}），新凭证的去向未知`,
+          hint: `先确认 ${configPath} 当前的内容/属主（不要打印内容），再用 Get-Acl 复核其 DACL；确认后重新执行 auth login（幂等）`,
+        })
+      }
       if (e.outcomeUnknown === true) {
         return fail({
           code: 'config_insecure', kind: 'config_insecure', retryable: false,

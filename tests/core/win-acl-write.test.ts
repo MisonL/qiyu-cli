@@ -446,27 +446,27 @@ describe('judgeCheckpoint / writeConfigFileWin32', () => {
   })
 
   it('复用档全绿 → GO；宽松父目录 → parent-writable', () => {
-    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, created: false, identityMatch: true, reparse: false, qiyu: aclJson(), parent: parentAcl() }))
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, groups: ['S-1-1-0;15'], created: false, identityMatch: true, reparse: false, qiyu: aclJson(), parent: parentAcl() }))
       .toEqual({ go: true })
     const looseParent = JSON.stringify({
       sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
       aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: 'S-1-1-0', mask: 0x2, inheritOnly: false }],
     })
-    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, created: false, identityMatch: true, reparse: false, qiyu: aclJson(), parent: looseParent }))
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, groups: ['S-1-1-0;15'], created: false, identityMatch: true, reparse: false, qiyu: aclJson(), parent: looseParent }))
       .toEqual({ go: false, problem: 'parent-writable' })
   })
 
   it('身份不符 / 重解析点 / 目录配方不合规 → 各自 STOP', () => {
-    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, created: true, identityMatch: false, reparse: false, qiyu: aclJson(), parent: parentAcl() }))
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, groups: ['S-1-1-0;15'], created: true, identityMatch: false, reparse: false, qiyu: aclJson(), parent: parentAcl() }))
       .toEqual({ go: false, problem: 'dir-identity-mismatch' })
-    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, created: true, identityMatch: true, reparse: true, qiyu: aclJson(), parent: parentAcl() }))
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, groups: ['S-1-1-0;15'], created: true, identityMatch: true, reparse: true, qiyu: aclJson(), parent: parentAcl() }))
       .toEqual({ go: false, problem: 'dir-is-reparse' })
-    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, created: true, identityMatch: true, reparse: false, qiyu: aclJson({ daclProtected: false }), parent: parentAcl() }))
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'created', selfSid: USER_SID, groups: ['S-1-1-0;15'], created: true, identityMatch: true, reparse: false, qiyu: aclJson({ daclProtected: false }), parent: parentAcl() }))
       .toEqual({ go: false, problem: 'dacl-inherited' })
   })
 
   it('首次登录：parent 阶段 created=true 时不要求身份（目录尚不存在）', () => {
-    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, created: true, parent: parentAcl() }))
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'parent', selfSid: USER_SID, groups: ['S-1-1-0;15'], created: true, parent: parentAcl() }))
       .toEqual({ go: true })
   })
 
@@ -510,7 +510,8 @@ describe('judgeCheckpoint：created 阶段不需要 parent', () => {
   const good = (): Record<string, unknown> => {
     const FA = 0x1f01ff
     return {
-      stage: 'probe', phase: 'created', selfSid: USER_SID, created: true,
+      stage: 'probe', phase: 'created', selfSid: USER_SID,
+      groups: ['S-1-1-0;15'], created: true,
       identityMatch: true, reparse: false,
       qiyu: JSON.stringify({
         sddl: 'D:PAI', daclProtected: true, ownerSid: USER_SID,
@@ -725,13 +726,15 @@ describe('Codex CR17 复查：祖先语境 / 结果未知 / 目标被替换', ()
 
   it('HOME 的 null DACL → ancestor-dacl-missing（不是未加前缀的 dacl-missing）', () => {
     expect(judgeCheckpoint({
-      stage: 'probe', phase: 'parent', selfSid: USER_SID, created: true, home: nullDacl(), parent: goodParent(),
+      stage: 'probe', phase: 'parent', selfSid: USER_SID,
+      groups: ['S-1-1-0;15'], created: true, home: nullDacl(), parent: goodParent(),
     })).toEqual({ go: false, problem: 'ancestor-dacl-missing' })
   })
 
   it('父目录的 null DACL → parent-dacl-missing', () => {
     expect(judgeCheckpoint({
-      stage: 'probe', phase: 'parent', selfSid: USER_SID, created: true, parent: nullDacl(),
+      stage: 'probe', phase: 'parent', selfSid: USER_SID,
+      groups: ['S-1-1-0;15'], created: true, parent: nullDacl(),
     })).toEqual({ go: false, problem: 'parent-dacl-missing' })
   })
 
@@ -798,20 +801,21 @@ describe('Codex 第三轮复查：祖先 checkpoint 与会话组', () => {
       sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
       aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: 'S-1-1-0', mask: 0x2, inheritOnly: false }],
     })
-    expect(judgeCheckpoint({ stage: 'probe', phase: 'ancestor', selfSid: USER_SID, created: false, home: loose }))
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'ancestor', selfSid: USER_SID, groups: ['S-1-1-0;15'], created: false, home: loose }))
       .toEqual({ go: false, problem: 'ancestor-writable' })
   })
 
   it('checkpoint 的令牌组参与目录判据：deny Users 拿掉 DELETE → dir-recipe-mismatch', () => {
     const cp = {
-      stage: 'probe', phase: 'created', selfSid: USER_SID, created: true,
+      stage: 'probe', phase: 'created', selfSid: USER_SID,
+      created: true,
       identityMatch: true, reparse: false, qiyu: dirWithUsersDeny(),
       groups: [`${USERS};15`],
     }
     expect(judgeCheckpoint(cp as never)).toEqual({ go: false, problem: 'dir-recipe-mismatch' })
-    // 没有组信息时同一 ACL 判合格——证明是组 deny 起了作用，而不是别的判据
+    // 空组不再等价「没有组」：判定不了（组 deny 会被静默放行）
     const noGroups = { ...cp, groups: [] }
-    expect(judgeCheckpoint(noGroups as never)).toEqual({ go: true })
+    expect(judgeCheckpoint(noGroups as never)).toEqual({ go: false, problem: 'groups-unparsable' })
   })
 
   it('组列表形状不对 → groups-unparsable（不能当「没有组」放行）', () => {
@@ -828,7 +832,28 @@ describe('Codex 第三轮复查：祖先 checkpoint 与会话组', () => {
   })
 
   it('可复用的材料齐全时 ancestor 阶段放行', () => {
-    expect(judgeCheckpoint({ stage: 'probe', phase: 'ancestor', selfSid: USER_SID, created: false, home: goodHome() }))
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'ancestor', selfSid: USER_SID, groups: ['S-1-1-0;15'], created: false, home: goodHome() }))
       .toEqual({ go: true })
+  })
+})
+
+
+describe('Codex 第四轮：组列表形状必须严格', () => {
+  const goodHome = (): string => JSON.stringify({
+    sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
+    aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: 0x1f01ff, inheritOnly: false }],
+  })
+  const base = (groups: unknown) => ({
+    stage: 'probe', phase: 'ancestor', selfSid: USER_SID, created: false, home: goodHome(), groups,
+  })
+  it.each([
+    ['缺组字段', undefined],
+    ['空数组', []],
+    ['缺属性值', ['S-1-1-0;']],
+    ['多字段', ['S-1-1-0;15;extra']],
+    ['属性超 32 位', ['S-1-1-0;4294967296']],
+    ['属性为负数', ['S-1-1-0;-1']],
+  ])('%s → groups-unparsable', (_label, groups) => {
+    expect(judgeCheckpoint(base(groups) as never)).toEqual({ go: false, problem: 'groups-unparsable' })
   })
 })

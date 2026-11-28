@@ -295,7 +295,7 @@ export function insecureConfigError(
               ? `配置文件 ${configPath} 被 Windows ACL 拒绝读取（不是 POSIX 权限语义，chmod 修不了它；与文件里有没有凭证无关）`
               : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
   const fix = reason === 'acl'
-    ? aclFixCommand(configPath, dir, acl)
+    ? aclFixCommand(configPath, dir, acl === undefined ? undefined : { ...acl, parentIsDir: true })
     : reason === 'acl-unchecked'
       ? `icacls ${shellArg(configPath, 'win32')}（先查看当前 ACL；本判据需要 PowerShell 可用且配置放在 NTFS 卷上）`
       : win && (reason === 'unreadable' || reason === 'dir-unreadable')
