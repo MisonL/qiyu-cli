@@ -857,3 +857,23 @@ describe('Codex 第四轮：组列表形状必须严格', () => {
     expect(judgeCheckpoint(base(groups) as never)).toEqual({ go: false, problem: 'groups-unparsable' })
   })
 })
+
+
+describe('Codex 第五轮：SID 形状', () => {
+  const goodHome = (): string => JSON.stringify({
+    sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
+    aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: 0x1f01ff, inheritOnly: false }],
+  })
+  it('组 SID 不是合法 SID → groups-unparsable', () => {
+    expect(judgeCheckpoint({
+      stage: 'probe', phase: 'ancestor', selfSid: USER_SID, created: false, home: goodHome(),
+      groups: ['not-a-sid;15'],
+    })).toEqual({ go: false, problem: 'groups-unparsable' })
+  })
+  it('selfSid 形状不对 → selfsid-unparsable', () => {
+    expect(judgeCheckpoint({
+      stage: 'probe', phase: 'ancestor', selfSid: 'tester', created: false, home: goodHome(),
+      groups: ['S-1-1-0;15'],
+    })).toEqual({ go: false, problem: 'selfsid-unparsable' })
+  })
+})

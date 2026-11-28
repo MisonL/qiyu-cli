@@ -197,7 +197,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '        for (int i = 0; i < count; i++) {',
     '          IntPtr sidPtr = Marshal.ReadIntPtr(IntPtr.Add(buf, off + i * structSize));',
     '          int attr = Marshal.ReadInt32(IntPtr.Add(buf, off + i * structSize + IntPtr.Size));',
-    '          // Attributes are 32-bit flags; SE_GROUP_LOGON_ID (0x40000000) would read as negative int.',
+    '          // Attributes are 32-bit flags; SE_GROUP_LOGON_ID is 0xC0000000 and would read as a negative int.',
     '          list.Add(new System.Security.Principal.SecurityIdentifier(sidPtr).Value + ";" + ((uint)attr).ToString());',
     '        }',
     '        return list.ToArray();',
@@ -864,8 +864,10 @@ function ancestorProblem(p: AclProblem): AclProblem {
 
 /** checkpoint 的**默认判定**：全部走 `win-acl.ts` 的纯函数（唯一判据实现点）。 */
 export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
+  const SID_RE = /^S-\d+(-\d+)+$/
   const userSid = cp.selfSid
   if (typeof userSid !== 'string' || userSid === '') return { go: false, problem: 'missing-selfsid' }
+  if (!SID_RE.test(userSid)) return { go: false, problem: 'selfsid-unparsable' }
   // 组列表是 deny 求值的一部分：缺失/空/形状不对一律判不了——假装「没有组」会静默放行组 deny。
   if (cp.groups === undefined || !Array.isArray(cp.groups) || cp.groups.length === 0) {
     return { go: false, problem: 'groups-unparsable' }
@@ -876,7 +878,7 @@ export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
     const parts = g.split(';')
     if (parts.length !== 2) return { go: false, problem: 'groups-unparsable' }
     const [gsid, gattr] = parts
-    if (gsid === '' || !/^\d+$/.test(gattr)) return { go: false, problem: 'groups-unparsable' }
+    if (!SID_RE.test(gsid) || !/^\d+$/.test(gattr)) return { go: false, problem: 'groups-unparsable' }
     const attr = Number(gattr)
     if (!Number.isSafeInteger(attr) || attr < 0 || attr > 0xffffffff) return { go: false, problem: 'groups-unparsable' }
     groups.push({ sid: gsid, attr })
