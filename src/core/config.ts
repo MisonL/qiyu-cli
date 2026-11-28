@@ -13,7 +13,7 @@
 
 import { readFileSync, writeFileSync, lstatSync, statSync, existsSync, mkdirSync, renameSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, dirname, isAbsolute } from 'node:path'
+import { join, dirname, isAbsolute, win32 } from 'node:path'
 import { shellArg } from './shell.js'
 import { checkWinAcl, describeAclProblem, type AclProblem } from './win-acl.js'
 import { writeConfigFileWin32 } from './win-acl-write.js'
@@ -197,15 +197,22 @@ export type PermReason = 'file' | 'dir' | 'unreadable' | 'dir-unreadable' | 'acl
  * 为什么带 SID 而不是 `%USERNAME%`：hint 会被原样执行，`%USERNAME%` 只在 cmd 展开、
  * Git Bash 与 pwsh 下是字面量；`*S-1-5-…` 在各 shell 下含义一致（icacls 的 SID 前缀 `*`）。
  * 父目录问题要授 `(OI)(CI)F`，否则其下的配置文件仍可被他人继承替换。
+ *
+ * ⚠️ 修复目标必须与**真正出事的对象**一致（真机 2026-11-28）：`parent-*` 修的是 qiyu 目录的
+ * 上一级（`~/.config`）；写序 `probe` 阶段判的是 qiyu 目录本身（`onDir`），不是 config.json——
+ * 对着文件跑 icacls 修不好目录的继承开关。文件级成因（`verify-target`）才修 configPath。
  */
-export function aclFixCommand(configPath: string, dir: string, acl?: { problem: AclProblem; selfSid?: string }): string {
+export function aclFixCommand(
+  configPath: string, dir: string, acl?: { problem: AclProblem; selfSid?: string; onDir?: boolean },
+): string {
   const onParent = acl?.problem.startsWith('parent-') ?? false
-  const target = onParent ? dir : configPath
+  const onDir = !onParent && (acl?.onDir ?? false)
+  const target = onParent ? win32.dirname(dir) : onDir ? dir : configPath
   if (acl?.selfSid === undefined) {
     return `用「属性 → 安全 → 高级」把 ${target} 的 DACL 重建为只授当前账户（受保护、断开继承）——`
       + `判定拿不到当前用户 SID，不给出可能半途失败的命令`
   }
-  const grant = shellArg(`*${acl.selfSid}:${onParent ? '(OI)(CI)F' : '(F)'}`, 'win32')
+  const grant = shellArg(`*${acl.selfSid}:${onParent || onDir ? '(OI)(CI)F' : '(F)'}`, 'win32')
   return `icacls ${shellArg(target, 'win32')} /inheritance:r /grant:r ${grant}`
 }
 

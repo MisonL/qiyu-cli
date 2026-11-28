@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
-  checkWinAcl, evaluateWinAcl, parseProbeOutput, evaluateDirectoryAcl,
+  checkWinAcl, evaluateWinAcl, parseProbeOutput, evaluateDirectoryAcl, isAclProblem,
   type AceSnapshot, type AclSnapshot, type ProbeSnapshot, type TokenSnapshot,
 } from '../../src/core/win-acl.js'
 import { __resetPermissionWarnings, checkPermissions } from '../../src/core/config.js'
@@ -314,5 +314,16 @@ describe('目录配方判定（写序 ⓪ 的 qiyu 目录档）', () => {
     expect(evaluateDirectoryAcl(base([ace('Allow', USER, FA, { inheritOnly: true })]), USER)).toEqual({
       ok: false, problem: 'dir-recipe-mismatch',
     })
+  })
+})
+
+describe('isAclProblem：运行期成员清单（唯一出处）', () => {
+  it('ACL 成因在内；写序的路径/IO 成因不在内', () => {
+    expect(isAclProblem('parent-writable')).toBe(true)
+    expect(isAclProblem('dir-recipe-mismatch')).toBe(true)
+    expect(isAclProblem('probe-failed')).toBe(true)
+    for (const p of ['parent-open-failed', 'parent-create-failed', 'dir-open-failed', 'already-exists', 'not-done']) {
+      expect(isAclProblem(p), p).toBe(false)
+    }
   })
 })

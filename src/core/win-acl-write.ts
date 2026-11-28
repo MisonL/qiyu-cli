@@ -310,7 +310,16 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  $err = 0',
     '  $up = Split-Path -Parent $parent',
     '  $ph = [QiyuWrite]::OpenDir($up, [ref]$err)',
-    '  if ($ph -eq [IntPtr]::Zero -or $ph.ToInt64() -eq -1) { $result.problem = "parent-open-failed"; throw "stop" }',
+    '  if ($ph -eq [IntPtr]::Zero -or $ph.ToInt64() -eq -1) {',
+    '    # A fresh Windows account has no ~/.config: create it with the same user-only recipe',
+    '    # the qiyu directory gets, then bind the handle. Real-machine e2e 2026-11-28.',
+    '    if ($err -ne 2 -and $err -ne 3) { $result.problem = "parent-open-failed"; throw "stop" }',
+    '    $pcerr = [QiyuWrite]::CreateDir($up, $dirSddl)',
+    '    if ($pcerr -ne 0) { $result.problem = "parent-create-failed"; throw "stop" }',
+    '    $err = 0',
+    '    $ph = [QiyuWrite]::OpenDir($up, [ref]$err)',
+    '    if ($ph -eq [IntPtr]::Zero -or $ph.ToInt64() -eq -1) { $result.problem = "parent-open-failed"; throw "stop" }',
+    '  }',
     '  $leaf = Split-Path -Leaf $parent',
     '  $qi = [QiyuWrite]::OpenDir($parent, [ref]$err)',
     '  if ($qi -eq [IntPtr]::Zero -or $qi.ToInt64() -eq -1) {',
@@ -743,11 +752,8 @@ export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
     if (typeof v === 'string') { try { return parseAclSnapshot(JSON.parse(v)) } catch { return null } }
     return parseAclSnapshot(v)
   }
-  const parent = parse(cp.parent)
-  if (parent === null) return { go: false, problem: 'parent-unparsable' }
-  const pv = evaluateParentAcl(parent, token)
-  if (!pv.ok) return { go: false, problem: pv.problem }
   if (cp.phase === 'created') {
+    // CP2 只带新建目录的材料：父目录已在 CP1 判过（GO 才可能走到建目录），不重复。
     if (cp.reparse === true) return { go: false, problem: 'dir-is-reparse' }
     if (cp.identityMatch !== true) return { go: false, problem: 'dir-identity-mismatch' }
     const qiyu = parse(cp.qiyu)
@@ -755,6 +761,10 @@ export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
     const dv = evaluateDirectoryAcl(qiyu, userSid)
     return dv.ok ? { go: true } : { go: false, problem: dv.problem }
   }
+  const parent = parse(cp.parent)
+  if (parent === null) return { go: false, problem: 'parent-unparsable' }
+  const pv = evaluateParentAcl(parent, token)
+  if (!pv.ok) return { go: false, problem: pv.problem }
   // phase 'parent'：复用档（目录已存在）在同一个 checkpoint 里附带了 qiyu 的判定材料。
   if (cp.created !== true) {
     if (cp.reparse === true) return { go: false, problem: 'dir-is-reparse' }
@@ -769,7 +779,7 @@ export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
 
 /** 写序失败：带 stage 与 problem，供上层渲染成带修法的错误。 */
 export class WinWriteError extends Error {
-  constructor(readonly stage: Stage, readonly problem: string) {
+  constructor(readonly stage: Stage, readonly problem: string, readonly selfSid?: string) {
     super(`Windows 写序在 ${stage} 阶段失败（${problem}）`)
     this.name = 'WinWriteError'
   }
@@ -799,5 +809,5 @@ export async function writeConfigFileWin32(
     script, configPath, parentDir, tmpPath, config: serialized,
     onCheckpoint: judge,
   })
-  if (!r.ok || r.stage !== 'done') throw new WinWriteError(r.stage, r.problem ?? 'not-done')
+  if (!r.ok || r.stage !== 'done') throw new WinWriteError(r.stage, r.problem ?? 'not-done', r.selfSid)
 }

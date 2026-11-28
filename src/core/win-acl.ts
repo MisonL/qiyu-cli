@@ -63,6 +63,16 @@ export type AclProblem =
   | 'restricted-token'
   | 'probe-failed'
 
+/** 运行期成员清单（唯一出处）：`AclProblem` 是类型，hint/文案分支需要运行期判据。 */
+const ACL_PROBLEM_SET: ReadonlySet<string> = new Set<AclProblem>([
+  'dacl-missing', 'dacl-empty', 'unsupported-ace', 'untrusted-owner', 'untrusted-allow', 'read-denied',
+  'dacl-inherited', 'parent-untrusted-owner', 'parent-writable', 'dir-recipe-mismatch', 'restricted-token', 'probe-failed',
+])
+
+export function isAclProblem(p: string): p is AclProblem {
+  return ACL_PROBLEM_SET.has(p)
+}
+
 export interface AceSnapshot {
   type: 'Allow' | 'Deny'
   /** .NET 返回的 ACE 类名；不是 `FileSystemAccessRule` 即 callback/条件 ACE。 */

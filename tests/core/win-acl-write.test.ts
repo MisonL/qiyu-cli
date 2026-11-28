@@ -477,3 +477,49 @@ describe('judgeCheckpoint / writeConfigFileWin32', () => {
     await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: partialRun as never })).rejects.toMatchObject({ stage: 'write-secret' })
   })
 })
+
+// ── 2026-11-28 真机：全新账户没有 ~/.config ────────────────────────────────
+describe('⓪ 缺失的上级目录（~/.config）', () => {
+  it('先尝试打开，缺失时用目录配方创建再重新绑定（顺序钉住）', () => {
+    const script = renderWriteScript(plan())
+    const openAt = script.indexOf('OpenDir($up')
+    const createAt = script.indexOf('CreateDir($up')
+    const reopenAt = script.indexOf('OpenDir($up', openAt + 1)
+    expect(openAt).toBeGreaterThan(-1)
+    expect(createAt).toBeGreaterThan(openAt)
+    expect(reopenAt).toBeGreaterThan(createAt)
+    // 只对「不存在」两码走创建，其它错误照旧 parent-open-failed
+    expect(script).toMatch(/\$err -ne 2 -and \$err -ne 3\) \{ \$result\.problem = "parent-open-failed"/)
+    expect(script).toContain('parent-create-failed')
+  })
+
+  it('WinWriteError 携带 selfSid，供 hint 渲染 icacls', async () => {
+    const run = vi.fn(async () => ({ ok: false, stage: 'probe' as const, problem: 'parent-writable', selfSid: USER_SID }))
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: run as never })).rejects.toMatchObject({
+      selfSid: USER_SID,
+    })
+  })
+})
+
+// ── 真机首登回归（2026-11-28）：CP2 只带新建目录材料 ────────────────────────
+describe('judgeCheckpoint：created 阶段不需要 parent', () => {
+  const good = (): Record<string, unknown> => {
+    const FA = 0x1f01ff
+    return {
+      stage: 'probe', phase: 'created', selfSid: USER_SID, created: true,
+      identityMatch: true, reparse: false,
+      qiyu: JSON.stringify({
+        sddl: 'D:PAI', daclProtected: true, ownerSid: USER_SID,
+        aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: FA, inheritOnly: false }],
+      }),
+    }
+  }
+  it('缺 parent 也放行（父目录已在 CP1 判过）', () => {
+    expect(judgeCheckpoint(good() as never)).toEqual({ go: true })
+  })
+  it('新建目录配方不合规仍 STOP', () => {
+    const cp = good()
+    cp.qiyu = JSON.stringify({ sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID, aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: 0x1f01ff, inheritOnly: false }] })
+    expect(judgeCheckpoint(cp as never)).toEqual({ go: false, problem: 'dacl-inherited' })
+  })
+})

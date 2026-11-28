@@ -8,16 +8,12 @@ import {
   resolveProfileName, shellPath,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
-import { describeAclProblem, type AclProblem } from '../core/win-acl.js'
+import { describeAclProblem, isAclProblem } from '../core/win-acl.js'
 import { WinWriteError } from '../core/win-acl-write.js'
 
 /** 写序 problem 若是 ACL 成因，用同一份文案；否则原样给稳定串。 */
 function describeAclProblemOr(problem: string): string {
-  const known: AclProblem[] = [
-    'dacl-missing', 'dacl-empty', 'unsupported-ace', 'untrusted-owner', 'untrusted-allow', 'read-denied',
-    'dacl-inherited', 'parent-untrusted-owner', 'parent-writable', 'dir-recipe-mismatch', 'restricted-token', 'probe-failed',
-  ]
-  return (known as string[]).includes(problem) ? describeAclProblem(problem as AclProblem) : problem
+  return isAclProblem(problem) ? describeAclProblem(problem) : problem
 }
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
@@ -311,9 +307,10 @@ async function login(argv: string[]): Promise<number> {
     // 写盘失败是环境问题（权限/符号链接/磁盘）——归业务错误（退出码 1），
     // 不是"改参数重来"。文案带上底层原因，否则用户只知道"失败了"。
     if (e instanceof WinWriteError) {
-      const aclHint = /parent-|dir-|dacl|untrusted|reparse/.test(e.problem)
-        ? `${e.stage} 阶段：${describeAclProblemOr(e.problem)}；可执行：${aclFixCommand(configPath, dirname(configPath))}`
-        : `${e.stage} 阶段失败（${e.problem}）；请检查目录可写、config.json 不是符号链接`
+      // 只有 ACL 成因才给 DACL 修复命令；`parent-open-failed` 之类的路径/IO 成因照 ACL 修是修错对象（真机实测 2026-11-28）。
+      const aclHint = isAclProblem(e.problem)
+        ? `${e.stage} 阶段：${describeAclProblem(e.problem)}；可执行：${aclFixCommand(configPath, dirname(configPath), { problem: e.problem, selfSid: e.selfSid, onDir: e.stage === 'probe' })}`
+        : `${e.stage} 阶段失败（${e.problem}）；请检查 ${dirname(configPath)} 及其上级目录是否存在、盘符可用`
       return fail({
         code: 'config_insecure', kind: 'config_insecure', retryable: false,
         message: `凭证未写入 ${configPath}（Windows 写序在 ${e.stage} 阶段失败：${describeAclProblemOr(e.problem)}）`,

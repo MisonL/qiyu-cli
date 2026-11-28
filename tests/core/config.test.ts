@@ -16,6 +16,7 @@ import {
   fileCredentials, fileProfile, insecureConfigError, loadConfigChecked, loadConfigFile, parseConfig,
   readConfigRaw,
   resolveProfileName, serializeConfig, writeConfigFile,
+  aclFixCommand,
 } from '../../src/core/config.js'
 import { shellArg } from '../../src/output.js'
 
@@ -504,5 +505,28 @@ describe('读点上的权限拒绝同样分流（CodeRabbit 第十三轮 minor�
     const t = caught as { kind?: string; message?: string }
     expect(t.kind).toBeUndefined()
     expect(String(t.message)).toContain('无法读取配置文件')
+  })
+})
+
+describe('aclFixCommand：修复目标必须是真正出事的对象', () => {
+  const CFG = 'C:\\Users\\t\\.config\\qiyu\\config.json'
+  const DIR = 'C:\\Users\\t\\.config\\qiyu'
+  const SID = 'S-1-5-21-1-2-3-1001'
+  it('parent-* 修 qiyu 目录的上一级（~/.config），授 (OI)(CI)F', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'parent-writable', selfSid: SID })
+    expect(cmd).toContain('C:\\Users\\t\\.config')
+    expect(cmd).not.toContain('config.json')
+    expect(cmd).toContain('(OI)(CI)F')
+  })
+  it('写序 probe 阶段的目录成因修 qiyu 目录本身', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'dacl-inherited', selfSid: SID, onDir: true })
+    expect(cmd).toContain(DIR + "'")
+    expect(cmd).not.toContain('config.json')
+    expect(cmd).toContain('(OI)(CI)F')
+  })
+  it('文件级成因修 config.json，授 (F)', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-allow', selfSid: SID })
+    expect(cmd).toContain('config.json')
+    expect(cmd).toContain(':(F)')
   })
 })
