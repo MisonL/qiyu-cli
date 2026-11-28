@@ -307,11 +307,19 @@ async function login(argv: string[]): Promise<number> {
     // 写盘失败是环境问题（权限/符号链接/磁盘）——归业务错误（退出码 1），
     // 不是"改参数重来"。文案带上底层原因，否则用户只知道"失败了"。
     if (e instanceof WinWriteError) {
+      if (e.stage === 'verify-target' && e.problem === 'target-identity-mismatch') {
+        return fail({
+          code: 'config_insecure', kind: 'config_insecure', retryable: false,
+          message: `换入后复核发现 ${configPath} 已不是本次写入的文件（可能被替换），新凭证的去向未知`,
+          hint: `检查 ${configPath} 当前的对象与 DACL；确认后删除该文件并重新执行 auth login（幂等）`,
+        })
+      }
       if (e.outcomeUnknown === true) {
         return fail({
           code: 'config_insecure', kind: 'config_insecure', retryable: false,
           message: `写入结果未知：${configPath} 的写序在发出凭证后中断（${e.problem}），文件可能已是新凭证、也可能仍是旧内容`,
           hint: `先检查 ${configPath} 是否存在、内容是否为新凭证（不要打印内容），再用 Get-Acl 复核其 DACL；`
+            + (e.tmpPath === undefined ? '' : `临时文件 ${e.tmpPath} 也可能残留（受限 ACL），一并检查；`)
             + '确认状态后可重新执行 auth login（幂等）',
         })
       }
@@ -378,7 +386,7 @@ async function login(argv: string[]): Promise<number> {
     }
   } catch {
     // 自检本身炸了（例如探测输出无法解析）：写入已是事实，但不能把「没查成」说成「查过且合格」。
-    verifyWarnings.push('凭证已写入，但 Windows ACL 自检未完成（探测执行失败）；本次写入不视为「权限已复核」')
+    verifyWarnings.push('凭证已写入，但写入后的权限自检未完成（自检执行失败）；本次写入不视为「权限已复核」')
   }
 
   // ⚠️ 绝不回显 appKey/appSecret —— 连末四位都不（与 whoami 同一条约束）。

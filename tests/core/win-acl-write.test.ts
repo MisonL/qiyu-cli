@@ -714,3 +714,53 @@ describe('PowerShell 保留变量守卫（真机 script-error 事故 2026-11-28�
     }
   })
 })
+
+
+describe('Codex CR17 复查：祖先语境 / 结果未知 / 目标被替换', () => {
+  const goodParent = (): string => JSON.stringify({
+    sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
+    aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: 0x1f01ff, inheritOnly: false }],
+  })
+  const nullDacl = (): string => JSON.stringify({ sddl: 'O:' + USER_SID, daclProtected: false, ownerSid: USER_SID, aces: [] })
+
+  it('HOME 的 null DACL → ancestor-dacl-missing（不是未加前缀的 dacl-missing）', () => {
+    expect(judgeCheckpoint({
+      stage: 'probe', phase: 'parent', selfSid: USER_SID, created: true, home: nullDacl(), parent: goodParent(),
+    })).toEqual({ go: false, problem: 'ancestor-dacl-missing' })
+  })
+
+  it('父目录的 null DACL → parent-dacl-missing', () => {
+    expect(judgeCheckpoint({
+      stage: 'probe', phase: 'parent', selfSid: USER_SID, created: true, parent: nullDacl(),
+    })).toEqual({ go: false, problem: 'parent-dacl-missing' })
+  })
+
+  it('脚本：自建 .config 前 HOME 读空即停；建后比身份/重解析点', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('ancestor-unparsable')
+    expect(script).toContain('ancestor-identity-mismatch')
+    expect(script).toContain('ancestor-is-reparse')
+    expect(script).toContain('OpenFile')
+    expect(script).toContain('0x200000') // FILE_FLAG_OPEN_REPARSE_POINT
+  })
+
+  it('载荷已发出后收到畸形结果 → 结果未知（不是 script-failed）', async () => {
+    const c = new FakeChildForUnknown()
+    const p = runWriteInteractive({
+      script: renderWriteScript(plan()), configPath: CONFIG, parentDir: PARENT, tmpPath: TMP,
+      config: CONFIG_JSON, onCheckpoint: () => ({ go: true }), spawnImpl: () => c as never, timeoutMs: 5000,
+    })
+    c.emitLine('QIYU-CP {}')
+    c.emitLine('QIYU-READY')
+    c.emitLine('QIYU-RESULT {broken')
+    await expect(p).resolves.toMatchObject({ outcomeUnknown: true })
+  })
+
+  it('wroteTarget 只对「身份通过、ACL 不符」成立；身份不符说明目标被替换', async () => {
+    const mk = (problem: string) => vi.fn(async () => ({ ok: false, stage: 'verify-target' as const, problem }))
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: mk('target-sddl-mismatch') as never }))
+      .rejects.toMatchObject({ wroteTarget: true })
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: mk('target-identity-mismatch') as never }))
+      .rejects.toMatchObject({ wroteTarget: false })
+  })
+})

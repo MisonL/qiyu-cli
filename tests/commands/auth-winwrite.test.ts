@@ -4,6 +4,9 @@
 // - 换入已发生、只是复核失败 → 不能说「凭证未写入」；
 // - 载荷已发出后进程消失 → 只能说「结果未知」，两种断言都不许下；
 // - 自检炸了 → 成功可以给，但必须带 warnings 说「没查成」。
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, beforeEach, afterEach, vi } from 'vitest'
 import { it, captureSinks } from '../helpers/capture.js'
 
@@ -24,10 +27,15 @@ let out = ''
 let err = ''
 const ORIG_KEY = process.env.QIYU_APP_KEY
 const ORIG_SECRET = process.env.QIYU_APP_SECRET
+const ORIG_HOME = process.env.HOME
+let home = ''
 
 beforeEach(() => {
   out = ''; err = ''
   captureSinks((s) => { out += s }, (s) => { err += s })
+  // 隔离 HOME：login 会读 ~/.config/qiyu/config.json，不隔离就依赖开发机真实配置。
+  home = mkdtempSync(join(tmpdir(), 'qiyu-authwin-'))
+  process.env.HOME = home
   process.env.QIYU_APP_KEY = 'key-sentinel'
   process.env.QIYU_APP_SECRET = 'secret-sentinel'
   writeConfigFile.mockReset()
@@ -36,6 +44,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  rmSync(home, { recursive: true, force: true })
+  if (ORIG_HOME === undefined) delete process.env.HOME; else process.env.HOME = ORIG_HOME
   if (ORIG_KEY === undefined) delete process.env.QIYU_APP_KEY; else process.env.QIYU_APP_KEY = ORIG_KEY
   if (ORIG_SECRET === undefined) delete process.env.QIYU_APP_SECRET; else process.env.QIYU_APP_SECRET = ORIG_SECRET
 })
@@ -55,6 +65,14 @@ describe('auth login：Windows 写序失败的如实报告', () => {
     expect(e.message).not.toContain('凭证未写入')
     expect(e.message).not.toContain('凭证已写入')
     expect(e.hint).toContain('复核其 DACL')
+  })
+
+  it('换入后目标身份不符 → 目标可能被替换，不说「已写入」', async () => {
+    writeConfigFile.mockRejectedValue(new WinWriteError('verify-target', 'target-identity-mismatch'))
+    expect(await login()).toBe(1)
+    const e = errorOf()
+    expect(e.message).toContain('不是本次写入的文件')
+    expect(e.message).not.toContain('凭证已写入 ')
   })
 
   it('换入成功、复核失败 → 已写入（wroteTarget）', async () => {
@@ -83,6 +101,6 @@ describe('auth login：Windows 写序失败的如实报告', () => {
     expect(await login()).toBe(0)
     const o = json() as { ok: boolean; meta?: { warnings?: string[] } }
     expect(o.ok).toBe(true)
-    expect(o.meta?.warnings?.join('\n')).toContain('ACL 自检未完成')
+    expect(o.meta?.warnings?.join('\n')).toContain('权限自检未完成')
   })
 })

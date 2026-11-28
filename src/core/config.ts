@@ -207,20 +207,24 @@ export type PermReason = 'file' | 'dir' | 'unreadable' | 'dir-unreadable' | 'acl
 export function aclFixCommand(
   configPath: string, dir: string, acl?: { problem: AclProblem; selfSid?: string; onDir?: boolean },
 ): string {
-  const onParent = acl?.problem.startsWith('parent-') ?? false
-  const onDir = !onParent && (acl?.onDir ?? false)
-  const target = onParent ? win32.dirname(dir) : onDir ? dir : configPath
+  const onAncestor = acl?.problem.startsWith('ancestor-') ?? false
+  const onParent = !onAncestor && (acl?.problem.startsWith('parent-') ?? false)
+  const onDir = !onAncestor && !onParent && (acl?.onDir ?? false)
+  // 三层语境三种目标：祖先（HOME）→ 上两级；父目录（~/.config）→ 上一级；目录/文件按 flag。
+  const target = onAncestor
+    ? win32.dirname(win32.dirname(dir))
+    : onParent ? win32.dirname(dir) : onDir ? dir : configPath
   const ps = (v: string): string => `'${v.replace(/'/g, "''")}'`
   if (acl?.selfSid === undefined) {
     return `用「属性 → 安全 → 高级」把 ${target} 的 DACL 重建为只授当前账户（受保护、断开继承）——`
       + `判定拿不到当前用户 SID，不给出可能半途失败的命令`
   }
-  const isDir = onParent || onDir
+  const isDir = onAncestor || onParent || onDir
   const aclType = isDir ? 'DirectorySecurity' : 'FileSecurity'
   const rule = isDir
     ? `New-Object System.Security.AccessControl.FileSystemAccessRule($aclSid,'FullControl','ContainerInherit, ObjectInherit','None','Allow')`
     : `New-Object System.Security.AccessControl.FileSystemAccessRule($aclSid,'FullControl','Allow')`
-  return '在 PowerShell 中执行：'
+  return '在 PowerShell 中执行（若提示权限不足，改用管理员 PowerShell——重建 DACL/属主需要相应权限）：'
     + `$aclPath=${ps(target)}; `
     + `$aclSid=New-Object System.Security.Principal.SecurityIdentifier(${ps(acl.selfSid)}); `
     + `$aclObj=New-Object System.Security.AccessControl.${aclType}; `

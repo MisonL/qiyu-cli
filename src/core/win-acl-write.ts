@@ -12,7 +12,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import {
-  evaluateDirectoryAcl, evaluateParentAcl, parseAclSnapshot, type TokenSnapshot,
+  evaluateDirectoryAcl, evaluateParentAcl, parentProblem, parseAclSnapshot, type AclProblem, type TokenSnapshot,
 } from './win-acl.js'
 import { pickSafeEnv } from './win-env.js'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -180,7 +180,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '',
     '  // FILE_READ_DATA|FILE_READ_ATTRIBUTES|READ_CONTROL ; share R|W|D ; OPEN_EXISTING',
     '  public static IntPtr OpenFile(string path, out int err) {',
-    '    IntPtr h = CreateFileW(path, 0x1u | 0x80u | 0x20000u, 0x7u, IntPtr.Zero, 3u, 0x80u, IntPtr.Zero);',
+    '    IntPtr h = CreateFileW(path, 0x1u | 0x80u | 0x20000u, 0x7u, IntPtr.Zero, 3u, 0x80u | 0x200000u, IntPtr.Zero);',
     '    err = (h == new IntPtr(-1)) ? Marshal.GetLastWin32Error() : 0;',
     '    return h;',
     '  }',
@@ -339,11 +339,21 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    $hph = [QiyuWrite]::OpenDir($homeDir, [ref]$err)',
     '    if ($hph -eq [IntPtr]::Zero -or $hph.ToInt64() -eq -1) { $result.problem = "ancestor-open-failed"; throw "stop" }',
     '    $homeAcl = [QiyuWrite]::AclJson($hph)',
+    '    if ([string]::IsNullOrEmpty($homeAcl)) { $result.problem = "ancestor-unparsable"; throw "stop" }',
     '    $pcerr = [QiyuWrite]::CreateDir($up, $dirSddl)',
     '    if ($pcerr -ne 0) { $result.problem = "parent-create-failed"; throw "stop" }',
     '    $err = 0',
     '    $ph = [QiyuWrite]::OpenDir($up, [ref]$err)',
     '    if ($ph -eq [IntPtr]::Zero -or $ph.ToInt64() -eq -1) { $result.problem = "parent-open-failed"; throw "stop" }',
+    '    $relUp = [QiyuWrite]::OpenChildDir($hph, (Split-Path -Leaf $up), [ref]$err)',
+    '    $idUp = if ($relUp -eq [IntPtr]::Zero) { "" } else { [QiyuWrite]::Identity($relUp) }',
+    '    $idUpH = [QiyuWrite]::Identity($ph)',
+    '    if ($relUp -ne [IntPtr]::Zero) { [QiyuWrite]::CloseHandle($relUp) | Out-Null }',
+    '    if ($idUp -eq "" -or $idUpH -eq "") { $result.problem = "ancestor-identity-failed"; throw "stop" }',
+    '    if ($idUp -ne $idUpH) { $result.problem = "ancestor-identity-mismatch"; throw "stop" }',
+    '    $rpUp = [QiyuWrite]::IsReparse($ph)',
+    '    if ($rpUp -lt 0) { $result.problem = "reparse-check-failed"; throw "stop" }',
+    '    if ($rpUp -eq 1) { $result.problem = "ancestor-is-reparse"; throw "stop" }',
     '  }',
     '  $leaf = Split-Path -Leaf $parent',
     '  $qi = [QiyuWrite]::OpenDir($parent, [ref]$err)',
@@ -762,7 +772,7 @@ export function runWriteInteractive(args: InteractiveArgs): Promise<WriteScriptR
         } catch {
           parsed = null
         }
-        finish(parsed ?? { ...FAILED })
+        finish(parsed ?? (payloadSent ? unknown() : { ...FAILED }))
       }
     }
 
@@ -789,6 +799,17 @@ export function runWriteInteractive(args: InteractiveArgs): Promise<WriteScriptR
 
 // ── 判定与入口（Task 6）────────────────────────────────────────────────────
 
+/** `evaluateParentAcl` 的结果用于 HOME 时，改成 ancestor-* 语境（hint 才能修对对象）。 */
+function ancestorProblem(p: AclProblem): AclProblem {
+  switch (p) {
+    case 'parent-writable': return 'ancestor-writable'
+    case 'parent-untrusted-owner': return 'ancestor-untrusted-owner'
+    case 'dacl-missing': return 'ancestor-dacl-missing'
+    case 'unsupported-ace': return 'ancestor-unsupported-ace'
+    default: return p
+  }
+}
+
 /** checkpoint 的**默认判定**：全部走 `win-acl.ts` 的纯函数（唯一判据实现点）。 */
 export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
   const userSid = cp.selfSid
@@ -804,26 +825,27 @@ export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
     if (cp.identityMatch !== true) return { go: false, problem: 'dir-identity-mismatch' }
     const qiyu = parse(cp.qiyu)
     if (qiyu === null) return { go: false, problem: 'dir-unparsable' }
-    const dv = evaluateDirectoryAcl(qiyu, userSid)
+    const dv = evaluateDirectoryAcl(qiyu, userSid, token)
     return dv.ok ? { go: true } : { go: false, problem: dv.problem }
   }
   if (cp.home !== undefined) {
     const home = parse(cp.home)
     if (home === null) return { go: false, problem: 'ancestor-unparsable' }
     const hv = evaluateParentAcl(home, token)
-    if (!hv.ok) return { go: false, problem: hv.problem }
+    // 语境前缀决定 hint 该修哪个对象：ancestor-* → HOME，parent-* → ~/.config。
+    if (!hv.ok) return { go: false, problem: ancestorProblem(hv.problem) }
   }
   const parent = parse(cp.parent)
   if (parent === null) return { go: false, problem: 'parent-unparsable' }
   const pv = evaluateParentAcl(parent, token)
-  if (!pv.ok) return { go: false, problem: pv.problem }
+  if (!pv.ok) return { go: false, problem: parentProblem(pv.problem) }
   // phase 'parent'：复用档（目录已存在）在同一个 checkpoint 里附带了 qiyu 的判定材料。
   if (cp.created !== true) {
     if (cp.reparse === true) return { go: false, problem: 'dir-is-reparse' }
     if (cp.identityMatch !== true) return { go: false, problem: 'dir-identity-mismatch' }
     const qiyu = parse(cp.qiyu)
     if (qiyu === null) return { go: false, problem: 'dir-unparsable' }
-    const dv = evaluateDirectoryAcl(qiyu, userSid)
+    const dv = evaluateDirectoryAcl(qiyu, userSid, token)
     if (!dv.ok) return { go: false, problem: dv.problem }
   }
   return { go: true }
@@ -842,7 +864,11 @@ export class WinWriteError extends Error {
     super(`Windows 写序在 ${stage} 阶段失败（${problem}）`)
     this.name = 'WinWriteError'
   }
-  get wroteTarget(): boolean { return this.stage === 'verify-target' }
+  get wroteTarget(): boolean {
+    // 身份核对通过、只是 ACL 不符：路径上确实是本次写入的那个对象，内容即新凭证。
+    // target-identity-mismatch：路径上的对象不是我们的，新凭证去向未知，不能断言「已写入」。
+    return this.stage === 'verify-target' && this.problem !== 'target-identity-mismatch'
+  }
 }
 
 export interface WinWriteOptions {

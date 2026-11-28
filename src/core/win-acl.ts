@@ -63,11 +63,19 @@ export type AclProblem =
   | 'dir-recipe-mismatch'
   | 'restricted-token'
   | 'probe-failed'
+  | 'parent-dacl-missing'
+  | 'parent-unsupported-ace'
+  | 'ancestor-dacl-missing'
+  | 'ancestor-unsupported-ace'
+  | 'ancestor-untrusted-owner'
+  | 'ancestor-writable'
 
 /** 运行期成员清单（唯一出处）：`AclProblem` 是类型，hint/文案分支需要运行期判据。 */
 const ACL_PROBLEM_SET: ReadonlySet<string> = new Set<AclProblem>([
   'dacl-missing', 'dacl-empty', 'unsupported-ace', 'untrusted-owner', 'untrusted-allow', 'read-denied',
   'dacl-inherited', 'parent-untrusted-owner', 'parent-writable', 'dir-recipe-mismatch', 'restricted-token', 'probe-failed',
+  'parent-dacl-missing', 'parent-unsupported-ace', 'ancestor-dacl-missing', 'ancestor-unsupported-ace',
+  'ancestor-untrusted-owner', 'ancestor-writable',
 ])
 
 export function isAclProblem(p: string): p is AclProblem {
@@ -141,6 +149,18 @@ export function describeAclProblem(problem: AclProblem): string {
       return '进程是受限令牌，无法判定 restricting SID 的求值档'
     case 'probe-failed':
       return 'ACL 探测执行失败（PowerShell 不可用、超时或输出无法解析）'
+    case 'parent-dacl-missing':
+      return '父目录 DACL 缺失（null DACL = 所有账户可写，配置可被整体替换）'
+    case 'parent-unsupported-ace':
+      return '父目录存在条件/对象 ACE，写面无法求值'
+    case 'ancestor-dacl-missing':
+      return '配置目录的上一级（首个既有祖先）DACL 缺失（null DACL = 所有账户可写）'
+    case 'ancestor-unsupported-ace':
+      return '首个既有祖先存在条件/对象 ACE，写面无法求值'
+    case 'ancestor-untrusted-owner':
+      return '首个既有祖先的属主不是受信主体'
+    case 'ancestor-writable':
+      return '首个既有祖先对受信名单之外的主体有写类权限（配置目录可被整体替换）'
   }
 }
 
@@ -149,10 +169,22 @@ export function describeAclProblem(problem: AclProblem): string {
  * 这类 ACE 显示成普通 FileSystemAccessRule 或干脆丢掉——只看类名不足以发现它们，
  * 所以在 SDDL 形态上也拦一道（仍不是完备判据：SDDL 也被投影过时无从得知）。
  */
-const SDDL_EXTENDED_ACE = /\((?:OA|OU|XA|RA)[A-Z]*;/
+const SDDL_EXTENDED_ACE = /\((?:OA|OU|XA|XD|OD|RA)[A-Z]*;/
 
 function hasExtendedAce(acl: AclSnapshot): boolean {
   return SDDL_EXTENDED_ACE.test(acl.sddl)
+}
+
+/**
+ * 父目录语境的成因（`evaluateParentAcl` 只产出 dacl-missing/unsupported-ace/parent-*）：
+ * 前两个补 `parent-` 前缀，读面与 judgeCheckpoint 共用，hint 才能把目标指到 ~/.config。
+ */
+export function parentProblem(p: AclProblem): AclProblem {
+  switch (p) {
+    case 'dacl-missing': return 'parent-dacl-missing'
+    case 'unsupported-ace': return 'parent-unsupported-ace'
+    default: return p
+  }
 }
 
 function trustedSid(sid: string, token: TokenSnapshot): boolean {
@@ -254,7 +286,9 @@ export function evaluateParentAcl(parent: AclSnapshot, token: TokenSnapshot): { 
 }
 
 /** 「判不了」的成因：修法是查环境/换权限来源，不是清 ACL——不得与「不安全」混成一个 ok:false。 */
-const UNDECIDABLE: ReadonlySet<AclProblem> = new Set<AclProblem>(['unsupported-ace', 'restricted-token', 'probe-failed'])
+const UNDECIDABLE: ReadonlySet<AclProblem> = new Set<AclProblem>([
+  'unsupported-ace', 'parent-unsupported-ace', 'ancestor-unsupported-ace', 'restricted-token', 'probe-failed',
+])
 
 /**
  * 目录配方的判定（写序 ⓪ 的 `qiyu` 目录档，设计稿 §2.4a「目录的 SD 要单独给」）。
@@ -267,7 +301,9 @@ const UNDECIDABLE: ReadonlySet<AclProblem> = new Set<AclProblem>(['unsupported-a
  */
 const DIR_REQUIRED = 0x20 | 0x1 | 0x2 | 0x4 | 0x10000 | 0x20000 | 0x100000
 
-export function evaluateDirectoryAcl(acl: AclSnapshot, selfSid: string): { ok: true } | { ok: false; problem: AclProblem } {
+export function evaluateDirectoryAcl(
+  acl: AclSnapshot, selfSid: string, token?: TokenSnapshot,
+): { ok: true } | { ok: false; problem: AclProblem } {
   if (acl.aces.some((a) => a.cls !== FILE_SYSTEM_ACCESS_RULE || (a.type !== 'Allow' && a.type !== 'Deny'))) {
     return { ok: false, problem: 'unsupported-ace' }
   }
@@ -279,14 +315,18 @@ export function evaluateDirectoryAcl(acl: AclSnapshot, selfSid: string): { ok: t
   if (hasExtendedAce(acl)) return { ok: false, problem: 'unsupported-ace' }
   // 按 ACE 顺序求**有效**权利（与 evaluateAcl 同一 RemainingAccess 模型）：
   // 只并集 allow 会放过「先 deny DELETE、后整份 allow」——Windows 上该目录并不授予 DELETE。
+  const tok: TokenSnapshot = token ?? { userSid: selfSid, groups: [], restrictedSids: [] }
   let remaining = DIR_REQUIRED
   for (const ace of acl.aces) {
-    if (ace.inheritOnly || ace.sid !== selfSid) continue
+    if (ace.inheritOnly) continue
     if (ace.type === 'Deny') {
-      if ((ace.mask & remaining) !== 0) return { ok: false, problem: 'dir-recipe-mismatch' }
+      // deny 对**组成员**同样生效（如 deny Everyone/Users 会拿掉 DELETE）——只看 selfSid 会假绿。
+      if (denyMatches(ace.sid, tok) && (ace.mask & remaining) !== 0) {
+        return { ok: false, problem: 'dir-recipe-mismatch' }
+      }
       continue
     }
-    remaining &= ~ace.mask
+    if (ace.sid === selfSid) remaining &= ~ace.mask
   }
   if (remaining !== 0) return { ok: false, problem: 'dir-recipe-mismatch' }
   return { ok: true }
@@ -301,7 +341,10 @@ export function evaluateWinAcl(snapshot: ProbeSnapshot): WinAclVerdict {
   const file = evaluateAcl(snapshot.file, snapshot.token)
   if (!file.ok) return { ok: false, checked: !UNDECIDABLE.has(file.problem), problem: file.problem }
   const parent = evaluateParentAcl(snapshot.parent, snapshot.token)
-  if (!parent.ok) return { ok: false, checked: !UNDECIDABLE.has(parent.problem), problem: parent.problem }
+  if (!parent.ok) {
+    const problem = parentProblem(parent.problem)
+    return { ok: false, checked: !UNDECIDABLE.has(problem), problem }
+  }
   return { ok: true, checked: true }
 }
 

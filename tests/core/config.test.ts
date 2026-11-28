@@ -538,6 +538,12 @@ describe('aclFixCommand：修复目标必须是真正出事的对象', () => {
     expect(cmd).toContain('Set-Acl -LiteralPath $aclPath')
     expect(cmd).not.toContain('icacls')
   })
+  it('ancestor-* 修首个既有祖先（上两级，HOME），不是 ~/.config', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'ancestor-writable', selfSid: SID })
+    expect(cmd).toContain("'C:\\Users\\t'")
+    expect(cmd).not.toContain('C:\\Users\\t\\.config')
+    expect(cmd).toContain('DirectorySecurity')
+  })
   it('拿不到 SID 时不给可能半途失败的命令', () => {
     const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-allow' })
     expect(cmd).toContain('属性 → 安全 → 高级')

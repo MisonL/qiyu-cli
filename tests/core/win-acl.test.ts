@@ -348,7 +348,7 @@ describe('CodeRabbit 17：读面补漏', () => {
   it('父目录 null DACL（SDDL 无 D: 段）不能当成「没人有写权限」', () => {
     const parent = acl([], { sddl: 'O:' + USER })
     const v = evaluateWinAcl(snapshot(acl([ace('Allow', USER, FULL)]), parent))
-    expect(v).toEqual({ ok: false, checked: true, problem: 'dacl-missing' })
+    expect(v).toEqual({ ok: false, checked: true, problem: 'parent-dacl-missing' })
   })
 
   it('目录配方按 ACE 顺序求有效权利：deny DELETE 在 allow 前 → 不合格', () => {
@@ -373,5 +373,25 @@ describe('CodeRabbit 17：读面补漏', () => {
     const file = acl([ace('Allow', USER, FULL)], { sddl: 'D:P(XA;;0x120089;;;S-1-1-0;(Member_of{SID(S-1-5-32-544)}))' })
     const v = evaluateWinAcl(snapshot(file, cleanParent()))
     expect(v).toEqual({ ok: false, checked: false, problem: 'unsupported-ace' })
+  })
+})
+
+
+describe('Codex CR17 复查：组 deny 与父目录成因语境', () => {
+  it('目录 deny 命中令牌里的组（Everyone/Users）→ 有效权利不足，dir-recipe-mismatch', () => {
+    const FA = 0x1f01ff
+    const USERS = 'S-1-5-32-545'
+    const a = acl([
+      ace('Deny', USERS, 0x10000),
+      ace('Allow', USER, FA),
+    ], { sddl: 'D:P' })
+    const tok: TokenSnapshot = { userSid: USER, groups: [{ sid: USERS, attr: 0xf }], restrictedSids: [] }
+    expect(evaluateDirectoryAcl(a, USER, tok)).toEqual({ ok: false, problem: 'dir-recipe-mismatch' })
+  })
+
+  it('父目录条件 ACE → parent-unsupported-ace 且 checked=false（判不了）', () => {
+    const parent = acl([ace('Allow', USER, FULL)], { sddl: 'D:AI(XA;;0x120089;;;S-1-1-0;(Member_of{SID(S-1-5-32-544)}))' })
+    const v = evaluateWinAcl(snapshot(acl([ace('Allow', USER, FULL)]), parent))
+    expect(v).toEqual({ ok: false, checked: false, problem: 'parent-unsupported-ace' })
   })
 })
