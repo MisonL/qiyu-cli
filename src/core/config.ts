@@ -205,15 +205,19 @@ export type PermReason = 'file' | 'dir' | 'unreadable' | 'dir-unreadable' | 'acl
  * ⚠️ 片段本身在 **PowerShell** 里执行（`$` 变量在外面被展开会坏），单引号字符串按 PS 规则转义。
  */
 export function aclFixCommand(
-  configPath: string, dir: string, acl?: { problem: AclProblem; selfSid?: string; onDir?: boolean },
+  configPath: string, dir: string,
+  acl?: { problem: AclProblem; selfSid?: string; onDir?: boolean; parentIsDir?: boolean },
 ): string {
   const onAncestor = acl?.problem.startsWith('ancestor-') ?? false
   const onParent = !onAncestor && (acl?.problem.startsWith('parent-') ?? false)
   const onDir = !onAncestor && !onParent && (acl?.onDir ?? false)
   // 三层语境三种目标：祖先（HOME）→ 上两级；父目录（~/.config）→ 上一级；目录/文件按 flag。
+  // 语境里「parent」指谁随调用面而变：读面 parent 就是 qiyu 目录本身（parentIsDir），
+  // 写序 parent 是 qiyu 的上一级 ~/.config。
   const target = onAncestor
     ? win32.dirname(win32.dirname(dir))
-    : onParent ? win32.dirname(dir) : onDir ? dir : configPath
+    : onParent ? (acl?.parentIsDir === true ? dir : win32.dirname(dir))
+      : onDir ? dir : configPath
   const ps = (v: string): string => `'${v.replace(/'/g, "''")}'`
   if (acl?.selfSid === undefined) {
     return `用「属性 → 安全 → 高级」把 ${target} 的 DACL 重建为只授当前账户（受保护、断开继承）——`
@@ -224,13 +228,19 @@ export function aclFixCommand(
   const rule = isDir
     ? `New-Object System.Security.AccessControl.FileSystemAccessRule($aclSid,'FullControl','ContainerInherit, ObjectInherit','None','Allow')`
     : `New-Object System.Security.AccessControl.FileSystemAccessRule($aclSid,'FullControl','Allow')`
-  return '在 PowerShell 中执行（若提示权限不足，改用管理员 PowerShell——重建 DACL/属主需要相应权限）：'
+  let cmd = '在 PowerShell 中执行（若提示权限不足，改用管理员 PowerShell）：'
     + `$aclPath=${ps(target)}; `
     + `$aclSid=New-Object System.Security.Principal.SecurityIdentifier(${ps(acl.selfSid)}); `
     + `$aclObj=New-Object System.Security.AccessControl.${aclType}; `
-    + '$aclObj.SetOwner($aclSid); $aclObj.SetAccessRuleProtection($true,$false); '
+    + '$aclObj.SetAccessRuleProtection($true,$false); '
     + `$aclObj.AddAccessRule((${rule})); `
     + 'Set-Acl -LiteralPath $aclPath -AclObject $aclObj'
+  // 改属主需要额外权限（SeRestorePrivilege）；只有 WRITE_DAC 的普通账户只能重建 DACL——
+  // 把它拆成独立一步，别让整条修复命令因 SetOwner 失败而全废。
+  if (acl.problem === 'untrusted-owner' || acl.problem === 'parent-untrusted-owner' || acl.problem === 'ancestor-untrusted-owner') {
+    cmd += `；随后修属主（需管理员）：icacls ${ps(target)} /setowner "${'*' + acl.selfSid}"`
+  }
+  return cmd
 }
 
 /**

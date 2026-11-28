@@ -531,12 +531,21 @@ describe('aclFixCommand：修复目标必须是真正出事的对象', () => {
     expect(cmd).toContain('FileSecurity')
     expect(cmd).not.toContain('ContainerInherit')
   })
-  it('修法是整体重建：受保护 + 属主=当前用户（icacls 删不掉名单外 ACE、改不了属主）', () => {
-    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-owner', selfSid: SID })
+  it('修法是整体重建 DACL（受保护、单 ACE）；不无条件改属主', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-allow', selfSid: SID })
     expect(cmd).toContain('SetAccessRuleProtection($true,$false)')
-    expect(cmd).toContain('SetOwner($aclSid)')
     expect(cmd).toContain('Set-Acl -LiteralPath $aclPath')
-    expect(cmd).not.toContain('icacls')
+    expect(cmd).not.toContain('SetOwner(')
+    expect(cmd).not.toContain('/setowner')
+  })
+  it('属主类成因才追加独立的 /setowner 一步（需管理员权限）', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-owner', selfSid: SID })
+    expect(cmd).toContain('/setowner "*' + SID + '"')
+  })
+  it('读面的 parent-* 指的是 qiyu 目录本身（parentIsDir），不是 ~/.config', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'parent-writable', selfSid: SID, parentIsDir: true })
+    expect(cmd).toContain(DIR + "'")
+    expect(cmd).not.toContain('C:\\\\Users\\\\t\\\\.config;')
   })
   it('ancestor-* 修首个既有祖先（上两级，HOME），不是 ~/.config', () => {
     const cmd = aclFixCommand(CFG, DIR, { problem: 'ancestor-writable', selfSid: SID })

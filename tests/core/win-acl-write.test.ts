@@ -764,3 +764,71 @@ describe('Codex CR17 复查：祖先语境 / 结果未知 / 目标被替换', ()
       .rejects.toMatchObject({ wroteTarget: false })
   })
 })
+
+
+describe('Codex 第三轮复查：祖先 checkpoint 与会话组', () => {
+  const USERS = 'S-1-5-32-545'
+  const goodParent = (): string => JSON.stringify({
+    sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
+    aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: 0x1f01ff, inheritOnly: false }],
+  })
+  const goodHome = (): string => JSON.stringify({
+    sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
+    aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: 0x1f01ff, inheritOnly: false }],
+  })
+  const dirWithUsersDeny = (): string => JSON.stringify({
+    sddl: 'D:P', daclProtected: true, ownerSid: USER_SID,
+    aces: [
+      { type: 'Deny', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USERS, mask: 0x10000, inheritOnly: false },
+      { type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: USER_SID, mask: 0x1f01ff, inheritOnly: false },
+    ],
+  })
+
+  it('脚本在建 .config 之前先发 phase=ancestor 的 checkpoint（STOP 不留目录）', () => {
+    const script = renderWriteScript(plan())
+    const cpAncestor = script.indexOf('phase = "ancestor"')
+    const createConfig = script.indexOf('CreateDir($up')
+    expect(cpAncestor).toBeGreaterThan(-1)
+    expect(createConfig).toBeGreaterThan(cpAncestor)
+    expect(script).toContain('GroupList()')
+  })
+
+  it('ancestor 阶段：HOME 写面不合格 → ancestor-writable', () => {
+    const loose = JSON.stringify({
+      sddl: 'D:AI', daclProtected: false, ownerSid: USER_SID,
+      aces: [{ type: 'Allow', cls: 'System.Security.AccessControl.FileSystemAccessRule', sid: 'S-1-1-0', mask: 0x2, inheritOnly: false }],
+    })
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'ancestor', selfSid: USER_SID, created: false, home: loose }))
+      .toEqual({ go: false, problem: 'ancestor-writable' })
+  })
+
+  it('checkpoint 的令牌组参与目录判据：deny Users 拿掉 DELETE → dir-recipe-mismatch', () => {
+    const cp = {
+      stage: 'probe', phase: 'created', selfSid: USER_SID, created: true,
+      identityMatch: true, reparse: false, qiyu: dirWithUsersDeny(),
+      groups: [`${USERS};15`],
+    }
+    expect(judgeCheckpoint(cp as never)).toEqual({ go: false, problem: 'dir-recipe-mismatch' })
+    // 没有组信息时同一 ACL 判合格——证明是组 deny 起了作用，而不是别的判据
+    const noGroups = { ...cp, groups: [] }
+    expect(judgeCheckpoint(noGroups as never)).toEqual({ go: true })
+  })
+
+  it('组列表形状不对 → groups-unparsable（不能当「没有组」放行）', () => {
+    expect(judgeCheckpoint({
+      stage: 'probe', phase: 'ancestor', selfSid: USER_SID, created: false, home: goodHome(),
+      groups: ['not-a-pair'] as never,
+    })).toEqual({ go: false, problem: 'groups-unparsable' })
+  })
+
+  it('目标打不开属于结果未知：wroteTarget 为 false', async () => {
+    const run = vi.fn(async () => ({ ok: false, stage: 'verify-target' as const, problem: 'target-open-failed' }))
+    await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: run as never }))
+      .rejects.toMatchObject({ wroteTarget: false })
+  })
+
+  it('可复用的材料齐全时 ancestor 阶段放行', () => {
+    expect(judgeCheckpoint({ stage: 'probe', phase: 'ancestor', selfSid: USER_SID, created: false, home: goodHome() }))
+      .toEqual({ go: true })
+  })
+})

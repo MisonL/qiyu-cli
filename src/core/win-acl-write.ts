@@ -170,6 +170,40 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    } finally { LocalFree(sd); }',
     '  }',
     '',
+    '  [DllImport("advapi32.dll", SetLastError=true)]',
+    '  static extern bool GetTokenInformation(IntPtr h, int cls, IntPtr buf, int len, out int ret);',
+    '  [DllImport("advapi32.dll", SetLastError=true)]',
+    '  static extern bool OpenProcessToken(IntPtr p, uint acc, out IntPtr tok);',
+    '  [DllImport("kernel32.dll")]',
+    '  static extern IntPtr GetCurrentProcess();',
+    '',
+    '  // Token groups with attributes as "sid;attr": a deny ACE on a group (e.g. Users) applies',
+    '  // to us too, so the Node-side judgement needs the real group list.',
+    '  public static string[] GroupList() {',
+    '    IntPtr tok;',
+    '    if (!OpenProcessToken(GetCurrentProcess(), 0x8, out tok)) return new string[0];',
+    '    try {',
+    '      int len = 0;',
+    '      GetTokenInformation(tok, 2, IntPtr.Zero, 0, out len);',
+    '      if (len == 0) return new string[0];',
+    '      IntPtr buf = Marshal.AllocHGlobal(len);',
+    '      try {',
+    '        int got;',
+    '        if (!GetTokenInformation(tok, 2, buf, len, out got)) return new string[0];',
+    '        int count = Marshal.ReadInt32(buf);',
+    '        int off = IntPtr.Size == 8 ? 8 : 4;',
+    '        int structSize = IntPtr.Size == 8 ? 16 : 8;',
+    '        System.Collections.Generic.List<string> list = new System.Collections.Generic.List<string>();',
+    '        for (int i = 0; i < count; i++) {',
+    '          IntPtr sidPtr = Marshal.ReadIntPtr(IntPtr.Add(buf, off + i * structSize));',
+    '          int attr = Marshal.ReadInt32(IntPtr.Add(buf, off + i * structSize + IntPtr.Size));',
+    '          list.Add(new System.Security.Principal.SecurityIdentifier(sidPtr).Value + ";" + attr);',
+    '        }',
+    '        return list.ToArray();',
+    '      } finally { Marshal.FreeHGlobal(buf); }',
+    '    } finally { CloseHandle(tok); }',
+    '  }',
+    '',
     '  // Directory handle: FILE_LIST_DIRECTORY|FILE_ADD_FILE|READ_CONTROL, share READ|WRITE (no DELETE),',
     '  // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT (attribute is checked separately).',
     '  public static IntPtr OpenDir(string path, out int err) {',
@@ -313,6 +347,8 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  if ([string]::IsNullOrEmpty($file) -or [string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($tmp)) { $result.problem = "missing-paths"; throw "stop" }',
     '  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
     '  $result.selfSid = $sid',
+    '  $usrGroups = [QiyuWrite]::GroupList()',
+    '  if ($usrGroups.Length -eq 0) { $result.problem = "token-groups-failed"; throw "stop" }',
     '  # Explicit owner: without O: the new object takes the token default owner, which an',
     '  # elevated token may resolve to Administrators and then fail our own owner check.',
     '  $fileDacl = "D:P(A;;0x13019f;;;" + $sid + ")"',
@@ -340,6 +376,16 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    if ($hph -eq [IntPtr]::Zero -or $hph.ToInt64() -eq -1) { $result.problem = "ancestor-open-failed"; throw "stop" }',
     '    $homeAcl = [QiyuWrite]::AclJson($hph)',
     '    if ([string]::IsNullOrEmpty($homeAcl)) { $result.problem = "ancestor-unparsable"; throw "stop" }',
+    '    # Judge the existing ancestor BEFORE the first filesystem change: a STOP here must',
+    '    # leave .config absent, or a retry would skip this very check.',
+    '    $ca = @{ stage = "probe"; phase = "ancestor"; selfSid = $sid; created = $false; home = $homeAcl; groups = $usrGroups }',
+    '    Emit ("QIYU-CP " + ($ca | ConvertTo-Json -Compress -Depth 6))',
+    '    $ra = ReadCtl',
+    '    if ($null -eq $ra) { $result.problem = "no-decision"; throw "stop" }',
+    '    if ($ra -ne "GO") {',
+    '      $result.problem = if ($ra.StartsWith("STOP ") -and $ra.Length -gt 5) { $ra.Substring(5) } else { "unexpected-reply" }',
+    '      throw "stop"',
+    '    }',
     '    $pcerr = [QiyuWrite]::CreateDir($up, $dirSddl)',
     '    if ($pcerr -ne 0) { $result.problem = "parent-create-failed"; throw "stop" }',
     '    $err = 0',
@@ -361,7 +407,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    if ($err -ne 2 -and $err -ne 3) { $result.problem = "dir-open-failed"; throw "stop" }',
     '    $created = $true',
     '  }',
-    '  $cp1 = @{ stage = "probe"; phase = "parent"; selfSid = $sid; created = $created }',
+    '  $cp1 = @{ stage = "probe"; phase = "parent"; selfSid = $sid; created = $created; groups = $usrGroups }',
     '  $cp1.parent = [QiyuWrite]::AclJson($ph)',
     '  if (-not [string]::IsNullOrEmpty($homeAcl)) { $cp1.home = $homeAcl }',
     '  if (-not $created) {',
@@ -391,7 +437,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    $qi = [QiyuWrite]::OpenDir($parent, [ref]$err)',
     '    if ($qi -eq [IntPtr]::Zero -or $qi.ToInt64() -eq -1) { $result.problem = "dir-open-failed"; throw "stop" }',
     '    $rel = [QiyuWrite]::OpenChildDir($ph, $leaf, [ref]$err)',
-    '    $cp2 = @{ stage = "probe"; phase = "created"; selfSid = $sid; created = $true }',
+    '    $cp2 = @{ stage = "probe"; phase = "created"; selfSid = $sid; created = $true; groups = $usrGroups }',
     '    $idRel2 = if ($rel -eq [IntPtr]::Zero) { "" } else { [QiyuWrite]::Identity($rel) }',
     '    $idQ2 = [QiyuWrite]::Identity($qi)',
     '    if ($idRel2 -eq "" -or $idQ2 -eq "") { $result.problem = "identity-failed"; throw "stop" }',
@@ -642,8 +688,11 @@ export const RESULT_PREFIX = 'QIYU-RESULT '
 
 export interface WriteCheckpoint {
   stage: Stage
-  /** 'parent'（绑定父目录后）或 'created'（首次登录已建目录后）。 */
-  phase?: 'parent' | 'created'
+  /**
+   * 'ancestor'（首登、`.config` 尚不存在、建目录**之前**）、'parent'（绑定父目录后）
+   * 或 'created'（首次登录已建目录后）。
+   */
+  phase?: 'ancestor' | 'parent' | 'created'
   /** 脚本探到的当前用户 SID。 */
   selfSid?: string
   /** 待 Node 判定的 ACL 节点（JSON 字符串或已解析对象，形状同 `AclSnapshot`）。 */
@@ -651,6 +700,8 @@ export interface WriteCheckpoint {
   parent?: unknown
   /** 首个既有祖先（首登自建 `~/.config` 时为 HOME）的 ACL；同样按写面受信判。 */
   home?: unknown
+  /** 进程令牌的组（`"sid;attr"`）：deny ACE 授给组（如 Users）时同样作用于本进程。 */
+  groups?: string[]
   /** qiyu 是否由本次调用创建。 */
   created?: boolean
   /** 相对打开的身份是否与 qiyu 句柄一致（仅复用档有）。 */
@@ -814,10 +865,26 @@ function ancestorProblem(p: AclProblem): AclProblem {
 export function judgeCheckpoint(cp: WriteCheckpoint): CheckpointDecision {
   const userSid = cp.selfSid
   if (typeof userSid !== 'string' || userSid === '') return { go: false, problem: 'missing-selfsid' }
-  const token: TokenSnapshot = { userSid, groups: [], restrictedSids: [] }
+  // 组列表形状不对就不能假装「没有组」：组 deny 会被静默放行。
+  if (cp.groups !== undefined && !Array.isArray(cp.groups)) return { go: false, problem: 'groups-unparsable' }
+  const groups: TokenSnapshot['groups'] = []
+  for (const g of cp.groups ?? []) {
+    if (typeof g !== 'string') return { go: false, problem: 'groups-unparsable' }
+    const [gsid, gattr] = g.split(';')
+    const attr = Number(gattr)
+    if (gsid === undefined || gsid === '' || !Number.isInteger(attr)) return { go: false, problem: 'groups-unparsable' }
+    groups.push({ sid: gsid, attr })
+  }
+  const token: TokenSnapshot = { userSid, groups, restrictedSids: [] }
   const parse = (v: unknown): ReturnType<typeof parseAclSnapshot> => {
     if (typeof v === 'string') { try { return parseAclSnapshot(JSON.parse(v)) } catch { return null } }
     return parseAclSnapshot(v)
+  }
+  if (cp.phase === 'ancestor') {
+    const home = parse(cp.home)
+    if (home === null) return { go: false, problem: 'ancestor-unparsable' }
+    const hv = evaluateParentAcl(home, token)
+    return hv.ok ? { go: true } : { go: false, problem: ancestorProblem(hv.problem) }
   }
   if (cp.phase === 'created') {
     // CP2 只带新建目录的材料：父目录已在 CP1 判过（GO 才可能走到建目录），不重复。
@@ -865,9 +932,9 @@ export class WinWriteError extends Error {
     this.name = 'WinWriteError'
   }
   get wroteTarget(): boolean {
-    // 身份核对通过、只是 ACL 不符：路径上确实是本次写入的那个对象，内容即新凭证。
-    // target-identity-mismatch：路径上的对象不是我们的，新凭证去向未知，不能断言「已写入」。
-    return this.stage === 'verify-target' && this.problem !== 'target-identity-mismatch'
+    // 只有「身份已确认、仅 ACL 不符」才能断言内容是新凭证；身份不符/打不开目标都属结果未知。
+    return this.stage === 'verify-target'
+      && (this.problem === 'target-sddl-mismatch' || this.problem === 'target-owner-mismatch')
   }
 }
 

@@ -311,7 +311,15 @@ async function login(argv: string[]): Promise<number> {
         return fail({
           code: 'config_insecure', kind: 'config_insecure', retryable: false,
           message: `换入后复核发现 ${configPath} 已不是本次写入的文件（可能被替换），新凭证的去向未知`,
-          hint: `检查 ${configPath} 当前的对象与 DACL；确认后删除该文件并重新执行 auth login（幂等）`,
+          hint: `不要直接删除：该文件可能是另一次登录写的合法配置。先确认其属主与写入时间（Get-Acl / Get-Item），`
+            + '必要时备份后再重新执行 auth login（幂等）',
+        })
+      }
+      if (e.stage === 'verify-target' && e.problem === 'target-open-failed') {
+        return fail({
+          code: 'config_insecure', kind: 'config_insecure', retryable: false,
+          message: `换入后无法打开 ${configPath} 复核（可能被占用或被替换），新凭证的去向未知`,
+          hint: `确认 ${configPath} 未被其它进程占用、路径不是重解析点，再用 Get-Acl 复核其 DACL`,
         })
       }
       if (e.outcomeUnknown === true) {
@@ -377,7 +385,7 @@ async function login(argv: string[]): Promise<number> {
         // ⚠️ 路径必须走 shellPath 引号（CodeRabbit 2026-10-26）：HOME 可含空格，
         // 不引号的 chmod 在那种 HOME 下照着抄是坏的。与 core 的 insecureConfigError 同源。
         hint: perm.reason === 'acl'
-          ? `请执行：${aclFixCommand(configPath, dirname(configPath), aclDetail)}`
+          ? `请执行：${aclFixCommand(configPath, dirname(configPath), aclDetail === undefined ? undefined : { ...aclDetail, parentIsDir: true })}`
           : perm.reason === 'acl-unchecked'
             ? '请先确认 PowerShell 可用、配置文件放在 NTFS 卷上，再用 icacls 查看当前 ACL；'
               + '判定不了时本次写入不视为「权限已复核」'

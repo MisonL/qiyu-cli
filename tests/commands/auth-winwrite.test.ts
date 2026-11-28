@@ -28,6 +28,7 @@ let err = ''
 const ORIG_KEY = process.env.QIYU_APP_KEY
 const ORIG_SECRET = process.env.QIYU_APP_SECRET
 const ORIG_HOME = process.env.HOME
+const ORIG_USERPROFILE = process.env.USERPROFILE
 let home = ''
 
 beforeEach(() => {
@@ -36,6 +37,8 @@ beforeEach(() => {
   // 隔离 HOME：login 会读 ~/.config/qiyu/config.json，不隔离就依赖开发机真实配置。
   home = mkdtempSync(join(tmpdir(), 'qiyu-authwin-'))
   process.env.HOME = home
+  // Windows 上 os.homedir() 取 USERPROFILE，两个变量一起隔离。
+  process.env.USERPROFILE = home
   process.env.QIYU_APP_KEY = 'key-sentinel'
   process.env.QIYU_APP_SECRET = 'secret-sentinel'
   writeConfigFile.mockReset()
@@ -46,6 +49,7 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(home, { recursive: true, force: true })
   if (ORIG_HOME === undefined) delete process.env.HOME; else process.env.HOME = ORIG_HOME
+  if (ORIG_USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = ORIG_USERPROFILE
   if (ORIG_KEY === undefined) delete process.env.QIYU_APP_KEY; else process.env.QIYU_APP_KEY = ORIG_KEY
   if (ORIG_SECRET === undefined) delete process.env.QIYU_APP_SECRET; else process.env.QIYU_APP_SECRET = ORIG_SECRET
 })
