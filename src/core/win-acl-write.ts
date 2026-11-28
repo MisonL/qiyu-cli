@@ -309,6 +309,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '  #    First login needs a second checkpoint after the directory is created (the recipe',
     '  #    of the new directory is judged then). Both checkpoints must pass before any write.',
     '  $created = $false',
+    '  $createdTmp = $false',
     '  $err = 0',
     '  $up = Split-Path -Parent $parent',
     '  $ph = [QiyuWrite]::OpenDir($up, [ref]$err)',
@@ -368,6 +369,7 @@ export function renderWriteScript(_plan: WritePlan): string {
     '    $result.problem = if ($err -eq 80 -or $err -eq 183) { "already-exists" } else { "create-failed" }',
     '    throw "stop"',
     '  }',
+    '  $createdTmp = $true',
     '  $result.path = $tmp',
     '  $result.sddlReadback = [QiyuWrite]::SddlFromHandle($h)',
     '',
@@ -417,7 +419,8 @@ export function renderWriteScript(_plan: WritePlan): string {
     '} finally {',
     '  foreach ($hh in @($h, $qi, $rel, $ph)) { if ($hh -ne [IntPtr]::Zero) { [QiyuWrite]::CloseHandle($hh) | Out-Null } }',
     '  # A failed run must not leave the secret in the tmp file. Best effort: remove it and report.',
-    '  if ($result.stage -ne "done" -and [System.IO.File]::Exists($tmp)) {',
+    '  # Only OUR tmp: on already-exists/create-failed the same name belongs to someone else.',
+    '  if ($createdTmp -and $result.stage -ne "done" -and [System.IO.File]::Exists($tmp)) {',
     '    try { [System.IO.File]::Delete($tmp) } catch { }',
     '    $result.tmpLeft = [System.IO.File]::Exists($tmp)',
     '  }',
@@ -542,11 +545,13 @@ function coerceResult(data: unknown): WriteScriptResult | null {
   for (const k of ['problem', 'selfSid', 'path', 'sddlReadback'] as const) {
     if (d[k] !== undefined && typeof d[k] !== 'string') return null
   }
+  if (d.tmpLeft !== undefined && typeof d.tmpLeft !== 'boolean') return null
   const out: WriteScriptResult = { ok: d.ok, stage: d.stage }
   if (typeof d.problem === 'string') out.problem = d.problem
   if (typeof d.selfSid === 'string') out.selfSid = d.selfSid
   if (typeof d.path === 'string') out.path = d.path
   if (typeof d.sddlReadback === 'string') out.sddlReadback = d.sddlReadback
+  if (typeof d.tmpLeft === 'boolean') out.tmpLeft = d.tmpLeft
   return out
 }
 

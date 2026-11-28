@@ -551,9 +551,16 @@ describe('Codex 65 写序修复', () => {
 
   })
 
+  it('只删本次创建的 tmp：already-exists 时同名文件不是我们的', () => {
+    const script = renderWriteScript(plan())
+    expect(script).toContain('$createdTmp = $false')
+    expect(script).toContain('$createdTmp = $true')
+    expect(script).toContain('if ($createdTmp -and $result.stage -ne "done"')
+  })
+
   it('失败收尾会尝试删除含 secret 的 tmp 并报告残留', () => {
     const script = renderWriteScript(plan())
-    expect(script).toContain('if ($result.stage -ne "done" -and [System.IO.File]::Exists($tmp))')
+    expect(script).toContain('if ($createdTmp -and $result.stage -ne "done" -and [System.IO.File]::Exists($tmp))')
     expect(script).toContain('[System.IO.File]::Delete($tmp)')
     expect(script).toContain('$result.tmpLeft = [System.IO.File]::Exists($tmp)')
   })
@@ -577,5 +584,22 @@ describe('Codex 65 写序修复', () => {
     await expect(writeConfigFileWin32(CONFIG, CONFIG_JSON, { run: run2 as never })).rejects.toMatchObject({
       wroteTarget: false, tmpLeft: true,
     })
+  })
+})
+
+
+describe('Codex 复查：tmpLeft 必须经结果解析器（真实交互通道）', () => {
+  const runner = (stdout: string) => () => ({ status: 0, stdout, stderr: '' })
+  it('结果行里的 tmpLeft 被复制，而不是在 coerceResult 丢弃', () => {
+    const out = runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload(), runner(
+      'QIYU-RESULT ' + JSON.stringify({ ok: false, stage: 'replace', problem: 'replace-failed', tmpLeft: true }),
+    ), TMP)
+    expect(out).toMatchObject({ ok: false, stage: 'replace', problem: 'replace-failed', tmpLeft: true })
+  })
+  it('tmpLeft 非布尔 → 结果形状不合法（script-failed）', () => {
+    const out = runWriteScript(renderWriteScript(plan()), CONFIG, PARENT, payload(), runner(
+      'QIYU-RESULT ' + JSON.stringify({ ok: false, stage: 'replace', problem: 'replace-failed', tmpLeft: 'yes' }),
+    ), TMP)
+    expect(out).toMatchObject({ ok: false, problem: 'script-failed' })
   })
 })
