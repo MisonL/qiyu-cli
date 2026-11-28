@@ -47,8 +47,28 @@ jobs:
 
       # npm test = 固定分片 runner（scripts/test-shards.mjs）。GitHub runner 只有 2 核，
       # 分片反而更慢（每片都要重新起 Node + 转换缓存），所以 CI 显式要求单片。
-      # 每片内部仍是 --maxWorkers=1 --no-file-parallelism，事故防护（2026-10-05 内存耗尽）
+      # 每片内部仍单进程单 worker，事故防护（2026-10-05 内存耗尽）
       # 一条都没松。
       - run: npm test
         env:
           QIYU_TEST_SHARDS: 1
+
+  # Windows 专用最小 job（0.2.4）：读面三态探测与写序的**纯函数层**在 Windows 上也要绿。
+  # 只跑 win-acl 两个文件——其余用例含 POSIX 权限/符号链接语义，Windows 上本就不成立。
+  # 并发开关收在 scripts/win-shard.mjs 里（与 ubuntu 侧同一条约束）。
+  # 真机端到端（auth login 全链）在 Windows 真机手工执行，不在 CI 里。
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: node scripts/win-shard.mjs

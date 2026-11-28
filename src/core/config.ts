@@ -13,8 +13,10 @@
 
 import { readFileSync, writeFileSync, lstatSync, statSync, existsSync, mkdirSync, renameSync, chmodSync, accessSync, constants as fsConstants } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, dirname, isAbsolute } from 'node:path'
+import { join, dirname, isAbsolute, win32 } from 'node:path'
 import { shellArg } from './shell.js'
+import { checkWinAcl, describeAclProblem, type AclProblem } from './win-acl.js'
+import { writeConfigFileWin32 } from './win-acl-write.js'
 
 /** 顶层已知键 —— 未知键 fail-closed（spec §3.3）。 */
 export const KNOWN_TOP = new Set(['defaultProfile', 'profiles'])
@@ -186,6 +188,61 @@ export function shellPath(p: string): string {
   return /[\s"'`$\\]/.test(p) ? `"${p.replace(/[\\"`$]/g, '\\$&')}"` : p
 }
 
+/** 权限拒绝的成因档：前四档是 POSIX 语义，后两档是 win32 ACL 三态（见 `checkPermissions`）。 */
+export type PermReason = 'file' | 'dir' | 'unreadable' | 'dir-unreadable' | 'acl' | 'acl-unchecked'
+
+/**
+ * ACL 不合格时的**修法**（win32）：按 SID 重建「受保护 + 只授当前用户」的 DACL。
+ *
+ * 为什么带 SID 而不是 `%USERNAME%`：hint 会被原样执行，`%USERNAME%` 只在 cmd 展开、
+ * Git Bash 与 pwsh 下是字面量；SID 在各 shell 下含义一致。
+ *
+ * ⚠️ 为什么不用 `icacls /inheritance:r /grant:r`（CodeRabbit 2026-11-28）：`/inheritance:r`
+ * 会把继承来的 ACE 转成显式 ACE **保留**，`/grant:r` 只替换当前 SID 的授权——名单外账户的
+ * 显式/继承授权都删不掉，跑了也修不好；它也改不了属主。这里用 PowerShell 新建一个
+ * 受保护、单 ACE、属主=当前用户的 ACL 整体写回，才真正满足契约。
+ *
+ * ⚠️ 片段本身在 **PowerShell** 里执行（`$` 变量在外面被展开会坏），单引号字符串按 PS 规则转义。
+ */
+export function aclFixCommand(
+  configPath: string, dir: string,
+  acl?: { problem: AclProblem; selfSid?: string; onDir?: boolean; parentIsDir?: boolean },
+): string {
+  const onAncestor = acl?.problem.startsWith('ancestor-') ?? false
+  const onParent = !onAncestor && (acl?.problem.startsWith('parent-') ?? false)
+  const onDir = !onAncestor && !onParent && (acl?.onDir ?? false)
+  // 三层语境三种目标：祖先（HOME）→ 上两级；父目录（~/.config）→ 上一级；目录/文件按 flag。
+  // 语境里「parent」指谁随调用面而变：读面 parent 就是 qiyu 目录本身（parentIsDir），
+  // 写序 parent 是 qiyu 的上一级 ~/.config。
+  const target = onAncestor
+    ? win32.dirname(win32.dirname(dir))
+    : onParent ? (acl?.parentIsDir === true ? dir : win32.dirname(dir))
+      : onDir ? dir : configPath
+  const ps = (v: string): string => `'${v.replace(/'/g, "''")}'`
+  if (acl?.selfSid === undefined) {
+    return `用「属性 → 安全 → 高级」把 ${target} 的 DACL 重建为只授当前账户（受保护、断开继承）——`
+      + `判定拿不到当前用户 SID，不给出可能半途失败的命令`
+  }
+  const isDir = onAncestor || onParent || onDir
+  const aclType = isDir ? 'DirectorySecurity' : 'FileSecurity'
+  const rule = isDir
+    ? `New-Object System.Security.AccessControl.FileSystemAccessRule($aclSid,'FullControl','ContainerInherit, ObjectInherit','None','Allow')`
+    : `New-Object System.Security.AccessControl.FileSystemAccessRule($aclSid,'FullControl','Allow')`
+  let cmd = '在 PowerShell 中执行（若提示权限不足，改用管理员 PowerShell）：'
+    + `$aclPath=${ps(target)}; `
+    + `$aclSid=New-Object System.Security.Principal.SecurityIdentifier(${ps(acl.selfSid)}); `
+    + `$aclObj=New-Object System.Security.AccessControl.${aclType}; `
+    + '$aclObj.SetAccessRuleProtection($true,$false); '
+    + `$aclObj.AddAccessRule((${rule})); `
+    + 'Set-Acl -LiteralPath $aclPath -AclObject $aclObj'
+  // 改属主需要额外权限（SeRestorePrivilege）；只有 WRITE_DAC 的普通账户只能重建 DACL——
+  // 把它拆成独立一步，别让整条修复命令因 SetOwner 失败而全废。
+  if (acl.problem === 'untrusted-owner' || acl.problem === 'parent-untrusted-owner' || acl.problem === 'ancestor-untrusted-owner') {
+    cmd += `；随后修属主（需管理员）：icacls ${ps(target)} /setowner "${'*' + acl.selfSid}"`
+  }
+  return cmd
+}
+
 /**
  * 权限拒绝的**唯一构造点**（两个配置解析入口共用同一句话）。
  *
@@ -198,14 +255,17 @@ export function shellPath(p: string): string {
  * 写的都是前者，所以 store 那条路径是缺陷，不是另一种口径。
  */
 export function insecureConfigError(
-  configPath: string, reason: 'file' | 'dir' | 'unreadable' | 'dir-unreadable',
+  configPath: string, reason: PermReason,
   /** `dir-unreadable` 专用：路径上**最外层**被权限挡住的目录（见 `blockedAncestor`）。 */
   blockedDir?: string,
   /** 测试可注入；生产恒为 `process.platform`。 */
   platform: string = process.platform,
+  /** `acl` / `acl-unchecked` 专用：具体的清单成因与当前用户 SID（hint 要生成可执行的 icacls）。 */
+  acl?: { problem: AclProblem; selfSid?: string },
 ): Error {
   const dir = dirname(configPath)
-  // ⚠️ 四种成因必须是四句话（CR/Codex 2026-11-10 第六轮 + 第十轮）：`unreadable` 是**当前
+  // ⚠️ 每种成因必须是各自的一句话（CR/Codex 2026-11-10 第六轮 + 第十轮；0.2.4 增两档 win32 ACL）：
+  // `unreadable` 是**当前
   // 用户读不了**，与「含凭证且过宽」相反（那说的是别人能读）—— 套用过宽的文案会把
   // 「权限位全零、不含凭证的文件」说成凭证暴露风险，Agent 会去查一个不存在的泄露面；
   // `dir-unreadable` 又是另一层（目录进不去），修法与文案都不能套用文件那一档。
@@ -217,24 +277,33 @@ export function insecureConfigError(
   // ACL；引号按 win32 方言走 `shellArg`（hint 会被真的执行，引号规则只许一个实现点）。
   const blocked = blockedDir ?? dir
   const win = platform === 'win32'
+  const aclText = acl !== undefined ? describeAclProblem(acl.problem) : ''
   const what = reason === 'file'
     ? `配置文件 ${configPath} 含凭证但权限过宽（group/other 有权限位；可读时其他用户就能读到 appSecret）`
     : reason === 'dir'
       ? `配置目录 ${dir} 权限过宽（group/other 可写，文件可被整体替换）且配置含凭证`
-      : reason === 'dir-unreadable'
-        ? win
-          ? `配置路径上的目录 ${blocked} 被 Windows ACL 拒绝访问（不是 POSIX 权限位，chmod 修不了它）`
-          : `配置目录 ${blocked} 当前用户不可搜索（它挡在配置路径上，因此读不到其中的配置文件；`
-            + `若它下面还有不可进入的层，修好这一层后重跑会重新点名；与文件里有没有凭证无关）`
-        : win
-          ? `配置文件 ${configPath} 被 Windows ACL 拒绝读取（不是 POSIX 权限语义，chmod 修不了它；与文件里有没有凭证无关）`
-          : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
-  const fix = win && (reason === 'unreadable' || reason === 'dir-unreadable')
-    ? `icacls ${shellArg(reason === 'dir-unreadable' ? blocked : configPath, 'win32')} /reset`
-      + `（恢复继承的 ACL；也可在「属性 → 安全」里给当前用户授予读取权限）`
-    : reason === 'dir' || reason === 'dir-unreadable'
-      ? `chmod 700 ${shellPath(blocked)}`
-      : `chmod 600 ${shellPath(configPath)}`
+      : reason === 'acl'
+        ? `配置文件 ${configPath} 的 Windows ACL 不处于受信状态（${aclText}）`
+        : reason === 'acl-unchecked'
+          ? `无法判定配置文件 ${configPath} 的 Windows ACL 是否安全（${aclText}；按不安全处理，不冒认通过）`
+          : reason === 'dir-unreadable'
+            ? win
+              ? `配置路径上的目录 ${blocked} 被 Windows ACL 拒绝访问（不是 POSIX 权限位，chmod 修不了它）`
+              : `配置目录 ${blocked} 当前用户不可搜索（它挡在配置路径上，因此读不到其中的配置文件；`
+                + `若它下面还有不可进入的层，修好这一层后重跑会重新点名；与文件里有没有凭证无关）`
+            : win
+              ? `配置文件 ${configPath} 被 Windows ACL 拒绝读取（不是 POSIX 权限语义，chmod 修不了它；与文件里有没有凭证无关）`
+              : `配置文件 ${configPath} 当前用户没有读取权限（权限位拒绝了本次读取；与文件里有没有凭证无关）`
+  const fix = reason === 'acl'
+    ? aclFixCommand(configPath, dir, acl === undefined ? undefined : { ...acl, parentIsDir: true })
+    : reason === 'acl-unchecked'
+      ? `icacls ${shellArg(configPath, 'win32')}（先查看当前 ACL；本判据需要 PowerShell 可用且配置放在 NTFS 卷上）`
+      : win && (reason === 'unreadable' || reason === 'dir-unreadable')
+        ? `icacls ${shellArg(reason === 'dir-unreadable' ? blocked : configPath, 'win32')} /reset`
+          + `（恢复继承的 ACL；也可在「属性 → 安全」里给当前用户授予读取权限）`
+        : reason === 'dir' || reason === 'dir-unreadable'
+          ? `chmod 700 ${shellPath(blocked)}`
+          : `chmod 600 ${shellPath(configPath)}`
   return Object.assign(
     new Error(`${what}，已拒绝读取`),
     {
@@ -335,7 +404,10 @@ export function loadConfigChecked(configPath: string): { file: QiyuConfigFile; e
     hasCredentials: configHasCredentials(loaded.file),
     onWarn: (m) => process.stderr.write(`${m}\n`),
   })
-  if (!perm.ok) throw insecureConfigError(configPath, perm.reason)
+  if (!perm.ok) {
+    throw insecureConfigError(configPath, perm.reason, undefined, process.platform,
+      perm.aclProblem === undefined ? undefined : { problem: perm.aclProblem, selfSid: perm.selfSid })
+  }
   return loaded
 }
 
@@ -364,15 +436,47 @@ export function __resetPermissionWarnings(): void { warnedPermissionPaths.clear(
  * ⚠️ `auth login` 的写入路径（`writeConfigFile`）总是产出 0600 文件 —— 所以
  * 「含凭证且过宽」只会在用户手工 chmod 放宽时出现，此时拒绝并提示收紧。
  */
+export type PermCheck =
+  | { ok: true; checked: boolean }
+  | { ok: false; checked: boolean; reason: PermReason; aclProblem?: AclProblem; selfSid?: string }
+
 export function checkPermissions(
   configPath: string,
   opts: { hasCredentials: boolean; onWarn: (msg: string) => void },
-): { ok: true } | { ok: false; reason: 'file' | 'dir' } {
-  if (process.platform === 'win32') return { ok: true }
+  /** 测试可注入（在非 Windows 上覆盖 win32 三态接线，而不只靠真机 CI）；生产恒为 `process.platform`。 */
+  platform: string = process.platform,
+  /** 测试可注入的 ACL 探测（真实实现在 `core/win-acl.ts`）。 */
+  winAcl: (configPath: string, dirPath: string) => ReturnType<typeof checkWinAcl> = checkWinAcl,
+): PermCheck {
+  // Windows：POSIX 权限位不成立（普通文件回读 666），改真探测 NTFS ACL（三态）。
+  // ⚠️ 「不安全」与「判不了」必须分开：前者清 ACL，后者查环境（PowerShell/NTFS/受限令牌）。
+  // 无凭证的文件维持「警告不阻断」的既有口径（与 POSIX 分支同构）；含凭证时两档都 fail closed。
+  if (platform === 'win32') {
+    const { verdict, userSid } = winAcl(configPath, dirname(configPath))
+    if (verdict.ok) return { ok: true, checked: true }
+    if (!opts.hasCredentials) {
+      const key = `acl:${configPath}`
+      if (!warnedPermissionPaths.has(key)) {
+        warnedPermissionPaths.add(key)
+        opts.onWarn(
+          `配置文件 ${configPath} 的 Windows ACL 不处于受信状态`
+            + `（${describeAclProblem(verdict.problem)}；建议用 icacls 收紧）`,
+        )
+      }
+      return { ok: true, checked: verdict.checked }
+    }
+    return {
+      ok: false,
+      checked: verdict.checked,
+      reason: verdict.checked ? 'acl' : 'acl-unchecked',
+      aclProblem: verdict.problem,
+      selfSid: userSid,
+    }
+  }
   const mode = statSync(configPath).mode & 0o777
   const fileWide = (mode & 0o077) !== 0
   if (fileWide) {
-    if (opts.hasCredentials) return { ok: false, reason: 'file' }
+    if (opts.hasCredentials) return { ok: false, checked: true, reason: 'file' }
     const key = `file:${configPath}`
     if (!warnedPermissionPaths.has(key)) {
       warnedPermissionPaths.add(key)
@@ -383,14 +487,14 @@ export function checkPermissions(
   // 目录可整体替换文件 → 含凭证时同样拒绝。
   const dirMode = statSync(dirname(configPath)).mode & 0o777
   if ((dirMode & 0o022) !== 0) {
-    if (opts.hasCredentials) return { ok: false, reason: 'dir' }
+    if (opts.hasCredentials) return { ok: false, checked: true, reason: 'dir' }
     const dirKey = `dir:${dirname(configPath)}`
     if (!warnedPermissionPaths.has(dirKey)) {
       warnedPermissionPaths.add(dirKey)
       opts.onWarn(`配置目录 ${dirname(configPath)} 权限过宽（建议 chmod 700）`)
     }
   }
-  return { ok: true }
+  return { ok: true, checked: true }
 }
 
 /** 配置文件是否含任何 credentials 块（权限升级判据）。 */
@@ -542,7 +646,12 @@ export function fileCredentials(
  * ⚠️ config 是符号链接时拒绝 —— 写入会穿透到链接目标（可能是任意路径）。
  * ⚠️ 合并语义由调用方先算好完整内容；本函数只负责「安全落盘」。
  */
-export function writeConfigFile(configPath: string, content: QiyuConfigFile): void {
+export function writeConfigFile(configPath: string, content: QiyuConfigFile): void | Promise<void> {
+  // Windows：POSIX 权限位不映射 NTFS ACL，走写序 ⓪–⑥（异步：需要 checkpoint 往返）。
+  // POSIX 分支逐字节不变（现有用例是验收线）。
+  if (process.platform === 'win32') {
+    return writeConfigFileWin32(configPath, serializeConfig(content))
+  }
   const dir = dirname(configPath)
   // ⚠️ lstat 不跟随链接：statSync 会穿透到目标，探测不到「config 本身是链接」。
   // 文件不存在（首次 login）是正常路径 —— ENOENT 放行，其余 errno 照常抛。

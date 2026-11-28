@@ -16,6 +16,7 @@ import {
   fileCredentials, fileProfile, insecureConfigError, loadConfigChecked, loadConfigFile, parseConfig,
   readConfigRaw,
   resolveProfileName, serializeConfig, writeConfigFile,
+  aclFixCommand,
 } from '../../src/core/config.js'
 import { shellArg } from '../../src/output.js'
 
@@ -504,5 +505,56 @@ describe('读点上的权限拒绝同样分流（CodeRabbit 第十三轮 minor�
     const t = caught as { kind?: string; message?: string }
     expect(t.kind).toBeUndefined()
     expect(String(t.message)).toContain('无法读取配置文件')
+  })
+})
+
+describe('aclFixCommand：修复目标必须是真正出事的对象', () => {
+  const CFG = 'C:\\Users\\t\\.config\\qiyu\\config.json'
+  const DIR = 'C:\\Users\\t\\.config\\qiyu'
+  const SID = 'S-1-5-21-1-2-3-1001'
+  it('parent-* 修 qiyu 目录的上一级（~/.config），用 DirectorySecurity 重建', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'parent-writable', selfSid: SID })
+    expect(cmd).toContain('C:\\Users\\t\\.config')
+    expect(cmd).not.toContain('config.json')
+    expect(cmd).toContain('DirectorySecurity')
+    expect(cmd).toContain('ContainerInherit, ObjectInherit')
+  })
+  it('写序 probe 阶段的目录成因修 qiyu 目录本身', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'dacl-inherited', selfSid: SID, onDir: true })
+    expect(cmd).toContain(DIR + "'")
+    expect(cmd).not.toContain('config.json')
+    expect(cmd).toContain('DirectorySecurity')
+  })
+  it('文件级成因修 config.json，用 FileSecurity 单 ACE', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-allow', selfSid: SID })
+    expect(cmd).toContain('config.json')
+    expect(cmd).toContain('FileSecurity')
+    expect(cmd).not.toContain('ContainerInherit')
+  })
+  it('修法是整体重建 DACL（受保护、单 ACE）；不无条件改属主', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-allow', selfSid: SID })
+    expect(cmd).toContain('SetAccessRuleProtection($true,$false)')
+    expect(cmd).toContain('Set-Acl -LiteralPath $aclPath')
+    expect(cmd).not.toContain('SetOwner(')
+    expect(cmd).not.toContain('/setowner')
+  })
+  it('属主类成因才追加独立的 /setowner 一步（需管理员权限）', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-owner', selfSid: SID })
+    expect(cmd).toContain('/setowner "*' + SID + '"')
+  })
+  it('读面的 parent-* 指的是 qiyu 目录本身（parentIsDir），不是 ~/.config', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'parent-writable', selfSid: SID, parentIsDir: true })
+    expect(cmd).toContain(DIR + "'")
+    expect(cmd).not.toContain('C:\\\\Users\\\\t\\\\.config;')
+  })
+  it('ancestor-* 修首个既有祖先（上两级，HOME），不是 ~/.config', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'ancestor-writable', selfSid: SID })
+    expect(cmd).toContain("'C:\\Users\\t'")
+    expect(cmd).not.toContain('C:\\Users\\t\\.config')
+    expect(cmd).toContain('DirectorySecurity')
+  })
+  it('拿不到 SID 时不给可能半途失败的命令', () => {
+    const cmd = aclFixCommand(CFG, DIR, { problem: 'untrusted-allow' })
+    expect(cmd).toContain('属性 → 安全 → 高级')
   })
 })

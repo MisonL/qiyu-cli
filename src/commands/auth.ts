@@ -4,10 +4,17 @@ import { resolveCredentials } from '../core/credentials.js'
 import { ok, fail, usageFail, failFromTagged, describeArgs, setPretty, EXIT } from '../output.js'
 import {
   configPathFor, loadConfigFile, loadConfigChecked, writeConfigFile, checkPermissions,
-  isWhitespaceOnly, nonEmptyValue,
+  isWhitespaceOnly, nonEmptyValue, aclFixCommand,
   resolveProfileName, shellPath,
 } from '../core/config.js'
 import type { QiyuConfigFile, ProfileBlock } from '../core/config.js'
+import { describeAclProblem, isAclProblem } from '../core/win-acl.js'
+import { WinWriteError } from '../core/win-acl-write.js'
+
+/** 写序 problem 若是 ACL 成因，用同一份文案；否则原样给稳定串。 */
+function describeAclProblemOr(problem: string): string {
+  return isAclProblem(problem) ? describeAclProblem(problem) : problem
+}
 import { GLOBAL_FLAGS, GLOBAL_FLAG_NAMES, prettyAfterSubcommand, prettyPositionalProblem, REJECTED_FLAGS } from './spec-types.js'
 import type { CommandSpec, FlagSpec } from './spec-types.js'
 
@@ -295,10 +302,68 @@ async function login(argv: string[]): Promise<number> {
     },
   }
   try {
-    writeConfigFile(configPath, next)
+    await writeConfigFile(configPath, next)
   } catch (e) {
     // 写盘失败是环境问题（权限/符号链接/磁盘）——归业务错误（退出码 1），
     // 不是"改参数重来"。文案带上底层原因，否则用户只知道"失败了"。
+    if (e instanceof WinWriteError) {
+      if (e.stage === 'verify-target' && e.problem === 'target-identity-mismatch') {
+        return fail({
+          code: 'config_insecure', kind: 'config_insecure', retryable: false,
+          message: `换入后复核发现 ${configPath} 已不是本次写入的文件（可能被替换），新凭证的去向未知`,
+          hint: `不要直接删除：该文件可能是另一次登录写的合法配置。先确认其属主与写入时间（Get-Acl / Get-Item），`
+            + '必要时备份后再重新执行 auth login（幂等）',
+        })
+      }
+      if (e.stage === 'verify-target' && e.problem === 'target-open-failed') {
+        return fail({
+          code: 'config_insecure', kind: 'config_insecure', retryable: false,
+          message: `换入后无法打开 ${configPath} 复核（可能被占用或被替换），新凭证的去向未知`,
+          hint: `确认 ${configPath} 未被其它进程占用、路径不是重解析点，再用 Get-Acl 复核其 DACL`,
+        })
+      }
+      // verify-target 上的其它失败（如 script-error）：换入可能已发生，复核没跑完 → 结果未知。
+      if (e.stage === 'verify-target' && !e.wroteTarget) {
+        return fail({
+          code: 'config_insecure', kind: 'config_insecure', retryable: false,
+          message: `换入后的 ACL 复核未完成（Windows 写序在 ${e.stage} 阶段失败：${e.problem}），新凭证的去向未知`,
+          hint: `先确认 ${configPath} 当前的内容/属主（不要打印内容），再用 Get-Acl 复核其 DACL；确认后重新执行 auth login（幂等）`,
+        })
+      }
+      if (e.outcomeUnknown === true) {
+        return fail({
+          code: 'config_insecure', kind: 'config_insecure', retryable: false,
+          message: `写入结果未知：${configPath} 的写序在发出凭证后中断（${e.problem}），文件可能已是新凭证、也可能仍是旧内容`,
+          hint: `先检查 ${configPath} 是否存在、内容是否为新凭证（不要打印内容），再用 Get-Acl 复核其 DACL；`
+            + (e.tmpPath === undefined ? '' : `临时文件 ${e.tmpPath} 也可能残留（受限 ACL），一并检查；`)
+            + '确认状态后可重新执行 auth login（幂等）',
+        })
+      }
+      // 换入（replace）已成功、只是换入后复核失败时，文件里**已经是新凭证**——照实报告，
+      // 说「未写入」会让 Agent 以为旧配置还在（Codex 65 P2）。
+      // 只有 ACL 成因才给 DACL 修复命令；`parent-open-failed` 之类的路径/IO 成因照 ACL 修是修错对象（真机 2026-11-28）。
+      const problem = e.problem
+      const aclProblem = isAclProblem(problem)
+      const stageText = `${e.stage} ${aclProblem ? `阶段：${describeAclProblem(problem)}` : `阶段失败（${problem}）`}`
+      let aclHint: string
+      if (aclProblem) {
+        aclHint = `${stageText}；可执行：${aclFixCommand(configPath, dirname(configPath), { problem, selfSid: e.selfSid, onDir: e.stage === 'probe' })}`
+      } else if (e.wroteTarget) {
+        aclHint = `${stageText}；文件内容已更新为新凭证，请用 Get-Acl 复核该文件的 DACL（应受保护、只授当前账户），确认无误后可重新执行 auth login`
+      } else {
+        aclHint = `${stageText}；请检查 ${dirname(configPath)} 及其上级目录是否存在、盘符可用`
+        if (e.tmpLeft === true && e.tmpPath !== undefined) {
+          aclHint += `；临时文件仍残留：${e.tmpPath}（受限 ACL，仅当前账户可读），删除后可重试`
+        }
+      }
+      return fail({
+        code: 'config_insecure', kind: 'config_insecure', retryable: false,
+        message: e.wroteTarget
+          ? `凭证已写入 ${configPath}，但换入后的 ACL 复核未通过（Windows 写序在 ${e.stage} 阶段失败：${describeAclProblemOr(e.problem)}）`
+          : `凭证未写入 ${configPath}（Windows 写序在 ${e.stage} 阶段失败：${describeAclProblemOr(e.problem)}）`,
+        hint: aclHint,
+      })
+    }
     const msg = (e as Error).message
     // 符号链接是我们的显式拒绝 —— 也归这里（用户的动作是"换成普通文件"）。
     return fail({
@@ -313,21 +378,44 @@ async function login(argv: string[]): Promise<number> {
   }
   // 权限自检：写出的文件必须 0600，否则这次"成功"是假的（凭证已落盘且可被他人读）。
   // writeConfigFile 用 0600 创建，这里只做一次如实复核 —— 失败则如实报告。
+  const verifyWarnings: string[] = []
   try {
     const perm = checkPermissions(configPath, { hasCredentials: true, onWarn: () => {} })
     if (!perm.ok) {
+      const isAcl = perm.reason === 'acl' || perm.reason === 'acl-unchecked'
+      const aclDetail = perm.aclProblem === undefined ? undefined : { problem: perm.aclProblem, selfSid: perm.selfSid }
       return fail({
         code: 'config_insecure', kind: 'config_insecure', retryable: false,
-        message: `凭证已写入 ${configPath}，但落盘权限不合格（${perm.reason === 'file' ? '文件' : '目录'}过宽）`,
+        message: isAcl
+          ? `凭证已写入 ${configPath}，但 Windows ACL 复核不合格（`
+            + `${perm.aclProblem === undefined ? '成因未知' : describeAclProblem(perm.aclProblem)}）`
+          : `凭证已写入 ${configPath}，但落盘权限不合格（${perm.reason === 'file' ? '文件' : '目录'}过宽）`,
         // ⚠️ 路径必须走 shellPath 引号（CodeRabbit 2026-10-26）：HOME 可含空格，
         // 不引号的 chmod 在那种 HOME 下照着抄是坏的。与 core 的 insecureConfigError 同源。
-        hint: `请执行 chmod ${perm.reason === 'file' ? `600 ${shellPath(configPath)}` : `700 ${shellPath(dirname(configPath))}`}`,
+        hint: perm.reason === 'acl'
+          ? `请执行：${aclFixCommand(configPath, dirname(configPath), aclDetail === undefined ? undefined : { ...aclDetail, parentIsDir: true })}`
+          : perm.reason === 'acl-unchecked'
+            ? '请先确认 PowerShell 可用、配置文件放在 NTFS 卷上，再用 icacls 查看当前 ACL；'
+              + '判定不了时本次写入不视为「权限已复核」'
+            : `请执行 chmod ${perm.reason === 'file' ? `600 ${shellPath(configPath)}` : `700 ${shellPath(dirname(configPath))}`}`,
       })
     }
-  } catch { /* 自检失败不影响"已写入"这一事实；下一次任何命令都会再查一次 */ }
+  } catch {
+    // 自检本身炸了（例如探测输出无法解析）：写入已是事实，但不能把「没查成」说成「查过且合格」。
+    // win32 与 acl-unchecked 走同一个响应（退出码 1）：同一件事不能因「抛异常/返回判不了」而两种结局。
+    if (process.platform === 'win32') {
+      return fail({
+        code: 'config_insecure', kind: 'config_insecure', retryable: false,
+        message: `凭证已写入 ${configPath}，但 Windows ACL 复核未完成（探测执行失败，结论未知）`,
+        hint: '先确认 PowerShell 可用、配置文件位于 NTFS 卷上，再用 Get-Acl 复核其 DACL（应受保护、只授当前账户）',
+      })
+    }
+    verifyWarnings.push('凭证已写入，但写入后的权限自检未完成（自检执行失败）；本次写入不视为「权限已复核」')
+  }
 
   // ⚠️ 绝不回显 appKey/appSecret —— 连末四位都不（与 whoami 同一条约束）。
   return ok({ configured: true, profile: name, config_path: configPath, source: 'file' }, {
+    ...(verifyWarnings.length > 0 ? { warnings: verifyWarnings } : {}),
     field_notes: {
       configured: 'true 只表示两个字段都已写入配置文件，不代表它们有效'
         + '（拼错的 appKey 同样返回 true）。⚠️ auth whoami 也只查「有没有配」，'
